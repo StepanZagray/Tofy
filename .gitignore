@@ -1,0 +1,42 @@
+# Rust
+/target/
+Cargo.lock
+
+# Model files
+*.safetensors
+*.pt
+*.bin
+*.onnx
+
+# Vocab/tokenizer files (generated)
+vocab.txt
+
+# Data files
+data/*.txt
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
