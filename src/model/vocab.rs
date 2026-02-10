@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Pair {
-    pub context: Vec<u32>,
-    pub target: Vec<u32>,
+    pub tokens: Vec<u32>,
 }
 
 pub struct Vocab {
@@ -11,6 +10,7 @@ pub struct Vocab {
     pub id_to_token: Vec<String>,
     pub pad_id: u32,
     pub unk_id: u32,
+    pub mask_id: u32,
 }
 
 impl Vocab {
@@ -19,11 +19,13 @@ impl Vocab {
         let mut id_to_token = Vec::new();
         let pad_id = Self::push_token(&mut token_to_id, &mut id_to_token, "<pad>");
         let unk_id = Self::push_token(&mut token_to_id, &mut id_to_token, "<unk>");
+        let mask_id = Self::push_token(&mut token_to_id, &mut id_to_token, "<mask>");
         Self {
             token_to_id,
             id_to_token,
             pad_id,
             unk_id,
+            mask_id,
         }
     }
 

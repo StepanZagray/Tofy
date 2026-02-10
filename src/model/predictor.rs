@@ -2,11 +2,13 @@ use anyhow::Result;
 use candle_core::{Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
+#[allow(dead_code)]
 pub struct Predictor {
     fc1: nn::Linear,
     fc2: nn::Linear,
 }
 
+#[allow(dead_code)]
 impl Predictor {
     pub fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
         let fc1 = nn::linear(dim, dim, vb.pp("fc1"))?;

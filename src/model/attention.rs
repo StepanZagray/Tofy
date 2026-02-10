@@ -72,7 +72,17 @@ impl MultiHeadAttention {
         let scores = q.matmul(&k_t)?;
         let scores = (scores / self.scale)?;
 
-        // Softmax over last dimension (key positions) - using Candle's softmax
+        Ok(self.attention_scores_to_output(scores, &v, b, t_q)?)
+    }
+
+    fn attention_scores_to_output(
+        &self,
+        scores: Tensor,
+        v: &Tensor,
+        b: usize,
+        t_q: usize,
+    ) -> Result<Tensor> {
+        // Softmax over last dimension (key positions)
         let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
         // Apply attention to values
@@ -119,50 +129,6 @@ impl TransformerBlock {
 
         // Feed-forward with residual
         let normed = self.ln2.forward(&x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
-        Ok((x + ff_out)?)
-    }
-}
-
-/// Transformer decoder block with self-attention AND cross-attention
-pub struct DecoderBlock {
-    self_attn: MultiHeadAttention,
-    cross_attn: MultiHeadAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ln3: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
-}
-
-impl DecoderBlock {
-    pub fn new(vb: VarBuilder<'_>, dim: usize, num_heads: usize, ff_dim: usize) -> Result<Self> {
-        let self_attn = MultiHeadAttention::new(vb.pp("self_attn"), dim, num_heads)?;
-        let cross_attn = MultiHeadAttention::new(vb.pp("cross_attn"), dim, num_heads)?;
-        let ln1 = nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?;
-        let ln3 = nn::layer_norm(dim, 1e-5, vb.pp("ln3"))?;
-        let ff1 = nn::linear(dim, ff_dim, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_dim, dim, vb.pp("ff2"))?;
-
-        Ok(Self { self_attn, cross_attn, ln1, ln2, ln3, ff1, ff2 })
-    }
-
-    /// Forward pass with encoder output for cross-attention
-    pub fn forward(&self, x: &Tensor, encoder_out: &Tensor) -> Result<Tensor> {
-        // Self-attention on decoder sequence
-        let normed = self.ln1.forward(x)?;
-        let self_attn_out = self.self_attn.forward(&normed)?;
-        let x = (x + self_attn_out)?;
-
-        // Cross-attention to encoder output
-        let normed = self.ln2.forward(&x)?;
-        let cross_attn_out = self.cross_attn.forward_cross(&normed, encoder_out)?;
-        let x = (x + cross_attn_out)?;
-
-        // Feed-forward
-        let normed = self.ln3.forward(&x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)

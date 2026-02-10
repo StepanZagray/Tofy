@@ -1,163 +1,211 @@
 # Tofy
 
-A transformer encoder-decoder chatbot implemented in Rust using the Candle ML framework. Tofy uses multi-head self-attention in the encoder and cross-attention in the decoder for sequence-to-sequence conversation generation.
+A transformer encoder–only proof-of-concept in Rust using the Candle ML framework. **Latent-only (JEPA-style)** prediction in embedding space: train with `--latent`, run with `--diff` (L2 and cosine between predicted embedding and user-provided answer). No decoder; designed to run locally (e.g. on an 8GB GPU).
+
+## Modes
+
+| Training | Inference | Output |
+|----------|-----------|--------|
+| `--latent` | `--diff` | L2 distance and cosine similarity between predicted embedding and user-provided answer |
+
+---
+
+## How to run
+
+**Training** = learn from a data file (writes `model_*.safetensors` and `vocab_*.txt`).  
+**Inference** = run a trained model (no learning; you type prompts and see results).
+
+Run `cargo run --release --` with no arguments to print usage (Training vs Inference).
+
+**GPU (CUDA):** The default build enables CUDA so the binary uses an NVIDIA GPU when available. For CPU-only (no NVIDIA GPU/driver), use `cargo run --release --no-default-features --`.
+
+### 1. Prepare data (once)
+
+```bash
+pip install datasets
+python3 scripts/prepare_casual_conversation.py --output data/casual_pairs.txt --min-tokens 2 --lower
+```
+
+### 2. Training
+
+Train to predict in latent space. Saves `model_latent.safetensors` and `vocab_latent.txt`.
+Example below is a ~5M model.
+
+```bash
+cargo run --release -- --latent hub:ag_news 120000 32 272 72 3 8 8000
+```
+
+### 3. Inference (run the model)
+
+Compare phrase vs answer in latent space (type `phrase _ more => answer`, get L2 and cosine).
+
+```bash
+cargo run --release -- --diff model_latent.safetensors vocab_latent.txt 272 72 3 8
+```
+
+Example (copy-paste into the program):
+```
+so how have you _ lately? => been
+```
+
+---
 
 ## Architecture
 
 - **Encoder**: Transformer with self-attention layers
-- **Decoder**: Transformer with self-attention and cross-attention to encoder output
-- **Training**: Full sequence training with teacher forcing
-- **Generation**: Autoregressive text generation with temperature sampling and top-k filtering
+- **Predictor**: Linear dim→dim — predicts embedding at mask; no vocab-sized decoder
 
 ## Project Structure
 
 ```
 src/
-├── main.rs                    # Entry point and training loop
-├── model/                      # Model components
+├── main.rs                    # Entry point: --latent, --latent-from-checkpoint, --diff
+├── model/
 │   ├── attention.rs           # Multi-head attention, transformer blocks
-│   ├── encoder.rs             # Transformer encoder
-│   ├── decoder.rs             # Transformer decoder with cross-attention
+│   ├── encoders/
+│   │   ├── online_encoder.rs  # Online encoder (optimizer-updated)
+│   │   └── teacher_encoder.rs # EMA teacher encoder utilities
 │   ├── vocab.rs               # Vocabulary and tokenization
 │   └── predictor.rs           # (legacy, unused)
-├── chatbot/                    # Chatbot functionality
-│   ├── chatbot.rs             # Chat loop and model loading
-│   └── generation.rs          # Text generation and sampling
-├── data/                       # Data handling
+├── data/
 │   └── data.rs                # Data loading, batching, encoding
-└── config/                     # Configuration
+└── config/
     └── config.rs              # CLI argument parsing
 ```
 
 ## Data Format
 
-Tofy reads a plain text file where each line is a dialogue pair:
+Plain text file, one dialogue pair per line:
 
 ```
 context<TAB>response
 ```
 
-Example:
-```
-hello how are you\tim fine thanks
-```
+Example: `hello how are you\tim fine thanks`
 
-The format also accepts `context|||response`. If there is no separator, the line is split in half by token count (fallback mode).
+Also accepts `context|||response`. For latent training we use **only the left side** (`context`) as a single phrase and ignore the response to avoid duplication. If no separator, the full line is treated as one phrase.
 
-## Cornell Movie Dialogs
+## Casual conversation (Hugging Face)
 
-This repo includes scripts to convert the Cornell Movie Dialogs corpus into the required format.
-
-### Convert Cornell → Training Pairs
+To train on [SohamGhadge/casual-conversation](https://huggingface.co/datasets/SohamGhadge/casual-conversation) (question/answer pairs, ~3.7k rows):
 
 ```bash
-python3 scripts/prepare_cornell.py \
-  --corpus-dir "cornell movie-dialogs" \
-  --output "data/cornell_pairs.txt" \
-  --min-tokens 2 \
-  --lower
+pip install datasets
+python3 scripts/prepare_casual_conversation.py --output data/casual_pairs.txt --min-tokens 2 --lower
 ```
 
-This produces `data/cornell_pairs.txt`, which the Rust trainer expects.
+Then use `data/casual_pairs.txt` as `<data_path>` in the training commands below. The dataset is ~3.7k pairs, so use fewer steps (e.g. 20k–50k).
+
+## Hugging Face Hub datasets (download once)
+
+You can train on a Hugging Face dataset **without Python**: the Rust binary downloads it once via [candle-datasets](https://docs.rs/candle-datasets) / [hf-hub](https://docs.rs/hf-hub), converts parquet to a local text file, and reuses that file on every future run (no re-download).
+
+Use `hub:<dataset_id>` as the first argument to `--latent`. The cache is written under `data/cached_<id>.txt` (e.g. `data/cached_li2017dailydialog_daily_dialog.txt`). Delete that file to force a re-download.
+
+**Example — AG News, ~5M model:**
+
+```bash
+cargo run --release -- --latent hub:ag_news 120000 32 272 72 3 8 8000
+```
+
+Then run inference: `cargo run --release -- --diff model_latent.safetensors vocab_latent.txt 272 72 3 8`
+
+**Example — AG News, ~10M model:**
+
+```bash
+cargo run --release -- --latent hub:ag_news 160000 64 368 72 5 8 5000
+```
+
+Then run inference: `cargo run --release -- --diff model_latent.safetensors vocab_latent.txt 368 72 5 8`
+
+Supported parquet layouts: a row with a **string** column (e.g. `text`) → one line per row; or a **list of strings** column (e.g. `dialog`) → one line per list element. Other schemas are ignored for that row.
+
+ Think of it as a table: each **row** is one record (e.g. one review, one dialogue). Columns might be `text`, `label`, `dialog`, etc. “Parquet rows” = those table rows; we read them one by one and pull out the text column(s).
+
+- **We do save the dataset locally**: The dataset is written to **`data/cached_<id>.txt`** (one phrase per line). That’s your local copy. Every later training run reads from this file; we don’t re-download or re-parse Parquet.
+
+- **How HF caches**: The **hf-hub** crate (same idea as Python’s `huggingface_hub`) keeps a **download cache** on disk, usually `~/.cache/huggingface/hub/`. When we ask for a dataset, hf-hub downloads the Parquet files into that cache (and reuses them on later runs). So:
+  1. **First run with `hub:...`**: hf-hub downloads Parquet into `~/.cache/...` (if not already there) → we read those Parquet files once, convert to text → write **`data/cached_<id>.txt`** → training uses that file.
+  2. **Next runs**: We see **`data/cached_<id>.txt`** exists → we use it directly (no hf-hub call, no Parquet, no network).
+
+So there are two levels: **hf-hub’s cache** (raw Parquet in `~/.cache/...`) and **our cache** (`data/cached_<id>.txt`). We use our cache for training so we never touch the network or Parquet after the first run.
 
 ## Training
 
-The program automatically uses **CUDA(0)** if available, otherwise falls back to CPU.
+**Device:** Commands include `--features cuda`; CUDA(0) is used when available. Omit `--features cuda` for CPU-only if you don't have an NVIDIA GPU.
 
-### Training Command
+### Training arguments (same order for `--latent`)
 
-```bash
-cargo run --release -- <data_path> [steps] [batch] [dim] [max_ctx] [max_tgt] [num_layers] [num_heads]
-```
+See [TRAINING_ARGS_AND_BPE.md](TRAINING_ARGS_AND_BPE.md) for how each argument affects the model, parameter count, and VRAM.
 
-**Arguments:**
-- `data_path`: Path to training data file (tab-separated pairs)
+- `data_path`: Path to training data (tab-separated pairs), or `hub:<dataset_id>` to download once and cache under `data/cached_<id>.txt`
 - `steps`: Number of training steps (default: 10000)
 - `batch`: Batch size (default: 16)
 - `dim`: Embedding dimension (default: 256)
-- `max_ctx`: Maximum context length (default: 64)
-- `max_tgt`: Maximum target length (default: 32)
+- `max_seq`: Maximum sequence length (default: 72)
 - `num_layers`: Number of transformer layers (default: 4)
 - `num_heads`: Number of attention heads (default: 4)
+- `max_vocab`: Maximum vocabulary size (default: 32000)
 
-**Example:**
+---
 
-```bash
-# Quick test (10k steps)
-cargo run --release -- data/cornell_pairs.txt 10000 16 256 64 32 4 4
+### Latent-only training (no decoder, JEPA-style)
 
-# Longer training (500k steps)
-cargo run --release -- data/cornell_pairs.txt 500000 32 256 64 32 4 4
-
-# Larger model (384 dim, 6 layers)
-cargo run --release -- data/cornell_pairs.txt 200000 16 384 64 32 6 6
-```
-
-**Recommended settings for RTX 5060 8GB:**
-- Small: `dim=256, layers=4, heads=4` (~15M params) - fast training
-- Medium: `dim=384, layers=6, heads=6` (~50M params) - better quality
-
-After training, Tofy is saved to `model.safetensors` and vocabulary to `vocab.txt`.
-
-## Chatbot Mode
-
-Run Tofy in interactive chatbot mode:
+Train the model to predict **in embedding space only**: encoder + small predictor (dim→dim). Loss = MSE (pred vs target direction) + sampled softmax over random negatives so the correct token ranks higher at inference. Saves `model_latent.safetensors` and `vocab_latent.txt`.
 
 ```bash
-cargo run --release -- --chat <model_path> <vocab_path> <data_path> [dim] [max_ctx] [num_layers] [num_heads]
+cargo run --release -- --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab]
 ```
 
-**Arguments:**
-- `--chat`: Enable chatbot mode
-- `model_path`: Path to saved model (`model.safetensors`)
-- `vocab_path`: Path to saved vocabulary (`vocab.txt`)
-- `data_path`: Training data path (for reference, not used in generation)
-- `dim`: Model dimension (must match training)
-- `max_ctx`: Max context length (must match training)
-- `num_layers`: Number of layers (must match training)
-- `num_heads`: Number of attention heads (must match training)
-
-**Example:**
+**Example (~5M params):** `dim=272`, `num_layers=3`, `num_heads=8`, `max_vocab=8000`.
 
 ```bash
-cargo run --release -- --chat model.safetensors vocab.txt data/cornell_pairs.txt 256 64 4 4
+cargo run --release -- --latent hub:ag_news 120000 32 272 72 3 8 8000
+cargo run --release -- --diff model_latent.safetensors vocab_latent.txt 272 72 3 8
 ```
 
-Tofy:
-1. Encodes your input using the transformer encoder
-2. Generates a response autoregressively using the decoder with cross-attention
-3. Uses temperature sampling and top-k filtering for diverse outputs
+**Example (~10M params):** `dim=368`, `num_layers=5`, `num_heads=8`, `max_vocab=5000`.
 
-Type `quit` or `exit` to end the chat.
+```bash
+cargo run --release -- --latent hub:ag_news 160000 64 368 72 5 8 5000
+cargo run --release -- --diff model_latent.safetensors vocab_latent.txt 368 72 5 8
+```
 
-## Model Details
+**Run latent diff** (compare prediction vs your answer in latent space):
 
-### Architecture
-- **Multi-head attention**: Uses Candle's built-in primitives (`nn::Linear`, `Tensor::matmul`, `ops::softmax`)
-- **Positional encoding**: Sinusoidal positional encodings
-- **Layer normalization**: Pre-norm architecture for stable training
-- **Feed-forward**: 4x embedding dimension with GELU activation
+```bash
+cargo run --release -- --diff model_latent.safetensors vocab_latent.txt <dim> <max_seq> <num_layers> <num_heads>
+```
 
-### Training
-- **Loss**: Cross-entropy over all target tokens (excluding padding)
-- **Optimizer**: AdamW with learning rate 3e-4
-- **Teacher forcing**: Target sequence shifted right for training
+Then type lines in the form: **`phrase with _ or [MASK] => answer`**, e.g.:
 
-### Generation
-- **Sampling**: Temperature scaling (default: 0.8) with top-k filtering (default: 40)
-- **Autoregressive**: Generates tokens one at a time using previous tokens
+```
+hello _ world => beautiful
+what is your [MASK] => name
+```
+
+The program prints **L2 distance** and **cosine similarity** between the predicted embedding (at the mask) and the embedding of the word you gave as answer. Use **only** a checkpoint from `--latent` training.
+
+**Train vs inference:** (1) The answer token is **stripped from the phrase** before encoding so the model doesn’t see the answer in the input (e.g. `good luck _ with school. => with` runs on `good luck _ school.`). (2) Latent training uses **context-only** when the mask is in the context: the target (response) part of the sequence is replaced with pads, so the model learns to predict from phrase + pads only and matches inference (no response). **You need to retrain** with the current code to get this behaviour; older checkpoints were trained with context||target, so inference (phrase only) didn’t match.
+
+---
+
+**Recommended for RTX 5060 Max-Q 8GB:** Default config above (`dim=512`, `num_layers=6`, `num_heads=8`, `batch=64`, `max_seq=96`, `max_vocab=50k`). If OOM, lower `batch` to 32 or 16, or reduce `dim`/`num_layers`.
+
+## Model details
+
+- **Multi-head attention**: Candle `nn::Linear`, `matmul`, `softmax`
+- **Positional encoding**: Sinusoidal
+- **Layer norm**: Pre-norm
+- **Feed-forward**: 4× embedding dimension, GELU
+- **Optimizer**: AdamW, lr 3e-4
 
 ## Dependencies
 
-- `candle-core` (0.9) with CUDA support
-- `candle-nn` (0.9) with CUDA support
-- `anyhow` for error handling
-- `rand` for sampling
+- `candle-core` (0.9), `candle-nn` (0.9); optional `--features cuda` for GPU (default build is CPU-only)
+- `anyhow`, `rand`
 
 ## Notes
 
-- Tofy uses full sequence training (all tokens), not just the first token
-- Padding tokens are masked during loss calculation
-- The decoder uses cross-attention to attend to the encoder output
-- For best results, train Tofy for 100k-500k steps depending on dataset size
-- Larger models (more layers/heads) generally produce better quality but require more training time
+- Encoder-only (no seq2seq); local proof-of-concept. Use `--diff` with `model_latent.safetensors` and `vocab_latent.txt`.
+- For best results, train for 100k–500k steps depending on data size.
