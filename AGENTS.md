@@ -13,3 +13,7 @@
 ## Validation
 - After code edits, run lint/compile checks when possible.
 - Resolve all errors and warnings.
+
+## Results Tracking
+- Keep `docs/RESULTS.md` up to date.
+- When a better metric is reported, update the "Best So Far" section with the new metric and exact command used.

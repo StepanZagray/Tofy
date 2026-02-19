@@ -30,10 +30,6 @@ impl TeacherEncoder {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.inner.forward(x)
     }
-
-    pub fn embed_tokens(&self, ids: &Tensor) -> Result<Tensor> {
-        self.inner.embed_tokens(ids)
-    }
 }
 
 /// Copy variables that exist in both varmaps from src to dst.

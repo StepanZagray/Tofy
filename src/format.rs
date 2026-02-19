@@ -3,7 +3,6 @@
 /// Parsed user input for inference: "phrase _ more => answer" → tokens, mask position, answer token.
 pub struct FormattedInput {
     pub tokens: Vec<String>,
-    pub mask_pos: usize,
     pub answer_token: String,
 }
 
@@ -13,7 +12,7 @@ pub enum FormatInputError {
     NoMask,
 }
 
-/// Parse a line "phrase _ or [MASK] => answer" into tokens (with <mask>), mask index, and answer token (first word, lowercased, backticks stripped).
+/// Parse a line "phrase _ or [MASK] => answer" into tokens (with <mask>) and answer token (first word, lowercased, backticks stripped).
 pub fn format_user_input(line: &str) -> Result<FormattedInput, FormatInputError> {
     let line = line.trim();
     let (phrase_part, answer_part) = line.split_once("=>").ok_or(FormatInputError::NoSeparator)?;
@@ -31,7 +30,7 @@ pub fn format_user_input(line: &str) -> Result<FormattedInput, FormatInputError>
             tokens.push(w.to_string());
         }
     }
-    let mask_pos = pos.ok_or(FormatInputError::NoMask)?;
+    pos.ok_or(FormatInputError::NoMask)?;
     let answer_token = answer_part
         .split_whitespace()
         .next()
@@ -40,7 +39,6 @@ pub fn format_user_input(line: &str) -> Result<FormattedInput, FormatInputError>
         .to_lowercase();
     Ok(FormattedInput {
         tokens,
-        mask_pos,
         answer_token,
     })
 }

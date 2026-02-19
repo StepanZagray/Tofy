@@ -41,3 +41,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local models (GGUF, etc.)
+models/
+*.gguf

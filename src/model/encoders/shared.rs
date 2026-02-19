@@ -24,12 +24,8 @@ impl EncoderBackbone {
 
         let mut blocks = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let block = TransformerBlock::new(
-                vb.pp(format!("block_{}", i)),
-                dim,
-                num_heads,
-                dim * 4,
-            )?;
+            let block =
+                TransformerBlock::new(vb.pp(format!("block_{}", i)), dim, num_heads, dim * 4)?;
             blocks.push(block);
         }
 
@@ -57,9 +53,5 @@ impl EncoderBackbone {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.forward_sequence(x)?;
         Ok(h.mean(1)?)
-    }
-
-    pub(crate) fn embed_tokens(&self, ids: &Tensor) -> Result<Tensor> {
-        Ok(self.embed.forward(ids)?)
     }
 }

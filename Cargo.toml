@@ -15,3 +15,10 @@ candle-nn = { version = "0.9", default-features = false }
 candle-datasets = "0.9"
 hf-hub = "0.4"
 parquet = "57"
+# OpenAI-compatible HTTP server (--serve)
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -90,10 +90,11 @@ impl MultiHeadAttention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // Reshape back: [B, num_heads, T_q, head_dim] -> [B, T_q, D]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, t_q, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
+            b,
+            t_q,
+            self.num_heads * self.head_dim,
+        ))?;
 
         // Output projection
         Ok(self.out_proj.forward(&attn_output)?)
@@ -117,7 +118,13 @@ impl TransformerBlock {
         let ff1 = nn::linear(dim, ff_dim, vb.pp("ff1"))?;
         let ff2 = nn::linear(ff_dim, dim, vb.pp("ff2"))?;
 
-        Ok(Self { attn, ln1, ln2, ff1, ff2 })
+        Ok(Self {
+            attn,
+            ln1,
+            ln2,
+            ff1,
+            ff2,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -136,9 +143,13 @@ impl TransformerBlock {
 }
 
 /// Sinusoidal positional encoding (fixed, not learned)
-pub fn positional_encoding(seq_len: usize, dim: usize, device: &candle_core::Device) -> Result<Tensor> {
+pub fn positional_encoding(
+    seq_len: usize,
+    dim: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
     let mut pe = vec![0f32; seq_len * dim];
-    
+
     for pos in 0..seq_len {
         for i in 0..dim / 2 {
             let angle = (pos as f64) / (10000f64).powf((2 * i) as f64 / dim as f64);
@@ -146,6 +157,6 @@ pub fn positional_encoding(seq_len: usize, dim: usize, device: &candle_core::Dev
             pe[pos * dim + 2 * i + 1] = angle.cos() as f32;
         }
     }
-    
+
     Ok(Tensor::from_vec(pe, (1, seq_len, dim), device)?)
 }

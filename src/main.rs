@@ -1,18 +1,19 @@
 mod config;
 mod data;
-mod format;
 mod model;
+mod tasks;
 
 use anyhow::{bail, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
-use format::{format_user_input, FormatInputError};
-use rand::Rng;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use config::Config;
-use data::{build_vocab_and_pairs, ensure_hub_dataset_cached, make_latent_batch};
+use data::{
+    build_pairs_with_vocab, build_vocab_and_pairs, ensure_hub_dataset_cached,
+    ensure_hub_wikipedia_cached, make_jepa_batch, prepare_ultrachat_pairs,
+};
 use model::{
     copy_matching_vars, ema_update_matching_vars, OnlineEncoder, Predictor, TeacherEncoder,
 };
@@ -20,9 +21,35 @@ use model::{
 /// Learning rate: linear warmup → constant base_lr → cosine decay to min_lr.
 /// Keeping LR flat for ~25% of training after warmup helps avoid early plateau (e.g. acc_ema stuck by 40k).
 fn scheduled_lr(step: usize, total_steps: usize, base_lr: f64, min_lr: f64) -> f64 {
-    let warmup = (total_steps / 10).min(2000).max(1);
+    scheduled_lr_profile(step, total_steps, base_lr, min_lr, 0.10, 0.25, 2000)
+}
+
+/// EMA decay for teacher: cosine schedule from tau_min to tau_max (modern JEPA practice).
+/// Start with faster teacher updates (lower tau), end with slower (higher tau) for stability.
+fn scheduled_ema_decay(step: usize, total_steps: usize, tau_min: f64, tau_max: f64) -> f64 {
+    if total_steps <= 1 {
+        return tau_max;
+    }
+    let progress = (step as f64 - 1.0) / (total_steps - 1).max(1) as f64;
+    let cos = (std::f64::consts::PI * progress.clamp(0.0, 1.0)).cos();
+    tau_min + 0.5 * (tau_max - tau_min) * (1.0 - cos)
+}
+
+fn scheduled_lr_profile(
+    step: usize,
+    total_steps: usize,
+    base_lr: f64,
+    min_lr: f64,
+    warmup_ratio: f64,
+    flat_ratio_after_warmup: f64,
+    warmup_cap: usize,
+) -> f64 {
+    let warmup = ((total_steps as f64) * warmup_ratio).round().max(1.0) as usize;
+    let warmup = warmup.min(warmup_cap).max(1);
     let post_warmup = total_steps.saturating_sub(warmup);
-    let flat_steps = post_warmup / 4; // constant LR for first 25% of post-warmup steps
+    let flat_steps = ((post_warmup as f64) * flat_ratio_after_warmup)
+        .round()
+        .max(0.0) as usize;
     let decay_start = warmup + flat_steps;
     if step <= warmup {
         base_lr * (step as f64 / warmup as f64)
@@ -38,34 +65,73 @@ fn scheduled_lr(step: usize, total_steps: usize, base_lr: f64, min_lr: f64) -> f
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Latent-space diff: show L2 and cosine between predicted embedding and user-provided answer
-    if args.len() >= 2 && (args[1] == "--diff" || args[1] == "diff") {
-        if args.len() < 4 {
-            bail!("usage: {} --diff <model_path> <vocab_path> [dim] [max_seq] [num_layers] [num_heads]", args[0]);
-        }
-        return run_diff(
+    if args.len() >= 2 && (args[1] == "--prepare-ultrachat" || args[1] == "prepare-ultrachat") {
+        let output = PathBuf::from(
+            args.get(2)
+                .cloned()
+                .unwrap_or_else(|| "data/ultrachat_pairs.txt".to_string()),
+        );
+        let context_window = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(6usize);
+        let min_tokens = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(2usize);
+        let max_rows = args.get(5).and_then(|v| v.parse().ok());
+        let written = prepare_ultrachat_pairs(&output, context_window, min_tokens, max_rows)?;
+        println!(
+            "Prepared UltraChat pairs: {} rows -> {} (context_window={}, min_tokens={})",
+            written,
+            output.display(),
+            context_window,
+            min_tokens
+        );
+        return Ok(());
+    }
+
+    if tasks::world::try_run_train(&args)? {
+        return Ok(());
+    }
+    if tasks::world::try_run_eval(&args)? {
+        return Ok(());
+    }
+    if tasks::world::try_run_infer(&args)? {
+        return Ok(());
+    }
+    if tasks::world::try_run_serve(&args)? {
+        return Ok(());
+    }
+
+    // JEPA-native evaluation (latent alignment + retrieval), no token-id ranking.
+    if args.len() >= 5 && (args[1] == "--eval-jepa" || args[1] == "eval-jepa") {
+        return run_eval_jepa(
             &PathBuf::from(&args[2]),
             &PathBuf::from(&args[3]),
-            args.get(4).and_then(|v| v.parse().ok()).unwrap_or(256),
-            args.get(5).and_then(|v| v.parse().ok()).unwrap_or(96),
-            args.get(6).and_then(|v| v.parse().ok()).unwrap_or(4),
-            args.get(7).and_then(|v| v.parse().ok()).unwrap_or(4),
+            &args[4],
+            args.get(5).and_then(|v| v.parse().ok()).unwrap_or(200),
+            args.get(6).and_then(|v| v.parse().ok()).unwrap_or(32),
+            args.get(7).and_then(|v| v.parse().ok()).unwrap_or(256),
+            args.get(8).and_then(|v| v.parse().ok()).unwrap_or(72),
+            args.get(9).and_then(|v| v.parse().ok()).unwrap_or(4),
+            args.get(10).and_then(|v| v.parse().ok()).unwrap_or(4),
         );
     }
 
-    // Latent-only training (no decoder: predict in embedding space, JEPA-style)
+    // JEPA-style training (predict teacher target-view contextual latents from masked context view)
     if args.len() >= 2 && (args[1] == "--latent" || args[1] == "latent") {
         let data_arg = if args.len() > 2 { &args[2] } else { "" };
-        let args_for_config: Vec<String> = if data_arg.starts_with("hub:") {
+        let (args_for_config, is_wikipedia) = if data_arg.starts_with("hub:") {
             let dataset_id = data_arg.strip_prefix("hub:").unwrap_or(data_arg);
-            let cache_path = ensure_hub_dataset_cached(dataset_id, Path::new("data"))?;
+            let is_wik = dataset_id.to_lowercase().contains("wikipedia");
+            let cache_path = if is_wik {
+                ensure_hub_wikipedia_cached(dataset_id, Path::new("data"))?
+            } else {
+                ensure_hub_dataset_cached(dataset_id, Path::new("data"))?
+            };
             let mut a = args[2..].to_vec();
             a[0] = cache_path.to_string_lossy().to_string();
-            a
+            (a, is_wik)
         } else {
-            args[2..].to_vec()
+            (args[2..].to_vec(), false)
         };
-        let config = Config::from_args_after(&args_for_config)?;
+        let mut config = Config::from_args_after(&args_for_config)?;
+        config.is_paragraph_data = is_wikipedia;
         return run_latent_training(config);
     }
 
@@ -74,8 +140,24 @@ fn main() -> Result<()> {
         && (args[1] == "--latent-from-checkpoint" || args[1] == "latent-from-checkpoint")
     {
         let init_path = PathBuf::from(&args[2]);
-        let mut config = Config::from_args_after(&args[3..])?;
+        let data_arg = if args.len() > 3 { &args[3] } else { "" };
+        let (args_after_data, is_wikipedia) = if data_arg.starts_with("hub:") {
+            let dataset_id = data_arg.strip_prefix("hub:").unwrap_or(data_arg);
+            let is_wik = dataset_id.to_lowercase().contains("wikipedia");
+            let cache_path = if is_wik {
+                ensure_hub_wikipedia_cached(dataset_id, Path::new("data"))?
+            } else {
+                ensure_hub_dataset_cached(dataset_id, Path::new("data"))?
+            };
+            let mut a = args[3..].to_vec();
+            a[0] = cache_path.to_string_lossy().to_string();
+            (a, is_wik)
+        } else {
+            (args[3..].to_vec(), false)
+        };
+        let mut config = Config::from_args_after(&args_after_data)?;
         config.init_encoder_path = Some(init_path);
+        config.is_paragraph_data = is_wikipedia;
         return run_latent_training(config);
     }
 
@@ -83,22 +165,45 @@ fn main() -> Result<()> {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab]",
+        "    {} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio]",
         args[0]
     );
     eprintln!(
         "    {} --latent-from-checkpoint <encoder_checkpoint.safetensors> <data_path> [steps] ...",
         args[0]
     );
-    eprintln!("  Inference (run trained model):");
+    eprintln!("  Evaluation (JEPA-native):");
     eprintln!(
-        "    {} --diff  <model_path> <vocab_path> [dim] [max_seq] [num_layers] [num_heads]",
+        "    {} --eval-jepa <model_path> <vocab_path> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads]",
         args[0]
     );
-    bail!("specify a mode: --latent or --latent-from-checkpoint (training) or --diff (inference)");
+    eprintln!("  World model agent:");
+    eprintln!(
+        "    {} --prepare-ultrachat [output_path] [context_window] [min_tokens] [max_rows]",
+        args[0]
+    );
+    eprintln!(
+        "    {} --train-world <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [bridge_dim] [--lr <float>] [--init-encoder <path>]",
+        args[0]
+    );
+    eprintln!(
+        "    {} --eval-world <model_path> <vocab_path> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [bridge_dim]",
+        args[0]
+    );
+    eprintln!(
+        "    {} --infer-agent <model_path> <vocab_path> <prompt> [dim] [max_seq] [num_layers] [num_heads] [bridge_dim] [max_new_tokens] [--ablate-conditioning]",
+        args[0]
+    );
+    eprintln!(
+        "    {} --serve <model_path> <vocab_path> [bind] [dim] [max_seq] [num_layers] [num_heads] [bridge_dim] [--debug]",
+        args[0]
+    );
+    bail!(
+        "specify a mode: --prepare-ultrachat / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --eval-world / --infer-agent / --serve"
+    );
 }
 
-// --- Latent-only training (no decoder: predict in embedding space, JEPA-style) ---
+// --- JEPA-style latent training ---
 fn run_latent_training(config: Config) -> Result<()> {
     let device = match Device::new_cuda(0) {
         Ok(d) => {
@@ -110,16 +215,25 @@ fn run_latent_training(config: Config) -> Result<()> {
             Device::Cpu
         }
     };
-    let (vocab, pairs, vocab_stats) = build_vocab_and_pairs(&config.data_path, config.max_vocab)?;
+    let min_tokens = if config.is_paragraph_data {
+        Some(1)
+    } else {
+        None
+    };
+    let (vocab, pairs, vocab_stats) =
+        build_vocab_and_pairs(&config.data_path, config.max_vocab, min_tokens)?;
     let vocab_size = vocab.id_to_token.len();
     let seq_len = config.max_seq;
 
     let embed_params = vocab_size * config.dim;
     let block_params =
         config.num_layers * (4 * config.dim * config.dim + 8 * config.dim * config.dim);
-    let predictor_params = 2 * (config.dim * config.dim + config.dim); // 2-layer MLP dim->dim->dim
+    let predictor_hidden = (config.dim / 4).max(32);
+    let predictor_params = 2 * config.dim // ln
+        + (config.dim * predictor_hidden + predictor_hidden) // fc1
+        + (predictor_hidden * config.dim + config.dim); // fc2
     let latent_params = embed_params + block_params + predictor_params;
-    println!("Training (Latent, embedding-space)");
+    println!("Training (JEPA-style latent alignment)");
     if let Some(ref p) = config.init_encoder_path {
         println!("Encoder init: {:?}", p);
     }
@@ -153,7 +267,7 @@ fn run_latent_training(config: Config) -> Result<()> {
         config.num_layers,
         config.num_heads,
     )?;
-    let predictor = Predictor::new(vb.pp("predictor"), config.dim)?;
+    let predictor = Predictor::new(vb.pp("predictor"), config.dim, predictor_hidden)?;
 
     // EMA teacher encoder (target network): no optimizer updates, only EMA from online encoder.
     let mut target_varmap = VarMap::new();
@@ -169,217 +283,138 @@ fn run_latent_training(config: Config) -> Result<()> {
 
     let mut opt = candle_nn::AdamW::new_lr(varmap.all_vars(), config.lr)?;
 
-    let model_path = PathBuf::from("model_latent.safetensors");
-    let mut best_acc_ema = -1.0f32;
-    let mut acc_ema = 0.0f32;
-    const EMA_DECAY: f64 = 0.996;
-    const FULL_VOCAB_EVAL_EVERY: usize = 1000;
-    let all_vocab_ids = Tensor::from_vec(
-        (0..vocab_size as u32).collect::<Vec<_>>(),
-        (vocab_size,),
-        &device,
-    )?;
+    let model_path = PathBuf::from(format!("model_latent_{}.safetensors", format_params(latent_params)));
+    let teacher_path = model_path.with_file_name(format!(
+        "{}_teacher.safetensors",
+        model_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
+    ));
+    let mut best_cos_ema = -1.0f32;
+    let mut cos_ema = 0.0f32;
+    const EMA_TAU_MIN: f64 = 0.996;
+    const EMA_TAU_MAX: f64 = 0.9999;
+
+    println!("JEPA: predictor bottleneck dim→{}→dim, EMA tau {:.3}→{:.4}, VICReg variance + covariance", predictor_hidden, EMA_TAU_MIN, EMA_TAU_MAX);
 
     for step in 1..=config.steps {
-        let (input_ids, mask_positions, target_ids) = make_latent_batch(
+        let (context_ids, target_ids, target_linear_indices) = make_jepa_batch(
             &pairs,
             config.batch_size,
             config.max_seq,
             vocab.pad_id,
             vocab.mask_id,
-            vocab_size,
+            config.max_spans_per_sample,
+            config.max_span_len,
+            config.max_masked_ratio,
             &device,
         )?;
 
-        let hidden = encoder.forward_sequence(&input_ids)?; // [B, T, D]
-        let (b, t, dim) = hidden.dims3()?;
-        let hidden_flat = hidden.reshape((b * t, dim))?;
-        let pos_vec: Vec<u32> = mask_positions.to_vec1()?;
-        let indices: Vec<u32> = (0..b)
-            .map(|i| (i as u32) * (t as u32) + pos_vec[i])
-            .collect();
-        let indices_t = Tensor::from_vec(indices, (b,), &device)?;
-        let hidden_at_mask = hidden_flat.index_select(&indices_t, 0)?; // [B, dim]
-        let pred_embed = predictor.forward(&hidden_at_mask)?; // [B, dim]
+        // Context view: masked target regions.
+        let online_hidden = encoder.forward_sequence(&context_ids)?; // [B, T, D]
+                                                                     // Target view: original tokens through EMA teacher.
+        let teacher_hidden = target_encoder.forward_sequence(&target_ids)?; // [B, T, D]
+        let (b, t, dim) = online_hidden.dims3()?;
+        let online_flat = online_hidden.reshape((b * t, dim))?;
+        let teacher_flat = teacher_hidden.reshape((b * t, dim))?;
 
-        // Stop-grad targets from EMA teacher encoder.
-        let target_embed = target_encoder.embed_tokens(&target_ids)?; // [B, dim]
+        // Gather all target positions across the batch (multi-position JEPA targets).
+        let online_at_targets = online_flat.index_select(&target_linear_indices, 0)?; // [N, D]
+        let target_latents = teacher_flat.index_select(&target_linear_indices, 0)?; // [N, D]
+        let pred_latents = predictor.forward(&online_at_targets)?; // [N, D]
 
-        // L2-normalize so we optimize direction (cosine), not magnitude. Improves alignment at inference.
-        let pred_norm = pred_embed
+        // Normalize for cosine-style alignment.
+        let pred_norm = pred_latents
             .sqr()?
             .sum(1)?
             .unsqueeze(1)?
             .sqrt()?
             .clamp(1e-8, 1e10)?;
-        let pred_unit = (pred_embed.clone() / pred_norm.broadcast_as(pred_embed.shape())?)?;
-        let tgt_norm = target_embed
+        let pred_unit = (pred_latents.clone() / pred_norm.broadcast_as(pred_latents.shape())?)?;
+        let tgt_norm = target_latents
             .sqr()?
             .sum(1)?
             .unsqueeze(1)?
             .sqrt()?
             .clamp(1e-8, 1e10)?;
-        let tgt_unit = (target_embed.clone() / tgt_norm.broadcast_as(target_embed.shape())?)?;
-        let diff = (pred_unit.clone() - tgt_unit.clone())?;
-        let loss_mse = diff.sqr()?.mean_all()?; // MSE on unit vectors = 2 - 2*cos, so we maximize cosine
+        let tgt_unit = (target_latents.clone() / tgt_norm.broadcast_as(target_latents.shape())?)?;
+        let diff = pred_unit.broadcast_sub(&tgt_unit)?;
+        let loss_align = diff.sqr()?.mean_all()?; // MSE on unit vectors = 2 - 2*cos
 
-        // Auxiliary: encourage encoder hidden at mask to point toward target embedding (same space as predictor target).
-        // This helps the encoder put the "answer" direction in the context representation so the predictor can refine it.
-        let hidden_norm = hidden_at_mask
-            .sqr()?
-            .sum(1)?
-            .unsqueeze(1)?
-            .sqrt()?
-            .clamp(1e-8, 1e10)?;
-        let hidden_unit =
-            (hidden_at_mask.clone() / hidden_norm.broadcast_as(hidden_at_mask.shape())?)?;
-        let cos_hidden_tgt = (hidden_unit * tgt_unit.clone())?.sum(1)?; // [B]
-        let loss_aux = (Tensor::from_vec(vec![1.0f32; b], (b,), hidden_at_mask.device())?
-            - cos_hidden_tgt)?
-            .mean_all()?;
+        // Variance regularization (VICReg-style) to reduce representation collapse risk.
+        let pred_mean = pred_unit.mean(0)?;
+        let pred_centered = (pred_unit.clone() - pred_mean.broadcast_as(pred_unit.shape())?)?;
+        let pred_std = pred_centered.sqr()?.mean(0)?.sqrt()?.clamp(1e-6, 1e10)?;
+        let tgt_mean = tgt_unit.mean(0)?;
+        let tgt_centered = (tgt_unit.clone() - tgt_mean.broadcast_as(tgt_unit.shape())?)?;
+        let tgt_std = tgt_centered.sqr()?.mean(0)?.sqrt()?.clamp(1e-6, 1e10)?;
+        let ones = Tensor::from_vec(vec![1.0f32; dim], (dim,), &device)?;
+        let pred_gap = ones.broadcast_sub(&pred_std)?;
+        let tgt_gap = ones.broadcast_sub(&tgt_std)?;
+        let loss_var_pred = pred_gap.relu()?.mean_all()?;
+        let loss_var_tgt = tgt_gap.relu()?.mean_all()?;
+        let loss_var = loss_var_pred.broadcast_add(&loss_var_tgt)?;
 
-        // Sampled softmax loss: rank correct token above random negatives.
-        const NUM_NEG: usize = 32;
-        let target_vec: Vec<u32> = target_ids.to_vec1()?;
-        let mut rng = rand::thread_rng();
-        let mut neg_ids = Vec::with_capacity(b * NUM_NEG);
-        for &t in &target_vec {
-            for _ in 0..NUM_NEG {
-                let mut id = rng.gen_range(0..vocab_size as u32);
-                while id == t {
-                    id = rng.gen_range(0..vocab_size as u32);
-                }
-                neg_ids.push(id);
-            }
-        }
-        let neg_ids_t = Tensor::from_vec(neg_ids, (b * NUM_NEG,), &device)?;
-        let neg_embed = encoder.embed_tokens(&neg_ids_t)?; // [B*N, dim]
-        let neg_norm = neg_embed
-            .sqr()?
-            .sum(1)?
-            .unsqueeze(1)?
-            .sqrt()?
-            .clamp(1e-8, 1e10)?;
-        let neg_unit = (neg_embed.clone() / neg_norm.broadcast_as(neg_embed.shape())?)?
-            .reshape((b, NUM_NEG, config.dim))?; // [B, N, dim]
-        let pred_broadcast = pred_unit.unsqueeze(1)?.broadcast_as(neg_unit.shape())?; // [B, N, dim]
-        let cos_neg = (pred_broadcast * neg_unit)?.sum(2)?; // [B, N]
-        let cos_target = (pred_unit * tgt_unit)?.sum(1)?.unsqueeze(1)?; // [B, 1]
-                                                                        // Lower RANK_TEMP = sharper softmax = stronger gradients to separate correct from negatives (helps full-vocab rank).
-        const RANK_TEMP: f64 = 0.05;
-        let to_cat = [cos_target.clone(), cos_neg.clone()];
-        let logits = Tensor::cat(&to_cat[..], 1)?;
-        let logits = (logits / RANK_TEMP)?;
-        let target_idx = Tensor::from_vec(vec![0u32; b], (b,), &device)?;
-        let loss_rank = candle_nn::loss::cross_entropy(&logits, &target_idx)?;
-        // Loss weights: higher MSE_WEIGHT pushes pred exactly toward target (better full-vocab rank at inference).
-        const MSE_WEIGHT: f64 = 20.0;
-        const RANK_WEIGHT: f64 = 1.0;
-        const AUX_WEIGHT: f64 = 0.1;
-        let loss_mse_w = (loss_mse.clone() / (1.0 / MSE_WEIGHT))?;
-        let loss_rank_w = (loss_rank / (1.0 / RANK_WEIGHT))?;
-        let loss = loss_mse_w.broadcast_add(&loss_rank_w)?;
-        let loss_aux_weighted = (loss_aux.clone() / (1.0 / AUX_WEIGHT))?;
-        let loss = loss.broadcast_add(&loss_aux_weighted)?;
+        // Covariance regularization (VICReg): penalize off-diagonal of cov matrix so dimensions decorrelate.
+        let n_latents = pred_centered.dim(0)?;
+        let n_inv = 1.0 / (n_latents as f64).max(1.0);
+        let pred_cov = pred_centered.transpose(0, 1)?.matmul(&pred_centered)?;
+        let pred_cov = pred_cov.affine(n_inv, 0.0)?;
+        let tgt_cov = tgt_centered.transpose(0, 1)?.matmul(&tgt_centered)?;
+        let tgt_cov = tgt_cov.affine(n_inv, 0.0)?;
+        let eye = Tensor::eye(dim, DType::F32, &device)?;
+        let pred_cov_sq = pred_cov.sqr()?;
+        let tgt_cov_sq = tgt_cov.sqr()?;
+        let pred_diag_sq = pred_cov_sq.broadcast_mul(&eye)?.sum_all()?;
+        let tgt_diag_sq = tgt_cov_sq.broadcast_mul(&eye)?.sum_all()?;
+        let loss_cov_pred = pred_cov_sq.sum_all()?.broadcast_sub(&pred_diag_sq)?;
+        let loss_cov_tgt = tgt_cov_sq.sum_all()?.broadcast_sub(&tgt_diag_sq)?;
+        let loss_cov = loss_cov_pred.broadcast_add(&loss_cov_tgt)?;
+
+        // Weighted JEPA objective: alignment + variance + covariance (full VICReg-style).
+        const ALIGN_WEIGHT: f64 = 1.0;
+        const VAR_WEIGHT: f64 = 0.1;
+        const COV_WEIGHT: f64 = 0.1;
+        let loss_align_w = (loss_align.clone() / (1.0 / ALIGN_WEIGHT))?;
+        let loss_var_w = (loss_var.clone() / (1.0 / VAR_WEIGHT))?;
+        let loss_cov_w = (loss_cov.clone() / (1.0 / COV_WEIGHT))?;
+        let loss = loss_align_w
+            .broadcast_add(&loss_var_w)?
+            .broadcast_add(&loss_cov_w)?;
 
         let lr = scheduled_lr(step, config.steps, config.lr, 1e-5);
+        let ema_tau = scheduled_ema_decay(step, config.steps, EMA_TAU_MIN, EMA_TAU_MAX);
         opt.set_learning_rate(lr);
         opt.backward_step(&loss)?;
-        ema_update_matching_vars(&varmap, &mut target_varmap, EMA_DECAY)?;
+        ema_update_matching_vars(&varmap, &mut target_varmap, ema_tau)?;
 
         if step % config.log_every == 0 {
             let loss_val = loss.to_scalar::<f32>()?;
-            let cos_mean = 1.0 - 0.5 * loss_mse.to_scalar::<f32>()?; // MSE = 2-2*cos => cos = 1 - MSE/2
-            let aux_val = loss_aux.to_scalar::<f32>()?;
+            let align_val = loss_align.to_scalar::<f32>()?;
+            let var_val = loss_var.to_scalar::<f32>()?;
+            let cov_val = loss_cov.to_scalar::<f32>()?;
+            let cos_mean = 1.0 - 0.5 * align_val; // align = 2 - 2*cos
+            cos_ema = 0.95 * cos_ema + 0.05 * cos_mean;
+            let n_targets = target_linear_indices.dims1()?;
 
-            let cos_neg_vec = cos_neg.to_vec2::<f32>()?;
-            let cos_target_vec = cos_target.squeeze(1)?.to_vec1::<f32>()?;
-            let mut correct = 0usize;
-            for (row, &ct) in cos_neg_vec.iter().zip(cos_target_vec.iter()) {
-                let max_neg = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                if ct > max_neg {
-                    correct += 1;
-                }
-            }
-            let acc_neg = if b > 0 {
-                correct as f32 / b as f32
-            } else {
-                0.0
-            };
-            acc_ema = 0.92 * acc_ema + 0.08 * acc_neg;
-            let mut full_eval_suffix = String::new();
-            if step % FULL_VOCAB_EVAL_EVERY == 0 {
-                let all_embeds = encoder.embed_tokens(&all_vocab_ids)?; // [V, D]
-                let all_norm = all_embeds
-                    .sqr()?
-                    .sum(1)?
-                    .unsqueeze(1)?
-                    .sqrt()?
-                    .clamp(1e-8, 1e10)?;
-                let all_unit = (all_embeds.clone() / all_norm.broadcast_as(all_embeds.shape())?)?;
-                let scores = pred_unit.matmul(&all_unit.transpose(0, 1)?)?; // [B, V]
-                let scores_vec = scores.to_vec2::<f32>()?;
-                let target_vec = target_ids.to_vec1::<u32>()?;
-                let mut top1 = 0usize;
-                let mut top10 = 0usize;
-                let mut rank_sum = 0usize;
-                for (row, &target_id) in scores_vec.iter().zip(target_vec.iter()) {
-                    let target_idx = target_id as usize;
-                    if target_idx >= row.len() {
-                        continue;
-                    }
-                    let target_score = row[target_idx];
-                    let mut gt_count = 0usize;
-                    let mut best_idx = 0usize;
-                    let mut best_score = f32::NEG_INFINITY;
-                    for (j, &s) in row.iter().enumerate() {
-                        if s > best_score {
-                            best_score = s;
-                            best_idx = j;
-                        }
-                        if s > target_score {
-                            gt_count += 1;
-                        }
-                    }
-                    let rank_1based = gt_count + 1;
-                    rank_sum += rank_1based;
-                    if best_idx == target_idx {
-                        top1 += 1;
-                    }
-                    if rank_1based <= 10 {
-                        top10 += 1;
-                    }
-                }
-                let denom = if b > 0 { b } else { 1 };
-                let full_top1 = top1 as f32 / denom as f32;
-                let full_top10 = top10 as f32 / denom as f32;
-                let mean_rank = rank_sum as f32 / denom as f32;
-                full_eval_suffix = format!(
-                    " full_top1 {full_top1:.3} full_top10 {full_top10:.3} mean_rank {mean_rank:.1}"
-                );
-            }
-
-            if acc_ema > best_acc_ema {
-                best_acc_ema = acc_ema;
+            if cos_ema > best_cos_ema {
+                best_cos_ema = cos_ema;
                 varmap.save(&model_path)?;
+                target_varmap.save(&teacher_path)?;
                 println!(
-                    "step {step}/{} loss {loss_val:.4} cos_mean {cos_mean:.4} aux {aux_val:.4} acc_neg {acc_neg:.3} acc_ema {acc_ema:.3} [saved best] lr {lr:.2e}{}",
-                    config.steps,
-                    full_eval_suffix
+                    "step {step}/{} loss {loss_val:.4} align {align_val:.4} var {var_val:.4} cov {cov_val:.4} cos_mean {cos_mean:.4} cos_ema {cos_ema:.4} targets {n_targets} [saved best] lr {lr:.2e}",
+                    config.steps
                 );
             } else {
                 println!(
-                    "step {step}/{} loss {loss_val:.4} cos_mean {cos_mean:.4} aux {aux_val:.4} acc_neg {acc_neg:.3} acc_ema {acc_ema:.3} lr {lr:.2e}{}",
-                    config.steps,
-                    full_eval_suffix
+                    "step {step}/{} loss {loss_val:.4} align {align_val:.4} var {var_val:.4} cov {cov_val:.4} cos_mean {cos_mean:.4} cos_ema {cos_ema:.4} targets {n_targets} lr {lr:.2e}",
+                    config.steps
                 );
             }
         }
     }
 
     println!(
-        "Best model saved to {:?} (acc_ema {:.3})",
-        model_path, best_acc_ema
+        "Best model saved to {:?} and teacher to {:?} (cos_ema {:.4})",
+        model_path, teacher_path, best_cos_ema
     );
 
     let vocab_path = PathBuf::from("vocab_latent.txt");
@@ -390,9 +425,10 @@ fn run_latent_training(config: Config) -> Result<()> {
     }
     fs::write(&vocab_path, vocab_text)?;
     println!("Vocab saved to {:?}", vocab_path);
-    println!("\nTo compare prediction vs answer in latent space:");
+    println!("\nTo run JEPA-native evaluation:");
     println!(
-        "  cargo run --release -- --diff model_latent.safetensors vocab_latent.txt {} {} {} {}",
+        "  cargo run --release -- --eval-jepa {} vocab_latent.txt <data_path|hub:dataset_id> 200 32 {} {} {} {}",
+        model_path.display(),
         config.dim, seq_len, config.num_layers, config.num_heads
     );
     Ok(())
@@ -412,23 +448,7 @@ fn format_params(n: usize) -> String {
     }
 }
 
-// --- Latent diff: show L2 and cosine between predicted embedding and user-provided answer ---
-#[allow(non_snake_case)] // Option::None in match arms triggers false-positive
-fn run_diff(
-    model_path: &PathBuf,
-    vocab_path: &PathBuf,
-    dim: usize,
-    max_seq: usize,
-    num_layers: usize,
-    num_heads: usize,
-) -> Result<()> {
-    use std::io::{self, BufRead, Write};
-
-    let device = match Device::new_cuda(0) {
-        Ok(d) => d,
-        Err(_) => Device::Cpu,
-    };
-
+fn load_vocab_from_file(vocab_path: &PathBuf) -> Result<model::Vocab> {
     let vocab_text = fs::read_to_string(vocab_path)?;
     let mut vocab = model::Vocab::new();
     for line in vocab_text.lines() {
@@ -437,172 +457,211 @@ fn run_diff(
         }
         vocab.add_token(line);
     }
+    Ok(vocab)
+}
+
+fn resolve_data_path(data_arg: &str) -> Result<PathBuf> {
+    if data_arg.starts_with("hub:") {
+        let dataset_id = data_arg.strip_prefix("hub:").unwrap_or(data_arg);
+        if dataset_id.to_lowercase().contains("wikipedia") {
+            ensure_hub_wikipedia_cached(dataset_id, Path::new("data"))
+        } else {
+            ensure_hub_dataset_cached(dataset_id, Path::new("data"))
+        }
+    } else {
+        Ok(PathBuf::from(data_arg))
+    }
+}
+
+// JEPA-native evaluation:
+// - latent alignment (cosine/L2) on held-out target regions
+// - in-batch latent retrieval (Top-1 / Top-5 / MRR)
+fn run_eval_jepa(
+    model_path: &PathBuf,
+    vocab_path: &PathBuf,
+    data_arg: &str,
+    eval_steps: usize,
+    batch_size: usize,
+    dim: usize,
+    max_seq: usize,
+    num_layers: usize,
+    num_heads: usize,
+) -> Result<()> {
+    let device = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => Device::Cpu,
+    };
+
+    let vocab = load_vocab_from_file(vocab_path)?;
+    let data_path = resolve_data_path(data_arg)?;
+    let pairs = build_pairs_with_vocab(&data_path, &vocab)?;
+
+    let teacher_path = model_path.with_file_name(format!(
+        "{}_teacher.safetensors",
+        model_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
+    ));
+    let use_teacher = teacher_path.exists();
 
     let mut varmap = VarMap::new();
     varmap.load(model_path)?;
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
     let vocab_size = vocab.id_to_token.len();
+    let predictor_hidden = (dim / 4).max(32);
     let encoder = OnlineEncoder::new(vb.pp("encoder"), vocab_size, dim, num_layers, num_heads)?;
-    let predictor = Predictor::new(vb.pp("predictor"), dim)?;
+    let predictor = Predictor::new(vb.pp("predictor"), dim, predictor_hidden)?;
+
+    let teacher_encoder = if use_teacher {
+        let mut teacher_varmap = VarMap::new();
+        teacher_varmap.load(&teacher_path)?;
+        let teacher_vb = VarBuilder::from_varmap(&teacher_varmap, DType::F32, &device);
+        Some(TeacherEncoder::new(
+            teacher_vb.pp("encoder"),
+            vocab_size,
+            dim,
+            num_layers,
+            num_heads,
+        )?)
+    } else {
+        None
+    };
 
     let embed_params = vocab_size * dim;
     let block_params = num_layers * (4 * dim * dim + 8 * dim * dim);
-    let predictor_params = 2 * (dim * dim + dim); // 2-layer MLP
+    let predictor_params = 2 * dim
+        + (dim * predictor_hidden + predictor_hidden)
+        + (predictor_hidden * dim + dim);
     let total_params = embed_params + block_params + predictor_params;
+
+    println!("JEPA evaluation");
+    println!("model: {:?}", model_path);
+    if use_teacher {
+        println!("teacher: {:?} (target view uses teacher, matches training)", teacher_path);
+    } else {
+        println!("teacher: not found (target view uses same encoder; metrics may be low)");
+    }
+    println!("data: {:?}", data_path);
+    println!("pairs: {}", pairs.len());
     println!(
-        "Model: ~{} [embed {} + blocks {} + predictor {}]",
+        "model size: ~{} [embed {} + blocks {} + predictor {}]",
         format_params(total_params),
         format_params(embed_params),
         format_params(block_params),
         format_params(predictor_params),
     );
-    println!("Inference (latent diff): phrase _ more => answer (empty line to quit)\n");
+    println!(
+        "eval config: steps={} batch={} dim={} max_seq={} layers={} heads={}",
+        eval_steps, batch_size, dim, max_seq, num_layers, num_heads
+    );
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?.trim().to_string();
-        if line.is_empty() {
-            break;
-        }
-        let input = match format_user_input(&line) {
-            Ok(i) => i,
-            Err(FormatInputError::NoSeparator) => {
-                println!(
-                    "(use => to separate phrase from answer, e.g. hello _ world => beautiful)\n"
-                );
-                continue;
-            }
-            Err(FormatInputError::NoMask) => {
-                println!("(no _ or [MASK] found in phrase)\n");
-                continue;
-            }
-        };
-        let answer_token = input.answer_token.clone();
-        let answer_id = match vocab.token_to_id.get(&answer_token) {
-            Some(&id) => id,
-            None => {
-                println!("(answer token '{}' not in vocab)\n", answer_token);
-                continue;
-            }
-        };
+    let mut n_total: usize = 0;
+    let mut sum_cos: f64 = 0.0;
+    let mut sum_l2: f64 = 0.0;
+    let mut sum_rank: f64 = 0.0;
+    let mut sum_rr: f64 = 0.0;
+    let mut top1: usize = 0;
+    let mut top5: usize = 0;
 
-        // Train/inference parity: when the mask is at position P, the input at P is [MASK], so
-        // the true token is not in the sequence there. The model was trained to predict from
-        // context like [good, luck, MASK, school., ...] (right context = "school."). If we feed
-        // [good, luck, MASK, with, school.], right context differs. Strip the answer from the
-        // phrase so encoder input matches training.
-        let tokens: Vec<String> = input
-            .tokens
-            .into_iter()
-            .filter(|t| t != &answer_token)
-            .collect();
-        let mask_pos = match tokens.iter().position(|t| t == "<mask>") {
-            Some(p) => p,
-            None => {
-                println!("(no mask in phrase after removing answer)\n");
-                continue;
-            }
-        };
-
-        let mut ids = vocab.encode(&tokens);
-        // Must match training: one phrase sequence padded/truncated to max_seq.
-        if ids.len() > max_seq {
-            ids.truncate(max_seq);
-        }
-        while ids.len() < max_seq {
-            ids.push(vocab.pad_id);
-        }
-        let seq_len = max_seq;
-
-        let input_t = Tensor::from_vec(ids.clone(), (1, seq_len), &device)?;
-        let hidden = encoder.forward_sequence(&input_t)?;
-        let hidden_at_mask = hidden.narrow(1, mask_pos, 1)?; // [1, 1, dim]
-        let pred_embed = predictor.forward(&hidden_at_mask)?; // [1, 1, dim] -> squeeze to [dim]
-        let pred_embed = pred_embed.squeeze(0)?.squeeze(0)?; // [dim]
-
-        let answer_ids = Tensor::from_vec(vec![answer_id], (1,), &device)?;
-        let answer_embed = encoder.embed_tokens(&answer_ids)?.squeeze(0)?; // [dim]
-
-        // Normalize to unit vectors (same as training objective) so L2 and cosine are comparable
-        let norm_p = pred_embed
-            .sqr()?
-            .sum_all()?
-            .to_scalar::<f32>()?
-            .sqrt()
-            .max(1e-8);
-        let norm_p_t =
-            Tensor::from_vec(vec![norm_p], (1,), &device)?.broadcast_as(pred_embed.shape())?;
-        let pred_unit = (pred_embed.clone() / norm_p_t)?;
-        let norm_a = answer_embed
-            .sqr()?
-            .sum_all()?
-            .to_scalar::<f32>()?
-            .sqrt()
-            .max(1e-8);
-        let norm_a_t =
-            Tensor::from_vec(vec![norm_a], (1,), &device)?.broadcast_as(answer_embed.shape())?;
-        let answer_unit = (answer_embed.clone() / norm_a_t)?;
-
-        let cos = (pred_unit.clone() * answer_unit.clone())?
-            .sum_all()?
-            .to_scalar::<f32>()?;
-        let l2_unit = (pred_unit.clone() - answer_unit)?
-            .sqr()?
-            .sum_all()?
-            .to_scalar::<f32>()?
-            .sqrt(); // sqrt(2-2*cos) for unit vectors
-
-        // Top-5 nearest tokens in latent space (cosine); Candle has no topk, so we sort in Rust
-        let vocab_size = vocab.id_to_token.len();
-        let all_ids = Tensor::from_vec(
-            (0..vocab_size as u32).collect::<Vec<_>>(),
-            (vocab_size,),
+    const EVAL_MAX_SPANS: usize = 3;
+    const EVAL_MAX_SPAN_LEN: usize = 32;
+    const EVAL_MAX_MASKED_RATIO: f64 = 0.25;
+    for _ in 0..eval_steps {
+        let (context_ids, target_ids, target_linear_indices) = make_jepa_batch(
+            &pairs,
+            batch_size,
+            max_seq,
+            vocab.pad_id,
+            vocab.mask_id,
+            EVAL_MAX_SPANS,
+            EVAL_MAX_SPAN_LEN,
+            EVAL_MAX_MASKED_RATIO,
             &device,
         )?;
-        let all_embeds = encoder.embed_tokens(&all_ids)?; // [V, dim]
-        let row_norm = all_embeds
+
+        let online_hidden = encoder.forward_sequence(&context_ids)?; // [B, T, D]
+        let target_hidden = match &teacher_encoder {
+            Some(te) => te.forward_sequence(&target_ids)?, // target view: teacher (matches training)
+            None => encoder.forward_sequence(&target_ids)?,
+        };
+        let (b, t, d) = online_hidden.dims3()?;
+        let online_flat = online_hidden.reshape((b * t, d))?;
+        let target_flat = target_hidden.reshape((b * t, d))?;
+
+        let online_at_targets = online_flat.index_select(&target_linear_indices, 0)?; // [N, D]
+        let target_latents = target_flat.index_select(&target_linear_indices, 0)?; // [N, D]
+        let pred_latents = predictor.forward(&online_at_targets)?; // [N, D]
+
+        let pred_norm = pred_latents
             .sqr()?
             .sum(1)?
             .unsqueeze(1)?
             .sqrt()?
             .clamp(1e-8, 1e10)?;
-        let all_unit = (all_embeds.clone() / row_norm.broadcast_as(all_embeds.shape())?)?;
-        let cos_scores = all_unit.matmul(&pred_unit.unsqueeze(1)?)?.squeeze(1)?; // [V]
-        let scores_vec: Vec<f32> = cos_scores.to_vec1::<f32>()?;
-        let mut indexed: Vec<(usize, f32)> = (0..vocab_size).zip(scores_vec).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let answer_idx: usize = answer_id.try_into().unwrap_or(0);
-        let rank_1based = match indexed.iter().position(|&(i, _)| i == answer_idx) {
-            Some(p) => p + 1,
-            None => 0usize,
-        };
-        let top_tokens: Vec<String> = indexed
-            .iter()
-            .take(5)
-            .map(|&(i, _)| {
-                vocab
-                    .id_to_token
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| "?".to_string())
-            })
-            .collect();
+        let pred_unit = (pred_latents.clone() / pred_norm.broadcast_as(pred_latents.shape())?)?;
+        let tgt_norm = target_latents
+            .sqr()?
+            .sum(1)?
+            .unsqueeze(1)?
+            .sqrt()?
+            .clamp(1e-8, 1e10)?;
+        let tgt_unit = (target_latents.clone() / tgt_norm.broadcast_as(target_latents.shape())?)?;
 
-        println!(
-            "  L2 (unit): {:.4}  cosine: {:.4}  (1.0 = perfect alignment)",
-            l2_unit, cos
-        );
-        println!(
-            "  Top-5 nearest: {}  (your answer \"{}\" rank: {}/{} cos: {:.4})\n",
-            top_tokens.join(", "),
-            &answer_token,
-            rank_1based,
-            vocab_size,
-            cos
-        );
-        stdout.flush()?;
+        let cos_vec = (pred_unit.clone() * tgt_unit.clone())?.sum(1)?; // [N]
+        let l2_vec = pred_unit
+            .clone()
+            .broadcast_sub(&tgt_unit)?
+            .sqr()?
+            .sum(1)?
+            .sqrt()?; // [N]
+        let cos_vals = cos_vec.to_vec1::<f32>()?;
+        let l2_vals = l2_vec.to_vec1::<f32>()?;
+        let n = cos_vals.len();
+        n_total += n;
+        sum_cos += cos_vals.iter().map(|&v| v as f64).sum::<f64>();
+        sum_l2 += l2_vals.iter().map(|&v| v as f64).sum::<f64>();
+
+        // In-batch latent retrieval:
+        // For each predicted latent i, rank all target latents j by cosine(pred_i, target_j).
+        // Correct match is diagonal j=i.
+        let scores = pred_unit
+            .clone()
+            .matmul(&tgt_unit.clone().transpose(0, 1)?)?; // [N, N]
+        let scores_vec = scores.to_vec2::<f32>()?;
+        for (i, row) in scores_vec.iter().enumerate() {
+            if i >= row.len() {
+                continue;
+            }
+            let target_score = row[i];
+            let mut gt_count = 0usize;
+            for &s in row {
+                if s > target_score {
+                    gt_count += 1;
+                }
+            }
+            let rank = gt_count + 1;
+            sum_rank += rank as f64;
+            sum_rr += 1.0 / rank as f64;
+            if rank == 1 {
+                top1 += 1;
+            }
+            if rank <= 5 {
+                top5 += 1;
+            }
+        }
     }
+
+    if n_total == 0 {
+        bail!("evaluation produced zero targets");
+    }
+
+    let denom = n_total as f64;
+    println!("\nJEPA metrics over {} targets:", n_total);
+    println!("  cosine_mean: {:.4}", sum_cos / denom);
+    println!("  l2_mean:     {:.4}", sum_l2 / denom);
+    println!("  retrieval_top1: {:.4}", top1 as f64 / denom);
+    println!("  retrieval_top5: {:.4}", top5 as f64 / denom);
+    println!("  retrieval_mrr:  {:.4}", sum_rr / denom);
+    println!("  mean_rank:      {:.2}", sum_rank / denom);
     Ok(())
 }
+
