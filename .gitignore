@@ -1,0 +1,50 @@
+# Rust
+/target/
+Cargo.lock
+
+# Locally trained models and vocabs (encoder, world, code/text decoders)
+local_models/
+
+# Model files (legacy / other)
+*.safetensors
+*.pt
+*.bin
+*.onnx
+
+# Vocab/tokenizer files (generated, if not under local_models)
+vocab.txt
+vocab_*.txt
+
+# Data files
+data/*.txt
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Downloaded GGUF decoders (optional; use local_models for trained weights)
+models/
+*.gguf
