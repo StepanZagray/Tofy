@@ -10,7 +10,9 @@ Formats and paths for JEPA, world model, and decoder training. See [RUNBOOK.md](
 
 ## World model and decoder
 
-- **Format:** `context<TAB>next_turn` (tab-separated). Also supported: `context|||next_turn`. Both sides are used; action is fixed to `reply`.
+- **Format:** `context<TAB>next_turn` (tab-separated). Also supported: `context|||next_turn`.
+- **Explicit action labels:** `context<TAB>next_turn<TAB>action` is also supported, where `action` is one of `text_reply`, `code`, or `done`.
+- **Implicit action labels:** if the third field is absent, the repo falls back to the heuristic classifier on `next_turn`.
 - **Prepare from UltraChat:** `--prepare-ultrachat` produces this format from Hugging Face UltraChat (see [RUNBOOK.md](RUNBOOK.md)).
 - **Code:** Use `context<TAB>completion` pairs (e.g. from [CODE_DATA.md](CODE_DATA.md)).
 
@@ -28,7 +30,7 @@ For Q&A or expert-style pairs (e.g. SciQ, SQuAD), use a script to produce `conte
 ```bash
 pip install datasets
 python scripts/prepare_expert_pairs.py --dataset sciq --output data/sciq_pairs.txt
-cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/sciq_pairs.txt 40000 32 768 128 6 8 256 64 --lambda 0.2
+cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/sciq_pairs.txt 40000 32 768 256 9 8 256 64 --lambda 0.2
 ```
 
 If `prepare_expert_pairs.py` is not in the repo, you can build pairs manually: one line per pair, `context\tnext_turn`, and use that file with `--train-world` and `--train-decoder` as in the [RUNBOOK](RUNBOOK.md).

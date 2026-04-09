@@ -60,6 +60,21 @@ impl Vocab {
     }
 }
 
+pub fn vocab_signature(vocab: &Vocab) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for token in &vocab.id_to_token {
+        for byte in token.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= u64::from(b'\n');
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// Load vocab from a file (one token per line).
 pub fn load_vocab_from_file(vocab_path: impl AsRef<Path>) -> Result<Vocab> {
     let vocab_text = fs::read_to_string(vocab_path.as_ref())?;
@@ -85,4 +100,28 @@ pub fn save_vocab_to_file(vocab: &Vocab, vocab_path: impl AsRef<Path>) -> Result
     }
     fs::write(path, vocab_text)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{vocab_signature, Vocab};
+
+    #[test]
+    fn vocab_signature_is_stable_for_same_vocab() {
+        let mut vocab = Vocab::new();
+        vocab.add_token("hello");
+        vocab.add_token("world");
+        let sig_a = vocab_signature(&vocab);
+        let sig_b = vocab_signature(&vocab);
+        assert_eq!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn vocab_signature_changes_when_vocab_changes() {
+        let mut vocab_a = Vocab::new();
+        vocab_a.add_token("hello");
+        let mut vocab_b = vocab_a.clone();
+        vocab_b.add_token("world");
+        assert_ne!(vocab_signature(&vocab_a), vocab_signature(&vocab_b));
+    }
 }

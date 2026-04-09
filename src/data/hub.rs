@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// Sanitize dataset id for use in a filename (e.g. "org/name" -> "org_name").
 fn sanitize_dataset_id(id: &str) -> String {
-    id.replace('/', "_").replace('\\', "_")
+    id.replace(['/', '\\'], "_")
 }
 
 /// Minimum character length for a paragraph to be written (avoids junk fragments).
@@ -25,9 +25,7 @@ const PARQUET_REVISION: &str = "refs/convert/parquet";
 const ULTRACHAT_DATASET_ID: &str = "HuggingFaceH4/ultrachat_200k";
 
 /// List English Wikipedia parquet filenames (Hub API only, no parquet download). Returns (sorted filenames, count).
-fn wikipedia_english_parquet_list(
-    api: &hf_hub::api::sync::Api,
-) -> Result<(Vec<String>, usize)> {
+fn wikipedia_english_parquet_list(api: &hf_hub::api::sync::Api) -> Result<(Vec<String>, usize)> {
     use hf_hub::{Repo, RepoType};
 
     let repo = Repo::with_revision(
@@ -214,19 +212,17 @@ pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result
 
 /// Extract article text from row (longest string field), split by `\n\n`, write each
 /// non-empty paragraph as one line.
-fn write_paragraphs_from_row<W: Write>(
-    row: &parquet::record::Row,
-    w: &mut W,
-) -> Result<usize> {
+fn write_paragraphs_from_row<W: Write>(row: &parquet::record::Row, w: &mut W) -> Result<usize> {
     let mut best: Option<&str> = None;
     let n = row.len();
     for i in 0..n {
         if let Ok(s) = row.get_string(i) {
             let s = s.trim();
-            if s.len() >= MIN_PARAGRAPH_CHARS && s.len() <= MAX_PARAGRAPH_CHARS {
-                if best.map(|b| b.len() < s.len()).unwrap_or(true) {
-                    best = Some(s);
-                }
+            if s.len() >= MIN_PARAGRAPH_CHARS
+                && s.len() <= MAX_PARAGRAPH_CHARS
+                && best.map(|b| b.len() < s.len()).unwrap_or(true)
+            {
+                best = Some(s);
             }
         }
     }
@@ -347,15 +343,28 @@ pub fn prepare_ultrachat_pairs(
                     }
                 }
             }
-
         }
     }
     out.flush().context("flush output")?;
     Ok(written)
 }
 
+fn escape_pair_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.trim().chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            '\t' => out.push_str("    "),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn sanitize_field(s: &str) -> String {
-    s.trim().replace('\t', " ")
+    escape_pair_field(s)
 }
 
 fn extract_turns_from_row(row: &parquet::record::Row) -> Option<Vec<(String, String)>> {
@@ -397,8 +406,7 @@ fn extract_turn_from_group(group: &parquet::record::Row) -> Option<(String, Stri
             role = Some("assistant".to_string());
             continue;
         }
-        if role.is_none() && matches!(low.as_str(), "user" | "human" | "prompt" | "instruction")
-        {
+        if role.is_none() && matches!(low.as_str(), "user" | "human" | "prompt" | "instruction") {
             role = Some("user".to_string());
             continue;
         }

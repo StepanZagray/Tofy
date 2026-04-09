@@ -3,6 +3,19 @@ import argparse
 from pathlib import Path
 
 
+def unescape_pair_field(text: str) -> str:
+    return (
+        text.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\\\", "\\")
+    )
+
+
+def flatten_for_encoder(text: str) -> str:
+    return " ".join(unescape_pair_field(text).split())
+
+
 def iter_lines(path: Path):
     with path.open("r", encoding="utf-8") as handle:
         for raw in handle:
@@ -12,18 +25,18 @@ def iter_lines(path: Path):
             if "\t" in line:
                 left, right = line.split("\t", 1)
                 if left.strip():
-                    yield left.strip()
+                    yield flatten_for_encoder(left.strip())
                 if right.strip():
-                    yield right.strip()
+                    yield flatten_for_encoder(right.strip())
                 continue
             if "|||" in line:
                 left, right = line.split("|||", 1)
                 if left.strip():
-                    yield left.strip()
+                    yield flatten_for_encoder(left.strip())
                 if right.strip():
-                    yield right.strip()
+                    yield flatten_for_encoder(right.strip())
                 continue
-            yield line
+            yield flatten_for_encoder(line)
 
 
 def main() -> None:

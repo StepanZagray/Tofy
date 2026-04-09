@@ -7,8 +7,8 @@ Decoder backends and env vars for `--serve`. The server picks the decoder by act
 | Backend | Use case | Env vars |
 |--------|----------|----------|
 | **GGUF (llama.cpp)** | General text/code via a GGUF model | `JEPA_DECODER_MODEL`, optional: `JEPA_DECODER_BIN`, `JEPA_DECODER_CTX`, `JEPA_DECODER_NGL`, `JEPA_DECODER_TEMP`, `JEPA_DECODER_REPEAT_PENALTY` |
-| **Candle codeDecoder** | In-repo code-specialist decoder | `JEPA_USE_CANDLE_DECODER=1`, `JEPA_CANDLE_DECODER=<path>`, optional `JEPA_CANDLE_DECODER_VOCAB=<path>`, optional `JEPA_DECODER_TEMP` |
-| **Candle textDecoder** | In-repo text-generalist decoder | `JEPA_USE_TEXT_DECODER=1`, `JEPA_TEXT_DECODER=<path>`, optional `JEPA_TEXT_DECODER_VOCAB=<path>`, optional `JEPA_TEXT_DECODER_TEMP` |
+| **Candle codeDecoder** | In-repo code-specialist decoder | `JEPA_USE_CANDLE_DECODER=1`, `JEPA_CANDLE_DECODER=<path>`, optional `JEPA_CANDLE_DECODER_VOCAB=<path>`, optional `JEPA_DECODER_TEMP`, `JEPA_DECODER_REPEAT_PENALTY`, `JEPA_DECODER_REPEAT_LAST_N`, `JEPA_DECODER_TOP_K`, `JEPA_DECODER_TOP_P`, `JEPA_CANDLE_DECODER_CTX` |
+| **Candle textDecoder** | In-repo text-generalist decoder | `JEPA_USE_TEXT_DECODER=1`, `JEPA_TEXT_DECODER=<path>`, optional `JEPA_TEXT_DECODER_VOCAB=<path>`, optional `JEPA_TEXT_DECODER_TEMP`, `JEPA_DECODER_REPEAT_PENALTY`, `JEPA_DECODER_REPEAT_LAST_N`, `JEPA_DECODER_TOP_K`, `JEPA_DECODER_TOP_P`, `JEPA_CANDLE_DECODER_CTX` |
 
 You can use GGUF only, Candle only, or both; the server chooses the decoder from the prompt/action.
 
@@ -40,3 +40,18 @@ At serve time, the server loads:
 - selected decoder checkpoint + decoder vocab
 
 If a decoder vocab env var is not set explicitly, Tofy looks for a sibling `.vocab.txt` file next to the decoder checkpoint.
+
+Additional Candle decoding controls:
+
+- **`JEPA_DECODER_REPEAT_PENALTY`** — Repetition penalty applied over recent generated/prompt tokens. Default: code `1.12`, text `1.08`.
+- **`JEPA_DECODER_REPEAT_LAST_N`** — Number of recent tokens to consider for repetition penalty. Default: code `160`, text `96`.
+- **`JEPA_DECODER_TOP_K`** — Keep only the top-k logits before sampling. Default: code `40`, text `0`.
+- **`JEPA_DECODER_TOP_P`** — Nucleus sampling cutoff. Default: code `0.92`, text `1.0`.
+- **`JEPA_CANDLE_DECODER_CTX`** — Maximum prompt tokens kept by the Candle runtime before generation.
+
+The Candle path now uses:
+
+- batched prompt prefill over the full prompt once before incremental decode
+- incremental self-attention KV cache
+- precomputed cross-attention K/V for the fixed planner/world latent
+- repeat penalty and optional top-k/top-p sampling controls

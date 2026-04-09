@@ -6,11 +6,143 @@ Current stack:
 
 `encoder -> planner memory -> router/orchestrator -> decoder-specific adapter -> decoder`
 
+## How Context Works
+
+In this project, "context" means three different things:
+
+1. **Conversation context at runtime**
+2. **Training-pair context in dataset rows**
+3. **Decoder autoregressive context during generation**
+
+They are related, but they are not the same object.
+
+### 1. Conversation context at runtime
+
+When serving, the API takes the full `messages` array and turns it into one prompt string:
+
+- `System: ...`
+- `User: ...`
+- `Assistant: ...`
+
+So the encoder sees the whole conversation text, not only the last user turn.
+
+Important detail: the encoder still has a per-forward-pass window of `max_seq`, but runtime context no longer has to be a pure hard truncation. The current serve/eval path can retain multiple encoder segments:
+
+- the newest segment keeps full token-level encoder memory
+- older segments are re-encoded one segment at a time and compressed into chunk/global/planner summaries
+- the planner then attends over the concatenation of compressed older memory and full recent memory
+
+So the runtime path keeps up to `TOFY_ENCODER_CONTEXT_SEGMENTS * max_seq` encoder tokens, with only the newest `TOFY_ENCODER_RECENT_FULL_SEGMENTS` segments preserved at full token resolution.
+
+Recent encoder changes make that window cheaper to scale:
+
+- token-level local attention now runs as a true sliding window instead of a dense masked `seq x seq` attention map
+- chunk size grows with sequence length so the global latent path stays near a fixed number of chunk states instead of growing linearly with every extra token
+- latent training can now sample multiple source segments with `TOFY_LATENT_CONTEXT_SEGMENTS`, keeping recent segments dense and reserving part of the window for older-history tokens via `TOFY_LATENT_HISTORY_RATIO`
+- latent training can also run in `bf16` / `f16` with `TOFY_TRAIN_DTYPE`, which is mainly there to buy more useful context under the same VRAM budget
+
+That means:
+
+- the model is **conversation-aware**
+- but its active runtime memory is still bounded by the encoder context window
+- "context length" here means **encoder-token count**, not characters or words
+
+The world/planner path can now also fold multiple state segments recurrently in planner space:
+
+- each retained segment is encoded separately
+- each segment is converted into planner slots
+- those segment-level planner slots are folded with a recency-biased recurrent update when `TOFY_RECURSIVE_PLANNER_MEMORY=1`
+
+That is cheaper than carrying every older token state forward at full resolution, and it is closer to a recurrent latent-memory setup than the earlier one-shot concatenation path.
+
+### 2. Planner/world context
+
+The encoder output is not passed directly to the decoders. Instead:
+
+1. the encoder produces token/chunk/global states
+2. planner memory compresses them into `num_latent_tokens` planner slots
+3. the orchestrator reads those slots to choose `TextReply`, `Code`, or `Done`
+4. the transition model predicts the **next** planner state for that chosen action
+
+So after the encoder stage, the conversation is represented as a small latent memory rather than a long token sequence.
+
+This is important because the model does **not** work like a normal single LLM with one giant KV-cache over the whole dialog. The shared conversation context is compressed into planner slots first.
+
+### 3. Decoder context at inference
+
+The selected decoder gets context from **two places**:
+
+- the raw prompt text tokenized with the decoder's own vocab
+- the predicted planner slots through cross-attention
+
+So the decoder is not generating from the latent alone. It still autoregresses over prompt/output tokens, but it is additionally conditioned by planner memory.
+
+For Candle decoders:
+
+- text decoder uses its own text vocab/tokenizer
+- code decoder uses its own code-aware vocab/tokenizer
+
+Because the tokenizers differ, `max_seq = 256` in the encoder and `max_seq = 192` in the code decoder do **not** mean the same exact amount of source text. Each module counts its own tokens.
+
+### 4. Decoder context during training
+
+For decoder training, each row is a pair:
+
+`state<TAB>next`
+
+Here:
+
+- `state` = conditioning side / prior context
+- `next` = target continuation
+
+Teacher forcing is built as:
+
+- `input = state + shifted(next)`
+- `target = shifted(state) + next`
+
+So the decoder training sequence length is effectively **`2 * max_seq`**, even though `max_seq` is still the configuration knob for each side individually.
+
+This means `max_seq = 192` for the code decoder really means:
+
+- up to `192` tokens from the left side
+- up to `192` tokens from the right side
+- up to `384` autoregressive positions inside the decoder loss
+
+### 5. Dataset context
+
+In the training data, "context" usually refers to the **left side** of the pair file.
+
+Examples:
+
+- chat pair: previous conversation or user request on the left, assistant reply on the right
+- code pair: code prefix on the left, code continuation on the right
+
+That dataset-level context is what teaches the world model and decoders what "continue from this state" means.
+
+### 6. What gets forgotten first
+
+When prompts get too long, the model forgets in this order:
+
+1. the oldest prompt segments are dropped first once the segment budget is exceeded
+2. within the retained budget, older segments are compressed before the newest segment
+3. the retained memory is compressed into planner slots
+4. the chosen decoder then generates using its own prompt tokens plus planner conditioning
+
+So the bottleneck is not only decoder context. The main bottleneck is usually the **encoder window**, because everything downstream depends on what survived encoder truncation.
+
+### 7. Practical implications
+
+- If you want better long-chat consistency, increasing encoder `max_seq` matters more than only increasing decoder output length.
+- If you want better code continuation quality, increasing code-decoder `max_seq` helps because the decoder teacher-forcing path sees longer prefix/continuation pairs.
+- Since decoders have separate tokenizers, compare context lengths in **tokens per module**, not by raw text length.
+- The planner slots are a compressed memory, so the system can preserve high-level intent even when exact token-level detail is partially lost.
+
 ## How each action model can know what the others do
 
 The text model (when replying in chat) and the code model (when generating code) can correctly refer to what the other did **only if they share the same context**. In this stack that happens in one place: **the encoder**.
 
 - **Encoder** sees a single string (the prompt) and produces token states.
+- The encoder is hierarchical: local token blocks feed chunk states, chunk states exchange information globally, and learned global latent tokens hold whole-sequence summaries.
 - **Planner memory** resamples those token states into planner slots.
 - **World transition + orchestrator** operate on those planner slots.
 - **Decoder adapters** transform planner slots into decoder-specific conditioning for code or text.
@@ -30,7 +162,7 @@ So **cross-action awareness** is achieved by:
 1. **Feeding the full conversation into the encoder** (all messages so far, including every assistant code and text reply).
 2. **Using the same encoded context** for the planner/router/decoder path, for whichever action is chosen.
 
-The shared state now lives in planner-memory slots rather than a single bridge/code-world latent. **Current behavior:** the HTTP server (`--serve`) uses full-conversation encoding: it builds the prompt from the full `messages` array and passes that to the engine. For long chats, the engine keeps the last `max_seq` tokens so the planner memory reflects the most recent context.
+The shared state now lives in planner-memory slots rather than a single bridge/code-world latent. **Current behavior:** the HTTP server (`--serve`) uses full-conversation encoding: it builds the prompt from the full `messages` array and passes that to the engine. For long chats, the engine can retain several encoder segments, compressing older segments into chunk/global/planner summaries so the planner memory reflects more than just the last raw `max_seq` tokens.
 
 ## Encoder smaller than decoder — is that okay?
 
@@ -44,21 +176,51 @@ Yes. The encoder and planner memory compress the conversation into a compact int
 
 Summary: cross-action awareness comes from shared full-context encoding plus shared planner memory, while decoder-specific behavior is isolated in each adapter/decoder pair.
 
-## Multi-step replies and one action at a time
+## Why the new encoder is more JEPA-like
 
-The **orchestrator** does **not** decide once per user message. It decides **per step** inside a single reply: the model can interleave text, code, writing a file, and running a CLI in one reply (e.g. brief text → code block → write file → run test). Only **one action is active at a time** (no parallel tool calls), so memory stays bounded.
+- It predicts target representations through dedicated predictor heads instead of matching raw context states directly.
+- It trains with multiscale losses over masked token targets, chunk latents, and global latent summaries.
+- It uses structured masking so code examples more often hide meaningful regions such as identifiers, comments, and block boundaries rather than only random spans.
 
-**Flow:**
+## Current Router Scope
 
-1. **Reply loop** (inside one assistant reply): we maintain `assistant_content` (what the assistant has produced so far). For each step (up to `MAX_ACTIONS_PER_REPLY`):
-   - Build **current prompt** = full conversation + `"\nAssistant: "` + `assistant_content`.
-   - **Orchestrator** returns the next action: `TextReply`, `Code`, `WriteFile`, `RunCli`, or `Done`.
-   - If `Done`, we finish and return `assistant_content`.
-  - If **decoder** action (`TextReply` or `Code`): encode current prompt → planner memory → transition → decoder adapter → run the appropriate decoder with a chunk of tokens; append the decoder output to `assistant_content`.
-   - If **tool** action (`WriteFile` or `RunCli`): execute the tool (or stub); append the result (e.g. `[Wrote file]`, `[Ran command]`) to `assistant_content`.
-2. **One action at a time**: we never run two decoders or two tools in parallel. We do one action → append result → decide next action. That keeps memory and control flow simple.
-3. **Orchestrator as the router:** The orchestrator is a trained action head on top of the predicted planner state. It outputs logits over 5 actions (`TextReply`, `Code`, `WriteFile`, `RunCli`, `Done`). At inference, if the checkpoint has the head, its prediction is used; otherwise the engine falls back to a fixed step policy.
+The **orchestrator** currently predicts only actions that the runtime can actually execute:
 
-**Actions:** `TextReply` (chat), `Code` (code block), `WriteFile` (write code to file; stub for now), `RunCli` (run command; stub for now), `Done`. Decoder actions use the existing text/code decoders; tool actions use stubs until real file/CLI execution is wired.
+1. `TextReply`
+2. `Code`
+3. `Done`
 
-**Memory:** The encoder sees `current_prompt` each step; if it exceeds `max_seq`, the existing truncation keeps the last `max_seq` tokens. No extra state beyond the growing `assistant_content` string.
+This is intentional. The runtime no longer pretends that file-writing or CLI execution are learned actions. `Done` is the only non-decoder action, and it is trained from explicit terminal rows in the world/orchestrator data.
+
+Current reply flow:
+
+1. Encode the full conversation prompt.
+2. Planner memory compresses it into private slots.
+3. The orchestrator picks `TextReply`, `Code`, or `Done`.
+4. The transition model conditions the planner state on that action.
+5. The matching decoder generates the response.
+
+## Current memory levers
+
+What is available now:
+
+- true sliding-window local attention in the encoder
+- adaptive chunk/global hierarchy for longer encoder context
+- `--grad-accum <int>` for latent, world, and decoder training
+- Candle decoder inference KV cache for incremental self-attention
+- precomputed cross-attention K/V for the fixed planner/world latent during Candle decoding
+
+What is not implemented yet:
+
+- true activation checkpointing / recomputation wrappers
+
+Why activation checkpointing is still missing:
+
+- the current Candle stack in this repo does not expose a simple built-in checkpoint wrapper for these transformer blocks
+- adding it cleanly would require a more invasive custom recompute path through encoder and decoder blocks, not just a config flag
+
+Why KV-cache is still only partial:
+
+- the GGUF / `llama.cpp` runtime has its own cache system
+- the in-repo Candle decoder now caches self-attention and precomputes world-latent cross-attention K/V
+- but there is still no trained recurrent-memory module, so runtime conversation context is bounded first by the configured encoder segment budget rather than being truly unbounded

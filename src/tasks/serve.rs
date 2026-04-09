@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP server for Tofy (world model + decoder).
+//! OpenAI-compatible HTTP server for Tofy (dialog transition model + decoder).
 //! Use with OpenCode or any client that speaks OpenAI API.
 
 /// Model ID returned by the API. Use this in OpenCode / clients.
@@ -6,7 +6,7 @@ pub const TOFY_MODEL_ID: &str = "tofy";
 
 /// Short description for model list and responses.
 const TOFY_MODEL_DESCRIPTION: &str =
-    "Tofy: JEPA-style world-model agent (encoder -> planner memory -> router -> decoder adapter -> decoder). Local inference with optional conditioning.";
+    "Tofy: JEPA-style dialog-transition agent (encoder -> planner memory -> router -> decoder adapter -> decoder). Local inference with text/code decoder routing.";
 
 use anyhow::{Context, Result};
 use axum::{
@@ -115,15 +115,15 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
         if role.eq_ignore_ascii_case("user") {
             out.push_str("User: ");
             out.push_str(content);
-            out.push_str("\n");
+            out.push('\n');
         } else if role.eq_ignore_ascii_case("assistant") {
             out.push_str("Assistant: ");
             out.push_str(content);
-            out.push_str("\n");
+            out.push('\n');
         } else if role.eq_ignore_ascii_case("system") {
             out.push_str("System: ");
             out.push_str(content);
-            out.push_str("\n");
+            out.push('\n');
         }
     }
     out.trim_end().to_string()
@@ -144,7 +144,11 @@ async fn chat_completions(
 
     let max_tokens = body.max_tokens.unwrap_or(4096) as usize;
     if std::env::var("JEPA_DEBUG").is_ok() {
-        let _ = writeln!(std::io::stderr(), "[tofy] request started (stream={})", body.stream == Some(true));
+        let _ = writeln!(
+            std::io::stderr(),
+            "[tofy] request started (stream={})",
+            body.stream == Some(true)
+        );
         let _ = std::io::stderr().flush();
     }
     let id = make_id();
@@ -206,8 +210,10 @@ async fn chat_completions(
         });
         let sse_stream = role_event.chain(chunk_stream);
         let mut res: axum::response::Response = Sse::new(sse_stream).into_response();
-        res.headers_mut()
-            .insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+        res.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
         return Ok(res);
     }
 
@@ -256,6 +262,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bind: &str,
     encoder_model_path: PathBuf,
@@ -270,7 +277,9 @@ pub async fn run(
     debug: bool,
 ) -> Result<()> {
     if debug {
-        tracing::info!("Tofy serve: debug mode on — t/s and decoder dumps go to this console (stderr)");
+        tracing::info!(
+            "Tofy serve: debug mode on — t/s and decoder dumps go to this console (stderr)"
+        );
     }
     let engine = AgentEngine::load(
         &encoder_model_path,
@@ -303,9 +312,7 @@ pub async fn run(
     tracing::info!("  GET  /health               — health check");
     tracing::info!("Use in OpenCode: Base URL = http://{}", bind);
 
-    axum::serve(listener, app)
-        .await
-        .context("serve")?;
+    axum::serve(listener, app).await.context("serve")?;
 
     Ok(())
 }

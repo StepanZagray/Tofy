@@ -1,18 +1,18 @@
-//! Orchestrator action head: JEPA-style world-model head that predicts the next action from the transition latent.
+//! Orchestrator action head: predicts whether the current reply should use text, code, or stop.
 //!
-//! Input: next latent from WorldTransition (or encoder → transition). Output: logits over actions
-//! (TextReply, Code, WriteFile, RunCli, Done). Trained jointly with the world model; used at inference
-//! to decide the next action from the current state (not from a fixed step policy).
+//! Input: planner-state slots. Output: logits over supported actions (`TextReply`, `Code`, `Done`).
+//! Trained jointly with the dialog-transition model and used at inference to choose which decoder to run.
 
 use anyhow::Result;
-use candle_core::{Module, Tensor};
+use candle_core::{DType, Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
 /// Number of actions the orchestrator can predict.
-pub const NUM_ACTIONS: usize = 5;
+pub const NUM_ACTIONS: usize = 3;
 
 /// MLP head on top of pooled latent slots → action logits.
 pub struct OrchestratorActionHead {
+    slot_score: nn::Linear,
     fc1: nn::Linear,
     fc2: nn::Linear,
 }
@@ -20,14 +20,27 @@ pub struct OrchestratorActionHead {
 impl OrchestratorActionHead {
     pub fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
         let hidden = (dim * 2).max(256);
+        let slot_score = nn::linear(dim, 1, vb.pp("slot_score"))?;
         let fc1 = nn::linear(dim, hidden, vb.pp("fc1"))?;
         let fc2 = nn::linear(hidden, NUM_ACTIONS, vb.pp("fc2"))?;
-        Ok(Self { fc1, fc2 })
+        Ok(Self {
+            slot_score,
+            fc1,
+            fc2,
+        })
     }
 
     /// latent_slots: [batch, slots, dim]. Returns logits [batch, NUM_ACTIONS].
     pub fn forward(&self, latent_slots: &Tensor) -> Result<Tensor> {
-        let pooled = latent_slots.mean(1)?;
+        let (batch, slots, dim) = latent_slots.dims3()?;
+        let scores = self
+            .slot_score
+            .forward(latent_slots)?
+            .reshape((batch, slots))?;
+        let weights = nn::ops::softmax(&scores, 1)?
+            .unsqueeze(2)?
+            .broadcast_as((batch, slots, dim))?;
+        let pooled = latent_slots.broadcast_mul(&weights)?.sum(1)?;
         let h = self.fc1.forward(&pooled)?.relu()?;
         Ok(self.fc2.forward(&h)?)
     }
@@ -35,8 +48,10 @@ impl OrchestratorActionHead {
     /// Argmax over actions. latent_slots: [1, slots, dim]. Returns action index 0..NUM_ACTIONS.
     pub fn predict(&self, latent_slots: &Tensor) -> Result<usize> {
         let logits = self.forward(latent_slots)?;
-        let logits_v = logits.to_vec2::<f32>()?;
-        let row = logits_v.first().ok_or_else(|| anyhow::anyhow!("empty logits"))?;
+        let logits_v = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let row = logits_v
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("empty logits"))?;
         let (idx, _) = row
             .iter()
             .enumerate()

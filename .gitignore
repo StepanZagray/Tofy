@@ -18,6 +18,7 @@ vocab_*.txt
 # Data files
 data/*.txt
 !data/.gitkeep
+runs/
 
 # Python
 __pycache__/

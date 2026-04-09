@@ -1,4 +1,5 @@
 use anyhow::Result;
+use candle_core::DType;
 use std::path::PathBuf;
 
 pub struct Config {
@@ -23,6 +24,11 @@ pub struct Config {
     pub lambda: f64,
     pub lr: f64,
     pub log_every: usize,
+    pub grad_accum_steps: usize,
+    pub train_dtype: DType,
+    pub latent_context_segments: usize,
+    pub latent_recent_full_segments: usize,
+    pub latent_history_ratio: f64,
 }
 
 impl Config {
@@ -30,26 +36,78 @@ impl Config {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.is_empty() {
             anyhow::bail!(
-                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda]"
+                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>]"
             );
         }
+        let mut grad_accum_steps = 1usize;
+        let train_dtype = std::env::var("TOFY_TRAIN_DTYPE")
+            .ok()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "f16" | "float16" | "fp16" => Some(DType::F16),
+                "bf16" => Some(DType::BF16),
+                "f32" | "float32" | "fp32" => Some(DType::F32),
+                _ => None,
+            })
+            .unwrap_or(DType::F32);
+        let mut filtered = Vec::new();
+        let mut i = 0usize;
+        while i < args.len() {
+            if args[i] == "--grad-accum" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--grad-accum requires integer"))?;
+                grad_accum_steps = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--grad-accum must be integer"))?;
+                i += 2;
+                continue;
+            }
+            filtered.push(args[i].clone());
+            i += 1;
+        }
         Ok(Self {
-            data_path: PathBuf::from(&args[0]),
+            data_path: PathBuf::from(&filtered[0]),
             init_encoder_path: None,
-            steps: args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10000),
-            batch_size: args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16),
-            dim: args.get(3).and_then(|v| v.parse().ok()).unwrap_or(768),
-            max_seq: args.get(4).and_then(|v| v.parse().ok()).unwrap_or(128),
-            num_layers: args.get(5).and_then(|v| v.parse().ok()).unwrap_or(6),
-            num_heads: args.get(6).and_then(|v| v.parse().ok()).unwrap_or(8),
-            max_vocab: args.get(7).and_then(|v| v.parse().ok()).unwrap_or(32_000),
-            max_spans_per_sample: args.get(8).and_then(|v| v.parse().ok()).unwrap_or(3),
-            max_span_len: args.get(9).and_then(|v| v.parse().ok()).unwrap_or(32),
-            max_masked_ratio: args.get(10).and_then(|v| v.parse().ok()).unwrap_or(0.25),
+            steps: filtered
+                .get(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10000),
+            batch_size: filtered.get(2).and_then(|v| v.parse().ok()).unwrap_or(12),
+            dim: filtered.get(3).and_then(|v| v.parse().ok()).unwrap_or(768),
+            max_seq: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(256),
+            num_layers: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(9),
+            num_heads: filtered.get(6).and_then(|v| v.parse().ok()).unwrap_or(8),
+            max_vocab: filtered
+                .get(7)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32_000),
+            max_spans_per_sample: filtered.get(8).and_then(|v| v.parse().ok()).unwrap_or(3),
+            max_span_len: filtered.get(9).and_then(|v| v.parse().ok()).unwrap_or(32),
+            max_masked_ratio: filtered
+                .get(10)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.25),
             is_paragraph_data: false, // set by caller when using hub:...wikipedia
-            lambda: args.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.2),
+            lambda: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.2),
             lr: 3e-4,
             log_every: 100,
+            grad_accum_steps: grad_accum_steps.max(1),
+            train_dtype,
+            latent_context_segments: std::env::var("TOFY_LATENT_CONTEXT_SEGMENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1usize)
+                .max(1),
+            latent_recent_full_segments: std::env::var("TOFY_LATENT_RECENT_FULL_SEGMENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1usize)
+                .max(1),
+            latent_history_ratio: std::env::var("TOFY_LATENT_HISTORY_RATIO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.25f64)
+                .clamp(0.0, 0.5),
         })
     }
 }

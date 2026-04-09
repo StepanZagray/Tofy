@@ -16,7 +16,7 @@ From your Tofy repo. Use either **GGUF** or the in-repo Candle decoders.
 **With GGUF:**
 ```bash
 export JEPA_DECODER_MODEL=./models/<your_model>.gguf
-cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 128 6 8 256 64
+cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 256 9 8 256 64
 ```
 
 **With Candle code + text decoders (no GGUF):**  
@@ -26,7 +26,7 @@ export JEPA_USE_CANDLE_DECODER=1
 export JEPA_CANDLE_DECODER=./local_models/code_decoder_90M.safetensors
 export JEPA_USE_TEXT_DECODER=1
 export JEPA_TEXT_DECODER=./local_models/text_decoder_90M.safetensors
-cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 128 6 8 256 64
+cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 256 9 8 256 64
 ```
 
 You should see: `Tofy OpenAI-compatible server listening on http://0.0.0.0:8080`.
@@ -103,7 +103,7 @@ Chat or run agent tasks as usual. Requests go to your local Tofy server, which r
 - **Model not listed**: Confirm `GET /v1/models` returns `tofy`; then check that the `models` key in `opencode.json` matches (e.g. `"tofy": { "name": "..." }`).
 - **Paths differ**: OpenCode may use different config paths on your OS; see [OpenCode docs](https://opencode.ai/docs/) for the correct locations of `auth.json` and `opencode.json`.
 - **No response / no generation animation**: (1) The server supports **streaming** (`stream: true`); if your client sends that, you should get SSE and a token-by-token animation. (2) The first reply can be slow (encoder + planner/world + decoder); wait for the decoder to finish. (3) Check the server terminal for errors.
-- **Empty response in OpenCode**: (1) Ensure **both** decoders are set (`JEPA_USE_CANDLE_DECODER` + `JEPA_CANDLE_DECODER` and `JEPA_USE_TEXT_DECODER` + `JEPA_TEXT_DECODER`) so the server can do text reply. (2) The orchestrator head may predict Done on the first step; the server now forces at least one TextReply when no content has been generated yet. (3) Run with `--debug` or `JEPA_DEBUG=1` and watch the server terminal for errors or decoder output.
+- **Empty response in OpenCode**: (1) Ensure **both** decoders are set (`JEPA_USE_CANDLE_DECODER` + `JEPA_CANDLE_DECODER` and `JEPA_USE_TEXT_DECODER` + `JEPA_TEXT_DECODER`) so the server can do text reply. (2) If the orchestrator predicts `done`, the server can legitimately return no content. (3) Run with `--debug` or `JEPA_DEBUG=1` and watch the server terminal for errors or decoder output.
 - **GPU not utilized**: The **decoder** (llama-completion / llama-cli) uses the GPU via `-ngl`. Set `JEPA_DECODER_NGL=99` (default) so all layers run on GPU. Ensure `JEPA_DECODER_MODEL` points to your GGUF and the decoder binary is built with GPU support.
 - **`--no-conversation is not supported` / broken output**: The default decoder binary is **llama-completion** (non-interactive). If you see this error or banner/prompt echo in the response, set `JEPA_DECODER_BIN=llama-completion` and restart the server. If your llama.cpp build only provides `llama-cli`, use a build that includes `llama-completion` or see [DECODER_RUNTIME.md](DECODER_RUNTIME.md).
 
@@ -140,7 +140,7 @@ You can use the in-repo decoders instead of llama.cpp. Both use cross-attention,
 ### 1. Train the world model (if not already)
 
 ```bash
-cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/ultrachat_pairs.txt 40000 32 768 128 6 8 256 64 --lambda 0.2
+cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/ultrachat_pairs.txt 40000 32 768 256 9 8 256 64 --lambda 0.2
 ```
 
 Replace encoder path with yours (see [RUNBOOK.md](RUNBOOK.md)). The world checkpoint includes planner memory, world transition, and the orchestrator head, but not the encoder or its vocab.
@@ -176,7 +176,7 @@ export JEPA_USE_TEXT_DECODER=1
 export JEPA_TEXT_DECODER=./local_models/text_decoder_90M.safetensors
 # optional: JEPA_TEXT_DECODER_TEMP=0.7
 
-cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 128 6 8 256 64
+cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 256 9 8 256 64
 ```
 
 Then configure OpenCode as in §2–4 above. The server uses **codeDecoder** for code-like prompts and **textDecoder** for chat; if a decoder is not set for that action, it falls back to llama.cpp (if `JEPA_DECODER_MODEL` is set) or the stub.

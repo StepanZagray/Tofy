@@ -59,12 +59,16 @@ impl DecoderAdapter {
     pub fn forward(&self, planner_slots: &Tensor) -> Result<Tensor> {
         let (batch, _, _) = planner_slots.dims3()?;
         let query_ids: Vec<u32> = (0..self.num_output_slots as u32).collect();
-        let query_ids =
-            Tensor::from_vec(query_ids, (1, self.num_output_slots), planner_slots.device())?;
-        let queries = self
-            .query_embed
-            .forward(&query_ids)?
-            .broadcast_as((batch, self.num_output_slots, self.planner_dim))?;
+        let query_ids = Tensor::from_vec(
+            query_ids,
+            (1, self.num_output_slots),
+            planner_slots.device(),
+        )?;
+        let queries = self.query_embed.forward(&query_ids)?.broadcast_as((
+            batch,
+            self.num_output_slots,
+            self.planner_dim,
+        ))?;
 
         let normed = self.ln1.forward(&queries)?;
         let attended = self.cross_attn.forward(&normed, planner_slots)?;

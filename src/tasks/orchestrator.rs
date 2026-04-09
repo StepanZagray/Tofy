@@ -1,13 +1,7 @@
-//! Orchestrator: decides which action the agent should take next (text, code, write file, run CLI, done).
+//! Orchestrator: chooses the next high-level action for the current reply.
 //!
-//! The orchestrator is called **per step** during a single reply, not once per user message.
-//! Only one action is active at a time (easy on memory): we execute one action, append its result
-//! to the assistant content, then decide the next action.
-//!
-//! Flow: Encoder → planner memory → orchestrator/router → decoder-specific adapter → decoder or tool.
-
-/// Maximum number of actions per reply (text → code → write file → run CLI → done, etc.).
-pub const MAX_ACTIONS_PER_REPLY: usize = 10;
+//! Tofy only exposes actions that the runtime can actually execute:
+//! `text_reply`, `code`, and `done`.
 
 /// Actions the agent can take. Decoder prompt uses the string (e.g. "Action=code").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,11 +10,7 @@ pub enum Action {
     TextReply,
     /// Code generation (e.g. code block in message).
     Code,
-    /// Write generated code (or content) to a file. Tool: one action at a time.
-    WriteFile,
-    /// Run a CLI command (e.g. test). Tool: one action at a time.
-    RunCli,
-    /// No further action; finish the reply.
+    /// Terminal action: no further reply content should be produced.
     Done,
 }
 
@@ -29,38 +19,72 @@ impl Action {
         match self {
             Action::TextReply => "text_reply",
             Action::Code => "code",
-            Action::WriteFile => "write_file",
-            Action::RunCli => "run_cli",
             Action::Done => "done",
         }
     }
-
-    /// True if this action uses the decoder (text or code); false for tools or done.
-    pub fn is_decoder(self) -> bool {
-        matches!(self, Action::TextReply | Action::Code)
-    }
 }
 
-/// Maps orchestrator head output index (0..5) to Action. Indices: 0=TextReply, 1=Code, 2=WriteFile, 3=RunCli, 4=Done.
+/// Maps orchestrator head output index to Action. Indices: 0=TextReply, 1=Code, 2=Done.
 #[inline]
 pub fn action_from_index(idx: usize) -> Action {
     match idx {
         0 => Action::TextReply,
         1 => Action::Code,
-        2 => Action::WriteFile,
-        3 => Action::RunCli,
         _ => Action::Done,
     }
 }
 
-/// Returns the next action for this step (fallback when orchestrator head is not loaded). Fixed sequence.
+fn looks_like_code_request(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("```")
+        || lower.contains("write code")
+        || lower.contains("implement")
+        || lower.contains("function")
+        || lower.contains("class")
+        || lower.contains("rust")
+        || lower.contains("python")
+        || lower.contains("javascript")
+        || lower.contains("typescript")
+}
+
+/// Fallback when no trained orchestrator head is loaded.
 #[inline]
-pub fn decide_next_action(step: usize, _prompt: &str, _assistant_so_far: &str) -> Action {
-    match step {
-        0 => Action::TextReply,
-        1 => Action::Code,
-        2 => Action::WriteFile,
-        3 => Action::RunCli,
-        _ => Action::Done,
+pub fn decide_next_action(prompt: &str, assistant_so_far: &str) -> Action {
+    if prompt.trim().is_empty() {
+        return Action::Done;
+    }
+    if !assistant_so_far.trim().is_empty() {
+        return Action::TextReply;
+    }
+    if looks_like_code_request(prompt) {
+        Action::Code
+    } else {
+        Action::TextReply
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{action_from_index, decide_next_action, Action};
+
+    #[test]
+    fn action_indices_cover_supported_actions() {
+        assert_eq!(action_from_index(0), Action::TextReply);
+        assert_eq!(action_from_index(1), Action::Code);
+        assert_eq!(action_from_index(2), Action::Done);
+        assert_eq!(action_from_index(99), Action::Done);
+    }
+
+    #[test]
+    fn fallback_prefers_code_for_code_requests() {
+        assert_eq!(
+            decide_next_action("Please implement this Rust function", ""),
+            Action::Code
+        );
+        assert_eq!(
+            decide_next_action("Explain what this code does", "already started"),
+            Action::TextReply
+        );
+        assert_eq!(decide_next_action("Hello there", ""), Action::TextReply);
     }
 }

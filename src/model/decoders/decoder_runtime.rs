@@ -73,7 +73,8 @@ pub struct LlamaCppDecoder {
 impl LlamaCppDecoder {
     pub fn try_new() -> Result<Self> {
         // Prefer llama-completion for non-interactive use (llama-cli often rejects --no-conversation).
-        let bin = std::env::var("JEPA_DECODER_BIN").unwrap_or_else(|_| "llama-completion".to_string());
+        let bin =
+            std::env::var("JEPA_DECODER_BIN").unwrap_or_else(|_| "llama-completion".to_string());
         let model_path = if let Ok(p) = std::env::var("JEPA_DECODER_MODEL") {
             PathBuf::from(p)
         } else {
@@ -128,7 +129,7 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
         // Conditioning is only injected as text in the prompt; the decoder is not conditioned by the vector in its forward pass.
         let cond_summary = summarize_conditioning(conditioning);
         let full_prompt = format!(
-            "System: You are Tofy, a JEPA-style world-model agent (encoder, planner memory, router, decoder adapter + decoder). Action={action}. Use the latent condition below to guide your reply (tone, depth, focus)—it encodes desired response style. Do not mention, repeat, or refer to the numbers themselves.\nLatentCondition: {cond_summary}\nUser: {prompt}\nAssistant:"
+            "System: You are Tofy, a JEPA-style dialog-transition agent (encoder, planner memory, router, decoder adapter + decoder). Action={action}. Use the latent condition below to guide your reply (tone, depth, focus)—it encodes desired response style. Do not mention, repeat, or refer to the numbers themselves.\nLatentCondition: {cond_summary}\nUser: {prompt}\nAssistant:"
         );
         let output = Command::new(&self.bin)
             .arg("-m")
@@ -190,7 +191,7 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
     ) -> Result<()> {
         let cond_summary = summarize_conditioning(conditioning);
         let full_prompt = format!(
-            "System: You are Tofy, a JEPA-style world-model agent (encoder, planner memory, router, decoder adapter + decoder). Action={action}. Use the latent condition below to guide your reply (tone, depth, focus)—it encodes desired response style. Do not mention, repeat, or refer to the numbers themselves.\nLatentCondition: {cond_summary}\nUser: {prompt}\nAssistant:"
+            "System: You are Tofy, a JEPA-style dialog-transition agent (encoder, planner memory, router, decoder adapter + decoder). Action={action}. Use the latent condition below to guide your reply (tone, depth, focus)—it encodes desired response style. Do not mention, repeat, or refer to the numbers themselves.\nLatentCondition: {cond_summary}\nUser: {prompt}\nAssistant:"
         );
         let debug = std::env::var("JEPA_DEBUG").is_ok();
         let mut child = Command::new(&self.bin)
@@ -241,11 +242,7 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 64];
         let mut buffer = String::new();
-        let mut debug_buf = if debug {
-            Some(String::new())
-        } else {
-            None
-        };
+        let mut debug_buf = if debug { Some(String::new()) } else { None };
         // Skip banner and prompt echo: only send content after "Assistant:".
         loop {
             let n = reader.read(&mut buf).context("read decoder stdout")?;
@@ -296,18 +293,30 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
         let stderr_str = stderr_rx
             .and_then(|rx| rx.try_recv().ok())
             .map(|b| String::from_utf8_lossy(&b).into_owned());
-        let printed_any = stderr_str
-            .as_deref()
-            .map_or(false, print_speed_lines)
-            || debug_buf.as_ref().map_or(false, |s| print_speed_lines(s));
+        let printed_any = stderr_str.as_deref().is_some_and(print_speed_lines)
+            || debug_buf.as_ref().is_some_and(|s| print_speed_lines(s));
         if debug && !printed_any {
             let mut stderr = std::io::stderr();
-            let dump = stderr_str.as_deref().unwrap_or("").lines().take(30).collect::<Vec<_>>().join("\n");
+            let dump = stderr_str
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .take(30)
+                .collect::<Vec<_>>()
+                .join("\n");
             if !dump.is_empty() {
-                let _ = writeln!(stderr, "[tofy] decoder stderr (no t/s line found):\n{}", dump);
+                let _ = writeln!(
+                    stderr,
+                    "[tofy] decoder stderr (no t/s line found):\n{}",
+                    dump
+                );
             } else if let Some(db) = &debug_buf {
                 let line_count = db.lines().count();
-                let _ = writeln!(stderr, "[tofy] decoder stdout: {} lines (response not printed)", line_count);
+                let _ = writeln!(
+                    stderr,
+                    "[tofy] decoder stdout: {} lines (response not printed)",
+                    line_count
+                );
             }
             let _ = stderr.flush();
         }
@@ -362,8 +371,7 @@ fn discover_gguf_model(models_dir: &Path) -> Result<PathBuf> {
                     let sub = sub?;
                     let p = sub.path();
                     if p.is_file()
-                        && p
-                            .extension()
+                        && p.extension()
                             .and_then(|e| e.to_str())
                             .map(|e| e.eq_ignore_ascii_case("gguf"))
                             .unwrap_or(false)

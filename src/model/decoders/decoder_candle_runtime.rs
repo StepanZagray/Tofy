@@ -3,13 +3,14 @@
 //! - Text: JEPA_USE_TEXT_DECODER=1, JEPA_TEXT_DECODER=<path>
 
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::data::tokenize_for_inference;
-use crate::model::vocab::{load_vocab_from_file, Vocab};
 use super::{CodeDecoder, DecoderAdapter, DecoderKind, LocalDecoderRuntime};
+use crate::data::{encode_text_with_vocab_mode, TokenizationMode};
+use crate::model::vocab::{load_vocab_from_file, vocab_signature, Vocab};
 
 /// Decoder architecture; must match training constants in world.rs. Sized for ~8GB VRAM (~90M params).
 const DECODER_DIM: usize = 768;
@@ -24,11 +25,104 @@ pub struct CandleCrossAttnDecoder {
     decoder: CodeDecoder,
     vocab: Vocab,
     device: Device,
+    runtime_dtype: DType,
     planner_dim: usize,
     temperature: f32,
+    repeat_penalty: f32,
+    repeat_last_n: usize,
+    top_k: usize,
+    top_p: f32,
+    tokenization_mode: TokenizationMode,
+    max_prompt_tokens: Option<usize>,
 }
 
 impl CandleCrossAttnDecoder {
+    pub fn metadata_path(checkpoint_path: &Path) -> PathBuf {
+        checkpoint_path.with_extension("meta.txt")
+    }
+
+    pub fn write_metadata(
+        checkpoint_path: &Path,
+        vocab: &Vocab,
+        kind: DecoderKind,
+        planner_dim: usize,
+        planner_slots: usize,
+    ) -> Result<()> {
+        let metadata = format!(
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\nplanner_slots={}\n",
+            kind.as_str(),
+            vocab_signature(vocab),
+            vocab.id_to_token.len(),
+            planner_dim,
+            planner_slots
+        );
+        fs::write(Self::metadata_path(checkpoint_path), metadata)?;
+        Ok(())
+    }
+
+    fn validate_metadata(
+        checkpoint_path: &Path,
+        vocab: &Vocab,
+        kind: DecoderKind,
+        planner_dim: usize,
+        planner_slots: usize,
+    ) -> Result<()> {
+        let metadata_path = Self::metadata_path(checkpoint_path);
+        if !metadata_path.exists() {
+            return Ok(());
+        }
+        let metadata = fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read decoder metadata from {:?}", metadata_path))?;
+        let mut parsed = std::collections::HashMap::new();
+        for line in metadata.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                parsed.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+        if let Some(saved_kind) = parsed.get("kind") {
+            if saved_kind != kind.as_str() {
+                anyhow::bail!(
+                    "decoder kind mismatch for {:?}: metadata says {}, runtime requested {}",
+                    checkpoint_path,
+                    saved_kind,
+                    kind.as_str()
+                );
+            }
+        }
+        if let Some(saved_sig) = parsed.get("vocab_signature") {
+            let current_sig = vocab_signature(vocab);
+            if *saved_sig != current_sig {
+                anyhow::bail!(
+                    "decoder vocab mismatch for {:?}: metadata signature {} does not match current {}",
+                    checkpoint_path,
+                    saved_sig,
+                    current_sig
+                );
+            }
+        }
+        if let Some(saved_dim) = parsed.get("planner_dim") {
+            if saved_dim.parse::<usize>().ok() != Some(planner_dim) {
+                anyhow::bail!(
+                    "decoder planner_dim mismatch for {:?}: metadata says {}, runtime requested {}",
+                    checkpoint_path,
+                    saved_dim,
+                    planner_dim
+                );
+            }
+        }
+        if let Some(saved_slots) = parsed.get("planner_slots") {
+            if saved_slots.parse::<usize>().ok() != Some(planner_slots) {
+                anyhow::bail!(
+                    "decoder planner_slots mismatch for {:?}: metadata says {}, runtime requested {}",
+                    checkpoint_path,
+                    saved_slots,
+                    planner_slots
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn infer_vocab_path(checkpoint_path: &Path) -> Result<PathBuf> {
         let inferred = checkpoint_path.with_extension("vocab.txt");
         if inferred.exists() {
@@ -53,14 +147,37 @@ impl CandleCrossAttnDecoder {
         kind: DecoderKind,
     ) -> Result<Self> {
         let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+        let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
         let mut varmap = VarMap::new();
         varmap
             .load(&checkpoint_path)
             .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
-        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        crate::util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
+        let vb = VarBuilder::from_varmap(&varmap, runtime_dtype, &device);
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
+        Self::validate_metadata(&checkpoint_path, &vocab, kind, planner_dim, planner_slots)?;
         let vocab_size = vocab.id_to_token.len();
+        let default_repeat_penalty = if kind == DecoderKind::CodeSpecialist {
+            1.12
+        } else {
+            1.08
+        };
+        let default_repeat_last_n = if kind == DecoderKind::CodeSpecialist {
+            160
+        } else {
+            96
+        };
+        let default_top_k = if kind == DecoderKind::CodeSpecialist {
+            40
+        } else {
+            0
+        };
+        let default_top_p = if kind == DecoderKind::CodeSpecialist {
+            0.92
+        } else {
+            1.0
+        };
         let adapter = DecoderAdapter::new(
             vb.pp("decoder_adapter"),
             planner_dim,
@@ -82,8 +199,34 @@ impl CandleCrossAttnDecoder {
             decoder,
             vocab,
             device,
+            runtime_dtype,
             planner_dim,
             temperature,
+            repeat_penalty: std::env::var("JEPA_DECODER_REPEAT_PENALTY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_repeat_penalty),
+            repeat_last_n: std::env::var("JEPA_DECODER_REPEAT_LAST_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_repeat_last_n),
+            top_k: std::env::var("JEPA_DECODER_TOP_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_top_k),
+            top_p: std::env::var("JEPA_DECODER_TOP_P")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_top_p),
+            tokenization_mode: if kind == DecoderKind::CodeSpecialist {
+                TokenizationMode::CodeAware
+            } else {
+                TokenizationMode::Default
+            },
+            max_prompt_tokens: std::env::var("JEPA_CANDLE_DECODER_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v: &usize| v > 0),
         })
     }
 
@@ -103,7 +246,7 @@ impl CandleCrossAttnDecoder {
                 let temp = std::env::var("JEPA_DECODER_TEMP")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.7);
+                    .unwrap_or(0.35);
                 Self::new(
                     checkpoint_path,
                     vocab_path,
@@ -114,7 +257,9 @@ impl CandleCrossAttnDecoder {
                     DecoderKind::CodeSpecialist,
                 )
             }
-            _ => Err(anyhow::anyhow!("JEPA_USE_CANDLE_DECODER=1 and JEPA_CANDLE_DECODER=<path> required")),
+            _ => Err(anyhow::anyhow!(
+                "JEPA_USE_CANDLE_DECODER=1 and JEPA_CANDLE_DECODER=<path> required"
+            )),
         }
     }
 
@@ -146,8 +291,153 @@ impl CandleCrossAttnDecoder {
                     DecoderKind::TextGeneralist,
                 )
             }
-            _ => Err(anyhow::anyhow!("JEPA_USE_TEXT_DECODER=1 and JEPA_TEXT_DECODER=<path> required")),
+            _ => Err(anyhow::anyhow!(
+                "JEPA_USE_TEXT_DECODER=1 and JEPA_TEXT_DECODER=<path> required"
+            )),
         }
+    }
+
+    fn sample_next_id(
+        &self,
+        state: &crate::model::decoders::decoder_cross::DecoderGenerationState,
+    ) -> Result<u32> {
+        let mut logits = self.decoder.last_token_logits(state)?;
+        self.apply_repeat_penalty(&mut logits, state);
+        self.apply_token_masks(&mut logits);
+        if self.temperature <= 0.0 {
+            return Ok(logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0));
+        }
+        let distribution = self.sample_distribution(&logits);
+        let mut rng = rand::thread_rng();
+        let r: f32 = rand::Rng::gen(&mut rng);
+        let mut cum = 0.0f32;
+        let mut chosen = distribution
+            .first()
+            .map(|(idx, _)| *idx as u32)
+            .unwrap_or(0);
+        for &(idx, prob) in &distribution {
+            cum += prob;
+            if r <= cum {
+                chosen = idx as u32;
+                break;
+            }
+        }
+        Ok(chosen)
+    }
+
+    fn apply_repeat_penalty(
+        &self,
+        logits: &mut [f32],
+        state: &crate::model::decoders::decoder_cross::DecoderGenerationState,
+    ) {
+        if self.repeat_penalty <= 1.0 {
+            return;
+        }
+        let len = state.token_ids.len();
+        let start = len.saturating_sub(self.repeat_last_n.max(1));
+        let mut seen = std::collections::HashSet::new();
+        for &token_id in &state.token_ids[start..] {
+            let idx = token_id as usize;
+            if idx >= logits.len() || !seen.insert(idx) {
+                continue;
+            }
+            let logit = &mut logits[idx];
+            if *logit >= 0.0 {
+                *logit /= self.repeat_penalty;
+            } else {
+                *logit *= self.repeat_penalty;
+            }
+        }
+    }
+
+    fn apply_token_masks(&self, logits: &mut [f32]) {
+        for &bad_id in &[self.vocab.pad_id, self.vocab.unk_id] {
+            if let Some(logit) = logits.get_mut(bad_id as usize) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn sample_candidate_indices(&self, logits: &[f32]) -> Vec<usize> {
+        let mut indexed = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .collect::<Vec<_>>();
+        indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        if self.top_k > 0 && indexed.len() > self.top_k {
+            indexed.truncate(self.top_k);
+        }
+        if indexed.is_empty() {
+            return vec![0];
+        }
+        indexed.into_iter().map(|(idx, _)| idx).collect()
+    }
+
+    fn sample_distribution(&self, logits: &[f32]) -> Vec<(usize, f32)> {
+        let candidates = self.sample_candidate_indices(logits);
+        self.softmax_over_candidates(logits, &candidates)
+            .unwrap_or_else(|_| vec![(0, 1.0)])
+    }
+
+    fn softmax_over_candidates(
+        &self,
+        logits: &[f32],
+        candidates: &[usize],
+    ) -> Result<Vec<(usize, f32)>> {
+        let scale = 1.0f32 / self.temperature.max(1e-5);
+        let max_logit = candidates
+            .iter()
+            .map(|&idx| logits[idx] * scale)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut scored = candidates
+            .iter()
+            .map(|&idx| (idx, ((logits[idx] * scale) - max_logit).exp()))
+            .collect::<Vec<_>>();
+        let mut total = scored.iter().map(|(_, prob)| *prob).sum::<f32>().max(1e-8);
+        for (_, prob) in &mut scored {
+            *prob /= total;
+        }
+        if self.top_p < 1.0 {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut kept = Vec::new();
+            let mut cumulative = 0.0f32;
+            for (idx, prob) in scored {
+                cumulative += prob;
+                kept.push((idx, prob));
+                if cumulative >= self.top_p.max(1e-3) {
+                    break;
+                }
+            }
+            total = kept.iter().map(|(_, prob)| *prob).sum::<f32>().max(1e-8);
+            let kept_map = kept
+                .into_iter()
+                .map(|(idx, prob)| (idx, prob / total))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut result = Vec::with_capacity(candidates.len().min(kept_map.len()));
+            for &idx in candidates {
+                if let Some(prob) = kept_map.get(&idx).copied() {
+                    result.push((idx, prob));
+                }
+            }
+            return Ok(result);
+        }
+        Ok(candidates
+            .iter()
+            .map(|idx| {
+                scored
+                    .iter()
+                    .find(|(cand_idx, _)| cand_idx == idx)
+                    .map(|(_, prob)| (*idx, *prob))
+                    .unwrap_or((*idx, 0.0))
+            })
+            .collect())
     }
 }
 
@@ -175,21 +465,32 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             conditioning.to_vec(),
             (1, num_planner_slots, self.planner_dim),
             &self.device,
-        )?;
+        )?
+        .to_dtype(self.runtime_dtype)?;
         let world_latent = self.adapter.forward(&planner_slots)?;
-        let tokens = tokenize_for_inference(prompt);
-        if tokens.is_empty() {
+        let mut prompt_ids =
+            encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
+        if let Some(limit) = self.max_prompt_tokens {
+            if prompt_ids.len() > limit {
+                prompt_ids = prompt_ids[prompt_ids.len() - limit..].to_vec();
+            }
+        }
+        if prompt_ids.is_empty() {
             return Ok(String::new());
         }
-        let prompt_ids = self.vocab.encode(&tokens);
-        let generated = self.decoder.generate(
-            &self.device,
-            &prompt_ids,
-            &world_latent,
-            max_new_tokens,
-            self.temperature,
-            Some(self.vocab.pad_id),
-        )?;
+        let mut state = self
+            .decoder
+            .begin_generation(&self.device, &prompt_ids, &world_latent)?;
+        let mut generated = Vec::new();
+        for _ in 0..max_new_tokens {
+            let next_id = self.sample_next_id(&state)?;
+            if next_id == self.vocab.pad_id {
+                break;
+            }
+            generated.push(next_id);
+            self.decoder
+                .step_generation(&self.device, &mut state, next_id)?;
+        }
         let text: String = generated
             .iter()
             .map(|&id| {
@@ -224,20 +525,27 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             conditioning.to_vec(),
             (1, num_planner_slots, self.planner_dim),
             &self.device,
-        )?;
+        )?
+        .to_dtype(self.runtime_dtype)?;
         let world_latent = self.adapter.forward(&planner_slots)?;
-        let tokens = tokenize_for_inference(prompt);
-        if tokens.is_empty() {
+        let mut prompt_ids =
+            encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
+        if let Some(limit) = self.max_prompt_tokens {
+            if prompt_ids.len() > limit {
+                prompt_ids = prompt_ids[prompt_ids.len() - limit..].to_vec();
+            }
+        }
+        if prompt_ids.is_empty() {
             return Ok(());
         }
-        let prompt_ids = self.vocab.encode(&tokens);
-        let mut ids = prompt_ids.clone();
+        let mut state = self
+            .decoder
+            .begin_generation(&self.device, &prompt_ids, &world_latent)?;
         for _ in 0..max_new_tokens {
-            let next_id = self.decoder.step(&self.device, &ids, &world_latent, self.temperature)?;
+            let next_id = self.sample_next_id(&state)?;
             if next_id == self.vocab.pad_id {
                 break;
             }
-            ids.push(next_id);
             let token_str = self
                 .vocab
                 .id_to_token
@@ -245,6 +553,8 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
                 .map(|s| s.as_str())
                 .unwrap_or("<unk>");
             on_chunk(token_str);
+            self.decoder
+                .step_generation(&self.device, &mut state, next_id)?;
         }
         Ok(())
     }
@@ -261,13 +571,20 @@ pub fn clean_candle_decoder_output(raw: &str) -> String {
         }
     }
     // Strip leading role/UI tokens (repeated).
-    const PREFIXES: &[&str] = &["Assistant:", "Assistant :", "assistant", "Assistant", "/", ">"];
+    const PREFIXES: &[&str] = &[
+        "Assistant:",
+        "Assistant :",
+        "assistant",
+        "Assistant",
+        "/",
+        ">",
+    ];
     loop {
         let t = s.trim_start();
         let mut changed = false;
         for p in PREFIXES {
-            if t.starts_with(p) {
-                s = t[p.len()..].trim_start().to_string();
+            if let Some(stripped) = t.strip_prefix(p) {
+                s = stripped.trim_start().to_string();
                 changed = true;
                 break;
             }
