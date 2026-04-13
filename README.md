@@ -28,6 +28,7 @@ The weakest part is still the text decoder, so the main KPI should be a **tiny h
 The **encoder and world model are not the same artifact anymore**.
 
 - The **encoder** turns token ids into hidden states and uses `local_models/vocabs/vocab_encoder.txt`
+- Each encoder checkpoint also saves a matched sibling vocab, for example `local_models/model_latent_69.84M.vocab.txt`
 - The **dialog transition model** works only in latent space and does **not** own a text vocab
 - Each Candle decoder has its **own** vocab saved next to its checkpoint, for example:
   - `local_models/text_decoder_90M.vocab.txt`
@@ -46,6 +47,7 @@ The **encoder and world model are not the same artifact anymore**.
 - hierarchical encoder with true sliding-window local attention, adaptive chunk/global latent states, learned global tokens, multiscale predictor heads, contrastive loss, and structured masking
 - output: `local_models/model_latent_<size>.safetensors`
 - vocab: `local_models/vocabs/vocab_encoder.txt`
+- matched vocab: `local_models/model_latent_<size>.vocab.txt`
 
 3. **Train dialog transition model**
 - uses the frozen encoder + encoder vocab
@@ -82,6 +84,12 @@ Runtime smoke tests for CUDA/BF16 dtype and inference/training-path regressions:
 ```
 
 This runs tiny `--latent`, `--train-world`, `--train-orchestrator`, `--eval-world`, `--train-decoder`, and `--eval-code-assistant` stages with temp data so mixed-precision/runtime issues fail fast.
+
+Also run the static dtype-discipline check before long BF16 runs:
+
+```bash
+python scripts/check_dtype_discipline.py
+```
 ```
 
 The code-first POC now biases the decoder toward the hard Rust eval format:

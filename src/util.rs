@@ -1,7 +1,9 @@
 //! Shared helpers.
 
 use anyhow::Result;
-use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
+use candle_core::{
+    backprop::GradStore, shape::ShapeWithOneHole, DType, Device, Tensor, Var, WithDType,
+};
 use candle_nn::{Optimizer, VarMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,51 @@ pub fn resolve_runtime_dtype(device: &Device) -> DType {
         })
         .unwrap_or(DType::F32);
     resolve_train_dtype(device, requested)
+}
+
+pub fn scalar_f32(tensor: &Tensor) -> Result<f32> {
+    tensor
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()
+        .map_err(Into::into)
+}
+
+pub fn vec1_f32(tensor: &Tensor) -> Result<Vec<f32>> {
+    tensor
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()
+        .map_err(Into::into)
+}
+
+pub fn vec2_f32(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
+    tensor
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()
+        .map_err(Into::into)
+}
+
+pub fn from_vec_like<T: WithDType, S: ShapeWithOneHole>(
+    data: Vec<T>,
+    shape: S,
+    reference: &Tensor,
+) -> Result<Tensor> {
+    Tensor::from_vec(data, shape, reference.device())?
+        .to_dtype(reference.dtype())
+        .map_err(Into::into)
+}
+
+pub fn ensure_same_dtype(lhs: &Tensor, rhs: &Tensor, context: &str) -> Result<()> {
+    let lhs_dtype = lhs.dtype();
+    let rhs_dtype = rhs.dtype();
+    if lhs_dtype != rhs_dtype {
+        anyhow::bail!(
+            "dtype mismatch in {}: lhs={:?} rhs={:?}",
+            context,
+            lhs_dtype,
+            rhs_dtype
+        );
+    }
+    Ok(())
 }
 
 pub fn cast_varmap_dtype(varmap: &mut VarMap, dtype: DType) -> Result<()> {

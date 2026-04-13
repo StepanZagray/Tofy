@@ -39,7 +39,7 @@ def main() -> None:
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--text-pairs", required=True)
-    parser.add_argument("--code-pairs", required=True)
+    parser.add_argument("--code-pairs", required=True, action="append")
     parser.add_argument("--code-ratio", type=float, default=0.35)
     parser.add_argument(
         "--done-ratio",
@@ -53,7 +53,9 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     text_rows = read_pairs(Path(args.text_pairs))
-    code_rows = read_pairs(Path(args.code_pairs))
+    code_rows: list[tuple[str, str]] = []
+    for path in args.code_pairs:
+        code_rows.extend(read_pairs(Path(path)))
     if not text_rows:
         raise SystemExit(f"no usable text rows found in {args.text_pairs}")
     if not code_rows:

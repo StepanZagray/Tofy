@@ -47,6 +47,103 @@ fn looks_like_code_request(prompt: &str) -> bool {
         || lower.contains("typescript")
 }
 
+pub fn code_request_score(prompt: &str) -> f32 {
+    let lower = prompt.to_ascii_lowercase();
+    let mut score = 0.0f32;
+    for needle in [
+        "return only rust code",
+        "implement exactly this function",
+        "write the rust function",
+        "complete this rust function",
+        "implement",
+        "write code",
+        "code only",
+        "rust",
+        "function",
+        "unit test",
+        "compiler",
+        "parse",
+        "impl ",
+        "pub fn",
+        "fn ",
+    ] {
+        if lower.contains(needle) {
+            score += if needle.len() > 10 { 0.9 } else { 0.45 };
+        }
+    }
+    if prompt.contains("```") {
+        score += 0.8;
+    }
+    score.min(3.0)
+}
+
+pub fn terminal_request_score(prompt: &str) -> f32 {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return 2.0;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let mut score = 0.0f32;
+    for needle in [
+        "thanks",
+        "thank you",
+        "that's all",
+        "thats all",
+        "no reply needed",
+        "no response needed",
+        "stop here",
+        "done for now",
+        "nothing else",
+    ] {
+        if lower.contains(needle) {
+            score += 0.8;
+        }
+    }
+    if lower.len() < 24
+        && matches!(
+            lower.as_str(),
+            "ok" | "okay" | "thanks" | "thank you" | "done" | "stop"
+        )
+    {
+        score += 1.2;
+    }
+    score.min(2.5)
+}
+
+pub fn guard_inference_action(prompt: &str, predicted: Action, logits: Option<&[f32]>) -> Action {
+    let code_score = code_request_score(prompt);
+    let terminal_score = terminal_request_score(prompt);
+    let margin = logits
+        .filter(|row| row.len() >= 3)
+        .map(|row| {
+            let mut sorted = [row[0], row[1], row[2]];
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            sorted[0] - sorted[1]
+        })
+        .unwrap_or(0.0);
+
+    if predicted == Action::Done && terminal_score < 0.8 {
+        if code_score >= 0.7 {
+            return Action::Code;
+        }
+        return Action::TextReply;
+    }
+
+    if predicted == Action::TextReply && code_score >= 1.0 {
+        return Action::Code;
+    }
+
+    if predicted == Action::Done && code_score >= 0.4 && margin < 1.5 {
+        return Action::Code;
+    }
+
+    if predicted == Action::Code && terminal_score >= 1.5 && margin < 0.8 {
+        return Action::Done;
+    }
+
+    predicted
+}
+
 /// Fallback when no trained orchestrator head is loaded.
 #[inline]
 pub fn decide_next_action(prompt: &str, assistant_so_far: &str) -> Action {
@@ -65,7 +162,10 @@ pub fn decide_next_action(prompt: &str, assistant_so_far: &str) -> Action {
 
 #[cfg(test)]
 mod tests {
-    use super::{action_from_index, decide_next_action, Action};
+    use super::{
+        action_from_index, decide_next_action, guard_inference_action, terminal_request_score,
+        Action,
+    };
 
     #[test]
     fn action_indices_cover_supported_actions() {
@@ -86,5 +186,20 @@ mod tests {
             Action::TextReply
         );
         assert_eq!(decide_next_action("Hello there", ""), Action::TextReply);
+    }
+
+    #[test]
+    fn inference_guard_prevents_done_on_obvious_code_prompt() {
+        let prompt = "Return only Rust code. Implement exactly this function:\npub fn normalize_path(input: &str) -> String {";
+        assert_eq!(
+            guard_inference_action(prompt, Action::Done, Some(&[0.2, 0.1, 0.9])),
+            Action::Code
+        );
+    }
+
+    #[test]
+    fn terminal_score_detects_short_terminal_prompts() {
+        assert!(terminal_request_score("thanks") >= 1.0);
+        assert!(terminal_request_score("Please implement this function") < 0.8);
     }
 }

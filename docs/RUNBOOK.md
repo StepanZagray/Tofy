@@ -74,6 +74,8 @@ Artifact ownership:
 - text decoder checkpoint + text decoder vocab
 - code decoder checkpoint + code decoder vocab
 
+Important: the encoder now also saves a checkpoint-matched vocab next to the latent model, for example `local_models/model_latent_69.84M.vocab.txt`. Use that sibling vocab when reusing an older latent checkpoint; `local_models/vocabs/vocab_encoder.txt` is only the latest shared encoder vocab.
+
 ## Context Guide
 
 In this project, "context" has three layers:
@@ -388,4 +390,10 @@ Useful overrides:
 - `TOFY_RUNTIME_SMOKE_SKIP_CODE_EVAL=1` to skip the final code-assistant eval
 - `TOFY_RUNTIME_SMOKE_KEEP=1` to keep temp artifacts
 - `TOFY_TRAIN_DTYPE=bf16|f16|f32`
+
+Static dtype discipline check:
+
+```bash
+python scripts/check_dtype_discipline.py
+```
 ```

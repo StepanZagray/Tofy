@@ -351,9 +351,11 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 }
 
 fn extract_code_candidate(response: &str) -> String {
+    let cleaned =
+        crate::model::decoders::decoder_candle_runtime::clean_candle_decoder_output(response);
     let mut best_rust = None;
     let mut best_any = None;
-    let parts: Vec<&str> = response.split("```").collect();
+    let parts: Vec<&str> = cleaned.split("```").collect();
     for fenced in parts.iter().skip(1).step_by(2) {
         let mut lines = fenced.lines();
         let first = lines.next().unwrap_or("").trim();
@@ -379,7 +381,7 @@ fn extract_code_candidate(response: &str) -> String {
     }
     best_rust
         .or(best_any)
-        .unwrap_or_else(|| response.trim().to_string())
+        .unwrap_or_else(|| cleaned.trim().to_string())
 }
 
 fn check_constraints(code: &str, task: &CodeEvalTask) -> (bool, String) {

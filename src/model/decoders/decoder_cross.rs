@@ -575,11 +575,8 @@ mod tests {
             .context("missing cached logits")?
             .i((0, 0, ..))?;
 
-        let max_diff = full_last
-            .broadcast_sub(&cached_last)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let max_diff =
+            crate::util::scalar_f32(&full_last.broadcast_sub(&cached_last)?.abs()?.max_all()?)?;
         assert!(max_diff < 1e-4, "incremental logits mismatch: {max_diff}");
         Ok(())
     }

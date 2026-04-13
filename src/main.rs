@@ -553,35 +553,31 @@ fn run_latent_training(config: Config) -> Result<()> {
             if should_capture_log {
                 let pred_chunk_flat = flatten_latent_slots(&predicted_features.chunk_states)?;
                 let target_chunk_flat = flatten_latent_slots(&paired_view_targets.chunk_states)?;
-                let pred_cos = mean_cosine_similarity(&context_targets, &target_targets)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
-                let chunk_cos = mean_cosine_similarity(&pred_chunk_flat, &target_chunk_flat)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
-                let global_cos = mean_cosine_similarity(&pred_global_mean, &target_global_mean)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
-                let context_rms = tensor_rms(&pred_token_flat)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
-                let target_rms = tensor_rms(&target_flat)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
-                let contrastive_cos = mean_cosine_similarity(&view_a_summary, &view_b_summary)?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()?;
+                let pred_cos =
+                    util::scalar_f32(&mean_cosine_similarity(&context_targets, &target_targets)?)?;
+                let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &pred_chunk_flat,
+                    &target_chunk_flat,
+                )?)?;
+                let global_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &pred_global_mean,
+                    &target_global_mean,
+                )?)?;
+                let context_rms = util::scalar_f32(&tensor_rms(&pred_token_flat)?)?;
+                let target_rms = util::scalar_f32(&tensor_rms(&target_flat)?)?;
+                let contrastive_cos =
+                    util::scalar_f32(&mean_cosine_similarity(&view_a_summary, &view_b_summary)?)?;
                 let target_count = batch.target_count;
                 let target_frac =
                     target_count as f32 / (config.batch_size * config.max_seq).max(1) as f32;
                 log_snapshot = Some(LatentLogSnapshot {
-                    loss_val: loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    pred_val: pred_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    token_pred_val: token_pred_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    chunk_pred_val: chunk_pred_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    global_pred_val: global_pred_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    contrastive_val: contrastive_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    sigreg_val: sigreg_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
+                    loss_val: util::scalar_f32(&loss)?,
+                    pred_val: util::scalar_f32(&pred_loss)?,
+                    token_pred_val: util::scalar_f32(&token_pred_loss)?,
+                    chunk_pred_val: util::scalar_f32(&chunk_pred_loss)?,
+                    global_pred_val: util::scalar_f32(&global_pred_loss)?,
+                    contrastive_val: util::scalar_f32(&contrastive_loss)?,
+                    sigreg_val: util::scalar_f32(&sigreg_loss)?,
                     pred_cos,
                     chunk_cos,
                     global_cos,
@@ -735,6 +731,9 @@ fn run_latent_training(config: Config) -> Result<()> {
     let vocab_path = PathBuf::from("local_models/vocabs/vocab_encoder.txt");
     save_vocab_to_file(&vocab, &vocab_path)?;
     println!("Encoder vocab saved to {:?}", vocab_path);
+    let matched_vocab_path = model_path.with_extension("vocab.txt");
+    save_vocab_to_file(&vocab, &matched_vocab_path)?;
+    println!("Matched encoder vocab saved to {:?}", matched_vocab_path);
     println!("\nTo run JEPA-native evaluation:");
     println!(
         "  cargo run --release -- --eval-jepa {} local_models/vocabs/vocab_encoder.txt <data_path|hub:dataset_id> 200 32 {} {} {} {}",
@@ -858,22 +857,20 @@ fn run_eval_jepa(
 
         let online_at_targets = online_flat.index_select(&target_linear_indices, 0)?; // [N, D]
         let target_latents = target_flat.index_select(&target_linear_indices, 0)?; // [N, D]
-        let pred_loss = prediction_loss(&online_at_targets, &target_latents)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
-        let sigreg_loss = sigreg_epps_pulley(&online_flat, 128, 17)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
+        let pred_loss = util::scalar_f32(&prediction_loss(&online_at_targets, &target_latents)?)?;
+        let sigreg_loss = util::scalar_f32(&sigreg_epps_pulley(&online_flat, 128, 17)?)?;
         let pred_chunk_flat = flatten_latent_slots(&predicted_features.chunk_states)?;
         let target_chunk_flat = flatten_latent_slots(&target_features.chunk_states)?;
         let target_global_mean = target_features.global_states.mean(1)?;
         let pred_global_mean = predicted_features.global_states.mean(1)?;
-        let chunk_cos = mean_cosine_similarity(&pred_chunk_flat, &target_chunk_flat)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
-        let global_cos = mean_cosine_similarity(&pred_global_mean, &target_global_mean)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
+        let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
+            &pred_chunk_flat,
+            &target_chunk_flat,
+        )?)?;
+        let global_cos = util::scalar_f32(&mean_cosine_similarity(
+            &pred_global_mean,
+            &target_global_mean,
+        )?)?;
         let tgt_norm = target_latents
             .sqr()?
             .sum(1)?
@@ -903,7 +900,7 @@ fn run_eval_jepa(
         let scores = pred_unit
             .clone()
             .matmul(&tgt_unit.clone().transpose(0, 1)?)?; // [N, N]
-        let scores_vec = scores.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let scores_vec = util::vec2_f32(&scores)?;
         for (i, row) in scores_vec.iter().enumerate() {
             if i >= row.len() {
                 continue;

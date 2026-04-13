@@ -2,6 +2,8 @@ use anyhow::Result;
 use candle_core::{Module, Tensor, D};
 use candle_nn::{self as nn, VarBuilder};
 
+use crate::util;
+
 #[derive(Clone)]
 pub struct AttentionKvCache {
     pub k: Tensor,
@@ -76,6 +78,7 @@ impl MultiHeadAttention {
         let (b, t, _) = x.dims3()?;
         let (q, k, v) = self.project_self_qkv(&x)?;
         let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        util::ensure_same_dtype(&q, &k, "self attention q/k")?;
         let mut scores = q.matmul(&k_t)?;
         scores = (scores / self.scale)?;
         let mask = mask.to_dtype(scores.dtype())?;
@@ -112,6 +115,7 @@ impl MultiHeadAttention {
         // Attention scores: Q @ K^T / sqrt(d_k)
         // [B, num_heads, T_q, head_dim] @ [B, num_heads, head_dim, T_kv] -> [B, num_heads, T_q, T_kv]
         let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        util::ensure_same_dtype(&q, &k, "cross attention q/k")?;
         let scores = q.matmul(&k_t)?;
         let scores = (scores / self.scale)?;
 
@@ -236,6 +240,7 @@ impl MultiHeadAttention {
             .contiguous()?
             .reshape((b * self.num_heads, t_kv, self.head_dim))?;
         let k_t = k.transpose(1, 2)?.contiguous()?;
+        util::ensure_same_dtype(&q, &k, "incremental self attention q/k")?;
         let scores = q
             .matmul(&k_t)?
             .reshape((b, self.num_heads, t_q, t_kv))?
@@ -282,6 +287,7 @@ impl MultiHeadAttention {
             let q_chunk = q.narrow(2, q_start, q_len)?;
             let k_chunk = k.narrow(2, kv_start, kv_len)?;
             let v_chunk = v.narrow(2, kv_start, kv_len)?;
+            util::ensure_same_dtype(&q_chunk, &k_chunk, "local attention q/k")?;
             let scores = (q_chunk.matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?)? / self.scale)?;
             let bias =
                 local_chunk_bias(q_start, q_len, kv_start, kv_len, window, causal, x.device())?;
@@ -518,6 +524,7 @@ impl CrossAttention {
             .contiguous()?
             .reshape((b * self.num_heads, t_kv, self.head_dim))?;
         let k_t = k.transpose(1, 2)?.contiguous()?;
+        util::ensure_same_dtype(&q, &k, "precomputed cross attention q/k")?;
         let scores = q
             .matmul(&k_t)?
             .reshape((b, self.num_heads, t_q, t_kv))?
@@ -569,6 +576,7 @@ impl CrossAttention {
             .transpose(1, 2)?
             .contiguous()?;
         let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        util::ensure_same_dtype(&q, &k, "masked cross attention q/k")?;
         let scores =
             self.add_key_padding_bias((q.matmul(&k_t)? / self.scale)?, key_padding_mask)?;
         let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
@@ -714,11 +722,7 @@ mod tests {
         let x = test_attention_input(2, 19, 8, &device)?;
         let dense = attn.forward_with_mask(&x, &local_mask(19, 5, &device)?)?;
         let sparse = attn.forward_local(&x, 5)?;
-        let max_diff = dense
-            .broadcast_sub(&sparse)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let max_diff = crate::util::scalar_f32(&dense.broadcast_sub(&sparse)?.abs()?.max_all()?)?;
         assert!(max_diff < 1e-4, "local attention mismatch: {max_diff}");
         Ok(())
     }
@@ -732,11 +736,7 @@ mod tests {
         let x = test_attention_input(2, 23, 12, &device)?;
         let dense = attn.forward_with_mask(&x, &causal_local_mask(23, 7, &device)?)?;
         let sparse = attn.forward_causal_local(&x, 7)?;
-        let max_diff = dense
-            .broadcast_sub(&sparse)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let max_diff = crate::util::scalar_f32(&dense.broadcast_sub(&sparse)?.abs()?.max_all()?)?;
         assert!(
             max_diff < 1e-4,
             "causal local attention mismatch: {max_diff}"
@@ -762,11 +762,8 @@ mod tests {
         }
         let full_last = full.narrow(1, 8, 1)?;
         let inc_last = last.expect("incremental output");
-        let max_diff = full_last
-            .broadcast_sub(&inc_last)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let max_diff =
+            crate::util::scalar_f32(&full_last.broadcast_sub(&inc_last)?.abs()?.max_all()?)?;
         assert!(
             max_diff < 1e-4,
             "incremental causal attention mismatch: {max_diff}"

@@ -461,12 +461,12 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
                 self.planner_dim
             );
         }
-        let planner_slots = Tensor::from_vec(
+        let dtype_ref = Tensor::zeros((1,), self.runtime_dtype, &self.device)?;
+        let planner_slots = crate::util::from_vec_like(
             conditioning.to_vec(),
             (1, num_planner_slots, self.planner_dim),
-            &self.device,
-        )?
-        .to_dtype(self.runtime_dtype)?;
+            &dtype_ref,
+        )?;
         let world_latent = self.adapter.forward(&planner_slots)?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
@@ -521,12 +521,12 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
                 self.planner_dim
             );
         }
-        let planner_slots = Tensor::from_vec(
+        let dtype_ref = Tensor::zeros((1,), self.runtime_dtype, &self.device)?;
+        let planner_slots = crate::util::from_vec_like(
             conditioning.to_vec(),
             (1, num_planner_slots, self.planner_dim),
-            &self.device,
-        )?
-        .to_dtype(self.runtime_dtype)?;
+            &dtype_ref,
+        )?;
         let world_latent = self.adapter.forward(&planner_slots)?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);

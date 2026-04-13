@@ -1481,8 +1481,11 @@ fn encode_sequence(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32>, us
 
 /// Build decoder teacher-forcing batch from world batch.
 /// input[b] = state[b, 0..state_len] ++ next[b, 0..next_len-1], padded to decoder_len.
-/// target[b] = state[b, 1..state_len] ++ next[b, 0..next_len], padded to decoder_len.
-/// loss_mask[b] = 1.0 for (state_len-1)+next_len positions, 0.0 elsewhere.
+/// target[b] = <pad> for prompt-only positions, then next[b, 0..next_len], padded to decoder_len.
+/// loss_mask[b] = 1.0 only for target continuation positions (the `next` side), 0.0 elsewhere.
+///
+/// This intentionally avoids training the decoder to reproduce the prompt/state tokens.
+/// The prompt is context only; the supervised target is the continuation.
 /// decoder_len = 2 * max_seq.
 pub fn make_decoder_batch(
     state_ids: &Tensor,
@@ -1513,18 +1516,18 @@ pub fn make_decoder_batch(
             input_buf.push(pad_id);
         }
 
-        target_buf.extend(state_v[b].iter().take(sl).skip(1).copied());
+        target_buf.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
         target_buf.extend(next_v[b].iter().take(nl).copied());
         let target_len = sl.saturating_sub(1) + nl;
         for _ in target_len..decoder_len {
             target_buf.push(pad_id);
         }
 
-        let n_loss = sl.saturating_sub(1) + nl;
-        mask_buf.extend(std::iter::repeat_n(1.0f32, n_loss));
+        mask_buf.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
+        mask_buf.extend(std::iter::repeat_n(1.0f32, nl));
         mask_buf.extend(std::iter::repeat_n(
             0.0f32,
-            decoder_len.saturating_sub(n_loss),
+            decoder_len.saturating_sub(target_len),
         ));
     }
 
@@ -1565,7 +1568,8 @@ pub fn make_world_batch_from_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::{tokenize_for_inference_mode, TokenizationMode};
+    use super::{make_decoder_batch, tokenize_for_inference_mode, TokenizationMode};
+    use candle_core::{Device, Tensor};
 
     #[test]
     fn code_tokenizer_splits_snake_case_and_operators() {
@@ -1585,5 +1589,26 @@ mod tests {
         let tokens = tokenize_for_inference_mode("parseHTTP2Response", TokenizationMode::CodeAware);
         let expected = vec!["parse", "HTTP", "2", "Response"];
         assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn decoder_batch_only_supervises_continuation_tokens() {
+        let device = Device::Cpu;
+        let state = Tensor::from_vec(vec![10u32, 11, 12, 0], (1, 4), &device).unwrap();
+        let next = Tensor::from_vec(vec![21u32, 22, 0, 0], (1, 4), &device).unwrap();
+        let (input, target, mask) =
+            make_decoder_batch(&state, &next, &[3], &[2], 4, 0, &device).unwrap();
+        assert_eq!(
+            input.to_vec2::<u32>().unwrap()[0],
+            vec![10, 11, 12, 21, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            target.to_vec2::<u32>().unwrap()[0],
+            vec![0, 0, 21, 22, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            mask.to_vec2::<f32>().unwrap()[0],
+            vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        );
     }
 }

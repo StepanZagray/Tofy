@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 use crate::data::{
@@ -451,11 +452,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
     let orchestrator_head =
         OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
+    let inverse_action_head =
+        OrchestratorActionHead::new(world_vb.pp("inverse_action_head"), config.bridge_dim)?;
 
     let train_vars = world_varmap.all_vars();
     let mut opt = candle_nn::AdamW::new_lr(train_vars.clone(), config.lr)?;
 
-    let transition_params = 2
+    let transition_params = 3
         * (config.bridge_dim * config.bridge_dim * 4
             + config.bridge_dim * config.bridge_dim * 2
             + 4 * config.bridge_dim);
@@ -469,7 +472,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         + orchestrator_hidden
         + orchestrator_hidden * ORCH_N
         + ORCH_N;
-    let total_params = transition_params + planner_params + orchestrator_params;
+    let inverse_params = orchestrator_params;
+    let total_params = transition_params + planner_params + orchestrator_params + inverse_params;
     let _ = fs::create_dir_all("local_models");
     let model_path = PathBuf::from(format!(
         "local_models/model_world_{}.safetensors",
@@ -497,11 +501,12 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         DEFAULT_STREAM_SHUFFLE_BUFFER
     );
     println!(
-        "Estimated parameters: ~{} [planner_memory {} + transition {} + orchestrator {}]",
+        "Estimated parameters: ~{} [planner_memory {} + transition {} + orchestrator {} + inverse {}]",
         util::format_params(total_params),
         util::format_params(planner_params),
         util::format_params(transition_params),
-        util::format_params(orchestrator_params)
+        util::format_params(orchestrator_params),
+        util::format_params(inverse_params)
     );
 
     let mut best_loss = f32::MAX;
@@ -536,6 +541,12 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         (config.batch_size * config.grad_accum_steps.max(1)) as f32,
         0,
     );
+    let inverse_loss_weight = std::env::var("TOFY_WORLD_INVERSE_LOSS_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.35f64)
+        .max(0.0);
+    tb.add_scalar("config/inverse_loss_weight", inverse_loss_weight as f32, 0);
     if let Some(vram) = vram_tracker.sample() {
         tb.add_scalar("memory/used_mb", vram.used_mb, 0);
         tb.add_scalar("memory/free_mb", vram.free_mb, 0);
@@ -556,8 +567,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let mut last_transition_loss = None;
         let mut last_sigreg_loss = None;
         let mut last_action_loss = None;
+        let mut last_inverse_loss = None;
         let mut last_loss = None;
         let mut last_action_logits = None;
+        let mut last_inverse_logits = None;
         let mut last_action_labels = Vec::new();
         let mut last_pred_next_slots = None;
         let mut last_next_slots = None;
@@ -652,15 +665,28 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
             let action_logits = orchestrator_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
+            let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+            let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
+            let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
+            let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;
+            let inverse_true_loss =
+                action_cross_entropy(&inverse_logits_true, &action_labels, &device)?;
+            let inverse_pred_loss =
+                action_cross_entropy(&inverse_logits_pred, &action_labels, &device)?;
+            let inverse_loss = inverse_true_loss
+                .broadcast_add(&inverse_pred_loss)?
+                .affine(0.5, 0.0)?;
             let loss = if router_warmup_active {
-                action_loss.clone()
+                action_loss.broadcast_add(&inverse_loss.affine(inverse_loss_weight, 0.0)?)?
             } else {
                 let pred_term = transition_loss.affine(1.0 - config.lambda, 0.0)?;
                 let reg_term = sigreg_loss.affine(config.lambda, 0.0)?;
                 let action_term = action_loss.affine(config.action_loss_weight, 0.0)?;
+                let inverse_term = inverse_loss.affine(inverse_loss_weight, 0.0)?;
                 pred_term
                     .broadcast_add(&reg_term)?
                     .broadcast_add(&action_term)?
+                    .broadcast_add(&inverse_term)?
             };
 
             util::accumulate_scaled_gradients(
@@ -673,8 +699,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             last_transition_loss = Some(transition_loss);
             last_sigreg_loss = Some(sigreg_loss);
             last_action_loss = Some(action_loss);
+            last_inverse_loss = Some(inverse_loss);
             last_loss = Some(loss);
             last_action_logits = Some(action_logits);
+            last_inverse_logits = Some(inverse_logits_pred);
             last_action_labels = action_labels;
             last_pred_next_slots = Some(pred_next_slots);
             last_next_slots = Some(next_slots);
@@ -690,36 +718,38 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 last_sigreg_loss.context("world grad accumulation produced no sigreg loss")?;
             let action_loss =
                 last_action_loss.context("world grad accumulation produced no action loss")?;
+            let inverse_loss =
+                last_inverse_loss.context("world grad accumulation produced no inverse loss")?;
             let loss = last_loss.context("world grad accumulation produced no total loss")?;
             let action_logits =
                 last_action_logits.context("world grad accumulation produced no action logits")?;
+            let inverse_logits = last_inverse_logits
+                .context("world grad accumulation produced no inverse action logits")?;
             let pred_next_slots = last_pred_next_slots
                 .context("world grad accumulation produced no predicted slots")?;
             let next_slots =
                 last_next_slots.context("world grad accumulation produced no next slots")?;
             let state_slots =
                 last_state_slots.context("world grad accumulation produced no state slots")?;
-            let trans_val = transition_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let sigreg_val = sigreg_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let act_val = action_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            let trans_val = util::scalar_f32(&transition_loss)?;
+            let loss_val = util::scalar_f32(&loss)?;
+            let sigreg_val = util::scalar_f32(&sigreg_loss)?;
+            let act_val = util::scalar_f32(&action_loss)?;
+            let inv_val = util::scalar_f32(&inverse_loss)?;
             let action_metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
+            let inverse_metrics = compute_action_metrics(&inverse_logits, &last_action_labels)?;
             let pred_slots_flat = flatten_latent_slots(&pred_next_slots)?;
             let next_slots_flat = flatten_latent_slots(&next_slots)?;
-            let trans_cos = mean_cosine_similarity(&pred_slots_flat, &next_slots_flat)?
-                .to_dtype(DType::F32)?
-                .to_scalar::<f32>()?;
-            let state_slot_rms = tensor_rms(&state_slots)?
-                .to_dtype(DType::F32)?
-                .to_scalar::<f32>()?;
-            let pred_slot_rms = tensor_rms(&pred_next_slots)?
-                .to_dtype(DType::F32)?
-                .to_scalar::<f32>()?;
+            let trans_cos =
+                util::scalar_f32(&mean_cosine_similarity(&pred_slots_flat, &next_slots_flat)?)?;
+            let state_slot_rms = util::scalar_f32(&tensor_rms(&state_slots)?)?;
+            let pred_slot_rms = util::scalar_f32(&tensor_rms(&pred_next_slots)?)?;
 
             tb.add_scalar("loss/total", loss_val, step);
             tb.add_scalar("loss/trans", trans_val, step);
             tb.add_scalar("loss/sigreg", sigreg_val, step);
             tb.add_scalar("loss/action", act_val, step);
+            tb.add_scalar("loss/inverse_action", inv_val, step);
             tb.add_scalar("metrics/action_acc", action_metrics.accuracy, step);
             tb.add_scalar(
                 "metrics/action_balanced_acc",
@@ -727,6 +757,17 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 step,
             );
             tb.add_scalar("metrics/action_macro_f1", action_metrics.macro_f1, step);
+            tb.add_scalar("metrics/inverse_action_acc", inverse_metrics.accuracy, step);
+            tb.add_scalar(
+                "metrics/inverse_action_balanced_acc",
+                inverse_metrics.balanced_accuracy,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/inverse_action_macro_f1",
+                inverse_metrics.macro_f1,
+                step,
+            );
             tb.add_scalar("metrics/trans_cosine", trans_cos, step);
             tb.add_scalar("metrics/code_rate", action_metrics.code_rate, step);
             tb.add_scalar(
@@ -782,9 +823,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     &planner_memory,
                     &transition,
                     &orchestrator_head,
+                    &inverse_action_head,
                     config.max_seq,
                     config.lambda,
                     config.action_loss_weight,
+                    inverse_loss_weight,
                     &device,
                 )?;
                 selection_metric = world_selection_score(&val_metrics);
@@ -793,6 +836,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 tb.add_scalar("val/trans", val_metrics.transition_loss, step);
                 tb.add_scalar("val/sigreg", val_metrics.sigreg_loss, step);
                 tb.add_scalar("val/action", val_metrics.action_loss, step);
+                tb.add_scalar("val/inverse_action", val_metrics.inverse_loss, step);
                 tb.add_scalar("val/action_acc", val_metrics.action_metrics.accuracy, step);
                 tb.add_scalar(
                     "val/action_balanced_acc",
@@ -802,6 +846,21 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 tb.add_scalar(
                     "val/action_macro_f1",
                     val_metrics.action_metrics.macro_f1,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/inverse_action_acc",
+                    val_metrics.inverse_action_metrics.accuracy,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/inverse_action_balanced_acc",
+                    val_metrics.inverse_action_metrics.balanced_accuracy,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/inverse_action_macro_f1",
+                    val_metrics.inverse_action_metrics.macro_f1,
                     step,
                 );
                 tb.add_scalar(
@@ -846,7 +905,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     transition_loss: trans_val,
                     sigreg_loss: sigreg_val,
                     action_loss: act_val,
+                    inverse_loss: inv_val,
                     action_metrics,
+                    inverse_action_metrics: inverse_metrics,
                     transition_cosine: trans_cos,
                 };
                 selection_metric = world_selection_score(&train_metrics);
@@ -859,11 +920,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 world_varmap.save(&model_path)?;
                 saved_checkpoint = true;
                 println!(
-                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}{} [saved best]",
+                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}{} [saved best]",
                     config.steps,
                     action_metrics.accuracy,
                     action_metrics.balanced_accuracy,
                     action_metrics.macro_f1,
+                    inverse_metrics.accuracy,
+                    inverse_metrics.balanced_accuracy,
+                    inverse_metrics.macro_f1,
                     action_metrics.code_precision,
                     action_metrics.code_recall,
                     action_metrics.code_f1,
@@ -877,11 +941,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}{}",
+                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}{}",
                     config.steps,
                     action_metrics.accuracy,
                     action_metrics.balanced_accuracy,
                     action_metrics.macro_f1,
+                    inverse_metrics.accuracy,
+                    inverse_metrics.balanced_accuracy,
+                    inverse_metrics.macro_f1,
                     action_metrics.code_precision,
                     action_metrics.code_recall,
                     action_metrics.code_f1,
@@ -984,6 +1051,15 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     let _transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
     let orchestrator_head =
         OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
+    let _inverse_action_head =
+        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_head.") {
+            Some(OrchestratorActionHead::new(
+                world_vb.pp("inverse_action_head"),
+                config.bridge_dim,
+            )?)
+        } else {
+            None
+        };
     world_varmap.load(&config.world_model_path)?;
     util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
 
@@ -1104,7 +1180,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
             let action_logits = last_action_logits
                 .context("orchestrator grad accumulation produced no action logits")?;
             let metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
-            let action_loss_val = action_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            let action_loss_val = util::scalar_f32(&action_loss)?;
             let mut selection_score = 1.0
                 - (0.7 * metrics.macro_f1 + 0.3 * metrics.balanced_accuracy)
                 + 0.05 * action_loss_val;
@@ -1167,7 +1243,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 .detach();
                 let action_logits = orchestrator_head.forward(&state_slots)?;
                 let val_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
-                let val_loss_val = val_loss.to_scalar::<f32>()?;
+                let val_loss_val = util::scalar_f32(&val_loss)?;
                 let val_metrics = compute_action_metrics(&action_logits, &action_labels)?;
                 selection_score = 1.0
                     - (0.7 * val_metrics.macro_f1 + 0.3 * val_metrics.balanced_accuracy)
@@ -1349,12 +1425,16 @@ struct WorldBatchMetrics {
     transition_loss: f32,
     sigreg_loss: f32,
     action_loss: f32,
+    inverse_loss: f32,
     action_metrics: ActionMetrics,
+    inverse_action_metrics: ActionMetrics,
     transition_cosine: f32,
 }
 
 struct DecoderBatchMetrics {
     loss: f32,
+    ablated_loss: f32,
+    conditioning_gain: f32,
     syntax_loss: f32,
     signature_loss: f32,
     perplexity: f32,
@@ -1535,15 +1615,14 @@ fn action_cross_entropy(logits: &Tensor, labels: &[u32], device: &Device) -> Res
         .gather(&indices, 1)?
         .squeeze(1)?
         .affine(-1.0, 0.0)?;
-    let sample_weights = Tensor::from_vec(
+    let sample_weights = util::from_vec_like(
         sample_labels
             .iter()
             .map(|&label| class_weights.get(label as usize).copied().unwrap_or(1.0))
             .collect::<Vec<_>>(),
         (b,),
-        device,
-    )?
-    .to_dtype(nll.dtype())?;
+        &nll,
+    )?;
     let weighted_nll = nll.broadcast_mul(&sample_weights)?;
     let normalizer = sample_weights.sum_all()?.clamp(1e-8, 1e10)?;
     Ok(weighted_nll.sum_all()?.broadcast_div(&normalizer)?)
@@ -1624,6 +1703,9 @@ fn world_selection_score(metrics: &WorldBatchMetrics) -> f32 {
     let routing_gap = 1.0
         - (0.65 * metrics.action_metrics.macro_f1
             + 0.35 * metrics.action_metrics.balanced_accuracy);
+    let inverse_gap = 1.0
+        - (0.65 * metrics.inverse_action_metrics.macro_f1
+            + 0.35 * metrics.inverse_action_metrics.balanced_accuracy);
     let collapse_penalty = if metrics.action_metrics.code_rate > 0.10
         && metrics.action_metrics.pred_code_rate < 0.05
     {
@@ -1637,11 +1719,20 @@ fn world_selection_score(metrics: &WorldBatchMetrics) -> f32 {
     } else {
         0.0
     };
-    routing_gap + 0.05 * metrics.action_loss + 0.01 * metrics.transition_loss + collapse_penalty
+    routing_gap
+        + 0.6 * inverse_gap
+        + 0.05 * metrics.action_loss
+        + 0.03 * metrics.inverse_loss
+        + 0.01 * metrics.transition_loss
+        + collapse_penalty
+}
+
+fn slot_delta_slots(next_slots: &Tensor, state_slots: &Tensor) -> Result<Tensor> {
+    next_slots.broadcast_sub(state_slots).map_err(Into::into)
 }
 
 fn compute_action_metrics(logits: &Tensor, labels: &[u32]) -> Result<ActionMetrics> {
-    let rows = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let rows = util::vec2_f32(logits)?;
     let n_classes = rows.first().map(|row| row.len()).unwrap_or(0).max(1);
     let mut confusion = vec![vec![0usize; n_classes]; n_classes];
     let mut correct = 0usize;
@@ -1894,13 +1985,10 @@ fn syntax_weight_mask(
     target: &Tensor,
     mask: &Tensor,
     vocab: &Vocab,
-    device: &Device,
+    _device: &Device,
 ) -> Result<Tensor> {
     let target_ids = target.reshape((target.elem_count(),))?.to_vec1::<u32>()?;
-    let mask_values = mask
-        .reshape((mask.elem_count(),))?
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()?;
+    let mask_values = util::vec1_f32(&mask.reshape((mask.elem_count(),))?)?;
     let weights = target_ids
         .iter()
         .zip(mask_values.iter())
@@ -1916,7 +2004,8 @@ fn syntax_weight_mask(
             }
         })
         .collect::<Vec<_>>();
-    Tensor::from_vec(weights, (target.elem_count(),), device).map_err(Into::into)
+    let mask_like = mask.reshape((mask.elem_count(),))?;
+    util::from_vec_like(weights, (target.elem_count(),), &mask_like)
 }
 
 fn signature_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize> {
@@ -1949,10 +2038,10 @@ fn signature_weight_mask(
     target: &Tensor,
     mask: &Tensor,
     vocab: &Vocab,
-    device: &Device,
+    _device: &Device,
 ) -> Result<Tensor> {
     let target_rows = target.to_vec2::<u32>()?;
-    let mask_rows = mask.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let mask_rows = util::vec2_f32(mask)?;
     let seq_len = target.dim(1)?;
     let mut weights = Vec::with_capacity(target.elem_count());
     for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
@@ -1969,7 +2058,7 @@ fn signature_weight_mask(
             }
         }
     }
-    Tensor::from_vec(weights, (target.elem_count(),), device).map_err(Into::into)
+    util::from_vec_like(weights, (target.elem_count(),), mask)
 }
 
 fn rust_function_skeleton_for_tokens(tokens: &[String]) -> bool {
@@ -1990,7 +2079,7 @@ fn decoder_prediction_metrics(
     let pred = logits.argmax(candle_core::D::Minus1)?;
     let pred_rows = pred.to_vec2::<u32>()?;
     let target_rows = target.to_vec2::<u32>()?;
-    let mask_rows = mask.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let mask_rows = util::vec2_f32(mask)?;
     let mut total = 0usize;
     let mut correct = 0usize;
     let mut ident_total = 0usize;
@@ -2082,9 +2171,11 @@ fn evaluate_world_batch(
     planner_memory: &PlannerMemory,
     transition: &WorldTransition,
     orchestrator_head: &OrchestratorActionHead,
+    inverse_action_head: &OrchestratorActionHead,
     max_seq: usize,
     lambda: f64,
     action_loss_weight: f64,
+    inverse_loss_weight: f64,
     device: &Device,
 ) -> Result<WorldBatchMetrics> {
     const SIGREG_SLICES: usize = 128;
@@ -2161,21 +2252,34 @@ fn evaluate_world_batch(
         .affine(1.0 / 3.0, 0.0)?;
     let action_logits = orchestrator_head.forward(&state_slots)?;
     let action_loss = action_cross_entropy(&action_logits, &action_labels, device)?;
+    let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+    let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
+    let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
+    let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;
+    let inverse_true_loss = action_cross_entropy(&inverse_logits_true, &action_labels, device)?;
+    let inverse_pred_loss = action_cross_entropy(&inverse_logits_pred, &action_labels, device)?;
+    let inverse_loss = inverse_true_loss
+        .broadcast_add(&inverse_pred_loss)?
+        .affine(0.5, 0.0)?;
     let total_loss = transition_loss
         .affine(1.0 - lambda, 0.0)?
         .broadcast_add(&sigreg_loss.affine(lambda, 0.0)?)?
-        .broadcast_add(&action_loss.affine(action_loss_weight, 0.0)?)?;
+        .broadcast_add(&action_loss.affine(action_loss_weight, 0.0)?)?
+        .broadcast_add(&inverse_loss.affine(inverse_loss_weight, 0.0)?)?;
     let pred_slots_flat = flatten_latent_slots(&pred_next_slots)?;
     let next_slots_flat = flatten_latent_slots(&next_slots)?;
     Ok(WorldBatchMetrics {
-        total_loss: total_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-        transition_loss: transition_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-        sigreg_loss: sigreg_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-        action_loss: action_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?,
+        total_loss: util::scalar_f32(&total_loss)?,
+        transition_loss: util::scalar_f32(&transition_loss)?,
+        sigreg_loss: util::scalar_f32(&sigreg_loss)?,
+        action_loss: util::scalar_f32(&action_loss)?,
+        inverse_loss: util::scalar_f32(&inverse_loss)?,
         action_metrics: compute_action_metrics(&action_logits, &action_labels)?,
-        transition_cosine: mean_cosine_similarity(&pred_slots_flat, &next_slots_flat)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?,
+        inverse_action_metrics: compute_action_metrics(&inverse_logits_pred, &action_labels)?,
+        transition_cosine: util::scalar_f32(&mean_cosine_similarity(
+            &pred_slots_flat,
+            &next_slots_flat,
+        )?)?,
     })
 }
 
@@ -2229,6 +2333,7 @@ fn evaluate_decoder_batch(
         )?
     };
     let world_latent = decoder_adapter.forward(&next_planner_slots.detach())?;
+    let zero_world_latent = world_latent.affine(0.0, 0.0)?;
     let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
         make_world_batch_from_slice(&decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
     let (dec_input, dec_target, loss_mask) = make_decoder_batch(
@@ -2241,18 +2346,18 @@ fn evaluate_decoder_batch(
         device,
     )?;
     let logits = decoder.forward(&dec_input, &world_latent)?;
+    let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
     let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
     let signature_mask = signature_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
     let loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
+    let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
     let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
     let signature_loss = masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
-    let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-    let syntax_loss_val = syntax_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-    let signature_loss_val = signature_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-    let active_tokens = loss_mask
-        .sum_all()?
-        .to_dtype(DType::F32)?
-        .to_scalar::<f32>()?;
+    let loss_val = util::scalar_f32(&loss)?;
+    let ablated_loss_val = util::scalar_f32(&ablated_loss)?;
+    let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
+    let signature_loss_val = util::scalar_f32(&signature_loss)?;
+    let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
     let total_tokens = (state_lens.len().max(1) * max_seq * 2) as f32;
     let (
         token_accuracy,
@@ -2265,14 +2370,14 @@ fn evaluate_decoder_batch(
     ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
     Ok(DecoderBatchMetrics {
         loss: loss_val,
+        ablated_loss: ablated_loss_val,
+        conditioning_gain: ablated_loss_val - loss_val,
         syntax_loss: syntax_loss_val,
         signature_loss: signature_loss_val,
         perplexity: loss_val.exp(),
         active_tokens,
         active_frac: active_tokens / total_tokens.max(1.0),
-        world_rms: tensor_rms(&world_latent)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?,
+        world_rms: util::scalar_f32(&tensor_rms(&world_latent)?)?,
         oov_rate: raw_examples_oov_rate(raw_batch, decoder_vocab, decoder_token_mode),
         token_accuracy,
         identifier_accuracy,
@@ -2316,6 +2421,7 @@ fn decoder_selection_score(
     signature_loss_weight: f64,
 ) -> f32 {
     metrics.loss
+        + 0.20 * (0.05 - metrics.conditioning_gain).max(0.0)
         + (syntax_loss_weight as f32 * 0.5 * metrics.syntax_loss)
         + (signature_loss_weight as f32 * 0.5 * metrics.signature_loss)
         - 0.08 * metrics.syntax_token_accuracy
@@ -2323,6 +2429,7 @@ fn decoder_selection_score(
         - 0.06 * metrics.delimiter_balance_rate
         - 0.06 * metrics.function_skeleton_rate
         - 0.08 * metrics.signature_exact_rate
+        - 0.04 * metrics.conditioning_gain.max(0.0)
 }
 
 fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
@@ -2392,6 +2499,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.num_latent_tokens,
     )?;
     let transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
+    let _inverse_action_head =
+        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_head.") {
+            Some(OrchestratorActionHead::new(
+                world_vb.pp("inverse_action_head"),
+                config.bridge_dim,
+            )?)
+        } else {
+            None
+        };
     world_varmap.load(&config.world_model_path)?;
     util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
 
@@ -2510,6 +2626,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let run_dir = util::create_run_dir("decoder")?;
     let mut tb = SummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
+    let conditioning_loss_weight = std::env::var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.30f64)
+        .max(0.0);
+    let conditioning_margin = std::env::var("TOFY_DECODER_CONDITIONING_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.10f64)
+        .max(0.0);
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
         run_dir
@@ -2529,6 +2655,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.signature_loss_weight as f32,
         0,
     );
+    tb.add_scalar(
+        "config/conditioning_loss_weight",
+        conditioning_loss_weight as f32,
+        0,
+    );
+    tb.add_scalar("config/conditioning_margin", conditioning_margin as f32, 0);
     tb.add_scalar(
         "config/train_dtype",
         match train_dtype {
@@ -2573,6 +2705,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_dec_target = None;
         let mut last_loss_mask = None;
         let mut last_loss = None;
+        let mut last_ablated_loss = None;
+        let mut last_conditioning_loss = None;
         let mut last_syntax_loss = None;
         let mut last_signature_loss = None;
 
@@ -2608,6 +2742,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 )?
             };
             let world_latent = decoder_adapter.forward(&next_planner_slots.detach())?;
+            let zero_world_latent = world_latent.affine(0.0, 0.0)?;
 
             let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
                 make_world_batch_from_slice(
@@ -2627,16 +2762,23 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             )?;
 
             let logits = decoder.forward(&dec_input, &world_latent)?;
+            let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
             let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let signature_mask =
                 signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let token_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
+            let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
             let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
             let signature_loss =
                 masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+            let conditioning_loss = token_loss
+                .broadcast_sub(&ablated_loss.detach())?
+                .affine(1.0, conditioning_margin)?
+                .relu()?;
             let loss = token_loss
                 .broadcast_add(&syntax_loss.affine(config.syntax_loss_weight, 0.0)?)?
-                .broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?;
+                .broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?
+                .broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
 
             util::accumulate_scaled_gradients(
                 &mut accumulated_grads,
@@ -2651,6 +2793,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             last_dec_target = Some(dec_target);
             last_loss_mask = Some(loss_mask);
             last_loss = Some(loss);
+            last_ablated_loss = Some(ablated_loss);
+            last_conditioning_loss = Some(conditioning_loss);
             last_syntax_loss = Some(syntax_loss);
             last_signature_loss = Some(signature_loss);
         }
@@ -2668,23 +2812,25 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let loss_mask =
                 last_loss_mask.context("decoder grad accumulation produced no loss mask")?;
             let loss = last_loss.context("decoder grad accumulation produced no loss")?;
+            let ablated_loss =
+                last_ablated_loss.context("decoder grad accumulation produced no ablated loss")?;
+            let conditioning_loss = last_conditioning_loss
+                .context("decoder grad accumulation produced no conditioning loss")?;
             let syntax_loss =
                 last_syntax_loss.context("decoder grad accumulation produced no syntax loss")?;
             let signature_loss = last_signature_loss
                 .context("decoder grad accumulation produced no signature loss")?;
-            let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let syntax_loss_val = syntax_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let signature_loss_val = signature_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let active_tokens = loss_mask
-                .sum_all()?
-                .to_dtype(DType::F32)?
-                .to_scalar::<f32>()?;
+            let loss_val = util::scalar_f32(&loss)?;
+            let ablated_loss_val = util::scalar_f32(&ablated_loss)?;
+            let conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
+            let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
+            let signature_loss_val = util::scalar_f32(&signature_loss)?;
+            let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
             let total_tokens = (config.batch_size.max(1) * config.max_seq * 2) as f32;
             let active_frac = active_tokens / total_tokens.max(1.0);
             let perplexity = loss_val.exp();
-            let world_rms = tensor_rms(&world_latent)?
-                .to_dtype(DType::F32)?
-                .to_scalar::<f32>()?;
+            let conditioning_gain = ablated_loss_val - loss_val;
+            let world_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
             let oov_rate = raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
             let (
                 token_accuracy,
@@ -2697,12 +2843,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
 
             tb.add_scalar("loss/token_ce", loss_val, step);
+            tb.add_scalar("loss/ablated_token_ce", ablated_loss_val, step);
+            tb.add_scalar("loss/conditioning_margin", conditioning_loss_val, step);
             tb.add_scalar("loss/syntax_ce", syntax_loss_val, step);
             tb.add_scalar("loss/signature_ce", signature_loss_val, step);
             tb.add_scalar("metrics/perplexity", perplexity, step);
             tb.add_scalar("metrics/active_tokens", active_tokens, step);
             tb.add_scalar("metrics/active_frac", active_frac, step);
             tb.add_scalar("metrics/world_latent_rms", world_rms, step);
+            tb.add_scalar("metrics/conditioning_gain", conditioning_gain, step);
             tb.add_scalar("metrics/oov_rate", oov_rate, step);
             tb.add_scalar("metrics/token_accuracy", token_accuracy, step);
             tb.add_scalar("metrics/identifier_accuracy", identifier_accuracy, step);
@@ -2736,6 +2885,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             }
             let train_metrics = DecoderBatchMetrics {
                 loss: loss_val,
+                ablated_loss: ablated_loss_val,
+                conditioning_gain,
                 syntax_loss: syntax_loss_val,
                 signature_loss: signature_loss_val,
                 perplexity,
@@ -2779,12 +2930,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 );
                 best_loss = best_loss.min(val_metrics.loss);
                 tb.add_scalar("val/token_ce", val_metrics.loss, step);
+                tb.add_scalar("val/ablated_token_ce", val_metrics.ablated_loss, step);
                 tb.add_scalar("val/syntax_ce", val_metrics.syntax_loss, step);
                 tb.add_scalar("val/signature_ce", val_metrics.signature_loss, step);
                 tb.add_scalar("val/perplexity", val_metrics.perplexity, step);
                 tb.add_scalar("val/active_tokens", val_metrics.active_tokens, step);
                 tb.add_scalar("val/active_frac", val_metrics.active_frac, step);
                 tb.add_scalar("val/world_latent_rms", val_metrics.world_rms, step);
+                tb.add_scalar("val/conditioning_gain", val_metrics.conditioning_gain, step);
                 tb.add_scalar("val/oov_rate", val_metrics.oov_rate, step);
                 tb.add_scalar("val/token_accuracy", val_metrics.token_accuracy, step);
                 tb.add_scalar(
@@ -2826,10 +2979,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 decoder_varmap.save(&decoder_path)?;
                 saved_checkpoint = true;
                 println!(
-                    "step {}/{} token_ce {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
                     step,
                     config.steps,
                     loss_val,
+                    ablated_loss_val,
+                    conditioning_gain,
+                    conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
                     perplexity,
@@ -2847,10 +3003,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {}/{} token_ce {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
                     step,
                     config.steps,
                     loss_val,
+                    ablated_loss_val,
+                    conditioning_gain,
+                    conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
                     perplexity,
@@ -3031,12 +3190,12 @@ fn run_eval_world(
             &device,
         )?;
         let pred_slots = transition.forward(&state_slots, &action_labels)?;
-        let pred_loss = prediction_loss(&pred_slots, &next_slots)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
-        let sigreg_loss = sigreg_epps_pulley(&flatten_latent_slots(&pred_slots)?, 128, 17)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
+        let pred_loss = util::scalar_f32(&prediction_loss(&pred_slots, &next_slots)?)?;
+        let sigreg_loss = util::scalar_f32(&sigreg_epps_pulley(
+            &flatten_latent_slots(&pred_slots)?,
+            128,
+            17,
+        )?)?;
         let action_logits = orchestrator_head.forward(&state_slots)?;
         let action_metrics = compute_action_metrics(&action_logits, &action_labels)?;
         n_total += chunk.len();
@@ -3165,6 +3324,104 @@ fn checkpoint_has_prefix(model_path: &PathBuf, prefix: &str) -> bool {
     mapped.tensors().iter().any(|(n, _)| n.starts_with(prefix))
 }
 
+fn likely_rust_request(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("rust")
+        || lower.contains("pub fn")
+        || lower.contains("fn ")
+        || lower.contains("implement exactly this function")
+        || lower.contains("return only rust code")
+}
+
+fn balanced_braces(text: &str) -> bool {
+    let mut round = 0i32;
+    let mut square = 0i32;
+    let mut curly = 0i32;
+    for ch in text.chars() {
+        match ch {
+            '(' => round += 1,
+            ')' => round -= 1,
+            '[' => square += 1,
+            ']' => square -= 1,
+            '{' => curly += 1,
+            '}' => curly -= 1,
+            _ => {}
+        }
+        if round < 0 || square < 0 || curly < 0 {
+            return false;
+        }
+    }
+    round == 0 && square == 0 && curly == 0
+}
+
+fn output_needs_code_repair(prompt: &str, output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let angle_noise = trimmed.matches('<').count() + trimmed.matches('>').count();
+    if !lower.contains("fn ") && prompt.to_ascii_lowercase().contains("fn") {
+        return true;
+    }
+    if !balanced_braces(trimmed) {
+        return true;
+    }
+    angle_noise >= 6 && !lower.contains("fn ")
+}
+
+fn rust_compile_feedback(code: &str) -> Option<String> {
+    let rustc_bin = std::env::var("TOFY_CODE_REPAIR_RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let mut path = std::env::temp_dir();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    path.push(format!("tofy_repair_{stamp}.rs"));
+    if fs::write(&path, format!("{code}\n")).is_err() {
+        return None;
+    }
+    let output = Command::new(rustc_bin)
+        .arg("--crate-type")
+        .arg("lib")
+        .arg(&path)
+        .output()
+        .ok();
+    let _ = fs::remove_file(&path);
+    let output = output?;
+    if output.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(12)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn build_code_repair_prompt(prompt: &str, attempt: &str, feedback: Option<&str>) -> String {
+    let mut out = String::from(
+        "Return only corrected Rust code.\nFix the previous attempt while keeping the exact requested function name and signature.\n\nOriginal request:\n",
+    );
+    out.push_str(prompt);
+    out.push_str("\n\nPrevious attempt:\n```rust\n");
+    out.push_str(attempt);
+    out.push_str("\n```\n");
+    if let Some(feedback) = feedback {
+        out.push_str("\nCompiler feedback:\n");
+        out.push_str(feedback);
+        out.push('\n');
+    }
+    out.push_str("\nRules:\n- Return only compilable Rust code.\n- Do not add explanation.\n");
+    out
+}
+
 impl AgentEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
@@ -3274,6 +3531,32 @@ impl AgentEngine {
         )
     }
 
+    fn route_action_from_state(
+        &self,
+        prompt: &str,
+        state_slots: &Tensor,
+    ) -> Result<crate::tasks::orchestrator::Action> {
+        use crate::tasks::orchestrator::{
+            action_from_index, decide_next_action, guard_inference_action,
+        };
+        if let Some(ref h) = self.orchestrator_head {
+            let logits = h.forward(state_slots)?;
+            let rows = crate::util::vec2_f32(&logits)?;
+            let row = rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("empty orchestrator logits"))?;
+            let predicted = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| action_from_index(idx))
+                .unwrap_or_else(|| decide_next_action(prompt, ""));
+            Ok(guard_inference_action(prompt, predicted, Some(row)))
+        } else {
+            Ok(decide_next_action(prompt, ""))
+        }
+    }
+
     /// Build decoder + conditioning from predicted next planner memory.
     fn get_decoder_and_cond_from_planner_memory(
         &self,
@@ -3281,16 +3564,9 @@ impl AgentEngine {
         action: crate::tasks::orchestrator::Action,
         ablate_conditioning: bool,
     ) -> Result<(Box<dyn LocalDecoderRuntime>, Vec<f32>)> {
-        let planner_vec = next_planner_slots
-            .flatten_all()?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        let pooled_planner = self
-            .planner_memory
-            .pool(next_planner_slots)?
-            .squeeze(0)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
+        let planner_vec = util::vec1_f32(&next_planner_slots.flatten_all()?)?;
+        let pooled_planner = self.planner_memory.pool(next_planner_slots)?.squeeze(0)?;
+        let pooled_planner = util::vec1_f32(&pooled_planner)?;
         let code_decoder =
             CandleCrossAttnDecoder::try_new_from_env_code(self.bridge_dim, self.num_latent_tokens)
                 .ok();
@@ -3341,13 +3617,9 @@ impl AgentEngine {
         ablate_conditioning: bool,
     ) -> Result<String> {
         let start = Instant::now();
-        use crate::tasks::orchestrator::{action_from_index, decide_next_action, Action};
+        use crate::tasks::orchestrator::Action;
         let state_slots = self.encode_prompt_planner_memory(prompt)?;
-        let action = if let Some(ref h) = self.orchestrator_head {
-            action_from_index(h.predict(&state_slots)?)
-        } else {
-            decide_next_action(prompt, "")
-        };
+        let action = self.route_action_from_state(prompt, &state_slots)?;
         let next_slots = rollout_transition_slots(
             &self.transition,
             &state_slots,
@@ -3368,8 +3640,28 @@ impl AgentEngine {
             action,
             ablate_conditioning,
         )?;
-        let assistant_content =
+        let mut assistant_content =
             decoder.generate(prompt, action.as_str(), &cond_vec, chunk_tokens)?;
+        if action == Action::Code && likely_rust_request(prompt) {
+            let repair_passes = std::env::var("TOFY_CODE_REPAIR_PASSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1usize);
+            for _ in 0..repair_passes {
+                if !output_needs_code_repair(prompt, &assistant_content) {
+                    break;
+                }
+                let feedback = rust_compile_feedback(&assistant_content);
+                let repair_prompt =
+                    build_code_repair_prompt(prompt, &assistant_content, feedback.as_deref());
+                let repaired =
+                    decoder.generate(&repair_prompt, action.as_str(), &cond_vec, chunk_tokens)?;
+                if repaired.trim().is_empty() || repaired.trim() == assistant_content.trim() {
+                    break;
+                }
+                assistant_content = repaired;
+            }
+        }
         if std::env::var("JEPA_DEBUG").is_ok() {
             let _ = writeln!(
                 std::io::stderr(),
@@ -3382,14 +3674,8 @@ impl AgentEngine {
     }
 
     pub fn predict_action(&self, prompt: &str) -> Result<crate::tasks::orchestrator::Action> {
-        use crate::tasks::orchestrator::{action_from_index, decide_next_action};
         let state_slots = self.encode_prompt_planner_memory(prompt)?;
-        let action = if let Some(ref h) = self.orchestrator_head {
-            action_from_index(h.predict(&state_slots)?)
-        } else {
-            decide_next_action(prompt, "")
-        };
-        Ok(action)
+        self.route_action_from_state(prompt, &state_slots)
     }
 
     /// Stream generated text in chunks (for SSE). The orchestrator chooses a single decoder mode for the reply.
@@ -3401,14 +3687,10 @@ impl AgentEngine {
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
         let start = Instant::now();
-        use crate::tasks::orchestrator::{action_from_index, decide_next_action, Action};
+        use crate::tasks::orchestrator::Action;
         on_chunk("Thinking... ");
         let state_slots = self.encode_prompt_planner_memory(prompt)?;
-        let action = if let Some(ref h) = self.orchestrator_head {
-            action_from_index(h.predict(&state_slots)?)
-        } else {
-            decide_next_action(prompt, "")
-        };
+        let action = self.route_action_from_state(prompt, &state_slots)?;
         if action == Action::Done {
             on_chunk("Done. ");
             return Ok(());
@@ -3630,8 +3912,11 @@ fn planner_slots_from_token_sequences(
                 planner_memory_segment_from_features(&features, token_len, include_tokens)?;
 
             if recursive_planner_memory && segments.len() > 1 {
-                let segment_mask_tensor =
-                    Tensor::from_vec(segment_mask, (1, segment_memory.dim(1)?), device)?;
+                let segment_mask_tensor = util::from_vec_like(
+                    segment_mask,
+                    (1, segment_memory.dim(1)?),
+                    &segment_memory,
+                )?;
                 let segment_slots =
                     planner_memory.forward_masked(&segment_memory, Some(&segment_mask_tensor))?;
                 folded_slots = Some(match folded_slots {
@@ -3653,7 +3938,7 @@ fn planner_slots_from_token_sequences(
         } else {
             let memory_refs = memory_parts.iter().collect::<Vec<_>>();
             let memory = Tensor::cat(&memory_refs, 1)?;
-            let mask = Tensor::from_vec(mask_parts, (1, memory.dim(1)?), device)?;
+            let mask = util::from_vec_like(mask_parts, (1, memory.dim(1)?), &memory)?;
             planner_memory.forward_masked(&memory, Some(&mask))?
         };
         sample_slots.push(sample);
@@ -3706,7 +3991,7 @@ mod tests {
             pooled_queries: Tensor::zeros((1, 3, 4), DType::F32, &device).unwrap(),
         };
         let mask = planner_memory_mask_from_lengths(&features, &[3]).unwrap();
-        let values = mask.to_vec2::<f32>().unwrap();
+        let values = crate::util::vec2_f32(&mask).unwrap();
         assert_eq!(
             values[0],
             vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0]
