@@ -76,6 +76,7 @@ pub struct DecoderGenerationState {
     pub(crate) self_kv_caches: Vec<Option<AttentionKvCache>>,
     pub(crate) cross_kv_caches: Vec<AttentionKvCache>,
     pub(crate) domain_state: Tensor,
+    pub(crate) structure_state: Tensor,
     pub(crate) last_logits: Option<Tensor>,
 }
 
@@ -247,6 +248,7 @@ impl CodeDecoderBlock {
 pub struct CodeDecoder {
     embed: nn::Embedding,
     kind_embed: nn::Embedding,
+    structure_proj: nn::Linear,
     blocks: Vec<CodeDecoderBlock>,
     ln_final: nn::LayerNorm,
     lm_head: nn::Linear,
@@ -268,6 +270,7 @@ impl CodeDecoder {
     ) -> Result<Self> {
         let embed = nn::embedding(vocab_size, dim, vb.pp("embed"))?;
         let kind_embed = nn::embedding(2, dim, vb.pp("kind_embed"))?;
+        let structure_proj = nn::linear(world_dim, dim, vb.pp("structure_proj"))?;
         let mut blocks = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let block = CodeDecoderBlock::new(
@@ -284,6 +287,7 @@ impl CodeDecoder {
         Ok(Self {
             embed,
             kind_embed,
+            structure_proj,
             blocks,
             ln_final,
             lm_head,
@@ -300,14 +304,16 @@ impl CodeDecoder {
         let pe = positional_encoding(t, self.dim, input_ids.device())?.to_dtype(h.dtype())?;
         h = h.broadcast_add(&pe)?;
         let domain_state = self.domain_state(input_ids.device(), b, t)?;
+        let structure_state = self.structure_state(world_latent, b, t)?;
         h = h.broadcast_add(&domain_state)?;
+        h = h.broadcast_add(&structure_state)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             let use_full_attention =
                 layer_idx % self.kind.anchor_period() == 0 || layer_idx + 1 == self.blocks.len();
             h = block.forward(
                 &h,
                 world_latent,
-                &domain_state,
+                &domain_state.broadcast_add(&structure_state)?,
                 use_full_attention,
                 self.kind.local_window(),
             )?;
@@ -322,6 +328,22 @@ impl CodeDecoder {
         let kind_ids = Tensor::from_vec(vec![self.kind.id(); batch], (batch,), device)?;
         self.kind_embed
             .forward(&kind_ids)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, seq_len, self.dim))
+            .map_err(Into::into)
+    }
+
+    fn structure_state(
+        &self,
+        world_latent: &Tensor,
+        batch: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let slots = world_latent.dim(1)?.max(1);
+        let pooled = world_latent.sum(1)?.affine(1.0 / slots as f64, 0.0)?;
+        self.structure_proj
+            .forward(&pooled)?
+            .tanh()?
             .unsqueeze(1)?
             .broadcast_as((batch, seq_len, self.dim))
             .map_err(Into::into)
@@ -346,13 +368,14 @@ impl CodeDecoder {
         let pe = positional_encoding_from(position, 1, self.dim, device)?.to_dtype(h.dtype())?;
         h = h.broadcast_add(&pe)?;
         h = h.broadcast_add(&state.domain_state)?;
+        h = h.broadcast_add(&state.structure_state)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             let use_full_attention =
                 layer_idx % self.kind.anchor_period() == 0 || layer_idx + 1 == self.blocks.len();
             let (next_h, next_cache) = block.forward_incremental(
                 &h,
                 &state.cross_kv_caches[layer_idx],
-                &state.domain_state,
+                &state.domain_state.broadcast_add(&state.structure_state)?,
                 use_full_attention,
                 self.kind.local_window(),
                 state.self_kv_caches[layer_idx].as_ref(),
@@ -378,6 +401,7 @@ impl CodeDecoder {
                 self_kv_caches: vec![None; self.blocks.len()],
                 cross_kv_caches: self.precompute_cross_kv_caches(world_latent)?,
                 domain_state: self.domain_state(device, 1, 1)?,
+                structure_state: self.structure_state(world_latent, 1, 1)?,
                 last_logits: None,
             });
         }
@@ -387,7 +411,9 @@ impl CodeDecoder {
         let pe = positional_encoding(prompt_len, self.dim, device)?.to_dtype(h.dtype())?;
         h = h.broadcast_add(&pe)?;
         let domain_state_full = self.domain_state(device, 1, prompt_len)?;
+        let structure_state_full = self.structure_state(world_latent, 1, prompt_len)?;
         h = h.broadcast_add(&domain_state_full)?;
+        h = h.broadcast_add(&structure_state_full)?;
         let cross_kv_caches = self.precompute_cross_kv_caches(world_latent)?;
         let mut self_kv_caches = Vec::with_capacity(self.blocks.len());
 
@@ -397,7 +423,7 @@ impl CodeDecoder {
             let (next_h, self_kv_cache) = block.forward_prefill(
                 &h,
                 &cross_kv_caches[layer_idx],
-                &domain_state_full,
+                &domain_state_full.broadcast_add(&structure_state_full)?,
                 use_full_attention,
                 self.kind.local_window(),
             )?;
@@ -414,6 +440,7 @@ impl CodeDecoder {
             self_kv_caches,
             cross_kv_caches,
             domain_state: self.domain_state(device, 1, 1)?,
+            structure_state: self.structure_state(world_latent, 1, 1)?,
             last_logits: Some(logits.narrow(1, prompt_len - 1, 1)?),
         })
     }

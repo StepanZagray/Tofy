@@ -57,10 +57,10 @@ fi
 case "${TOFY_GPU_PROFILE}" in
   8gb)
     DEFAULT_BATCH=2
-    DEFAULT_GRAD_ACCUM=3
+    DEFAULT_GRAD_ACCUM=16
     ;;
   balanced)
-    DEFAULT_BATCH=12
+    DEFAULT_BATCH=8
     DEFAULT_GRAD_ACCUM=1
     ;;
   *)
@@ -78,7 +78,7 @@ if [[ ! -f "${DATASET}" && "${DATASET}" == "data/encoder_mix.txt" ]]; then
   exit 1
 fi
 
-echo "Training LeJEPA encoder: dataset=${DATASET} steps=${STEPS} batch=${BATCH} grad_accum=${GRAD_ACCUM} dim=${DIM} gpu_profile=${TOFY_GPU_PROFILE} vram_mb=${TOTAL_VRAM_MB:-unknown} dtype=${TOFY_TRAIN_DTYPE} latent_segments=${TOFY_LATENT_CONTEXT_SEGMENTS} recent_full=${TOFY_LATENT_RECENT_FULL_SEGMENTS} history_ratio=${TOFY_LATENT_HISTORY_RATIO}"
+echo "Training LeJEPA encoder: dataset=${DATASET} steps=${STEPS} batch=${BATCH} grad_accum=${GRAD_ACCUM} effective_batch=$((BATCH * GRAD_ACCUM)) dim=${DIM} gpu_profile=${TOFY_GPU_PROFILE} vram_mb=${TOTAL_VRAM_MB:-unknown} dtype=${TOFY_TRAIN_DTYPE} latent_segments=${TOFY_LATENT_CONTEXT_SEGMENTS} recent_full=${TOFY_LATENT_RECENT_FULL_SEGMENTS} history_ratio=${TOFY_LATENT_HISTORY_RATIO}"
 maybe_export_cuda_compat
 if [[ -n "${CUDARC_CUDA_VERSION:-}" || -n "${CUDA_COMPUTE_CAP:-}" ]]; then
   echo "CUDA build env: CUDARC_CUDA_VERSION=${CUDARC_CUDA_VERSION:-unset} CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-unset}"

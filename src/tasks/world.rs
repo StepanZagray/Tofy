@@ -6,8 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 use crate::data::{
@@ -1340,6 +1339,7 @@ fn decoder_param_count(
     let lm_head = dim * vocab_size;
     let ln_final = 2 * dim;
     let kind_embed = 2 * dim;
+    let structure_proj = world_dim * dim + dim;
     let adapter_rank = (dim / 4).max(64);
     let per_block = 4 * dim * dim
         + 2 * dim * dim
@@ -1360,7 +1360,13 @@ fn decoder_param_count(
         + 2 * (planner_dim * planner_dim + planner_dim * 4 * planner_dim)
         + planner_dim * world_dim
         + world_dim;
-    decoder_adapter + embed + kind_embed + n_layers * per_block + ln_final + lm_head
+    decoder_adapter
+        + embed
+        + kind_embed
+        + structure_proj
+        + n_layers * per_block
+        + ln_final
+        + lm_head
 }
 
 fn default_decoder_vocab_path(decoder_path: &Path) -> PathBuf {
@@ -1395,6 +1401,7 @@ struct DecoderTrainConfig {
     train_dtype: DType,
     syntax_loss_weight: f64,
     signature_loss_weight: f64,
+    structure_loss_weight: f64,
     init_decoder_path: Option<PathBuf>,
     decoder_kind: DecoderKind,
     decoder_vocab_path: Option<PathBuf>,
@@ -1433,10 +1440,12 @@ struct WorldBatchMetrics {
 
 struct DecoderBatchMetrics {
     loss: f32,
+    raw_loss: f32,
     ablated_loss: f32,
     conditioning_gain: f32,
     syntax_loss: f32,
     signature_loss: f32,
+    structure_loss: f32,
     perplexity: f32,
     active_tokens: f32,
     active_frac: f32,
@@ -1449,6 +1458,8 @@ struct DecoderBatchMetrics {
     function_skeleton_rate: f32,
     signature_token_accuracy: f32,
     signature_exact_rate: f32,
+    function_name_token_accuracy: f32,
+    function_name_exact_rate: f32,
 }
 
 impl DecoderTrainConfig {
@@ -1590,9 +1601,22 @@ impl DecoderTrainConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.45f64)
                 .max(0.0),
+            structure_loss_weight: std::env::var("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.9f64)
+                .max(0.0),
             init_decoder_path,
             decoder_vocab_path,
-            decoder_max_vocab: decoder_max_vocab.unwrap_or(16_000),
+            decoder_max_vocab: decoder_max_vocab.unwrap_or_else(|| {
+                if decoder_kind.unwrap_or(DecoderKind::CodeSpecialist)
+                    == DecoderKind::CodeSpecialist
+                {
+                    32_000
+                } else {
+                    16_000
+                }
+            }),
             decoder_output_path,
         })
     }
@@ -1981,6 +2005,51 @@ fn syntax_weight_for_token(token: &str) -> f32 {
     }
 }
 
+fn is_type_like_token(token: &str) -> bool {
+    matches!(
+        token,
+        "Result"
+            | "Option"
+            | "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "Vec"
+            | "String"
+            | "bool"
+            | "str"
+            | "Self"
+            | "usize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn importance_weight_for_token(token: &str) -> f32 {
+    if matches!(
+        token,
+        "fn" | "pub" | "->" | ":" | "(" | ")" | "{" | "}" | "," | "::"
+    ) {
+        2.4
+    } else if is_type_like_token(token) {
+        2.0
+    } else if is_syntax_token(token) {
+        1.6
+    } else if is_identifier_token(token) {
+        0.35
+    } else {
+        1.0
+    }
+}
+
 fn syntax_weight_mask(
     target: &Tensor,
     mask: &Tensor,
@@ -2034,6 +2103,35 @@ fn signature_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize
     }
 }
 
+fn function_name_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize> {
+    let mut seen_fn = false;
+    let mut positions = Vec::new();
+    for (idx, (&id, &m)) in ids.iter().zip(mask.iter()).enumerate() {
+        if m <= 0.0 {
+            continue;
+        }
+        let token = vocab
+            .id_to_token
+            .get(id as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("<unk>");
+        if !seen_fn {
+            if token == "fn" {
+                seen_fn = true;
+            }
+            continue;
+        }
+        if token == "(" {
+            break;
+        }
+        if token == "<nl>" || token == "pub" {
+            continue;
+        }
+        positions.push(idx);
+    }
+    positions
+}
+
 fn signature_weight_mask(
     target: &Tensor,
     mask: &Tensor,
@@ -2061,6 +2159,101 @@ fn signature_weight_mask(
     util::from_vec_like(weights, (target.elem_count(),), mask)
 }
 
+fn structure_weight_mask(
+    target: &Tensor,
+    mask: &Tensor,
+    vocab: &Vocab,
+    _device: &Device,
+) -> Result<Tensor> {
+    let target_rows = target.to_vec2::<u32>()?;
+    let mask_rows = util::vec2_f32(mask)?;
+    let seq_len = target.dim(1)?;
+    let mut weights = Vec::with_capacity(target.elem_count());
+    for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
+        let signature_positions = signature_span_indices(target_row, mask_row, vocab)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let name_positions = function_name_span_indices(target_row, mask_row, vocab)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let last_brace = target_row
+            .iter()
+            .zip(mask_row.iter())
+            .enumerate()
+            .filter_map(|(idx, (&id, &m))| {
+                if m <= 0.0 {
+                    return None;
+                }
+                let token = vocab.id_to_token.get(id as usize).map(|s| s.as_str())?;
+                if token == "}" {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .next_back();
+        for (idx, &m) in mask_row.iter().enumerate().take(seq_len) {
+            if m <= 0.0 {
+                weights.push(0.0);
+            } else if name_positions.contains(&idx) {
+                weights.push(4.0);
+            } else if signature_positions.contains(&idx) {
+                weights.push(2.8);
+            } else if last_brace == Some(idx) {
+                weights.push(2.2);
+            } else {
+                weights.push(1.0);
+            }
+        }
+    }
+    util::from_vec_like(weights, (target.elem_count(),), mask)
+}
+
+fn importance_weight_mask(
+    target: &Tensor,
+    mask: &Tensor,
+    vocab: &Vocab,
+    _device: &Device,
+) -> Result<Tensor> {
+    let target_rows = target.to_vec2::<u32>()?;
+    let mask_rows = util::vec2_f32(mask)?;
+    let seq_len = target.dim(1)?;
+    let mut weights = Vec::with_capacity(target.elem_count());
+    for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
+        let signature_positions = signature_span_indices(target_row, mask_row, vocab)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let name_positions = function_name_span_indices(target_row, mask_row, vocab)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for (idx, (&id, &m)) in target_row
+            .iter()
+            .zip(mask_row.iter())
+            .enumerate()
+            .take(seq_len)
+        {
+            if m <= 0.0 {
+                weights.push(0.0);
+                continue;
+            }
+            let token = vocab
+                .id_to_token
+                .get(id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("<unk>");
+            let weight = if name_positions.contains(&idx) {
+                4.5
+            } else if signature_positions.contains(&idx) {
+                3.0
+            } else {
+                importance_weight_for_token(token)
+            };
+            weights.push(weight);
+        }
+    }
+    util::from_vec_like(weights, (target.elem_count(),), mask)
+}
+
 fn rust_function_skeleton_for_tokens(tokens: &[String]) -> bool {
     let has_fn = tokens.iter().any(|token| token == "fn");
     let has_parens =
@@ -2075,7 +2268,7 @@ fn decoder_prediction_metrics(
     target: &Tensor,
     mask: &Tensor,
     vocab: &Vocab,
-) -> Result<(f32, f32, f32, f32, f32, f32, f32)> {
+) -> Result<(f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
     let pred = logits.argmax(candle_core::D::Minus1)?;
     let pred_rows = pred.to_vec2::<u32>()?;
     let target_rows = target.to_vec2::<u32>()?;
@@ -2091,13 +2284,18 @@ fn decoder_prediction_metrics(
     let mut signature_total = 0usize;
     let mut signature_correct = 0usize;
     let mut signature_exact = 0usize;
+    let mut function_name_total = 0usize;
+    let mut function_name_correct = 0usize;
+    let mut function_name_exact = 0usize;
     for ((pred_row, target_row), mask_row) in pred_rows
         .iter()
         .zip(target_rows.iter())
         .zip(mask_rows.iter())
     {
         let signature_positions = signature_span_indices(target_row, mask_row, vocab);
+        let function_name_positions = function_name_span_indices(target_row, mask_row, vocab);
         let mut row_signature_ok = !signature_positions.is_empty();
+        let mut row_function_name_ok = !function_name_positions.is_empty();
         for ((&pred_id, &target_id), &m) in
             pred_row.iter().zip(target_row.iter()).zip(mask_row.iter())
         {
@@ -2134,8 +2332,19 @@ fn decoder_prediction_metrics(
                 row_signature_ok = false;
             }
         }
+        for &idx in &function_name_positions {
+            function_name_total += 1;
+            if pred_row.get(idx).copied() == target_row.get(idx).copied() {
+                function_name_correct += 1;
+            } else {
+                row_function_name_ok = false;
+            }
+        }
         if row_signature_ok {
             signature_exact += 1;
+        }
+        if row_function_name_ok {
+            function_name_exact += 1;
         }
         let pred_tokens = decode_active_tokens(pred_row, mask_row, vocab);
         if delimiter_balance_for_tokens(&pred_tokens) {
@@ -2152,6 +2361,9 @@ fn decoder_prediction_metrics(
     let function_skeleton_rate = function_skeletons as f32 / pred_rows.len().max(1) as f32;
     let signature_token_accuracy = signature_correct as f32 / signature_total.max(1) as f32;
     let signature_exact_rate = signature_exact as f32 / pred_rows.len().max(1) as f32;
+    let function_name_token_accuracy =
+        function_name_correct as f32 / function_name_total.max(1) as f32;
+    let function_name_exact_rate = function_name_exact as f32 / pred_rows.len().max(1) as f32;
     Ok((
         token_accuracy,
         identifier_accuracy,
@@ -2160,6 +2372,8 @@ fn decoder_prediction_metrics(
         function_skeleton_rate,
         signature_token_accuracy,
         signature_exact_rate,
+        function_name_token_accuracy,
+        function_name_exact_rate,
     ))
 }
 
@@ -2347,16 +2561,22 @@ fn evaluate_decoder_batch(
     )?;
     let logits = decoder.forward(&dec_input, &world_latent)?;
     let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
+    let importance_mask = importance_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
+    let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
     let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
     let signature_mask = signature_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
-    let loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
+    let structure_mask = structure_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
+    let loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
     let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
+    let raw_loss_val = util::scalar_f32(&raw_loss)?;
     let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
     let signature_loss = masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+    let structure_loss = masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
     let loss_val = util::scalar_f32(&loss)?;
     let ablated_loss_val = util::scalar_f32(&ablated_loss)?;
     let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
     let signature_loss_val = util::scalar_f32(&signature_loss)?;
+    let structure_loss_val = util::scalar_f32(&structure_loss)?;
     let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
     let total_tokens = (state_lens.len().max(1) * max_seq * 2) as f32;
     let (
@@ -2367,13 +2587,17 @@ fn evaluate_decoder_batch(
         function_skeleton_rate,
         signature_token_accuracy,
         signature_exact_rate,
+        function_name_token_accuracy,
+        function_name_exact_rate,
     ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
     Ok(DecoderBatchMetrics {
         loss: loss_val,
+        raw_loss: raw_loss_val,
         ablated_loss: ablated_loss_val,
         conditioning_gain: ablated_loss_val - loss_val,
         syntax_loss: syntax_loss_val,
         signature_loss: signature_loss_val,
+        structure_loss: structure_loss_val,
         perplexity: loss_val.exp(),
         active_tokens,
         active_frac: active_tokens / total_tokens.max(1.0),
@@ -2386,6 +2610,8 @@ fn evaluate_decoder_batch(
         function_skeleton_rate,
         signature_token_accuracy,
         signature_exact_rate,
+        function_name_token_accuracy,
+        function_name_exact_rate,
     })
 }
 
@@ -2419,16 +2645,20 @@ fn decoder_selection_score(
     metrics: &DecoderBatchMetrics,
     syntax_loss_weight: f64,
     signature_loss_weight: f64,
+    structure_loss_weight: f64,
 ) -> f32 {
     metrics.loss
         + 0.20 * (0.05 - metrics.conditioning_gain).max(0.0)
         + (syntax_loss_weight as f32 * 0.5 * metrics.syntax_loss)
         + (signature_loss_weight as f32 * 0.5 * metrics.signature_loss)
+        + (structure_loss_weight as f32 * 0.7 * metrics.structure_loss)
         - 0.08 * metrics.syntax_token_accuracy
         - 0.08 * metrics.signature_token_accuracy
+        - 0.10 * metrics.function_name_token_accuracy
         - 0.06 * metrics.delimiter_balance_rate
         - 0.06 * metrics.function_skeleton_rate
         - 0.08 * metrics.signature_exact_rate
+        - 0.12 * metrics.function_name_exact_rate
         - 0.04 * metrics.conditioning_gain.max(0.0)
 }
 
@@ -2656,6 +2886,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         0,
     );
     tb.add_scalar(
+        "config/structure_loss_weight",
+        config.structure_loss_weight as f32,
+        0,
+    );
+    tb.add_scalar(
         "config/conditioning_loss_weight",
         conditioning_loss_weight as f32,
         0,
@@ -2705,10 +2940,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_dec_target = None;
         let mut last_loss_mask = None;
         let mut last_loss = None;
+        let mut last_raw_loss = None;
         let mut last_ablated_loss = None;
         let mut last_conditioning_loss = None;
         let mut last_syntax_loss = None;
         let mut last_signature_loss = None;
+        let mut last_structure_loss = None;
 
         for _micro_step in 0..config.grad_accum_steps.max(1) {
             let raw_batch = raw_stream.next_batch(config.batch_size.max(1))?;
@@ -2763,14 +3000,21 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
 
             let logits = decoder.forward(&dec_input, &world_latent)?;
             let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
+            let importance_mask =
+                importance_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+            let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
             let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let signature_mask =
                 signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let token_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
+            let structure_mask =
+                structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+            let token_loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
             let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
             let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
             let signature_loss =
                 masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+            let structure_loss =
+                masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
             let conditioning_loss = token_loss
                 .broadcast_sub(&ablated_loss.detach())?
                 .affine(1.0, conditioning_margin)?
@@ -2778,6 +3022,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let loss = token_loss
                 .broadcast_add(&syntax_loss.affine(config.syntax_loss_weight, 0.0)?)?
                 .broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?
+                .broadcast_add(&structure_loss.affine(config.structure_loss_weight, 0.0)?)?
                 .broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
 
             util::accumulate_scaled_gradients(
@@ -2793,10 +3038,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             last_dec_target = Some(dec_target);
             last_loss_mask = Some(loss_mask);
             last_loss = Some(loss);
+            last_raw_loss = Some(raw_loss);
             last_ablated_loss = Some(ablated_loss);
             last_conditioning_loss = Some(conditioning_loss);
             last_syntax_loss = Some(syntax_loss);
             last_signature_loss = Some(signature_loss);
+            last_structure_loss = Some(structure_loss);
         }
 
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
@@ -2812,6 +3059,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let loss_mask =
                 last_loss_mask.context("decoder grad accumulation produced no loss mask")?;
             let loss = last_loss.context("decoder grad accumulation produced no loss")?;
+            let raw_loss =
+                last_raw_loss.context("decoder grad accumulation produced no raw loss")?;
             let ablated_loss =
                 last_ablated_loss.context("decoder grad accumulation produced no ablated loss")?;
             let conditioning_loss = last_conditioning_loss
@@ -2820,11 +3069,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 last_syntax_loss.context("decoder grad accumulation produced no syntax loss")?;
             let signature_loss = last_signature_loss
                 .context("decoder grad accumulation produced no signature loss")?;
+            let structure_loss = last_structure_loss
+                .context("decoder grad accumulation produced no structure loss")?;
             let loss_val = util::scalar_f32(&loss)?;
+            let raw_loss_val = util::scalar_f32(&raw_loss)?;
             let ablated_loss_val = util::scalar_f32(&ablated_loss)?;
             let conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
             let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
             let signature_loss_val = util::scalar_f32(&signature_loss)?;
+            let structure_loss_val = util::scalar_f32(&structure_loss)?;
             let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
             let total_tokens = (config.batch_size.max(1) * config.max_seq * 2) as f32;
             let active_frac = active_tokens / total_tokens.max(1.0);
@@ -2840,13 +3093,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 function_skeleton_rate,
                 signature_token_accuracy,
                 signature_exact_rate,
+                function_name_token_accuracy,
+                function_name_exact_rate,
             ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
 
             tb.add_scalar("loss/token_ce", loss_val, step);
+            tb.add_scalar("loss/raw_token_ce", raw_loss_val, step);
             tb.add_scalar("loss/ablated_token_ce", ablated_loss_val, step);
             tb.add_scalar("loss/conditioning_margin", conditioning_loss_val, step);
             tb.add_scalar("loss/syntax_ce", syntax_loss_val, step);
             tb.add_scalar("loss/signature_ce", signature_loss_val, step);
+            tb.add_scalar("loss/structure_ce", structure_loss_val, step);
             tb.add_scalar("metrics/perplexity", perplexity, step);
             tb.add_scalar("metrics/active_tokens", active_tokens, step);
             tb.add_scalar("metrics/active_frac", active_frac, step);
@@ -2862,6 +3119,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 step,
             );
             tb.add_scalar("metrics/signature_exact_rate", signature_exact_rate, step);
+            tb.add_scalar(
+                "metrics/function_name_token_accuracy",
+                function_name_token_accuracy,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/function_name_exact_rate",
+                function_name_exact_rate,
+                step,
+            );
             tb.add_scalar(
                 "metrics/function_skeleton_rate",
                 function_skeleton_rate,
@@ -2885,10 +3152,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             }
             let train_metrics = DecoderBatchMetrics {
                 loss: loss_val,
+                raw_loss: raw_loss_val,
                 ablated_loss: ablated_loss_val,
                 conditioning_gain,
                 syntax_loss: syntax_loss_val,
                 signature_loss: signature_loss_val,
+                structure_loss: structure_loss_val,
                 perplexity,
                 active_tokens,
                 active_frac,
@@ -2901,11 +3170,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 function_skeleton_rate,
                 signature_token_accuracy,
                 signature_exact_rate,
+                function_name_token_accuracy,
+                function_name_exact_rate,
             };
             let mut selection_metric = decoder_selection_score(
                 &train_metrics,
                 config.syntax_loss_weight,
                 config.signature_loss_weight,
+                config.structure_loss_weight,
             );
             if let Some(ref mut val_stream) = val_stream {
                 let val_raw_batch = val_stream.next_batch(config.batch_size.max(1))?;
@@ -2927,12 +3199,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     &val_metrics,
                     config.syntax_loss_weight,
                     config.signature_loss_weight,
+                    config.structure_loss_weight,
                 );
                 best_loss = best_loss.min(val_metrics.loss);
                 tb.add_scalar("val/token_ce", val_metrics.loss, step);
+                tb.add_scalar("val/raw_token_ce", val_metrics.raw_loss, step);
                 tb.add_scalar("val/ablated_token_ce", val_metrics.ablated_loss, step);
                 tb.add_scalar("val/syntax_ce", val_metrics.syntax_loss, step);
                 tb.add_scalar("val/signature_ce", val_metrics.signature_loss, step);
+                tb.add_scalar("val/structure_ce", val_metrics.structure_loss, step);
                 tb.add_scalar("val/perplexity", val_metrics.perplexity, step);
                 tb.add_scalar("val/active_tokens", val_metrics.active_tokens, step);
                 tb.add_scalar("val/active_frac", val_metrics.active_frac, step);
@@ -2961,6 +3236,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     step,
                 );
                 tb.add_scalar(
+                    "val/function_name_token_accuracy",
+                    val_metrics.function_name_token_accuracy,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/function_name_exact_rate",
+                    val_metrics.function_name_exact_rate,
+                    step,
+                );
+                tb.add_scalar(
                     "val/function_skeleton_rate",
                     val_metrics.function_skeleton_rate,
                     step,
@@ -2979,7 +3264,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 decoder_varmap.save(&decoder_path)?;
                 saved_checkpoint = true;
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
                     step,
                     config.steps,
                     loss_val,
@@ -2988,6 +3273,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
+                    structure_loss_val,
                     perplexity,
                     active_frac * 100.0,
                     oov_rate * 100.0,
@@ -2996,6 +3282,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     syntax_token_accuracy * 100.0,
                     signature_token_accuracy * 100.0,
                     signature_exact_rate * 100.0,
+                    function_name_token_accuracy * 100.0,
+                    function_name_exact_rate * 100.0,
                     delimiter_balance_rate * 100.0,
                     function_skeleton_rate * 100.0,
                     selection_metric,
@@ -3003,7 +3291,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
                     step,
                     config.steps,
                     loss_val,
@@ -3012,6 +3300,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
+                    structure_loss_val,
                     perplexity,
                     active_frac * 100.0,
                     oov_rate * 100.0,
@@ -3020,6 +3309,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     syntax_token_accuracy * 100.0,
                     signature_token_accuracy * 100.0,
                     signature_exact_rate * 100.0,
+                    function_name_token_accuracy * 100.0,
+                    function_name_exact_rate * 100.0,
                     delimiter_balance_rate * 100.0,
                     function_skeleton_rate * 100.0,
                     selection_metric,
@@ -3370,42 +3661,37 @@ fn output_needs_code_repair(prompt: &str, output: &str) -> bool {
     angle_noise >= 6 && !lower.contains("fn ")
 }
 
-fn rust_compile_feedback(code: &str) -> Option<String> {
-    let rustc_bin = std::env::var("TOFY_CODE_REPAIR_RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let mut path = std::env::temp_dir();
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    path.push(format!("tofy_repair_{stamp}.rs"));
-    if fs::write(&path, format!("{code}\n")).is_err() {
-        return None;
+fn maybe_repair_code_output(
+    decoder: &dyn LocalDecoderRuntime,
+    prompt: &str,
+    action: &str,
+    cond_vec: &[f32],
+    chunk_tokens: usize,
+    initial: String,
+) -> String {
+    let repair_passes = std::env::var("TOFY_CODE_REPAIR_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1usize);
+    let mut assistant_content = initial;
+    for _ in 0..repair_passes {
+        if !output_needs_code_repair(prompt, &assistant_content) {
+            break;
+        }
+        let repair_prompt = build_code_repair_prompt(prompt, &assistant_content);
+        let repaired = match decoder.generate(&repair_prompt, action, cond_vec, chunk_tokens) {
+            Ok(text) => text,
+            Err(_) => break,
+        };
+        if repaired.trim().is_empty() || repaired.trim() == assistant_content.trim() {
+            break;
+        }
+        assistant_content = repaired;
     }
-    let output = Command::new(rustc_bin)
-        .arg("--crate-type")
-        .arg("lib")
-        .arg(&path)
-        .output()
-        .ok();
-    let _ = fs::remove_file(&path);
-    let output = output?;
-    if output.status.success() {
-        return None;
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let lines = stderr
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(12)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
+    assistant_content
 }
 
-fn build_code_repair_prompt(prompt: &str, attempt: &str, feedback: Option<&str>) -> String {
+fn build_code_repair_prompt(prompt: &str, attempt: &str) -> String {
     let mut out = String::from(
         "Return only corrected Rust code.\nFix the previous attempt while keeping the exact requested function name and signature.\n\nOriginal request:\n",
     );
@@ -3413,11 +3699,6 @@ fn build_code_repair_prompt(prompt: &str, attempt: &str, feedback: Option<&str>)
     out.push_str("\n\nPrevious attempt:\n```rust\n");
     out.push_str(attempt);
     out.push_str("\n```\n");
-    if let Some(feedback) = feedback {
-        out.push_str("\nCompiler feedback:\n");
-        out.push_str(feedback);
-        out.push('\n');
-    }
     out.push_str("\nRules:\n- Return only compilable Rust code.\n- Do not add explanation.\n");
     out
 }
@@ -3643,24 +3924,14 @@ impl AgentEngine {
         let mut assistant_content =
             decoder.generate(prompt, action.as_str(), &cond_vec, chunk_tokens)?;
         if action == Action::Code && likely_rust_request(prompt) {
-            let repair_passes = std::env::var("TOFY_CODE_REPAIR_PASSES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1usize);
-            for _ in 0..repair_passes {
-                if !output_needs_code_repair(prompt, &assistant_content) {
-                    break;
-                }
-                let feedback = rust_compile_feedback(&assistant_content);
-                let repair_prompt =
-                    build_code_repair_prompt(prompt, &assistant_content, feedback.as_deref());
-                let repaired =
-                    decoder.generate(&repair_prompt, action.as_str(), &cond_vec, chunk_tokens)?;
-                if repaired.trim().is_empty() || repaired.trim() == assistant_content.trim() {
-                    break;
-                }
-                assistant_content = repaired;
-            }
+            assistant_content = maybe_repair_code_output(
+                decoder.as_ref(),
+                prompt,
+                action.as_str(),
+                &cond_vec,
+                chunk_tokens,
+                assistant_content,
+            );
         }
         if std::env::var("JEPA_DEBUG").is_ok() {
             let _ = writeln!(

@@ -154,6 +154,16 @@ fn push_indent_token(tokens: &mut Vec<String>, indent_cols: usize, saw_tab: bool
     }
 }
 
+fn is_lifetime_marker(chars: &[char], idx: usize) -> bool {
+    chars.get(idx) == Some(&'\'')
+        && chars
+            .get(idx + 1)
+            .copied()
+            .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
+            .unwrap_or(false)
+        && chars.get(idx + 2) != Some(&'\'')
+}
+
 fn tokenize_code_text(text: &str) -> Vec<String> {
     const THREE_CHAR_TOKENS: [&str; 8] = ["<<<", ">>>", "<<=", ">>=", "...", "===", "!==", "**="];
     const TWO_CHAR_TOKENS: [&str; 23] = [
@@ -172,17 +182,25 @@ fn tokenize_code_text(text: &str) -> Vec<String> {
             i = next_i;
             continue;
         }
+        if is_lifetime_marker(&chars, i) {
+            push_code_identifier_tokens(&mut tokens, &mut ident);
+            tokens.push("'".to_string());
+            i += 1;
+            continue;
+        }
         let ch = chars[i];
         if ch == '"' || ch == '\'' || ch == '`' {
             push_code_identifier_tokens(&mut tokens, &mut ident);
             let quote = ch;
             i += 1;
             let mut escaped = false;
+            let mut inner_len = 0usize;
             while i < chars.len() {
                 let cur = chars[i];
                 i += 1;
                 if escaped {
                     escaped = false;
+                    inner_len += 1;
                     continue;
                 }
                 if cur == '\\' {
@@ -195,8 +213,13 @@ fn tokenize_code_text(text: &str) -> Vec<String> {
                 if cur == '\n' {
                     break;
                 }
+                inner_len += 1;
             }
-            tokens.push("<str_lit>".to_string());
+            if quote == '\'' && inner_len <= 4 {
+                tokens.push("<char_lit>".to_string());
+            } else {
+                tokens.push("<str_lit>".to_string());
+            }
             continue;
         }
         if ch.is_ascii_digit() && ident.is_empty() {
@@ -1254,7 +1277,54 @@ pub fn tokenize_for_inference_mode(text: &str, mode: TokenizationMode) -> Vec<St
 }
 
 fn is_subword_candidate(token: &str) -> bool {
-    !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric())
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn add_codeaware_reserved_tokens(vocab: &mut Vocab) {
+    const CONTROL_TOKENS: &[&str] = &[
+        "<nl>",
+        "<indent_tab>",
+        "<str_lit>",
+        "<char_lit>",
+        "<num_lit>",
+    ];
+    const RUST_KEYWORDS: &[&str] = &[
+        "fn", "pub", "let", "mut", "impl", "struct", "enum", "trait", "use", "mod", "self", "Self",
+        "crate", "super", "where", "match", "if", "else", "for", "while", "loop", "return",
+        "async", "await", "move", "const", "static", "type", "dyn", "in", "as", "unsafe", "extern",
+        "ref", "Result", "Option", "Some", "None", "Ok", "Err", "Vec", "String", "bool", "str",
+        "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64",
+    ];
+    const DIRECT_TOKENS: &[&str] = &[
+        "'", "_", "&", "*", "(", ")", "{", "}", "[", "]", "<", ">", ",", ".", ":", ";", "!", "?",
+        "+", "-", "/", "%", "=", "|", "^", "#", "@", "$", "~", "\\", "::", "->", "=>", "==", "!=",
+        "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "<<=",
+        ">>=", "...", "//",
+    ];
+    for token in CONTROL_TOKENS {
+        vocab.add_token(token);
+    }
+    for indent in 1..=16 {
+        vocab.add_token(&format!("<indent_{indent}>"));
+    }
+    for token in DIRECT_TOKENS {
+        vocab.add_token(token);
+    }
+    for token in RUST_KEYWORDS {
+        vocab.add_token(token);
+    }
+    for ch in 'a'..='z' {
+        vocab.add_token(&ch.to_string());
+    }
+    for ch in 'A'..='Z' {
+        vocab.add_token(&ch.to_string());
+    }
+    for ch in '0'..='9' {
+        vocab.add_token(&ch.to_string());
+    }
 }
 
 fn encode_tokens_with_vocab(tokens: &[String], vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
@@ -1264,7 +1334,7 @@ fn encode_tokens_with_vocab(tokens: &[String], vocab: &Vocab, mode: Tokenization
             encoded.push(*id);
             continue;
         }
-        if mode != TokenizationMode::CodeAware || !is_subword_candidate(token) {
+        if mode != TokenizationMode::CodeAware {
             encoded.push(vocab.unk_id);
             continue;
         }
@@ -1362,17 +1432,18 @@ pub fn build_vocab_from_raw_world_file_with_mode(
     let vocab_size = max_vocab.saturating_sub(3).min(sorted.len());
     let mut vocab = Vocab::new();
     if mode == TokenizationMode::CodeAware {
+        add_codeaware_reserved_tokens(&mut vocab);
         let mut direct_tokens = Vec::new();
         let mut char_counts: HashMap<String, usize> = HashMap::new();
         let mut word_tokens = Vec::new();
         for (token, count) in &sorted {
             if is_subword_candidate(token) {
                 word_tokens.push((token.clone(), *count));
-                for ch in token.chars() {
-                    *char_counts.entry(ch.to_string()).or_insert(0) += *count;
-                }
             } else {
                 direct_tokens.push((token.clone(), *count));
+            }
+            for ch in token.chars() {
+                *char_counts.entry(ch.to_string()).or_insert(0) += *count;
             }
         }
         direct_tokens.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1588,6 +1659,35 @@ mod tests {
     fn code_tokenizer_splits_camel_case_and_digits() {
         let tokens = tokenize_for_inference_mode("parseHTTP2Response", TokenizationMode::CodeAware);
         let expected = vec!["parse", "HTTP", "2", "Response"];
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn code_tokenizer_keeps_rust_lifetimes_and_char_literals_distinct() {
+        let tokens = tokenize_for_inference_mode(
+            "fn map<'a>(x: &'a str, c: 'x')",
+            TokenizationMode::CodeAware,
+        );
+        let expected = vec![
+            "fn",
+            "map",
+            "<",
+            "'",
+            "a",
+            ">",
+            "(",
+            "x",
+            ":",
+            "&",
+            "'",
+            "a",
+            "str",
+            ",",
+            "c",
+            ":",
+            "<char_lit>",
+            ")",
+        ];
         assert_eq!(tokens, expected);
     }
 

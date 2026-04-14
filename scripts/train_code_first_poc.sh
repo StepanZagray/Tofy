@@ -11,7 +11,6 @@ WIKI_DATA="${WIKI_DATA:-data/cached_wikimedia_wikipedia_1.txt}"
 ENCODER_DATA="${ENCODER_DATA:-data/encoder_mix.txt}"
 EVAL_SUITE="${EVAL_SUITE:-eval/code_assistant_rust_hard.jsonl}"
 RUST_TASK_DATA="${RUST_TASK_DATA:-data/rust_instruction_pairs.txt}"
-RUST_REPAIR_DATA="${RUST_REPAIR_DATA:-data/rust_repair_pairs.txt}"
 RUST_DOCS_ROOT="${RUST_DOCS_ROOT:-data/sunface_rust-by-practice_en}"
 RUST_DOCS_JEPA_DATA="${RUST_DOCS_JEPA_DATA:-data/rust_docs_jepa.txt}"
 RUST_DOCS_PAIR_DATA="${RUST_DOCS_PAIR_DATA:-data/rust_docs_pairs.txt}"
@@ -41,7 +40,6 @@ WORLD_STEPS="${WORLD_STEPS:-60000}"
 ROUTER_STEPS="${ROUTER_STEPS:-15000}"
 CODE_DECODER_STEPS="${CODE_DECODER_STEPS:-40000}"
 CODE_POLISH_STEPS="${CODE_POLISH_STEPS:-8000}"
-CODE_REPAIR_STEPS="${CODE_REPAIR_STEPS:-4000}"
 
 DIM="${DIM:-768}"
 LATENT_MAX_SEQ="${LATENT_MAX_SEQ:-256}"
@@ -50,13 +48,12 @@ CODE_DECODER_MAX_SEQ="${CODE_DECODER_MAX_SEQ:-224}"
 LAYERS="${LAYERS:-9}"
 HEADS="${HEADS:-8}"
 MAX_VOCAB="${MAX_VOCAB:-8000}"
-CODE_DECODER_MAX_VOCAB="${CODE_DECODER_MAX_VOCAB:-24000}"
+CODE_DECODER_MAX_VOCAB="${CODE_DECODER_MAX_VOCAB:-32000}"
 BRIDGE_DIM="${BRIDGE_DIM:-256}"
 NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
 WORLD_LR="${WORLD_LR:-2e-4}"
 CODE_DECODER_LR="${CODE_DECODER_LR:-3e-4}"
 CODE_POLISH_LR="${CODE_POLISH_LR:-1e-4}"
-CODE_REPAIR_LR="${CODE_REPAIR_LR:-8e-5}"
 WORLD_LAMBDA="${WORLD_LAMBDA:-0.2}"
 WORLD_ACTION_LOSS_WEIGHT="${WORLD_ACTION_LOSS_WEIGHT:-1.0}"
 WORLD_ROUTER_WARMUP="${WORLD_ROUTER_WARMUP:-5000}"
@@ -111,15 +108,19 @@ fi
 
 case "${TOFY_GPU_PROFILE}" in
   8gb)
-    DEFAULT_BATCH=2
+    DEFAULT_BATCH=4
     DEFAULT_DECODER_BATCH=4
-    DEFAULT_LATENT_GRAD_ACCUM=3
-    DEFAULT_WORLD_GRAD_ACCUM=1
-    DEFAULT_DECODER_GRAD_ACCUM=2
+    DEFAULT_LATENT_BATCH=2
+    DEFAULT_WORLD_BATCH=4
+    DEFAULT_LATENT_GRAD_ACCUM=16
+    DEFAULT_WORLD_GRAD_ACCUM=32
+    DEFAULT_DECODER_GRAD_ACCUM=8
     ;;
   balanced)
     DEFAULT_BATCH=12
     DEFAULT_DECODER_BATCH=8
+    DEFAULT_LATENT_BATCH=8
+    DEFAULT_WORLD_BATCH=12
     DEFAULT_LATENT_GRAD_ACCUM=1
     DEFAULT_WORLD_GRAD_ACCUM=1
     DEFAULT_DECODER_GRAD_ACCUM=1
@@ -132,8 +133,8 @@ esac
 
 BATCH="${BATCH:-${DEFAULT_BATCH}}"
 DECODER_BATCH="${DECODER_BATCH:-${DEFAULT_DECODER_BATCH}}"
-LATENT_BATCH="${LATENT_BATCH:-${BATCH}}"
-WORLD_BATCH="${WORLD_BATCH:-${BATCH}}"
+LATENT_BATCH="${LATENT_BATCH:-${DEFAULT_LATENT_BATCH:-${BATCH}}}"
+WORLD_BATCH="${WORLD_BATCH:-${DEFAULT_WORLD_BATCH:-${BATCH}}}"
 CODE_DECODER_BATCH="${CODE_DECODER_BATCH:-${DECODER_BATCH}}"
 DECODER_GRAD_ACCUM="${DECODER_GRAD_ACCUM:-${DEFAULT_DECODER_GRAD_ACCUM}}"
 LATENT_GRAD_ACCUM="${LATENT_GRAD_ACCUM:-${DEFAULT_LATENT_GRAD_ACCUM}}"
@@ -145,6 +146,7 @@ CODE_DECODER_GRAD_ACCUM="${CODE_DECODER_GRAD_ACCUM:-${DECODER_GRAD_ACCUM}}"
 echo "GPU profile: ${TOFY_GPU_PROFILE} (vram_mb=${TOTAL_VRAM_MB:-unknown})"
 echo "Microbatches: latent=${LATENT_BATCH} world=${WORLD_BATCH} code_decoder=${CODE_DECODER_BATCH}"
 echo "Grad accum: latent=${LATENT_GRAD_ACCUM} world=${WORLD_GRAD_ACCUM} code_decoder=${CODE_DECODER_GRAD_ACCUM}"
+echo "Effective batch: latent=$((LATENT_BATCH * LATENT_GRAD_ACCUM)) world=$((WORLD_BATCH * WORLD_GRAD_ACCUM)) code_decoder=$((CODE_DECODER_BATCH * CODE_DECODER_GRAD_ACCUM))"
 echo "Training dtype: ${TOFY_TRAIN_DTYPE} | latent_segments=${TOFY_LATENT_CONTEXT_SEGMENTS} recent_full=${TOFY_LATENT_RECENT_FULL_SEGMENTS} history_ratio=${TOFY_LATENT_HISTORY_RATIO}"
 echo "World memory: segments=${TOFY_WORLD_CONTEXT_SEGMENTS} recent_full=${TOFY_WORLD_RECENT_FULL_SEGMENTS} recursive=${TOFY_RECURSIVE_PLANNER_MEMORY} rollout_train=${TOFY_WORLD_TRAIN_ROLLOUT_STEPS} rollout_serve=${TOFY_WORLD_ROLLOUT_STEPS}"
 
@@ -222,14 +224,6 @@ echo "Preparing code-first decoder mix at ${CODE_TRAIN_DATA}"
   "${EXTRA_CODE_MIX_ARGS[@]}" \
   --max-rows "${CODE_TRAIN_MAX_ROWS}"
 
-echo "Preparing Rust repair pairs at ${RUST_REPAIR_DATA}"
-"${PYTHON_BIN}" scripts/prepare_rust_repair_tasks.py \
-  --input "${RUST_TASK_DATA}" \
-  --output "${RUST_REPAIR_DATA}" \
-  --rustc rustc \
-  --variants-per-sample 2 \
-  --max-rows "${CODE_TRAIN_MAX_ROWS}"
-
 echo "Generating code eval suite at ${EVAL_SUITE}"
 "${PYTHON_BIN}" scripts/generate_code_eval_suite.py --output "${EVAL_SUITE}"
 
@@ -280,13 +274,6 @@ if [[ "${CODE_POLISH_STEPS}" -gt 0 ]]; then
   TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code_polish" cargo run --release -- \
     --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${RUST_TASK_DATA}" "${CODE_POLISH_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
     --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --init-decoder "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_POLISH_LR}"
-fi
-
-if [[ -s "${RUST_REPAIR_DATA}" && "${CODE_REPAIR_STEPS}" -gt 0 ]]; then
-  echo "== Stage 4c/6: code decoder repair polish =="
-  TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code_repair" cargo run --release -- \
-    --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${RUST_REPAIR_DATA}" "${CODE_REPAIR_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
-    --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --init-decoder "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_REPAIR_LR}"
 fi
 
 echo "== Stage 5/6: code eval suite =="
