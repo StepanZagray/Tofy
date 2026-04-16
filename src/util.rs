@@ -1,10 +1,12 @@
 //! Shared helpers.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{
     backprop::GradStore, shape::ShapeWithOneHole, DType, Device, Tensor, Var, WithDType,
 };
-use candle_nn::{Optimizer, VarMap};
+use candle_nn::{Optimizer, ParamsAdamW, VarMap};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,6 +111,274 @@ pub fn cast_varmap_dtype(varmap: &mut VarMap, dtype: DType) -> Result<()> {
             var.set(&casted)?;
         }
     }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct NamedVar {
+    pub name: String,
+    pub var: Var,
+}
+
+pub fn named_train_vars(varmap: &VarMap) -> Result<Vec<NamedVar>> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to lock varmap for named train vars"))?;
+    let mut vars = data
+        .iter()
+        .filter(|(_, var)| var.dtype().is_float())
+        .map(|(name, var)| NamedVar {
+            name: name.clone(),
+            var: var.clone(),
+        })
+        .collect::<Vec<_>>();
+    vars.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(vars)
+}
+
+#[derive(Debug)]
+struct AdamWVarState {
+    name: String,
+    var: Var,
+    first_moment: Var,
+    second_moment: Var,
+}
+
+/// AdamW with explicit save/load support for optimizer moments and step count.
+///
+/// Candle's built-in AdamW keeps moment buffers private, so long-running training could only
+/// restart from weights. This optimizer mirrors Candle's update rule but stores moments as F32 for
+/// better mixed-precision stability and resumability.
+#[derive(Debug)]
+pub struct ResumableAdamW {
+    vars: Vec<AdamWVarState>,
+    step_t: usize,
+    params: ParamsAdamW,
+}
+
+impl ResumableAdamW {
+    pub fn new_lr_named(vars: Vec<NamedVar>, learning_rate: f64) -> Result<Self> {
+        let params = ParamsAdamW {
+            lr: learning_rate,
+            ..ParamsAdamW::default()
+        };
+        let vars = vars
+            .into_iter()
+            .filter(|entry| entry.var.dtype().is_float())
+            .map(|entry| {
+                let shape = entry.var.shape().clone();
+                let device = entry.var.device().clone();
+                Ok(AdamWVarState {
+                    name: entry.name,
+                    var: entry.var,
+                    first_moment: Var::zeros(shape.clone(), DType::F32, &device)?,
+                    second_moment: Var::zeros(shape, DType::F32, &device)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            vars,
+            step_t: 0,
+            params,
+        })
+    }
+
+    pub fn step_t(&self) -> usize {
+        self.step_t
+    }
+
+    pub fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let device = self
+            .vars
+            .first()
+            .map(|state| state.var.device().clone())
+            .unwrap_or(Device::Cpu);
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        tensors.insert(
+            "__step".to_string(),
+            Tensor::from_vec(vec![self.step_t as i64], (1,), &device)?,
+        );
+        tensors.insert(
+            "__lr".to_string(),
+            Tensor::from_vec(vec![self.params.lr], (1,), &device)?,
+        );
+        for state in &self.vars {
+            tensors.insert(
+                format!("{}.first_moment", state.name),
+                state.first_moment.as_tensor().clone(),
+            );
+            tensors.insert(
+                format!("{}.second_moment", state.name),
+                state.second_moment.as_tensor().clone(),
+            );
+        }
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+        candle_core::safetensors::save(&tensors, &tmp_path)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    pub fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let device = self
+            .vars
+            .first()
+            .map(|state| state.var.device().clone())
+            .unwrap_or(Device::Cpu);
+        let tensors = candle_core::safetensors::load(path, &device)
+            .with_context(|| format!("failed to load optimizer state from {:?}", path))?;
+        if let Some(step) = tensors.get("__step") {
+            self.step_t = step.to_dtype(DType::I64)?.to_scalar::<i64>()?.max(0) as usize;
+        }
+        for state in &mut self.vars {
+            let m_key = format!("{}.first_moment", state.name);
+            let v_key = format!("{}.second_moment", state.name);
+            let m = tensors.get(&m_key).ok_or_else(|| {
+                anyhow::anyhow!("optimizer state {:?} missing tensor {}", path, m_key)
+            })?;
+            let v = tensors.get(&v_key).ok_or_else(|| {
+                anyhow::anyhow!("optimizer state {:?} missing tensor {}", path, v_key)
+            })?;
+            state.first_moment.set(&m.to_dtype(DType::F32)?)?;
+            state.second_moment.set(&v.to_dtype(DType::F32)?)?;
+        }
+        Ok(())
+    }
+}
+
+impl Optimizer for ResumableAdamW {
+    type Config = ParamsAdamW;
+
+    fn new(vars: Vec<Var>, params: ParamsAdamW) -> candle_core::Result<Self> {
+        let vars = vars
+            .into_iter()
+            .enumerate()
+            .map(|(idx, var)| NamedVar {
+                name: format!("var_{idx}"),
+                var,
+            })
+            .collect::<Vec<_>>();
+        let mut optimizer =
+            Self::new_lr_named(vars, params.lr).map_err(candle_core::Error::wrap)?;
+        optimizer.params = params;
+        Ok(optimizer)
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.params.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.params.lr = lr;
+    }
+
+    fn step(&mut self, grads: &GradStore) -> candle_core::Result<()> {
+        self.step_t += 1;
+        let lr = self.params.lr;
+        let lambda = self.params.weight_decay;
+        let lr_lambda = lr * lambda;
+        let beta1 = self.params.beta1;
+        let beta2 = self.params.beta2;
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        for state in &self.vars {
+            if let Some(g) = grads.get(&state.var) {
+                let theta_f32 = state.var.as_tensor().to_dtype(DType::F32)?;
+                let grad_f32 = g.to_dtype(DType::F32)?;
+                let m = state.first_moment.as_tensor();
+                let v = state.second_moment.as_tensor();
+                let next_m = ((m * beta1)? + (&grad_f32 * (1.0 - beta1))?)?;
+                let next_v = ((v * beta2)? + (grad_f32.sqr()? * (1.0 - beta2))?)?;
+                let m_hat = (&next_m * scale_m)?;
+                let v_hat = (&next_v * scale_v)?;
+                let decayed_theta = (theta_f32 * (1f64 - lr_lambda))?;
+                let adjusted_grad = (m_hat / (v_hat.sqrt()? + self.params.eps)?)?;
+                let next_theta = (decayed_theta - (adjusted_grad * lr)?)?;
+                state.first_moment.set(&next_m)?;
+                state.second_moment.set(&next_v)?;
+                state.var.set(&next_theta.to_dtype(state.var.dtype())?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingResumeState {
+    pub stage: String,
+    pub step: usize,
+    pub best_metric: f32,
+    pub best_aux_metric: f32,
+    pub saved_checkpoint: bool,
+}
+
+impl TrainingResumeState {
+    pub fn new(stage: &str) -> Self {
+        Self {
+            stage: stage.to_string(),
+            step: 0,
+            best_metric: f32::MAX,
+            best_aux_metric: f32::MAX,
+            saved_checkpoint: false,
+        }
+    }
+}
+
+pub fn checkpoint_sidecar_path(model_path: &Path, stage: &str, suffix: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.{}.{}",
+        model_path.to_string_lossy(),
+        stage,
+        suffix
+    ))
+}
+
+pub fn resume_stage_name(default_stage: &str) -> String {
+    std::env::var("TOFY_RUN_STAGE_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_stage.to_string())
+}
+
+pub fn save_varmap_atomic(varmap: &VarMap, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    varmap.save(&tmp_path)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+pub fn load_resume_state(path: &Path, expected_stage: &str) -> Result<Option<TrainingResumeState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    let state: TrainingResumeState = serde_json::from_str(&text)?;
+    if state.stage != expected_stage {
+        anyhow::bail!(
+            "resume state {:?} is for stage {:?}, expected {:?}",
+            path,
+            state.stage,
+            expected_stage
+        );
+    }
+    Ok(Some(state))
+}
+
+pub fn save_resume_state(path: &Path, state: &TrainingResumeState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 

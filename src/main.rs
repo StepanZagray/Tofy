@@ -42,6 +42,28 @@ fn latent_target_ema_decay(step: usize, total_steps: usize) -> f64 {
     (0.992 + 0.007 * progress).clamp(0.992, 0.999)
 }
 
+fn latent_grad_accum_for_step(step: usize, config: &Config) -> usize {
+    if config.grad_accum_warmup_steps > 0
+        && step <= config.grad_accum_warmup_steps
+        && config.grad_accum_warmup_value < config.grad_accum_steps
+    {
+        config.grad_accum_warmup_value.max(1)
+    } else {
+        config.grad_accum_steps.max(1)
+    }
+}
+
+fn latent_batch_size_for_step(step: usize, config: &Config) -> usize {
+    if config.batch_warmup_steps > 0
+        && step <= config.batch_warmup_steps
+        && config.batch_warmup_value != config.batch_size
+    {
+        config.batch_warmup_value.max(1)
+    } else {
+        config.batch_size.max(1)
+    }
+}
+
 fn latent_curriculum(
     step: usize,
     total_steps: usize,
@@ -296,7 +318,7 @@ fn main() -> Result<()> {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>]",
+        "    {} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--resume]",
         args[0]
     );
     eprintln!(
@@ -314,15 +336,15 @@ fn main() -> Result<()> {
         args[0]
     );
     eprintln!(
-        "    {} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>]",
+        "    {} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--resume]",
         args[0]
     );
     eprintln!(
-        "    {} --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>]",
+        "    {} --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>] [--resume]",
         args[0]
     );
     eprintln!(
-        "    {} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--init-decoder <path>] [--decoder-output <path>]",
+        "    {} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]",
         args[0]
     );
     eprintln!(
@@ -405,9 +427,6 @@ fn run_latent_training(config: Config) -> Result<()> {
     );
 
     let mut varmap = VarMap::new();
-    if let Some(ref init_path) = config.init_encoder_path {
-        varmap.load(init_path)?;
-    }
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let vb = VarBuilder::from_varmap(&varmap, train_dtype, &device);
 
@@ -420,6 +439,42 @@ fn run_latent_training(config: Config) -> Result<()> {
     )?;
     util::cast_varmap_dtype(&mut varmap, train_dtype)?;
 
+    let _ =
+        fs::create_dir_all("local_models").and_then(|_| fs::create_dir_all("local_models/vocabs"));
+    let model_path = PathBuf::from(format!(
+        "local_models/model_latent_{}.safetensors",
+        util::format_params(latent_params)
+    ));
+    let resume_stage = util::resume_stage_name("latent");
+    let train_checkpoint_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "train.safetensors");
+    let optimizer_checkpoint_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "optimizer.safetensors");
+    let target_checkpoint_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "target.safetensors");
+    let resume_state_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
+    let mut resume_state = util::TrainingResumeState::new(&resume_stage);
+    let mut resumed_weights = false;
+    if config.resume && train_checkpoint_path.exists() {
+        varmap.load(&train_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+        resumed_weights = true;
+        println!("Resuming latent weights from {:?}", train_checkpoint_path);
+    } else if config.resume && model_path.exists() {
+        varmap.load(&model_path)?;
+        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+        resumed_weights = true;
+        println!(
+            "Resuming latent weights from best export {:?} without optimizer state",
+            model_path
+        );
+    } else if let Some(ref init_path) = config.init_encoder_path {
+        varmap.load(init_path)?;
+        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+        println!("Initialized latent weights from {:?}", init_path);
+    }
+
     let mut target_varmap = VarMap::new();
     let target_vb = VarBuilder::from_varmap(&target_varmap, train_dtype, &device);
     let target_encoder = OnlineEncoder::new(
@@ -430,19 +485,45 @@ fn run_latent_training(config: Config) -> Result<()> {
         config.num_heads,
     )?;
     util::cast_varmap_dtype(&mut target_varmap, train_dtype)?;
-    copy_varmap_weights(&mut target_varmap, &varmap)?;
+    if resumed_weights && target_checkpoint_path.exists() {
+        target_varmap.load(&target_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut target_varmap, train_dtype)?;
+        println!(
+            "Resuming latent EMA target from {:?}",
+            target_checkpoint_path
+        );
+    } else {
+        copy_varmap_weights(&mut target_varmap, &varmap)?;
+    }
 
-    let train_vars = varmap.all_vars();
-    let mut opt = candle_nn::AdamW::new_lr(train_vars.clone(), config.lr)?;
-
-    let _ =
-        fs::create_dir_all("local_models").and_then(|_| fs::create_dir_all("local_models/vocabs"));
-    let model_path = PathBuf::from(format!(
-        "local_models/model_latent_{}.safetensors",
-        util::format_params(latent_params)
-    ));
-    let mut best_pred = f32::MAX;
-    let mut saved_checkpoint = false;
+    let named_train_vars = util::named_train_vars(&varmap)?;
+    let train_vars = named_train_vars
+        .iter()
+        .map(|entry| entry.var.clone())
+        .collect::<Vec<_>>();
+    let mut opt = util::ResumableAdamW::new_lr_named(named_train_vars, config.lr)?;
+    if config.resume {
+        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
+            resume_state = state;
+        }
+        if optimizer_checkpoint_path.exists() {
+            opt.load_state(&optimizer_checkpoint_path)?;
+            if resume_state.step == 0 {
+                resume_state.step = opt.step_t();
+            }
+            println!(
+                "Resuming latent optimizer from {:?} at step {}",
+                optimizer_checkpoint_path, resume_state.step
+            );
+        }
+    }
+    let mut best_pred = resume_state.best_metric;
+    let mut saved_checkpoint = resume_state.saved_checkpoint;
+    let start_step = if config.resume {
+        resume_state.step.min(config.steps)
+    } else {
+        0
+    };
 
     let run_dir = util::create_run_dir("latent")?;
     let mut tb = SummaryWriter::new(&run_dir);
@@ -457,7 +538,13 @@ fn run_latent_training(config: Config) -> Result<()> {
         DEFAULT_STREAM_SHUFFLE_BUFFER
     );
     tb.add_scalar("run/alive", 1.0, 0);
+    tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
+    tb.add_scalar(
+        "config/warmup_batch_size",
+        config.batch_warmup_value as f32,
+        0,
+    );
     tb.add_scalar("config/dim", config.dim as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
     tb.add_scalar("config/num_layers", config.num_layers as f32, 0);
@@ -475,8 +562,23 @@ fn run_latent_training(config: Config) -> Result<()> {
     );
     tb.add_scalar("config/grad_accum", config.grad_accum_steps as f32, 0);
     tb.add_scalar(
+        "config/warmup_grad_accum",
+        config.grad_accum_warmup_value as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/warmup_grad_accum_steps",
+        config.grad_accum_warmup_steps as f32,
+        0,
+    );
+    tb.add_scalar(
         "config/effective_batch_size",
         (config.batch_size * config.grad_accum_steps.max(1)) as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/warmup_effective_batch_size",
+        (config.batch_warmup_value.max(1) * config.grad_accum_warmup_value.max(1)) as f32,
         0,
     );
     tb.add_scalar(
@@ -499,14 +601,21 @@ fn run_latent_training(config: Config) -> Result<()> {
 
     const SIGREG_SLICES: usize = 128;
     const SIGREG_POINTS: usize = 17;
-    for step in 1..=config.steps {
+    if start_step >= config.steps {
+        println!(
+            "Latent resume checkpoint already reached step {}/{}; skipping training.",
+            start_step, config.steps
+        );
+    }
+    for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
         let mut log_snapshot = None;
-        let grad_accum_steps = config.grad_accum_steps.max(1);
+        let batch_size = latent_batch_size_for_step(step, &config);
+        let grad_accum_steps = latent_grad_accum_for_step(step, &config);
         let ema_decay = latent_target_ema_decay(step, config.steps);
 
         for micro_step in 0..grad_accum_steps {
-            let batch_tokens = pair_stream.next_batch(config.batch_size)?;
+            let batch_tokens = pair_stream.next_batch(batch_size)?;
             let curriculum = latent_curriculum(step, config.steps, &config);
             let batch = make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?;
 
@@ -568,8 +677,7 @@ fn run_latent_training(config: Config) -> Result<()> {
                 let contrastive_cos =
                     util::scalar_f32(&mean_cosine_similarity(&view_a_summary, &view_b_summary)?)?;
                 let target_count = batch.target_count;
-                let target_frac =
-                    target_count as f32 / (config.batch_size * config.max_seq).max(1) as f32;
+                let target_frac = target_count as f32 / (batch_size * config.max_seq).max(1) as f32;
                 log_snapshot = Some(LatentLogSnapshot {
                     loss_val: util::scalar_f32(&loss)?,
                     pred_val: util::scalar_f32(&pred_loss)?,
@@ -601,7 +709,7 @@ fn run_latent_training(config: Config) -> Result<()> {
                 &mut accumulated_grads,
                 &train_vars,
                 &loss,
-                config.grad_accum_steps,
+                grad_accum_steps,
             )?;
         }
 
@@ -643,6 +751,13 @@ fn run_latent_training(config: Config) -> Result<()> {
                 step,
             );
             tb.add_scalar("schedule/reg_weight", snapshot.reg_weight, step);
+            tb.add_scalar("schedule/batch_size", batch_size as f32, step);
+            tb.add_scalar("schedule/grad_accum", grad_accum_steps as f32, step);
+            tb.add_scalar(
+                "schedule/effective_batch_size",
+                (batch_size * grad_accum_steps) as f32,
+                step,
+            );
             let mut memory_note = String::new();
             if let Some(vram) = vram_tracker.sample() {
                 tb.add_scalar("memory/used_mb", vram.used_mb, step);
@@ -658,7 +773,7 @@ fn run_latent_training(config: Config) -> Result<()> {
 
             if snapshot.pred_val < best_pred {
                 best_pred = snapshot.pred_val;
-                varmap.save(&model_path)?;
+                util::save_varmap_atomic(&varmap, &model_path)?;
                 saved_checkpoint = true;
                 println!(
                     "step {step}/{} total {:.4} pred {:.4} tok {:.4} chk {:.4} glb {:.4} ctr {:.4} sigreg {:.4} pred_cos {:.4} chk_cos {:.4} glb_cos {:.4} ctr_cos {:.4} targets {} code_frac {:.2} seq {} reg_w {:.4} ema {:.4}{} [saved best_pred]",
@@ -704,16 +819,38 @@ fn run_latent_training(config: Config) -> Result<()> {
                     memory_note,
                 );
             }
+            util::save_varmap_atomic(&varmap, &train_checkpoint_path)?;
+            util::save_varmap_atomic(&target_varmap, &target_checkpoint_path)?;
+            opt.save_state(&optimizer_checkpoint_path)?;
+            resume_state = util::TrainingResumeState {
+                stage: resume_stage.clone(),
+                step,
+                best_metric: best_pred,
+                best_aux_metric: best_pred,
+                saved_checkpoint,
+            };
+            util::save_resume_state(&resume_state_path, &resume_state)?;
         }
     }
 
     if !saved_checkpoint {
-        varmap.save(&model_path)?;
+        util::save_varmap_atomic(&varmap, &model_path)?;
         println!(
             "No checkpoint was saved during logging; saved final encoder weights to {:?}",
             model_path
         );
     }
+    util::save_varmap_atomic(&varmap, &train_checkpoint_path)?;
+    util::save_varmap_atomic(&target_varmap, &target_checkpoint_path)?;
+    opt.save_state(&optimizer_checkpoint_path)?;
+    resume_state = util::TrainingResumeState {
+        stage: resume_stage.clone(),
+        step: config.steps,
+        best_metric: best_pred,
+        best_aux_metric: best_pred,
+        saved_checkpoint,
+    };
+    util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
     let _ = vram_tracker.write_summary(&run_dir, "latent");
     if saved_checkpoint {

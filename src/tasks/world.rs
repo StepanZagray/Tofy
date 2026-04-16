@@ -29,6 +29,28 @@ use candle_nn::ops;
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
 
+fn world_batch_size_for_step(step: usize, config: &WorldConfig) -> usize {
+    if config.batch_warmup_steps > 0
+        && step <= config.batch_warmup_steps
+        && config.batch_warmup_value != config.batch_size
+    {
+        config.batch_warmup_value.max(1)
+    } else {
+        config.batch_size.max(1)
+    }
+}
+
+fn world_grad_accum_for_step(step: usize, config: &WorldConfig) -> usize {
+    if config.grad_accum_warmup_steps > 0
+        && step <= config.grad_accum_warmup_steps
+        && config.grad_accum_warmup_value < config.grad_accum_steps
+    {
+        config.grad_accum_warmup_value.max(1)
+    } else {
+        config.grad_accum_steps.max(1)
+    }
+}
+
 #[derive(Clone)]
 struct WorldConfig {
     encoder_model_path: PathBuf,
@@ -47,6 +69,11 @@ struct WorldConfig {
     lr: f64,
     log_every: usize,
     grad_accum_steps: usize,
+    grad_accum_warmup_steps: usize,
+    grad_accum_warmup_value: usize,
+    batch_warmup_steps: usize,
+    batch_warmup_value: usize,
+    resume: bool,
     action_loss_weight: f64,
     router_warmup_steps: usize,
     train_dtype: DType,
@@ -56,12 +83,15 @@ impl WorldConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 3 {
             bail!(
-                    "usage: --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--grad-accum <int>]"
+                    "usage: --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--grad-accum <int>] [--resume]"
             );
         }
         let mut lr_override = None;
         let mut lambda_override = None;
         let mut grad_accum_steps = 1usize;
+        let mut resume = std::env::var("TOFY_RESUME")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let mut action_loss_weight = None;
         let mut router_warmup_steps = 0usize;
         let mut filtered = Vec::new();
@@ -99,6 +129,11 @@ impl WorldConfig {
                 i += 2;
                 continue;
             }
+            if args[i] == "--resume" {
+                resume = true;
+                i += 1;
+                continue;
+            }
             if args[i] == "--action-loss-weight" {
                 let value = args
                     .get(i + 1)
@@ -123,15 +158,37 @@ impl WorldConfig {
             filtered.push(args[i].clone());
             i += 1;
         }
+        let steps = filtered
+            .get(3)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000);
+        let batch_size = filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(24);
+        let grad_accum_steps = grad_accum_steps.max(1);
+        let batch_warmup_value = std::env::var("TOFY_WORLD_WARMUP_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(batch_size)
+            .max(1);
+        let grad_accum_warmup_value = std::env::var("TOFY_WORLD_WARMUP_GRAD_ACCUM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize)
+            .max(1)
+            .min(grad_accum_steps);
+        let warmup_is_active =
+            batch_warmup_value != batch_size || grad_accum_warmup_value < grad_accum_steps;
+        let grad_accum_warmup_steps = std::env::var("TOFY_WORLD_WARMUP_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if warmup_is_active { steps / 5 } else { 0 })
+            .min(steps);
+        let batch_warmup_steps = grad_accum_warmup_steps;
         Ok(Self {
             encoder_model_path: PathBuf::from(&filtered[0]),
             encoder_vocab_path: PathBuf::from(&filtered[1]),
             data_path: PathBuf::from(&filtered[2]),
-            steps: filtered
-                .get(3)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60_000),
-            batch_size: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(24),
+            steps,
+            batch_size,
             dim: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(768),
             max_seq: filtered.get(6).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_layers: filtered.get(7).and_then(|v| v.parse().ok()).unwrap_or(9),
@@ -141,7 +198,12 @@ impl WorldConfig {
             lambda: lambda_override.unwrap_or(0.2),
             lr: lr_override.unwrap_or(2e-4),
             log_every: 100,
-            grad_accum_steps: grad_accum_steps.max(1),
+            grad_accum_steps,
+            grad_accum_warmup_steps,
+            grad_accum_warmup_value,
+            batch_warmup_steps,
+            batch_warmup_value,
+            resume,
             action_loss_weight: action_loss_weight.unwrap_or(1.0),
             router_warmup_steps,
             train_dtype: std::env::var("TOFY_TRAIN_DTYPE")
@@ -174,6 +236,7 @@ struct OrchestratorTrainConfig {
     lr: f64,
     log_every: usize,
     grad_accum_steps: usize,
+    resume: bool,
     tune_planner: bool,
     output_path: Option<PathBuf>,
     train_dtype: DType,
@@ -183,11 +246,14 @@ impl OrchestratorTrainConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>]"
+                "usage: --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>] [--resume]"
             );
         }
         let mut lr_override = None;
         let mut grad_accum_steps = 1usize;
+        let mut resume = std::env::var("TOFY_RESUME")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let mut tune_planner = true;
         let mut output_path = None;
         let mut filtered = Vec::new();
@@ -213,6 +279,10 @@ impl OrchestratorTrainConfig {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--grad-accum must be integer"))?;
                     i += 2;
+                }
+                "--resume" => {
+                    resume = true;
+                    i += 1;
                 }
                 "--freeze-planner" => {
                     tune_planner = false;
@@ -250,6 +320,7 @@ impl OrchestratorTrainConfig {
             lr: lr_override.unwrap_or(2e-4),
             log_every: 100,
             grad_accum_steps: grad_accum_steps.max(1),
+            resume,
             tune_planner,
             output_path,
             train_dtype: std::env::var("TOFY_TRAIN_DTYPE")
@@ -440,7 +511,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     encoder_varmap.load(&config.encoder_model_path)?;
     util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
 
-    let world_varmap = VarMap::new();
+    let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
     let planner_memory = PlannerMemory::new(
         world_vb.pp("planner_memory"),
@@ -453,9 +524,6 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
     let inverse_action_head =
         OrchestratorActionHead::new(world_vb.pp("inverse_action_head"), config.bridge_dim)?;
-
-    let train_vars = world_varmap.all_vars();
-    let mut opt = candle_nn::AdamW::new_lr(train_vars.clone(), config.lr)?;
 
     let transition_params = 3
         * (config.bridge_dim * config.bridge_dim * 4
@@ -478,6 +546,48 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         "local_models/model_world_{}.safetensors",
         util::format_params(total_params)
     ));
+    let resume_stage = util::resume_stage_name("world");
+    let train_checkpoint_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "train.safetensors");
+    let optimizer_checkpoint_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "optimizer.safetensors");
+    let resume_state_path =
+        util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
+    let mut resume_state = util::TrainingResumeState::new(&resume_stage);
+    if config.resume && train_checkpoint_path.exists() {
+        world_varmap.load(&train_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+        println!("Resuming world weights from {:?}", train_checkpoint_path);
+    } else if config.resume && model_path.exists() {
+        world_varmap.load(&model_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+        println!(
+            "Resuming world weights from best export {:?} without optimizer state",
+            model_path
+        );
+    }
+
+    let named_train_vars = util::named_train_vars(&world_varmap)?;
+    let train_vars = named_train_vars
+        .iter()
+        .map(|entry| entry.var.clone())
+        .collect::<Vec<_>>();
+    let mut opt = util::ResumableAdamW::new_lr_named(named_train_vars, config.lr)?;
+    if config.resume {
+        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
+            resume_state = state;
+        }
+        if optimizer_checkpoint_path.exists() {
+            opt.load_state(&optimizer_checkpoint_path)?;
+            if resume_state.step == 0 {
+                resume_state.step = opt.step_t();
+            }
+            println!(
+                "Resuming world optimizer from {:?} at step {}",
+                optimizer_checkpoint_path, resume_state.step
+            );
+        }
+    }
 
     println!("Training (latent-only dialog transition model for text + code)");
     println!("Encoder checkpoint: {:?}", config.encoder_model_path);
@@ -508,9 +618,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         util::format_params(inverse_params)
     );
 
-    let mut best_loss = f32::MAX;
-    let mut best_metric = f32::MAX;
-    let mut saved_checkpoint = false;
+    let mut best_loss = resume_state.best_aux_metric;
+    let mut best_metric = resume_state.best_metric;
+    let mut saved_checkpoint = resume_state.saved_checkpoint;
+    let start_step = if config.resume {
+        resume_state.step.min(config.steps)
+    } else {
+        0
+    };
 
     let run_dir = util::create_run_dir("world")?;
     let mut tb = SummaryWriter::new(&run_dir);
@@ -520,7 +635,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         run_dir
     );
     tb.add_scalar("run/alive", 1.0, 0);
+    tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
+    tb.add_scalar(
+        "config/warmup_batch_size",
+        config.batch_warmup_value as f32,
+        0,
+    );
     tb.add_scalar("config/dim", config.dim as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
     tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
@@ -536,8 +657,23 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     );
     tb.add_scalar("config/grad_accum", config.grad_accum_steps as f32, 0);
     tb.add_scalar(
+        "config/warmup_grad_accum",
+        config.grad_accum_warmup_value as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/warmup_grad_accum_steps",
+        config.grad_accum_warmup_steps as f32,
+        0,
+    );
+    tb.add_scalar(
         "config/effective_batch_size",
         (config.batch_size * config.grad_accum_steps.max(1)) as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/warmup_effective_batch_size",
+        (config.batch_warmup_value.max(1) * config.grad_accum_warmup_value.max(1)) as f32,
         0,
     );
     let inverse_loss_weight = std::env::var("TOFY_WORLD_INVERSE_LOSS_WEIGHT")
@@ -561,7 +697,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
-    for step in 1..=config.steps {
+    if start_step >= config.steps {
+        println!(
+            "World resume checkpoint already reached step {}/{}; skipping training.",
+            start_step, config.steps
+        );
+    }
+    for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
         let mut last_transition_loss = None;
         let mut last_sigreg_loss = None;
@@ -575,11 +717,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let mut last_next_slots = None;
         let mut last_state_slots = None;
         let router_warmup_active = step <= config.router_warmup_steps;
+        let batch_size = world_batch_size_for_step(step, &config);
+        let grad_accum_steps = world_grad_accum_for_step(step, &config);
 
-        for _micro_step in 0..config.grad_accum_steps.max(1) {
+        for _micro_step in 0..grad_accum_steps {
             let raw_batch = collect_action_training_batch(
                 &mut world_stream,
-                config.batch_size,
+                batch_size,
                 TARGET_CODE_RATE,
                 TARGET_DONE_RATE,
             )?;
@@ -692,7 +836,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 &mut accumulated_grads,
                 &train_vars,
                 &loss,
-                config.grad_accum_steps,
+                grad_accum_steps,
             )?;
 
             last_transition_loss = Some(transition_loss);
@@ -796,6 +940,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             tb.add_scalar("metrics/done_f1", action_metrics.done_f1, step);
             tb.add_scalar("metrics/state_slot_rms", state_slot_rms, step);
             tb.add_scalar("metrics/pred_slot_rms", pred_slot_rms, step);
+            tb.add_scalar("schedule/batch_size", batch_size as f32, step);
+            tb.add_scalar("schedule/grad_accum", grad_accum_steps as f32, step);
+            tb.add_scalar(
+                "schedule/effective_batch_size",
+                (batch_size * grad_accum_steps) as f32,
+                step,
+            );
             let mut memory_note = String::new();
             if let Some(vram) = vram_tracker.sample() {
                 tb.add_scalar("memory/used_mb", vram.used_mb, step);
@@ -811,7 +962,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             if let Some(ref mut val_stream) = val_stream {
                 let val_raw_batch = collect_action_training_batch(
                     val_stream,
-                    config.batch_size,
+                    batch_size,
                     TARGET_CODE_RATE,
                     TARGET_DONE_RATE,
                 )?;
@@ -916,7 +1067,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
             if selection_metric < best_metric {
                 best_metric = selection_metric;
-                world_varmap.save(&model_path)?;
+                util::save_varmap_atomic(&world_varmap, &model_path)?;
                 saved_checkpoint = true;
                 println!(
                     "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}{} [saved best]",
@@ -960,16 +1111,36 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     memory_note
                 );
             }
+            util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+            opt.save_state(&optimizer_checkpoint_path)?;
+            resume_state = util::TrainingResumeState {
+                stage: resume_stage.clone(),
+                step,
+                best_metric,
+                best_aux_metric: best_loss,
+                saved_checkpoint,
+            };
+            util::save_resume_state(&resume_state_path, &resume_state)?;
         }
     }
 
     if !saved_checkpoint {
-        world_varmap.save(&model_path)?;
+        util::save_varmap_atomic(&world_varmap, &model_path)?;
         println!(
             "No checkpoint was saved during logging; saved final world weights to {:?}",
             model_path
         );
     }
+    util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+    opt.save_state(&optimizer_checkpoint_path)?;
+    resume_state = util::TrainingResumeState {
+        stage: resume_stage.clone(),
+        step: config.steps,
+        best_metric,
+        best_aux_metric: best_loss,
+        saved_checkpoint,
+    };
+    util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
     let _ = vram_tracker.write_summary(&run_dir, "world");
     if saved_checkpoint {
@@ -1062,12 +1233,48 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     world_varmap.load(&config.world_model_path)?;
     util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
 
-    let train_vars = world_varmap.all_vars();
-    let mut opt = candle_nn::AdamW::new_lr(train_vars.clone(), config.lr)?;
     let output_path = config
         .output_path
         .clone()
         .unwrap_or_else(|| config.world_model_path.clone());
+    let resume_stage = util::resume_stage_name("orchestrator");
+    let train_checkpoint_path =
+        util::checkpoint_sidecar_path(&output_path, &resume_stage, "train.safetensors");
+    let optimizer_checkpoint_path =
+        util::checkpoint_sidecar_path(&output_path, &resume_stage, "optimizer.safetensors");
+    let resume_state_path =
+        util::checkpoint_sidecar_path(&output_path, &resume_stage, "resume.json");
+    let mut resume_state = util::TrainingResumeState::new(&resume_stage);
+    if config.resume && train_checkpoint_path.exists() {
+        world_varmap.load(&train_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+        println!(
+            "Resuming orchestrator weights from {:?}",
+            train_checkpoint_path
+        );
+    }
+
+    let named_train_vars = util::named_train_vars(&world_varmap)?;
+    let train_vars = named_train_vars
+        .iter()
+        .map(|entry| entry.var.clone())
+        .collect::<Vec<_>>();
+    let mut opt = util::ResumableAdamW::new_lr_named(named_train_vars, config.lr)?;
+    if config.resume {
+        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
+            resume_state = state;
+        }
+        if optimizer_checkpoint_path.exists() {
+            opt.load_state(&optimizer_checkpoint_path)?;
+            if resume_state.step == 0 {
+                resume_state.step = opt.step_t();
+            }
+            println!(
+                "Resuming orchestrator optimizer from {:?} at step {}",
+                optimizer_checkpoint_path, resume_state.step
+            );
+        }
+    }
 
     println!("Training (planner/orchestrator action model)");
     println!("Encoder checkpoint: {:?}", config.encoder_model_path);
@@ -1089,6 +1296,12 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         run_dir
     );
     tb.add_scalar("run/alive", 1.0, 0);
+    let start_step = if config.resume {
+        resume_state.step.min(config.steps)
+    } else {
+        0
+    };
+    tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
     tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
@@ -1120,10 +1333,16 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
-    let mut best_score = f32::MAX;
-    let mut saved_checkpoint = false;
+    let mut best_score = resume_state.best_metric;
+    let mut saved_checkpoint = resume_state.saved_checkpoint;
 
-    for step in 1..=config.steps {
+    if start_step >= config.steps {
+        println!(
+            "Orchestrator resume checkpoint already reached step {}/{}; skipping training.",
+            start_step, config.steps
+        );
+    }
+    for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
         let mut last_action_loss = None;
         let mut last_action_logits = None;
@@ -1271,7 +1490,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
 
             if selection_score < best_score {
                 best_score = selection_score;
-                world_varmap.save(&output_path)?;
+                util::save_varmap_atomic(&world_varmap, &output_path)?;
                 saved_checkpoint = true;
                 println!(
                     "step {}/{} action {:.4} acc {:.3} bal {:.3} macro_f1 {:.3} code_f1 {:.3} done_f1 {:.3} sel {:.4}{} [saved best]",
@@ -1301,12 +1520,32 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                     memory_note
                 );
             }
+            util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+            opt.save_state(&optimizer_checkpoint_path)?;
+            resume_state = util::TrainingResumeState {
+                stage: resume_stage.clone(),
+                step,
+                best_metric: best_score,
+                best_aux_metric: best_score,
+                saved_checkpoint,
+            };
+            util::save_resume_state(&resume_state_path, &resume_state)?;
         }
     }
 
     if !saved_checkpoint {
-        world_varmap.save(&output_path)?;
+        util::save_varmap_atomic(&world_varmap, &output_path)?;
     }
+    util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+    opt.save_state(&optimizer_checkpoint_path)?;
+    resume_state = util::TrainingResumeState {
+        stage: resume_stage.clone(),
+        step: config.steps,
+        best_metric: best_score,
+        best_aux_metric: best_score,
+        saved_checkpoint,
+    };
+    util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
     let _ = vram_tracker.write_summary(&run_dir, "orchestrator");
     println!(
@@ -1318,11 +1557,11 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
 
 /// Decoder training: load frozen planner stack (encoder + planner_memory + transition),
 /// train decoder adapter + decoder jointly on top of planner memory.
-/// Defaults sized for ~8GB VRAM (e.g. RTX 5060): ~90M decoder, batch 8.
-const DECODER_DIM: usize = 768;
+/// Defaults sized for the shared-width proof-of-concept architecture.
+const DECODER_DIM: usize = 640;
 const DECODER_LAYERS: usize = 8;
 const DECODER_HEADS: usize = 8;
-const DECODER_FF_DIM: usize = 3072;
+const DECODER_FF_DIM: usize = 2560;
 
 /// Approximate parameter count for decoder checkpoint: decoder adapter + decoder.
 fn decoder_param_count(
@@ -1398,6 +1637,7 @@ struct DecoderTrainConfig {
     lr: f64,
     log_every: usize,
     grad_accum_steps: usize,
+    resume: bool,
     train_dtype: DType,
     syntax_loss_weight: f64,
     signature_loss_weight: f64,
@@ -1462,11 +1702,23 @@ struct DecoderBatchMetrics {
     function_name_exact_rate: f32,
 }
 
+struct DecoderPredictionMetrics {
+    token_accuracy: f32,
+    identifier_accuracy: f32,
+    delimiter_balance_rate: f32,
+    syntax_token_accuracy: f32,
+    function_skeleton_rate: f32,
+    signature_token_accuracy: f32,
+    signature_exact_rate: f32,
+    function_name_token_accuracy: f32,
+    function_name_exact_rate: f32,
+}
+
 impl DecoderTrainConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--init-decoder <path>] [--decoder-output <path>]"
+                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
             );
         }
         let mut init_decoder_path = None;
@@ -1475,6 +1727,9 @@ impl DecoderTrainConfig {
         let mut decoder_kind = None;
         let mut lr_override = None;
         let mut grad_accum_steps = 1usize;
+        let mut resume = std::env::var("TOFY_RESUME")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let mut decoder_max_vocab = None;
         let mut filtered = Vec::new();
         let mut i = 0usize;
@@ -1548,6 +1803,11 @@ impl DecoderTrainConfig {
                 i += 2;
                 continue;
             }
+            if args[i] == "--resume" {
+                resume = true;
+                i += 1;
+                continue;
+            }
             filtered.push(args[i].clone());
             i += 1;
         }
@@ -1582,6 +1842,7 @@ impl DecoderTrainConfig {
             lr: lr_override.unwrap_or(3e-4),
             log_every: 100,
             grad_accum_steps: grad_accum_steps.max(1),
+            resume,
             train_dtype: std::env::var("TOFY_TRAIN_DTYPE")
                 .ok()
                 .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
@@ -2268,7 +2529,7 @@ fn decoder_prediction_metrics(
     target: &Tensor,
     mask: &Tensor,
     vocab: &Vocab,
-) -> Result<(f32, f32, f32, f32, f32, f32, f32, f32, f32)> {
+) -> Result<DecoderPredictionMetrics> {
     let pred = logits.argmax(candle_core::D::Minus1)?;
     let pred_rows = pred.to_vec2::<u32>()?;
     let target_rows = target.to_vec2::<u32>()?;
@@ -2364,7 +2625,7 @@ fn decoder_prediction_metrics(
     let function_name_token_accuracy =
         function_name_correct as f32 / function_name_total.max(1) as f32;
     let function_name_exact_rate = function_name_exact as f32 / pred_rows.len().max(1) as f32;
-    Ok((
+    Ok(DecoderPredictionMetrics {
         token_accuracy,
         identifier_accuracy,
         delimiter_balance_rate,
@@ -2374,7 +2635,7 @@ fn decoder_prediction_metrics(
         signature_exact_rate,
         function_name_token_accuracy,
         function_name_exact_rate,
-    ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2579,17 +2840,8 @@ fn evaluate_decoder_batch(
     let structure_loss_val = util::scalar_f32(&structure_loss)?;
     let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
     let total_tokens = (state_lens.len().max(1) * max_seq * 2) as f32;
-    let (
-        token_accuracy,
-        identifier_accuracy,
-        delimiter_balance_rate,
-        syntax_token_accuracy,
-        function_skeleton_rate,
-        signature_token_accuracy,
-        signature_exact_rate,
-        function_name_token_accuracy,
-        function_name_exact_rate,
-    ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
+    let prediction_metrics =
+        decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
     Ok(DecoderBatchMetrics {
         loss: loss_val,
         raw_loss: raw_loss_val,
@@ -2603,15 +2855,15 @@ fn evaluate_decoder_batch(
         active_frac: active_tokens / total_tokens.max(1.0),
         world_rms: util::scalar_f32(&tensor_rms(&world_latent)?)?,
         oov_rate: raw_examples_oov_rate(raw_batch, decoder_vocab, decoder_token_mode),
-        token_accuracy,
-        identifier_accuracy,
-        delimiter_balance_rate,
-        syntax_token_accuracy,
-        function_skeleton_rate,
-        signature_token_accuracy,
-        signature_exact_rate,
-        function_name_token_accuracy,
-        function_name_exact_rate,
+        token_accuracy: prediction_metrics.token_accuracy,
+        identifier_accuracy: prediction_metrics.identifier_accuracy,
+        delimiter_balance_rate: prediction_metrics.delimiter_balance_rate,
+        syntax_token_accuracy: prediction_metrics.syntax_token_accuracy,
+        function_skeleton_rate: prediction_metrics.function_skeleton_rate,
+        signature_token_accuracy: prediction_metrics.signature_token_accuracy,
+        signature_exact_rate: prediction_metrics.signature_exact_rate,
+        function_name_token_accuracy: prediction_metrics.function_name_token_accuracy,
+        function_name_exact_rate: prediction_metrics.function_name_exact_rate,
     })
 }
 
@@ -2742,10 +2994,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
 
     let mut decoder_varmap = VarMap::new();
-    if let Some(ref p) = config.init_decoder_path {
-        decoder_varmap.load(p)?;
-        util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
-    }
     let decoder_vb = VarBuilder::from_varmap(&decoder_varmap, train_dtype, &device);
     let decoder_adapter = DecoderAdapter::new(
         decoder_vb.pp("decoder_adapter"),
@@ -2778,6 +3026,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     }
                 ))
         });
+    let resume_stage = util::resume_stage_name("decoder");
+    let train_checkpoint_path =
+        util::checkpoint_sidecar_path(&decoder_path, &resume_stage, "train.safetensors");
+    let optimizer_checkpoint_path =
+        util::checkpoint_sidecar_path(&decoder_path, &resume_stage, "optimizer.safetensors");
+    let resume_state_path =
+        util::checkpoint_sidecar_path(&decoder_path, &resume_stage, "resume.json");
     let decoder_vocab_path = config
         .decoder_vocab_path
         .clone()
@@ -2804,9 +3059,45 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.decoder_kind,
     )?;
     util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
+    let mut resume_state = util::TrainingResumeState::new(&resume_stage);
+    if config.resume && train_checkpoint_path.exists() {
+        decoder_varmap.load(&train_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
+        println!("Resuming decoder weights from {:?}", train_checkpoint_path);
+    } else if config.resume && decoder_path.exists() {
+        decoder_varmap.load(&decoder_path)?;
+        util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
+        println!(
+            "Resuming decoder weights from best export {:?} without optimizer state",
+            decoder_path
+        );
+    } else if let Some(ref p) = config.init_decoder_path {
+        decoder_varmap.load(p)?;
+        util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
+        println!("Initialized decoder weights from {:?}", p);
+    }
 
-    let train_vars = decoder_varmap.all_vars();
-    let mut opt = candle_nn::AdamW::new_lr(train_vars.clone(), config.lr)?;
+    let named_train_vars = util::named_train_vars(&decoder_varmap)?;
+    let train_vars = named_train_vars
+        .iter()
+        .map(|entry| entry.var.clone())
+        .collect::<Vec<_>>();
+    let mut opt = util::ResumableAdamW::new_lr_named(named_train_vars, config.lr)?;
+    if config.resume {
+        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
+            resume_state = state;
+        }
+        if optimizer_checkpoint_path.exists() {
+            opt.load_state(&optimizer_checkpoint_path)?;
+            if resume_state.step == 0 {
+                resume_state.step = opt.step_t();
+            }
+            println!(
+                "Resuming decoder optimizer from {:?} at step {}",
+                optimizer_checkpoint_path, resume_state.step
+            );
+        }
+    }
 
     let decoder_params = decoder_param_count(
         vocab_size,
@@ -2871,6 +3162,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         run_dir
     );
     tb.add_scalar("run/alive", 1.0, 0);
+    let start_step = if config.resume {
+        resume_state.step.min(config.steps)
+    } else {
+        0
+    };
+    tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
     tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
@@ -2919,9 +3216,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     }
     tb.flush();
 
-    let mut best_loss = f32::MAX;
-    let mut best_metric = f32::MAX;
-    let mut saved_checkpoint = false;
+    let mut best_loss = resume_state.best_aux_metric;
+    let mut best_metric = resume_state.best_metric;
+    let mut saved_checkpoint = resume_state.saved_checkpoint;
     let decoder_action_label = if config.decoder_kind == DecoderKind::TextGeneralist {
         0
     } else {
@@ -2932,7 +3229,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
 
-    for step in 1..=config.steps {
+    if start_step >= config.steps {
+        println!(
+            "Decoder resume checkpoint already reached step {}/{}; skipping training.",
+            start_step, config.steps
+        );
+    }
+    for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
         let mut last_raw_batch = None;
         let mut last_world_latent = None;
@@ -3085,17 +3388,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let conditioning_gain = ablated_loss_val - loss_val;
             let world_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
             let oov_rate = raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
-            let (
-                token_accuracy,
-                identifier_accuracy,
-                delimiter_balance_rate,
-                syntax_token_accuracy,
-                function_skeleton_rate,
-                signature_token_accuracy,
-                signature_exact_rate,
-                function_name_token_accuracy,
-                function_name_exact_rate,
-            ) = decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
+            let prediction_metrics =
+                decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
+            let token_accuracy = prediction_metrics.token_accuracy;
+            let identifier_accuracy = prediction_metrics.identifier_accuracy;
+            let delimiter_balance_rate = prediction_metrics.delimiter_balance_rate;
+            let syntax_token_accuracy = prediction_metrics.syntax_token_accuracy;
+            let function_skeleton_rate = prediction_metrics.function_skeleton_rate;
+            let signature_token_accuracy = prediction_metrics.signature_token_accuracy;
+            let signature_exact_rate = prediction_metrics.signature_exact_rate;
+            let function_name_token_accuracy = prediction_metrics.function_name_token_accuracy;
+            let function_name_exact_rate = prediction_metrics.function_name_exact_rate;
 
             tb.add_scalar("loss/token_ce", loss_val, step);
             tb.add_scalar("loss/raw_token_ce", raw_loss_val, step);
@@ -3261,7 +3564,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             tb.flush();
             if selection_metric < best_metric {
                 best_metric = selection_metric;
-                decoder_varmap.save(&decoder_path)?;
+                util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
                 saved_checkpoint = true;
                 println!(
                     "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
@@ -3317,16 +3620,36 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     memory_note
                 );
             }
+            util::save_varmap_atomic(&decoder_varmap, &train_checkpoint_path)?;
+            opt.save_state(&optimizer_checkpoint_path)?;
+            resume_state = util::TrainingResumeState {
+                stage: resume_stage.clone(),
+                step,
+                best_metric,
+                best_aux_metric: best_loss,
+                saved_checkpoint,
+            };
+            util::save_resume_state(&resume_state_path, &resume_state)?;
         }
     }
 
     if !saved_checkpoint {
-        decoder_varmap.save(&decoder_path)?;
+        util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
         println!(
             "No checkpoint was saved during logging; saved final decoder weights to {:?}",
             decoder_path
         );
     }
+    util::save_varmap_atomic(&decoder_varmap, &train_checkpoint_path)?;
+    opt.save_state(&optimizer_checkpoint_path)?;
+    resume_state = util::TrainingResumeState {
+        stage: resume_stage.clone(),
+        step: config.steps,
+        best_metric,
+        best_aux_metric: best_loss,
+        saved_checkpoint,
+    };
+    util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
     let _ = vram_tracker.write_summary(&run_dir, "decoder");
     if saved_checkpoint {

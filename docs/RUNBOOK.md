@@ -76,6 +76,54 @@ Artifact ownership:
 
 Important: the encoder now also saves a checkpoint-matched vocab next to the latent model, for example `local_models/model_latent_69.84M.vocab.txt`. Use that sibling vocab when reusing an older latent checkpoint; `local_models/vocabs/vocab_encoder.txt` is only the latest shared encoder vocab.
 
+## Resuming training
+
+Training stages support resumable sidecar checkpoints. The easiest path is to rerun the same pipeline with:
+
+```bash
+TOFY_RESUME=1 scripts/train_code_first_poc.sh
+```
+
+or:
+
+```bash
+TOFY_RESUME=1 scripts/train_full_pipeline.sh
+```
+
+The scripts pass `--resume` into the supported stages automatically. Direct commands can also use `--resume`:
+
+```bash
+cargo run --release -- --latent data/encoder_mix.txt 25000 32 640 256 7 8 8000 --grad-accum 1 --resume
+```
+
+```bash
+cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/world_mix_pairs.txt 60000 64 640 256 7 8 640 64 --grad-accum 2 --resume
+```
+
+```bash
+cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/code_poc_mix.txt 40000 12 224 640 7 8 640 64 --decoder-kind code --decoder-output local_models/code_decoder_poc.safetensors --grad-accum 2 --resume
+```
+
+Resume files are saved next to the target model path:
+
+- `<model>.STAGE.train.safetensors`
+- `<model>.STAGE.optimizer.safetensors`
+- `<model>.STAGE.resume.json`
+
+For latent training there is also:
+
+- `<model>.STAGE.target.safetensors`
+
+`STAGE` comes from `TOFY_RUN_STAGE_NAME` when it is set by the scripts, otherwise it is the default stage name such as `latent`, `world`, `orchestrator`, or `decoder`.
+
+Resume rules:
+
+- Keep the same architecture arguments: `DIM`, `LAYERS`, `HEADS`, `BRIDGE_DIM`, `NUM_LATENT_TOKENS`, vocab size, and decoder architecture must match the saved sidecars.
+- Keep the same model output path. Changing output paths creates a new resume namespace.
+- If optimizer sidecars do not exist, `--resume` can still load the exported best/final model weights when available, but optimizer momentum and exact step continuation are not restored.
+- If `resume.json` already reached the requested step count, the stage exits without doing more training. Increase `LATENT_STEPS`, `WORLD_STEPS`, `CODE_DECODER_STEPS`, etc. to continue further.
+- Do not use old checkpoints from a different architecture, for example the previous `DIM=768` encoder/world with the current shared-width `DIM=640` setup.
+
 ## Context Guide
 
 In this project, "context" has three layers:

@@ -41,15 +41,15 @@ ROUTER_STEPS="${ROUTER_STEPS:-15000}"
 CODE_DECODER_STEPS="${CODE_DECODER_STEPS:-40000}"
 CODE_POLISH_STEPS="${CODE_POLISH_STEPS:-8000}"
 
-DIM="${DIM:-768}"
+DIM="${DIM:-640}"
 LATENT_MAX_SEQ="${LATENT_MAX_SEQ:-256}"
 WORLD_MAX_SEQ="${WORLD_MAX_SEQ:-256}"
 CODE_DECODER_MAX_SEQ="${CODE_DECODER_MAX_SEQ:-224}"
-LAYERS="${LAYERS:-9}"
+LAYERS="${LAYERS:-7}"
 HEADS="${HEADS:-8}"
 MAX_VOCAB="${MAX_VOCAB:-8000}"
-CODE_DECODER_MAX_VOCAB="${CODE_DECODER_MAX_VOCAB:-32000}"
-BRIDGE_DIM="${BRIDGE_DIM:-256}"
+CODE_DECODER_MAX_VOCAB="${CODE_DECODER_MAX_VOCAB:-16000}"
+BRIDGE_DIM="${BRIDGE_DIM:-640}"
 NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
 WORLD_LR="${WORLD_LR:-2e-4}"
 CODE_DECODER_LR="${CODE_DECODER_LR:-3e-4}"
@@ -62,6 +62,7 @@ WORLD_DONE_RATIO="${WORLD_DONE_RATIO:-0.18}"
 WORLD_MAX_ROWS="${WORLD_MAX_ROWS:-0}"
 ENCODER_VOCAB="${ENCODER_VOCAB:-}"
 CODE_DECODER_OUTPUT="${CODE_DECODER_OUTPUT:-local_models/code_decoder_poc.safetensors}"
+TOFY_RESUME="${TOFY_RESUME:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
   if [[ -x ".venv/bin/python" ]]; then
@@ -71,6 +72,10 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   fi
 fi
 PIPELINE_RUN_ID="${PIPELINE_RUN_ID:-code_poc_$(date +%Y-%m-%d_%H-%M-%S)}"
+RESUME_ARGS=()
+if [[ "${TOFY_RESUME}" == "1" || "${TOFY_RESUME}" == "true" ]]; then
+  RESUME_ARGS=(--resume)
+fi
 
 detect_total_vram_mb() {
   if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -108,19 +113,23 @@ fi
 
 case "${TOFY_GPU_PROFILE}" in
   8gb)
-    DEFAULT_BATCH=4
-    DEFAULT_DECODER_BATCH=4
-    DEFAULT_LATENT_BATCH=2
-    DEFAULT_WORLD_BATCH=4
-    DEFAULT_LATENT_GRAD_ACCUM=16
-    DEFAULT_WORLD_GRAD_ACCUM=32
-    DEFAULT_DECODER_GRAD_ACCUM=8
+    DEFAULT_BATCH=8
+    DEFAULT_DECODER_BATCH=12
+    DEFAULT_LATENT_BATCH=32
+    DEFAULT_LATENT_WARMUP_BATCH=32
+    DEFAULT_WORLD_BATCH=64
+    DEFAULT_WORLD_WARMUP_BATCH=96
+    DEFAULT_LATENT_GRAD_ACCUM=1
+    DEFAULT_WORLD_GRAD_ACCUM=2
+    DEFAULT_DECODER_GRAD_ACCUM=2
     ;;
   balanced)
     DEFAULT_BATCH=12
     DEFAULT_DECODER_BATCH=8
     DEFAULT_LATENT_BATCH=8
+    DEFAULT_LATENT_WARMUP_BATCH=8
     DEFAULT_WORLD_BATCH=12
+    DEFAULT_WORLD_WARMUP_BATCH=12
     DEFAULT_LATENT_GRAD_ACCUM=1
     DEFAULT_WORLD_GRAD_ACCUM=1
     DEFAULT_DECODER_GRAD_ACCUM=1
@@ -134,7 +143,11 @@ esac
 BATCH="${BATCH:-${DEFAULT_BATCH}}"
 DECODER_BATCH="${DECODER_BATCH:-${DEFAULT_DECODER_BATCH}}"
 LATENT_BATCH="${LATENT_BATCH:-${DEFAULT_LATENT_BATCH:-${BATCH}}}"
+TOFY_LATENT_WARMUP_BATCH="${TOFY_LATENT_WARMUP_BATCH:-${DEFAULT_LATENT_WARMUP_BATCH:-${LATENT_BATCH}}}"
+TOFY_LATENT_WARMUP_GRAD_ACCUM="${TOFY_LATENT_WARMUP_GRAD_ACCUM:-1}"
 WORLD_BATCH="${WORLD_BATCH:-${DEFAULT_WORLD_BATCH:-${BATCH}}}"
+TOFY_WORLD_WARMUP_BATCH="${TOFY_WORLD_WARMUP_BATCH:-${DEFAULT_WORLD_WARMUP_BATCH:-${WORLD_BATCH}}}"
+TOFY_WORLD_WARMUP_GRAD_ACCUM="${TOFY_WORLD_WARMUP_GRAD_ACCUM:-1}"
 CODE_DECODER_BATCH="${CODE_DECODER_BATCH:-${DECODER_BATCH}}"
 DECODER_GRAD_ACCUM="${DECODER_GRAD_ACCUM:-${DEFAULT_DECODER_GRAD_ACCUM}}"
 LATENT_GRAD_ACCUM="${LATENT_GRAD_ACCUM:-${DEFAULT_LATENT_GRAD_ACCUM}}"
@@ -142,11 +155,24 @@ WORLD_GRAD_ACCUM="${WORLD_GRAD_ACCUM:-${DEFAULT_WORLD_GRAD_ACCUM}}"
 ROUTER_BATCH="${ROUTER_BATCH:-${WORLD_BATCH}}"
 ROUTER_GRAD_ACCUM="${ROUTER_GRAD_ACCUM:-${WORLD_GRAD_ACCUM}}"
 CODE_DECODER_GRAD_ACCUM="${CODE_DECODER_GRAD_ACCUM:-${DECODER_GRAD_ACCUM}}"
+export TOFY_LATENT_WARMUP_BATCH TOFY_LATENT_WARMUP_GRAD_ACCUM
+export TOFY_WORLD_WARMUP_BATCH TOFY_WORLD_WARMUP_GRAD_ACCUM
+
+latest_model_artifact() {
+  local pattern="$1"
+  find local_models -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' 2>/dev/null \
+    | awk '$0 !~ /\.safetensors\..*\.safetensors$/' \
+    | sort -nr \
+    | head -n1 \
+    | cut -d' ' -f2-
+}
 
 echo "GPU profile: ${TOFY_GPU_PROFILE} (vram_mb=${TOTAL_VRAM_MB:-unknown})"
 echo "Microbatches: latent=${LATENT_BATCH} world=${WORLD_BATCH} code_decoder=${CODE_DECODER_BATCH}"
 echo "Grad accum: latent=${LATENT_GRAD_ACCUM} world=${WORLD_GRAD_ACCUM} code_decoder=${CODE_DECODER_GRAD_ACCUM}"
 echo "Effective batch: latent=$((LATENT_BATCH * LATENT_GRAD_ACCUM)) world=$((WORLD_BATCH * WORLD_GRAD_ACCUM)) code_decoder=$((CODE_DECODER_BATCH * CODE_DECODER_GRAD_ACCUM))"
+echo "Latent warmup: batch=${TOFY_LATENT_WARMUP_BATCH} grad_accum=${TOFY_LATENT_WARMUP_GRAD_ACCUM} effective=$((TOFY_LATENT_WARMUP_BATCH * TOFY_LATENT_WARMUP_GRAD_ACCUM)) for ${TOFY_LATENT_WARMUP_STEPS:-20%} of latent steps"
+echo "World warmup: batch=${TOFY_WORLD_WARMUP_BATCH} grad_accum=${TOFY_WORLD_WARMUP_GRAD_ACCUM} effective=$((TOFY_WORLD_WARMUP_BATCH * TOFY_WORLD_WARMUP_GRAD_ACCUM)) for ${TOFY_WORLD_WARMUP_STEPS:-20%} of world steps"
 echo "Training dtype: ${TOFY_TRAIN_DTYPE} | latent_segments=${TOFY_LATENT_CONTEXT_SEGMENTS} recent_full=${TOFY_LATENT_RECENT_FULL_SEGMENTS} history_ratio=${TOFY_LATENT_HISTORY_RATIO}"
 echo "World memory: segments=${TOFY_WORLD_CONTEXT_SEGMENTS} recent_full=${TOFY_WORLD_RECENT_FULL_SEGMENTS} recursive=${TOFY_RECURSIVE_PLANNER_MEMORY} rollout_train=${TOFY_WORLD_TRAIN_ROLLOUT_STEPS} rollout_serve=${TOFY_WORLD_ROLLOUT_STEPS}"
 
@@ -230,9 +256,9 @@ echo "Generating code eval suite at ${EVAL_SUITE}"
 echo "== Stage 1/6: encoder =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="latent" cargo run --release -- \
   --latent "${ENCODER_DATA}" "${LATENT_STEPS}" "${LATENT_BATCH}" "${DIM}" "${LATENT_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${MAX_VOCAB}" \
-  --grad-accum "${LATENT_GRAD_ACCUM}"
+  --grad-accum "${LATENT_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
 
-LATENT_MODEL="${LATENT_MODEL:-$(ls -1t local_models/model_latent_*.safetensors 2>/dev/null | awk '{print; exit}')}"
+LATENT_MODEL="${LATENT_MODEL:-$(latest_model_artifact 'model_latent_*.safetensors')}"
 if [[ -z "${LATENT_MODEL}" || ! -f "${LATENT_MODEL}" ]]; then
   echo "ERROR: latent checkpoint not found"
   exit 1
@@ -251,9 +277,9 @@ echo "== Stage 2/6: world transition =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="world" cargo run --release -- \
   --train-world "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_DATA}" "${WORLD_STEPS}" "${WORLD_BATCH}" "${DIM}" "${WORLD_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
   --lambda "${WORLD_LAMBDA}" --lr "${WORLD_LR}" --grad-accum "${WORLD_GRAD_ACCUM}" \
-  --action-loss-weight "${WORLD_ACTION_LOSS_WEIGHT}" --router-warmup "${WORLD_ROUTER_WARMUP}"
+  --action-loss-weight "${WORLD_ACTION_LOSS_WEIGHT}" --router-warmup "${WORLD_ROUTER_WARMUP}" "${RESUME_ARGS[@]}"
 
-WORLD_MODEL="${WORLD_MODEL:-$(ls -1t local_models/model_world_*.safetensors 2>/dev/null | awk '{print; exit}')}"
+WORLD_MODEL="${WORLD_MODEL:-$(latest_model_artifact 'model_world_*.safetensors')}"
 if [[ -z "${WORLD_MODEL}" || ! -f "${WORLD_MODEL}" ]]; then
   echo "ERROR: world checkpoint not found"
   exit 1
@@ -262,18 +288,18 @@ fi
 echo "== Stage 3/6: orchestrator/planner tune =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="orchestrator" cargo run --release -- \
   --train-orchestrator "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${WORLD_DATA}" "${ROUTER_STEPS}" "${ROUTER_BATCH}" "${DIM}" "${WORLD_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
-  --lr "${WORLD_LR}" --grad-accum "${ROUTER_GRAD_ACCUM}" --output "${WORLD_MODEL}"
+  --lr "${WORLD_LR}" --grad-accum "${ROUTER_GRAD_ACCUM}" --output "${WORLD_MODEL}" "${RESUME_ARGS[@]}"
 
 echo "== Stage 4/6: code decoder =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code" cargo run --release -- \
   --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${CODE_TRAIN_DATA}" "${CODE_DECODER_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
-  --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_DECODER_LR}"
+  --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_DECODER_LR}" "${RESUME_ARGS[@]}"
 
 if [[ "${CODE_POLISH_STEPS}" -gt 0 ]]; then
   echo "== Stage 4b/6: code decoder instruction polish =="
   TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code_polish" cargo run --release -- \
     --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${RUST_TASK_DATA}" "${CODE_POLISH_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" \
-    --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --init-decoder "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_POLISH_LR}"
+    --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --decoder-output "${CODE_DECODER_OUTPUT}" --init-decoder "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_POLISH_LR}" "${RESUME_ARGS[@]}"
 fi
 
 echo "== Stage 5/6: code eval suite =="

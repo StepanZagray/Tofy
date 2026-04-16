@@ -42,6 +42,7 @@ maybe_export_cuda_compat() {
 latest_artifact() {
   local pattern="$1"
   find local_models -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' 2>/dev/null \
+    | awk '$0 !~ /\.safetensors\..*\.safetensors$/' \
     | sort -nr \
     | head -n1 \
     | cut -d' ' -f2-

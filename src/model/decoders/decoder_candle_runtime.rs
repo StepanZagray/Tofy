@@ -12,11 +12,11 @@ use super::{CodeDecoder, DecoderAdapter, DecoderKind, LocalDecoderRuntime};
 use crate::data::{encode_text_with_vocab_mode, TokenizationMode};
 use crate::model::vocab::{load_vocab_from_file, vocab_signature, Vocab};
 
-/// Decoder architecture; must match training constants in world.rs. Sized for ~8GB VRAM (~90M params).
-const DECODER_DIM: usize = 768;
+/// Decoder architecture; must match training constants in world.rs.
+const DECODER_DIM: usize = 640;
 const DECODER_LAYERS: usize = 8;
 const DECODER_HEADS: usize = 8;
-const DECODER_FF_DIM: usize = 3072;
+const DECODER_FF_DIM: usize = 2560;
 
 /// Decoder backend that runs the Candle CodeDecoder with cross-attention to the world latent sequence.
 /// Expects conditioning to be the **flattened** latent sequence (length = num_latent_tokens * world_dim).
@@ -49,12 +49,16 @@ impl CandleCrossAttnDecoder {
         planner_slots: usize,
     ) -> Result<()> {
         let metadata = format!(
-            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\nplanner_slots={}\n",
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\nplanner_slots={}\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
             kind.as_str(),
             vocab_signature(vocab),
             vocab.id_to_token.len(),
             planner_dim,
-            planner_slots
+            planner_slots,
+            DECODER_DIM,
+            DECODER_LAYERS,
+            DECODER_HEADS,
+            DECODER_FF_DIM
         );
         fs::write(Self::metadata_path(checkpoint_path), metadata)?;
         Ok(())
@@ -120,6 +124,46 @@ impl CandleCrossAttnDecoder {
                 );
             }
         }
+        if let Some(saved_dim) = parsed.get("decoder_dim") {
+            if saved_dim.parse::<usize>().ok() != Some(DECODER_DIM) {
+                anyhow::bail!(
+                    "decoder dim mismatch for {:?}: metadata says {}, runtime expects {}",
+                    checkpoint_path,
+                    saved_dim,
+                    DECODER_DIM
+                );
+            }
+        }
+        if let Some(saved_layers) = parsed.get("decoder_layers") {
+            if saved_layers.parse::<usize>().ok() != Some(DECODER_LAYERS) {
+                anyhow::bail!(
+                    "decoder layer mismatch for {:?}: metadata says {}, runtime expects {}",
+                    checkpoint_path,
+                    saved_layers,
+                    DECODER_LAYERS
+                );
+            }
+        }
+        if let Some(saved_heads) = parsed.get("decoder_heads") {
+            if saved_heads.parse::<usize>().ok() != Some(DECODER_HEADS) {
+                anyhow::bail!(
+                    "decoder head mismatch for {:?}: metadata says {}, runtime expects {}",
+                    checkpoint_path,
+                    saved_heads,
+                    DECODER_HEADS
+                );
+            }
+        }
+        if let Some(saved_ff_dim) = parsed.get("decoder_ff_dim") {
+            if saved_ff_dim.parse::<usize>().ok() != Some(DECODER_FF_DIM) {
+                anyhow::bail!(
+                    "decoder ff_dim mismatch for {:?}: metadata says {}, runtime expects {}",
+                    checkpoint_path,
+                    saved_ff_dim,
+                    DECODER_FF_DIM
+                );
+            }
+        }
         Ok(())
     }
 
@@ -136,7 +180,7 @@ impl CandleCrossAttnDecoder {
         }
     }
 
-    /// Load CodeDecoder from checkpoint. Config: dim=768, 8 layers, 8 heads, ff=3072.
+    /// Load CodeDecoder from checkpoint. Config: dim=640, 8 layers, 8 heads, ff=2560.
     pub fn new(
         checkpoint_path: PathBuf,
         vocab_path: PathBuf,
@@ -149,11 +193,6 @@ impl CandleCrossAttnDecoder {
         let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
         let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
         let mut varmap = VarMap::new();
-        varmap
-            .load(&checkpoint_path)
-            .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
-        crate::util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
-        let vb = VarBuilder::from_varmap(&varmap, runtime_dtype, &device);
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
         Self::validate_metadata(&checkpoint_path, &vocab, kind, planner_dim, planner_slots)?;
@@ -179,13 +218,13 @@ impl CandleCrossAttnDecoder {
             1.0
         };
         let adapter = DecoderAdapter::new(
-            vb.pp("decoder_adapter"),
+            VarBuilder::from_varmap(&varmap, runtime_dtype, &device).pp("decoder_adapter"),
             planner_dim,
             world_dim,
             DecoderAdapter::output_slots_for(kind, planner_slots),
         )?;
         let decoder = CodeDecoder::new(
-            vb.pp("decoder"),
+            VarBuilder::from_varmap(&varmap, runtime_dtype, &device).pp("decoder"),
             vocab_size,
             DECODER_DIM,
             world_dim,
@@ -194,6 +233,10 @@ impl CandleCrossAttnDecoder {
             DECODER_FF_DIM,
             kind,
         )?;
+        varmap
+            .load(&checkpoint_path)
+            .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
+        crate::util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
         Ok(Self {
             adapter,
             decoder,

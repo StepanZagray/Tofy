@@ -25,6 +25,11 @@ pub struct Config {
     pub lr: f64,
     pub log_every: usize,
     pub grad_accum_steps: usize,
+    pub grad_accum_warmup_steps: usize,
+    pub grad_accum_warmup_value: usize,
+    pub batch_warmup_steps: usize,
+    pub batch_warmup_value: usize,
+    pub resume: bool,
     pub train_dtype: DType,
     pub latent_context_segments: usize,
     pub latent_recent_full_segments: usize,
@@ -36,10 +41,13 @@ impl Config {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.is_empty() {
             anyhow::bail!(
-                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>]"
+                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--resume]"
             );
         }
         let mut grad_accum_steps = 1usize;
+        let mut resume = std::env::var("TOFY_RESUME")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let train_dtype = std::env::var("TOFY_TRAIN_DTYPE")
             .ok()
             .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
@@ -62,17 +70,44 @@ impl Config {
                 i += 2;
                 continue;
             }
+            if args[i] == "--resume" {
+                resume = true;
+                i += 1;
+                continue;
+            }
             filtered.push(args[i].clone());
             i += 1;
         }
+        let steps = filtered
+            .get(1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10000);
+        let batch_size = filtered.get(2).and_then(|v| v.parse().ok()).unwrap_or(12);
+        let grad_accum_steps = grad_accum_steps.max(1);
+        let batch_warmup_value = std::env::var("TOFY_LATENT_WARMUP_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(batch_size)
+            .max(1);
+        let grad_accum_warmup_value = std::env::var("TOFY_LATENT_WARMUP_GRAD_ACCUM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize)
+            .max(1)
+            .min(grad_accum_steps);
+        let warmup_is_active =
+            batch_warmup_value != batch_size || grad_accum_warmup_value < grad_accum_steps;
+        let grad_accum_warmup_steps = std::env::var("TOFY_LATENT_WARMUP_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if warmup_is_active { steps / 5 } else { 0 })
+            .min(steps);
+        let batch_warmup_steps = grad_accum_warmup_steps;
         Ok(Self {
             data_path: PathBuf::from(&filtered[0]),
             init_encoder_path: None,
-            steps: filtered
-                .get(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10000),
-            batch_size: filtered.get(2).and_then(|v| v.parse().ok()).unwrap_or(12),
+            steps,
+            batch_size,
             dim: filtered.get(3).and_then(|v| v.parse().ok()).unwrap_or(768),
             max_seq: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_layers: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(9),
@@ -91,7 +126,12 @@ impl Config {
             lambda: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.2),
             lr: 3e-4,
             log_every: 100,
-            grad_accum_steps: grad_accum_steps.max(1),
+            grad_accum_steps,
+            grad_accum_warmup_steps,
+            grad_accum_warmup_value,
+            batch_warmup_steps,
+            batch_warmup_value,
+            resume,
             train_dtype,
             latent_context_segments: std::env::var("TOFY_LATENT_CONTEXT_SEGMENTS")
                 .ok()
