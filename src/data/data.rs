@@ -5,7 +5,7 @@ use rand::thread_rng;
 use rand::Rng;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 
 use crate::model::vocab::{Pair, Vocab};
@@ -333,6 +333,16 @@ pub fn split_line_with_min_tokens_mode(
     Some(tokens)
 }
 
+pub fn encode_line_with_vocab_mode(
+    line: &str,
+    vocab: &Vocab,
+    mode: TokenizationMode,
+    min_tokens: usize,
+) -> Option<Vec<u32>> {
+    let tokens = split_line_with_min_tokens_mode(line, min_tokens, mode)?;
+    Some(encode_tokens_with_vocab(&tokens, vocab, mode))
+}
+
 pub struct VocabStats {
     pub total_tokens: usize,
     pub covered_tokens: usize,
@@ -503,9 +513,64 @@ pub struct RawWorldExample {
     pub action_label: u32,
 }
 
+pub fn raw_world_example_from_line_with_mode(
+    line: &str,
+    mode: TokenizationMode,
+) -> Option<RawWorldExample> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (left, right, explicit_action) = parse_world_line_fields(line)?;
+    let state_text = left;
+    let mut next_text = right;
+    let action_label = if let Some(action) = explicit_action {
+        action
+    } else if let Some((action, stripped)) = explicit_action_from_next_text(&next_text) {
+        next_text = stripped;
+        action
+    } else {
+        action_label_heuristic(&next_text)
+    };
+    let state_tokens = tokenize_with_mode(&state_text, mode);
+    let next_tokens = tokenize_with_mode(&next_text, mode);
+    if state_tokens.is_empty() || next_tokens.is_empty() {
+        return None;
+    }
+    Some(RawWorldExample {
+        state_text,
+        next_text,
+        action_label,
+    })
+}
+
+pub fn encode_raw_world_line_with_vocab_mode(
+    line: &str,
+    vocab: &Vocab,
+    mode: TokenizationMode,
+) -> Option<WorldExample> {
+    let row = raw_world_example_from_line_with_mode(line, mode)?;
+    Some(WorldExample {
+        state_tokens: encode_tokens_with_vocab(
+            &tokenize_with_mode(&row.state_text, mode),
+            vocab,
+            mode,
+        ),
+        next_tokens: encode_tokens_with_vocab(
+            &tokenize_with_mode(&row.next_text, mode),
+            vocab,
+            mode,
+        ),
+        action_label: row.action_label,
+    })
+}
+
 /// Minimum number of tokens per line to include (2 = skip single-token lines; 1 = paragraph mode).
 pub const DEFAULT_MIN_TOKENS_PER_LINE: usize = 2;
 pub const DEFAULT_STREAM_SHUFFLE_BUFFER: usize = 1024;
+const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V1\n";
+const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V1\n";
+type TokenCacheRecord = (Vec<u32>, Vec<u32>, u32);
 
 pub struct PairStream {
     path: PathBuf,
@@ -578,6 +643,81 @@ impl PairStream {
     }
 }
 
+pub struct CachedPairStream {
+    path: PathBuf,
+    reader: BufReader<File>,
+    shuffle_buffer_size: usize,
+    shuffle_buffer: Vec<Pair>,
+}
+
+impl CachedPairStream {
+    pub fn new(path: &PathBuf) -> Result<Self> {
+        Self::with_shuffle(path, DEFAULT_STREAM_SHUFFLE_BUFFER)
+    }
+
+    pub fn with_shuffle(path: &PathBuf, shuffle_buffer_size: usize) -> Result<Self> {
+        let mut stream = Self {
+            path: path.clone(),
+            reader: BufReader::new(File::open(path)?),
+            shuffle_buffer_size: shuffle_buffer_size.max(1),
+            shuffle_buffer: Vec::new(),
+        };
+        stream.read_magic()?;
+        Ok(stream)
+    }
+
+    fn read_magic(&mut self) -> Result<()> {
+        let mut magic = vec![0u8; TOKEN_CACHE_MAGIC.len()];
+        self.reader.read_exact(&mut magic)?;
+        if magic != TOKEN_CACHE_MAGIC {
+            bail!("invalid token cache magic in {:?}", self.path);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reader = BufReader::new(File::open(&self.path)?);
+        self.read_magic()
+    }
+
+    fn read_next_pair(&mut self) -> Result<Pair> {
+        loop {
+            match read_token_cache_record(&mut self.reader)? {
+                Some((tokens, _right, _action)) if !tokens.is_empty() => {
+                    return Ok(Pair { tokens });
+                }
+                Some(_) => continue,
+                None => self.reset()?,
+            }
+        }
+    }
+
+    fn refill_shuffle_buffer(&mut self) -> Result<()> {
+        while self.shuffle_buffer.len() < self.shuffle_buffer_size {
+            let pair = self.read_next_pair()?;
+            self.shuffle_buffer.push(pair);
+        }
+        Ok(())
+    }
+
+    fn next_pair(&mut self) -> Result<Pair> {
+        if self.shuffle_buffer_size <= 1 {
+            return self.read_next_pair();
+        }
+        self.refill_shuffle_buffer()?;
+        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        Ok(self.shuffle_buffer.swap_remove(idx))
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<Pair>> {
+        let mut batch = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            batch.push(self.next_pair()?);
+        }
+        Ok(batch)
+    }
+}
+
 pub struct RawWorldStream {
     path: PathBuf,
     reader: BufReader<File>,
@@ -588,6 +728,300 @@ pub struct RawWorldStream {
     split_remainder: usize,
     exclude_split_matches: bool,
     line_index: usize,
+}
+
+pub struct CachedWorldStream {
+    path: PathBuf,
+    reader: BufReader<File>,
+    shuffle_buffer_size: usize,
+    shuffle_buffer: Vec<WorldExample>,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    exclude_split_matches: bool,
+    row_index: usize,
+}
+
+#[derive(Clone)]
+pub struct CachedDecoderExample {
+    pub encoder: WorldExample,
+    pub decoder: WorldExample,
+}
+
+pub struct CachedDecoderStream {
+    path: PathBuf,
+    reader: BufReader<File>,
+    shuffle_buffer_size: usize,
+    shuffle_buffer: Vec<CachedDecoderExample>,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    exclude_split_matches: bool,
+    row_index: usize,
+}
+
+impl CachedWorldStream {
+    pub fn with_split(
+        path: &PathBuf,
+        shuffle_buffer_size: usize,
+        split_modulus: Option<usize>,
+        split_remainder: usize,
+        exclude_split_matches: bool,
+    ) -> Result<Self> {
+        let mut stream = Self {
+            path: path.clone(),
+            reader: BufReader::new(File::open(path)?),
+            shuffle_buffer_size: shuffle_buffer_size.max(1),
+            shuffle_buffer: Vec::new(),
+            split_modulus,
+            split_remainder,
+            exclude_split_matches,
+            row_index: 0,
+        };
+        stream.read_magic()?;
+        Ok(stream)
+    }
+
+    fn read_magic(&mut self) -> Result<()> {
+        let mut magic = vec![0u8; TOKEN_CACHE_MAGIC.len()];
+        self.reader.read_exact(&mut magic)?;
+        if magic != TOKEN_CACHE_MAGIC {
+            bail!("invalid token cache magic in {:?}", self.path);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reader = BufReader::new(File::open(&self.path)?);
+        self.row_index = 0;
+        self.read_magic()
+    }
+
+    fn read_next_example(&mut self) -> Result<WorldExample> {
+        loop {
+            let Some((state_tokens, next_tokens, action_label)) =
+                read_token_cache_record(&mut self.reader)?
+            else {
+                self.reset()?;
+                continue;
+            };
+            let row_idx = self.row_index;
+            self.row_index += 1;
+            if let Some(modulus) = self.split_modulus {
+                let is_match = row_idx % modulus == self.split_remainder;
+                let keep = if self.exclude_split_matches {
+                    !is_match
+                } else {
+                    is_match
+                };
+                if !keep {
+                    continue;
+                }
+            }
+            if state_tokens.is_empty() || next_tokens.is_empty() {
+                continue;
+            }
+            return Ok(WorldExample {
+                state_tokens,
+                next_tokens,
+                action_label,
+            });
+        }
+    }
+
+    fn refill_shuffle_buffer(&mut self) -> Result<()> {
+        while self.shuffle_buffer.len() < self.shuffle_buffer_size {
+            let example = self.read_next_example()?;
+            self.shuffle_buffer.push(example);
+        }
+        Ok(())
+    }
+
+    fn next_example(&mut self) -> Result<WorldExample> {
+        if self.shuffle_buffer_size <= 1 {
+            return self.read_next_example();
+        }
+        self.refill_shuffle_buffer()?;
+        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        Ok(self.shuffle_buffer.swap_remove(idx))
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<WorldExample>> {
+        let mut batch = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            batch.push(self.next_example()?);
+        }
+        Ok(batch)
+    }
+}
+
+impl CachedDecoderStream {
+    pub fn with_split(
+        path: &PathBuf,
+        shuffle_buffer_size: usize,
+        split_modulus: Option<usize>,
+        split_remainder: usize,
+        exclude_split_matches: bool,
+    ) -> Result<Self> {
+        let mut stream = Self {
+            path: path.clone(),
+            reader: BufReader::new(File::open(path)?),
+            shuffle_buffer_size: shuffle_buffer_size.max(1),
+            shuffle_buffer: Vec::new(),
+            split_modulus,
+            split_remainder,
+            exclude_split_matches,
+            row_index: 0,
+        };
+        stream.read_magic()?;
+        Ok(stream)
+    }
+
+    fn read_magic(&mut self) -> Result<()> {
+        let mut magic = vec![0u8; DUAL_TOKEN_CACHE_MAGIC.len()];
+        self.reader.read_exact(&mut magic)?;
+        if magic != DUAL_TOKEN_CACHE_MAGIC {
+            bail!("invalid dual token cache magic in {:?}", self.path);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reader = BufReader::new(File::open(&self.path)?);
+        self.row_index = 0;
+        self.read_magic()
+    }
+
+    fn read_next_example(&mut self) -> Result<CachedDecoderExample> {
+        loop {
+            let Some((enc_state, enc_next, dec_state, dec_next, action_label)) =
+                read_dual_token_cache_record(&mut self.reader)?
+            else {
+                self.reset()?;
+                continue;
+            };
+            let row_idx = self.row_index;
+            self.row_index += 1;
+            if let Some(modulus) = self.split_modulus {
+                let is_match = row_idx % modulus == self.split_remainder;
+                let keep = if self.exclude_split_matches {
+                    !is_match
+                } else {
+                    is_match
+                };
+                if !keep {
+                    continue;
+                }
+            }
+            if enc_state.is_empty()
+                || enc_next.is_empty()
+                || dec_state.is_empty()
+                || dec_next.is_empty()
+            {
+                continue;
+            }
+            return Ok(CachedDecoderExample {
+                encoder: WorldExample {
+                    state_tokens: enc_state,
+                    next_tokens: enc_next,
+                    action_label,
+                },
+                decoder: WorldExample {
+                    state_tokens: dec_state,
+                    next_tokens: dec_next,
+                    action_label,
+                },
+            });
+        }
+    }
+
+    fn refill_shuffle_buffer(&mut self) -> Result<()> {
+        while self.shuffle_buffer.len() < self.shuffle_buffer_size {
+            let example = self.read_next_example()?;
+            self.shuffle_buffer.push(example);
+        }
+        Ok(())
+    }
+
+    fn next_example(&mut self) -> Result<CachedDecoderExample> {
+        if self.shuffle_buffer_size <= 1 {
+            return self.read_next_example();
+        }
+        self.refill_shuffle_buffer()?;
+        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        Ok(self.shuffle_buffer.swap_remove(idx))
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
+        let mut batch = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            batch.push(self.next_example()?);
+        }
+        Ok(batch)
+    }
+}
+
+fn read_u32_le<R: Read>(reader: &mut R) -> Result<Option<u32>> {
+    let mut buf = [0u8; 4];
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = reader.read(&mut buf[read..])?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            bail!("truncated token cache record");
+        }
+        read += n;
+    }
+    Ok(Some(u32::from_le_bytes(buf)))
+}
+
+fn read_ids<R: Read>(reader: &mut R) -> Result<Option<Vec<u32>>> {
+    let Some(len) = read_u32_le(reader)? else {
+        return Ok(None);
+    };
+    let len = len as usize;
+    let mut ids = Vec::with_capacity(len);
+    for _ in 0..len {
+        let Some(id) = read_u32_le(reader)? else {
+            bail!("truncated token cache id sequence");
+        };
+        ids.push(id);
+    }
+    Ok(Some(ids))
+}
+
+fn read_token_cache_record<R: Read>(reader: &mut R) -> Result<Option<TokenCacheRecord>> {
+    let Some(left) = read_ids(reader)? else {
+        return Ok(None);
+    };
+    let Some(right) = read_ids(reader)? else {
+        bail!("truncated token cache right sequence");
+    };
+    let Some(action) = read_u32_le(reader)? else {
+        bail!("truncated token cache action");
+    };
+    Ok(Some((left, right, action)))
+}
+
+type DualTokenCacheRecord = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, u32);
+
+fn read_dual_token_cache_record<R: Read>(reader: &mut R) -> Result<Option<DualTokenCacheRecord>> {
+    let Some(enc_left) = read_ids(reader)? else {
+        return Ok(None);
+    };
+    let Some(enc_right) = read_ids(reader)? else {
+        bail!("truncated dual token cache encoder right sequence");
+    };
+    let Some(dec_left) = read_ids(reader)? else {
+        bail!("truncated dual token cache decoder left sequence");
+    };
+    let Some(dec_right) = read_ids(reader)? else {
+        bail!("truncated dual token cache decoder right sequence");
+    };
+    let Some(action) = read_u32_le(reader)? else {
+        bail!("truncated dual token cache action");
+    };
+    Ok(Some((enc_left, enc_right, dec_left, dec_right, action)))
 }
 
 impl RawWorldStream {
@@ -888,6 +1322,47 @@ fn is_code_like_tokens(tokens: &[String]) -> bool {
     code_chars * 5 > len || (code_chars > 4 && identifiers > len / 4)
 }
 
+fn token_str(vocab: &Vocab, id: u32) -> &str {
+    vocab
+        .id_to_token
+        .get(id as usize)
+        .map(String::as_str)
+        .unwrap_or("<unk>")
+}
+
+fn is_code_like_ids(ids: &[u32], vocab: &Vocab) -> bool {
+    let code_chars = ids
+        .iter()
+        .filter(|&&id| {
+            matches!(
+                token_str(vocab, id),
+                "{" | "}"
+                    | "("
+                    | ")"
+                    | "["
+                    | "]"
+                    | ";"
+                    | "::"
+                    | "."
+                    | "=>"
+                    | "->"
+                    | "="
+                    | "=="
+                    | "+"
+                    | "-"
+                    | "*"
+                    | "/"
+            )
+        })
+        .count();
+    let identifiers = ids
+        .iter()
+        .filter(|&&id| is_identifier_like(token_str(vocab, id)))
+        .count();
+    let len = ids.len().max(1);
+    code_chars * 5 > len || (code_chars > 4 && identifiers > len / 4)
+}
+
 fn is_comment_token(token: &str) -> bool {
     matches!(token, "//" | "/*" | "*/" | "#" | "\"\"\"" | "'''")
 }
@@ -980,6 +1455,89 @@ fn prepare_segmented_context_tokens(
     let mut combined = Vec::with_capacity(history_tokens.len() + recent_tokens.len());
     combined.extend(history_tokens);
     combined.extend(recent_tokens);
+    if combined.len() > cfg.max_seq {
+        combined = combined[combined.len() - cfg.max_seq..].to_vec();
+    }
+    combined
+}
+
+fn crop_ids_for_curriculum(
+    ids: &[u32],
+    active_seq: usize,
+    rng: &mut rand::rngs::ThreadRng,
+) -> Vec<u32> {
+    if ids.len() <= active_seq {
+        return ids.to_vec();
+    }
+    let start = rng.gen_range(0..=ids.len() - active_seq);
+    ids[start..start + active_seq].to_vec()
+}
+
+fn sample_even_history_ids(
+    ids: &[u32],
+    budget: usize,
+    rng: &mut rand::rngs::ThreadRng,
+) -> Vec<u32> {
+    if budget == 0 || ids.is_empty() {
+        return Vec::new();
+    }
+    if ids.len() <= budget {
+        return ids.to_vec();
+    }
+    let stride = ids.len() as f64 / budget as f64;
+    let jitter = stride.min(1.0);
+    let mut out = Vec::with_capacity(budget);
+    for idx in 0..budget {
+        let base = (idx as f64 * stride).floor() as usize;
+        let jitter_offset = if jitter > 0.0 {
+            rng.gen_range(0.0..=jitter).floor() as usize
+        } else {
+            0
+        };
+        let chosen = (base + jitter_offset).min(ids.len().saturating_sub(1));
+        out.push(ids[chosen]);
+    }
+    out
+}
+
+fn prepare_segmented_context_ids(
+    ids: &[u32],
+    cfg: &CurriculumDenoisingConfig,
+    rng: &mut rand::rngs::ThreadRng,
+) -> Vec<u32> {
+    let context_segments = cfg.context_segments.max(1);
+    let recent_full_segments = cfg.recent_full_segments.min(context_segments).max(1);
+    let source_budget = cfg.active_seq.max(1) * context_segments;
+    let mut cropped = crop_ids_for_curriculum(ids, source_budget, rng);
+    if context_segments == 1 || cropped.len() <= cfg.max_seq {
+        return crop_ids_for_curriculum(&cropped, cfg.active_seq.max(1).min(cfg.max_seq), rng);
+    }
+
+    let segment_len = cfg.active_seq.max(1);
+    if cropped.len() > source_budget {
+        cropped = cropped[cropped.len() - source_budget..].to_vec();
+    }
+    let recent_span = segment_len * recent_full_segments;
+    let history_len = cropped.len().saturating_sub(recent_span);
+    let history_budget = ((cfg.max_seq as f64) * cfg.history_ratio).round().max(0.0) as usize;
+    let history_budget = history_budget.min(cfg.max_seq / 2).min(history_len);
+    let recent_budget = cfg.max_seq.saturating_sub(history_budget).max(1);
+
+    let history_ids = if history_len > 0 {
+        sample_even_history_ids(&cropped[..history_len], history_budget, rng)
+    } else {
+        Vec::new()
+    };
+    let recent_ids_all = &cropped[history_len..];
+    let recent_ids = if recent_ids_all.len() > recent_budget {
+        recent_ids_all[recent_ids_all.len() - recent_budget..].to_vec()
+    } else {
+        recent_ids_all.to_vec()
+    };
+
+    let mut combined = Vec::with_capacity(history_ids.len() + recent_ids.len());
+    combined.extend(history_ids);
+    combined.extend(recent_ids);
     if combined.len() > cfg.max_seq {
         combined = combined[combined.len() - cfg.max_seq..].to_vec();
     }
@@ -1122,6 +1680,135 @@ fn build_masked_view(
     (context_ids, target_ids, selected_positions, code_like)
 }
 
+fn build_masked_view_from_ids(
+    ids: &[u32],
+    vocab: &Vocab,
+    cfg: &CurriculumDenoisingConfig,
+    rng: &mut rand::rngs::ThreadRng,
+) -> (Vec<u32>, Vec<u32>, Vec<usize>, bool) {
+    let prepared_ids = prepare_segmented_context_ids(ids, cfg, rng);
+    let code_like = is_code_like_ids(&prepared_ids, vocab);
+    let mut target_ids = prepared_ids.clone();
+    let valid_len = target_ids.len().max(1);
+    pad_or_truncate(&mut target_ids, cfg.max_seq, vocab.pad_id);
+    let mut context_ids = target_ids.clone();
+
+    let valid_positions: Vec<usize> = (0..valid_len).collect();
+    let identifier_positions: Vec<usize> = prepared_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &id)| is_identifier_like(token_str(vocab, id)).then_some(idx))
+        .collect();
+    let comment_positions: Vec<usize> = prepared_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &id)| is_comment_token(token_str(vocab, id)).then_some(idx))
+        .collect();
+    let block_positions: Vec<usize> = prepared_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &id)| is_block_token(token_str(vocab, id)).then_some(idx))
+        .collect();
+    let text_boundary_positions: Vec<usize> = prepared_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &id)| is_text_boundary_token(token_str(vocab, id)).then_some(idx))
+        .collect();
+    let ratio_scale = if code_like {
+        cfg.code_masked_ratio_multiplier
+    } else {
+        1.0
+    };
+    let min_ratio = (cfg.min_masked_ratio * ratio_scale).clamp(0.01, 0.60);
+    let max_ratio = (cfg.max_masked_ratio * ratio_scale).clamp(min_ratio, 0.70);
+    let sampled_ratio = if max_ratio > min_ratio {
+        rng.gen_range(min_ratio..=max_ratio)
+    } else {
+        min_ratio
+    };
+    let target_masked = ((valid_len as f64) * sampled_ratio).ceil() as usize;
+    let target_masked = target_masked.max(1).min(valid_len);
+    let span_len_cap = cfg.max_span_len.max(1).min(valid_len.max(1));
+    let span_count_cap = cfg.max_spans_per_sample.max(1);
+    let mut selected: HashSet<usize> = HashSet::new();
+
+    for _ in 0..span_count_cap {
+        if selected.len() >= target_masked {
+            break;
+        }
+        let use_identifier_focus = code_like
+            && !identifier_positions.is_empty()
+            && rng.gen_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0));
+        let use_comment_focus =
+            code_like && !comment_positions.is_empty() && rng.gen_bool(cfg.comment_focus_prob);
+        let use_block_focus = code_like
+            && !block_positions.is_empty()
+            && rng.gen_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
+        let use_text_boundary_focus = !code_like
+            && !text_boundary_positions.is_empty()
+            && rng.gen_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
+        let start_pool = if use_comment_focus {
+            &comment_positions
+        } else if use_block_focus {
+            &block_positions
+        } else if use_text_boundary_focus {
+            &text_boundary_positions
+        } else if use_identifier_focus {
+            &identifier_positions
+        } else {
+            &valid_positions
+        };
+        let Some(&start) = start_pool.choose(rng) else {
+            continue;
+        };
+        let span_len = if use_comment_focus {
+            rng.gen_range(2..=span_len_cap.clamp(2, 12))
+        } else if use_block_focus {
+            rng.gen_range(2..=span_len_cap.clamp(2, 10))
+        } else if use_text_boundary_focus {
+            rng.gen_range(3..=span_len_cap.clamp(3, 12))
+        } else if use_identifier_focus {
+            rng.gen_range(1..=span_len_cap.min(4))
+        } else {
+            rng.gen_range(1..=span_len_cap)
+        };
+        for p in start..(start + span_len).min(valid_len) {
+            if selected.len() >= target_masked {
+                break;
+            }
+            selected.insert(p);
+        }
+    }
+
+    while selected.len() < target_masked {
+        let Some(&start) = valid_positions.choose(rng) else {
+            break;
+        };
+        let span_len = rng
+            .gen_range(1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)));
+        for p in start..(start + span_len).min(valid_len) {
+            if selected.len() >= target_masked {
+                break;
+            }
+            selected.insert(p);
+        }
+    }
+
+    if selected.is_empty() {
+        if let Some(&fallback) = valid_positions.choose(rng) {
+            selected.insert(fallback);
+        }
+    }
+
+    let mut selected_positions: Vec<usize> = selected.into_iter().collect();
+    selected_positions.sort_unstable();
+    for &p in &selected_positions {
+        context_ids[p] = vocab.mask_id;
+    }
+
+    (context_ids, target_ids, selected_positions, code_like)
+}
+
 pub fn make_augmented_jepa_batch(
     token_batches: &[Vec<String>],
     vocab: &Vocab,
@@ -1140,6 +1827,52 @@ pub fn make_augmented_jepa_batch(
         let (view_a_ids, target_ids, selected_positions, code_like) =
             build_masked_view(tokens, vocab, cfg, &mut rng);
         let (view_b_ids, _, _, code_like_b) = build_masked_view(tokens, vocab, cfg, &mut rng);
+        if code_like || code_like_b {
+            code_like_count += 1;
+        }
+        for &p in &selected_positions {
+            target_linear.push((b * cfg.max_seq + p) as u32);
+        }
+        view_a_buf.extend(view_a_ids);
+        view_b_buf.extend(view_b_ids);
+        target_buf.extend(target_ids);
+    }
+
+    let view_a_ids = Tensor::from_vec(view_a_buf, (batch_size, cfg.max_seq), device)?;
+    let view_b_ids = Tensor::from_vec(view_b_buf, (batch_size, cfg.max_seq), device)?;
+    let target_ids = Tensor::from_vec(target_buf, (batch_size, cfg.max_seq), device)?;
+    let target_count = target_linear.len();
+    let target_linear_indices = Tensor::from_vec(target_linear, (target_count,), device)?;
+
+    Ok(AugmentedJepaBatch {
+        view_a_ids,
+        view_b_ids,
+        target_ids,
+        target_linear_indices,
+        target_count,
+        code_fraction: code_like_count as f32 / batch_size.max(1) as f32,
+    })
+}
+
+pub fn make_augmented_jepa_batch_from_pairs(
+    pairs: &[Pair],
+    vocab: &Vocab,
+    cfg: &CurriculumDenoisingConfig,
+    device: &Device,
+) -> Result<AugmentedJepaBatch> {
+    let mut rng = thread_rng();
+    let batch_size = pairs.len();
+    let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
+    let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
+    let mut target_buf = Vec::with_capacity(batch_size * cfg.max_seq);
+    let mut target_linear = Vec::new();
+    let mut code_like_count = 0usize;
+
+    for (b, pair) in pairs.iter().enumerate() {
+        let (view_a_ids, target_ids, selected_positions, code_like) =
+            build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
+        let (view_b_ids, _, _, code_like_b) =
+            build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
         if code_like || code_like_b {
             code_like_count += 1;
         }

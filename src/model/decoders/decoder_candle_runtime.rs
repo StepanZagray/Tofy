@@ -14,7 +14,7 @@ use crate::model::vocab::{load_vocab_from_file, vocab_signature, Vocab};
 
 /// Decoder architecture; must match training constants in world.rs.
 const DECODER_DIM: usize = 640;
-const DECODER_LAYERS: usize = 8;
+const DECODER_LAYERS: usize = 6;
 const DECODER_HEADS: usize = 8;
 const DECODER_FF_DIM: usize = 2560;
 
@@ -180,7 +180,7 @@ impl CandleCrossAttnDecoder {
         }
     }
 
-    /// Load CodeDecoder from checkpoint. Config: dim=640, 8 layers, 8 heads, ff=2560.
+    /// Load CodeDecoder from checkpoint. Config: dim=640, 6 layers, 8 heads, ff=2560.
     pub fn new(
         checkpoint_path: PathBuf,
         vocab_path: PathBuf,

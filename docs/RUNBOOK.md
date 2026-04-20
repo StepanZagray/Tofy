@@ -23,16 +23,24 @@ The code-first script now also does a short instruction-only decoder polish pass
 For a local GPU around 8 GB VRAM, the training scripts now auto-pick a safer profile:
 
 - encoder/world keep `256` context
-- encoder microbatch defaults to `2` with `LATENT_GRAD_ACCUM=3`
-- decoder microbatch defaults to `4` with `*_DECODER_GRAD_ACCUM=2`
-- world stays at `WORLD_GRAD_ACCUM=1` because it is much cheaper than the encoder/decoders
+- encoder microbatch defaults to `32` with `LATENT_GRAD_ACCUM=1`
+- world defaults to `128x1`
+- code decoder defaults to `6x4`
 - training defaults to `TOFY_TRAIN_DTYPE=bf16` on GPU, with CPU forced back to `f32`
-- code decoder defaults now use `max_seq=192` rather than `160`
+- code decoder defaults now use `max_seq=192`
 
 Override that behavior with:
 
 - `TOFY_GPU_PROFILE=balanced`
-- or explicit stage overrides such as `LATENT_BATCH=4`, `WORLD_BATCH=12`, `CODE_DECODER_BATCH=3`
+- or explicit stage overrides such as `LATENT_BATCH=24`, `WORLD_BATCH=48`, `CODE_DECODER_BATCH=8`
+
+For batch/VRAM decisions, use the sustained OOM probe rather than one-step smoke tests:
+
+```bash
+./scripts/sustained_oom_probe.py --stage all
+```
+
+See [OOM_TESTING.md](OOM_TESTING.md).
 
 Training-side latent context knobs:
 
@@ -75,6 +83,42 @@ Artifact ownership:
 - code decoder checkpoint + code decoder vocab
 
 Important: the encoder now also saves a checkpoint-matched vocab next to the latent model, for example `local_models/model_latent_69.84M.vocab.txt`. Use that sibling vocab when reusing an older latent checkpoint; `local_models/vocabs/vocab_encoder.txt` is only the latest shared encoder vocab.
+
+## Vocab and Token Cache
+
+The pipeline scripts run a Rust cache stage before training by default:
+
+```bash
+./scripts/train_code_first_poc.sh
+```
+
+Stage 1 builds or validates:
+
+- encoder vocab, default `local_models/vocabs/vocab_encoder_8000_default.txt`
+- code-decoder vocab, default `local_models/vocabs/vocab_code_16000_codeaware.txt`
+- latent encoder token cache: `data/cache/encoder.tokens.bin`
+- world token cache: `data/cache/world.tokens.bin`
+- code-decoder token cache: `data/cache/code_decoder.tokens.bin`
+- dual-vocab code-decoder token cache: `data/cache/code_decoder_dual.tokens.bin`
+- JSON manifests under `data/cache/`
+
+The standalone command is:
+
+```bash
+cargo run --release -- --prepare-pipeline-cache data/encoder_mix.txt data/world_mix_pairs.txt data/code_poc_mix.txt local_models/vocabs/vocab_encoder_8000_default.txt local_models/vocabs/vocab_code_16000_codeaware.txt data/cache --encoder-max-vocab 8000 --code-max-vocab 16000 --encoder-max-seq 1024 --world-max-seq 256 --code-max-seq 192
+```
+
+The manifests include source path, byte length, content hash, tokenizer mode, vocab signature, max sequence length, and row count. If these match, the stage skips rebuilding even if the source file mtime changed. Set `TOFY_PRETOKENIZE=0` to skip the stage, or pass `--force` to rebuild caches.
+
+Fresh non-resume pipeline runs export the cached encoder vocab to latent training and pass the cached code vocab to code-decoder training. Resume runs keep using the checkpoint-matched vocabs to avoid accidentally pairing old weights with a new vocab.
+
+Latent training consumes `data/cache/encoder.tokens.bin` only when the manifest vocab signature matches the active encoder vocab and the cache max sequence is large enough for segmented context. The scripts set `--encoder-max-seq` to `LATENT_MAX_SEQ * TOFY_LATENT_CONTEXT_SEGMENTS`, which is `1024` with the current defaults.
+
+World and orchestrator training consume `data/cache/world.tokens.bin` directly when it exists, so both stages skip raw-text tokenization in per-step training and validation batches.
+
+Code-decoder training consumes `data/cache/code_decoder_dual.tokens.bin` when it exists. This cache stores each row twice, once with the encoder vocab for world conditioning and once with the code-decoder vocab for teacher forcing, so the two views stay row-aligned.
+
+Disable token-cache reads with `TOFY_USE_TOKEN_CACHE=0`.
 
 ## Resuming training
 
@@ -330,9 +374,9 @@ With Candle text + code decoders:
 
 ```bash
 export JEPA_USE_CANDLE_DECODER=1
-export JEPA_CANDLE_DECODER=./local_models/code_decoder_90M.safetensors
+export JEPA_CANDLE_DECODER=./local_models/code_decoder_68.50M.safetensors
 export JEPA_USE_TEXT_DECODER=1
-export JEPA_TEXT_DECODER=./local_models/text_decoder_90M.safetensors
+export JEPA_TEXT_DECODER=./local_models/text_decoder_68.50M.safetensors
 cargo run --release -- --serve local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors 0.0.0.0:8080 768 256 9 8 256 64
 ```
 
@@ -344,6 +388,10 @@ If the decoder vocab files are not next to the decoder checkpoints, set:
 Optional Candle decoder inference tuning:
 
 - `JEPA_CANDLE_DECODER_CTX=<tokens>` limits the prompt tokens kept by the Candle decoder runtime before generation
+- `TOFY_RLM_CODE=1` enables the default recursive code path: split Rust requests into local work units, re-encode each unit through the world/planner, and reuse one decoder with short prompts
+- `TOFY_RLM_CODE=0` disables the recursive code path and uses the old one-shot decoder call
+- `TOFY_RLM_UNIT_TOKENS=<tokens>` sets the per-work-unit generation budget, default `192`
+- `TOFY_RLM_MAX_UNITS=<n>` caps generated work units, default `4`
 
 ## 10b. Code-first eval suite
 
@@ -356,7 +404,7 @@ python scripts/generate_code_eval_suite.py --output eval/code_assistant_rust_har
 Run the end-to-end eval:
 
 ```bash
-cargo run --release -- --eval-code-assistant local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors eval/code_assistant_rust_hard.jsonl 384 768 256 9 8 256 64 --code-decoder local_models/code_decoder_90M.safetensors
+cargo run --release -- --eval-code-assistant local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors eval/code_assistant_rust_hard.jsonl 384 768 256 9 8 256 64 --code-decoder local_models/code_decoder_68.50M.safetensors
 ```
 
 The eval writes:

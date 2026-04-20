@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "code_decoder",
+  "source": {
+    "path": "data/code_poc_mix.txt",
+    "len": 5289692043,
+    "modified_unix_secs": 1776631044,
+    "content_hash": "f27d593df7cb6e6c"
+  },
+  "tokenizer": "code-aware",
+  "max_vocab": 16000,
+  "vocab_path": "local_models/vocabs/vocab_code_16000_codeaware.txt",
+  "vocab_signature": "9c9b790488d69b79",
+  "rows": 5896342
+}

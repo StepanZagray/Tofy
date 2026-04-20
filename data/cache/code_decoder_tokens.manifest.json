@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "kind": "code_decoder",
+  "source": {
+    "path": "data/code_poc_mix.txt",
+    "len": 5289692043,
+    "modified_unix_secs": 1776631044,
+    "content_hash": "f27d593df7cb6e6c"
+  },
+  "tokenizer": "code-aware",
+  "max_seq": 192,
+  "vocab_path": "",
+  "vocab_signature": "9c9b790488d69b79",
+  "token_cache_path": "data/cache/code_decoder.tokens.bin",
+  "rows": 5896342
+}

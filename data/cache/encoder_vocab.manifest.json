@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "encoder",
+  "source": {
+    "path": "data/encoder_mix.txt",
+    "len": 5972526744,
+    "modified_unix_secs": 1776630978,
+    "content_hash": "2c61419c5a16b1ab"
+  },
+  "tokenizer": "default",
+  "max_vocab": 8000,
+  "vocab_path": "local_models/vocabs/vocab_encoder_8000_default.txt",
+  "vocab_signature": "94b57ea196fd6b14",
+  "rows": 29912163
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Full training pipeline (encoder -> world transition -> planner/orchestrator tune -> code decoder -> text decoder).
+# Full training pipeline (vocab/token cache -> encoder -> world transition -> planner/orchestrator tune -> code decoder -> text decoder).
 # Override via env: ENCODER_DATA, WORLD_DATA, CODE_DATA, TEXT_DATA, WIKI_DATA, *_STEPS, BATCH, DIM, etc.
 #
 # 1) LeJEPA encoder (--latent)
@@ -40,7 +40,7 @@ DIM="${DIM:-640}"
 LATENT_MAX_SEQ="${LATENT_MAX_SEQ:-256}"
 WORLD_MAX_SEQ="${WORLD_MAX_SEQ:-256}"
 DECODER_MAX_SEQ="${DECODER_MAX_SEQ:-192}"
-CODE_DECODER_MAX_SEQ="${CODE_DECODER_MAX_SEQ:-224}"
+CODE_DECODER_MAX_SEQ="${CODE_DECODER_MAX_SEQ:-192}"
 TEXT_DECODER_MAX_SEQ="${TEXT_DECODER_MAX_SEQ:-128}"
 LAYERS="${LAYERS:-7}"
 HEADS="${HEADS:-8}"
@@ -59,6 +59,14 @@ WORLD_CODE_RATIO="${WORLD_CODE_RATIO:-0.35}"
 WORLD_DONE_RATIO="${WORLD_DONE_RATIO:-0.18}"
 WORLD_MAX_ROWS="${WORLD_MAX_ROWS:-0}"
 ENCODER_VOCAB="${ENCODER_VOCAB:-}"
+CODE_DECODER_OUTPUT="${CODE_DECODER_OUTPUT:-local_models/code_decoder_68.50M.safetensors}"
+TEXT_DECODER_OUTPUT="${TEXT_DECODER_OUTPUT:-local_models/text_decoder_68.50M.safetensors}"
+TOFY_PRETOKENIZE="${TOFY_PRETOKENIZE:-1}"
+TOFY_CACHE_DIR="${TOFY_CACHE_DIR:-data/cache}"
+ENCODER_CACHE_MAX_SEQ="${ENCODER_CACHE_MAX_SEQ:-$((LATENT_MAX_SEQ * TOFY_LATENT_CONTEXT_SEGMENTS))}"
+ENCODER_CACHE_VOCAB="${ENCODER_CACHE_VOCAB:-local_models/vocabs/vocab_encoder_${MAX_VOCAB}_default.txt}"
+CODE_DECODER_CACHE_VOCAB="${CODE_DECODER_CACHE_VOCAB:-local_models/vocabs/vocab_code_${CODE_DECODER_MAX_VOCAB}_codeaware.txt}"
+CODE_DECODER_VOCAB="${CODE_DECODER_VOCAB:-}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
   if [[ -x ".venv/bin/python" ]]; then
@@ -105,14 +113,14 @@ fi
 case "${TOFY_GPU_PROFILE}" in
   8gb)
     DEFAULT_BATCH=8
-    DEFAULT_DECODER_BATCH=12
+    DEFAULT_DECODER_BATCH=6
     DEFAULT_LATENT_BATCH=32
     DEFAULT_LATENT_WARMUP_BATCH=32
-    DEFAULT_WORLD_BATCH=64
-    DEFAULT_WORLD_WARMUP_BATCH=96
+    DEFAULT_WORLD_BATCH=128
+    DEFAULT_WORLD_WARMUP_BATCH=128
     DEFAULT_LATENT_GRAD_ACCUM=1
-    DEFAULT_WORLD_GRAD_ACCUM=2
-    DEFAULT_DECODER_GRAD_ACCUM=2
+    DEFAULT_WORLD_GRAD_ACCUM=1
+    DEFAULT_DECODER_GRAD_ACCUM=4
     ;;
   balanced)
     DEFAULT_BATCH=12
@@ -139,6 +147,10 @@ TOFY_LATENT_WARMUP_GRAD_ACCUM="${TOFY_LATENT_WARMUP_GRAD_ACCUM:-1}"
 WORLD_BATCH="${WORLD_BATCH:-${DEFAULT_WORLD_BATCH:-${BATCH}}}"
 TOFY_WORLD_WARMUP_BATCH="${TOFY_WORLD_WARMUP_BATCH:-${DEFAULT_WORLD_WARMUP_BATCH:-${WORLD_BATCH}}}"
 TOFY_WORLD_WARMUP_GRAD_ACCUM="${TOFY_WORLD_WARMUP_GRAD_ACCUM:-1}"
+TOFY_WORLD_WARMUP_STEPS="${TOFY_WORLD_WARMUP_STEPS:-1200}"
+TOFY_WORLD_LOG_EVERY="${TOFY_WORLD_LOG_EVERY:-1000}"
+TOFY_ORCHESTRATOR_LOG_EVERY="${TOFY_ORCHESTRATOR_LOG_EVERY:-500}"
+TOFY_DECODER_LOG_EVERY="${TOFY_DECODER_LOG_EVERY:-500}"
 CODE_DECODER_BATCH="${CODE_DECODER_BATCH:-${DECODER_BATCH}}"
 TEXT_DECODER_BATCH="${TEXT_DECODER_BATCH:-${DECODER_BATCH}}"
 DECODER_GRAD_ACCUM="${DECODER_GRAD_ACCUM:-${DEFAULT_DECODER_GRAD_ACCUM}}"
@@ -149,7 +161,8 @@ ROUTER_GRAD_ACCUM="${ROUTER_GRAD_ACCUM:-${WORLD_GRAD_ACCUM}}"
 CODE_DECODER_GRAD_ACCUM="${CODE_DECODER_GRAD_ACCUM:-${DECODER_GRAD_ACCUM}}"
 TEXT_DECODER_GRAD_ACCUM="${TEXT_DECODER_GRAD_ACCUM:-${DECODER_GRAD_ACCUM}}"
 export TOFY_LATENT_WARMUP_BATCH TOFY_LATENT_WARMUP_GRAD_ACCUM
-export TOFY_WORLD_WARMUP_BATCH TOFY_WORLD_WARMUP_GRAD_ACCUM
+export TOFY_WORLD_WARMUP_BATCH TOFY_WORLD_WARMUP_GRAD_ACCUM TOFY_WORLD_WARMUP_STEPS
+export TOFY_WORLD_LOG_EVERY TOFY_ORCHESTRATOR_LOG_EVERY TOFY_DECODER_LOG_EVERY
 
 latest_model_artifact() {
   local pattern="$1"
@@ -262,8 +275,30 @@ echo "Preparing world-model mix at ${WORLD_DATA}"
   --done-ratio "${WORLD_DONE_RATIO}" \
   --max-rows "${WORLD_MAX_ROWS}"
 
-# --- Stage 1: LeJEPA encoder ---
-echo "== Stage 1/5: LeJEPA encoder (--latent) =="
+# --- Stage 1: Vocab/token cache ---
+if [[ "${TOFY_PRETOKENIZE}" == "1" || "${TOFY_PRETOKENIZE}" == "true" ]]; then
+  echo "== Stage 1/6: vocab + token cache =="
+  cargo run --release -- \
+    --prepare-pipeline-cache "${ENCODER_DATA}" "${WORLD_DATA}" "${CODE_DATA}" "${ENCODER_CACHE_VOCAB}" "${CODE_DECODER_CACHE_VOCAB}" "${TOFY_CACHE_DIR}" \
+    --encoder-max-vocab "${MAX_VOCAB}" --code-max-vocab "${CODE_DECODER_MAX_VOCAB}" \
+    --encoder-max-seq "${ENCODER_CACHE_MAX_SEQ}" --world-max-seq "${WORLD_MAX_SEQ}" --code-max-seq "${CODE_DECODER_MAX_SEQ}"
+  if [[ "${TOFY_RESUME}" != "1" && "${TOFY_RESUME}" != "true" ]]; then
+    export TOFY_ENCODER_VOCAB="${ENCODER_CACHE_VOCAB}"
+    if [[ -z "${CODE_DECODER_VOCAB}" ]]; then
+      CODE_DECODER_VOCAB="${CODE_DECODER_CACHE_VOCAB}"
+    fi
+  fi
+else
+  echo "== Stage 1/6: vocab + token cache skipped (TOFY_PRETOKENIZE=0) =="
+fi
+
+DECODER_VOCAB_ARGS=()
+if [[ -n "${CODE_DECODER_VOCAB}" ]]; then
+  DECODER_VOCAB_ARGS=(--decoder-vocab "${CODE_DECODER_VOCAB}")
+fi
+
+# --- Stage 2: LeJEPA encoder ---
+echo "== Stage 2/6: LeJEPA encoder (--latent) =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="latent" cargo run --release -- --latent "${ENCODER_DATA}" "${LATENT_STEPS}" "${LATENT_BATCH}" "${DIM}" "${LATENT_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${MAX_VOCAB}" --grad-accum "${LATENT_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
 
 LATENT_MODEL="${LATENT_MODEL:-$(latest_model_artifact 'model_latent_*.safetensors')}"
@@ -286,8 +321,8 @@ fi
 echo "  Using: ${LATENT_MODEL}"
 echo "  Encoder vocab: ${ENCODER_VOCAB}"
 
-# --- Stage 2: Planner/world model ---
-echo "== Stage 2/5: Planner/world model (--train-world) =="
+# --- Stage 3: Planner/world model ---
+echo "== Stage 3/6: Planner/world model (--train-world) =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="world" cargo run --release -- --train-world "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_DATA}" "${WORLD_STEPS}" "${WORLD_BATCH}" "${DIM}" "${WORLD_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --lambda "${WORLD_LAMBDA}" --lr "${WORLD_LR}" --grad-accum "${WORLD_GRAD_ACCUM}" --action-loss-weight "${WORLD_ACTION_LOSS_WEIGHT}" --router-warmup "${WORLD_ROUTER_WARMUP}" "${RESUME_ARGS[@]}"
 
 WORLD_MODEL="${WORLD_MODEL:-$(latest_model_artifact 'model_world_*.safetensors')}"
@@ -297,29 +332,29 @@ if [[ -z "${WORLD_MODEL}" ]]; then
 fi
 echo "  Using: ${WORLD_MODEL}"
 
-# --- Stage 3: Orchestrator/planner fine-tune ---
-echo "== Stage 3/5: Orchestrator/planner (--train-orchestrator) =="
+# --- Stage 4: Orchestrator/planner fine-tune ---
+echo "== Stage 4/6: Orchestrator/planner (--train-orchestrator) =="
 TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="orchestrator" cargo run --release -- --train-orchestrator "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${WORLD_DATA}" "${ROUTER_STEPS}" "${ROUTER_BATCH}" "${DIM}" "${WORLD_MAX_SEQ}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --lr "${WORLD_LR}" --grad-accum "${ROUTER_GRAD_ACCUM}" --output "${WORLD_MODEL}" "${RESUME_ARGS[@]}"
 
-# --- Stage 4: Code decoder ---
-echo "== Stage 4/5: Code decoder (--train-decoder --decoder-kind code) =="
+# --- Stage 5: Code decoder ---
+echo "== Stage 5/6: Code decoder (--train-decoder --decoder-kind code) =="
 if [[ ! -f "${CODE_DATA}" ]]; then
   echo "  Skipping (CODE_DATA not found: ${CODE_DATA})"
 else
-  TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${CODE_DATA}" "${CODE_DECODER_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
+  TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${CODE_DATA}" "${CODE_DECODER_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" "${DECODER_VOCAB_ARGS[@]}" --decoder-output "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
   if [[ -s "${RUST_TASK_DATA}" && "${CODE_POLISH_STEPS}" -gt 0 ]]; then
-    TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code_polish" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${RUST_TASK_DATA}" "${CODE_POLISH_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_POLISH_LR}" --init-decoder local_models/code_decoder.safetensors "${RESUME_ARGS[@]}"
+    TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_code_polish" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${RUST_TASK_DATA}" "${CODE_POLISH_STEPS}" "${CODE_DECODER_BATCH}" "${CODE_DECODER_MAX_SEQ}" "${DIM}" "${LAYERS}" "${HEADS}" "${BRIDGE_DIM}" "${NUM_LATENT_TOKENS}" --decoder-kind code --decoder-max-vocab "${CODE_DECODER_MAX_VOCAB}" "${DECODER_VOCAB_ARGS[@]}" --decoder-output "${CODE_DECODER_OUTPUT}" --grad-accum "${CODE_DECODER_GRAD_ACCUM}" --lr "${CODE_POLISH_LR}" --init-decoder "${CODE_DECODER_OUTPUT}" "${RESUME_ARGS[@]}"
   fi
-  echo "  Code decoder: local_models/code_decoder_*.safetensors"
+  echo "  Code decoder: ${CODE_DECODER_OUTPUT}"
 fi
 
-# --- Stage 5: Text decoder (chat) ---
-echo "== Stage 5/5: Text decoder (--train-decoder --decoder-kind text) =="
+# --- Stage 6: Text decoder (chat) ---
+echo "== Stage 6/6: Text decoder (--train-decoder --decoder-kind text) =="
 if [[ ! -f "${TEXT_DATA}" ]]; then
   echo "  Skipping (TEXT_DATA not found: ${TEXT_DATA}). Set TEXT_DATA= to skip, or provide a path."
 else
-  TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_text" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${TEXT_DATA}" "${TEXT_DECODER_STEPS}" "${TEXT_DECODER_BATCH}" "${TEXT_DECODER_MAX_SEQ}" --decoder-kind text --decoder-max-vocab "${TEXT_DECODER_MAX_VOCAB}" --decoder-output local_models/text_decoder_90M.safetensors --grad-accum "${TEXT_DECODER_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
-  echo "  Text decoder: local_models/text_decoder_90M.safetensors"
+  TOFY_RUN_GROUP="${PIPELINE_RUN_ID}" TOFY_RUN_STAGE_NAME="decoder_text" cargo run --release -- --train-decoder "${LATENT_MODEL}" "${ENCODER_VOCAB}" "${WORLD_MODEL}" "${TEXT_DATA}" "${TEXT_DECODER_STEPS}" "${TEXT_DECODER_BATCH}" "${TEXT_DECODER_MAX_SEQ}" --decoder-kind text --decoder-max-vocab "${TEXT_DECODER_MAX_VOCAB}" --decoder-output "${TEXT_DECODER_OUTPUT}" --grad-accum "${TEXT_DECODER_GRAD_ACCUM}" "${RESUME_ARGS[@]}"
+  echo "  Text decoder: ${TEXT_DECODER_OUTPUT}"
 fi
 
 echo "Pipeline complete. Serve with: cargo run --release -- --serve ${LATENT_MODEL} ${ENCODER_VOCAB} ${WORLD_MODEL} 0.0.0.0:8080 ${DIM} ${WORLD_MAX_SEQ} ${LAYERS} ${HEADS} ${BRIDGE_DIM} ${NUM_LATENT_TOKENS}"

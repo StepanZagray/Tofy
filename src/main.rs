@@ -14,11 +14,12 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use data::{
     build_vocab_from_pair_file, count_pairs_with_vocab, ensure_hub_dataset_cached,
-    ensure_hub_wikipedia_cached, make_augmented_jepa_batch, make_jepa_batch_from_pairs,
-    prepare_ultrachat_pairs, CurriculumDenoisingConfig, PairStream, DEFAULT_MIN_TOKENS_PER_LINE,
+    ensure_hub_wikipedia_cached, make_augmented_jepa_batch, make_augmented_jepa_batch_from_pairs,
+    make_jepa_batch_from_pairs, prepare_ultrachat_pairs, CachedPairStream,
+    CurriculumDenoisingConfig, PairStream, DEFAULT_MIN_TOKENS_PER_LINE,
     DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
-use model::vocab::Pair;
+use model::vocab::{vocab_signature, Pair};
 use model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
     save_vocab_to_file, sigreg_epps_pulley, symmetric_contrastive_loss, tensor_rms, OnlineEncoder,
@@ -62,6 +63,35 @@ fn latent_batch_size_for_step(step: usize, config: &Config) -> usize {
     } else {
         config.batch_size.max(1)
     }
+}
+
+fn token_cache_path(kind: &str) -> Option<PathBuf> {
+    let enabled = std::env::var("TOFY_USE_TOKEN_CACHE")
+        .ok()
+        .is_none_or(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if !enabled {
+        return None;
+    }
+    let cache_dir = std::env::var("TOFY_CACHE_DIR").unwrap_or_else(|_| "data/cache".to_string());
+    let path = PathBuf::from(cache_dir).join(format!("{kind}.tokens.bin"));
+    path.exists().then_some(path)
+}
+
+fn token_cache_manifest(kind: &str) -> Option<serde_json::Value> {
+    let cache_dir = std::env::var("TOFY_CACHE_DIR").unwrap_or_else(|_| "data/cache".to_string());
+    let path = PathBuf::from(cache_dir).join(format!("{kind}_tokens.manifest.json"));
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn latent_token_cache_path(vocab_signature_value: &str, source_budget: usize) -> Option<PathBuf> {
+    let manifest = token_cache_manifest("encoder")?;
+    let max_seq = manifest.get("max_seq")?.as_u64()? as usize;
+    let signature = manifest.get("vocab_signature")?.as_str()?;
+    if max_seq < source_budget || signature != vocab_signature_value {
+        return None;
+    }
+    token_cache_path("encoder")
 }
 
 fn latent_curriculum(
@@ -232,6 +262,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if tasks::cache::try_run_prepare_pipeline_cache(&args)? {
+        return Ok(());
+    }
     if tasks::world::try_run_train(&args)? {
         return Ok(());
     }
@@ -336,6 +369,10 @@ fn main() -> Result<()> {
         args[0]
     );
     eprintln!(
+        "    {} --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] [--encoder-max-vocab N] [--code-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--code-max-seq N] [--force]",
+        args[0]
+    );
+    eprintln!(
         "    {} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--resume]",
         args[0]
     );
@@ -360,7 +397,7 @@ fn main() -> Result<()> {
         args[0]
     );
     bail!(
-        "specify a mode: --prepare-ultrachat / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --serve"
+        "specify a mode: --prepare-ultrachat / --prepare-pipeline-cache / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --serve"
     );
 }
 
@@ -381,17 +418,42 @@ fn run_latent_training(config: Config) -> Result<()> {
     } else {
         None
     };
-    println!(
-        "Preparing latent training input from {:?}: scanning dataset and building encoder vocab...",
-        config.data_path
-    );
-    let (vocab, vocab_stats, pair_count) =
-        build_vocab_from_pair_file(&config.data_path, config.max_vocab, min_tokens)?;
+    let cached_encoder_vocab = std::env::var("TOFY_ENCODER_VOCAB")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.exists() && !config.is_paragraph_data);
+    let (vocab, vocab_stats, pair_count) = if let Some(vocab_path) = cached_encoder_vocab {
+        println!(
+            "Preparing latent training input from {:?}: loading cached encoder vocab from {:?}...",
+            config.data_path, vocab_path
+        );
+        let vocab = load_vocab_from_file(&vocab_path)?;
+        let pair_count = count_pairs_with_vocab(&config.data_path)?;
+        (vocab, None, pair_count)
+    } else {
+        println!(
+            "Preparing latent training input from {:?}: scanning dataset and building encoder vocab...",
+            config.data_path
+        );
+        let (vocab, stats, pair_count) =
+            build_vocab_from_pair_file(&config.data_path, config.max_vocab, min_tokens)?;
+        (vocab, Some(stats), pair_count)
+    };
     println!("Vocab scan complete. Initializing streaming reader...");
     let mut pair_stream = PairStream::new(
         &config.data_path,
         min_tokens.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE),
     )?;
+    let latent_source_budget = config.max_seq.max(1) * config.latent_context_segments.max(1);
+    let mut cached_pair_stream = if let Some(cache_path) =
+        latent_token_cache_path(&vocab_signature(&vocab), latent_source_budget)
+    {
+        println!("Token cache: using latent encoder cache {:?}", cache_path);
+        Some(CachedPairStream::new(&cache_path)?)
+    } else {
+        println!("Token cache: no compatible latent cache found; using raw tokenization stream");
+        None
+    };
     println!("Streaming reader ready. Building training graph...");
     let vocab_size = vocab.id_to_token.len();
     let seq_len = config.max_seq;
@@ -408,7 +470,7 @@ fn run_latent_training(config: Config) -> Result<()> {
         "Vocab size: {} (includes <mask>) | pairs {} | seq_len {} | lambda {:.3}",
         vocab_size, pair_count, seq_len, config.lambda
     );
-    if vocab_stats.total_tokens > 0 {
+    if let Some(vocab_stats) = vocab_stats {
         let coverage =
             (vocab_stats.covered_tokens as f64 / vocab_stats.total_tokens as f64) * 100.0;
         println!(
@@ -420,6 +482,8 @@ fn run_latent_training(config: Config) -> Result<()> {
             vocab_stats.unique_tokens,
             vocab_stats.vocab_size
         );
+    } else {
+        println!("Vocab coverage: cached vocab loaded; coverage scan skipped.");
     }
     println!(
         "Estimated parameters: ~{}",
@@ -615,9 +679,14 @@ fn run_latent_training(config: Config) -> Result<()> {
         let ema_decay = latent_target_ema_decay(step, config.steps);
 
         for micro_step in 0..grad_accum_steps {
-            let batch_tokens = pair_stream.next_batch(batch_size)?;
             let curriculum = latent_curriculum(step, config.steps, &config);
-            let batch = make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?;
+            let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
+                let batch_pairs = cached_stream.next_batch(batch_size)?;
+                make_augmented_jepa_batch_from_pairs(&batch_pairs, &vocab, &curriculum, &device)?
+            } else {
+                let batch_tokens = pair_stream.next_batch(batch_size)?;
+                make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
+            };
 
             let view_a_features = encoder.forward_features(&batch.view_a_ids)?;
             let target_features = target_encoder

@@ -10,6 +10,7 @@ All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-pa
 | [CODE_DATA.md](CODE_DATA.md) | Code training data: GitHub Top Code script, Rust-by-Practice script, formats. |
 | [DATA_FORMATS.md](DATA_FORMATS.md) | Data formats for LeJEPA/planner-world/decoder training; hub caching; expert/technical data. |
 | [DECODER_RUNTIME.md](DECODER_RUNTIME.md) | Decoder backends (GGUF/llama.cpp, Candle code/text decoders) and env vars. |
+| [OOM_TESTING.md](OOM_TESTING.md) | Sustained CUDA OOM probes for batch/VRAM decisions. |
 | [RESULTS.md](RESULTS.md) | Best metrics and commands (updated when runs improve). |
 
 Root [../README.md](../README.md) has quick start, argument order, and project structure.

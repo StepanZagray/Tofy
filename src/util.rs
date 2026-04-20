@@ -233,7 +233,8 @@ impl ResumableAdamW {
         let tensors = candle_core::safetensors::load(path, &device)
             .with_context(|| format!("failed to load optimizer state from {:?}", path))?;
         if let Some(step) = tensors.get("__step") {
-            self.step_t = step.to_dtype(DType::I64)?.to_scalar::<i64>()?.max(0) as usize;
+            let step_values = step.to_dtype(DType::I64)?.flatten_all()?.to_vec1::<i64>()?;
+            self.step_t = step_values.first().copied().unwrap_or(0).max(0) as usize;
         }
         for state in &mut self.vars {
             let m_key = format!("{}.first_moment", state.name);

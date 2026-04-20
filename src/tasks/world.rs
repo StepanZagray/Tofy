@@ -13,8 +13,9 @@ use crate::data::{
     build_vocab_from_raw_world_file_with_mode, count_raw_world_rows, count_raw_world_rows_split,
     count_raw_world_rows_split_with_mode, encode_text_with_vocab_mode, encode_world_examples,
     encode_world_examples_with_mode, ensure_hub_dataset_cached, make_decoder_batch,
-    make_world_batch_from_slice, tokenize_for_inference, RawWorldExample, RawWorldStream,
-    TokenizationMode, ACTION_CODE, ACTION_DONE, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    make_world_batch_from_slice, tokenize_for_inference, CachedDecoderExample, CachedDecoderStream,
+    CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode, WorldExample,
+    ACTION_CODE, ACTION_DONE, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::{
@@ -28,6 +29,15 @@ use candle_nn::ops;
 
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
+
+fn token_cache_path(kind: &str) -> Option<PathBuf> {
+    if !env_bool("TOFY_USE_TOKEN_CACHE", true) {
+        return None;
+    }
+    let cache_dir = std::env::var("TOFY_CACHE_DIR").unwrap_or_else(|_| "data/cache".to_string());
+    let path = PathBuf::from(cache_dir).join(format!("{kind}.tokens.bin"));
+    path.exists().then_some(path)
+}
 
 fn world_batch_size_for_step(step: usize, config: &WorldConfig) -> usize {
     if config.batch_warmup_steps > 0
@@ -197,7 +207,7 @@ impl WorldConfig {
             num_latent_tokens: filtered.get(10).and_then(|v| v.parse().ok()).unwrap_or(64),
             lambda: lambda_override.unwrap_or(0.2),
             lr: lr_override.unwrap_or(2e-4),
-            log_every: 100,
+            log_every: env_usize("TOFY_WORLD_LOG_EVERY", 100),
             grad_accum_steps,
             grad_accum_warmup_steps,
             grad_accum_warmup_value,
@@ -318,7 +328,7 @@ impl OrchestratorTrainConfig {
             bridge_dim: filtered.get(10).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_latent_tokens: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(64),
             lr: lr_override.unwrap_or(2e-4),
-            log_every: 100,
+            log_every: env_usize("TOFY_ORCHESTRATOR_LOG_EVERY", 100),
             grad_accum_steps: grad_accum_steps.max(1),
             resume,
             tune_planner,
@@ -494,6 +504,34 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             HELDOUT_SPLIT_REMAINDER,
             false,
         )?)
+    } else {
+        None
+    };
+    let mut cached_world_stream = if let Some(cache_path) = token_cache_path("world") {
+        println!("Token cache: using world training cache {:?}", cache_path);
+        Some(CachedWorldStream::with_split(
+            &cache_path,
+            DEFAULT_STREAM_SHUFFLE_BUFFER,
+            Some(HELDOUT_SPLIT_MODULUS),
+            HELDOUT_SPLIT_REMAINDER,
+            true,
+        )?)
+    } else {
+        println!("Token cache: no world cache found; using raw tokenization stream");
+        None
+    };
+    let mut cached_val_stream = if val_row_count > 0 {
+        if let Some(cache_path) = token_cache_path("world") {
+            Some(CachedWorldStream::with_split(
+                &cache_path,
+                DEFAULT_STREAM_SHUFFLE_BUFFER,
+                Some(HELDOUT_SPLIT_MODULUS),
+                HELDOUT_SPLIT_REMAINDER,
+                false,
+            )?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -721,13 +759,22 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let grad_accum_steps = world_grad_accum_for_step(step, &config);
 
         for _micro_step in 0..grad_accum_steps {
-            let raw_batch = collect_action_training_batch(
-                &mut world_stream,
-                batch_size,
-                TARGET_CODE_RATE,
-                TARGET_DONE_RATE,
-            )?;
-            let batch = encode_world_examples(&raw_batch, &encoder_vocab);
+            let batch = if let Some(ref mut cached_stream) = cached_world_stream {
+                collect_action_training_batch_cached(
+                    cached_stream,
+                    batch_size,
+                    TARGET_CODE_RATE,
+                    TARGET_DONE_RATE,
+                )?
+            } else {
+                let raw_batch = collect_action_training_batch(
+                    &mut world_stream,
+                    batch_size,
+                    TARGET_CODE_RATE,
+                    TARGET_DONE_RATE,
+                )?;
+                encode_world_examples(&raw_batch, &encoder_vocab)
+            };
             let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
             let state_slots = if context_segments > 1 || recursive_planner_memory {
                 let state_tokens = batch
@@ -959,15 +1006,28 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 );
             }
             let selection_metric;
-            if let Some(ref mut val_stream) = val_stream {
-                let val_raw_batch = collect_action_training_batch(
-                    val_stream,
-                    batch_size,
-                    TARGET_CODE_RATE,
-                    TARGET_DONE_RATE,
-                )?;
-                let val_metrics = evaluate_world_batch(
-                    &val_raw_batch,
+            if val_stream.is_some() || cached_val_stream.is_some() {
+                let val_batch = if let Some(ref mut cached_stream) = cached_val_stream {
+                    collect_action_training_batch_cached(
+                        cached_stream,
+                        batch_size,
+                        TARGET_CODE_RATE,
+                        TARGET_DONE_RATE,
+                    )?
+                } else {
+                    let val_stream = val_stream
+                        .as_mut()
+                        .context("world validation stream missing")?;
+                    let val_raw_batch = collect_action_training_batch(
+                        val_stream,
+                        batch_size,
+                        TARGET_CODE_RATE,
+                        TARGET_DONE_RATE,
+                    )?;
+                    encode_world_examples(&val_raw_batch, &encoder_vocab)
+                };
+                let val_metrics = evaluate_world_encoded_batch(
+                    &val_batch,
                     &encoder_vocab,
                     &encoder,
                     &planner_memory,
@@ -1197,6 +1257,37 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     } else {
         None
     };
+    let mut cached_train_stream = if let Some(cache_path) = token_cache_path("world") {
+        println!(
+            "Token cache: using orchestrator world cache {:?}",
+            cache_path
+        );
+        Some(CachedWorldStream::with_split(
+            &cache_path,
+            DEFAULT_STREAM_SHUFFLE_BUFFER,
+            Some(HELDOUT_SPLIT_MODULUS),
+            HELDOUT_SPLIT_REMAINDER,
+            true,
+        )?)
+    } else {
+        println!("Token cache: no orchestrator world cache found; using raw tokenization stream");
+        None
+    };
+    let mut cached_val_stream = if val_row_count > 0 {
+        if let Some(cache_path) = token_cache_path("world") {
+            Some(CachedWorldStream::with_split(
+                &cache_path,
+                DEFAULT_STREAM_SHUFFLE_BUFFER,
+                Some(HELDOUT_SPLIT_MODULUS),
+                HELDOUT_SPLIT_REMAINDER,
+                false,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut encoder_varmap = VarMap::new();
     let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
@@ -1349,13 +1440,22 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         let mut last_action_labels = Vec::new();
 
         for _micro_step in 0..config.grad_accum_steps.max(1) {
-            let raw_batch = collect_action_training_batch(
-                &mut train_stream,
-                config.batch_size,
-                TARGET_CODE_RATE,
-                TARGET_DONE_RATE,
-            )?;
-            let batch = encode_world_examples(&raw_batch, &encoder_vocab);
+            let batch = if let Some(ref mut cached_stream) = cached_train_stream {
+                collect_action_training_batch_cached(
+                    cached_stream,
+                    config.batch_size,
+                    TARGET_CODE_RATE,
+                    TARGET_DONE_RATE,
+                )?
+            } else {
+                let raw_batch = collect_action_training_batch(
+                    &mut train_stream,
+                    config.batch_size,
+                    TARGET_CODE_RATE,
+                    TARGET_DONE_RATE,
+                )?;
+                encode_world_examples(&raw_batch, &encoder_vocab)
+            };
             let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
             let state_tokens = batch
                 .iter()
@@ -1434,14 +1534,26 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 );
             }
 
-            if let Some(ref mut stream) = val_stream {
-                let raw_batch = collect_action_training_batch(
-                    stream,
-                    config.batch_size,
-                    TARGET_CODE_RATE,
-                    TARGET_DONE_RATE,
-                )?;
-                let batch = encode_world_examples(&raw_batch, &encoder_vocab);
+            if val_stream.is_some() || cached_val_stream.is_some() {
+                let batch = if let Some(ref mut cached_stream) = cached_val_stream {
+                    collect_action_training_batch_cached(
+                        cached_stream,
+                        config.batch_size,
+                        TARGET_CODE_RATE,
+                        TARGET_DONE_RATE,
+                    )?
+                } else {
+                    let stream = val_stream
+                        .as_mut()
+                        .context("orchestrator validation stream missing")?;
+                    let raw_batch = collect_action_training_batch(
+                        stream,
+                        config.batch_size,
+                        TARGET_CODE_RATE,
+                        TARGET_DONE_RATE,
+                    )?;
+                    encode_world_examples(&raw_batch, &encoder_vocab)
+                };
                 let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
                 let state_tokens = batch
                     .iter()
@@ -1559,7 +1671,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
 /// train decoder adapter + decoder jointly on top of planner memory.
 /// Defaults sized for the shared-width proof-of-concept architecture.
 const DECODER_DIM: usize = 640;
-const DECODER_LAYERS: usize = 8;
+const DECODER_LAYERS: usize = 6;
 const DECODER_HEADS: usize = 8;
 const DECODER_FF_DIM: usize = 2560;
 
@@ -1840,7 +1952,7 @@ impl DecoderTrainConfig {
             bridge_dim: filtered.get(10).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_latent_tokens: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(64),
             lr: lr_override.unwrap_or(3e-4),
-            log_every: 100,
+            log_every: env_usize("TOFY_DECODER_LOG_EVERY", 100),
             grad_accum_steps: grad_accum_steps.max(1),
             resume,
             train_dtype: std::env::var("TOFY_TRAIN_DTYPE")
@@ -2151,6 +2263,73 @@ fn collect_action_training_batch(
     Ok(batch)
 }
 
+fn collect_action_training_batch_cached(
+    stream: &mut CachedWorldStream,
+    batch_size: usize,
+    target_code_rate: f32,
+    target_done_rate: f32,
+) -> Result<Vec<WorldExample>> {
+    let mut rng = rand::thread_rng();
+    let target_code = ((batch_size as f32) * target_code_rate.clamp(0.0, 0.5)).round() as usize;
+    let target_done = ((batch_size as f32) * target_done_rate.clamp(0.0, 0.4)).round() as usize;
+    let target_code = target_code.min(batch_size.saturating_sub(1));
+    let target_done = target_done.min(batch_size.saturating_sub(target_code));
+    let target_text = batch_size.saturating_sub(target_code + target_done);
+    let mut code_examples = Vec::new();
+    let mut text_examples = Vec::new();
+    let mut done_examples = Vec::new();
+
+    for _ in 0..8 {
+        for example in stream.next_batch(batch_size.max(1))? {
+            match example.action_label {
+                ACTION_CODE => code_examples.push(example),
+                ACTION_DONE => done_examples.push(example),
+                _ => text_examples.push(example),
+            }
+        }
+        if code_examples.len() >= target_code
+            && text_examples.len() >= target_text
+            && done_examples.len() >= target_done
+        {
+            break;
+        }
+    }
+
+    code_examples.shuffle(&mut rng);
+    text_examples.shuffle(&mut rng);
+    done_examples.shuffle(&mut rng);
+
+    let take_code = target_code.min(code_examples.len());
+    let take_text = target_text.min(text_examples.len());
+    let take_done = target_done.min(done_examples.len());
+    let mut batch = Vec::with_capacity(batch_size);
+    batch.extend(code_examples.drain(..take_code));
+    batch.extend(text_examples.drain(..take_text));
+    batch.extend(done_examples.drain(..take_done));
+
+    let mut leftovers = Vec::new();
+    leftovers.extend(code_examples);
+    leftovers.extend(text_examples);
+    leftovers.extend(done_examples);
+    leftovers.shuffle(&mut rng);
+    for example in leftovers
+        .into_iter()
+        .take(batch_size.saturating_sub(batch.len()))
+    {
+        batch.push(example);
+    }
+
+    while batch.len() < batch_size {
+        let mut extra = stream.next_batch(1)?;
+        if let Some(example) = extra.pop() {
+            batch.push(example);
+        }
+    }
+
+    batch.shuffle(&mut rng);
+    Ok(batch)
+}
+
 fn raw_examples_oov_rate(rows: &[RawWorldExample], vocab: &Vocab, mode: TokenizationMode) -> f32 {
     let mut total = 0usize;
     let mut oov = 0usize;
@@ -2162,6 +2341,25 @@ fn raw_examples_oov_rate(rows: &[RawWorldExample], vocab: &Vocab, mode: Tokeniza
             .iter()
             .chain(next_ids.iter())
             .filter(|&&id| id == vocab.unk_id)
+            .count();
+    }
+    if total == 0 {
+        0.0
+    } else {
+        oov as f32 / total as f32
+    }
+}
+
+fn encoded_examples_oov_rate(rows: &[WorldExample], unk_id: u32) -> f32 {
+    let mut total = 0usize;
+    let mut oov = 0usize;
+    for row in rows {
+        total += row.state_tokens.len() + row.next_tokens.len();
+        oov += row
+            .state_tokens
+            .iter()
+            .chain(row.next_tokens.iter())
+            .filter(|&&id| id == unk_id)
             .count();
     }
     if total == 0 {
@@ -2639,8 +2837,8 @@ fn decoder_prediction_metrics(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_world_batch(
-    raw_batch: &[RawWorldExample],
+fn evaluate_world_encoded_batch(
+    batch: &[WorldExample],
     encoder_vocab: &Vocab,
     encoder: &OnlineEncoder,
     planner_memory: &PlannerMemory,
@@ -2658,7 +2856,6 @@ fn evaluate_world_batch(
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
-    let batch = encode_world_examples(raw_batch, encoder_vocab);
     let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
     let state_slots = if context_segments > 1 || recursive_planner_memory {
         let state_tokens = batch
@@ -2678,7 +2875,7 @@ fn evaluate_world_batch(
         )?
     } else {
         let (state_ids, _next_ids, state_lens, _next_lens, _) =
-            make_world_batch_from_slice(&batch, max_seq, encoder_vocab.pad_id, device)?;
+            make_world_batch_from_slice(batch, max_seq, encoder_vocab.pad_id, device)?;
         let state_features = encoder.forward_features(&state_ids)?.detached();
         planner_forward_encoder_masked(planner_memory, &state_features, &state_lens)?
     };
@@ -2700,7 +2897,7 @@ fn evaluate_world_batch(
         )?
     } else {
         let (_state_ids, next_ids, _state_lens, next_lens, _) =
-            make_world_batch_from_slice(&batch, max_seq, encoder_vocab.pad_id, device)?;
+            make_world_batch_from_slice(batch, max_seq, encoder_vocab.pad_id, device)?;
         let next_features = encoder.forward_features(&next_ids)?.detached();
         planner_forward_encoder_masked(planner_memory, &next_features, &next_lens)?
     };
@@ -2774,13 +2971,87 @@ fn evaluate_decoder_batch(
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
     let decoder_token_mode = decoder_tokenization_mode(decoder_kind);
+    let encoder_batch = encode_world_examples(raw_batch, encoder_vocab);
+    let decoder_batch =
+        encode_world_examples_with_mode(raw_batch, decoder_vocab, decoder_token_mode);
+    evaluate_decoder_encoded_batch(
+        &encoder_batch,
+        &decoder_batch,
+        raw_examples_oov_rate(raw_batch, decoder_vocab, decoder_token_mode),
+        encoder_vocab,
+        decoder_vocab,
+        encoder,
+        planner_memory,
+        transition,
+        decoder_adapter,
+        decoder,
+        decoder_action_label,
+        max_seq,
+        device,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_decoder_cached_batch(
+    cached_batch: &[CachedDecoderExample],
+    encoder_vocab: &Vocab,
+    decoder_vocab: &Vocab,
+    encoder: &OnlineEncoder,
+    planner_memory: &PlannerMemory,
+    transition: &WorldTransition,
+    decoder_adapter: &DecoderAdapter,
+    decoder: &CodeDecoder,
+    _decoder_kind: DecoderKind,
+    decoder_action_label: u32,
+    max_seq: usize,
+    device: &Device,
+) -> Result<DecoderBatchMetrics> {
+    let encoder_batch = cached_batch
+        .iter()
+        .map(|row| row.encoder.clone())
+        .collect::<Vec<_>>();
+    let decoder_batch = cached_batch
+        .iter()
+        .map(|row| row.decoder.clone())
+        .collect::<Vec<_>>();
+    let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
+    evaluate_decoder_encoded_batch(
+        &encoder_batch,
+        &decoder_batch,
+        oov_rate,
+        encoder_vocab,
+        decoder_vocab,
+        encoder,
+        planner_memory,
+        transition,
+        decoder_adapter,
+        decoder,
+        decoder_action_label,
+        max_seq,
+        device,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_decoder_encoded_batch(
+    encoder_batch: &[WorldExample],
+    decoder_batch: &[WorldExample],
+    oov_rate: f32,
+    encoder_vocab: &Vocab,
+    decoder_vocab: &Vocab,
+    encoder: &OnlineEncoder,
+    planner_memory: &PlannerMemory,
+    transition: &WorldTransition,
+    decoder_adapter: &DecoderAdapter,
+    decoder: &CodeDecoder,
+    decoder_action_label: u32,
+    max_seq: usize,
+    device: &Device,
+) -> Result<DecoderBatchMetrics> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
-    let encoder_batch = encode_world_examples(raw_batch, encoder_vocab);
-    let decoder_batch =
-        encode_world_examples_with_mode(raw_batch, decoder_vocab, decoder_token_mode);
     let state_tokens = encoder_batch
         .iter()
         .map(|row| row.state_tokens.clone())
@@ -2810,7 +3081,7 @@ fn evaluate_decoder_batch(
     let world_latent = decoder_adapter.forward(&next_planner_slots.detach())?;
     let zero_world_latent = world_latent.affine(0.0, 0.0)?;
     let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
-        make_world_batch_from_slice(&decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
+        make_world_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
     let (dec_input, dec_target, loss_mask) = make_decoder_batch(
         &dec_state_ids,
         &dec_next_ids,
@@ -2854,7 +3125,7 @@ fn evaluate_decoder_batch(
         active_tokens,
         active_frac: active_tokens / total_tokens.max(1.0),
         world_rms: util::scalar_f32(&tensor_rms(&world_latent)?)?,
-        oov_rate: raw_examples_oov_rate(raw_batch, decoder_vocab, decoder_token_mode),
+        oov_rate,
         token_accuracy: prediction_metrics.token_accuracy,
         identifier_accuracy: prediction_metrics.identifier_accuracy,
         delimiter_balance_rate: prediction_metrics.delimiter_balance_rate,
@@ -2958,6 +3229,39 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     } else {
         None
     };
+    let mut cached_decoder_stream = if config.decoder_kind == DecoderKind::CodeSpecialist {
+        if let Some(cache_path) = token_cache_path("code_decoder_dual") {
+            println!("Token cache: using decoder dual cache {:?}", cache_path);
+            Some(CachedDecoderStream::with_split(
+                &cache_path,
+                DEFAULT_STREAM_SHUFFLE_BUFFER,
+                Some(HELDOUT_SPLIT_MODULUS),
+                HELDOUT_SPLIT_REMAINDER,
+                true,
+            )?)
+        } else {
+            println!("Token cache: no decoder dual cache found; using raw tokenization stream");
+            None
+        }
+    } else {
+        None
+    };
+    let mut cached_decoder_val_stream =
+        if val_row_count > 0 && config.decoder_kind == DecoderKind::CodeSpecialist {
+            if let Some(cache_path) = token_cache_path("code_decoder_dual") {
+                Some(CachedDecoderStream::with_split(
+                    &cache_path,
+                    DEFAULT_STREAM_SHUFFLE_BUFFER,
+                    Some(HELDOUT_SPLIT_MODULUS),
+                    HELDOUT_SPLIT_REMAINDER,
+                    false,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
 
     let mut encoder_varmap = VarMap::new();
@@ -3237,7 +3541,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     }
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut last_raw_batch = None;
+        let mut last_oov_rate = None;
         let mut last_world_latent = None;
         let mut last_logits = None;
         let mut last_dec_target = None;
@@ -3251,10 +3555,29 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_structure_loss = None;
 
         for _micro_step in 0..config.grad_accum_steps.max(1) {
-            let raw_batch = raw_stream.next_batch(config.batch_size.max(1))?;
-            let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
-            let decoder_batch =
-                encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
+            let (encoder_batch, decoder_batch, oov_rate) = if let Some(ref mut cached_stream) =
+                cached_decoder_stream
+            {
+                let cached_batch = cached_stream.next_batch(config.batch_size.max(1))?;
+                let encoder_batch = cached_batch
+                    .iter()
+                    .map(|row| row.encoder.clone())
+                    .collect::<Vec<_>>();
+                let decoder_batch = cached_batch
+                    .iter()
+                    .map(|row| row.decoder.clone())
+                    .collect::<Vec<_>>();
+                let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
+                (encoder_batch, decoder_batch, oov_rate)
+            } else {
+                let raw_batch = raw_stream.next_batch(config.batch_size.max(1))?;
+                let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
+                let decoder_batch =
+                    encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
+                let oov_rate =
+                    raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
+                (encoder_batch, decoder_batch, oov_rate)
+            };
             let state_tokens = encoder_batch
                 .iter()
                 .map(|row| row.state_tokens.clone())
@@ -3335,7 +3658,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 config.grad_accum_steps,
             )?;
 
-            last_raw_batch = Some(raw_batch);
+            last_oov_rate = Some(oov_rate);
             last_world_latent = Some(world_latent);
             last_logits = Some(logits);
             last_dec_target = Some(dec_target);
@@ -3352,8 +3675,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
-            let raw_batch =
-                last_raw_batch.context("decoder grad accumulation produced no raw batch")?;
+            let oov_rate =
+                last_oov_rate.context("decoder grad accumulation produced no OOV rate")?;
             let world_latent =
                 last_world_latent.context("decoder grad accumulation produced no latent")?;
             let logits = last_logits.context("decoder grad accumulation produced no logits")?;
@@ -3387,7 +3710,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let perplexity = loss_val.exp();
             let conditioning_gain = ablated_loss_val - loss_val;
             let world_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
-            let oov_rate = raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
             let prediction_metrics =
                 decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
             let token_accuracy = prediction_metrics.token_accuracy;
@@ -3482,22 +3804,43 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 config.signature_loss_weight,
                 config.structure_loss_weight,
             );
-            if let Some(ref mut val_stream) = val_stream {
-                let val_raw_batch = val_stream.next_batch(config.batch_size.max(1))?;
-                let val_metrics = evaluate_decoder_batch(
-                    &val_raw_batch,
-                    &encoder_vocab,
-                    &decoder_vocab,
-                    &encoder,
-                    &planner_memory,
-                    &transition,
-                    &decoder_adapter,
-                    &decoder,
-                    config.decoder_kind,
-                    decoder_action_label,
-                    config.max_seq,
-                    &device,
-                )?;
+            if val_stream.is_some() || cached_decoder_val_stream.is_some() {
+                let val_metrics = if let Some(ref mut cached_stream) = cached_decoder_val_stream {
+                    let cached_batch = cached_stream.next_batch(config.batch_size.max(1))?;
+                    evaluate_decoder_cached_batch(
+                        &cached_batch,
+                        &encoder_vocab,
+                        &decoder_vocab,
+                        &encoder,
+                        &planner_memory,
+                        &transition,
+                        &decoder_adapter,
+                        &decoder,
+                        config.decoder_kind,
+                        decoder_action_label,
+                        config.max_seq,
+                        &device,
+                    )?
+                } else {
+                    let val_stream = val_stream
+                        .as_mut()
+                        .context("decoder validation stream missing")?;
+                    let val_raw_batch = val_stream.next_batch(config.batch_size.max(1))?;
+                    evaluate_decoder_batch(
+                        &val_raw_batch,
+                        &encoder_vocab,
+                        &decoder_vocab,
+                        &encoder,
+                        &planner_memory,
+                        &transition,
+                        &decoder_adapter,
+                        &decoder,
+                        config.decoder_kind,
+                        decoder_action_label,
+                        config.max_seq,
+                        &device,
+                    )?
+                };
                 selection_metric = decoder_selection_score(
                     &val_metrics,
                     config.syntax_loss_weight,
@@ -3947,6 +4290,127 @@ fn likely_rust_request(prompt: &str) -> bool {
         || lower.contains("return only rust code")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeWorkUnit {
+    signature: Option<String>,
+    requirements: Vec<String>,
+    source_excerpt: String,
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(default)
+}
+
+fn rlm_code_enabled() -> bool {
+    env_flag("TOFY_RLM_CODE", true)
+}
+
+fn extract_rust_work_units(prompt: &str, max_units: usize) -> Vec<CodeWorkUnit> {
+    let max_units = max_units.max(1);
+    let requirements = extract_prompt_requirements(prompt);
+    let mut units = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if !(trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ")) {
+            continue;
+        }
+        let signature = trimmed.trim_end_matches('{').trim().to_string();
+        if signature.is_empty() || !seen.insert(signature.clone()) {
+            continue;
+        }
+        units.push(CodeWorkUnit {
+            signature: Some(signature),
+            requirements: requirements.clone(),
+            source_excerpt: excerpt_chars(prompt, 1200),
+        });
+        if units.len() >= max_units {
+            break;
+        }
+    }
+    if units.is_empty() {
+        units.push(CodeWorkUnit {
+            signature: None,
+            requirements,
+            source_excerpt: excerpt_chars(prompt, 1600),
+        });
+    }
+    units
+}
+
+fn extract_prompt_requirements(prompt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_rules = false;
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("rules:") {
+            in_rules = true;
+            continue;
+        }
+        if in_rules {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(rule) = trimmed.strip_prefix("- ") {
+                out.push(rule.trim().to_string());
+            } else if trimmed.ends_with(':') {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn excerpt_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("\n...");
+    out
+}
+
+fn build_rlm_code_prompt(
+    prompt: &str,
+    unit: &CodeWorkUnit,
+    unit_idx: usize,
+    total: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str("Return only Rust code for this recursive local work unit.\n");
+    out.push_str("Do not explain. Prefer one complete function unless helper code is required.\n");
+    if total > 1 {
+        out.push_str(&format!("Work unit {}/{}.\n", unit_idx + 1, total));
+    }
+    if let Some(signature) = unit.signature.as_ref() {
+        out.push_str("\nExact function signature:\n");
+        out.push_str(signature);
+        out.push('\n');
+    }
+    if !unit.requirements.is_empty() {
+        out.push_str("\nRequirements:\n");
+        for requirement in &unit.requirements {
+            out.push_str("- ");
+            out.push_str(requirement);
+            out.push('\n');
+        }
+    }
+    out.push_str("\nOriginal request excerpt:\n");
+    out.push_str(&unit.source_excerpt);
+    if !prompt.contains(&unit.source_excerpt) {
+        out.push_str(
+            "\n\nFull request was truncated; obey the exact signature and requirements above.",
+        );
+    }
+    out
+}
+
 fn balanced_braces(text: &str) -> bool {
     let mut round = 0i32;
     let mut square = 0i32;
@@ -4161,6 +4625,27 @@ impl AgentEngine {
         }
     }
 
+    fn conditioning_for_action_prompt(
+        &self,
+        prompt: &str,
+        action: crate::tasks::orchestrator::Action,
+        ablate_conditioning: bool,
+    ) -> Result<Vec<f32>> {
+        let state_slots = self.encode_prompt_planner_memory(prompt)?;
+        let next_slots = rollout_transition_slots(
+            &self.transition,
+            &state_slots,
+            action as u32,
+            self.world_rollout_steps,
+        )
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let mut cond_vec = util::vec1_f32(&next_slots.flatten_all()?)?;
+        if ablate_conditioning {
+            cond_vec.fill(0.0);
+        }
+        Ok(cond_vec)
+    }
+
     /// Build decoder + conditioning from predicted next planner memory.
     fn get_decoder_and_cond_from_planner_memory(
         &self,
@@ -4209,6 +4694,55 @@ impl AgentEngine {
         Ok((decoder, cond_vec))
     }
 
+    fn generate_code_rlm(
+        &self,
+        decoder: &dyn LocalDecoderRuntime,
+        prompt: &str,
+        max_new_tokens: usize,
+        ablate_conditioning: bool,
+    ) -> Result<String> {
+        use crate::tasks::orchestrator::Action;
+        let max_units = std::env::var("TOFY_RLM_MAX_UNITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize)
+            .max(1);
+        let units = extract_rust_work_units(prompt, max_units);
+        let unit_tokens = std::env::var("TOFY_RLM_UNIT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(192usize)
+            .max(32);
+        let per_unit_tokens = unit_tokens.min(max_new_tokens.max(1));
+        let mut outputs = Vec::new();
+        for (idx, unit) in units.iter().enumerate() {
+            let local_prompt = build_rlm_code_prompt(prompt, unit, idx, units.len());
+            let cond_vec = self.conditioning_for_action_prompt(
+                &local_prompt,
+                Action::Code,
+                ablate_conditioning,
+            )?;
+            let mut code = decoder.generate(
+                &local_prompt,
+                Action::Code.as_str(),
+                &cond_vec,
+                per_unit_tokens,
+            )?;
+            code = maybe_repair_code_output(
+                decoder,
+                &local_prompt,
+                Action::Code.as_str(),
+                &cond_vec,
+                per_unit_tokens,
+                code,
+            );
+            if !code.trim().is_empty() {
+                outputs.push(code.trim().to_string());
+            }
+        }
+        Ok(outputs.join("\n\n"))
+    }
+
     /// Max tokens per decoder chunk for text (brief reply) and code (block).
     const TEXT_CHUNK_TOKENS: usize = 256;
     const CODE_CHUNK_TOKENS: usize = 512;
@@ -4244,6 +4778,23 @@ impl AgentEngine {
             action,
             ablate_conditioning,
         )?;
+        if action == Action::Code && likely_rust_request(prompt) && rlm_code_enabled() {
+            let assistant_content = self.generate_code_rlm(
+                decoder.as_ref(),
+                prompt,
+                max_new_tokens,
+                ablate_conditioning,
+            )?;
+            if std::env::var("JEPA_DEBUG").is_ok() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[tofy] rlm response in {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                let _ = std::io::stderr().flush();
+            }
+            return Ok(assistant_content);
+        }
         let mut assistant_content =
             decoder.generate(prompt, action.as_str(), &cond_vec, chunk_tokens)?;
         if action == Action::Code && likely_rust_request(prompt) {
@@ -4311,6 +4862,26 @@ impl AgentEngine {
             action,
             ablate_conditioning,
         )?;
+        if action == Action::Code && likely_rust_request(prompt) && rlm_code_enabled() {
+            let assistant_content = self.generate_code_rlm(
+                decoder.as_ref(),
+                prompt,
+                max_new_tokens,
+                ablate_conditioning,
+            )?;
+            if !assistant_content.is_empty() {
+                on_chunk(&assistant_content);
+            }
+            if std::env::var("JEPA_DEBUG").is_ok() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[tofy] rlm streamed response in {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                let _ = std::io::stderr().flush();
+            }
+            return Ok(());
+        }
         decoder.generate_stream(
             prompt,
             action.as_str(),
@@ -4571,7 +5142,10 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_segment_ranges, planner_memory_mask_from_lengths};
+    use super::{
+        build_rlm_code_prompt, context_segment_ranges, extract_rust_work_units,
+        planner_memory_mask_from_lengths,
+    };
     use crate::model::encoders::EncoderFeatures;
     use candle_core::{DType, Device, Tensor};
 
@@ -4603,5 +5177,27 @@ mod tests {
             vec![(32, 48), (48, 64), (64, 80)]
         );
         assert_eq!(context_segment_ranges(8, 16, 4), vec![(0, 8)]);
+    }
+
+    #[test]
+    fn rlm_work_units_extract_function_signature_and_rules() {
+        let prompt = "Return only Rust code. Implement exactly this function:\n\
+pub fn parse_size(input: &str) -> Result<u64, String>\n\n\
+Rules:\n\
+- Support B and KB.\n\
+- Reject negatives.\n";
+        let units = extract_rust_work_units(prompt, 4);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].signature.as_deref(),
+            Some("pub fn parse_size(input: &str) -> Result<u64, String>")
+        );
+        assert_eq!(
+            units[0].requirements,
+            vec!["Support B and KB.", "Reject negatives."]
+        );
+        let local_prompt = build_rlm_code_prompt(prompt, &units[0], 0, 1);
+        assert!(local_prompt.contains("Exact function signature"));
+        assert!(local_prompt.contains("Reject negatives."));
     }
 }

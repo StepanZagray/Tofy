@@ -4,7 +4,7 @@ Update the **Best So Far** section when a run improves on a reported metric. Rec
 
 ## Best So Far
 
-*(No entries yet. Add metric, dataset/split, and full command when you have a run to record.)*
+- **World transition selection score:** `0.0096` at step `7000/60000` on `data/world_mix_pairs.txt` validation stream, logged peak VRAM `6139/8151 MB` — `TOFY_RESUME=1 ./scripts/train_code_first_poc.sh` with `DIM=640`, `LAYERS=7`, `HEADS=8`, `WORLD_BATCH=128`, `WORLD_GRAD_ACCUM=1`, `TOFY_TRAIN_DTYPE=bf16`.
 
 ## Observed Baseline Runs
 
@@ -32,15 +32,39 @@ Current 8 GB RTX 5060 measurements:
 
 - Latent encoder `DIM=640`, `LAYERS=7`, `HEADS=8`, `MAX_VOCAB=8000`, `seq_len=256`, `bf16`: `32x1` passed at about `4942 MB` peak; `32x2` OOM; `64x1` OOM.
 - Previous latent encoder `DIM=768`, `LAYERS=9`, `HEADS=8`, `MAX_VOCAB=8000`, `seq_len=256`, `bf16`: `32x1` passed at about `7545 MB` peak; `32x2` OOM.
-- Shared-width world model `DIM=640`, `BRIDGE_DIM=640`, `NUM_LATENT_TOKENS=64`: `128x1` OOM; `96x1` passed; `64x2` passed.
+- Shared-width world model `DIM=640`, `BRIDGE_DIM=640`, `NUM_LATENT_TOKENS=64`: `128x1` resumed from step `6100` and passed to step `7000`, but live `nvidia-smi` later reached about `7259/8151 MB`, so it is too close for unattended full-pipeline use; `96x1` passed in a shallow probe but later OOMed during a long run when logging/checkpointing was more frequent; `64x2` passed at about `4379 MB` peak and is the safer default.
 
 Current default batch schedules for the 8 GB profile:
 
 - Latent: `32x1`.
-- World: warmup `96x1`, then `64x2` after `TOFY_WORLD_WARMUP_STEPS` (defaults to 20% of world steps when warmup differs from the main schedule).
-- Decoder: `12x2` passed at effective batch 24, peaking around `6233 MB` total sampled VRAM in the one-step decoder fit probe; `24x1` OOMed around `7641 MB`.
+- World: warmup `64x1`, then `64x2` after `TOFY_WORLD_WARMUP_STEPS=1200`.
+- Decoder: old 82.85M `12x2` and `8x3` OOMed in the full pipeline decoder startup path; old 82.85M `6x4` passed at about `7545 MB` peak but was too tight for unattended training; new 68.50M decoder (`dim=640`, `layers=6`, `heads=8`, `ff=2560`, `seq_len=192`) passed at `6x4` effective batch 24 with about `6489 MB` peak and is the current default.
+
+Short full-pipeline smoke pass:
+
+```bash
+TOFY_RESUME=1 WORLD_STEPS=8000 ROUTER_STEPS=1 CODE_DECODER_STEPS=1 CODE_POLISH_STEPS=1 \
+WORLD_MODEL=local_models/tmp_pipeline_world.safetensors \
+CODE_DECODER_OUTPUT=local_models/tmp_code_decoder_poc.safetensors \
+PIPELINE_RUN_ID=code_poc_smoke_4x6_2026-04-18_06-22-04 \
+./scripts/train_code_first_poc.sh
+```
+
+This completed all stages through `--eval-code-assistant` with the temporary world/decoder outputs and the previous 82.85M `4x6` decoder schedule. It is a pipeline/runtime smoke pass, not a quality result.
+
+Current runtime generation uses an RLM-style code path by default (`TOFY_RLM_CODE=1`): Rust prompts are decomposed into local function work units, each work unit is re-encoded through the world/planner, and one shared decoder is reused sequentially with short local prompts. Disable with `TOFY_RLM_CODE=0` for the old one-shot code decoder path.
 
 Recommended OOM probe pattern:
+
+Use the sustained probe for batch defaults:
+
+```bash
+./scripts/sustained_oom_probe.py --stage all
+```
+
+One-step probes are not trusted for batch decisions. They only prove that the code path starts. The world `96x1` case passed shallow testing but OOMed in a real run after VRAM climbed across thousands of steps.
+
+Legacy one-step fit pattern:
 
 ```bash
 TOFY_TRAIN_DTYPE=bf16 \
@@ -55,13 +79,13 @@ For world schedule transition testing, force a two-step run:
 
 ```bash
 TOFY_TRAIN_DTYPE=bf16 \
-TOFY_WORLD_WARMUP_BATCH=96 \
+TOFY_WORLD_WARMUP_BATCH=64 \
 TOFY_WORLD_WARMUP_GRAD_ACCUM=1 \
 TOFY_WORLD_WARMUP_STEPS=1 \
 ./target/release/jepa_ai --train-world <latent.safetensors> <vocab.txt> <world_pairs.txt> 2 64 640 256 7 8 640 64 --grad-accum 2
 ```
 
-Treat a passing one-step OOM probe as a memory fit check only. It does not prove training quality. Record real quality improvements in **Best So Far** with the exact full command.
+Treat a passing one-step OOM probe as a startup check only. It does not prove long-run memory safety or training quality. Record real quality improvements in **Best So Far** with the exact full command.
 
 Example:
 

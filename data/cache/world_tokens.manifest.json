@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "kind": "world",
+  "source": {
+    "path": "data/world_mix_pairs.txt",
+    "len": 2277344036,
+    "modified_unix_secs": 1776631035,
+    "content_hash": "3e56eaf987abe4a9"
+  },
+  "tokenizer": "default",
+  "max_seq": 256,
+  "vocab_path": "",
+  "vocab_signature": "94b57ea196fd6b14",
+  "token_cache_path": "data/cache/world.tokens.bin",
+  "rows": 2872387
+}
