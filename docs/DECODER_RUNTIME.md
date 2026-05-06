@@ -55,3 +55,18 @@ The Candle path now uses:
 - incremental self-attention KV cache
 - precomputed cross-attention K/V for the fixed planner/world latent
 - repeat penalty and optional top-k/top-p sampling controls
+
+## RLM code generation
+
+Rust code requests use the RLM scaffold by default (`TOFY_RLM_CODE=1`). The scaffold keeps the full request as external environment state, executes an RLM command program over prompt work units, invokes `SUB_RLM` recursively on local snippets, re-encodes each sub-call through the world/planner, and joins the stored sub-call outputs as the final response.
+
+Useful controls:
+
+- `TOFY_RLM_CODE=0` restores the one-shot code decoder call.
+- `TOFY_RLM_MAX_UNITS=<n>` caps root work units, default `4`.
+- `TOFY_RLM_MAX_DEPTH=<n>` caps recursive `SUB_RLM` depth, default `2`.
+- `TOFY_RLM_MAX_OPS=<n>` caps root RLM command execution, default derived from `TOFY_RLM_MAX_UNITS`.
+- `TOFY_RLM_ROOT_CONTEXT_CHARS=<n>` controls the short root prefix shown as metadata when model-program drafting is enabled, default `1200`.
+- `TOFY_RLM_UNIT_TOKENS=<tokens>` sets each leaf generation budget, default `192`.
+- `TOFY_RLM_MODEL_PROGRAM=1` asks the decoder to draft the root RLM command program; default `0` uses a deterministic program from discovered Rust work units.
+- `TOFY_RLM_PROGRAM_TOKENS=<tokens>` sets the root program generation budget, default `160`.

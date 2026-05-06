@@ -2,10 +2,13 @@ use anyhow::Result;
 use candle_core::DType;
 use std::path::PathBuf;
 
-pub struct Config {
+#[derive(Debug, Clone)]
+pub struct LatentTrainConfig {
     pub data_path: PathBuf,
     /// If set, load encoder weights from this path (e.g. previous latent checkpoint) before training.
     pub init_encoder_path: Option<PathBuf>,
+    /// If set, save the best encoder checkpoint and resume sidecars under this path.
+    pub output_path: Option<PathBuf>,
     pub steps: usize,
     pub batch_size: usize,
     pub dim: usize,
@@ -17,7 +20,7 @@ pub struct Config {
     pub max_spans_per_sample: usize,
     /// Max span length in tokens per mask. Default 32 for paragraph-style; use smaller for short phrases.
     pub max_span_len: usize,
-    /// Cap on fraction of valid (non-pad) context that can be masked (e.g. 0.25 = at most 1/4). Defence against masking most of context.
+    /// Cap on fraction of valid (non-pad) context that can be masked (e.g. 0.25 = at most 1/4).
     pub max_masked_ratio: f64,
     /// True when data is one paragraph per line (e.g. Wikipedia cache); allows single-token lines.
     pub is_paragraph_data: bool,
@@ -36,15 +39,16 @@ pub struct Config {
     pub latent_history_ratio: f64,
 }
 
-impl Config {
+impl LatentTrainConfig {
     /// Parse config from slice starting with data_path (for --latent)
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.is_empty() {
             anyhow::bail!(
-                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--resume]"
+                "usage: --latent <data_path> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
             );
         }
         let mut grad_accum_steps = 1usize;
+        let mut output_path = None;
         let mut resume = std::env::var("TOFY_RESUME")
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
@@ -73,6 +77,14 @@ impl Config {
             if args[i] == "--resume" {
                 resume = true;
                 i += 1;
+                continue;
+            }
+            if args[i] == "--output" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--output requires path"))?;
+                output_path = Some(PathBuf::from(value));
+                i += 2;
                 continue;
             }
             filtered.push(args[i].clone());
@@ -106,6 +118,7 @@ impl Config {
         Ok(Self {
             data_path: PathBuf::from(&filtered[0]),
             init_encoder_path: None,
+            output_path,
             steps,
             batch_size,
             dim: filtered.get(3).and_then(|v| v.parse().ok()).unwrap_or(768),
@@ -122,7 +135,7 @@ impl Config {
                 .get(10)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.25),
-            is_paragraph_data: false, // set by caller when using hub:...wikipedia
+            is_paragraph_data: false,
             lambda: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.2),
             lr: 3e-4,
             log_every: 100,
@@ -148,6 +161,40 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.25f64)
                 .clamp(0.0, 0.5),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LatentEvalConfig {
+    pub model_path: PathBuf,
+    pub vocab_path: PathBuf,
+    pub data_arg: String,
+    pub eval_steps: usize,
+    pub batch_size: usize,
+    pub dim: usize,
+    pub max_seq: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+}
+
+impl LatentEvalConfig {
+    pub fn from_args_after(args: &[String]) -> Result<Self> {
+        if args.len() < 3 {
+            anyhow::bail!(
+                "usage: --eval-jepa <model_path> <vocab_path> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads]"
+            );
+        }
+        Ok(Self {
+            model_path: PathBuf::from(&args[0]),
+            vocab_path: PathBuf::from(&args[1]),
+            data_arg: args[2].clone(),
+            eval_steps: args.get(3).and_then(|v| v.parse().ok()).unwrap_or(200),
+            batch_size: args.get(4).and_then(|v| v.parse().ok()).unwrap_or(32),
+            dim: args.get(5).and_then(|v| v.parse().ok()).unwrap_or(768),
+            max_seq: args.get(6).and_then(|v| v.parse().ok()).unwrap_or(256),
+            num_layers: args.get(7).and_then(|v| v.parse().ok()).unwrap_or(9),
+            num_heads: args.get(8).and_then(|v| v.parse().ok()).unwrap_or(8),
         })
     }
 }

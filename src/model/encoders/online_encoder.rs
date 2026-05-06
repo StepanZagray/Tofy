@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::Tensor;
 use candle_nn::VarBuilder;
 
-use super::shared::{EncoderBackbone, EncoderFeatures, PredictedEncoderFeatures};
+use super::shared::{EncoderBackbone, EncoderFeatures};
 
 /// Online encoder: updated directly by gradients/optimizer each step.
 pub struct OnlineEncoder {
@@ -22,21 +22,7 @@ impl OnlineEncoder {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn forward_sequence(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward_sequence(x)
-    }
-
     pub fn forward_features(&self, x: &Tensor) -> Result<EncoderFeatures> {
         self.inner.forward_features(x)
-    }
-
-    pub fn predict_features(&self, features: &EncoderFeatures) -> Result<PredictedEncoderFeatures> {
-        self.inner.predict_features(features)
-    }
-
-    #[allow(dead_code)]
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward(x)
     }
 }

@@ -1,16 +1,30 @@
 {
-  "version": 1,
+  "version": 2,
   "kind": "encoder",
   "source": {
     "path": "data/encoder_mix.txt",
-    "len": 5972526744,
-    "modified_unix_secs": 1776630978,
-    "content_hash": "2c61419c5a16b1ab"
+    "len": 5972529894,
+    "modified_unix_secs": 1777022565,
+    "content_hash": "6ffd606a1baf67e8"
   },
   "tokenizer": "default",
-  "max_seq": 256,
+  "tokenizer_spec": {
+    "version": 5,
+    "mode": "default",
+    "normalization": "identity_utf8",
+    "pretokenizer": "none",
+    "byte_fallback": false,
+    "reserved_byte_tokens": false,
+    "subword_identifier_fallback": false,
+    "byte_token_format": "none",
+    "byte_native": false,
+    "adaptive_boundaries": false,
+    "boundaryless_bpe": true
+  },
+  "tokenizer_spec_signature": "c52ae76f842076ee",
+  "max_seq": 1024,
   "vocab_path": "",
-  "vocab_signature": "94b57ea196fd6b14",
+  "vocab_signature": "a8c3fa5439d8cda8",
   "token_cache_path": "data/cache/encoder.tokens.bin",
-  "rows": 29912163
+  "rows": 30161845
 }

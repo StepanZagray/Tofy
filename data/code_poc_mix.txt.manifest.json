@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "kind": "code_poc_mix",
+  "output_path": "data/code_poc_mix.txt",
+  "params": {
+    "extra_repeat": 2,
+    "instruction_repeat": 6,
+    "max_rows": null,
+    "seed": 1337
+  },
+  "inputs": [
+    {
+      "path": "data/rust_code_pairs.txt",
+      "len": 332444344,
+      "modified_unix_nanos": 1775518153217127102,
+      "content_hash": "e2bafb32a848992e790909d86be9d73c8a835d0b477894cc3fc460b2eb680b2e"
+    },
+    {
+      "path": "data/rust_instruction_pairs.txt",
+      "len": 826115469,
+      "modified_unix_nanos": 1777022581348531978,
+      "content_hash": "3d242391f926bd0784435be8d789eb2f700ca97f25f5cad89749e7f0fc2b8054"
+    },
+    {
+      "path": "data/rust_docs_pairs.txt",
+      "len": 200718,
+      "modified_unix_nanos": 1777022534163323247,
+      "content_hash": "b46cc17283fdf7217d9756454f1d4fdbb2b4f412b63e321c7282486e2e23c81e"
+    },
+    {
+      "path": "data/rust_repair_pairs.txt",
+      "len": 4069509,
+      "modified_unix_nanos": 1777149487007667515,
+      "content_hash": "6934f4a2616c5cd31f1dcdf264589e1d5dbf60a4d1e23bf67113c6b18b265b18"
+    }
+  ],
+  "rows": 5911875
+}

@@ -1,0 +1,570 @@
+{
+  "version": 1,
+  "kind": "rust_by_practice",
+  "output_path": "data/rust_docs_jepa.txt",
+  "params": {
+    "mode": "jepa",
+    "split_headings": true
+  },
+  "inputs": [
+    {
+      "path": "data/sunface_rust-by-practice_en/SUMMARY.md",
+      "len": 3834,
+      "modified_unix_nanos": 1772043116614298862,
+      "content_hash": "3c07de2bc208a8cb86b3456f2832243324bd73db52435b422077d0d08cdcfb0a"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/about.md",
+      "len": 19,
+      "modified_unix_nanos": 1772043116614810139,
+      "content_hash": "04477d3a38599d2f7be740ccb363ba838b17f8c577b2796be30869255d36a7ef"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/async/async-await.md",
+      "len": 19,
+      "modified_unix_nanos": 1772043116615695756,
+      "content_hash": "92b4253a9ea7f106dab66284bcf5f1b9c6ebad3d9018485a2a46a571d670e605"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/async/future.md",
+      "len": 9,
+      "modified_unix_nanos": 1772043116616150792,
+      "content_hash": "8147d9893183cf9d38ecd6218de4e5192925af8761323aed256a9eca908a95a6"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/async/intro.md",
+      "len": 14,
+      "modified_unix_nanos": 1772043116616564415,
+      "content_hash": "ed30b88fe38e6d3639e2fa60599532d320e87c4fd2e4446e9183fcf0fe8f4a61"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/async/pin-unpin.md",
+      "len": 16,
+      "modified_unix_nanos": 1772043116616829355,
+      "content_hash": "ebfbf9dd9de03974ad54946c602ca92e1f0f6b85d6577941b253d6d7839a93ff"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/async/stream.md",
+      "len": 9,
+      "modified_unix_nanos": 1772043116617264754,
+      "content_hash": "cadcd0dc27b6af31f0ec60d9abeae102e2b08e84ac5260da54ba110c15709db4"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/basic-types/char-bool-unit.md",
+      "len": 1508,
+      "modified_unix_nanos": 1772043116617866933,
+      "content_hash": "a9ba8b1fd02e19af3b3be7c90d5eca1bd06095fff26ebbae1075975358063386"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/basic-types/functions.md",
+      "len": 1800,
+      "modified_unix_nanos": 1772043116617990605,
+      "content_hash": "f01e4211139993f14f1ac1afca3a02492b5ccb512f086f939c7663280eb4768c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/basic-types/intro.md",
+      "len": 223,
+      "modified_unix_nanos": 1772043116618354223,
+      "content_hash": "7a96866728f235617fc76fc7e3b46aba787235965c2b770f3a743b7e9f8fe6f5"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/basic-types/numbers.md",
+      "len": 3487,
+      "modified_unix_nanos": 1772043116618770792,
+      "content_hash": "5c8c13cb2081c87bdb1f19e26a62bdc730c418898bf4730b95cb537c05847a19"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/basic-types/statements-expressions.md",
+      "len": 1092,
+      "modified_unix_nanos": 1772043116618989750,
+      "content_hash": "a2165a408f75d8628a41a25cb56b8a3102c1a6110f5f5fdb384634169ebcd1ec"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/circle-reference/intro.md",
+      "len": 40,
+      "modified_unix_nanos": 1772043116619648528,
+      "content_hash": "525da858a27e040a5fca294b1c2d06b3d0351aacfd32a46cfd24c0b60058e60c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/collections/hashmap.md",
+      "len": 7371,
+      "modified_unix_nanos": 1772043116620428979,
+      "content_hash": "bf40aed719f2431a804753ce43e5fc07ae0d6ce29c0c36eb542d5dc5ebda4c71"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/collections/intro.md",
+      "len": 236,
+      "modified_unix_nanos": 1772043116620750895,
+      "content_hash": "498fa93d087d6a56750115db7371b181f61adc06a4cb99929c27cfbdddb74213"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/collections/string.md",
+      "len": 5463,
+      "modified_unix_nanos": 1772043116621107758,
+      "content_hash": "fe1ef61f08a40f35aca9b4c2edc9cc17753b192d5617564b9d4d36106498af65"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/collections/vector.md",
+      "len": 5761,
+      "modified_unix_nanos": 1772043116621434768,
+      "content_hash": "219005144230a26035b31817d0cd24f0f31eeca82077f401073e6d330ab2a5fd"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/comments-docs.md",
+      "len": 6943,
+      "modified_unix_nanos": 1772043116621620660,
+      "content_hash": "5ba5bbf39bcd823d12dfea8dcf8287f3c35e6d9c11499a2650f783c9ebce8127"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/array.md",
+      "len": 2268,
+      "modified_unix_nanos": 1772043116621993426,
+      "content_hash": "f9d28d6cbbc7eb3fb98dda4c45335c46d2e061ba608e095f5e5d7d8e8a1d0f9e"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/enum.md",
+      "len": 4868,
+      "modified_unix_nanos": 1772043116622491370,
+      "content_hash": "330021273c4c301b361549d115d401c1f6ee29a8f892c5e79cb128c306791c87"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/intro.md",
+      "len": 234,
+      "modified_unix_nanos": 1772043116622649247,
+      "content_hash": "b57555e1eb84e6bb781f7577494e49dffa55aad41e4b026b3b024d44fe28b6d9"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/slice.md",
+      "len": 2725,
+      "modified_unix_nanos": 1772043116622894487,
+      "content_hash": "f71b61c29ff4a7d7381eb1bfa3624c30ddb15e4e511e9e25085647cb8e77966b"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/string.md",
+      "len": 7239,
+      "modified_unix_nanos": 1772043116623235106,
+      "content_hash": "3531d16122d826806edd381e7cb6e37034331f285541939c41c65edb778bdb83"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/struct.md",
+      "len": 5389,
+      "modified_unix_nanos": 1772043116623470222,
+      "content_hash": "02d14ae50aad20409d60c6065f421f887aa900c9fe0d331e31e3ac2b3c3571e0"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/compound-types/tuple.md",
+      "len": 1954,
+      "modified_unix_nanos": 1772043116623621796,
+      "content_hash": "4d36394e4dc0377a218e8ff902ede67e110ed1908279b30594dba233b1ed4eb7"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/crate-module/crate.md",
+      "len": 3080,
+      "modified_unix_nanos": 1772043116623860498,
+      "content_hash": "5fe2f7010ded09d3be93bdaed40cf48e3fab4f03efd80e519589cf1939fdb1f8"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/crate-module/intro.md",
+      "len": 277,
+      "modified_unix_nanos": 1772043116624091161,
+      "content_hash": "45a5bee10d2b7bf8b377bbebac9daa9ee4dd0bf5155b330fe48fcaef3a489a51"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/crate-module/module.md",
+      "len": 4516,
+      "modified_unix_nanos": 1772043116624196405,
+      "content_hash": "675a94d258c82522270eedbb271928b534d52092883548ffe17c56277ed7c54d"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/crate-module/use-pub.md",
+      "len": 1813,
+      "modified_unix_nanos": 1772043116624414304,
+      "content_hash": "7f3cd537c933d17d3aa3396fdc920145783711b80d7dfa5c3d3ae9e599ef02dd"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/elegant-code-base.md",
+      "len": 2817,
+      "modified_unix_nanos": 1772043116624535036,
+      "content_hash": "ebc91ca8aa7f4f79912577079b9c9f354cfbfd57865f59e4d21c3e8fc068cea4"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/errors.md",
+      "len": 9,
+      "modified_unix_nanos": 1772043116624623080,
+      "content_hash": "8f64d655be2315181373032ac4e626b7f9e5bbf475c71813f521f3c9e2bcffd0"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/fight-compiler/borrowing.md",
+      "len": 632,
+      "modified_unix_nanos": 1772043116624841971,
+      "content_hash": "d1bb1b0ad9d97bd340197d9f325dd15bb34bf816f69f44f02ca2ddc8bb246613"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/fight-compiler/intro.md",
+      "len": 231,
+      "modified_unix_nanos": 1772043116624949820,
+      "content_hash": "46cee45b825a36c1711b69de8b0a51b4a729402aa9dd1e9b7b3dced19664a7e6"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/flow-control.md",
+      "len": 4796,
+      "modified_unix_nanos": 1772043116625032241,
+      "content_hash": "de185dcffd6c7eb2b24d1aa66e62f9cf177ee613753ed256fcdd5ed5d01b564c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/formatted-output/debug-display.md",
+      "len": 4291,
+      "modified_unix_nanos": 1772043116625182725,
+      "content_hash": "aa6cd3667655d380a2ea61efff8c7459e7bb7a9d6eedaa251b54dd6341a131d2"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/formatted-output/formatting.md",
+      "len": 4225,
+      "modified_unix_nanos": 1772043116625444249,
+      "content_hash": "beccb7b8f0a7c87256d9af13e0894259bff79f4bcc430ad585ce945f8fc7d1ff"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/formatted-output/intro.md",
+      "len": 2569,
+      "modified_unix_nanos": 1772043116625727903,
+      "content_hash": "c87a467b19011e9608d3d093b6d42c0a48c06e992c3fe45e8bd066f944ada2e6"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/formatted-output/println.md",
+      "len": 1145,
+      "modified_unix_nanos": 1772043116625852267,
+      "content_hash": "94c47a64be74c4cdfa7a2b76b08cadf6eb56b21f77d8247c3f97d6cb53aecb1a"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/functional-programing/closure.md",
+      "len": 9427,
+      "modified_unix_nanos": 1772043116626196601,
+      "content_hash": "c71abf78ca1621c78bf46f27a3304e208741937b090e00d99744bb1a9c060d38"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/functional-programing/intro.md",
+      "len": 271,
+      "modified_unix_nanos": 1772043116626517689,
+      "content_hash": "29f8fccb3a17cbdf49021ae7b2b95446cea6cae882b9629e811979368a68accc"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/functional-programing/iterator.md",
+      "len": 7900,
+      "modified_unix_nanos": 1772043116626638336,
+      "content_hash": "88236c220620458d804c6e0d04666e7075f3da57a7846fff405a8caa093293fd"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/advanced-traits.md",
+      "len": 7240,
+      "modified_unix_nanos": 1772043116627041135,
+      "content_hash": "9f6979bd7116dd205fae60536a19124692e21aff29628168f0f90cf351d47c9c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/const-generics.md",
+      "len": 4524,
+      "modified_unix_nanos": 1772043116627123090,
+      "content_hash": "2170e5deee386a571b149f68919f01b7ea37f4a01bf48989693bfb6fc624a4d3"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/generics.md",
+      "len": 2840,
+      "modified_unix_nanos": 1772043116627232442,
+      "content_hash": "d1f26e53ed0665fd7833a7d83597af6b382ac0104c3692aafc2bb9d6614538cc"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/intro.md",
+      "len": 225,
+      "modified_unix_nanos": 1772043116627331338,
+      "content_hash": "c51520e58a72132bae6def5dc4512a2dad41dfb6150f56257dd4346f118f8e5f"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/trait-object.md",
+      "len": 5589,
+      "modified_unix_nanos": 1772043116627424437,
+      "content_hash": "92415b2413401a9cf6dacb450f3dc272258a27adc2861d1597c8a008e36d0924"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/generics-traits/traits.md",
+      "len": 11097,
+      "modified_unix_nanos": 1772043116627652494,
+      "content_hash": "764e2752d4a0f4762463eec430b0d9951ff4c282b80b7292cdf696ec493d0c2c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/global-variables.md",
+      "len": 19,
+      "modified_unix_nanos": 1772043116627754136,
+      "content_hash": "bb741325e9c24c87e51b90d73461355fb583ff2c6680b917d748ba3760ddb380"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/lifetime/advance.md",
+      "len": 6489,
+      "modified_unix_nanos": 1772043116628231577,
+      "content_hash": "2c3b7f6ea1a5fa049de2a00a6a1411fa4b78a2cec235dc43e1bfba5d50a68d62"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/lifetime/basic.md",
+      "len": 9220,
+      "modified_unix_nanos": 1772043116628321436,
+      "content_hash": "4038b5131c27889d1446f06e5a56e9ca00432c1892d2ccf53dcddee6f2c2066a"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/lifetime/intro.md",
+      "len": 219,
+      "modified_unix_nanos": 1772043116628432637,
+      "content_hash": "3b1fdf78ae74bc8d167e4a3c92e412f44ea31996e05a0794bd627a4418fe82ef"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/lifetime/static.md",
+      "len": 4644,
+      "modified_unix_nanos": 1772043116628537122,
+      "content_hash": "fbb1ec4b967455e7f7d0adad09098e2496155e3caf9b5f53c748caf62e809caa"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/macro.md",
+      "len": 8,
+      "modified_unix_nanos": 1772043116628642087,
+      "content_hash": "a85320089da9ad1950bb21b0d79ab52593ee5b968e5083a129ed3b0cc01026eb"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/method.md",
+      "len": 6999,
+      "modified_unix_nanos": 1772043116628734056,
+      "content_hash": "50af6cd6420c83ac15bd1190cb3d78370aaf2fea35c730816a05a20a2396c22a"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/newtype-sized.md",
+      "len": 4444,
+      "modified_unix_nanos": 1772043116628834534,
+      "content_hash": "9e14dda8836edb4c7f6146bcecd81f4366ff479be7e12c251b0eb3b8270bb9a7"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/ownership/borrowing.md",
+      "len": 2990,
+      "modified_unix_nanos": 1772043116629043831,
+      "content_hash": "b321974f732932d03ac3accdf777fcd399fb0b649889bde812f4c12ed6c02ba2"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/ownership/intro.md",
+      "len": 250,
+      "modified_unix_nanos": 1772043116629147138,
+      "content_hash": "2f6e90ff13025880613e222bfa64077847e73d9e233b79b0182cc0c925f2f179"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/ownership/ownership.md",
+      "len": 3435,
+      "modified_unix_nanos": 1772043116629248593,
+      "content_hash": "3bd915ef7e2ea5029b9983f5996c500a99b52ac2ee399f74b98f49e8d1c58b66"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/pattern-match/intro.md",
+      "len": 219,
+      "modified_unix_nanos": 1772043116629413818,
+      "content_hash": "3894c4d62c4f8f38e801148085732f524332073a745ceedf1aedb981f4921ab2"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/pattern-match/match-iflet.md",
+      "len": 3861,
+      "modified_unix_nanos": 1772043116629507206,
+      "content_hash": "7b6d37bd7be1a235b8b6ca83e45c854f056cd30cba3335989bd24e1e5e91fbc2"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/pattern-match/patterns.md",
+      "len": 3026,
+      "modified_unix_nanos": 1772043116629570759,
+      "content_hash": "252f112f5820f77a72f12e25c870fbe8025ae4695397a64b5f3d32302322faa7"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/result-panic/intro.md",
+      "len": 244,
+      "modified_unix_nanos": 1772043116629942772,
+      "content_hash": "1ed4c2fb9ab190a362972b0da6c7e48a04fde76b083d09f065d7ed7ee0ff4597"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/result-panic/panic.md",
+      "len": 3863,
+      "modified_unix_nanos": 1772043116630191465,
+      "content_hash": "04cbd05b02e4b1009a91c47fccc64649c684c5eac33b0e55cc7de29b9a10d2ee"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/result-panic/result.md",
+      "len": 5428,
+      "modified_unix_nanos": 1772043116630317798,
+      "content_hash": "59e1ec7d3eb2c4504ddad994db1875d2b076db31c3420b56d0a9c795ddf9f5b0"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/self-referential.md",
+      "len": 19,
+      "modified_unix_nanos": 1772043116630591184,
+      "content_hash": "a4f9486d9b3f3086bb066d4a28906a4ec4909087b050c6819e78ead064ed3e1a"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/box.md",
+      "len": 792,
+      "modified_unix_nanos": 1772043116631019890,
+      "content_hash": "ef51921d189b520c7fde1743389533ff5e26a18ac6da5c9dc7b58ad2923997fc"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/cell-refcell.md",
+      "len": 19,
+      "modified_unix_nanos": 1772043116631131037,
+      "content_hash": "d49016b79c529c060176cefead76f5cab13b21f9462de9e8251b14d16a9c1c50"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/deref.md",
+      "len": 8,
+      "modified_unix_nanos": 1772043116631375227,
+      "content_hash": "64659c612da0c879be8d46c11aecab34103b709a5add0f15faf3fb6f85771b04"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/drop.md",
+      "len": 7,
+      "modified_unix_nanos": 1772043116631502245,
+      "content_hash": "6103d794c62b94c9828fcb401c5cdc627addfb50f50b9abf6727d63b2aeda841"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/intro.md",
+      "len": 94,
+      "modified_unix_nanos": 1772043116631774681,
+      "content_hash": "8b5eea7b9e1f97726f4bad4c2cc0ceb01eb7a59029ff4137771d0ff83807f8e4"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/smart-pointers/rc-arc.md",
+      "len": 13,
+      "modified_unix_nanos": 1772043116631931504,
+      "content_hash": "f7d4f604fb07cea5a48d57fdd7035a25371596b70e30278246f4cd9a3e32e060"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/std/String.md",
+      "len": 9,
+      "modified_unix_nanos": 1772043116632519473,
+      "content_hash": "08241f990bc4ef011dad7a7ae6cd45c538da93d5225946aa4b6c331092c75df9"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/std/intro.md",
+      "len": 21,
+      "modified_unix_nanos": 1772043116633312666,
+      "content_hash": "1304d3a702859683dee87ac8fa116991d374442e13272cfddbd58b4f02765190"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/tests/assertions.md",
+      "len": 13,
+      "modified_unix_nanos": 1772043116633601313,
+      "content_hash": "c396fd936c6f1aa20da89462895fcb6679839b89687c9f4f1ec276a744ae8a38"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/tests/benchmark.md",
+      "len": 79,
+      "modified_unix_nanos": 1772043116633687025,
+      "content_hash": "32f7722454a5fbb06ab6c39f8b5d98a9210c111be5a4f334e056b6b5dd75e209"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/tests/intro.md",
+      "len": 8,
+      "modified_unix_nanos": 1772043116633774842,
+      "content_hash": "96ef1d7374b189997691f6f01a0c8cfa9cd47ae024bfa081e04a882f36f364a3"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/tests/unit-integration.md",
+      "len": 23,
+      "modified_unix_nanos": 1772043116633851452,
+      "content_hash": "cf05826b4d734564eb227c98df497a96895f8d4622a9f684a2d2c1f6b25c6c23"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/tests/write-tests.md",
+      "len": 14,
+      "modified_unix_nanos": 1772043116633940469,
+      "content_hash": "50969dfcb632476de8a60ea8ddf912095c8dca29f17b051385b6b8709f54bc61"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/atomic.md",
+      "len": 9,
+      "modified_unix_nanos": 1772043116634169890,
+      "content_hash": "8fe2a527cbdf69801b5dc75bd28f96a2b7500370cd7f06d41eac1a84d5c769fc"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/basic-using.md",
+      "len": 14,
+      "modified_unix_nanos": 1772043116634356331,
+      "content_hash": "4139e60292029d62e83bb8b8f263bf89715f1f2bf53da8ec777053fdba097b2f"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/intro.md",
+      "len": 10,
+      "modified_unix_nanos": 1772043116634546139,
+      "content_hash": "cb2176fe7ca8c95fc88569d4bde19726e3139a392ed10fdf93cfdd074e115be1"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/message-passing.md",
+      "len": 18,
+      "modified_unix_nanos": 1772043116634725147,
+      "content_hash": "b0d6250ef283110f52cbdd86c9f981110a57ef40724a835a98c8dd64495f8bc9"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/send-sync.md",
+      "len": 16,
+      "modified_unix_nanos": 1772043116634815588,
+      "content_hash": "b712f2d91e85dc7a265927b32ac15f72a12cba8991996deaf8377518a9cd207b"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/threads/sync.md",
+      "len": 7,
+      "modified_unix_nanos": 1772043116634914976,
+      "content_hash": "088b43a907ac540dd98a3ac82f607accbb4e159dc298fa41c97224f07f856542"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/type-conversions/as.md",
+      "len": 3254,
+      "modified_unix_nanos": 1772043116635177092,
+      "content_hash": "3a2cfdf772127c69e4c1048361a0b0d7627f1ece920957e2d4c896e5f22867d0"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/type-conversions/from-into.md",
+      "len": 4836,
+      "modified_unix_nanos": 1772043116635252367,
+      "content_hash": "e62704c4a97e392fb3d40c9823d0227f7570ec9ba17263ad50962edc4aeb6503"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/type-conversions/intro.md",
+      "len": 181,
+      "modified_unix_nanos": 1772043116635498572,
+      "content_hash": "60d9e2aa82bae1d793b9fdf01688f9c658a2d18d812813003b6d1ae4cf84c49b"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/type-conversions/others.md",
+      "len": 5503,
+      "modified_unix_nanos": 1772043116635678217,
+      "content_hash": "a4828cdff255a62851a1ad2eb5f3e2ca037cb464f609c5970db9d39ed6f7f8f6"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/unsafe/inline-asm.md",
+      "len": 18260,
+      "modified_unix_nanos": 1772043116635968233,
+      "content_hash": "a8a8a6899efd327310757678a84d2e440d34f2d47a4b895088cb7b8e18bb8b62"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/unsafe/intro.md",
+      "len": 14,
+      "modified_unix_nanos": 1772043116636100894,
+      "content_hash": "ccfd2c10b9897e0c64df4ab5b929562e0c444f5ce9a06582dd3256ce1c9f003c"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/variables.md",
+      "len": 3098,
+      "modified_unix_nanos": 1772043116636206388,
+      "content_hash": "9a67f52ea1519e2db1aa8c545475a7a6aee5f051067704c1c0ec6e188ab44fd0"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/weak.md",
+      "len": 28,
+      "modified_unix_nanos": 1772043116636311119,
+      "content_hash": "f9ef717c4981ae2a2fc0eadd43b40a659545439fa1a8bc69b1af79fd813f288f"
+    },
+    {
+      "path": "data/sunface_rust-by-practice_en/why-exercise.md",
+      "len": 2080,
+      "modified_unix_nanos": 1772043116636443671,
+      "content_hash": "4ba105760b613f14ca39782d3fc8d623496bd4385bcc3c0f13332bdd11533e45"
+    }
+  ],
+  "rows": 143
+}

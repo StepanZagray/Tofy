@@ -7,15 +7,15 @@ use std::time::UNIX_EPOCH;
 
 use crate::data::{
     build_vocab_from_pair_file, build_vocab_from_raw_world_file_with_mode,
-    encode_line_with_vocab_mode, encode_raw_world_line_with_vocab_mode, TokenizationMode,
-    DEFAULT_MIN_TOKENS_PER_LINE,
+    encode_line_with_vocab_mode, encode_raw_world_line_with_vocab_mode, tokenizer_spec,
+    tokenizer_spec_signature, TokenizationMode, TokenizerSpec, DEFAULT_MIN_TOKENS_PER_LINE,
 };
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
-const CACHE_VERSION: u32 = 1;
-const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V1\n";
-const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V1\n";
+const CACHE_VERSION: u32 = 2;
+const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
+const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
 const PROGRESS_EVERY_LINES: usize = 500_000;
 
@@ -33,6 +33,8 @@ struct VocabManifest {
     kind: String,
     source: SourceFingerprint,
     tokenizer: String,
+    tokenizer_spec: TokenizerSpec,
+    tokenizer_spec_signature: String,
     max_vocab: usize,
     vocab_path: String,
     vocab_signature: String,
@@ -45,6 +47,8 @@ struct TokenManifest {
     kind: String,
     source: SourceFingerprint,
     tokenizer: String,
+    tokenizer_spec: TokenizerSpec,
+    tokenizer_spec_signature: String,
     max_seq: usize,
     vocab_path: String,
     vocab_signature: String,
@@ -283,12 +287,15 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
 }
 
 fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
+    let tokenizer_spec = tokenizer_spec(spec.mode);
+    let tokenizer_spec_sig = tokenizer_spec_signature(spec.mode);
     if !spec.force && spec.vocab_path.exists() && spec.manifest_path.exists() {
         if let Ok(manifest) = load_json::<VocabManifest>(spec.manifest_path) {
             if manifest.version == CACHE_VERSION
                 && manifest.kind == spec.kind
                 && source_matches(&manifest.source, spec.source)
                 && manifest.tokenizer == spec.mode.as_str()
+                && manifest.tokenizer_spec_signature == tokenizer_spec_sig
                 && manifest.max_vocab == spec.max_vocab
                 && manifest.vocab_path == path_string(spec.vocab_path)
             {
@@ -331,6 +338,8 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
             kind: spec.kind.to_string(),
             source: spec.source.clone(),
             tokenizer: spec.mode.as_str().to_string(),
+            tokenizer_spec,
+            tokenizer_spec_signature: tokenizer_spec_sig,
             max_vocab: spec.max_vocab,
             vocab_path: path_string(spec.vocab_path),
             vocab_signature: signature.clone(),
@@ -398,6 +407,8 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             kind: spec.kind.to_string(),
             source: spec.source.clone(),
             tokenizer: spec.mode.as_str().to_string(),
+            tokenizer_spec: tokenizer_spec(spec.mode),
+            tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -464,6 +475,8 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             kind: spec.kind.to_string(),
             source: spec.source.clone(),
             tokenizer: spec.mode.as_str().to_string(),
+            tokenizer_spec: tokenizer_spec(spec.mode),
+            tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -548,6 +561,8 @@ fn ensure_dual_world_token_cache(
             kind: spec.kind.to_string(),
             source: spec.source.clone(),
             tokenizer: spec.mode.as_str().to_string(),
+            tokenizer_spec: tokenizer_spec(spec.mode),
+            tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -570,7 +585,8 @@ fn token_cache_is_valid(spec: &TokenCacheSpec<'_>, vocab_signature: &str) -> boo
         && manifest.kind == spec.kind
         && source_matches(&manifest.source, spec.source)
         && manifest.tokenizer == spec.mode.as_str()
-        && manifest.max_seq == spec.max_seq
+        && manifest.tokenizer_spec_signature == tokenizer_spec_signature(spec.mode)
+        && manifest.max_seq >= spec.max_seq
         && manifest.vocab_signature == vocab_signature
         && manifest.token_cache_path == path_string(spec.token_cache_path)
 }
@@ -605,9 +621,11 @@ fn write_dual_token_record<W: Write>(
 
 fn write_ids<W: Write>(writer: &mut W, ids: &[u32]) -> Result<()> {
     writer.write_all(&(ids.len() as u32).to_le_bytes())?;
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(ids));
     for id in ids {
-        writer.write_all(&id.to_le_bytes())?;
+        bytes.extend_from_slice(&id.to_le_bytes());
     }
+    writer.write_all(&bytes)?;
     Ok(())
 }
 

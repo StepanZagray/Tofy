@@ -1,5 +1,8 @@
-#![allow(clippy::module_inception)]
+pub mod latent;
+pub mod world;
 
-pub mod config;
-
-pub use config::Config;
+pub use latent::{LatentEvalConfig, LatentTrainConfig};
+pub use world::{
+    DecoderTrainConfig, HighWorldTrainConfig, OrchestratorTrainConfig, ServeConfig,
+    WorldEvalConfig, WorldTrainConfig,
+};

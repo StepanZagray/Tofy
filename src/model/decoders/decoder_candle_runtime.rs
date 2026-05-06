@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
+use rand::RngExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -356,8 +357,8 @@ impl CandleCrossAttnDecoder {
                 .unwrap_or(0));
         }
         let distribution = self.sample_distribution(&logits);
-        let mut rng = rand::thread_rng();
-        let r: f32 = rand::Rng::gen(&mut rng);
+        let mut rng = rand::rng();
+        let r: f32 = rng.random();
         let mut cum = 0.0f32;
         let mut chosen = distribution
             .first()
@@ -534,16 +535,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             self.decoder
                 .step_generation(&self.device, &mut state, next_id)?;
         }
-        let text: String = generated
-            .iter()
-            .map(|&id| {
-                self.vocab
-                    .id_to_token
-                    .get(id as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<unk>")
-            })
-            .collect();
+        let text = self.vocab.decode_ids_lossy(&generated);
         Ok(clean_candle_decoder_output(&text))
     }
 

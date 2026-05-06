@@ -1,16 +1,30 @@
 {
-  "version": 1,
+  "version": 2,
   "kind": "world",
   "source": {
     "path": "data/world_mix_pairs.txt",
-    "len": 2277344036,
-    "modified_unix_secs": 1776631035,
-    "content_hash": "3e56eaf987abe4a9"
+    "len": 2286742926,
+    "modified_unix_secs": 1777149497,
+    "content_hash": "5d5a3c250c06ea26"
   },
   "tokenizer": "default",
+  "tokenizer_spec": {
+    "version": 5,
+    "mode": "default",
+    "normalization": "identity_utf8",
+    "pretokenizer": "none",
+    "byte_fallback": false,
+    "reserved_byte_tokens": false,
+    "subword_identifier_fallback": false,
+    "byte_token_format": "none",
+    "byte_native": false,
+    "adaptive_boundaries": false,
+    "boundaryless_bpe": true
+  },
+  "tokenizer_spec_signature": "c52ae76f842076ee",
   "max_seq": 256,
   "vocab_path": "",
-  "vocab_signature": "94b57ea196fd6b14",
+  "vocab_signature": "a8c3fa5439d8cda8",
   "token_cache_path": "data/cache/world.tokens.bin",
-  "rows": 2872387
+  "rows": 2874815
 }

@@ -1,16 +1,30 @@
 {
-  "version": 1,
+  "version": 2,
   "kind": "code_decoder",
   "source": {
     "path": "data/code_poc_mix.txt",
-    "len": 5289692043,
-    "modified_unix_secs": 1776631044,
-    "content_hash": "f27d593df7cb6e6c"
+    "len": 5297673830,
+    "modified_unix_secs": 1777149514,
+    "content_hash": "00ae1114617e5358"
   },
   "tokenizer": "code-aware",
-  "max_seq": 192,
+  "tokenizer_spec": {
+    "version": 5,
+    "mode": "code-aware",
+    "normalization": "identity_utf8",
+    "pretokenizer": "none",
+    "byte_fallback": false,
+    "reserved_byte_tokens": false,
+    "subword_identifier_fallback": false,
+    "byte_token_format": "none",
+    "byte_native": false,
+    "adaptive_boundaries": false,
+    "boundaryless_bpe": true
+  },
+  "tokenizer_spec_signature": "b15880942f080cd1",
+  "max_seq": 128,
   "vocab_path": "",
-  "vocab_signature": "9c9b790488d69b79",
+  "vocab_signature": "7f48701e139aa517",
   "token_cache_path": "data/cache/code_decoder.tokens.bin",
-  "rows": 5896342
+  "rows": 5900369
 }

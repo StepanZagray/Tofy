@@ -8,22 +8,24 @@ default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
-anyhow = "1"
-thiserror = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand = "0.8"
-candle-core = { version = "0.9", default-features = false }
-candle-nn = { version = "0.9", default-features = false }
-candle-datasets = "0.9"
-hf-hub = "0.4"
-parquet = "57"
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+rand = "0.10.1"
+candle-core = { version = "0.10.2", default-features = false }
+candle-nn = { version = "0.10.2", default-features = false }
+hf-hub = "0.5.0"
+parquet = "58.1.0"
 # OpenAI-compatible HTTP server (--serve)
-axum = { version = "0.7", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-tokio-stream = "0.1"
-futures-util = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+axum = { version = "0.8.9", features = ["json"] }
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1.18"
+futures-util = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+regex = "1.12.2"
+sha2 = "0.10.9"
+md5 = "0.8.0"
 # TensorBoard logging (local: writes to runs/, view with tensorboard --logdir runs/)
-tensorboard-rs = "0.5"
+tensorboard-rs = "0.5.9"

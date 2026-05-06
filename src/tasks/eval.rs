@@ -38,6 +38,9 @@ struct CodeEvalTaskResult {
     id: String,
     predicted_action: String,
     expected_action: String,
+    rlm_used: bool,
+    candidate_count: usize,
+    repair_attempts_used: usize,
     route_ok: bool,
     constraints_ok: bool,
     compile_ok: bool,
@@ -54,6 +57,7 @@ struct CodeEvalTaskResult {
 struct CodeEvalSummary {
     task_count: usize,
     route_ok: usize,
+    rlm_used: usize,
     constraints_ok: usize,
     compile_ok: usize,
     tests_ok: usize,
@@ -65,6 +69,7 @@ struct EvalConfig {
     encoder_model_path: PathBuf,
     encoder_vocab_path: PathBuf,
     world_model_path: PathBuf,
+    high_world_model_path: Option<PathBuf>,
     suite_path: PathBuf,
     max_new_tokens: usize,
     dim: usize,
@@ -78,6 +83,20 @@ struct EvalConfig {
     code_decoder_vocab_path: Option<PathBuf>,
     rustc_bin: String,
     rust_timeout_secs: u64,
+    candidates: usize,
+    repair_attempts: usize,
+}
+
+#[derive(Clone)]
+struct CandidateEval {
+    response: String,
+    code: String,
+    route_ok: bool,
+    constraints_ok: bool,
+    compile_ok: bool,
+    tests_ok: bool,
+    detail: String,
+    repair_attempts_used: usize,
 }
 
 fn default_language() -> String {
@@ -105,15 +124,18 @@ impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>]"
+                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>]"
             );
         }
         let mut filtered = Vec::new();
         let mut ablate_conditioning = false;
         let mut code_decoder_path = None;
         let mut code_decoder_vocab_path = None;
+        let mut high_world_model_path = None;
         let mut rustc_bin = "rustc".to_string();
         let mut rust_timeout_secs = DEFAULT_RUST_TIMEOUT_SECS;
+        let mut candidates = 1usize;
+        let mut repair_attempts = 0usize;
         let mut i = 0usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -126,6 +148,13 @@ impl EvalConfig {
                         .get(i + 1)
                         .ok_or_else(|| anyhow::anyhow!("--code-decoder requires path"))?;
                     code_decoder_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--high-world-model" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--high-world-model requires path"))?;
+                    high_world_model_path = Some(PathBuf::from(value));
                     i += 2;
                 }
                 "--code-decoder-vocab" => {
@@ -151,6 +180,24 @@ impl EvalConfig {
                         .map_err(|_| anyhow::anyhow!("--rust-timeout-sec must be integer"))?;
                     i += 2;
                 }
+                "--candidates" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--candidates requires integer"))?;
+                    candidates = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--candidates must be integer"))?;
+                    i += 2;
+                }
+                "--repair-attempts" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--repair-attempts requires integer"))?;
+                    repair_attempts = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--repair-attempts must be integer"))?;
+                    i += 2;
+                }
                 _ => {
                     filtered.push(args[i].clone());
                     i += 1;
@@ -161,6 +208,7 @@ impl EvalConfig {
             encoder_model_path: PathBuf::from(&filtered[0]),
             encoder_vocab_path: PathBuf::from(&filtered[1]),
             world_model_path: PathBuf::from(&filtered[2]),
+            high_world_model_path,
             suite_path: PathBuf::from(&filtered[3]),
             max_new_tokens: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(384),
             dim: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(768),
@@ -174,6 +222,8 @@ impl EvalConfig {
             code_decoder_vocab_path,
             rustc_bin,
             rust_timeout_secs: rust_timeout_secs.max(1),
+            candidates: candidates.max(1),
+            repair_attempts,
         })
     }
 }
@@ -196,6 +246,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         &cfg.encoder_model_path,
         &cfg.encoder_vocab_path,
         &cfg.world_model_path,
+        cfg.high_world_model_path.as_ref(),
         cfg.dim,
         cfg.max_seq,
         cfg.num_layers,
@@ -214,6 +265,23 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     println!("suite: {:?}", cfg.suite_path);
     println!("tasks: {}", tasks.len());
     println!("run dir: {}", run_dir);
+    println!(
+        "high_world: {}",
+        cfg.high_world_model_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                std::env::var("TOFY_HIGH_WORLD_MODEL").unwrap_or_else(|_| "disabled".to_string())
+            })
+    );
+    println!(
+        "hwm_planning: {}",
+        std::env::var("TOFY_HWM_PLANNING").unwrap_or_else(|_| "0".to_string())
+    );
+    println!(
+        "search: candidates={} repair_attempts={}",
+        cfg.candidates, cfg.repair_attempts
+    );
 
     let mut summary = CodeEvalSummary {
         task_count: tasks.len(),
@@ -223,64 +291,40 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     for task in tasks {
         let started = Instant::now();
         let predicted_action = engine.predict_action(&task.prompt)?;
-        let response = engine.generate(
-            &task.prompt,
-            task.max_new_tokens.min(cfg.max_new_tokens),
-            cfg.ablate_conditioning,
-        )?;
-        let code = extract_code_candidate(&response);
+        let rlm_used = engine.uses_recursive_code_generation(&task.prompt, predicted_action);
         let route_ok = predicted_action == parse_expected_action(&task.expected_action)?;
-        let (constraints_ok, constraint_detail) = check_constraints(&code, &task);
-        let (compile_ok, tests_ok, exec_detail) = if task.language.eq_ignore_ascii_case("rust") {
-            match run_rust_harness(
-                &scratch_dir,
-                &cfg.rustc_bin,
-                cfg.rust_timeout_secs,
-                &task,
-                &code,
-            ) {
-                Ok(result) => result,
-                Err(err) => (false, false, format!("harness_error: {err}")),
-            }
-        } else {
-            (
-                false,
-                false,
-                format!("unsupported language {}", task.language),
-            )
-        };
-        let pass = route_ok && constraints_ok && compile_ok && tests_ok;
+        let best = evaluate_best_candidate(&engine, &cfg, &scratch_dir, &task, route_ok)?;
+        let pass = best.route_ok && best.constraints_ok && best.compile_ok && best.tests_ok;
         summary.route_ok += usize::from(route_ok);
-        summary.constraints_ok += usize::from(constraints_ok);
-        summary.compile_ok += usize::from(compile_ok);
-        summary.tests_ok += usize::from(tests_ok);
+        summary.rlm_used += usize::from(rlm_used);
+        summary.constraints_ok += usize::from(best.constraints_ok);
+        summary.compile_ok += usize::from(best.compile_ok);
+        summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
-
-        let detail = if !constraint_detail.is_empty() {
-            constraint_detail
-        } else {
-            exec_detail
-        };
         let result = CodeEvalTaskResult {
             id: task.id,
             predicted_action: action_name(predicted_action).to_string(),
             expected_action: task.expected_action,
-            route_ok,
-            constraints_ok,
-            compile_ok,
-            tests_ok,
+            rlm_used,
+            candidate_count: cfg.candidates,
+            repair_attempts_used: best.repair_attempts_used,
+            route_ok: best.route_ok,
+            constraints_ok: best.constraints_ok,
+            compile_ok: best.compile_ok,
+            tests_ok: best.tests_ok,
             pass,
             duration_ms: started.elapsed().as_millis(),
-            response_preview: preview_text(&response, 240),
-            code_preview: preview_text(&code, 240),
-            detail: preview_text(&detail, 600),
+            response_preview: preview_text(&best.response, 240),
+            code_preview: preview_text(&best.code, 240),
+            detail: preview_text(&best.detail, 600),
             tags: task.tags,
         };
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
         println!(
-            "{} route={} constraints={} compile={} tests={} pass={} {}",
+            "{} route={} rlm={} constraints={} compile={} tests={} pass={} {}",
             result.id,
             result.route_ok,
+            result.rlm_used,
             result.constraints_ok,
             result.compile_ok,
             result.tests_ok,
@@ -294,9 +338,10 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     }
 
     let summary_text = format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
+        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
+        summary.rlm_used as f32 / summary.task_count.max(1) as f32,
         summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
         summary.compile_ok as f32 / summary.task_count.max(1) as f32,
         summary.tests_ok as f32 / summary.task_count.max(1) as f32,
@@ -305,6 +350,126 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     fs::write(run_path.join("summary.txt"), &summary_text)?;
     println!("\n{}", summary_text);
     Ok(())
+}
+
+fn evaluate_best_candidate(
+    engine: &AgentEngine,
+    cfg: &EvalConfig,
+    scratch_dir: &Path,
+    task: &CodeEvalTask,
+    route_ok: bool,
+) -> Result<CandidateEval> {
+    let mut best = None;
+    let max_new_tokens = task.max_new_tokens.min(cfg.max_new_tokens);
+    for _ in 0..cfg.candidates.max(1) {
+        let response = engine.generate(&task.prompt, max_new_tokens, cfg.ablate_conditioning)?;
+        let mut candidate = evaluate_candidate_response(
+            scratch_dir,
+            &cfg.rustc_bin,
+            cfg.rust_timeout_secs,
+            task,
+            route_ok,
+            response,
+            0,
+        )?;
+        best = Some(select_better_candidate(best, candidate.clone()));
+        for repair_idx in 0..cfg.repair_attempts {
+            if candidate.route_ok
+                && candidate.constraints_ok
+                && candidate.compile_ok
+                && candidate.tests_ok
+            {
+                break;
+            }
+            let repair_prompt = build_repair_prompt(task, &candidate.code, &candidate.detail);
+            let repaired_response =
+                engine.generate(&repair_prompt, max_new_tokens, cfg.ablate_conditioning)?;
+            candidate = evaluate_candidate_response(
+                scratch_dir,
+                &cfg.rustc_bin,
+                cfg.rust_timeout_secs,
+                task,
+                route_ok,
+                repaired_response,
+                repair_idx + 1,
+            )?;
+            best = Some(select_better_candidate(best, candidate.clone()));
+        }
+    }
+    best.context("eval produced no candidates")
+}
+
+fn evaluate_candidate_response(
+    scratch_dir: &Path,
+    rustc_bin: &str,
+    timeout_secs: u64,
+    task: &CodeEvalTask,
+    route_ok: bool,
+    response: String,
+    repair_attempts_used: usize,
+) -> Result<CandidateEval> {
+    let code = extract_code_candidate(&response);
+    let (constraints_ok, constraint_detail) = check_constraints(&code, task);
+    let (compile_ok, tests_ok, exec_detail) = if task.language.eq_ignore_ascii_case("rust") {
+        match run_rust_harness(scratch_dir, rustc_bin, timeout_secs, task, &code) {
+            Ok(result) => result,
+            Err(err) => (false, false, format!("harness_error: {err}")),
+        }
+    } else {
+        (
+            false,
+            false,
+            format!("unsupported language {}", task.language),
+        )
+    };
+    let detail = if !constraint_detail.is_empty() {
+        constraint_detail
+    } else {
+        exec_detail
+    };
+    Ok(CandidateEval {
+        response,
+        code,
+        route_ok,
+        constraints_ok,
+        compile_ok,
+        tests_ok,
+        detail,
+        repair_attempts_used,
+    })
+}
+
+fn select_better_candidate(
+    current: Option<CandidateEval>,
+    challenger: CandidateEval,
+) -> CandidateEval {
+    match current {
+        None => challenger,
+        Some(existing) => {
+            if candidate_rank(&challenger) > candidate_rank(&existing) {
+                challenger
+            } else {
+                existing
+            }
+        }
+    }
+}
+
+fn candidate_rank(candidate: &CandidateEval) -> i32 {
+    32 * i32::from(candidate.route_ok)
+        + 16 * i32::from(candidate.constraints_ok)
+        + 8 * i32::from(candidate.compile_ok)
+        + 4 * i32::from(candidate.tests_ok)
+        - candidate.repair_attempts_used as i32
+}
+
+fn build_repair_prompt(task: &CodeEvalTask, previous_code: &str, failure_detail: &str) -> String {
+    format!(
+        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected Rust code.\nFix the previous attempt while preserving the requested function name and signature.\n\n<ctx:original_request>\n{}\n\n<ctx:previous_attempt>\n```rust\n{}\n```\n\n<ctx:failure_feedback>\n{}\n",
+        task.prompt,
+        previous_code,
+        failure_detail
+    )
 }
 
 fn load_suite(path: &Path) -> Result<Vec<CodeEvalTask>> {

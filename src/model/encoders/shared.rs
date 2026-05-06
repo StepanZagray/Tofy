@@ -9,7 +9,7 @@ const DEFAULT_CHUNK_SIZE: usize = 16;
 const DEFAULT_LOCAL_WINDOW: usize = 16;
 const TARGET_NUM_CHUNKS: usize = 16;
 const MAX_LOCAL_WINDOW: usize = 64;
-const NUM_POOL_QUERIES: usize = 3;
+const NUM_POOL_QUERIES: usize = 2;
 const NUM_GLOBAL_TOKENS: usize = 4;
 
 pub struct EncoderFeatures {
@@ -17,34 +17,6 @@ pub struct EncoderFeatures {
     pub chunk_states: Tensor,
     pub global_states: Tensor,
     pub pooled_queries: Tensor,
-}
-
-pub struct PredictedEncoderFeatures {
-    pub token_states: Tensor,
-    pub chunk_states: Tensor,
-    pub global_states: Tensor,
-}
-
-struct PredictorHead {
-    ln: nn::LayerNorm,
-    fc1: nn::Linear,
-    fc2: nn::Linear,
-}
-
-impl PredictorHead {
-    fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
-        Ok(Self {
-            ln: nn::layer_norm(dim, 1e-5, vb.pp("ln"))?,
-            fc1: nn::linear(dim, dim * 4, vb.pp("fc1"))?,
-            fc2: nn::linear(dim * 4, dim, vb.pp("fc2"))?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln.forward(x)?;
-        let hidden = self.fc1.forward(&normed)?.gelu()?;
-        Ok((x + self.fc2.forward(&hidden)?)?)
-    }
 }
 
 impl EncoderFeatures {
@@ -65,11 +37,6 @@ impl EncoderFeatures {
         Ok(self.pooled_queries.narrow(1, 1, 1)?)
     }
 
-    pub fn contrastive_summary(&self) -> Result<Tensor> {
-        Ok(self.pooled_queries.narrow(1, 2, 1)?)
-    }
-
-    #[allow(dead_code)]
     pub fn memory(&self) -> Result<Tensor> {
         let planner = self.planner_summary()?;
         let routing = self.routing_summary()?;
@@ -97,9 +64,6 @@ pub(crate) struct EncoderBackbone {
     chunk_ln_final: nn::LayerNorm,
     global_ln_final: nn::LayerNorm,
     pool: MultiQueryPool,
-    token_predictor: PredictorHead,
-    chunk_predictor: PredictorHead,
-    global_predictor: PredictorHead,
     dim: usize,
     chunk_size: usize,
 }
@@ -144,9 +108,6 @@ impl EncoderBackbone {
         let chunk_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("chunk_ln_final"))?;
         let global_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("global_ln_final"))?;
         let pool = MultiQueryPool::new(vb.pp("pool"), dim, num_heads, NUM_POOL_QUERIES)?;
-        let token_predictor = PredictorHead::new(vb.pp("token_predictor"), dim)?;
-        let chunk_predictor = PredictorHead::new(vb.pp("chunk_predictor"), dim)?;
-        let global_predictor = PredictorHead::new(vb.pp("global_predictor"), dim)?;
         Ok(Self {
             embed,
             local_blocks,
@@ -157,9 +118,6 @@ impl EncoderBackbone {
             chunk_ln_final,
             global_ln_final,
             pool,
-            token_predictor,
-            chunk_predictor,
-            global_predictor,
             dim,
             chunk_size: DEFAULT_CHUNK_SIZE,
         })
@@ -235,27 +193,5 @@ impl EncoderBackbone {
             global_states,
             pooled_queries,
         })
-    }
-
-    pub(crate) fn predict_features(
-        &self,
-        features: &EncoderFeatures,
-    ) -> Result<PredictedEncoderFeatures> {
-        Ok(PredictedEncoderFeatures {
-            token_states: self.token_predictor.forward(&features.token_states)?,
-            chunk_states: self.chunk_predictor.forward(&features.chunk_states)?,
-            global_states: self.global_predictor.forward(&features.global_states)?,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn forward_sequence(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.forward_features(x)?.token_states)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let features = self.forward_features(x)?;
-        Ok(features.contrastive_summary()?.squeeze(1)?)
     }
 }

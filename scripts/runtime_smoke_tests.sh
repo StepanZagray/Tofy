@@ -22,14 +22,6 @@ have_cuda() {
 }
 
 maybe_export_cuda_compat() {
-  if ! command -v nvcc >/dev/null 2>&1; then
-    return 0
-  fi
-  local nvcc_release
-  nvcc_release="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
-  if [[ -n "${nvcc_release}" ]] && [[ "${nvcc_release}" == "13.2" || "${nvcc_release}" == 13.[3-9]* || "${nvcc_release}" == 1[4-9].* ]]; then
-    export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-13010}"
-  fi
   if [[ -z "${CUDA_COMPUTE_CAP:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
     local compute_cap
     compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d '.[:space:]')"
@@ -108,8 +100,8 @@ head -n "${EVAL_ROWS}" "${EVAL_SUITE}" > "${EVAL_SMOKE_SUITE}"
 echo "Runtime smoke dir: ${SMOKE_DIR}"
 echo "Run id: ${RUN_ID}"
 echo "Train dtype: ${TOFY_TRAIN_DTYPE}"
-if [[ -n "${CUDARC_CUDA_VERSION:-}" || -n "${CUDA_COMPUTE_CAP:-}" ]]; then
-  echo "CUDA build env: CUDARC_CUDA_VERSION=${CUDARC_CUDA_VERSION:-unset} CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-unset}"
+if [[ -n "${CUDA_COMPUTE_CAP:-}" ]]; then
+  echo "CUDA build env: CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-unset}"
 fi
 
 run_stage latent \

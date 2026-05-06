@@ -1,12 +1,17 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use candle_core::{Device, Tensor};
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-use rand::Rng;
+use rand::rng;
+use rand::seq::IndexedRandom;
+use rand::RngExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::thread;
+use std::time::Instant;
 
 use crate::model::vocab::{Pair, Vocab};
 
@@ -16,6 +21,21 @@ pub enum TokenizationMode {
     CodeAware,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenizerSpec {
+    pub version: u32,
+    pub mode: String,
+    pub normalization: String,
+    pub pretokenizer: String,
+    pub byte_fallback: bool,
+    pub reserved_byte_tokens: bool,
+    pub subword_identifier_fallback: bool,
+    pub byte_token_format: String,
+    pub byte_native: bool,
+    pub adaptive_boundaries: bool,
+    pub boundaryless_bpe: bool,
+}
+
 impl TokenizationMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -23,6 +43,35 @@ impl TokenizationMode {
             Self::CodeAware => "code-aware",
         }
     }
+}
+
+const TOKENIZER_SPEC_VERSION: u32 = 5;
+
+pub fn tokenizer_spec(mode: TokenizationMode) -> TokenizerSpec {
+    TokenizerSpec {
+        version: TOKENIZER_SPEC_VERSION,
+        mode: mode.as_str().to_string(),
+        normalization: "identity_utf8".to_string(),
+        pretokenizer: "none".to_string(),
+        byte_fallback: false,
+        reserved_byte_tokens: false,
+        subword_identifier_fallback: false,
+        byte_token_format: "none".to_string(),
+        byte_native: false,
+        adaptive_boundaries: false,
+        boundaryless_bpe: true,
+    }
+}
+
+pub fn tokenizer_spec_signature(mode: TokenizationMode) -> String {
+    let text =
+        serde_json::to_string(&tokenizer_spec(mode)).unwrap_or_else(|_| mode.as_str().into());
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn unescape_pair_field(text: &str) -> String {
@@ -48,257 +97,13 @@ fn unescape_pair_field(text: &str) -> String {
     out
 }
 
-fn is_control_token_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-' | '+' | '.')
-}
-
-fn try_read_control_token(chars: &[char], start: usize) -> Option<(String, usize)> {
-    if chars.get(start).copied() != Some('<') {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < chars.len() && chars[end] != '>' && is_control_token_char(chars[end]) {
-        end += 1;
-    }
-    if end < chars.len() && chars[end] == '>' && end > start + 1 {
-        let token: String = chars[start..=end].iter().collect();
-        return Some((token, end + 1));
-    }
-    None
-}
-
 fn tokenize_text(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut buf = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if let Some((token, next_i)) = try_read_control_token(&chars, i) {
-            if !buf.is_empty() {
-                tokens.push(buf.clone());
-                buf.clear();
-            }
-            tokens.push(token);
-            i = next_i;
-            continue;
-        }
-        let ch = chars[i];
-        if ch.is_ascii_alphanumeric() || (ch as u32) == 39 {
-            buf.push(ch);
-        } else if ch.is_whitespace() {
-            if !buf.is_empty() {
-                tokens.push(buf.clone());
-                buf.clear();
-            }
-        } else {
-            if !buf.is_empty() {
-                tokens.push(buf.clone());
-                buf.clear();
-            }
-            tokens.push(ch.to_string());
-        }
-        i += 1;
-    }
-    if !buf.is_empty() {
-        tokens.push(buf);
-    }
-    tokens
-}
-
-fn push_code_identifier_tokens(tokens: &mut Vec<String>, ident: &mut String) {
-    if ident.is_empty() {
-        return;
-    }
-    let chars: Vec<char> = ident.chars().collect();
-    let mut piece = String::new();
-    for (idx, ch) in chars.iter().copied().enumerate() {
-        let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
-        let next = chars.get(idx + 1).copied();
-        let boundary = if piece.is_empty() {
-            false
-        } else if ch.is_ascii_uppercase() {
-            matches!(prev, Some(p) if p.is_ascii_lowercase() || p.is_ascii_digit())
-                || matches!(
-                    (prev, next),
-                    (Some(p), Some(n)) if p.is_ascii_uppercase() && n.is_ascii_lowercase()
-                )
-        } else if ch.is_ascii_digit() {
-            matches!(prev, Some(p) if p.is_ascii_alphabetic())
-        } else if ch.is_ascii_lowercase() {
-            matches!(prev, Some(p) if p.is_ascii_digit())
-        } else {
-            false
-        };
-        if boundary {
-            tokens.push(piece.clone());
-            piece.clear();
-        }
-        piece.push(ch);
-    }
-    if !piece.is_empty() {
-        tokens.push(piece);
-    }
-    ident.clear();
-}
-
-fn push_indent_token(tokens: &mut Vec<String>, indent_cols: usize, saw_tab: bool) {
-    if indent_cols == 0 && !saw_tab {
-        return;
-    }
-    if saw_tab {
-        tokens.push("<indent_tab>".to_string());
-    }
-    if indent_cols > 0 {
-        let bucket = indent_cols.min(16);
-        tokens.push(format!("<indent_{bucket}>"));
-    }
-}
-
-fn is_lifetime_marker(chars: &[char], idx: usize) -> bool {
-    chars.get(idx) == Some(&'\'')
-        && chars
-            .get(idx + 1)
-            .copied()
-            .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
-            .unwrap_or(false)
-        && chars.get(idx + 2) != Some(&'\'')
-}
-
-fn tokenize_code_text(text: &str) -> Vec<String> {
-    const THREE_CHAR_TOKENS: [&str; 8] = ["<<<", ">>>", "<<=", ">>=", "...", "===", "!==", "**="];
-    const TWO_CHAR_TOKENS: [&str; 23] = [
-        "->", "=>", "::", "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=",
-        "%=", "&=", "|=", "^=", "<<", ">>", "**", "//",
-    ];
-
-    let mut tokens = Vec::new();
-    let mut ident = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if let Some((token, next_i)) = try_read_control_token(&chars, i) {
-            push_code_identifier_tokens(&mut tokens, &mut ident);
-            tokens.push(token);
-            i = next_i;
-            continue;
-        }
-        if is_lifetime_marker(&chars, i) {
-            push_code_identifier_tokens(&mut tokens, &mut ident);
-            tokens.push("'".to_string());
-            i += 1;
-            continue;
-        }
-        let ch = chars[i];
-        if ch == '"' || ch == '\'' || ch == '`' {
-            push_code_identifier_tokens(&mut tokens, &mut ident);
-            let quote = ch;
-            i += 1;
-            let mut escaped = false;
-            let mut inner_len = 0usize;
-            while i < chars.len() {
-                let cur = chars[i];
-                i += 1;
-                if escaped {
-                    escaped = false;
-                    inner_len += 1;
-                    continue;
-                }
-                if cur == '\\' {
-                    escaped = true;
-                    continue;
-                }
-                if cur == quote {
-                    break;
-                }
-                if cur == '\n' {
-                    break;
-                }
-                inner_len += 1;
-            }
-            if quote == '\'' && inner_len <= 4 {
-                tokens.push("<char_lit>".to_string());
-            } else {
-                tokens.push("<str_lit>".to_string());
-            }
-            continue;
-        }
-        if ch.is_ascii_digit() && ident.is_empty() {
-            push_code_identifier_tokens(&mut tokens, &mut ident);
-            i += 1;
-            while i < chars.len()
-                && (chars[i].is_ascii_hexdigit()
-                    || matches!(chars[i], '_' | '.' | 'x' | 'X' | 'o' | 'O' | 'b' | 'B'))
-            {
-                i += 1;
-            }
-            tokens.push("<num_lit>".to_string());
-            continue;
-        }
-        if ch.is_ascii_alphanumeric() {
-            ident.push(ch);
-            i += 1;
-            continue;
-        }
-        push_code_identifier_tokens(&mut tokens, &mut ident);
-        if ch == '\n' {
-            tokens.push("<nl>".to_string());
-            i += 1;
-            let mut indent_cols = 0usize;
-            let mut saw_tab = false;
-            while i < chars.len() {
-                match chars[i] {
-                    ' ' => {
-                        indent_cols += 1;
-                        i += 1;
-                    }
-                    '\t' => {
-                        indent_cols += 4;
-                        saw_tab = true;
-                        i += 1;
-                    }
-                    '\n' => {
-                        tokens.push("<nl>".to_string());
-                        i += 1;
-                        indent_cols = 0;
-                        saw_tab = false;
-                    }
-                    _ => break,
-                }
-            }
-            push_indent_token(&mut tokens, indent_cols, saw_tab);
-            continue;
-        }
-        if ch.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if i + 2 < chars.len() {
-            let three = format!("{}{}{}", chars[i], chars[i + 1], chars[i + 2]);
-            if THREE_CHAR_TOKENS.contains(&three.as_str()) {
-                tokens.push(three);
-                i += 3;
-                continue;
-            }
-        }
-        if i + 1 < chars.len() {
-            let two = format!("{}{}", chars[i], chars[i + 1]);
-            if TWO_CHAR_TOKENS.contains(&two.as_str()) {
-                tokens.push(two);
-                i += 2;
-                continue;
-            }
-        }
-        tokens.push(ch.to_string());
-        i += 1;
-    }
-    push_code_identifier_tokens(&mut tokens, &mut ident);
-    tokens
+    text.chars().map(|ch| ch.to_string()).collect()
 }
 
 fn tokenize_with_mode(text: &str, mode: TokenizationMode) -> Vec<String> {
     match mode {
-        TokenizationMode::Default => tokenize_text(text),
-        TokenizationMode::CodeAware => tokenize_code_text(text),
+        TokenizationMode::Default | TokenizationMode::CodeAware => tokenize_text(text),
     }
 }
 
@@ -339,8 +144,26 @@ pub fn encode_line_with_vocab_mode(
     mode: TokenizationMode,
     min_tokens: usize,
 ) -> Option<Vec<u32>> {
-    let tokens = split_line_with_min_tokens_mode(line, min_tokens, mode)?;
-    Some(encode_tokens_with_vocab(&tokens, vocab, mode))
+    let text = extract_text_side_for_vocab(line)?;
+    let token_count = tokenize_with_mode(&text, mode).len();
+    if token_count < min_tokens {
+        return None;
+    }
+    Some(vocab.encode_boundless(&text))
+}
+
+fn extract_text_side_for_vocab(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if let Some((left, _right)) = line.split_once('\t') {
+        return Some(unescape_pair_field(left.trim()));
+    }
+    if let Some((left, _right)) = line.split_once("|||") {
+        return Some(unescape_pair_field(left.trim()));
+    }
+    Some(line.to_string())
 }
 
 pub struct VocabStats {
@@ -358,9 +181,10 @@ pub const DONE_SENTINEL: &str = "<done>";
 
 fn parse_action_label_str(value: &str) -> Option<u32> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "0" | "text" | "text_reply" => Some(ACTION_TEXT_REPLY),
-        "1" | "code" => Some(ACTION_CODE),
-        "2" | "done" => Some(ACTION_DONE),
+        "0" | "text" | "text_reply" | "explain" | "summarize" => Some(ACTION_TEXT_REPLY),
+        "1" | "code" | "inspect_file" | "read_file" | "edit_file" | "apply_patch" | "run_tests"
+        | "read_error" | "repair_patch" | "compiler_feedback" => Some(ACTION_CODE),
+        "2" | "done" | "final" | "finalize" | "stop" => Some(ACTION_DONE),
         _ => None,
     }
 }
@@ -404,10 +228,8 @@ pub fn action_label_heuristic(next_turn: &str) -> u32 {
     if s.eq_ignore_ascii_case(DONE_SENTINEL) {
         return ACTION_DONE;
     }
-    if let Some((explicit, stripped)) = explicit_action_from_next_text(s) {
-        if explicit == ACTION_DONE || stripped.is_empty() {
-            return explicit;
-        }
+    if let Some((explicit, _stripped)) = explicit_action_from_next_text(s) {
+        return explicit;
     }
     if s.contains("```") {
         return ACTION_CODE; // code block
@@ -568,9 +390,100 @@ pub fn encode_raw_world_line_with_vocab_mode(
 /// Minimum number of tokens per line to include (2 = skip single-token lines; 1 = paragraph mode).
 pub const DEFAULT_MIN_TOKENS_PER_LINE: usize = 2;
 pub const DEFAULT_STREAM_SHUFFLE_BUFFER: usize = 1024;
-const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V1\n";
-const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V1\n";
+const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
+const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
+const DEFAULT_TOKEN_CACHE_READER_MB: usize = 8;
+const DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 2;
+const MAX_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 16;
+const DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS: usize = 500_000;
+const DEFAULT_BPE_PROGRESS_EVERY_MERGES: usize = 250;
 type TokenCacheRecord = (Vec<u32>, Vec<u32>, u32);
+type PrefetchRx<T> = Receiver<Result<Vec<T>>>;
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VocabSampleBudget {
+    max_rows: Option<usize>,
+    max_text_bytes: Option<usize>,
+}
+
+impl VocabSampleBudget {
+    fn describe(self) -> String {
+        let rows = self
+            .max_rows
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unlimited".to_string());
+        let bytes = self
+            .max_text_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unlimited".to_string());
+        format!("rows={rows}, text_bytes={bytes}")
+    }
+}
+
+fn code_vocab_sample_budget() -> VocabSampleBudget {
+    VocabSampleBudget {
+        max_rows: env_usize("TOFY_CODE_VOCAB_SAMPLE_ROWS").filter(|&value| value > 0),
+        max_text_bytes: env_usize("TOFY_CODE_VOCAB_SAMPLE_BYTES").filter(|&value| value > 0),
+    }
+}
+
+fn bpe_progress_every_merges() -> usize {
+    env_usize("TOFY_BPE_PROGRESS_EVERY_MERGES")
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_BPE_PROGRESS_EVERY_MERGES)
+}
+
+fn token_cache_reader_capacity() -> usize {
+    let mb = env_usize("TOFY_TOKEN_CACHE_READER_MB")
+        .unwrap_or(DEFAULT_TOKEN_CACHE_READER_MB)
+        .clamp(1, 256);
+    mb * 1024 * 1024
+}
+
+fn token_cache_prefetch_chunks() -> usize {
+    env_usize("TOFY_CACHE_PREFETCH_BATCHES")
+        .unwrap_or(DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS)
+        .min(MAX_TOKEN_CACHE_PREFETCH_CHUNKS)
+}
+
+fn token_cache_prefetch_chunk_size(batch_size: usize) -> usize {
+    env_usize("TOFY_CACHE_PREFETCH_CHUNK")
+        .filter(|&value| value > 0)
+        .unwrap_or(batch_size.max(1))
+}
+
+fn token_cache_reader(path: &PathBuf) -> Result<BufReader<File>> {
+    Ok(BufReader::with_capacity(
+        token_cache_reader_capacity(),
+        File::open(path)?,
+    ))
+}
+
+fn recv_prefetched_batch<T>(
+    rx: &PrefetchRx<T>,
+    stash: &mut VecDeque<T>,
+    batch_size: usize,
+    label: &str,
+) -> Result<Vec<T>> {
+    let mut batch = Vec::with_capacity(batch_size);
+    while batch.len() < batch_size {
+        if let Some(item) = stash.pop_front() {
+            batch.push(item);
+            continue;
+        }
+        let chunk = rx
+            .recv()
+            .map_err(|_| anyhow!("{label} token-cache prefetch worker stopped"))??;
+        stash.extend(chunk);
+    }
+    Ok(batch)
+}
 
 pub struct PairStream {
     path: PathBuf,
@@ -630,7 +543,7 @@ impl PairStream {
             return self.read_next_tokens();
         }
         self.refill_shuffle_buffer()?;
-        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        let idx = rng().random_range(0..self.shuffle_buffer.len());
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
@@ -648,6 +561,8 @@ pub struct CachedPairStream {
     reader: BufReader<File>,
     shuffle_buffer_size: usize,
     shuffle_buffer: Vec<Pair>,
+    prefetch_rx: Option<PrefetchRx<Pair>>,
+    prefetch_stash: VecDeque<Pair>,
 }
 
 impl CachedPairStream {
@@ -658,9 +573,11 @@ impl CachedPairStream {
     pub fn with_shuffle(path: &PathBuf, shuffle_buffer_size: usize) -> Result<Self> {
         let mut stream = Self {
             path: path.clone(),
-            reader: BufReader::new(File::open(path)?),
+            reader: token_cache_reader(path)?,
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
+            prefetch_rx: None,
+            prefetch_stash: VecDeque::new(),
         };
         stream.read_magic()?;
         Ok(stream)
@@ -676,7 +593,7 @@ impl CachedPairStream {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.reader = BufReader::new(File::open(&self.path)?);
+        self.reader = token_cache_reader(&self.path)?;
         self.read_magic()
     }
 
@@ -705,16 +622,64 @@ impl CachedPairStream {
             return self.read_next_pair();
         }
         self.refill_shuffle_buffer()?;
-        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        let idx = rng().random_range(0..self.shuffle_buffer.len());
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
-    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<Pair>> {
+    fn next_batch_direct(&mut self, batch_size: usize) -> Result<Vec<Pair>> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             batch.push(self.next_pair()?);
         }
         Ok(batch)
+    }
+
+    fn start_prefetch(&mut self, batch_size: usize) -> Result<()> {
+        if self.prefetch_rx.is_some() {
+            return Ok(());
+        }
+        let prefetch_chunks = token_cache_prefetch_chunks();
+        if prefetch_chunks == 0 {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let shuffle_buffer_size = self.shuffle_buffer_size;
+        let chunk_size = token_cache_prefetch_chunk_size(batch_size);
+        let (tx, rx) = sync_channel(prefetch_chunks);
+        thread::Builder::new()
+            .name("tofy-cache-prefetch-pair".to_string())
+            .spawn(move || {
+                let mut stream = match CachedPairStream::with_shuffle(&path, shuffle_buffer_size) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        return;
+                    }
+                };
+                loop {
+                    let result = stream.next_batch_direct(chunk_size);
+                    let should_continue = result.is_ok();
+                    if tx.send(result).is_err() || !should_continue {
+                        break;
+                    }
+                }
+            })?;
+        println!(
+            "Token cache prefetch: encoder chunks={} chunk_size={} reader_mb={}",
+            prefetch_chunks,
+            chunk_size,
+            token_cache_reader_capacity() / (1024 * 1024)
+        );
+        self.prefetch_rx = Some(rx);
+        Ok(())
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<Pair>> {
+        self.start_prefetch(batch_size)?;
+        if let Some(rx) = &self.prefetch_rx {
+            return recv_prefetched_batch(rx, &mut self.prefetch_stash, batch_size, "encoder");
+        }
+        self.next_batch_direct(batch_size)
     }
 }
 
@@ -739,6 +704,8 @@ pub struct CachedWorldStream {
     split_remainder: usize,
     exclude_split_matches: bool,
     row_index: usize,
+    prefetch_rx: Option<PrefetchRx<WorldExample>>,
+    prefetch_stash: VecDeque<WorldExample>,
 }
 
 #[derive(Clone)]
@@ -756,6 +723,8 @@ pub struct CachedDecoderStream {
     split_remainder: usize,
     exclude_split_matches: bool,
     row_index: usize,
+    prefetch_rx: Option<PrefetchRx<CachedDecoderExample>>,
+    prefetch_stash: VecDeque<CachedDecoderExample>,
 }
 
 impl CachedWorldStream {
@@ -768,13 +737,15 @@ impl CachedWorldStream {
     ) -> Result<Self> {
         let mut stream = Self {
             path: path.clone(),
-            reader: BufReader::new(File::open(path)?),
+            reader: token_cache_reader(path)?,
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
             split_modulus,
             split_remainder,
             exclude_split_matches,
             row_index: 0,
+            prefetch_rx: None,
+            prefetch_stash: VecDeque::new(),
         };
         stream.read_magic()?;
         Ok(stream)
@@ -790,7 +761,7 @@ impl CachedWorldStream {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.reader = BufReader::new(File::open(&self.path)?);
+        self.reader = token_cache_reader(&self.path)?;
         self.row_index = 0;
         self.read_magic()
     }
@@ -840,16 +811,73 @@ impl CachedWorldStream {
             return self.read_next_example();
         }
         self.refill_shuffle_buffer()?;
-        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        let idx = rng().random_range(0..self.shuffle_buffer.len());
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
-    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<WorldExample>> {
+    fn next_batch_direct(&mut self, batch_size: usize) -> Result<Vec<WorldExample>> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             batch.push(self.next_example()?);
         }
         Ok(batch)
+    }
+
+    fn start_prefetch(&mut self, batch_size: usize) -> Result<()> {
+        if self.prefetch_rx.is_some() {
+            return Ok(());
+        }
+        let prefetch_chunks = token_cache_prefetch_chunks();
+        if prefetch_chunks == 0 {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let shuffle_buffer_size = self.shuffle_buffer_size;
+        let split_modulus = self.split_modulus;
+        let split_remainder = self.split_remainder;
+        let exclude_split_matches = self.exclude_split_matches;
+        let chunk_size = token_cache_prefetch_chunk_size(batch_size);
+        let (tx, rx) = sync_channel(prefetch_chunks);
+        thread::Builder::new()
+            .name("tofy-cache-prefetch-world".to_string())
+            .spawn(move || {
+                let mut stream = match CachedWorldStream::with_split(
+                    &path,
+                    shuffle_buffer_size,
+                    split_modulus,
+                    split_remainder,
+                    exclude_split_matches,
+                ) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        return;
+                    }
+                };
+                loop {
+                    let result = stream.next_batch_direct(chunk_size);
+                    let should_continue = result.is_ok();
+                    if tx.send(result).is_err() || !should_continue {
+                        break;
+                    }
+                }
+            })?;
+        println!(
+            "Token cache prefetch: world chunks={} chunk_size={} reader_mb={}",
+            prefetch_chunks,
+            chunk_size,
+            token_cache_reader_capacity() / (1024 * 1024)
+        );
+        self.prefetch_rx = Some(rx);
+        Ok(())
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<WorldExample>> {
+        self.start_prefetch(batch_size)?;
+        if let Some(rx) = &self.prefetch_rx {
+            return recv_prefetched_batch(rx, &mut self.prefetch_stash, batch_size, "world");
+        }
+        self.next_batch_direct(batch_size)
     }
 }
 
@@ -863,13 +891,15 @@ impl CachedDecoderStream {
     ) -> Result<Self> {
         let mut stream = Self {
             path: path.clone(),
-            reader: BufReader::new(File::open(path)?),
+            reader: token_cache_reader(path)?,
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
             split_modulus,
             split_remainder,
             exclude_split_matches,
             row_index: 0,
+            prefetch_rx: None,
+            prefetch_stash: VecDeque::new(),
         };
         stream.read_magic()?;
         Ok(stream)
@@ -885,7 +915,7 @@ impl CachedDecoderStream {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.reader = BufReader::new(File::open(&self.path)?);
+        self.reader = token_cache_reader(&self.path)?;
         self.row_index = 0;
         self.read_magic()
     }
@@ -946,16 +976,73 @@ impl CachedDecoderStream {
             return self.read_next_example();
         }
         self.refill_shuffle_buffer()?;
-        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        let idx = rng().random_range(0..self.shuffle_buffer.len());
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
-    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
+    fn next_batch_direct(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             batch.push(self.next_example()?);
         }
         Ok(batch)
+    }
+
+    fn start_prefetch(&mut self, batch_size: usize) -> Result<()> {
+        if self.prefetch_rx.is_some() {
+            return Ok(());
+        }
+        let prefetch_chunks = token_cache_prefetch_chunks();
+        if prefetch_chunks == 0 {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let shuffle_buffer_size = self.shuffle_buffer_size;
+        let split_modulus = self.split_modulus;
+        let split_remainder = self.split_remainder;
+        let exclude_split_matches = self.exclude_split_matches;
+        let chunk_size = token_cache_prefetch_chunk_size(batch_size);
+        let (tx, rx) = sync_channel(prefetch_chunks);
+        thread::Builder::new()
+            .name("tofy-cache-prefetch-decoder".to_string())
+            .spawn(move || {
+                let mut stream = match CachedDecoderStream::with_split(
+                    &path,
+                    shuffle_buffer_size,
+                    split_modulus,
+                    split_remainder,
+                    exclude_split_matches,
+                ) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        return;
+                    }
+                };
+                loop {
+                    let result = stream.next_batch_direct(chunk_size);
+                    let should_continue = result.is_ok();
+                    if tx.send(result).is_err() || !should_continue {
+                        break;
+                    }
+                }
+            })?;
+        println!(
+            "Token cache prefetch: decoder chunks={} chunk_size={} reader_mb={}",
+            prefetch_chunks,
+            chunk_size,
+            token_cache_reader_capacity() / (1024 * 1024)
+        );
+        self.prefetch_rx = Some(rx);
+        Ok(())
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
+        self.start_prefetch(batch_size)?;
+        if let Some(rx) = &self.prefetch_rx {
+            return recv_prefetched_batch(rx, &mut self.prefetch_stash, batch_size, "decoder");
+        }
+        self.next_batch_direct(batch_size)
     }
 }
 
@@ -980,12 +1067,23 @@ fn read_ids<R: Read>(reader: &mut R) -> Result<Option<Vec<u32>>> {
         return Ok(None);
     };
     let len = len as usize;
-    let mut ids = Vec::with_capacity(len);
-    for _ in 0..len {
-        let Some(id) = read_u32_le(reader)? else {
-            bail!("truncated token cache id sequence");
-        };
-        ids.push(id);
+    if len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let byte_len = len
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| anyhow!("token cache id sequence too large: {len} ids"))?;
+    let mut ids = vec![0u32; len];
+    // The cache stores raw little-endian u32 ids; read directly into the output
+    // allocation to avoid a temporary Vec<u8> for every sequence.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr().cast::<u8>(), byte_len) };
+    if let Err(err) = reader.read_exact(bytes) {
+        bail!("truncated token cache id sequence: {err}");
+    }
+    if cfg!(target_endian = "big") {
+        for id in &mut ids {
+            *id = u32::from_le(*id);
+        }
     }
     Ok(Some(ids))
 }
@@ -1148,7 +1246,7 @@ impl RawWorldStream {
             return self.read_next_example();
         }
         self.refill_shuffle_buffer()?;
-        let idx = thread_rng().gen_range(0..self.shuffle_buffer.len());
+        let idx = rng().random_range(0..self.shuffle_buffer.len());
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
@@ -1166,19 +1264,18 @@ pub fn build_vocab_from_pair_file(
     max_vocab: usize,
     min_tokens_per_line: Option<usize>,
 ) -> Result<(Vocab, VocabStats, usize)> {
-    use std::collections::HashMap;
     const PROGRESS_EVERY_LINES: usize = 500_000;
 
     let min_tok = min_tokens_per_line.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE);
-    let mut counts: HashMap<String, usize> = HashMap::new();
     let mut pair_count = 0usize;
     let mut raw_line_count = 0usize;
+    let mut texts = Vec::new();
     let reader = BufReader::new(File::open(path)?);
 
     for line in reader.lines() {
         let line = line?;
         raw_line_count += 1;
-        let Some(tokens) = split_line_with_min_tokens(&line, min_tok) else {
+        let Some(_tokens) = split_line_with_min_tokens(&line, min_tok) else {
             if raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
                 println!(
                     "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
@@ -1187,8 +1284,8 @@ pub fn build_vocab_from_pair_file(
             }
             continue;
         };
-        for token in &tokens {
-            *counts.entry(token.clone()).or_insert(0) += 1;
+        if let Some(text) = extract_text_side_for_vocab(&line) {
+            texts.push(text);
         }
         pair_count += 1;
         if raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
@@ -1203,29 +1300,12 @@ pub fn build_vocab_from_pair_file(
         bail!("no usable lines found in {:?}", path);
     }
 
-    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let vocab_size = max_vocab.saturating_sub(3).min(sorted.len());
-    let top_tokens: Vec<String> = sorted
-        .iter()
-        .take(vocab_size)
-        .map(|(t, _)| t.clone())
-        .collect();
-
-    let mut vocab = Vocab::new();
-    for token in &top_tokens {
-        vocab.add_token(token);
-    }
-
-    let total_tokens: usize = sorted.iter().map(|(_, c)| *c).sum();
-    let covered_tokens: usize = sorted.iter().take(vocab_size).map(|(_, c)| *c).sum();
-    let oov_tokens = total_tokens.saturating_sub(covered_tokens);
-    let unique_tokens = sorted.len();
+    let (vocab, total_tokens) = train_boundless_bpe_from_texts(&texts, max_vocab)?;
     let stats = VocabStats {
         total_tokens,
-        covered_tokens,
-        oov_tokens,
-        unique_tokens,
+        covered_tokens: total_tokens,
+        oov_tokens: 0,
+        unique_tokens: vocab.id_to_token.len(),
         vocab_size: vocab.id_to_token.len(),
     };
 
@@ -1386,7 +1466,7 @@ fn crop_tokens_for_curriculum(
     if tokens.len() <= active_seq {
         return tokens.to_vec();
     }
-    let start = rng.gen_range(0..=tokens.len() - active_seq);
+    let start = rng.random_range(0..=tokens.len() - active_seq);
     tokens[start..start + active_seq].to_vec()
 }
 
@@ -1407,7 +1487,7 @@ fn sample_even_history_tokens(
     for idx in 0..budget {
         let base = (idx as f64 * stride).floor() as usize;
         let jitter_offset = if jitter > 0.0 {
-            rng.gen_range(0.0..=jitter).floor() as usize
+            rng.random_range(0.0..=jitter).floor() as usize
         } else {
             0
         };
@@ -1469,7 +1549,7 @@ fn crop_ids_for_curriculum(
     if ids.len() <= active_seq {
         return ids.to_vec();
     }
-    let start = rng.gen_range(0..=ids.len() - active_seq);
+    let start = rng.random_range(0..=ids.len() - active_seq);
     ids[start..start + active_seq].to_vec()
 }
 
@@ -1490,7 +1570,7 @@ fn sample_even_history_ids(
     for idx in 0..budget {
         let base = (idx as f64 * stride).floor() as usize;
         let jitter_offset = if jitter > 0.0 {
-            rng.gen_range(0.0..=jitter).floor() as usize
+            rng.random_range(0.0..=jitter).floor() as usize
         } else {
             0
         };
@@ -1594,9 +1674,9 @@ fn build_masked_view(
     let target_masked = if min_masked >= max_masked {
         max_masked
     } else {
-        rng.gen_range(min_masked..=max_masked)
+        rng.random_range(min_masked..=max_masked)
     };
-    let span_count = rng.gen_range(1..=cfg.max_spans_per_sample.max(1));
+    let span_count = rng.random_range(1..=cfg.max_spans_per_sample.max(1));
     let mut span_len_cap = cfg.max_span_len.max(1);
     if code_like {
         span_len_cap = ((span_len_cap as f64) * cfg.code_span_multiplier).round() as usize;
@@ -1609,15 +1689,15 @@ fn build_masked_view(
         }
         let use_identifier_focus = code_like
             && !identifier_positions.is_empty()
-            && (span_idx == 0 || rng.gen_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
-        let use_comment_focus =
-            !comment_positions.is_empty() && rng.gen_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
+            && (span_idx == 0 || rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
+        let use_comment_focus = !comment_positions.is_empty()
+            && rng.random_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
         let use_block_focus = code_like
             && !block_positions.is_empty()
-            && rng.gen_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
+            && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
         let use_text_boundary_focus = !code_like
             && !text_boundary_positions.is_empty()
-            && rng.gen_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
+            && rng.random_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
         let start_pool = if use_comment_focus {
             &comment_positions
         } else if use_block_focus {
@@ -1633,15 +1713,15 @@ fn build_masked_view(
             continue;
         };
         let span_len = if use_comment_focus {
-            rng.gen_range(2..=span_len_cap.clamp(2, 12))
+            rng.random_range(2..=span_len_cap.clamp(2, 12))
         } else if use_block_focus {
-            rng.gen_range(2..=span_len_cap.clamp(2, 10))
+            rng.random_range(2..=span_len_cap.clamp(2, 10))
         } else if use_text_boundary_focus {
-            rng.gen_range(3..=span_len_cap.clamp(3, 12))
+            rng.random_range(3..=span_len_cap.clamp(3, 12))
         } else if use_identifier_focus {
-            rng.gen_range(1..=span_len_cap.min(4))
+            rng.random_range(1..=span_len_cap.min(4))
         } else {
-            rng.gen_range(1..=span_len_cap)
+            rng.random_range(1..=span_len_cap)
         };
         for p in start..(start + span_len).min(valid_len) {
             if selected.len() >= target_masked {
@@ -1655,8 +1735,9 @@ fn build_masked_view(
         let Some(&start) = valid_positions.choose(rng) else {
             break;
         };
-        let span_len = rng
-            .gen_range(1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)));
+        let span_len = rng.random_range(
+            1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)),
+        );
         for p in start..(start + span_len).min(valid_len) {
             if selected.len() >= target_masked {
                 break;
@@ -1722,7 +1803,7 @@ fn build_masked_view_from_ids(
     let min_ratio = (cfg.min_masked_ratio * ratio_scale).clamp(0.01, 0.60);
     let max_ratio = (cfg.max_masked_ratio * ratio_scale).clamp(min_ratio, 0.70);
     let sampled_ratio = if max_ratio > min_ratio {
-        rng.gen_range(min_ratio..=max_ratio)
+        rng.random_range(min_ratio..=max_ratio)
     } else {
         min_ratio
     };
@@ -1738,15 +1819,15 @@ fn build_masked_view_from_ids(
         }
         let use_identifier_focus = code_like
             && !identifier_positions.is_empty()
-            && rng.gen_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0));
+            && rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0));
         let use_comment_focus =
-            code_like && !comment_positions.is_empty() && rng.gen_bool(cfg.comment_focus_prob);
+            code_like && !comment_positions.is_empty() && rng.random_bool(cfg.comment_focus_prob);
         let use_block_focus = code_like
             && !block_positions.is_empty()
-            && rng.gen_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
+            && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
         let use_text_boundary_focus = !code_like
             && !text_boundary_positions.is_empty()
-            && rng.gen_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
+            && rng.random_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
         let start_pool = if use_comment_focus {
             &comment_positions
         } else if use_block_focus {
@@ -1762,15 +1843,15 @@ fn build_masked_view_from_ids(
             continue;
         };
         let span_len = if use_comment_focus {
-            rng.gen_range(2..=span_len_cap.clamp(2, 12))
+            rng.random_range(2..=span_len_cap.clamp(2, 12))
         } else if use_block_focus {
-            rng.gen_range(2..=span_len_cap.clamp(2, 10))
+            rng.random_range(2..=span_len_cap.clamp(2, 10))
         } else if use_text_boundary_focus {
-            rng.gen_range(3..=span_len_cap.clamp(3, 12))
+            rng.random_range(3..=span_len_cap.clamp(3, 12))
         } else if use_identifier_focus {
-            rng.gen_range(1..=span_len_cap.min(4))
+            rng.random_range(1..=span_len_cap.min(4))
         } else {
-            rng.gen_range(1..=span_len_cap)
+            rng.random_range(1..=span_len_cap)
         };
         for p in start..(start + span_len).min(valid_len) {
             if selected.len() >= target_masked {
@@ -1784,8 +1865,9 @@ fn build_masked_view_from_ids(
         let Some(&start) = valid_positions.choose(rng) else {
             break;
         };
-        let span_len = rng
-            .gen_range(1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)));
+        let span_len = rng.random_range(
+            1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)),
+        );
         for p in start..(start + span_len).min(valid_len) {
             if selected.len() >= target_masked {
                 break;
@@ -1815,7 +1897,7 @@ pub fn make_augmented_jepa_batch(
     cfg: &CurriculumDenoisingConfig,
     device: &Device,
 ) -> Result<AugmentedJepaBatch> {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let batch_size = token_batches.len();
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
@@ -1860,7 +1942,7 @@ pub fn make_augmented_jepa_batch_from_pairs(
     cfg: &CurriculumDenoisingConfig,
     device: &Device,
 ) -> Result<AugmentedJepaBatch> {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let batch_size = pairs.len();
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
@@ -1924,7 +2006,7 @@ pub fn make_jepa_batch_from_pairs(
     max_masked_ratio: f64,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let batch_size = pairs.len();
     let mut context_buf = Vec::with_capacity(batch_size * max_seq);
     let mut target_buf = Vec::with_capacity(batch_size * max_seq);
@@ -1949,7 +2031,7 @@ pub fn make_jepa_batch_from_pairs(
             let max_masked = (valid_positions.len() as f64 * ratio).ceil() as usize;
             let max_masked = max_masked.max(1).min(valid_positions.len());
 
-            let span_count = rng.gen_range(1..=span_count_cap);
+            let span_count = rng.random_range(1..=span_count_cap);
             for _ in 0..span_count {
                 if selected.len() >= max_masked {
                     break;
@@ -1957,7 +2039,7 @@ pub fn make_jepa_batch_from_pairs(
                 let Some(&start) = valid_positions.choose(&mut rng) else {
                     break;
                 };
-                let span_len = rng.gen_range(1..=span_len_cap);
+                let span_len = rng.random_range(1..=span_len_cap);
                 for (p, token) in target_seq
                     .iter()
                     .enumerate()
@@ -2009,96 +2091,13 @@ pub fn tokenize_for_inference_mode(text: &str, mode: TokenizationMode) -> Vec<St
     tokenize_with_mode(text, mode)
 }
 
-fn is_subword_candidate(token: &str) -> bool {
-    !token.is_empty()
-        && token
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn add_codeaware_reserved_tokens(vocab: &mut Vocab) {
-    const CONTROL_TOKENS: &[&str] = &[
-        "<nl>",
-        "<indent_tab>",
-        "<str_lit>",
-        "<char_lit>",
-        "<num_lit>",
-    ];
-    const RUST_KEYWORDS: &[&str] = &[
-        "fn", "pub", "let", "mut", "impl", "struct", "enum", "trait", "use", "mod", "self", "Self",
-        "crate", "super", "where", "match", "if", "else", "for", "while", "loop", "return",
-        "async", "await", "move", "const", "static", "type", "dyn", "in", "as", "unsafe", "extern",
-        "ref", "Result", "Option", "Some", "None", "Ok", "Err", "Vec", "String", "bool", "str",
-        "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64",
-    ];
-    const DIRECT_TOKENS: &[&str] = &[
-        "'", "_", "&", "*", "(", ")", "{", "}", "[", "]", "<", ">", ",", ".", ":", ";", "!", "?",
-        "+", "-", "/", "%", "=", "|", "^", "#", "@", "$", "~", "\\", "::", "->", "=>", "==", "!=",
-        "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "<<=",
-        ">>=", "...", "//",
-    ];
-    for token in CONTROL_TOKENS {
-        vocab.add_token(token);
-    }
-    for indent in 1..=16 {
-        vocab.add_token(&format!("<indent_{indent}>"));
-    }
-    for token in DIRECT_TOKENS {
-        vocab.add_token(token);
-    }
-    for token in RUST_KEYWORDS {
-        vocab.add_token(token);
-    }
-    for ch in 'a'..='z' {
-        vocab.add_token(&ch.to_string());
-    }
-    for ch in 'A'..='Z' {
-        vocab.add_token(&ch.to_string());
-    }
-    for ch in '0'..='9' {
-        vocab.add_token(&ch.to_string());
-    }
-}
-
-fn encode_tokens_with_vocab(tokens: &[String], vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
-    let mut encoded = Vec::new();
-    for token in tokens {
-        if let Some(id) = vocab.token_to_id.get(token) {
-            encoded.push(*id);
-            continue;
-        }
-        if mode != TokenizationMode::CodeAware {
-            encoded.push(vocab.unk_id);
-            continue;
-        }
-        let chars: Vec<char> = token.chars().collect();
-        let mut idx = 0usize;
-        while idx < chars.len() {
-            let mut matched: Option<u32> = None;
-            let mut matched_end = idx + 1;
-            for end in ((idx + 1)..=chars.len()).rev() {
-                let piece: String = chars[idx..end].iter().collect();
-                if let Some(id) = vocab.token_to_id.get(&piece) {
-                    matched = Some(*id);
-                    matched_end = end;
-                    break;
-                }
-            }
-            if let Some(id) = matched {
-                encoded.push(id);
-                idx = matched_end;
-            } else {
-                encoded.push(vocab.unk_id);
-                idx += 1;
-            }
-        }
-    }
-    encoded
+fn encode_tokens_with_vocab(tokens: &[String], vocab: &Vocab, _mode: TokenizationMode) -> Vec<u32> {
+    vocab.encode(tokens)
 }
 
 pub fn encode_text_with_vocab_mode(text: &str, vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
-    let tokens = tokenize_with_mode(text, mode);
-    encode_tokens_with_vocab(&tokens, vocab, mode)
+    let _ = mode;
+    vocab.encode_boundless(text)
 }
 
 pub fn encode_world_examples(rows: &[RawWorldExample], vocab: &Vocab) -> Vec<WorldExample> {
@@ -2112,19 +2111,125 @@ pub fn encode_world_examples_with_mode(
 ) -> Vec<WorldExample> {
     rows.iter()
         .map(|row| WorldExample {
-            state_tokens: encode_tokens_with_vocab(
-                &tokenize_with_mode(&row.state_text, mode),
-                vocab,
-                mode,
-            ),
-            next_tokens: encode_tokens_with_vocab(
-                &tokenize_with_mode(&row.next_text, mode),
-                vocab,
-                mode,
-            ),
+            state_tokens: encode_text_with_vocab_mode(&row.state_text, vocab, mode),
+            next_tokens: encode_text_with_vocab_mode(&row.next_text, vocab, mode),
             action_label: row.action_label,
         })
         .collect()
+}
+
+fn merge_pair_counts(sequences: &[Vec<u32>]) -> std::collections::HashMap<(u32, u32), usize> {
+    let mut counts = std::collections::HashMap::new();
+    for seq in sequences {
+        for pair in seq.windows(2) {
+            if let [left, right] = pair {
+                *counts.entry((*left, *right)).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn apply_merge_to_sequence(seq: &mut Vec<u32>, left: u32, right: u32, merged: u32) {
+    if seq.len() < 2 {
+        return;
+    }
+    let mut out = Vec::with_capacity(seq.len());
+    let mut i = 0usize;
+    while i < seq.len() {
+        if i + 1 < seq.len() && seq[i] == left && seq[i + 1] == right {
+            out.push(merged);
+            i += 2;
+        } else {
+            out.push(seq[i]);
+            i += 1;
+        }
+    }
+    *seq = out;
+}
+
+fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
+    if texts.is_empty() {
+        bail!("cannot train tokenizer on empty text set");
+    }
+    let start = Instant::now();
+    let mut char_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for text in texts {
+        for ch in text.chars() {
+            *char_counts.entry(ch.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut chars = char_counts.into_iter().collect::<Vec<_>>();
+    chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut vocab = Vocab::new();
+    for (token, _) in chars {
+        if vocab.id_to_token.len() >= max_vocab {
+            break;
+        }
+        vocab.add_token(&token);
+    }
+
+    let mut sequences = texts
+        .iter()
+        .map(|text| {
+            text.chars()
+                .map(|ch| {
+                    let token = ch.to_string();
+                    *vocab.token_to_id.get(&token).unwrap_or(&vocab.unk_id)
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|seq| !seq.is_empty())
+        .collect::<Vec<_>>();
+
+    let initial_vocab_len = vocab.id_to_token.len();
+    let target_merges = max_vocab.saturating_sub(initial_vocab_len);
+    let progress_every = bpe_progress_every_merges();
+    let mut merges_applied = 0usize;
+    while vocab.id_to_token.len() < max_vocab {
+        let pair_counts = merge_pair_counts(&sequences);
+        let best = pair_counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .max_by(|((l1, r1), c1), ((l2, r2), c2)| {
+                c1.cmp(c2)
+                    .then_with(|| {
+                        vocab.id_to_token[*l1 as usize].cmp(&vocab.id_to_token[*l2 as usize])
+                    })
+                    .then_with(|| {
+                        vocab.id_to_token[*r1 as usize].cmp(&vocab.id_to_token[*r2 as usize])
+                    })
+            });
+        let Some(((left, right), _count)) = best else {
+            break;
+        };
+        let merged_token = format!(
+            "{}{}",
+            vocab.id_to_token[left as usize], vocab.id_to_token[right as usize]
+        );
+        let merged = vocab.add_merge(left, right, &merged_token);
+        for seq in &mut sequences {
+            apply_merge_to_sequence(seq, left, right, merged);
+        }
+        merges_applied += 1;
+        if merges_applied.is_multiple_of(progress_every) {
+            let elapsed = start.elapsed().as_secs_f32();
+            println!(
+                "BPE merge progress: {merges_applied}/{target_merges} merges, vocab={}, elapsed={elapsed:.1}s",
+                vocab.id_to_token.len()
+            );
+        }
+    }
+
+    let total_tokens = sequences.iter().map(|seq| seq.len()).sum();
+    let elapsed = start.elapsed().as_secs_f32();
+    println!(
+        "BPE training complete: merges_applied={merges_applied}, vocab={}, elapsed={elapsed:.1}s",
+        vocab.id_to_token.len()
+    );
+    Ok((vocab, total_tokens))
 }
 
 pub fn build_vocab_from_raw_world_file_with_mode(
@@ -2132,11 +2237,21 @@ pub fn build_vocab_from_raw_world_file_with_mode(
     max_vocab: usize,
     mode: TokenizationMode,
 ) -> Result<(Vocab, VocabStats, usize)> {
-    use std::collections::HashMap;
-
     let reader = BufReader::new(File::open(path)?);
-    let mut counts: HashMap<String, usize> = HashMap::new();
     let mut row_count = 0usize;
+    let mut texts = Vec::new();
+    let budget = if mode == TokenizationMode::CodeAware {
+        let configured = code_vocab_sample_budget();
+        println!(
+            "code-aware vocab sampling budget for {}: {}",
+            path.display(),
+            configured.describe()
+        );
+        configured
+    } else {
+        VocabSampleBudget::default()
+    };
+    let mut sampled_text_bytes = 0usize;
     for line in reader.lines() {
         let line = line?;
         let line = line.trim();
@@ -2151,69 +2266,49 @@ pub fn build_vocab_from_raw_world_file_with_mode(
         if state_tokens.is_empty() || next_tokens.is_empty() {
             continue;
         }
-        for tok in state_tokens.iter().chain(next_tokens.iter()) {
-            *counts.entry(tok.clone()).or_insert(0) += 1;
+        if let Some(limit) = budget.max_rows {
+            if row_count >= limit {
+                println!(
+                    "vocab sampling row budget reached for {}: kept {row_count} rows",
+                    path.display()
+                );
+                break;
+            }
         }
+        let pair_text_bytes = left.len() + right.len();
+        if let Some(limit) = budget.max_text_bytes {
+            if row_count > 0 && sampled_text_bytes.saturating_add(pair_text_bytes) > limit {
+                println!(
+                    "vocab sampling byte budget reached for {}: kept {row_count} rows and {} text bytes",
+                    path.display(),
+                    sampled_text_bytes
+                );
+                break;
+            }
+        }
+        texts.push(left);
+        texts.push(right);
+        sampled_text_bytes = sampled_text_bytes.saturating_add(pair_text_bytes);
         row_count += 1;
+        if row_count.is_multiple_of(DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS) {
+            println!(
+                "Vocab scan progress: {row_count} usable rows kept for {} (sampled_text_bytes={sampled_text_bytes})",
+                path.display()
+            );
+        }
     }
     if row_count == 0 {
         bail!("cannot build vocab from empty raw world file {:?}", path);
     }
-
-    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let vocab_size = max_vocab.saturating_sub(3).min(sorted.len());
-    let mut vocab = Vocab::new();
-    if mode == TokenizationMode::CodeAware {
-        add_codeaware_reserved_tokens(&mut vocab);
-        let mut direct_tokens = Vec::new();
-        let mut char_counts: HashMap<String, usize> = HashMap::new();
-        let mut word_tokens = Vec::new();
-        for (token, count) in &sorted {
-            if is_subword_candidate(token) {
-                word_tokens.push((token.clone(), *count));
-            } else {
-                direct_tokens.push((token.clone(), *count));
-            }
-            for ch in token.chars() {
-                *char_counts.entry(ch.to_string()).or_insert(0) += *count;
-            }
-        }
-        direct_tokens.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        word_tokens.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut chars: Vec<(String, usize)> = char_counts.into_iter().collect();
-        chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (token, _) in direct_tokens
-            .iter()
-            .chain(chars.iter())
-            .chain(word_tokens.iter())
-        {
-            if vocab.id_to_token.len() >= max_vocab {
-                break;
-            }
-            vocab.add_token(token);
-        }
-    } else {
-        for (token, _) in sorted.iter().take(vocab_size) {
-            vocab.add_token(token);
-        }
-    }
-    let total_tokens: usize = sorted.iter().map(|(_, c)| *c).sum();
-    let covered_tokens: usize = sorted
-        .iter()
-        .filter(|(token, _)| vocab.token_to_id.contains_key(token))
-        .map(|(_, c)| *c)
-        .sum();
-    let oov_tokens = total_tokens.saturating_sub(covered_tokens);
-    let unique_tokens = sorted.len();
+    let (vocab, total_tokens) = train_boundless_bpe_from_texts(&texts, max_vocab)?;
     let vocab_len = vocab.id_to_token.len();
     Ok((
         vocab,
         VocabStats {
             total_tokens,
-            covered_tokens,
-            oov_tokens,
-            unique_tokens,
+            covered_tokens: total_tokens,
+            oov_tokens: 0,
+            unique_tokens: vocab_len,
             vocab_size: vocab_len,
         },
         row_count,
@@ -2372,56 +2467,146 @@ pub fn make_world_batch_from_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_decoder_batch, tokenize_for_inference_mode, TokenizationMode};
+    use super::{
+        action_label_heuristic, make_decoder_batch, parse_action_label_str,
+        tokenize_for_inference_mode, tokenizer_spec_signature, CachedDecoderStream,
+        CachedPairStream, CachedWorldStream, TokenizationMode, ACTION_CODE, ACTION_DONE,
+        ACTION_TEXT_REPLY, DUAL_TOKEN_CACHE_MAGIC, TOKEN_CACHE_MAGIC,
+    };
+    use crate::model::Vocab;
     use candle_core::{Device, Tensor};
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_cache_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tofy_{name}_{nanos}.tokens.bin"))
+    }
+
+    fn write_ids(file: &mut File, ids: &[u32]) {
+        file.write_all(&(ids.len() as u32).to_le_bytes()).unwrap();
+        for id in ids {
+            file.write_all(&id.to_le_bytes()).unwrap();
+        }
+    }
+
+    fn write_token_record(file: &mut File, left: &[u32], right: &[u32], action: u32) {
+        write_ids(file, left);
+        write_ids(file, right);
+        file.write_all(&action.to_le_bytes()).unwrap();
+    }
+
+    fn write_dual_token_record(
+        file: &mut File,
+        enc_left: &[u32],
+        enc_right: &[u32],
+        dec_left: &[u32],
+        dec_right: &[u32],
+        action: u32,
+    ) {
+        write_ids(file, enc_left);
+        write_ids(file, enc_right);
+        write_ids(file, dec_left);
+        write_ids(file, dec_right);
+        file.write_all(&action.to_le_bytes()).unwrap();
+    }
 
     #[test]
-    fn code_tokenizer_splits_snake_case_and_operators() {
+    fn tokenizer_has_no_pretokenization_barrier_for_code_mode() {
         let tokens = tokenize_for_inference_mode(
             "my_special_function(value_one, valueTwo) -> result_value",
             TokenizationMode::CodeAware,
         );
-        let expected = vec![
-            "my", "_", "special", "_", "function", "(", "value", "_", "one", ",", "value", "Two",
-            ")", "->", "result", "_", "value",
-        ];
+        let expected = "my_special_function(value_one, valueTwo) -> result_value"
+            .chars()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(tokens, expected);
     }
 
     #[test]
-    fn code_tokenizer_splits_camel_case_and_digits() {
+    fn tokenizer_tracks_unicode_scalars() {
         let tokens = tokenize_for_inference_mode("parseHTTP2Response", TokenizationMode::CodeAware);
-        let expected = vec!["parse", "HTTP", "2", "Response"];
+        let expected = "parseHTTP2Response"
+            .chars()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(tokens, expected);
     }
 
     #[test]
-    fn code_tokenizer_keeps_rust_lifetimes_and_char_literals_distinct() {
-        let tokens = tokenize_for_inference_mode(
-            "fn map<'a>(x: &'a str, c: 'x')",
-            TokenizationMode::CodeAware,
-        );
-        let expected = vec![
-            "fn",
-            "map",
-            "<",
-            "'",
-            "a",
-            ">",
-            "(",
-            "x",
-            ":",
-            "&",
-            "'",
-            "a",
-            "str",
-            ",",
-            "c",
-            ":",
-            "<char_lit>",
-            ")",
-        ];
+    fn tokenizer_preserves_raw_boundaries_in_default_mode() {
+        let tokens =
+            tokenize_for_inference_mode("naïve café 你好 co-op l'été", TokenizationMode::Default);
+        let expected = "naïve café 你好 co-op l'été"
+            .chars()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn default_mode_applies_bpe_merges_without_pretokenization() {
+        let mut vocab = Vocab::new();
+        let h = vocab.add_token("h");
+        let e = vocab.add_token("e");
+        let l = vocab.add_token("l");
+        let o = vocab.add_token("o");
+        let space = vocab.add_token(" ");
+        let w = vocab.add_token("w");
+        let r = vocab.add_token("r");
+        let d = vocab.add_token("d");
+        let he = vocab.add_merge(h, e, "he");
+        let ll = vocab.add_merge(l, l, "ll");
+        let llo = vocab.add_merge(ll, o, "llo");
+        let hello = vocab.add_merge(he, llo, "hello");
+        let wo = vocab.add_merge(w, o, "wo");
+        let rl = vocab.add_merge(r, l, "rl");
+        let rld = vocab.add_merge(rl, d, "rld");
+        let world = vocab.add_merge(wo, rld, "world");
+        let hello_space = vocab.add_merge(hello, space, "hello ");
+        vocab.add_merge(hello_space, world, "hello world");
+
+        let ids =
+            super::encode_text_with_vocab_mode("hello world", &vocab, TokenizationMode::Default);
+        let expected = vec![*vocab.token_to_id.get("hello world").unwrap()];
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn tokenizer_spec_signature_changes_by_mode() {
+        assert_ne!(
+            tokenizer_spec_signature(TokenizationMode::Default),
+            tokenizer_spec_signature(TokenizationMode::CodeAware)
+        );
+    }
+
+    #[test]
+    fn default_mode_uses_utf8_byte_fallback() {
+        let mut vocab = Vocab::new();
+        vocab.add_token("h");
+        vocab.add_token("e");
+        vocab.add_token("l");
+        vocab.add_token("o");
+        let ids = super::encode_text_with_vocab_mode("hello", &vocab, TokenizationMode::Default);
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn action_aliases_preserve_three_way_router_compatibility() {
+        assert_eq!(parse_action_label_str("repair_patch"), Some(ACTION_CODE));
+        assert_eq!(parse_action_label_str("run_tests"), Some(ACTION_CODE));
+        assert_eq!(parse_action_label_str("explain"), Some(ACTION_TEXT_REPLY));
+        assert_eq!(parse_action_label_str("finalize"), Some(ACTION_DONE));
+        assert_eq!(
+            action_label_heuristic("<action:repair_patch> fix compiler error"),
+            ACTION_CODE
+        );
     }
 
     #[test]
@@ -2440,8 +2625,60 @@ mod tests {
             vec![0, 0, 21, 22, 0, 0, 0, 0]
         );
         assert_eq!(
-            mask.to_vec2::<f32>().unwrap()[0],
+            crate::util::vec2_f32(&mask).unwrap()[0],
             vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn cached_pair_stream_prefetch_reads_existing_cache_format() {
+        let path = temp_cache_path("pair_prefetch");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(TOKEN_CACHE_MAGIC).unwrap();
+            write_token_record(&mut file, &[10, 11], &[], 0);
+            write_token_record(&mut file, &[12, 13, 14], &[], 0);
+        }
+        let mut stream = CachedPairStream::with_shuffle(&path, 1).unwrap();
+        let batch = stream.next_batch(2).unwrap();
+        assert_eq!(batch[0].tokens, vec![10, 11]);
+        assert_eq!(batch[1].tokens, vec![12, 13, 14]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_world_stream_prefetch_preserves_split_and_records() {
+        let path = temp_cache_path("world_prefetch");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(TOKEN_CACHE_MAGIC).unwrap();
+            write_token_record(&mut file, &[1], &[2], 0);
+            write_token_record(&mut file, &[3], &[4], 1);
+            write_token_record(&mut file, &[5], &[6], 2);
+        }
+        let mut stream = CachedWorldStream::with_split(&path, 1, Some(2), 1, false).unwrap();
+        let batch = stream.next_batch(1).unwrap();
+        assert_eq!(batch[0].state_tokens, vec![3]);
+        assert_eq!(batch[0].next_tokens, vec![4]);
+        assert_eq!(batch[0].action_label, 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_decoder_stream_prefetch_reads_dual_cache_format() {
+        let path = temp_cache_path("decoder_prefetch");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(DUAL_TOKEN_CACHE_MAGIC).unwrap();
+            write_dual_token_record(&mut file, &[1, 2], &[3], &[10], &[11, 12], 1);
+        }
+        let mut stream = CachedDecoderStream::with_split(&path, 1, None, 0, false).unwrap();
+        let batch = stream.next_batch(1).unwrap();
+        assert_eq!(batch[0].encoder.state_tokens, vec![1, 2]);
+        assert_eq!(batch[0].encoder.next_tokens, vec![3]);
+        assert_eq!(batch[0].decoder.state_tokens, vec![10]);
+        assert_eq!(batch[0].decoder.next_tokens, vec![11, 12]);
+        assert_eq!(batch[0].encoder.action_label, 1);
+        std::fs::remove_file(path).unwrap();
     }
 }

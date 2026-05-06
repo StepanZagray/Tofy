@@ -14,3 +14,14 @@ All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-pa
 | [RESULTS.md](RESULTS.md) | Best metrics and commands (updated when runs improve). |
 
 Root [../README.md](../README.md) has quick start, argument order, and project structure.
+
+## Current Source Layout
+
+Recent refactors split command parsing and runtime code more explicitly:
+
+- [`src/main.rs`](../src/main.rs) is now a thin command-dispatch entrypoint.
+- [`src/cli.rs`](../src/cli.rs) owns shared CLI helpers such as hub-path resolution and usage text.
+- [`src/config/latent.rs`](../src/config/latent.rs) and [`src/config/world.rs`](../src/config/world.rs) hold typed configs for latent, world, decoder, eval, and serve commands.
+- [`src/tasks/latent.rs`](../src/tasks/latent.rs) owns latent training and JEPA evaluation.
+- [`src/tasks/world.rs`](../src/tasks/world.rs) owns world/orchestrator/decoder training plus agent runtime.
+- [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) holds shared world/decoder metrics, masking, and evaluation helpers extracted from `world.rs` for readability.

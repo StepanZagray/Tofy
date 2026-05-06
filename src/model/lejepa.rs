@@ -1,7 +1,6 @@
 use anyhow::Result;
 use candle_core::Tensor;
-use candle_nn::ops;
-use rand::Rng;
+use rand::RngExt;
 
 pub fn prediction_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
     Ok(pred.broadcast_sub(target)?.sqr()?.mean_all()?)
@@ -20,44 +19,6 @@ pub fn tensor_rms(x: &Tensor) -> Result<Tensor> {
     x.sqr()?.mean_all()?.sqrt().map_err(Into::into)
 }
 
-pub fn symmetric_contrastive_loss(a: &Tensor, b: &Tensor, temperature: f64) -> Result<Tensor> {
-    let batch = a.dim(0)?;
-    let temp = temperature.max(1e-4);
-    let work_dtype = a.dtype();
-    let a_norm = a.sqr()?.sum(1)?.unsqueeze(1)?.sqrt()?.clamp(1e-8, 1e10)?;
-    let b_norm = b.sqr()?.sum(1)?.unsqueeze(1)?.sqrt()?.clamp(1e-8, 1e10)?;
-    let a_unit = (a.clone() / a_norm.broadcast_as(a.shape())?)?;
-    let b_unit = (b.clone() / b_norm.broadcast_as(b.shape())?)?;
-    let logits_ab = a_unit
-        .matmul(&b_unit.transpose(0, 1)?)?
-        .affine(1.0 / temp, 0.0)?;
-    let logits_ba = b_unit
-        .matmul(&a_unit.transpose(0, 1)?)?
-        .affine(1.0 / temp, 0.0)?;
-    let labels = Tensor::from_vec(
-        (0..batch as u32).map(|idx| idx as i64).collect::<Vec<_>>(),
-        (batch,),
-        a.device(),
-    )?
-    .unsqueeze(1)?;
-    let nll_ab = ops::log_softmax(&logits_ab, 1)?
-        .gather(&labels, 1)?
-        .squeeze(1)?
-        .affine(-1.0, 0.0)?
-        .mean_all()?;
-    let nll_ba = ops::log_softmax(&logits_ba, 1)?
-        .gather(&labels, 1)?
-        .squeeze(1)?
-        .affine(-1.0, 0.0)?
-        .mean_all()?;
-    let nll_ab = nll_ab.to_dtype(work_dtype)?;
-    let nll_ba = nll_ba.to_dtype(work_dtype)?;
-    nll_ab
-        .broadcast_add(&nll_ba)?
-        .affine(0.5, 0.0)
-        .map_err(Into::into)
-}
-
 pub fn flatten_latent_slots(latent_slots: &Tensor) -> Result<Tensor> {
     let (batch, slots, dim) = latent_slots.dims3()?;
     latent_slots
@@ -71,13 +32,13 @@ pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> R
     let (num_samples, dim) = x.dims2()?;
     let device = x.device();
     let work_dtype = x.dtype();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut proj = vec![0f32; dim * num_slices];
     for slice in 0..num_slices {
         let mut norm = 0f32;
         for d in 0..dim {
-            let v = rng.gen_range(-1.0f32..1.0f32);
+            let v = rng.random_range(-1.0f32..1.0f32);
             proj[d * num_slices + slice] = v;
             norm += v * v;
         }

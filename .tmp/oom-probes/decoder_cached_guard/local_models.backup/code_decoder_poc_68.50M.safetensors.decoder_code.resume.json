@@ -1,0 +1,7 @@
+{
+  "stage": "decoder_code",
+  "step": 40000,
+  "best_metric": 6.130293,
+  "best_aux_metric": 2.703125,
+  "saved_checkpoint": true
+}

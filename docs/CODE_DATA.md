@@ -4,9 +4,7 @@ Scripts and formats for code-focused training. Output is `context<TAB>completion
 
 ## GitHub Top Code (ronantakizawa/github-top-code)
 
-Use **scripts/prepare_github_top_code.py** to build `context<TAB>completion` pairs for world model and code decoder training.
-
-**Install:** `pip install datasets`
+Use `cargo run --release -- --prepare-github-top-code` to build `context<TAB>completion` pairs for world model and code decoder training.
 
 **Default language set** (use `--default-languages`): Rust, TypeScript, Go, JavaScript, C/C++ Header, C, C++, TSX, CSS, HTML.
 
@@ -14,16 +12,16 @@ Use **scripts/prepare_github_top_code.py** to build `context<TAB>completion` pai
 
 ```bash
 # All languages, first 100k files (safe for memory)
-python scripts/prepare_github_top_code.py --output data/github_top_code_pairs.txt --max-files 100000
+cargo run --release -- --prepare-github-top-code --output data/github_top_code_pairs.txt --max-files 100000
 
 # Rust only, 50k files
-python scripts/prepare_github_top_code.py --output data/rust_code_pairs.txt --languages Rust --max-files 50000
+cargo run --release -- --prepare-github-top-code --output data/rust_code_pairs.txt --languages Rust --max-files 50000
 
 # Multilingual preset: Rust, TypeScript, Go, JavaScript, C/C++ Header, C, C++, TSX, CSS, HTML
-python scripts/prepare_github_top_code.py --output data/multilang_pairs.txt --default-languages --max-files 200000
+cargo run --release -- --prepare-github-top-code --output data/multilang_pairs.txt --default-languages --max-files 200000
 
 # Or list languages explicitly (handy if dataset uses different names)
-python scripts/prepare_github_top_code.py --output data/multilang_pairs.txt --languages Rust TypeScript Go JavaScript "C/C++ Header" C C++ TSX CSS HTML --max-files 200000
+cargo run --release -- --prepare-github-top-code --output data/multilang_pairs.txt --languages Rust TypeScript Go JavaScript "C/C++ Header" C C++ TSX CSS HTML --max-files 200000
 ```
 
 The generator now also:
@@ -32,6 +30,7 @@ The generator now also:
 - skips obviously generated/minified files
 - deduplicates identical pairs
 - prefixes code rows with tags such as `<lang:rust>`, `<ctx>`, and `<reply>`
+- relies on the code-aware tokenizer path, which still does identifier-aware splitting first but now falls back to reserved UTF-8 byte tokens for uncovered pieces instead of raw `<unk>` collapse
 
 Then train the pure world model + code decoder on the output file, e.g.:
 
@@ -43,12 +42,12 @@ cargo run --release -- --train-decoder local_models/model_latent_<size>.safetens
 For the router/orchestrator, prefer a chat+code mix instead of code-only or chat-only data. The mix script now writes explicit action labels and synthetic terminal `done` rows:
 
 ```bash
-python scripts/prepare_world_mix.py --output data/world_mix_pairs.txt --text-pairs data/ultrachat_pairs.txt --code-pairs data/multilang_pairs.txt --code-ratio 0.35 --done-ratio 0.18
-cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/world_mix_pairs.txt 40000 24 768 256 9 8 256 64 --lambda 0.2 --action-loss-weight 1.0 --router-warmup 5000
+cargo run --release -- --prepare-world-mix --output data/world_mix_pairs.txt --text-pairs data/ultrachat_pairs.txt --code-pairs data/multilang_pairs.txt --code-ratio 0.35 --done-ratio 0.18
+cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/world_mix_pairs.txt 40000 24 768 256 9 8 256 64 --lambda 0.2 --action-loss-weight 0
 cargo run --release -- --train-orchestrator local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/world_mix_pairs.txt 15000 24 768 256 9 8 256 64
 ```
 
-**Options:** `--split` (train/test/validation), `--min-lines`, `--split-ratio` (prefix/completion split). See `python scripts/prepare_github_top_code.py --help`.
+**Options:** `--split` (train/test/validation), `--min-lines`, `--split-ratio` (prefix/completion split). See `cargo run --release -- --prepare-github-top-code --help`.
 
 ### Rust instruction/function tasks for the code-first POC
 
@@ -61,8 +60,8 @@ The hard Rust eval suite is not a generic code-continuation benchmark. It asks f
 So for the code-first proof of concept, build a second decoder dataset that matches that shape:
 
 ```bash
-python scripts/prepare_rust_function_tasks.py --input data/rust_code_pairs.txt --output data/rust_instruction_pairs.txt
-python scripts/prepare_code_poc_mix.py --output data/code_poc_mix.txt --base-pairs data/rust_code_pairs.txt --instruction-pairs data/rust_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/rust_docs_pairs.txt --extra-repeat 1
+cargo run --release -- --prepare-rust-function-tasks --input data/rust_code_pairs.txt --output data/rust_instruction_pairs.txt
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/rust_code_pairs.txt --instruction-pairs data/rust_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/rust_docs_pairs.txt --extra-repeat 1
 ```
 
 What this does:
@@ -80,23 +79,45 @@ The code-first pipeline now uses these rows twice:
 - first as part of the mixed decoder dataset
 - then again in a short instruction-only polish phase to improve exact signature retention
 
+### Rust compiler-feedback repair tasks
+
+Use `cargo run --release -- --prepare-rust-repair-tasks` to turn instruction/function rows into repair trajectories. The generator corrupts a known-good Rust answer, runs `rustc --crate-type lib`, keeps the compiler diagnostics, and writes a new pair whose left side asks the decoder to repair the failed attempt.
+
+The generated `data/rust_repair_pairs.txt` artifact is cached with a sidecar manifest. If the instruction-pair input hash, `rustc` version, and generation settings still match, reruns print `Repair pair cache hit: ...` and skip regeneration.
+
+The same manifest-cache pattern is now used for the other Stage 1 prepared-data artifacts as well, including `data/encoder_mix.txt`, `data/rust_instruction_pairs.txt`, `data/world_mix_pairs.txt`, and `data/code_poc_mix.txt`.
+
+```bash
+cargo run --release -- --prepare-rust-repair-tasks --input data/rust_instruction_pairs.txt --output data/rust_repair_pairs.txt
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/rust_code_pairs.txt --instruction-pairs data/rust_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/rust_repair_pairs.txt --extra-repeat 2
+```
+
+Repair prompts include tool/context tags:
+
+- `<action:repair_patch>`
+- `<tool:read_error>`
+- `<tool:repair_patch>`
+- `<ctx:compiler_feedback>`
+
+These tags are text conditioning for the decoder and training signal for the planner/world path. They intentionally still map to the existing `code` action label so current three-way router checkpoints remain usable.
+
 ---
 
 ## Rust-by-Practice markdown (sunface_rust-by-practice_en)
 
-Use **scripts/prepare_rust_by_practice_md.py** to turn the md docs under `data/sunface_rust-by-practice_en` into training data.
+Use `cargo run --release -- --prepare-rust-by-practice` to turn the md docs under `data/sunface_rust-by-practice_en` into training data.
 
 **JEPA encoder (--latent):** one chunk per line (split by `##` headings):
 
 ```bash
-python scripts/prepare_rust_by_practice_md.py --mode jepa --output data/rust_docs_jepa.txt
+cargo run --release -- --prepare-rust-by-practice --mode jepa --output data/rust_docs_jepa.txt
 cargo run --release -- --latent data/rust_docs_jepa.txt 15000 16 768 256 9 8 8000
 ```
 
 **World / decoder pairs:** consecutive sections as context TAB next:
 
 ```bash
-python scripts/prepare_rust_by_practice_md.py --mode pairs --output data/rust_docs_pairs.txt
+cargo run --release -- --prepare-rust-by-practice --mode pairs --output data/rust_docs_pairs.txt
 ```
 
 You can **concatenate** with code pairs for a mix of docs + code, e.g.:
@@ -106,4 +127,4 @@ cat data/rust_docs_pairs.txt data/rust_code_pairs.txt > data/rust_mixed_pairs.tx
 # Then train world/decoder on data/rust_mixed_pairs.txt
 ```
 
-**Options:** `--input` (default `data/sunface_rust-by-practice_en`), `--no-split-headings` (JEPA: one file per line). See `python scripts/prepare_rust_by_practice_md.py --help`.
+**Options:** `--input` (default `data/sunface_rust-by-practice_en`), `--no-split-headings` (JEPA: one file per line). See `cargo run --release -- --prepare-rust-by-practice --help`.

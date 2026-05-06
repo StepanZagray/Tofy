@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "kind": "rust_function_tasks",
+  "output_path": "data/rust_instruction_pairs.txt",
+  "params": {
+    "github_top_code": false,
+    "max_files": null,
+    "max_rows": null,
+    "split": "train"
+  },
+  "inputs": [
+    {
+      "path": "data/rust_code_pairs.txt",
+      "len": 332444344,
+      "modified_unix_nanos": 1775518153217127102,
+      "content_hash": "e2bafb32a848992e790909d86be9d73c8a835d0b477894cc3fc460b2eb680b2e"
+    }
+  ],
+  "rows": 976887
+}

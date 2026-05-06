@@ -4,7 +4,30 @@ How cross-action awareness works and how encoder/decoder size is chosen. See [RU
 
 Current stack:
 
-`encoder -> planner memory -> router/orchestrator -> decoder-specific adapter -> decoder`
+`strict LeJEPA encoder -> action-conditioned LeJEPA world transition -> planner memory -> downstream decoder adapter -> decoder`
+
+## Current Code Layout
+
+The runtime architecture above is now reflected more directly in the crate structure:
+
+- [`src/main.rs`](../src/main.rs) only initializes tracing and dispatches modes.
+- [`src/cli.rs`](../src/cli.rs) contains shared command-line/path helpers.
+- [`src/config/latent.rs`](../src/config/latent.rs) contains latent train/eval configs.
+- [`src/config/world.rs`](../src/config/world.rs) contains world, orchestrator, decoder, eval, and serve configs.
+- [`src/tasks/latent.rs`](../src/tasks/latent.rs) implements the latent train/eval path.
+- [`src/tasks/world.rs`](../src/tasks/world.rs) implements the world/orchestrator/decoder train path and runtime engine.
+- [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) contains shared world/decoder metric and masking helpers that used to live inline in `world.rs`.
+
+This means the codebase now separates:
+
+- command parsing and path resolution
+- typed stage configuration
+- stage orchestration
+- shared world/decoder helper logic
+
+more cleanly than the earlier single-file entrypoint approach.
+
+Training defaults follow the LeJEPA/LeWorldModel direction: encoder training uses online masked-view prediction plus SIGReg without EMA target updates, stop-gradient teacher targets, contrastive loss, or predictor heads; world training uses action-conditioned next-latent prediction plus SIGReg without router/inverse auxiliary losses. The autoregressive decoders remain downstream code/text emitters, not the world model.
 
 ## How Context Works
 
@@ -61,12 +84,20 @@ The encoder output is not passed directly to the decoders. Instead:
 
 1. the encoder produces token/chunk/global states
 2. planner memory compresses them into `num_latent_tokens` planner slots
-3. the orchestrator reads those slots to choose `TextReply`, `Code`, or `Done`
-4. the transition model predicts the **next** planner state for that chosen action
+3. the low-level action-conditioned transition model predicts the **next** planner state for a candidate primitive action
+4. optionally, a high-level world model predicts longer-range planner states from macro-actions encoded from primitive action spans
+5. optional downstream router/orchestrator heads can choose `TextReply`, `Code`, or `Done` for compatibility, but they are not part of the strict world objective
 
 So after the encoder stage, the conversation is represented as a small latent memory rather than a long token sequence.
 
 This is important because the model does **not** work like a normal single LLM with one giant KV-cache over the whole dialog. The shared conversation context is compressed into planner slots first.
+
+The optional high-level world model follows the Hierarchical Planning with
+Latent World Models idea: it operates in the same planner-slot latent space as
+the low-level world model, but conditions on a learned macro-action vector
+instead of one primitive action id. At inference, HWM planning can first choose a
+macro-action subgoal, then use the low-level transition model to choose the
+first primitive action toward that subgoal.
 
 ### 3. Decoder context at inference
 
@@ -82,7 +113,7 @@ For Candle decoders:
 - text decoder uses its own text vocab/tokenizer
 - code decoder uses its own code-aware vocab/tokenizer
 
-Because the tokenizers differ, `max_seq = 256` in the encoder and `max_seq = 192` in the code decoder do **not** mean the same exact amount of source text. Each module counts its own tokens.
+Because the tokenizers differ, `max_seq = 256` in the encoder and `max_seq = 128` or `192` in the code decoder do **not** mean the same exact amount of source text. Each module counts its own tokens.
 
 ### 4. Decoder context during training
 
@@ -102,11 +133,11 @@ Teacher forcing is built as:
 
 So the decoder training sequence length is effectively **`2 * max_seq`**, even though `max_seq` is still the configuration knob for each side individually.
 
-This means `max_seq = 192` for the code decoder really means:
+This means `max_seq = 128` for the code decoder really means:
 
-- up to `192` tokens from the left side
-- up to `192` tokens from the right side
-- up to `384` autoregressive positions inside the decoder loss
+- up to `128` tokens from the left side
+- up to `128` tokens from the right side
+- up to `256` autoregressive positions inside the decoder loss
 
 ### 5. Dataset context
 

@@ -1,4 +1,4 @@
-//! Download a Hugging Face dataset once via candle-datasets/hf-hub, save as local
+//! Download a Hugging Face dataset once via hf-hub, save as local
 //! line-based text so training never re-downloads.
 
 use anyhow::{Context, Result};
@@ -20,7 +20,7 @@ const MAX_PARAGRAPH_CHARS: usize = 50_000;
 
 /// English Wikipedia subset on Hugging Face (wikimedia/wikipedia): only parquet files under this path are used.
 const WIKIPEDIA_EN_SUBSET: &str = "20231101.en/";
-/// Same revision candle-datasets uses for parquet datasets.
+/// Hugging Face revision for converted parquet datasets.
 const PARQUET_REVISION: &str = "refs/convert/parquet";
 const ULTRACHAT_DATASET_ID: &str = "HuggingFaceH4/ultrachat_200k";
 
@@ -74,6 +74,36 @@ fn wikipedia_english_parquet_readers(
     Ok(readers)
 }
 
+/// Open all converted parquet readers for a dataset on the Hugging Face Hub.
+fn parquet_readers_from_hub(
+    api: &hf_hub::api::sync::Api,
+    dataset_id: &str,
+) -> Result<Vec<SerializedFileReader<File>>> {
+    use hf_hub::{Repo, RepoType};
+
+    let repo = Repo::with_revision(
+        dataset_id.to_string(),
+        RepoType::Dataset,
+        PARQUET_REVISION.to_string(),
+    );
+    let api_repo = api.repo(repo);
+    let info = api_repo
+        .info()
+        .map_err(|e| anyhow::anyhow!("hub info: {}", e))?;
+
+    info.siblings
+        .into_iter()
+        .filter(|s| s.rfilename.ends_with(".parquet"))
+        .map(|s| {
+            let local_path = api_repo
+                .get(&s.rfilename)
+                .map_err(|e| anyhow::anyhow!("hub get: {}", e))?;
+            let file = File::open(local_path).context("open parquet file")?;
+            SerializedFileReader::new(file).context("parquet reader")
+        })
+        .collect()
+}
+
 /// Ensure the Hugging Face dataset is available as a local text file.
 /// If `cache_dir/cached_<id>.txt` already exists, return that path (no download).
 /// Otherwise download via hf-hub (cached by hf-hub), convert parquet rows to
@@ -97,8 +127,7 @@ pub fn ensure_hub_dataset_cached(dataset_id: &str, cache_dir: &Path) -> Result<P
     );
 
     let api = hf_hub::api::sync::Api::new().context("hf-hub API")?;
-    let readers = candle_datasets::hub::from_hub(&api, dataset_id.to_string())
-        .map_err(|e| anyhow::anyhow!("hub: {}", e))?;
+    let readers = parquet_readers_from_hub(&api, dataset_id)?;
 
     if readers.is_empty() {
         anyhow::bail!("dataset '{}' has no parquet files", dataset_id);
@@ -281,8 +310,7 @@ pub fn prepare_ultrachat_pairs(
     max_rows: Option<usize>,
 ) -> Result<usize> {
     let api = hf_hub::api::sync::Api::new().context("hf-hub API")?;
-    let readers = candle_datasets::hub::from_hub(&api, ULTRACHAT_DATASET_ID.to_string())
-        .map_err(|e| anyhow::anyhow!("hub: {}", e))?;
+    let readers = parquet_readers_from_hub(&api, ULTRACHAT_DATASET_ID)?;
     if readers.is_empty() {
         anyhow::bail!("dataset '{}' has no parquet files", ULTRACHAT_DATASET_ID);
     }

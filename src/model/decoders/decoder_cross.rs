@@ -5,7 +5,7 @@ use anyhow::Context;
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::model::attention::{
     positional_encoding, positional_encoding_from, AttentionKvCache, CrossAttention,
@@ -471,8 +471,8 @@ impl CodeDecoder {
                 .map(|&logit| (logit - max_logit).exp())
                 .collect::<Vec<_>>();
             let total = weights.iter().sum::<f32>().max(1e-8);
-            let mut rng = rand::thread_rng();
-            let r: f32 = rng.gen();
+            let mut rng = rand::rng();
+            let r: f32 = rng.random();
             let mut cum = 0.0f32;
             let mut chosen = 0u32;
             for (i, &w) in weights.iter().enumerate() {
