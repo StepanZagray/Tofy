@@ -31,6 +31,7 @@ pub fn resolve_data_path(data_arg: &str) -> Result<ResolvedDataPath> {
 pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
+    eprintln!("    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]]");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );
@@ -71,9 +72,9 @@ pub fn print_usage(program: &str) {
         "    {program} --eval-world <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots]"
     );
     eprintln!(
-        "    {program} --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning]"
+        "    {program} --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning]"
     );
     eprintln!(
-        "    {program} --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <path>] [--debug]"
+        "    {program} --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--debug]"
     );
 }

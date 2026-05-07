@@ -2,6 +2,7 @@ pub mod cache;
 pub mod eval;
 pub mod latent;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod prepare;
 pub mod serve;
 pub mod world;

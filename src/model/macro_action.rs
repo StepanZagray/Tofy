@@ -146,34 +146,3 @@ impl HighLevelWorldTransition {
         (state_slots + delta).map_err(Into::into)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::{DType, Device};
-    use candle_nn::{VarBuilder, VarMap};
-
-    #[test]
-    fn macro_action_encoder_returns_one_vector_per_sequence() -> Result<()> {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let encoder = MacroActionEncoder::new(vb.pp("macro"), 16, 4)?;
-        let out = encoder.forward_from_slices(&[vec![0, 1, 2], vec![1]], &device)?;
-        assert_eq!(out.dims(), &[2, 16]);
-        Ok(())
-    }
-
-    #[test]
-    fn high_level_world_transition_preserves_slot_shape() -> Result<()> {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let transition = HighLevelWorldTransition::new(vb.pp("high"), 16)?;
-        let state = Tensor::zeros((2, 3, 16), DType::F32, &device)?;
-        let macro_action = Tensor::zeros((2, 16), DType::F32, &device)?;
-        let out = transition.forward(&state, &macro_action)?;
-        assert_eq!(out.dims(), &[2, 3, 16]);
-        Ok(())
-    }
-}

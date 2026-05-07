@@ -2,7 +2,7 @@
 
 OOM behavior is not a compiler property and not a normal unit-test property. It depends on the GPU, driver, CUDA allocator, dtype, exact batch shape, sequence length, and how long the training loop runs.
 
-Use `runtime_smoke_tests.sh` for correctness smoke. Use `cargo run --release -- --sustained-oom-probe ...` for VRAM/batch decisions.
+Use short manual `cargo run --release -- ...` stages when you need a quick correctness smoke. Use `cargo run --release -- --sustained-oom-probe ...` for VRAM and batch decisions.
 
 ## Trusted Probe
 
@@ -49,21 +49,20 @@ Latent only:
 cargo run --release -- --sustained-oom-probe --stage latent
 ```
 
-To validate the probe script itself without doing a real memory decision:
+To validate the `--sustained-oom-probe` implementation itself without doing a real memory decision:
 
 ```bash
 cargo run --release -- --sustained-oom-probe --stage all --quick
 ```
 
-Treat `--quick` as a script smoke test only.
+Treat `--quick` as a shallow sanity check only.
 
 ## 80 GB Cloud Profile Probe
 
-The 10x code-first cloud wrapper can run the sustained probe before launching
-the long pipeline:
+Run the sustained probe manually before launching the long 80 GB pipeline:
 
 ```bash
-TOFY_80GB_OOM_PROBE=1 ./scripts/train_code_first_poc_80gb.sh
+cargo run --release -- --sustained-oom-probe --stage all --dim 2048 --layers 7 --heads 16 --bridge-dim 2048 --planner-slots 128 --decoder-max-vocab 32000
 ```
 
 That profile uses `DIM=2048`, `BRIDGE_DIM=2048`, `LAYERS=7`, `HEADS=16`,
@@ -74,11 +73,10 @@ That profile uses `DIM=2048`, `BRIDGE_DIM=2048`, `LAYERS=7`, `HEADS=16`,
 
 ## 48 GB A40 Profile Probe
 
-The smaller A40 test wrapper can run the sustained probe before launching the
-long pipeline:
+Run the sustained probe manually before launching the long 48 GB pipeline:
 
 ```bash
-TOFY_48GB_OOM_PROBE=1 ./scripts/train_code_first_poc_48gb.sh
+cargo run --release -- --sustained-oom-probe --stage all --dim 1536 --layers 7 --heads 12 --bridge-dim 1536 --planner-slots 96 --decoder-max-vocab 24000
 ```
 
 That profile uses `DIM=1536`, `BRIDGE_DIM=1536`, `LAYERS=7`, `HEADS=12`,
@@ -89,13 +87,11 @@ That profile uses `DIM=1536`, `BRIDGE_DIM=1536`, `LAYERS=7`, `HEADS=12`,
 
 ## High-Level World Stage
 
-`HIGH_WORLD_STEPS=0` by default, so existing OOM probes do not include the HWM
-stage. When enabling HWM on a cloud run, first probe the base world and decoder
-profile, then run a tiny high-world smoke such as:
-
-```bash
-HIGH_WORLD_STEPS=10 ./scripts/train_code_first_poc_48gb.sh
-```
+HWM is part of the standard training pipeline. The profile defaults train the
+high-world stage after the low-level world model: `12000` steps for `8gb`,
+`36000` for `48gb`, and `120000` for `80gb`. It is not toggled on separately:
+the model uses the high-world checkpoint automatically when the profile run
+creates it.
 
 The high-level world model reuses frozen encoder/planner memory and trains only
 the macro-action encoder plus high-level transition, so it should be smaller

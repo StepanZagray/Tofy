@@ -6,8 +6,8 @@ Update the **Best So Far** section when a run improves on a reported metric. Rec
 
 These best metrics were produced before the strict LeJEPA default rewrite. Treat them as legacy baselines until a strict run reports better metrics with its exact command.
 
-- **World transition selection score:** `0.0041821287` at step `17000/60000` on `data/world_mix_pairs.txt` validation stream, logged peak VRAM `7280/8151 MB` — legacy `./scripts/train_code_first_poc.sh` run with `DIM=640`, `LAYERS=7`, `HEADS=8`, `WORLD_BATCH=128`, `WORLD_GRAD_ACCUM=1`, `TOFY_TRAIN_DTYPE=bf16`. This is not the current default 8 GB schedule.
-- **World training throughput:** `1.2209 steps/s` (`0.8191 s/step`) over logged steps `18000 -> 21000` on `data/world_mix_pairs.txt`, batch `128x1`, from `runs/code_poc_2026-04-21_21-50-54/world/events.out.tfevents.1776804849.zephyrus.25746.0`. This is about `1.98x` faster than `0.6170 steps/s` (`1.6208 s/step`) from `runs/code_poc_2026-04-20_22-32-35/world/events.out.tfevents.1776732255.zephyrus.86212.0` with the same world shape. Command: `TOFY_RESUME=1 ./scripts/train_code_first_poc.sh` (world stage invoked `target/release/jepa_ai --train-world local_models/model_latent_39.53M.safetensors local_models/model_latent_39.53M.vocab.txt data/world_mix_pairs.txt 60000 128 640 256 7 8 640 64 --lambda 0.2 --lr 2e-4 --grad-accum 1 --action-loss-weight 1.0 --router-warmup 5000 --resume`) with default token-cache prefetch enabled (`TOFY_CACHE_PREFETCH_BATCHES` unset, default `2`; `TOFY_TOKEN_CACHE_READER_MB` unset, default `8`).
+- **World transition selection score:** `0.0041821287` at step `17000/60000` on `data/world_mix_pairs.txt` validation stream, logged peak VRAM `7280/8151 MB` — legacy pre-CLI run with `DIM=640`, `LAYERS=7`, `HEADS=8`, `WORLD_BATCH=128`, `WORLD_GRAD_ACCUM=1`, `TOFY_TRAIN_DTYPE=bf16`. This is not the current default 8 GB schedule.
+- **World training throughput:** `1.2209 steps/s` (`0.8191 s/step`) over logged steps `18000 -> 21000` on `data/world_mix_pairs.txt`, batch `128x1`, from `runs/code_poc_2026-04-21_21-50-54/world/events.out.tfevents.1776804849.zephyrus.25746.0`. This is about `1.98x` faster than `0.6170 steps/s` (`1.6208 s/step`) from `runs/code_poc_2026-04-20_22-32-35/world/events.out.tfevents.1776732255.zephyrus.86212.0` with the same world shape. Command: legacy pre-CLI resume run whose world stage invoked `target/release/jepa_ai --train-world local_models/model_latent_39.53M.safetensors local_models/model_latent_39.53M.vocab.txt data/world_mix_pairs.txt 60000 128 640 256 7 8 640 64 --lambda 0.2 --lr 2e-4 --grad-accum 1 --action-loss-weight 1.0 --router-warmup 5000 --resume`, with default token-cache prefetch enabled (`TOFY_CACHE_PREFETCH_BATCHES` unset, default `2`; `TOFY_TOKEN_CACHE_READER_MB` unset, default `8`).
 - **Zero-conditioned code decoder constraint pass rate:** `0.3000` (`3/10`) with `suite_pass_rate=0.0000`, `compile_rate=0.0000`, and `route_code_acc=1.0000` on `eval/code_assistant_rust_hard.jsonl`, from `runs/code_eval/1776932354`. This used the current 68.50M code decoder with the planner/world conditioning vector filled with zeros; passing constraints were `merge_intervals`, `top_k_words`, and `compact_sorted_numbers`, but none compiled. Command: `cargo run --release -- --eval-code-assistant local_models/model_latent_39.53M.safetensors local_models/model_latent_39.53M.vocab.txt local_models/model_world_13.58M.safetensors eval/code_assistant_rust_hard.jsonl 384 640 256 7 8 640 64 --code-decoder local_models/code_decoder_poc_68.50M.safetensors --ablate-conditioning`.
 
 ## Observed Baseline Runs
@@ -24,17 +24,17 @@ These were existing TensorBoard runs in `runs/` before the current training-code
 - The default training objective is now LeJEPA/LeWorldModel-style: online masked-view prediction plus SIGReg for the encoder, action-conditioned next-latent prediction plus SIGReg for the world model, `TOFY_SIGREG_SLICES=1024`, no EMA target update, no detached teacher, no contrastive auxiliary, no predictor heads, no world action/inverse loss by default, and no decoder syntax/signature/structure auxiliaries unless explicitly re-enabled.
 - Encoder masking now enforces a non-trivial minimum target fraction and uses paired augmented views for chunk/global targets.
 - World-model training still logs router/action diagnostics when the heads are present, but strict checkpoint selection is based on transition/SIGReg rather than router or inverse-action losses.
-- The full pipeline now prepares a mixed world dataset by default and gives the text decoder a larger default vocab budget.
+- The Rust `train <8gb|48gb|80gb>` pipeline now prepares the mixed world/code datasets by default and is the canonical full training path.
 - The repo now has a hard code-first eval suite at `eval/code_assistant_rust_hard.jsonl` plus `--eval-code-assistant` for end-to-end proof-of-concept scoring.
 - Latent, world, and decoder training now support `--grad-accum <int>` so effective batch size can grow on 8 GB GPUs without increasing microbatch memory.
-- `scripts/train_code_first_poc.sh` now defines the narrow proof-of-concept path: strict encoder -> strict world transition -> downstream code decoder -> hard Rust eval suite.
+- `cargo run --release -- train 8gb` now defines the canonical path: strict encoder -> strict world transition -> integrated high-world transition -> downstream code decoder -> hard Rust eval suite.
 - The code-first pipeline now generates compiler-feedback Rust repair rows when `rustc` is available, mixes them into both world/code data as code-route examples, and uses tool/context tags while preserving three-action checkpoint compatibility.
-- Pipeline scripts now save stage checkpoints and logs inside run-owned directories under `runs/` and resume by explicit run id or `latest`, which prevents stale checkpoints from unrelated runs being reused.
+- The Rust pipeline saves stage checkpoints inside run-owned directories under `runs/` and resumes by explicit run id or `latest`, which prevents stale checkpoints from unrelated runs being reused.
 - Tokenization and token caching now use an explicit tokenizer-spec fingerprint plus UTF-8 byte fallback, so tokenizer/cache invalidation is tied to tokenizer behavior rather than only source hashes and mode names.
 
 ## OOM Testing Notes
 
-CUDA OOM checks should use the real release binary, not `cargo check`, because the memory failure happens at runtime after Candle builds CUDA tensors. Use short training runs with the same dtype, sequence length, segmentation settings, and dimensions as the intended pipeline. Preserve existing `local_models/` artifacts before probes, because smoke runs save checkpoints and vocab files.
+CUDA OOM checks should use the real release binary, not `cargo check`, because the memory failure happens at runtime after Candle builds CUDA tensors. The repo does not ship bash wrappers; call `./target/release/jepa_ai` or `cargo run --release -- …` directly. Use short training runs with the same dtype, sequence length, segmentation settings, and dimensions as the intended pipeline. Preserve existing `local_models/` artifacts before probes, because smoke runs save checkpoints and vocab files.
 
 Current 8 GB RTX 5060 measurements:
 
@@ -52,11 +52,7 @@ Current default batch schedules for the 8 GB profile:
 Short full-pipeline smoke pass:
 
 ```bash
-TOFY_RESUME=1 WORLD_STEPS=8000 ROUTER_STEPS=1 CODE_DECODER_STEPS=1 CODE_POLISH_STEPS=1 \
-WORLD_MODEL=local_models/tmp_pipeline_world.safetensors \
-CODE_DECODER_OUTPUT=local_models/tmp_code_decoder_poc.safetensors \
-PIPELINE_RUN_ID=code_poc_smoke_6x4_2026-04-18_06-22-04 \
-./scripts/train_code_first_poc.sh
+cargo run --release -- train 8gb --resume latest
 ```
 
 This completed all stages through `--eval-code-assistant` with the temporary world/decoder outputs and the previous 82.85M `6x4` decoder schedule. It is a pipeline/runtime smoke pass, not a quality result.

@@ -716,7 +716,7 @@ impl ServeConfig {
         }
         if positional.len() < 3 {
             bail!(
-                "usage: --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <path>] [--debug]"
+                "usage: --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--debug]"
             );
         }
         Ok(Self {

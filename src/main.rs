@@ -18,6 +18,9 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
+    if tasks::pipeline::try_run_pipeline(&args)? {
+        return Ok(());
+    }
     if tasks::latent::try_run_prepare_ultrachat(&args)? {
         return Ok(());
     }
@@ -58,6 +61,6 @@ fn main() -> Result<()> {
     let program = args.first().map(String::as_str).unwrap_or("jepa_ai");
     cli::print_usage(program);
     bail!(
-        "specify a mode: --prepare-ultrachat / --prepare-encoder-corpus / --prepare-github-top-code / --prepare-rust-function-tasks / --prepare-rust-repair-tasks / --prepare-world-mix / --prepare-code-poc-mix / --prepare-expert-pairs / --prepare-casual-conversation / --generate-code-eval-suite / --convert-jsonl-context-response-to-tsv / --check-dtype-discipline / --sustained-oom-probe / --prepare-pipeline-cache / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-high-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --serve"
+        "specify a mode: train / --prepare-ultrachat / --prepare-encoder-corpus / --prepare-github-top-code / --prepare-rust-function-tasks / --prepare-rust-repair-tasks / --prepare-world-mix / --prepare-code-poc-mix / --prepare-expert-pairs / --prepare-casual-conversation / --generate-code-eval-suite / --convert-jsonl-context-response-to-tsv / --check-dtype-discipline / --sustained-oom-probe / --prepare-pipeline-cache / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-high-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --serve"
     );
 }

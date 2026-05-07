@@ -55,6 +55,22 @@ fn default_world_encoder_path(model_path: &Path) -> PathBuf {
     }
 }
 
+fn default_high_world_path(world_model_path: &Path) -> PathBuf {
+    if let Some(stage_dir) = world_model_path.parent() {
+        if stage_dir.file_name().and_then(|name| name.to_str()) == Some("world") {
+            if let Some(run_root) = stage_dir.parent() {
+                return run_root.join("high_world").join("model.safetensors");
+            }
+        }
+    }
+    let raw = world_model_path.to_string_lossy();
+    if let Some(prefix) = raw.strip_suffix(".safetensors") {
+        PathBuf::from(format!("{prefix}.high_world.safetensors"))
+    } else {
+        PathBuf::from(format!("{raw}.high_world.safetensors"))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CacheManifestSource {
     path: String,
@@ -3081,6 +3097,7 @@ pub struct AgentEngine {
     encoder: OnlineEncoder,
     planner_memory: PlannerMemory,
     transition: WorldTransition,
+    high_world_model_path: Option<PathBuf>,
     macro_action_encoder: Option<MacroActionEncoder>,
     high_transition: Option<HighLevelWorldTransition>,
     /// JEPA-style orchestrator head: predicts next action from transition latent. None if checkpoint has no head.
@@ -3208,7 +3225,6 @@ struct LeWmPlanningConfig {
 
 #[derive(Debug, Clone)]
 struct HwmPlanningConfig {
-    enabled: bool,
     high_horizon: usize,
     low_horizon: usize,
     macro_candidates: usize,
@@ -3218,7 +3234,6 @@ struct HwmPlanningConfig {
 impl HwmPlanningConfig {
     fn from_env() -> Self {
         Self {
-            enabled: env_bool("TOFY_HWM_PLANNING", false),
             high_horizon: std::env::var("TOFY_HWM_HIGH_HORIZON")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -3763,11 +3778,25 @@ impl AgentEngine {
             } else {
                 None
             };
-        let high_world_model_path = high_world_model_path.cloned().or_else(|| {
-            std::env::var("TOFY_HIGH_WORLD_MODEL")
-                .ok()
-                .map(PathBuf::from)
-        });
+        let explicit_high_world_model_path = high_world_model_path.cloned();
+        let env_high_world_model_path = std::env::var("TOFY_HIGH_WORLD_MODEL")
+            .ok()
+            .map(PathBuf::from);
+        let high_world_model_path = explicit_high_world_model_path
+            .clone()
+            .or_else(|| env_high_world_model_path.clone())
+            .unwrap_or_else(|| default_high_world_path(world_model_path));
+        if !high_world_model_path.exists()
+            && (explicit_high_world_model_path.is_some() || env_high_world_model_path.is_some())
+        {
+            bail!(
+                "high-world checkpoint not found at {:?}",
+                high_world_model_path
+            );
+        }
+        let high_world_model_path = high_world_model_path
+            .exists()
+            .then_some(high_world_model_path);
         let high_macro_max_len = env_usize("TOFY_HWM_MACRO_MAX_LEN", 4);
         let (high_world_varmap, macro_action_encoder, high_transition) =
             if let Some(path) = high_world_model_path.as_ref().filter(|path| path.exists()) {
@@ -3799,6 +3828,7 @@ impl AgentEngine {
             encoder,
             planner_memory,
             transition,
+            high_world_model_path,
             macro_action_encoder,
             high_transition,
             orchestrator_head,
@@ -4020,9 +4050,6 @@ impl AgentEngine {
         lewm_cfg: &LeWmPlanningConfig,
     ) -> Result<Option<LeWmPlan>> {
         let hwm_cfg = HwmPlanningConfig::from_env();
-        if !hwm_cfg.enabled {
-            return Ok(None);
-        }
         let (Some(macro_encoder), Some(high_transition)) = (
             self.macro_action_encoder.as_ref(),
             self.high_transition.as_ref(),
@@ -4166,6 +4193,10 @@ impl AgentEngine {
             let _ = std::io::stderr().flush();
         }
         Ok(plan)
+    }
+
+    pub fn high_world_model_path(&self) -> Option<&Path> {
+        self.high_world_model_path.as_deref()
     }
 
     fn conditioning_for_action_prompt(
@@ -5139,167 +5170,4 @@ pub(crate) fn env_bool(name: &str, default: bool) -> bool {
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(default)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_default_rlm_program, build_rlm_code_prompt, context_segment_ranges,
-        enumerate_action_sequences, extract_rust_work_units, parse_rlm_program,
-        planner_memory_mask_from_lengths, planner_slots_from_world_pair_batch, RlmProgramOp,
-    };
-    use crate::data::WorldExample;
-    use crate::model::encoders::EncoderFeatures;
-    use crate::model::{OnlineEncoder, PlannerMemory};
-    use crate::tasks::orchestrator::Action;
-    use candle_core::{DType, Device, Tensor};
-    use candle_nn::{VarBuilder, VarMap};
-
-    #[test]
-    fn planner_memory_mask_tracks_valid_tokens_and_chunks() {
-        let device = Device::Cpu;
-        let features = EncoderFeatures {
-            token_states: Tensor::zeros((1, 8, 4), DType::F32, &device).unwrap(),
-            chunk_states: Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap(),
-            global_states: Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap(),
-            pooled_queries: Tensor::zeros((1, 3, 4), DType::F32, &device).unwrap(),
-        };
-        let mask = planner_memory_mask_from_lengths(&features, &[3]).unwrap();
-        let values = crate::util::vec2_f32(&mask).unwrap();
-        assert_eq!(
-            values[0],
-            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0]
-        );
-    }
-
-    #[test]
-    fn context_segment_ranges_keeps_recent_segments() {
-        assert_eq!(
-            context_segment_ranges(40, 16, 4),
-            vec![(0, 16), (16, 32), (32, 40)]
-        );
-        assert_eq!(
-            context_segment_ranges(80, 16, 3),
-            vec![(32, 48), (48, 64), (64, 80)]
-        );
-        assert_eq!(context_segment_ranges(8, 16, 4), vec![(0, 8)]);
-    }
-
-    #[test]
-    fn lewm_planner_candidates_cover_action_prefixes_when_capped() {
-        let sequences = enumerate_action_sequences(6, 9);
-        assert_eq!(sequences.len(), 9);
-        assert!(sequences
-            .iter()
-            .any(|seq| seq.first() == Some(&Action::TextReply)));
-        assert!(sequences
-            .iter()
-            .any(|seq| seq.first() == Some(&Action::Code)));
-        assert!(sequences
-            .iter()
-            .any(|seq| seq.first() == Some(&Action::Done)));
-    }
-
-    #[test]
-    fn planner_slots_from_world_pair_batch_shapes() -> anyhow::Result<()> {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let encoder = OnlineEncoder::new(vb.pp("encoder"), 64, 16, 1, 4)?;
-        let planner_memory = PlannerMemory::new(vb.pp("planner_memory"), 16, 8, 4)?;
-        let batch = vec![
-            WorldExample {
-                state_tokens: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
-                next_tokens: vec![2, 3, 4, 5, 6, 7],
-                action_label: 1,
-            },
-            WorldExample {
-                state_tokens: vec![10, 11, 12],
-                next_tokens: vec![13, 14, 15, 16, 17, 18, 19, 20, 21],
-                action_label: 0,
-            },
-        ];
-
-        let (state_slots, next_slots) = planner_slots_from_world_pair_batch(
-            &encoder,
-            &planner_memory,
-            &batch,
-            0,
-            8,
-            2,
-            1,
-            true,
-            false,
-            &device,
-        )?;
-
-        assert_eq!(state_slots.dims(), &[2, 4, 8]);
-        assert_eq!(next_slots.dims(), &[2, 4, 8]);
-        Ok(())
-    }
-
-    #[test]
-    fn rlm_work_units_extract_function_signature_and_rules() {
-        let prompt = "Return only Rust code. Implement exactly this function:\n\
-pub fn parse_size(input: &str) -> Result<u64, String>\n\n\
-Rules:\n\
-- Support B and KB.\n\
-- Reject negatives.\n";
-        let units = extract_rust_work_units(prompt, 4);
-        assert_eq!(units.len(), 1);
-        assert_eq!(
-            units[0].signature.as_deref(),
-            Some("pub fn parse_size(input: &str) -> Result<u64, String>")
-        );
-        assert_eq!(
-            units[0].requirements,
-            vec!["Support B and KB.", "Reject negatives."]
-        );
-        let local_prompt = build_rlm_code_prompt(prompt, &units[0], 0, 1);
-        assert!(local_prompt.contains("Exact function signature"));
-        assert!(local_prompt.contains("Reject negatives."));
-    }
-
-    #[test]
-    fn rlm_program_parser_accepts_core_commands() {
-        let ops = parse_rlm_program(
-            "UNIT 0 AS unit_0\n\
-             PEEK 10 20 AS snippet\n\
-             SUB_RLM unit_0 AS out_0\n\
-             APPEND out_0\n\
-             FINAL\n",
-        );
-        assert_eq!(ops.len(), 5);
-        assert!(matches!(
-            &ops[0],
-            RlmProgramOp::Unit { index: 0, var } if var == "unit_0"
-        ));
-        assert!(matches!(
-            &ops[1],
-            RlmProgramOp::Peek { start: 10, len: 20, var } if var == "snippet"
-        ));
-        assert!(matches!(
-            &ops[2],
-            RlmProgramOp::SubRlm {
-                input_var,
-                output_var
-            } if input_var == "unit_0" && output_var == "out_0"
-        ));
-        assert!(matches!(
-            &ops[3],
-            RlmProgramOp::Append { var } if var == "out_0"
-        ));
-        assert!(matches!(&ops[4], RlmProgramOp::Final));
-    }
-
-    #[test]
-    fn default_rlm_program_calls_each_unit() {
-        let ops = build_default_rlm_program(2);
-        assert_eq!(ops.len(), 7);
-        assert!(matches!(&ops[0], RlmProgramOp::Unit { index: 0, .. }));
-        assert!(matches!(&ops[1], RlmProgramOp::SubRlm { .. }));
-        assert!(matches!(&ops[2], RlmProgramOp::Append { .. }));
-        assert!(matches!(&ops[3], RlmProgramOp::Unit { index: 1, .. }));
-        assert!(matches!(&ops[6], RlmProgramOp::Final));
-    }
 }

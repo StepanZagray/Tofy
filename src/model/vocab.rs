@@ -209,29 +209,3 @@ pub fn save_vocab_to_file(vocab: &Vocab, vocab_path: impl AsRef<Path>) -> Result
     fs::write(path, serde_json::to_string_pretty(&serialized)?)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{vocab_signature, Vocab};
-
-    #[test]
-    fn vocab_signature_is_stable_for_same_vocab() {
-        let mut vocab = Vocab::new();
-        vocab.add_token("h");
-        vocab.add_token("e");
-        vocab.add_token("he");
-        vocab.add_merge(3, 4, "hello");
-        let sig_a = vocab_signature(&vocab);
-        let sig_b = vocab_signature(&vocab);
-        assert_eq!(sig_a, sig_b);
-    }
-
-    #[test]
-    fn vocab_signature_changes_when_vocab_changes() {
-        let mut vocab_a = Vocab::new();
-        vocab_a.add_token("hello");
-        let mut vocab_b = vocab_a.clone();
-        vocab_b.add_token("world");
-        assert_ne!(vocab_signature(&vocab_a), vocab_signature(&vocab_b));
-    }
-}

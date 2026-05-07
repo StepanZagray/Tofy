@@ -124,7 +124,7 @@ impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>]"
+                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>]"
             );
         }
         let mut filtered = Vec::new();
@@ -265,19 +265,10 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     println!("suite: {:?}", cfg.suite_path);
     println!("tasks: {}", tasks.len());
     println!("run dir: {}", run_dir);
-    println!(
-        "high_world: {}",
-        cfg.high_world_model_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| {
-                std::env::var("TOFY_HIGH_WORLD_MODEL").unwrap_or_else(|_| "disabled".to_string())
-            })
-    );
-    println!(
-        "hwm_planning: {}",
-        std::env::var("TOFY_HWM_PLANNING").unwrap_or_else(|_| "0".to_string())
-    );
+    match engine.high_world_model_path() {
+        Some(path) => println!("high_world: integrated planner {}", path.display()),
+        None => println!("high_world: unavailable; train the integrated high-world stage"),
+    }
     println!(
         "search: candidates={} repair_attempts={}",
         cfg.candidates, cfg.repair_attempts
@@ -508,8 +499,8 @@ fn action_name(action: Action) -> &'static str {
 
 fn preview_text(text: &str, max_chars: usize) -> String {
     let mut out = text.replace('\n', "\\n");
-    if out.len() > max_chars {
-        out.truncate(max_chars);
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
         out.push_str("...");
     }
     out

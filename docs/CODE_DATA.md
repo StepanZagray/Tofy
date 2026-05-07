@@ -1,6 +1,6 @@
 # Code training data
 
-Scripts and formats for code-focused training. Output is `context<TAB>completion`; fields are escaped onto one physical line so multiline code survives without breaking the TSV reader. Use with `--train-world` and `--train-decoder --decoder-kind code` (see [RUNBOOK.md](RUNBOOK.md)).
+CLI preparation commands and formats for code-focused training. Output is `context<TAB>completion`; fields are escaped onto one physical line so multiline code survives without breaking the TSV reader. Use with `--train-world` and `--train-decoder --decoder-kind code` (see [RUNBOOK.md](RUNBOOK.md)).
 
 ## GitHub Top Code (ronantakizawa/github-top-code)
 
@@ -39,7 +39,7 @@ cargo run --release -- --train-world local_models/model_latent_<size>.safetensor
 cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 160 --decoder-kind code --decoder-max-vocab 16000 --decoder-output local_models/code_decoder_90M.safetensors
 ```
 
-For the router/orchestrator, prefer a chat+code mix instead of code-only or chat-only data. The mix script now writes explicit action labels and synthetic terminal `done` rows:
+For the router/orchestrator, prefer a chat+code mix instead of code-only or chat-only data. `--prepare-world-mix` writes explicit action labels and synthetic terminal `done` rows:
 
 ```bash
 cargo run --release -- --prepare-world-mix --output data/world_mix_pairs.txt --text-pairs data/ultrachat_pairs.txt --code-pairs data/multilang_pairs.txt --code-ratio 0.35 --done-ratio 0.18

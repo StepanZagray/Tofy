@@ -15,7 +15,8 @@ The runtime architecture above is now reflected more directly in the crate struc
 - [`src/config/latent.rs`](../src/config/latent.rs) contains latent train/eval configs.
 - [`src/config/world.rs`](../src/config/world.rs) contains world, orchestrator, decoder, eval, and serve configs.
 - [`src/tasks/latent.rs`](../src/tasks/latent.rs) implements the latent train/eval path.
-- [`src/tasks/world.rs`](../src/tasks/world.rs) implements the world/orchestrator/decoder train path and runtime engine.
+- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) wires the canonical `train` pipeline: data prep and caches, encoder, world, high-world, code decoder (+ polish), and the hard Rust code eval stage.
+- [`src/tasks/world.rs`](../src/tasks/world.rs) implements the world/high-world/orchestrator/decoder train paths and runtime engine.
 - [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) contains shared world/decoder metric and masking helpers that used to live inline in `world.rs`.
 
 This means the codebase now separates:
@@ -85,19 +86,19 @@ The encoder output is not passed directly to the decoders. Instead:
 1. the encoder produces token/chunk/global states
 2. planner memory compresses them into `num_latent_tokens` planner slots
 3. the low-level action-conditioned transition model predicts the **next** planner state for a candidate primitive action
-4. optionally, a high-level world model predicts longer-range planner states from macro-actions encoded from primitive action spans
+4. a high-level world model predicts longer-range planner states from macro-actions encoded from primitive action spans
 5. optional downstream router/orchestrator heads can choose `TextReply`, `Code`, or `Done` for compatibility, but they are not part of the strict world objective
 
 So after the encoder stage, the conversation is represented as a small latent memory rather than a long token sequence.
 
 This is important because the model does **not** work like a normal single LLM with one giant KV-cache over the whole dialog. The shared conversation context is compressed into planner slots first.
 
-The optional high-level world model follows the Hierarchical Planning with
+The integrated high-level world model follows the Hierarchical Planning with
 Latent World Models idea: it operates in the same planner-slot latent space as
 the low-level world model, but conditions on a learned macro-action vector
-instead of one primitive action id. At inference, HWM planning can first choose a
-macro-action subgoal, then use the low-level transition model to choose the
-first primitive action toward that subgoal.
+instead of one primitive action id. At inference, HWM planning chooses a
+macro-action subgoal first, then uses the low-level transition model to choose
+the first primitive action toward that subgoal.
 
 ### 3. Decoder context at inference
 

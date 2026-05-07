@@ -295,6 +295,11 @@ pub async fn run(
         num_latent_tokens,
     )
     .context("load world model for server")?;
+    if let Some(path) = engine.high_world_model_path() {
+        tracing::info!("Integrated high-world planner: {}", path.display());
+    } else {
+        tracing::warn!("Integrated high-world planner checkpoint was not found");
+    }
 
     let state = std::sync::Arc::new(Mutex::new(engine));
 
