@@ -177,6 +177,7 @@ pub struct VocabStats {
 pub const ACTION_TEXT_REPLY: u32 = 0;
 pub const ACTION_CODE: u32 = 1;
 pub const ACTION_DONE: u32 = 2;
+pub const ACTION_FETCH_DOCS: u32 = 3;
 pub const DONE_SENTINEL: &str = "<done>";
 
 fn parse_action_label_str(value: &str) -> Option<u32> {
@@ -185,6 +186,9 @@ fn parse_action_label_str(value: &str) -> Option<u32> {
         "1" | "code" | "inspect_file" | "read_file" | "edit_file" | "apply_patch" | "run_tests"
         | "read_error" | "repair_patch" | "compiler_feedback" => Some(ACTION_CODE),
         "2" | "done" | "final" | "finalize" | "stop" => Some(ACTION_DONE),
+        "3" | "fetch_docs" | "docs" | "rust_docs" | "retrieve_docs" | "doc_lookup" => {
+            Some(ACTION_FETCH_DOCS)
+        }
         _ => None,
     }
 }
@@ -218,7 +222,8 @@ fn parse_world_line_fields(line: &str) -> Option<(String, String, Option<u32>)> 
     None
 }
 
-/// Heuristic action label for orchestrator training: 0 = TextReply, 1 = Code, 2 = Done.
+/// Heuristic action label for orchestrator training:
+/// 0 = TextReply, 1 = Code, 2 = Done, 3 = FetchDocs.
 /// Used when building world examples from raw text (next turn string).
 pub fn action_label_heuristic(next_turn: &str) -> u32 {
     let s = next_turn.trim();
@@ -235,6 +240,12 @@ pub fn action_label_heuristic(next_turn: &str) -> u32 {
         return ACTION_CODE; // code block
     }
     let lower = s.to_ascii_lowercase();
+    if lower.contains("<ctx:rust_docs>")
+        || lower.contains("<tool:fetch_docs>")
+        || lower.contains("<action:fetch_docs>")
+    {
+        return ACTION_FETCH_DOCS;
+    }
     let code_keywords = [
         "fn ",
         "let ",
@@ -324,7 +335,7 @@ pub fn action_label_heuristic(next_turn: &str) -> u32 {
 pub struct WorldExample {
     pub state_tokens: Vec<u32>,
     pub next_tokens: Vec<u32>,
-    /// 0 = TextReply, 1 = Code, 2 = Done.
+    /// 0 = TextReply, 1 = Code, 2 = Done, 3 = FetchDocs.
     pub action_label: u32,
 }
 

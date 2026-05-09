@@ -1,7 +1,7 @@
 //! Orchestrator: chooses the next high-level action for the current reply.
 //!
 //! Tofy only exposes actions that the runtime can actually execute:
-//! `text_reply`, `code`, and `done`.
+//! `text_reply`, `code`, `done`, and `fetch_docs`.
 
 /// Actions the agent can take. Decoder prompt uses the string (e.g. "Action=code").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +12,8 @@ pub enum Action {
     Code,
     /// Terminal action: no further reply content should be produced.
     Done,
+    /// Retrieve Rust documentation before generating code.
+    FetchDocs,
 }
 
 impl Action {
@@ -20,17 +22,20 @@ impl Action {
             Action::TextReply => "text_reply",
             Action::Code => "code",
             Action::Done => "done",
+            Action::FetchDocs => "fetch_docs",
         }
     }
 }
 
-/// Maps orchestrator head output index to Action. Indices: 0=TextReply, 1=Code, 2=Done.
+/// Maps orchestrator head output index to Action.
+/// Indices: 0=TextReply, 1=Code, 2=Done, 3=FetchDocs.
 #[inline]
 pub fn action_from_index(idx: usize) -> Action {
     match idx {
         0 => Action::TextReply,
         1 => Action::Code,
-        _ => Action::Done,
+        2 => Action::Done,
+        _ => Action::FetchDocs,
     }
 }
 
@@ -110,6 +115,46 @@ pub fn terminal_request_score(prompt: &str) -> f32 {
     score.min(2.5)
 }
 
+pub fn rust_docs_request_score(prompt: &str) -> f32 {
+    let lower = prompt.to_ascii_lowercase();
+    if !lower.contains("rust") && !lower.contains("cargo") && !lower.contains("rustc") {
+        return 0.0;
+    }
+    let mut score = code_request_score(prompt) * 0.35;
+    for needle in [
+        "std::",
+        "core::",
+        "alloc::",
+        "iterator",
+        "trait",
+        "lifetime",
+        "borrow",
+        "ownership",
+        "hashmap",
+        "btree",
+        "binaryheap",
+        "vecdeque",
+        "result<",
+        "option<",
+        "fromstr",
+        "asref",
+        "borrowchecker",
+        "compiler error",
+        "rustdoc",
+        "docs",
+        "documentation",
+        "api",
+    ] {
+        if lower.contains(needle) {
+            score += 0.7;
+        }
+    }
+    if prompt.contains("::") {
+        score += 0.8;
+    }
+    score.min(4.0)
+}
+
 pub fn guard_inference_action(prompt: &str, predicted: Action, logits: Option<&[f32]>) -> Action {
     let code_score = code_request_score(prompt);
     let terminal_score = terminal_request_score(prompt);
@@ -129,12 +174,24 @@ pub fn guard_inference_action(prompt: &str, predicted: Action, logits: Option<&[
         return Action::TextReply;
     }
 
+    if predicted == Action::FetchDocs && code_score < 0.4 && rust_docs_request_score(prompt) < 0.8 {
+        return Action::TextReply;
+    }
+
+    if predicted == Action::TextReply && rust_docs_request_score(prompt) >= 1.4 {
+        return Action::FetchDocs;
+    }
+
     if predicted == Action::TextReply && code_score >= 1.0 {
         return Action::Code;
     }
 
     if predicted == Action::Done && code_score >= 0.4 && margin < 1.5 {
         return Action::Code;
+    }
+
+    if predicted == Action::Code && rust_docs_request_score(prompt) >= 2.0 && margin < 1.2 {
+        return Action::FetchDocs;
     }
 
     if predicted == Action::Code && terminal_score >= 1.5 && margin < 0.8 {
@@ -152,6 +209,9 @@ pub fn decide_next_action(prompt: &str, assistant_so_far: &str) -> Action {
     }
     if !assistant_so_far.trim().is_empty() {
         return Action::TextReply;
+    }
+    if rust_docs_request_score(prompt) >= 1.4 {
+        return Action::FetchDocs;
     }
     if looks_like_code_request(prompt) {
         Action::Code

@@ -19,6 +19,10 @@ const RUST_REPAIR_DATA: &str = "data/rust_repair_pairs.txt";
 const RUST_DOCS_ROOT: &str = "data/sunface_rust-by-practice_en";
 const RUST_DOCS_JEPA_DATA: &str = "data/rust_docs_jepa.txt";
 const RUST_DOCS_PAIR_DATA: &str = "data/rust_docs_pairs.txt";
+const RUST_STD_DOCS_JEPA_DATA: &str = "data/rust_std_docs_jepa.txt";
+const RUST_STD_DOC_TOOL_DATA: &str = "data/rust_std_doc_tool_pairs.txt";
+const RUST_STD_DOC_TRAJECTORY_DATA: &str = "data/rust_std_doc_trajectories.txt";
+const RUST_STD_DOC_CODE_DATA: &str = "data/rust_std_doc_code_pairs.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
 
@@ -503,6 +507,32 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             ]);
         }
     }
+    let rust_std_docs_available = tasks::rust_docs::default_rust_docs_root().is_some();
+    if rust_std_docs_available {
+        run_prepare([
+            "--prepare-rust-docs",
+            "--mode",
+            "jepa",
+            "--output",
+            RUST_STD_DOCS_JEPA_DATA,
+            "--max-rows",
+            "20000",
+        ])?;
+        if nonempty_file(RUST_STD_DOCS_JEPA_DATA) {
+            extra_encoder_inputs.push(RUST_STD_DOCS_JEPA_DATA.to_string());
+        }
+        run_prepare([
+            "--prepare-rust-docs",
+            "--mode",
+            "tool-pairs",
+            "--output",
+            RUST_STD_DOC_TOOL_DATA,
+            "--max-rows",
+            "12000",
+        ])?;
+    } else {
+        println!("Installed Rust docs not found; run `rustup component add rust-docs rust-src` to enable fetch_docs training rows.");
+    }
 
     let mut encoder_args = vec![
         "--prepare-encoder-corpus".to_string(),
@@ -530,6 +560,19 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             "120000",
             "--output",
             RUST_TASK_DATA,
+        ])?;
+    }
+    if rust_std_docs_available {
+        run_prepare([
+            "--prepare-rust-doc-trajectories",
+            "--input",
+            RUST_TASK_DATA,
+            "--output",
+            RUST_STD_DOC_TRAJECTORY_DATA,
+            "--code-output",
+            RUST_STD_DOC_CODE_DATA,
+            "--max-rows",
+            "12000",
         ])?;
     }
 
@@ -569,6 +612,26 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         extra_code_mix_args.extend([
             "--extra-pairs".to_string(),
             RUST_REPAIR_DATA.to_string(),
+            "--extra-repeat".to_string(),
+            "2".to_string(),
+        ]);
+    }
+    if nonempty_file(RUST_STD_DOC_TOOL_DATA) {
+        world_args.extend([
+            "--code-pairs".to_string(),
+            RUST_STD_DOC_TOOL_DATA.to_string(),
+        ]);
+    }
+    if nonempty_file(RUST_STD_DOC_TRAJECTORY_DATA) {
+        world_args.extend([
+            "--code-pairs".to_string(),
+            RUST_STD_DOC_TRAJECTORY_DATA.to_string(),
+        ]);
+    }
+    if nonempty_file(RUST_STD_DOC_CODE_DATA) {
+        extra_code_mix_args.extend([
+            "--extra-pairs".to_string(),
+            RUST_STD_DOC_CODE_DATA.to_string(),
             "--extra-repeat".to_string(),
             "2".to_string(),
         ]);

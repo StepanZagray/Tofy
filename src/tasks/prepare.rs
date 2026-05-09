@@ -156,6 +156,14 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
             run_prepare_rust_by_practice(&args[2..])?;
             Ok(true)
         }
+        "--prepare-rust-docs" | "prepare-rust-docs" => {
+            run_prepare_rust_docs(&args[2..])?;
+            Ok(true)
+        }
+        "--prepare-rust-doc-trajectories" | "prepare-rust-doc-trajectories" => {
+            run_prepare_rust_doc_trajectories(&args[2..])?;
+            Ok(true)
+        }
         "--prepare-github-top-code" | "prepare-github-top-code" => {
             run_prepare_github_top_code(&args[2..])?;
             Ok(true)
@@ -625,6 +633,271 @@ fn run_prepare_rust_by_practice(args: &[String]) -> Result<()> {
     )?;
     println!("Wrote {} lines to {}", rows.len(), output.display());
     Ok(())
+}
+
+fn run_prepare_rust_docs(args: &[String]) -> Result<()> {
+    let mut input = crate::tasks::rust_docs::default_rust_docs_root();
+    let mut output = None;
+    let mut mode = None;
+    let mut max_rows = 20_000usize;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--input" => {
+                input = Some(parse_path_value(args, i, "--input")?);
+                i += 2;
+            }
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--mode" => {
+                mode = Some(parse_flag_value(args, i, "--mode")?);
+                i += 2;
+            }
+            "--max-rows" => {
+                max_rows = parse_usize_value(args, i, "--max-rows")?.max(1);
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let input =
+        input.context("Rust docs root not found; install rust-docs/rust-src or pass --input")?;
+    let output = output.context("--output is required")?;
+    let mode = mode.context("--mode is required (jepa|tool-pairs)")?;
+    let params = json!({
+        "mode": mode,
+        "max_rows": max_rows,
+        "source": "installed-rust-docs",
+        "input": input.to_string_lossy(),
+    });
+    let inputs = Vec::new();
+    if !force {
+        if let Some(manifest) = artifact_cache_hit("rust_docs", &output, &inputs, &params)? {
+            println!(
+                "Rust docs cache hit: {} (rows={})",
+                output.display(),
+                manifest.rows
+            );
+            return Ok(());
+        }
+    }
+    let index = crate::tasks::rust_docs::RustDocIndex::load_from_root(&input)?;
+    let rows = match mode.as_str() {
+        "jepa" => index.jepa_rows(max_rows),
+        "tool-pairs" => index.tool_pairs(max_rows),
+        _ => bail!("--mode must be jepa or tool-pairs"),
+    };
+    let mut content = String::new();
+    for row in &rows {
+        content.push_str(row.trim());
+        content.push('\n');
+    }
+    write_text_atomic(&output, &content)?;
+    write_artifact_manifest("rust_docs", &output, &inputs, params, rows.len())?;
+    println!(
+        "Wrote {} Rust docs rows to {} from {}",
+        rows.len(),
+        output.display(),
+        input.display()
+    );
+    Ok(())
+}
+
+fn run_prepare_rust_doc_trajectories(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut code_output = None;
+    let mut docs_root = crate::tasks::rust_docs::default_rust_docs_root();
+    let mut max_rows = 12_000usize;
+    let mut docs_top_k = 4usize;
+    let mut docs_chars = 2200usize;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--input" => {
+                input = Some(parse_path_value(args, i, "--input")?);
+                i += 2;
+            }
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--code-output" => {
+                code_output = Some(parse_path_value(args, i, "--code-output")?);
+                i += 2;
+            }
+            "--docs-root" => {
+                docs_root = Some(parse_path_value(args, i, "--docs-root")?);
+                i += 2;
+            }
+            "--max-rows" => {
+                max_rows = parse_usize_value(args, i, "--max-rows")?.max(1);
+                i += 2;
+            }
+            "--docs-top-k" => {
+                docs_top_k = parse_usize_value(args, i, "--docs-top-k")?.max(1);
+                i += 2;
+            }
+            "--docs-chars" => {
+                docs_chars = parse_usize_value(args, i, "--docs-chars")?.max(256);
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let input = input.context("--input is required")?;
+    let output = output.context("--output is required")?;
+    let docs_root = docs_root
+        .context("Rust docs root not found; install rust-docs/rust-src or pass --docs-root")?;
+    let params = json!({
+        "max_rows": max_rows,
+        "docs_top_k": docs_top_k,
+        "docs_chars": docs_chars,
+        "docs_root": docs_root.to_string_lossy(),
+        "code_output": code_output.as_ref().map(|path: &PathBuf| path.to_string_lossy().to_string()),
+        "trajectory": "prompt->fetch_docs->docs_conditioned_code",
+    });
+    let inputs = vec![input.clone()];
+    if !force {
+        if let Some(manifest) =
+            artifact_cache_hit("rust_doc_trajectories", &output, &inputs, &params)?
+        {
+            if code_output
+                .as_ref()
+                .map(|path| path.exists())
+                .unwrap_or(true)
+            {
+                println!(
+                    "Rust doc trajectory cache hit: {} (rows={})",
+                    output.display(),
+                    manifest.rows
+                );
+                return Ok(());
+            }
+        }
+    }
+    let index = crate::tasks::rust_docs::RustDocIndex::load_from_root(&docs_root)?;
+    let task_pairs = load_raw_pairs(&input)?;
+    let mut rows = Vec::new();
+    let mut code_rows = Vec::new();
+    for (prompt, code) in task_pairs {
+        if rows.len() >= max_rows {
+            break;
+        }
+        let docs = index.format_hits(&prompt, docs_top_k, docs_chars);
+        if docs.trim().is_empty() {
+            continue;
+        }
+        let fetch_state = format!(
+            "<action:fetch_docs>\n<tool:fetch_docs>\nUser request:\n{}\n\nQuery:\n{}",
+            prompt,
+            rust_doc_query_hint(&prompt)
+        );
+        rows.push(format!(
+            "{}\t{}\tfetch_docs",
+            escape_pair_field(&fetch_state),
+            escape_pair_field(&docs)
+        ));
+        if rows.len() >= max_rows {
+            break;
+        }
+        let code_state = format!(
+            "<action:code>\n<ctx:user_request>\n{}\n</ctx:user_request>\n\n{}",
+            prompt, docs
+        );
+        rows.push(format!(
+            "{}\t{}\tcode",
+            escape_pair_field(&code_state),
+            escape_pair_field(&code)
+        ));
+        code_rows.push(format!(
+            "{}\t{}",
+            escape_pair_field(&code_state),
+            escape_pair_field(&code)
+        ));
+    }
+    let mut content = String::new();
+    for row in &rows {
+        content.push_str(row);
+        content.push('\n');
+    }
+    write_text_atomic(&output, &content)?;
+    if let Some(code_output) = code_output.as_ref() {
+        let mut code_content = String::new();
+        for row in &code_rows {
+            code_content.push_str(row);
+            code_content.push('\n');
+        }
+        write_text_atomic(code_output, &code_content)?;
+    }
+    write_artifact_manifest(
+        "rust_doc_trajectories",
+        &output,
+        &inputs,
+        params,
+        rows.len(),
+    )?;
+    println!(
+        "Wrote {} Rust doc trajectory rows to {} from {}",
+        rows.len(),
+        output.display(),
+        input.display()
+    );
+    Ok(())
+}
+
+fn rust_doc_query_hint(prompt: &str) -> String {
+    let mut terms = Vec::new();
+    for token in prompt.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
+    }) {
+        let clean = token.trim_matches(|ch: char| ch == '<' || ch == '>' || ch == ',');
+        if clean.len() < 3 {
+            continue;
+        }
+        if clean.contains("::")
+            || clean.chars().any(|ch| ch.is_ascii_uppercase())
+            || matches!(
+                clean.to_ascii_lowercase().as_str(),
+                "iterator"
+                    | "hashmap"
+                    | "btree"
+                    | "binaryheap"
+                    | "vecdeque"
+                    | "fromstr"
+                    | "result"
+                    | "option"
+                    | "trait"
+                    | "lifetime"
+            )
+        {
+            terms.push(clean.to_string());
+        }
+        if terms.len() >= 12 {
+            break;
+        }
+    }
+    if terms.is_empty() {
+        prompt
+            .split_whitespace()
+            .take(24)
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        terms.join(" ")
+    }
 }
 
 fn iter_md_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -1725,8 +1998,9 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
         let want_code = rng.random::<f64>() < code_ratio;
         if want_code && !code_rows.is_empty() {
             let (left, right) = code_rows.pop().unwrap();
-            output_rows.push(format!("{left}\t{right}\tcode"));
-            terminal_candidates.push((left, right, "code".to_string()));
+            let action = world_mix_code_action(&left, &right);
+            output_rows.push(format!("{left}\t{right}\t{action}"));
+            terminal_candidates.push((left, right, action.to_string()));
             chosen_code += 1;
         } else if !text_rows.is_empty() {
             let (left, right) = text_rows.pop().unwrap();
@@ -1735,8 +2009,9 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
             chosen_text += 1;
         } else if !code_rows.is_empty() {
             let (left, right) = code_rows.pop().unwrap();
-            output_rows.push(format!("{left}\t{right}\tcode"));
-            terminal_candidates.push((left, right, "code".to_string()));
+            let action = world_mix_code_action(&left, &right);
+            output_rows.push(format!("{left}\t{right}\t{action}"));
+            terminal_candidates.push((left, right, action.to_string()));
             chosen_code += 1;
         }
     }
@@ -1779,6 +2054,19 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn world_mix_code_action(left: &str, right: &str) -> &'static str {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower.contains("<action:fetch_docs>")
+        || left_lower.contains("<tool:fetch_docs>")
+        || right_lower.contains("<ctx:rust_docs>")
+    {
+        "fetch_docs"
+    } else {
+        "code"
+    }
+}
+
 fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
     let reader = BufReader::new(File::open(path)?);
     let mut rows = Vec::new();
@@ -1788,11 +2076,23 @@ fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
         if trimmed.is_empty() {
             continue;
         }
-        if let Some((left, right)) = split_pair_line(trimmed) {
+        if let Some((left, right)) = split_pair_line_first_two(trimmed) {
             rows.push((left.to_string(), right.to_string()));
         }
     }
     Ok(rows)
+}
+
+fn split_pair_line_first_two(line: &str) -> Option<(&str, &str)> {
+    if line.contains('\t') {
+        let mut parts = line.split('\t');
+        return Some((parts.next()?, parts.next()?));
+    }
+    if line.contains("|||") {
+        let mut parts = line.split("|||");
+        return Some((parts.next()?, parts.next()?));
+    }
+    None
 }
 
 fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {

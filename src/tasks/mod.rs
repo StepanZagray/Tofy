@@ -4,6 +4,7 @@ pub mod latent;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod prepare;
+pub(crate) mod rust_docs;
 pub mod serve;
 pub mod world;
 pub(crate) mod world_support;

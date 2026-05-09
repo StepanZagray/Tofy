@@ -20,7 +20,7 @@ use crate::data::{
     count_raw_world_rows_split_with_mode, encode_world_examples, encode_world_examples_with_mode,
     make_decoder_batch, make_world_batch_from_slice, tokenize_for_inference, CachedDecoderStream,
     CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode, WorldExample,
-    ACTION_CODE, ACTION_DONE, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::vocab_signature;
@@ -758,6 +758,27 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             );
             tb.add_scalar("metrics/done_recall", action_metrics.done_recall, step);
             tb.add_scalar("metrics/done_f1", action_metrics.done_f1, step);
+            tb.add_scalar(
+                "metrics/fetch_docs_rate",
+                action_metrics.fetch_docs_rate,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/pred_fetch_docs_rate",
+                action_metrics.pred_fetch_docs_rate,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/fetch_docs_precision",
+                action_metrics.fetch_docs_precision,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/fetch_docs_recall",
+                action_metrics.fetch_docs_recall,
+                step,
+            );
+            tb.add_scalar("metrics/fetch_docs_f1", action_metrics.fetch_docs_f1, step);
             tb.add_scalar("metrics/state_slot_rms", state_slot_rms, step);
             tb.add_scalar("metrics/pred_slot_rms", pred_slot_rms, step);
             tb.add_scalar("schedule/batch_size", batch_size as f32, step);
@@ -878,6 +899,31 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 tb.add_scalar(
                     "val/pred_done_rate",
                     val_metrics.action_metrics.pred_done_rate,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/fetch_docs_rate",
+                    val_metrics.action_metrics.fetch_docs_rate,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/pred_fetch_docs_rate",
+                    val_metrics.action_metrics.pred_fetch_docs_rate,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/fetch_docs_precision",
+                    val_metrics.action_metrics.fetch_docs_precision,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/fetch_docs_recall",
+                    val_metrics.action_metrics.fetch_docs_recall,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/fetch_docs_f1",
+                    val_metrics.action_metrics.fetch_docs_f1,
                     step,
                 );
                 tb.add_scalar("val/trans_cosine", val_metrics.transition_cosine, step);
@@ -1666,6 +1712,19 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
             tb.add_scalar("metrics/done_f1", metrics.done_f1, step);
             tb.add_scalar("metrics/done_rate", metrics.done_rate, step);
             tb.add_scalar("metrics/pred_done_rate", metrics.pred_done_rate, step);
+            tb.add_scalar("metrics/fetch_docs_rate", metrics.fetch_docs_rate, step);
+            tb.add_scalar(
+                "metrics/pred_fetch_docs_rate",
+                metrics.pred_fetch_docs_rate,
+                step,
+            );
+            tb.add_scalar(
+                "metrics/fetch_docs_precision",
+                metrics.fetch_docs_precision,
+                step,
+            );
+            tb.add_scalar("metrics/fetch_docs_recall", metrics.fetch_docs_recall, step);
+            tb.add_scalar("metrics/fetch_docs_f1", metrics.fetch_docs_f1, step);
 
             let mut memory_note = String::new();
             if let Some(vram) = vram_tracker.sample() {
@@ -1741,6 +1800,19 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 tb.add_scalar("val/done_f1", val_metrics.done_f1, step);
                 tb.add_scalar("val/done_rate", val_metrics.done_rate, step);
                 tb.add_scalar("val/pred_done_rate", val_metrics.pred_done_rate, step);
+                tb.add_scalar("val/fetch_docs_rate", val_metrics.fetch_docs_rate, step);
+                tb.add_scalar(
+                    "val/pred_fetch_docs_rate",
+                    val_metrics.pred_fetch_docs_rate,
+                    step,
+                );
+                tb.add_scalar(
+                    "val/fetch_docs_precision",
+                    val_metrics.fetch_docs_precision,
+                    step,
+                );
+                tb.add_scalar("val/fetch_docs_recall", val_metrics.fetch_docs_recall, step);
+                tb.add_scalar("val/fetch_docs_f1", val_metrics.fetch_docs_f1, step);
             }
             tb.add_scalar("val/selection_score", selection_score, step);
             tb.flush();
@@ -1894,18 +1966,29 @@ fn collect_action_training_batch(
     let mut code_examples = Vec::new();
     let mut text_examples = Vec::new();
     let mut done_examples = Vec::new();
+    let mut docs_examples = Vec::new();
+    let target_docs_rate = std::env::var("TOFY_WORLD_FETCH_DOCS_RATE")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.12)
+        .clamp(0.0, 0.35);
+    let target_docs = ((batch_size as f32) * target_docs_rate).round() as usize;
+    let target_docs = target_docs.min(batch_size.saturating_sub(target_code + target_done));
+    let target_text = target_text.saturating_sub(target_docs);
 
     for _ in 0..8 {
         for example in stream.next_batch(batch_size.max(1))? {
             match example.action_label {
                 ACTION_CODE => code_examples.push(example),
                 ACTION_DONE => done_examples.push(example),
+                ACTION_FETCH_DOCS => docs_examples.push(example),
                 _ => text_examples.push(example),
             }
         }
         if code_examples.len() >= target_code
             && text_examples.len() >= target_text
             && done_examples.len() >= target_done
+            && docs_examples.len() >= target_docs
         {
             break;
         }
@@ -1914,19 +1997,23 @@ fn collect_action_training_batch(
     code_examples.shuffle(&mut rng);
     text_examples.shuffle(&mut rng);
     done_examples.shuffle(&mut rng);
+    docs_examples.shuffle(&mut rng);
 
     let take_code = target_code.min(code_examples.len());
     let take_text = target_text.min(text_examples.len());
     let take_done = target_done.min(done_examples.len());
+    let take_docs = target_docs.min(docs_examples.len());
     let mut batch = Vec::with_capacity(batch_size);
     batch.extend(code_examples.drain(..take_code));
     batch.extend(text_examples.drain(..take_text));
     batch.extend(done_examples.drain(..take_done));
+    batch.extend(docs_examples.drain(..take_docs));
 
     let mut leftovers = Vec::new();
     leftovers.extend(code_examples);
     leftovers.extend(text_examples);
     leftovers.extend(done_examples);
+    leftovers.extend(docs_examples);
     leftovers.shuffle(&mut rng);
     for example in leftovers
         .into_iter()
@@ -1961,18 +2048,29 @@ fn collect_action_training_batch_cached(
     let mut code_examples = Vec::new();
     let mut text_examples = Vec::new();
     let mut done_examples = Vec::new();
+    let mut docs_examples = Vec::new();
+    let target_docs_rate = std::env::var("TOFY_WORLD_FETCH_DOCS_RATE")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.12)
+        .clamp(0.0, 0.35);
+    let target_docs = ((batch_size as f32) * target_docs_rate).round() as usize;
+    let target_docs = target_docs.min(batch_size.saturating_sub(target_code + target_done));
+    let target_text = target_text.saturating_sub(target_docs);
 
     for _ in 0..8 {
         for example in stream.next_batch(batch_size.max(1))? {
             match example.action_label {
                 ACTION_CODE => code_examples.push(example),
                 ACTION_DONE => done_examples.push(example),
+                ACTION_FETCH_DOCS => docs_examples.push(example),
                 _ => text_examples.push(example),
             }
         }
         if code_examples.len() >= target_code
             && text_examples.len() >= target_text
             && done_examples.len() >= target_done
+            && docs_examples.len() >= target_docs
         {
             break;
         }
@@ -1981,19 +2079,23 @@ fn collect_action_training_batch_cached(
     code_examples.shuffle(&mut rng);
     text_examples.shuffle(&mut rng);
     done_examples.shuffle(&mut rng);
+    docs_examples.shuffle(&mut rng);
 
     let take_code = target_code.min(code_examples.len());
     let take_text = target_text.min(text_examples.len());
     let take_done = target_done.min(done_examples.len());
+    let take_docs = target_docs.min(docs_examples.len());
     let mut batch = Vec::with_capacity(batch_size);
     batch.extend(code_examples.drain(..take_code));
     batch.extend(text_examples.drain(..take_text));
     batch.extend(done_examples.drain(..take_done));
+    batch.extend(docs_examples.drain(..take_docs));
 
     let mut leftovers = Vec::new();
     leftovers.extend(code_examples);
     leftovers.extend(text_examples);
     leftovers.extend(done_examples);
+    leftovers.extend(docs_examples);
     leftovers.shuffle(&mut rng);
     for example in leftovers
         .into_iter()
@@ -3366,8 +3468,13 @@ enum RlmProgramOp {
         len: usize,
         var: String,
     },
+    FetchDocs {
+        query_var: String,
+        output_var: String,
+    },
     SubRlm {
         input_var: String,
+        docs_var: Option<String>,
         output_var: String,
     },
     Append {
@@ -3485,14 +3592,42 @@ fn parse_rlm_program(raw: &str) -> Vec<RlmProgramOp> {
                     ops.push(RlmProgramOp::Peek { start, len, var });
                 }
             }
-            "SUB_RLM" if tokens.len() >= 4 => {
+            "FETCH_DOCS" if tokens.len() >= 4 => {
                 let Some(output_var) = parse_as_var(&tokens, 2) else {
                     continue;
                 };
+                let query_var = tokens[1];
+                if valid_rlm_var(query_var) {
+                    ops.push(RlmProgramOp::FetchDocs {
+                        query_var: query_var.to_string(),
+                        output_var,
+                    });
+                }
+            }
+            "SUB_RLM" if tokens.len() >= 4 => {
                 let input_var = tokens[1];
-                if valid_rlm_var(input_var) {
+                if !valid_rlm_var(input_var) {
+                    continue;
+                }
+                if tokens.len() >= 6 && tokens[2].eq_ignore_ascii_case("WITH") {
+                    let docs_var = tokens[3];
+                    let Some(output_var) = parse_as_var(&tokens, 4) else {
+                        continue;
+                    };
+                    if valid_rlm_var(docs_var) {
+                        ops.push(RlmProgramOp::SubRlm {
+                            input_var: input_var.to_string(),
+                            docs_var: Some(docs_var.to_string()),
+                            output_var,
+                        });
+                    }
+                } else {
+                    let Some(output_var) = parse_as_var(&tokens, 2) else {
+                        continue;
+                    };
                     ops.push(RlmProgramOp::SubRlm {
                         input_var: input_var.to_string(),
+                        docs_var: None,
                         output_var,
                     });
                 }
@@ -3518,8 +3653,13 @@ fn build_default_rlm_program(unit_count: usize) -> Vec<RlmProgramOp> {
             index: idx,
             var: unit_var.clone(),
         });
+        ops.push(RlmProgramOp::FetchDocs {
+            query_var: unit_var.clone(),
+            output_var: format!("docs_{idx}"),
+        });
         ops.push(RlmProgramOp::SubRlm {
             input_var: unit_var,
+            docs_var: Some(format!("docs_{idx}")),
             output_var: out_var.clone(),
         });
         ops.push(RlmProgramOp::Append { var: out_var });
@@ -3534,10 +3674,12 @@ fn build_rlm_program_prompt(env: &RlmEnvironment, cfg: &RlmConfig) -> String {
     out.push_str("Allowed commands only:\n");
     out.push_str("UNIT <index> AS <var>\n");
     out.push_str("PEEK <start_char> <len_chars> AS <var>\n");
+    out.push_str("FETCH_DOCS <query_var> AS <out_var>\n");
     out.push_str("SUB_RLM <var> AS <out_var>\n");
+    out.push_str("SUB_RLM <var> WITH <docs_var> AS <out_var>\n");
     out.push_str("APPEND <var>\n");
     out.push_str("FINAL\n\n");
-    out.push_str("Use UNIT and SUB_RLM for each Rust work unit. Return only commands.\n\n");
+    out.push_str("Use UNIT, FETCH_DOCS, and SUB_RLM WITH docs for each Rust work unit. Keep docs in a separate variable. Return only commands.\n\n");
     out.push_str(&env.metadata(cfg));
     out
 }
@@ -3642,6 +3784,29 @@ fn build_rlm_code_prompt(
         );
     }
     out
+}
+
+fn augment_prompt_with_rust_docs(prompt: &str) -> String {
+    if prompt.contains("<ctx:rust_docs>") {
+        return prompt.to_string();
+    }
+    let docs = crate::tasks::rust_docs::retrieve_rust_docs(prompt, 5, 2600);
+    if docs.trim().is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{prompt}\n\n{docs}")
+    }
+}
+
+fn build_ephemeral_docs_prompt(prompt: &str, docs: Option<&str>) -> String {
+    let Some(docs) = docs.map(str::trim).filter(|docs| !docs.is_empty()) else {
+        return prompt.to_string();
+    };
+    if prompt.contains("<ctx:rust_docs>") {
+        prompt.to_string()
+    } else {
+        format!("{prompt}\n\n{docs}")
+    }
 }
 
 fn balanced_braces(text: &str) -> bool {
@@ -3929,6 +4094,7 @@ impl AgentEngine {
         let terminal = terminal_request_score(prompt);
         match action {
             Action::Code => code,
+            Action::FetchDocs => crate::tasks::orchestrator::rust_docs_request_score(prompt),
             Action::Done => terminal - 0.6,
             Action::TextReply => 0.8 - 0.25 * code.max(terminal),
         }
@@ -4349,6 +4515,20 @@ impl AgentEngine {
                     env.store(var, local_prompt);
                     env.record(format!("depth={depth} UNIT {index} AS {var}"));
                 }
+                RlmProgramOp::FetchDocs {
+                    query_var,
+                    output_var,
+                } => {
+                    let Some(query) = env.load(query_var) else {
+                        env.record(format!("depth={depth} FETCH_DOCS missing {query_var}"));
+                        continue;
+                    };
+                    let docs = crate::tasks::rust_docs::retrieve_rust_docs(&query, 4, 2200);
+                    env.store(output_var, docs);
+                    env.record(format!(
+                        "depth={depth} FETCH_DOCS {query_var} AS {output_var}"
+                    ));
+                }
                 RlmProgramOp::Peek { start, len, var } => {
                     let value = env.peek_chars(*start, *len);
                     env.store(var, value);
@@ -4356,21 +4536,30 @@ impl AgentEngine {
                 }
                 RlmProgramOp::SubRlm {
                     input_var,
+                    docs_var,
                     output_var,
                 } => {
                     let Some(input) = env.load(input_var) else {
                         env.record(format!("depth={depth} SUB_RLM missing {input_var}"));
                         continue;
                     };
+                    let docs = docs_var.as_deref().and_then(|name| env.load(name));
                     let output = self.invoke_code_sub_rlm(
                         decoder,
                         &input,
+                        docs.as_deref(),
                         depth + 1,
                         cfg,
                         ablate_conditioning,
                     )?;
                     env.store(output_var, output);
-                    env.record(format!("depth={depth} SUB_RLM {input_var} AS {output_var}"));
+                    if let Some(docs_var) = docs_var {
+                        env.record(format!(
+                            "depth={depth} SUB_RLM {input_var} WITH {docs_var} AS {output_var}"
+                        ));
+                    } else {
+                        env.record(format!("depth={depth} SUB_RLM {input_var} AS {output_var}"));
+                    }
                 }
                 RlmProgramOp::Append { var } => {
                     if let Some(value) = env.load(var) {
@@ -4396,6 +4585,7 @@ impl AgentEngine {
         &self,
         decoder: &dyn LocalDecoderRuntime,
         prompt: &str,
+        docs: Option<&str>,
         depth: usize,
         cfg: &RlmConfig,
         ablate_conditioning: bool,
@@ -4418,13 +4608,21 @@ impl AgentEngine {
                 ablate_conditioning,
             );
         }
-        let cond_vec =
-            self.conditioning_for_action_prompt(prompt, Action::Code, ablate_conditioning)?;
-        let mut code =
-            decoder.generate(prompt, Action::Code.as_str(), &cond_vec, cfg.unit_tokens)?;
+        let prompt_for_decoder = build_ephemeral_docs_prompt(prompt, docs);
+        let cond_vec = self.conditioning_for_action_prompt(
+            &prompt_for_decoder,
+            Action::Code,
+            ablate_conditioning,
+        )?;
+        let mut code = decoder.generate(
+            &prompt_for_decoder,
+            Action::Code.as_str(),
+            &cond_vec,
+            cfg.unit_tokens,
+        )?;
         code = maybe_repair_code_output(
             decoder,
-            prompt,
+            &prompt_for_decoder,
             Action::Code.as_str(),
             &cond_vec,
             cfg.unit_tokens,
@@ -4448,25 +4646,35 @@ impl AgentEngine {
         use crate::tasks::orchestrator::Action;
         let state_slots = self.encode_prompt_planner_memory(prompt)?;
         let plan = self.lewm_plan_from_state(prompt, &state_slots)?;
-        let action = plan.first_action;
+        let mut action = plan.first_action;
         let next_slots = plan.planned_slots;
         if action == Action::Done {
             return Ok(String::new());
+        }
+        let fetched_docs_action = action == Action::FetchDocs;
+        let mut generation_prompt = prompt.to_string();
+        let mut effective_slots = next_slots;
+        if fetched_docs_action {
+            effective_slots = self
+                .transition
+                .forward_one(&effective_slots, Action::Code as u32)?;
+            action = Action::Code;
         }
         let chunk_tokens = match action {
             Action::TextReply => Self::TEXT_CHUNK_TOKENS.min(max_new_tokens),
             Action::Code => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
             Action::Done => 0,
+            Action::FetchDocs => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
         };
         let (decoder, cond_vec) = self.get_decoder_and_cond_from_planner_memory(
-            &next_slots,
+            &effective_slots,
             action,
             ablate_conditioning,
         )?;
-        if self.uses_recursive_code_generation(prompt, action) {
+        if self.uses_recursive_code_generation(&generation_prompt, action) {
             let assistant_content = self.generate_code_rlm(
                 decoder.as_ref(),
-                prompt,
+                &generation_prompt,
                 max_new_tokens,
                 ablate_conditioning,
             )?;
@@ -4480,12 +4688,15 @@ impl AgentEngine {
             }
             return Ok(assistant_content);
         }
+        if fetched_docs_action {
+            generation_prompt = augment_prompt_with_rust_docs(prompt);
+        }
         let mut assistant_content =
-            decoder.generate(prompt, action.as_str(), &cond_vec, chunk_tokens)?;
-        if action == Action::Code && likely_rust_request(prompt) {
+            decoder.generate(&generation_prompt, action.as_str(), &cond_vec, chunk_tokens)?;
+        if action == Action::Code && likely_rust_request(&generation_prompt) {
             assistant_content = maybe_repair_code_output(
                 decoder.as_ref(),
-                prompt,
+                &generation_prompt,
                 action.as_str(),
                 &cond_vec,
                 chunk_tokens,
@@ -4520,6 +4731,13 @@ impl AgentEngine {
             && rlm_code_enabled()
     }
 
+    pub fn uses_rust_docs(&self, prompt: &str, action: crate::tasks::orchestrator::Action) -> bool {
+        action == crate::tasks::orchestrator::Action::FetchDocs
+            || (action == crate::tasks::orchestrator::Action::Code
+                && crate::tasks::orchestrator::rust_docs_request_score(prompt) >= 2.0
+                && crate::tasks::rust_docs::rust_docs_enabled())
+    }
+
     /// Stream generated text in chunks (for SSE). The orchestrator chooses a single decoder mode for the reply.
     pub fn generate_stream(
         &self,
@@ -4533,31 +4751,42 @@ impl AgentEngine {
         on_chunk("Thinking... ");
         let state_slots = self.encode_prompt_planner_memory(prompt)?;
         let plan = self.lewm_plan_from_state(prompt, &state_slots)?;
-        let action = plan.first_action;
+        let mut action = plan.first_action;
         if action == Action::Done {
             on_chunk("Done. ");
             return Ok(());
+        }
+        let fetched_docs_action = action == Action::FetchDocs;
+        let mut generation_prompt = prompt.to_string();
+        let mut next_slots = plan.planned_slots;
+        if fetched_docs_action {
+            on_chunk("Fetching Rust docs. ");
+            next_slots = self
+                .transition
+                .forward_one(&next_slots, Action::Code as u32)?;
+            action = Action::Code;
         }
         match action {
             Action::TextReply => on_chunk("Writing text. "),
             Action::Code => on_chunk("Generating code. "),
             Action::Done => on_chunk("Done. "),
+            Action::FetchDocs => on_chunk("Fetching Rust docs. "),
         }
-        let next_slots = plan.planned_slots;
         let chunk_tokens = match action {
             Action::TextReply => Self::TEXT_CHUNK_TOKENS.min(max_new_tokens),
             Action::Code => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
             Action::Done => 0,
+            Action::FetchDocs => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
         };
         let (decoder, cond_vec) = self.get_decoder_and_cond_from_planner_memory(
             &next_slots,
             action,
             ablate_conditioning,
         )?;
-        if self.uses_recursive_code_generation(prompt, action) {
+        if self.uses_recursive_code_generation(&generation_prompt, action) {
             let assistant_content = self.generate_code_rlm(
                 decoder.as_ref(),
-                prompt,
+                &generation_prompt,
                 max_new_tokens,
                 ablate_conditioning,
             )?;
@@ -4574,8 +4803,11 @@ impl AgentEngine {
             }
             return Ok(());
         }
+        if fetched_docs_action {
+            generation_prompt = augment_prompt_with_rust_docs(prompt);
+        }
         decoder.generate_stream(
-            prompt,
+            &generation_prompt,
             action.as_str(),
             &cond_vec,
             chunk_tokens,

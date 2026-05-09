@@ -1,6 +1,7 @@
-//! Orchestrator action head: predicts whether the current reply should use text, code, or stop.
+//! Orchestrator action head: predicts whether the current reply should use text, code, docs, or stop.
 //!
-//! Input: planner-state slots. Output: logits over supported actions (`TextReply`, `Code`, `Done`).
+//! Input: planner-state slots. Output: logits over supported actions
+//! (`TextReply`, `Code`, `Done`, `FetchDocs`).
 //! Trained jointly with the dialog-transition model and used at inference to choose which decoder to run.
 
 use anyhow::Result;
@@ -8,7 +9,7 @@ use candle_core::{Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
 /// Number of actions the orchestrator can predict.
-pub const NUM_ACTIONS: usize = 3;
+pub const NUM_ACTIONS: usize = 4;
 
 /// MLP head on top of pooled latent slots → action logits.
 pub struct OrchestratorActionHead {

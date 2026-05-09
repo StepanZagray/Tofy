@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::data::{
     encode_text_with_vocab_mode, make_decoder_batch, make_world_batch_from_slice, RawWorldExample,
-    TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE,
+    TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
 };
 use crate::model::{
     flatten_latent_slots, mean_cosine_similarity, prediction_loss, tensor_rms, CodeDecoder,
@@ -32,6 +32,11 @@ pub(crate) struct ActionMetrics {
     pub(crate) done_f1: f32,
     pub(crate) done_rate: f32,
     pub(crate) pred_done_rate: f32,
+    pub(crate) fetch_docs_precision: f32,
+    pub(crate) fetch_docs_recall: f32,
+    pub(crate) fetch_docs_f1: f32,
+    pub(crate) fetch_docs_rate: f32,
+    pub(crate) pred_fetch_docs_rate: f32,
 }
 
 pub(crate) struct WorldBatchMetrics {
@@ -243,6 +248,8 @@ pub(crate) fn compute_action_metrics(logits: &Tensor, labels: &[u32]) -> Result<
         class_prf(&confusion, ACTION_CODE as usize);
     let (done_precision, done_recall, done_f1, done_rate) =
         class_prf(&confusion, ACTION_DONE as usize);
+    let (fetch_docs_precision, fetch_docs_recall, fetch_docs_f1, fetch_docs_rate) =
+        class_prf(&confusion, ACTION_FETCH_DOCS as usize);
 
     Ok(ActionMetrics {
         accuracy: correct as f32 / total.max(1) as f32,
@@ -258,6 +265,11 @@ pub(crate) fn compute_action_metrics(logits: &Tensor, labels: &[u32]) -> Result<
         done_f1,
         done_rate,
         pred_done_rate: predicted_positive_rate(&confusion, ACTION_DONE as usize),
+        fetch_docs_precision,
+        fetch_docs_recall,
+        fetch_docs_f1,
+        fetch_docs_rate,
+        pred_fetch_docs_rate: predicted_positive_rate(&confusion, ACTION_FETCH_DOCS as usize),
     })
 }
 

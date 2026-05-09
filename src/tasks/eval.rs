@@ -39,6 +39,7 @@ struct CodeEvalTaskResult {
     predicted_action: String,
     expected_action: String,
     rlm_used: bool,
+    docs_used: bool,
     candidate_count: usize,
     repair_attempts_used: usize,
     route_ok: bool,
@@ -58,6 +59,7 @@ struct CodeEvalSummary {
     task_count: usize,
     route_ok: usize,
     rlm_used: usize,
+    docs_used: usize,
     constraints_ok: usize,
     compile_ok: usize,
     tests_ok: usize,
@@ -283,11 +285,15 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         let started = Instant::now();
         let predicted_action = engine.predict_action(&task.prompt)?;
         let rlm_used = engine.uses_recursive_code_generation(&task.prompt, predicted_action);
-        let route_ok = predicted_action == parse_expected_action(&task.expected_action)?;
+        let docs_used = engine.uses_rust_docs(&task.prompt, predicted_action);
+        let expected_action = parse_expected_action(&task.expected_action)?;
+        let route_ok = predicted_action == expected_action
+            || (expected_action == Action::Code && predicted_action == Action::FetchDocs);
         let best = evaluate_best_candidate(&engine, &cfg, &scratch_dir, &task, route_ok)?;
         let pass = best.route_ok && best.constraints_ok && best.compile_ok && best.tests_ok;
         summary.route_ok += usize::from(route_ok);
         summary.rlm_used += usize::from(rlm_used);
+        summary.docs_used += usize::from(docs_used);
         summary.constraints_ok += usize::from(best.constraints_ok);
         summary.compile_ok += usize::from(best.compile_ok);
         summary.tests_ok += usize::from(best.tests_ok);
@@ -297,6 +303,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
             predicted_action: action_name(predicted_action).to_string(),
             expected_action: task.expected_action,
             rlm_used,
+            docs_used,
             candidate_count: cfg.candidates,
             repair_attempts_used: best.repair_attempts_used,
             route_ok: best.route_ok,
@@ -312,10 +319,11 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         };
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
         println!(
-            "{} route={} rlm={} constraints={} compile={} tests={} pass={} {}",
+            "{} route={} rlm={} docs={} constraints={} compile={} tests={} pass={} {}",
             result.id,
             result.route_ok,
             result.rlm_used,
+            result.docs_used,
             result.constraints_ok,
             result.compile_ok,
             result.tests_ok,
@@ -329,10 +337,11 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     }
 
     let summary_text = format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
+        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
         summary.rlm_used as f32 / summary.task_count.max(1) as f32,
+        summary.docs_used as f32 / summary.task_count.max(1) as f32,
         summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
         summary.compile_ok as f32 / summary.task_count.max(1) as f32,
         summary.tests_ok as f32 / summary.task_count.max(1) as f32,
@@ -485,6 +494,7 @@ fn parse_expected_action(value: &str) -> Result<Action> {
         "code" => Ok(Action::Code),
         "text" | "text_reply" => Ok(Action::TextReply),
         "done" => Ok(Action::Done),
+        "fetch_docs" | "docs" | "rust_docs" => Ok(Action::FetchDocs),
         other => bail!("unsupported expected action {:?}", other),
     }
 }
@@ -494,6 +504,7 @@ fn action_name(action: Action) -> &'static str {
         Action::TextReply => "text_reply",
         Action::Code => "code",
         Action::Done => "done",
+        Action::FetchDocs => "fetch_docs",
     }
 }
 
