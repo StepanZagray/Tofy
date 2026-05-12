@@ -9,8 +9,8 @@ pub mod vocab;
 pub mod world_transition;
 
 pub use decoders::{
-    CandleCrossAttnDecoder, CodeDecoder, DecoderAdapter, DecoderKind, LlamaCppDecoder,
-    LocalDecoderRuntime, StubLocalDecoder,
+    CandleCrossAttnDecoder, CodeDecoder, DecoderAdapter, DecoderArchitecture, DecoderKind,
+    LlamaCppDecoder, LocalDecoderRuntime, StubLocalDecoder,
 };
 pub use encoders::OnlineEncoder;
 pub use lejepa::{

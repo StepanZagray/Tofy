@@ -32,7 +32,7 @@ The repository now mirrors that split more directly in Rust:
 - `src/config/latent.rs`: latent train/eval config parsing
 - `src/config/world.rs`: world/orchestrator/decoder/eval/serve config parsing
 - `src/tasks/latent.rs`: latent training and JEPA evaluation
-- `src/tasks/pipeline.rs`: canonical `train 8gb|48gb|80gb` full pipeline (prep → encoder → world → high-world → code decoder → eval)
+- `src/tasks/pipeline.rs`: canonical `train 8gb|48gb|80gb` full pipeline (prep → encoder → world → high-world → code decoder; optional eval)
 - `src/tasks/world.rs`: world/high-world/orchestrator/decoder training and runtime engine
 - `src/tasks/world_support.rs`: shared world/decoder metrics, masking, and evaluation helpers
 
@@ -87,6 +87,13 @@ cargo run --release -- train 48gb
 cargo run --release -- train 80gb
 ```
 
+By default, `train` only trains the pipeline modules. Add `--with-code-eval` to
+run verifier-guided decoder selection and the hard Rust code-test eval suite:
+
+```bash
+cargo run --release -- train 8gb --with-code-eval
+```
+
 Resume an existing run:
 
 ```bash
@@ -126,6 +133,7 @@ Default behavior:
   - world defaults to `64x2` after a `64x1` warmup
   - high-world planning is trained by default for `12000` steps and loaded automatically from the run directory
   - code decoder defaults to `6x4` with `CODE_DECODER_MAX_SEQ=128`
+  - code eval/model code tests are skipped unless `--with-code-eval` is passed
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline
 - the 80 GB cloud profile is available through `cargo run --release -- train 80gb`:
   - uses shared `DIM=2048`, `BRIDGE_DIM=2048`, `LAYERS=7`, `HEADS=16`
@@ -223,7 +231,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 
 | Mode | Output |
 |------|--------|
-| `train` | full pipeline for memory profile `8gb`, `48gb`, or `80gb`: prep → encoder → world → high-world → code decoder (+ polish) → hard Rust eval (`src/tasks/pipeline.rs`) |
+| `train` | full pipeline for memory profile `8gb`, `48gb`, or `80gb`: prep → encoder → world → high-world → code decoder (+ polish); add `--with-code-eval` for hard Rust eval (`src/tasks/pipeline.rs`) |
 | `--latent` | encoder checkpoint + encoder vocab |
 | `--eval-jepa` | encoder metrics |
 | `--train-world` | pure latent world-model checkpoint |
@@ -248,7 +256,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 - CUDA is enabled by default
 - CPU-only: `cargo run --release --no-default-features -- ...`
 - training logs go to per-run directories under `runs/`
-- the Rust pipeline groups runs as `runs/code_poc_<timestamp>/{latent,world,high_world,decoder_code,decoder_code_polish,code_eval}`
+- the Rust pipeline groups runs as `runs/code_poc_<timestamp>/{latent,world,high_world,decoder_code,decoder_code_polish}` and uses `code_eval` when `--with-code-eval` is passed
 - each training run also records GPU memory telemetry under `memory/*` in TensorBoard and `memory_summary.txt` in the run directory
 - latent, world, and decoder training now support `--grad-accum <int>` so you can trade wall-clock time for larger effective batch / context on small GPUs
 - the canonical pipeline fixes training dtype and microbatch schedules through the selected memory profile

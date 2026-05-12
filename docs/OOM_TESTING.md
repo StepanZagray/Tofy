@@ -57,6 +57,28 @@ cargo run --release -- --sustained-oom-probe --stage all --quick
 
 Treat `--quick` as a shallow sanity check only.
 
+## Short Max-VRAM Probe
+
+Before renting a GPU for a long run, use the short max-VRAM probe:
+
+```bash
+cargo run --release -- --max-vram-probe --profile 48gb --stage all
+```
+
+This uses `config/model_profiles.json`, runs latent, world, high-world, and
+decoder probes. Latent, high-world, and decoder are capped under 500 measured
+steps; world runs 1000 measured steps because previous runs only provide a
+meaningful early world VRAM baseline at step 1000. It forces the world warmup
+transition early and uses frequent world/high-world/decoder logging so
+validation/checkpoint paths are exercised during the short run.
+
+The output includes `peak_used_mb`, `min_free_mb`, per-stage
+`*.vram_samples.jsonl`, and `summary.json` in the probe directory. The summary
+also includes rough full-run VRAM estimates by multiplying measured peaks by
+historical stage growth factors from saved runs. It is still an empirical check
+rather than a formal guarantee: allocator behavior, driver version, background
+processes, and longer-run checkpoint cadence can still change the exact peak.
+
 ## 80 GB Cloud Profile Probe
 
 Run the sustained probe manually before launching the long 80 GB pipeline:
@@ -76,14 +98,12 @@ That profile uses `DIM=2048`, `BRIDGE_DIM=2048`, `LAYERS=7`, `HEADS=16`,
 Run the sustained probe manually before launching the long 48 GB pipeline:
 
 ```bash
-cargo run --release -- --sustained-oom-probe --stage all --dim 1536 --layers 7 --heads 12 --bridge-dim 1536 --planner-slots 96 --decoder-max-vocab 24000
+cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 ```
 
-That profile uses `DIM=1536`, `BRIDGE_DIM=1536`, `LAYERS=7`, `HEADS=12`,
-`NUM_LATENT_TOKENS=96`, encoder/world context `256`, and code-decoder context
-`128`. The probe defaults to at least `3072 MB` free headroom and allows up to
-`1536 MB` late-run growth; override with `TOFY_48GB_MIN_HEADROOM_MB` and
-`TOFY_48GB_MAX_LATE_GROWTH_MB` if needed.
+The probe loads the current `48gb` shape from `config/model_profiles.json`.
+Prefer `--max-vram-probe --profile 48gb` for the first rental check, then run
+the sustained probe only after the short probe passes.
 
 ## High-Level World Stage
 

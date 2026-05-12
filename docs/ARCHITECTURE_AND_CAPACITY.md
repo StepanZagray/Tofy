@@ -15,7 +15,7 @@ The runtime architecture above is now reflected more directly in the crate struc
 - [`src/config/latent.rs`](../src/config/latent.rs) contains latent train/eval configs.
 - [`src/config/world.rs`](../src/config/world.rs) contains world, orchestrator, decoder, eval, and serve configs.
 - [`src/tasks/latent.rs`](../src/tasks/latent.rs) implements the latent train/eval path.
-- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) wires the canonical `train` pipeline: data prep and caches, encoder, world, high-world, code decoder (+ polish), and the hard Rust code eval stage.
+- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) wires the canonical `train` pipeline: data prep and caches, encoder, world, high-world, code decoder (+ polish), with the hard Rust code eval stage behind `--with-code-eval`.
 - [`src/tasks/world.rs`](../src/tasks/world.rs) implements the world/high-world/orchestrator/decoder train paths and runtime engine.
 - [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) contains shared world/decoder metric and masking helpers that used to live inline in `world.rs`.
 

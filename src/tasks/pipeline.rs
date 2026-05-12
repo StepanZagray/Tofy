@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ const RUST_STD_DOC_TRAJECTORY_DATA: &str = "data/rust_std_doc_trajectories.txt";
 const RUST_STD_DOC_CODE_DATA: &str = "data/rust_std_doc_code_pairs.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
+const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemoryProfile {
@@ -33,7 +34,7 @@ enum MemoryProfile {
     EightyGb,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 struct ProfileDefaults {
     latent_steps: usize,
     world_steps: usize,
@@ -50,6 +51,10 @@ struct ProfileDefaults {
     code_decoder_max_vocab: usize,
     bridge_dim: usize,
     num_latent_tokens: usize,
+    decoder_dim: usize,
+    decoder_layers: usize,
+    decoder_heads: usize,
+    decoder_ff_dim: usize,
     latent_batch: usize,
     latent_warmup_batch: usize,
     world_batch: usize,
@@ -62,11 +67,22 @@ struct ProfileDefaults {
     code_polish_grad_accum: usize,
 }
 
+#[derive(Deserialize)]
+struct ModelProfiles {
+    #[serde(rename = "8gb")]
+    eight_gb: ProfileDefaults,
+    #[serde(rename = "48gb")]
+    forty_eight_gb: ProfileDefaults,
+    #[serde(rename = "80gb")]
+    eighty_gb: ProfileDefaults,
+}
+
 #[derive(Debug)]
 struct PipelineConfig {
     profile: MemoryProfile,
     resume: bool,
     resume_selector: Option<String>,
+    with_code_eval: bool,
 }
 
 #[derive(Debug)]
@@ -111,6 +127,7 @@ struct PipelineMeta<'a> {
     code_train_data: &'a str,
     eval_suite: &'a str,
     profile: &'a str,
+    with_code_eval: bool,
     latent_steps: usize,
     world_steps: usize,
     high_world_steps: usize,
@@ -129,6 +146,10 @@ struct PipelineMeta<'a> {
     heads: usize,
     bridge_dim: usize,
     num_latent_tokens: usize,
+    decoder_dim: usize,
+    decoder_layers: usize,
+    decoder_heads: usize,
+    decoder_ff_dim: usize,
 }
 
 pub fn try_run_pipeline(args: &[String]) -> Result<bool> {
@@ -158,101 +179,33 @@ impl MemoryProfile {
         }
     }
 
-    fn defaults(self) -> ProfileDefaults {
-        match self {
-            Self::EightGb => ProfileDefaults {
-                latent_steps: 25_000,
-                world_steps: 60_000,
-                high_world_steps: 12_000,
-                code_decoder_steps: 40_000,
-                code_polish_steps: 8_000,
-                dim: 640,
-                latent_max_seq: 256,
-                world_max_seq: 256,
-                code_decoder_max_seq: 128,
-                layers: 7,
-                heads: 8,
-                max_vocab: 8_000,
-                code_decoder_max_vocab: 16_000,
-                bridge_dim: 640,
-                num_latent_tokens: 64,
-                latent_batch: 12,
-                latent_warmup_batch: 12,
-                world_batch: 64,
-                world_warmup_batch: 64,
-                code_decoder_batch: 6,
-                code_polish_batch: 4,
-                latent_grad_accum: 2,
-                world_grad_accum: 2,
-                code_decoder_grad_accum: 4,
-                code_polish_grad_accum: 6,
-            },
-            Self::FortyEightGb => ProfileDefaults {
-                latent_steps: 75_000,
-                world_steps: 180_000,
-                high_world_steps: 36_000,
-                code_decoder_steps: 120_000,
-                code_polish_steps: 24_000,
-                dim: 1536,
-                latent_max_seq: 256,
-                world_max_seq: 256,
-                code_decoder_max_seq: 128,
-                layers: 7,
-                heads: 12,
-                max_vocab: 12_000,
-                code_decoder_max_vocab: 24_000,
-                bridge_dim: 1536,
-                num_latent_tokens: 96,
-                latent_batch: 6,
-                latent_warmup_batch: 3,
-                world_batch: 24,
-                world_warmup_batch: 12,
-                code_decoder_batch: 2,
-                code_polish_batch: 2,
-                latent_grad_accum: 4,
-                world_grad_accum: 3,
-                code_decoder_grad_accum: 6,
-                code_polish_grad_accum: 6,
-            },
-            Self::EightyGb => ProfileDefaults {
-                latent_steps: 250_000,
-                world_steps: 600_000,
-                high_world_steps: 120_000,
-                code_decoder_steps: 400_000,
-                code_polish_steps: 80_000,
-                dim: 2048,
-                latent_max_seq: 256,
-                world_max_seq: 256,
-                code_decoder_max_seq: 128,
-                layers: 7,
-                heads: 16,
-                max_vocab: 16_000,
-                code_decoder_max_vocab: 32_000,
-                bridge_dim: 2048,
-                num_latent_tokens: 128,
-                latent_batch: 4,
-                latent_warmup_batch: 2,
-                world_batch: 16,
-                world_warmup_batch: 8,
-                code_decoder_batch: 2,
-                code_polish_batch: 2,
-                latent_grad_accum: 8,
-                world_grad_accum: 4,
-                code_decoder_grad_accum: 8,
-                code_polish_grad_accum: 8,
-            },
-        }
+    fn defaults(self) -> Result<ProfileDefaults> {
+        let path = std::env::var("TOFY_MODEL_PROFILES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(MODEL_PROFILES_PATH));
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read model profile config from {:?}", path))?;
+        let profiles: ModelProfiles = serde_json::from_str(&raw)
+            .with_context(|| format!("parse model profile config from {:?}", path))?;
+        Ok(match self {
+            Self::EightGb => profiles.eight_gb,
+            Self::FortyEightGb => profiles.forty_eight_gb,
+            Self::EightyGb => profiles.eighty_gb,
+        })
     }
 }
 
 impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
-            anyhow::anyhow!("usage: train <8gb|48gb|80gb> [--resume [latest|run]]")
+            anyhow::anyhow!(
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
+            )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
+        let mut with_code_eval = false;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -269,19 +222,26 @@ impl PipelineConfig {
                         i += 1;
                     }
                 }
-                other => bail!("unsupported train argument '{other}' (only --resume is accepted)"),
+                "--with-code-eval" => {
+                    with_code_eval = true;
+                    i += 1;
+                }
+                other => bail!(
+                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval)"
+                ),
             }
         }
         Ok(Self {
             profile,
             resume,
             resume_selector,
+            with_code_eval,
         })
     }
 }
 
 fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
-    let defaults = cfg.profile.defaults();
+    let defaults = cfg.profile.defaults()?;
     set_pipeline_env(&cfg, &defaults);
     maybe_export_cuda_compat();
 
@@ -321,11 +281,19 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
     train_high_world(&paths, &cfg, &defaults)?;
     train_code_decoder(&paths, &cfg, &defaults)?;
     train_code_polish(&paths, &cfg, &defaults)?;
-    let selected_decoder = select_decoder_checkpoint(&paths, &cfg, &defaults)?;
+    let selected_decoder = if cfg.with_code_eval {
+        select_decoder_checkpoint(&paths, &defaults)?
+    } else {
+        select_trained_decoder_checkpoint(&paths)
+    };
     let mut paths = paths;
     paths.code_decoder_model = selected_decoder;
     write_meta(&paths, &cfg, &defaults)?;
-    final_eval(&paths, &defaults)?;
+    if cfg.with_code_eval {
+        final_eval(&paths, &defaults)?;
+    } else {
+        println!("Skipping code eval suite; pass --with-code-eval to run model code tests.");
+    }
 
     println!("Pipeline complete.");
     println!(
@@ -381,6 +349,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_HWM_MACRO_MAX_LEN", "4");
     std::env::set_var("TOFY_CACHE_DIR", CACHE_DIR);
     std::env::set_var("TOFY_CACHE_PREFETCH_BATCHES", "1");
+    if cfg.profile == MemoryProfile::EightGb {
+        std::env::set_var("TOFY_PLANNER_SEGMENT_BATCH", "16");
+    }
     if cfg.resume {
         std::env::set_var("TOFY_RESUME", "1");
     } else {
@@ -744,7 +715,7 @@ fn train_world(
         return Ok(());
     }
     let vocab = matched_encoder_vocab(paths);
-    let args = vec![
+    let mut args = vec![
         "jepa_ai".to_string(),
         "--train-world".to_string(),
         paths.latent_model.to_string_lossy().to_string(),
@@ -771,10 +742,21 @@ fn train_world(
         "--action-loss-weight".to_string(),
         "0.0".to_string(),
     ];
+    if cfg.profile == MemoryProfile::EightGb {
+        args.push("--freeze-encoder".to_string());
+    }
     with_stage("world", || {
         tasks::world::try_run_train(&append_resume(args, cfg.resume))
     })?;
     ensure_file(&paths.world_model)?;
+    if cfg.profile == MemoryProfile::EightGb && !paths.world_encoder_model.exists() {
+        fs::copy(&paths.latent_model, &paths.world_encoder_model).with_context(|| {
+            format!(
+                "copy frozen encoder export from {:?} to {:?}",
+                paths.latent_model, paths.world_encoder_model
+            )
+        })?;
+    }
     ensure_file(&paths.world_encoder_model)?;
     Ok(())
 }
@@ -938,6 +920,14 @@ fn decoder_args(
         "code".to_string(),
         "--decoder-max-vocab".to_string(),
         defaults.code_decoder_max_vocab.to_string(),
+        "--decoder-dim".to_string(),
+        defaults.decoder_dim.to_string(),
+        "--decoder-layers".to_string(),
+        defaults.decoder_layers.to_string(),
+        "--decoder-heads".to_string(),
+        defaults.decoder_heads.to_string(),
+        "--decoder-ff-dim".to_string(),
+        defaults.decoder_ff_dim.to_string(),
         "--decoder-vocab".to_string(),
         paths.code_decoder_vocab.to_string_lossy().to_string(),
         "--decoder-output".to_string(),
@@ -956,11 +946,7 @@ fn decoder_args(
     args
 }
 
-fn select_decoder_checkpoint(
-    paths: &PipelinePaths,
-    cfg: &PipelineConfig,
-    defaults: &ProfileDefaults,
-) -> Result<PathBuf> {
+fn select_decoder_checkpoint(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<PathBuf> {
     println!("== Stage 5c/6: verifier-guided checkpoint selection ==");
     run_code_eval_with_label(paths, defaults, &paths.code_decoder_base_model, "base")?;
     if paths.code_decoder_polish_model.exists() {
@@ -980,8 +966,15 @@ fn select_decoder_checkpoint(
         selected.1,
         selected.0.display()
     );
-    let _ = cfg;
     Ok(selected.0.clone())
+}
+
+fn select_trained_decoder_checkpoint(paths: &PipelinePaths) -> PathBuf {
+    if paths.code_decoder_polish_model.exists() {
+        paths.code_decoder_polish_model.clone()
+    } else {
+        paths.code_decoder_base_model.clone()
+    }
 }
 
 fn final_eval(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<()> {
@@ -1185,15 +1178,21 @@ fn metrics_better(candidate: &SummaryMetrics, current: &SummaryMetrics) -> bool 
 
 fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     let selector = cfg.resume_selector.as_deref().unwrap_or("");
+    let eval_flag = if cfg.with_code_eval {
+        " --with-code-eval"
+    } else {
+        ""
+    };
     let content = format!(
-        "timestamp_unix={}\ncommand=train {}{}\n",
+        "timestamp_unix={}\ncommand=train {}{}{}\n",
         unix_timestamp()?,
         cfg.profile.as_str(),
         if selector.is_empty() {
             String::new()
         } else {
             format!(" --resume {selector}")
-        }
+        },
+        eval_flag
     );
     fs::write(paths.run_root.join("launch.txt"), content)?;
     Ok(())
@@ -1227,6 +1226,7 @@ fn write_meta(
         code_train_data: CODE_TRAIN_DATA,
         eval_suite: EVAL_SUITE,
         profile: cfg.profile.as_str(),
+        with_code_eval: cfg.with_code_eval,
         latent_steps: defaults.latent_steps,
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,
@@ -1245,6 +1245,10 @@ fn write_meta(
         heads: defaults.heads,
         bridge_dim: defaults.bridge_dim,
         num_latent_tokens: defaults.num_latent_tokens,
+        decoder_dim: defaults.decoder_dim,
+        decoder_layers: defaults.decoder_layers,
+        decoder_heads: defaults.decoder_heads,
+        decoder_ff_dim: defaults.decoder_ff_dim,
     };
     fs::write(
         paths.run_root.join("meta.json"),

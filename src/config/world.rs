@@ -476,6 +476,10 @@ pub struct DecoderTrainConfig {
     pub decoder_vocab_path: Option<PathBuf>,
     pub decoder_max_vocab: usize,
     pub decoder_output_path: Option<PathBuf>,
+    pub decoder_dim: usize,
+    pub decoder_layers: usize,
+    pub decoder_heads: usize,
+    pub decoder_ff_dim: usize,
 }
 
 impl DecoderTrainConfig {
@@ -495,6 +499,10 @@ impl DecoderTrainConfig {
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let mut decoder_max_vocab = None;
+        let mut decoder_dim = None;
+        let mut decoder_layers = None;
+        let mut decoder_heads = None;
+        let mut decoder_ff_dim = None;
         let mut filtered = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -530,6 +538,54 @@ impl DecoderTrainConfig {
                     value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--decoder-max-vocab must be integer"))?,
+                );
+                i += 2;
+                continue;
+            }
+            if args[i] == "--decoder-dim" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--decoder-dim requires integer"))?;
+                decoder_dim = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--decoder-dim must be integer"))?,
+                );
+                i += 2;
+                continue;
+            }
+            if args[i] == "--decoder-layers" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--decoder-layers requires integer"))?;
+                decoder_layers = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--decoder-layers must be integer"))?,
+                );
+                i += 2;
+                continue;
+            }
+            if args[i] == "--decoder-heads" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--decoder-heads requires integer"))?;
+                decoder_heads = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--decoder-heads must be integer"))?,
+                );
+                i += 2;
+                continue;
+            }
+            if args[i] == "--decoder-ff-dim" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--decoder-ff-dim requires integer"))?;
+                decoder_ff_dim = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--decoder-ff-dim must be integer"))?,
                 );
                 i += 2;
                 continue;
@@ -632,6 +688,34 @@ impl DecoderTrainConfig {
                 }
             }),
             decoder_output_path,
+            decoder_dim: decoder_dim
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_DIM")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(640),
+            decoder_layers: decoder_layers
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_LAYERS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(6),
+            decoder_heads: decoder_heads
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_HEADS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(8),
+            decoder_ff_dim: decoder_ff_dim
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_FF_DIM")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(2560),
         })
     }
 }

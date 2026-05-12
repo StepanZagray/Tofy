@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "kind": "rust_doc_trajectories",
+  "output_path": "data/rust_std_doc_trajectories.txt",
+  "params": {
+    "code_output": "data/rust_std_doc_code_pairs.txt",
+    "docs_chars": 2200,
+    "docs_root": "/home/stepan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/share/doc/rust/html/std",
+    "docs_top_k": 4,
+    "max_rows": 12000,
+    "trajectory": "prompt->fetch_docs->docs_conditioned_code"
+  },
+  "inputs": [
+    {
+      "path": "data/rust_instruction_pairs.txt",
+      "len": 826115469,
+      "modified_unix_nanos": 1777022581348531978,
+      "content_hash": "3d242391f926bd0784435be8d789eb2f700ca97f25f5cad89749e7f0fc2b8054"
+    }
+  ],
+  "rows": 12000
+}

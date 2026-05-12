@@ -22,7 +22,7 @@ For the current repo, the cleanest proof of concept is now paper-strict by defau
 2. train the action-conditioned world transition with next-latent prediction plus SIGReg only
 3. train the integrated high-level world transition in the same planner-slot latent space
 4. train only the code decoder as a downstream emitter
-5. score the result on the hard Rust eval suite
+5. optionally score the result on the hard Rust eval suite with `--with-code-eval`
 
 The Rust pipeline fixes `TOFY_SIGREG_SLICES=1024`, zero world action/inverse auxiliary weights, and zero decoder syntax/signature/structure auxiliary weights.
 
@@ -38,6 +38,17 @@ The canonical training command is:
 ```bash
 cargo run --release -- train 8gb
 ```
+
+This trains the modules only. To also run verifier-guided decoder selection and
+the hard Rust eval suite, pass:
+
+```bash
+cargo run --release -- train 8gb --with-code-eval
+```
+
+The `8gb`, `48gb`, and `80gb` model/profile sizes are defined in
+`config/model_profiles.json`. Override that file path with
+`TOFY_MODEL_PROFILES=<path>` when testing a different shape.
 
 Use `train 48gb` for the A40 profile or `train 80gb` for the larger cloud
 profile. Resume uses the run directory layout:

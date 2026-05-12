@@ -13,6 +13,31 @@ use crate::model::attention::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecoderArchitecture {
+    pub dim: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub ff_dim: usize,
+}
+
+impl DecoderArchitecture {
+    pub fn new(dim: usize, num_layers: usize, num_heads: usize, ff_dim: usize) -> Result<Self> {
+        if dim == 0 || num_layers == 0 || num_heads == 0 || ff_dim == 0 {
+            anyhow::bail!("decoder architecture values must be non-zero");
+        }
+        if dim % num_heads != 0 {
+            anyhow::bail!("decoder dim {dim} must be divisible by heads {num_heads}");
+        }
+        Ok(Self {
+            dim,
+            num_layers,
+            num_heads,
+            ff_dim,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecoderKind {
     TextGeneralist,
     CodeSpecialist,

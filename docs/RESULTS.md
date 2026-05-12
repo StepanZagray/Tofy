@@ -27,7 +27,7 @@ These were existing TensorBoard runs in `runs/` before the current training-code
 - The Rust `train <8gb|48gb|80gb>` pipeline now prepares the mixed world/code datasets by default and is the canonical full training path.
 - The repo now has a hard code-first eval suite at `eval/code_assistant_rust_hard.jsonl` plus `--eval-code-assistant` for end-to-end proof-of-concept scoring.
 - Latent, world, and decoder training now support `--grad-accum <int>` so effective batch size can grow on 8 GB GPUs without increasing microbatch memory.
-- `cargo run --release -- train 8gb` now defines the canonical path: strict encoder -> strict world transition -> integrated high-world transition -> downstream code decoder -> hard Rust eval suite.
+- `cargo run --release -- train 8gb` now defines the canonical module-training path: strict encoder -> strict world transition -> integrated high-world transition -> downstream code decoder. Add `--with-code-eval` to run verifier-guided decoder selection and the hard Rust eval suite.
 - The code-first pipeline now generates compiler-feedback Rust repair rows when `rustc` is available, mixes them into both world/code data as code-route examples, and uses tool/context tags while preserving three-action checkpoint compatibility.
 - The Rust pipeline saves stage checkpoints inside run-owned directories under `runs/` and resumes by explicit run id or `latest`, which prevents stale checkpoints from unrelated runs being reused.
 - Tokenization and token caching now use an explicit tokenizer-spec fingerprint plus UTF-8 byte fallback, so tokenizer/cache invalidation is tied to tokenizer behavior rather than only source hashes and mode names.

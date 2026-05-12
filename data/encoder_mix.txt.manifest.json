@@ -27,7 +27,13 @@
       "len": 235239,
       "modified_unix_nanos": 1777022116388862148,
       "content_hash": "03b4c3fec1ea27ac6c5bc1102667601334604b344098e66830d09943395b613b"
+    },
+    {
+      "path": "data/rust_std_docs_jepa.txt",
+      "len": 23329716,
+      "modified_unix_nanos": 1778361261991434639,
+      "content_hash": "1d20ecd6d27f2524d69b4c7307f845adc7efe48943e91c93a4317fb180b09fe5"
     }
   ],
-  "rows": 30446812
+  "rows": 30460643
 }

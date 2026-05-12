@@ -3,9 +3,9 @@
   "kind": "code_decoder",
   "source": {
     "path": "data/code_poc_mix.txt",
-    "len": 5297673830,
-    "modified_unix_secs": 1777149514,
-    "content_hash": "00ae1114617e5358"
+    "len": 5333243324,
+    "modified_unix_secs": 1778362824,
+    "content_hash": "90408078c5020b08"
   },
   "tokenizer": "code-aware",
   "tokenizer_spec": {
@@ -24,7 +24,7 @@
   "tokenizer_spec_signature": "b15880942f080cd1",
   "max_seq": 128,
   "vocab_path": "",
-  "vocab_signature": "7f48701e139aa517",
+  "vocab_signature": "c86566baa896359e",
   "token_cache_path": "data/cache/code_decoder.tokens.bin",
-  "rows": 5900369
+  "rows": 5912369
 }

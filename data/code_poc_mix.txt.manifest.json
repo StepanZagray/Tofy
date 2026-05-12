@@ -29,10 +29,16 @@
     },
     {
       "path": "data/rust_repair_pairs.txt",
-      "len": 4069509,
-      "modified_unix_nanos": 1777149487007667515,
-      "content_hash": "6934f4a2616c5cd31f1dcdf264589e1d5dbf60a4d1e23bf67113c6b18b265b18"
+      "len": 4070429,
+      "modified_unix_nanos": 1778362806931685733,
+      "content_hash": "ca847eabbde66f0daa086295d97e952074b6904c1090aae7bf4f2b5724502995"
+    },
+    {
+      "path": "data/rust_std_doc_code_pairs.txt",
+      "len": 17783827,
+      "modified_unix_nanos": 1778362749484015060,
+      "content_hash": "25af188460007431bc0e07cb50b2524e461a61bc32133efa205eb7e6abafee31"
     }
   ],
-  "rows": 5911875
+  "rows": 5923875
 }

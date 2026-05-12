@@ -26,6 +26,8 @@ pub(crate) struct RustDocHit {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RustDocIndex {
     chunks: Vec<RustDocChunk>,
+    doc_freq: HashMap<String, usize>,
+    inverted: HashMap<String, Vec<usize>>,
 }
 
 const DEFAULT_MAX_DOC_FILES: usize = 6000;
@@ -107,6 +109,8 @@ impl RustDocIndex {
         let mut files = Vec::new();
         collect_doc_files(root, &mut files, max_files)?;
         let mut chunks = Vec::new();
+        let mut doc_freq = HashMap::<String, usize>::new();
+        let mut inverted = HashMap::<String, Vec<usize>>::new();
         for path in files {
             let Ok(raw) = fs::read_to_string(&path) else {
                 continue;
@@ -122,6 +126,16 @@ impl RustDocIndex {
                 if tokens.len() < 6 {
                     continue;
                 }
+                let chunk_idx = chunks.len();
+                for token in tokens.keys() {
+                    *doc_freq.entry(token.clone()).or_insert(0) += 1;
+                    inverted.entry(token.clone()).or_default().push(chunk_idx);
+                }
+                for symbol in symbols.iter().map(|value| value.to_ascii_lowercase()) {
+                    if symbol.len() >= 3 {
+                        inverted.entry(symbol).or_default().push(chunk_idx);
+                    }
+                }
                 chunks.push(RustDocChunk {
                     title: title.clone(),
                     path: path.clone(),
@@ -131,7 +145,11 @@ impl RustDocIndex {
                 });
             }
         }
-        Ok(Self { chunks })
+        Ok(Self {
+            chunks,
+            doc_freq,
+            inverted,
+        })
     }
 
     pub(crate) fn search(&self, query: &str, top_k: usize) -> Vec<RustDocHit> {
@@ -141,21 +159,31 @@ impl RustDocIndex {
         }
         let query_symbols = extract_symbol_like_terms(query);
         let total_docs = self.chunks.len().max(1) as f32;
-        let mut doc_freq = HashMap::<String, usize>::new();
+        let mut candidate_ids = HashSet::new();
         for token in query_tokens.keys() {
-            let count = self
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.tokens.contains_key(token))
-                .count();
-            doc_freq.insert(token.clone(), count.max(1));
+            if let Some(ids) = self.inverted.get(token) {
+                candidate_ids.extend(ids.iter().copied());
+            }
         }
-        let mut scored = self
-            .chunks
+        for symbol in &query_symbols {
+            if let Some(ids) = self.inverted.get(symbol) {
+                candidate_ids.extend(ids.iter().copied());
+            }
+        }
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut scored = candidate_ids
             .iter()
+            .filter_map(|chunk_idx| self.chunks.get(*chunk_idx))
             .filter_map(|chunk| {
-                let score =
-                    score_chunk(chunk, &query_tokens, &query_symbols, &doc_freq, total_docs);
+                let score = score_chunk(
+                    chunk,
+                    &query_tokens,
+                    &query_symbols,
+                    &self.doc_freq,
+                    total_docs,
+                );
                 (score > 0.0).then(|| RustDocHit {
                     title: chunk.title.clone(),
                     path: chunk.path.clone(),
@@ -433,7 +461,7 @@ fn score_chunk(
         .map(|value| value.to_ascii_lowercase())
         .collect::<HashSet<_>>();
     for symbol in query_symbols {
-        if chunk_symbols.contains(symbol) || chunk.text.to_ascii_lowercase().contains(symbol) {
+        if chunk_symbols.contains(symbol) {
             score += 3.5;
         }
     }

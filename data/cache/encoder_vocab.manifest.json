@@ -3,9 +3,9 @@
   "kind": "encoder",
   "source": {
     "path": "data/encoder_mix.txt",
-    "len": 5972529894,
-    "modified_unix_secs": 1777022565,
-    "content_hash": "6ffd606a1baf67e8"
+    "len": 5995838002,
+    "modified_unix_secs": 1778361294,
+    "content_hash": "9532d51f9729c52f"
   },
   "tokenizer": "default",
   "tokenizer_spec": {
@@ -24,6 +24,6 @@
   "tokenizer_spec_signature": "c52ae76f842076ee",
   "max_vocab": 8000,
   "vocab_path": "local_models/vocabs/vocab_encoder_8000_default.txt",
-  "vocab_signature": "a8c3fa5439d8cda8",
-  "rows": 30161845
+  "vocab_signature": "1c88c7be453a0df6",
+  "rows": 30175676
 }

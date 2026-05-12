@@ -3,9 +3,9 @@
   "kind": "world",
   "source": {
     "path": "data/world_mix_pairs.txt",
-    "len": 2286742926,
-    "modified_unix_secs": 1777149497,
-    "content_hash": "5d5a3c250c06ea26"
+    "len": 2344936230,
+    "modified_unix_secs": 1778362816,
+    "content_hash": "c62f2fc046323ae8"
   },
   "tokenizer": "default",
   "tokenizer_spec": {
@@ -24,7 +24,7 @@
   "tokenizer_spec_signature": "c52ae76f842076ee",
   "max_seq": 256,
   "vocab_path": "",
-  "vocab_signature": "a8c3fa5439d8cda8",
+  "vocab_signature": "1c88c7be453a0df6",
   "token_cache_path": "data/cache/world.tokens.bin",
-  "rows": 2874815
+  "rows": 2904083
 }

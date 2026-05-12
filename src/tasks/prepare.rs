@@ -62,6 +62,7 @@ enum ProbeStage {
     All,
     Latent,
     World,
+    HighWorld,
     Decoder,
 }
 
@@ -69,6 +70,7 @@ enum ProbeStage {
 struct OomProbeArgs {
     stage: ProbeStage,
     quick: bool,
+    max_vram: bool,
     probe_dir: Option<PathBuf>,
     keep_local_models: bool,
     build: bool,
@@ -98,11 +100,18 @@ struct OomProbeArgs {
     world_lambda: f64,
     world_lr: f64,
     world_action_loss_weight: f64,
+    high_world_steps: usize,
+    high_world_batch: usize,
+    high_world_accum: usize,
     decoder_steps: usize,
     decoder_batch: usize,
     decoder_accum: usize,
     decoder_max_seq: usize,
     decoder_max_vocab: usize,
+    decoder_dim: usize,
+    decoder_layers: usize,
+    decoder_heads: usize,
+    decoder_ff_dim: usize,
     setup_latent_steps: usize,
     setup_world_steps: usize,
     latent_model: Option<PathBuf>,
@@ -141,6 +150,60 @@ struct ProbeResult {
     last_used_mb: Option<i64>,
     samples_path: String,
     tail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FullRunVramEstimate {
+    stage: String,
+    measured_peak_mb: Option<i64>,
+    historical_multiplier: f64,
+    estimated_full_peak_mb: Option<i64>,
+    rationale: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProbeSummary {
+    results: Vec<ProbeResult>,
+    full_run_estimates: Vec<FullRunVramEstimate>,
+}
+
+#[derive(Deserialize)]
+struct OomProbeProfileFile {
+    #[serde(rename = "8gb")]
+    eight_gb: OomProbeProfile,
+    #[serde(rename = "48gb")]
+    forty_eight_gb: OomProbeProfile,
+    #[serde(rename = "80gb")]
+    eighty_gb: OomProbeProfile,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct OomProbeProfile {
+    latent_steps: usize,
+    world_steps: usize,
+    high_world_steps: usize,
+    code_decoder_steps: usize,
+    dim: usize,
+    latent_max_seq: usize,
+    world_max_seq: usize,
+    code_decoder_max_seq: usize,
+    layers: usize,
+    heads: usize,
+    max_vocab: usize,
+    code_decoder_max_vocab: usize,
+    bridge_dim: usize,
+    num_latent_tokens: usize,
+    decoder_dim: usize,
+    decoder_layers: usize,
+    decoder_heads: usize,
+    decoder_ff_dim: usize,
+    latent_batch: usize,
+    world_batch: usize,
+    world_warmup_batch: usize,
+    code_decoder_batch: usize,
+    latent_grad_accum: usize,
+    world_grad_accum: usize,
+    code_decoder_grad_accum: usize,
 }
 
 pub fn try_run_prepare(args: &[String]) -> Result<bool> {
@@ -206,6 +269,10 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
         }
         "--sustained-oom-probe" | "sustained-oom-probe" => {
             run_sustained_oom_probe(&args[2..])?;
+            Ok(true)
+        }
+        "--max-vram-probe" | "max-vram-probe" => {
+            run_max_vram_probe(&args[2..])?;
             Ok(true)
         }
         _ => Ok(false),
@@ -796,14 +863,16 @@ fn run_prepare_rust_doc_trajectories(args: &[String]) -> Result<()> {
         if rows.len() >= max_rows {
             break;
         }
-        let docs = index.format_hits(&prompt, docs_top_k, docs_chars);
+        let Some(query_hint) = rust_doc_query_hint(&prompt) else {
+            continue;
+        };
+        let docs = index.format_hits(&query_hint, docs_top_k, docs_chars);
         if docs.trim().is_empty() {
             continue;
         }
         let fetch_state = format!(
             "<action:fetch_docs>\n<tool:fetch_docs>\nUser request:\n{}\n\nQuery:\n{}",
-            prompt,
-            rust_doc_query_hint(&prompt)
+            prompt, query_hint
         );
         rows.push(format!(
             "{}\t{}\tfetch_docs",
@@ -858,7 +927,7 @@ fn run_prepare_rust_doc_trajectories(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn rust_doc_query_hint(prompt: &str) -> String {
+fn rust_doc_query_hint(prompt: &str) -> Option<String> {
     let mut terms = Vec::new();
     for token in prompt.split(|ch: char| {
         !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
@@ -867,10 +936,30 @@ fn rust_doc_query_hint(prompt: &str) -> String {
         if clean.len() < 3 {
             continue;
         }
+        let lower = clean.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "rust"
+                | "return"
+                | "rules"
+                | "keep"
+                | "exact"
+                | "function"
+                | "signature"
+                | "code"
+                | "only"
+                | "write"
+                | "complete"
+                | "implement"
+                | "output"
+                | "compilable"
+        ) {
+            continue;
+        }
         if clean.contains("::")
-            || clean.chars().any(|ch| ch.is_ascii_uppercase())
+            || (clean.chars().any(|ch| ch.is_ascii_uppercase()) && !clean.ends_with(':'))
             || matches!(
-                clean.to_ascii_lowercase().as_str(),
+                lower.as_str(),
                 "iterator"
                     | "hashmap"
                     | "btree"
@@ -889,15 +978,7 @@ fn rust_doc_query_hint(prompt: &str) -> String {
             break;
         }
     }
-    if terms.is_empty() {
-        prompt
-            .split_whitespace()
-            .take(24)
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        terms.join(" ")
-    }
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 fn iter_md_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -2646,8 +2727,9 @@ fn parse_probe_stage(value: &str) -> Result<ProbeStage> {
         "all" => Ok(ProbeStage::All),
         "latent" => Ok(ProbeStage::Latent),
         "world" => Ok(ProbeStage::World),
+        "high-world" | "high_world" | "highworld" => Ok(ProbeStage::HighWorld),
         "decoder" => Ok(ProbeStage::Decoder),
-        other => bail!("--stage must be one of all|latent|world|decoder, got {other}"),
+        other => bail!("--stage must be one of all|latent|world|high-world|decoder, got {other}"),
     }
 }
 
@@ -2655,6 +2737,7 @@ fn default_oom_probe_args() -> OomProbeArgs {
     OomProbeArgs {
         stage: ProbeStage::All,
         quick: false,
+        max_vram: false,
         probe_dir: None,
         keep_local_models: false,
         build: false,
@@ -2684,11 +2767,18 @@ fn default_oom_probe_args() -> OomProbeArgs {
         world_lambda: 0.2,
         world_lr: 2e-4,
         world_action_loss_weight: 0.0,
+        high_world_steps: 1000,
+        high_world_batch: 64,
+        high_world_accum: 2,
         decoder_steps: 1000,
         decoder_batch: 6,
         decoder_accum: 4,
         decoder_max_seq: 128,
         decoder_max_vocab: 16_000,
+        decoder_dim: 640,
+        decoder_layers: 6,
+        decoder_heads: 8,
+        decoder_ff_dim: 2560,
         setup_latent_steps: 1,
         setup_world_steps: 2,
         latent_model: None,
@@ -2697,14 +2787,91 @@ fn default_oom_probe_args() -> OomProbeArgs {
     }
 }
 
+fn model_profiles_path() -> PathBuf {
+    std::env::var("TOFY_MODEL_PROFILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("config/model_profiles.json"))
+}
+
+fn load_oom_probe_profile(name: &str) -> Result<OomProbeProfile> {
+    let path = model_profiles_path();
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read model profile config from {:?}", path))?;
+    let profiles: OomProbeProfileFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parse model profile config from {:?}", path))?;
+    match name {
+        "8gb" => Ok(profiles.eight_gb),
+        "48gb" => Ok(profiles.forty_eight_gb),
+        "80gb" => Ok(profiles.eighty_gb),
+        other => bail!("--profile must be one of 8gb|48gb|80gb, got {other}"),
+    }
+}
+
+fn apply_oom_probe_profile(args: &mut OomProbeArgs, profile: OomProbeProfile) {
+    args.dim = profile.dim;
+    args.max_seq = profile.latent_max_seq.max(profile.world_max_seq);
+    args.layers = profile.layers;
+    args.heads = profile.heads;
+    args.bridge_dim = profile.bridge_dim;
+    args.planner_slots = profile.num_latent_tokens;
+    args.vocab = profile.max_vocab;
+    args.latent_steps = profile.latent_steps;
+    args.latent_batch = profile.latent_batch;
+    args.latent_accum = profile.latent_grad_accum;
+    args.world_steps = profile.world_steps;
+    args.world_batch = profile.world_batch;
+    args.world_accum = profile.world_grad_accum;
+    args.world_warmup_batch = profile.world_warmup_batch;
+    args.world_warmup_accum = 1;
+    args.high_world_steps = profile.high_world_steps;
+    args.high_world_batch = profile.world_batch;
+    args.high_world_accum = profile.world_grad_accum;
+    args.decoder_steps = profile.code_decoder_steps;
+    args.decoder_batch = profile.code_decoder_batch;
+    args.decoder_accum = profile.code_decoder_grad_accum;
+    args.decoder_max_seq = profile.code_decoder_max_seq;
+    args.decoder_max_vocab = profile.code_decoder_max_vocab;
+    args.decoder_dim = profile.decoder_dim;
+    args.decoder_layers = profile.decoder_layers;
+    args.decoder_heads = profile.decoder_heads;
+    args.decoder_ff_dim = profile.decoder_ff_dim;
+}
+
+fn apply_max_vram_probe_defaults(args: &mut OomProbeArgs) {
+    args.max_vram = true;
+    args.latent_steps = args.latent_steps.min(480);
+    args.world_steps = args.world_steps.min(1000).max(1000);
+    args.high_world_steps = args.high_world_steps.min(480);
+    args.decoder_steps = args.decoder_steps.min(480);
+    args.setup_latent_steps = args.setup_latent_steps.max(4).min(32);
+    args.setup_world_steps = args.setup_world_steps.max(4).min(32);
+    args.world_warmup_steps = Some(args.world_warmup_steps.unwrap_or(1).min(1));
+    args.max_late_growth_mb = 0;
+    args.sample_interval_sec = args.sample_interval_sec.min(0.10);
+}
+
 fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
     let mut parsed = default_oom_probe_args();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--profile" {
+            let profile_name = parse_flag_value(args, i, "--profile")?;
+            let profile = load_oom_probe_profile(&profile_name)?;
+            apply_oom_probe_profile(&mut parsed, profile);
+        }
+    }
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--profile" => {
+                i += 2;
+            }
             "--stage" => {
                 parsed.stage = parse_probe_stage(&parse_flag_value(args, i, "--stage")?)?;
                 i += 2;
+            }
+            "--max-vram" | "--max_vram" => {
+                parsed.max_vram = true;
+                i += 1;
             }
             "--quick" => {
                 parsed.quick = true;
@@ -2828,6 +2995,18 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
                     parse_f64_value(args, i, "--world-action-loss-weight")?;
                 i += 2;
             }
+            "--high-world-steps" | "--high_world_steps" => {
+                parsed.high_world_steps = parse_usize_value(args, i, "--high-world-steps")?;
+                i += 2;
+            }
+            "--high-world-batch" | "--high_world_batch" => {
+                parsed.high_world_batch = parse_usize_value(args, i, "--high-world-batch")?;
+                i += 2;
+            }
+            "--high-world-accum" | "--high_world_accum" => {
+                parsed.high_world_accum = parse_usize_value(args, i, "--high-world-accum")?;
+                i += 2;
+            }
             "--decoder-steps" | "--decoder_steps" => {
                 parsed.decoder_steps = parse_usize_value(args, i, "--decoder-steps")?;
                 i += 2;
@@ -2846,6 +3025,22 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
             }
             "--decoder-max-vocab" | "--decoder_max_vocab" => {
                 parsed.decoder_max_vocab = parse_usize_value(args, i, "--decoder-max-vocab")?;
+                i += 2;
+            }
+            "--decoder-dim" | "--decoder_dim" => {
+                parsed.decoder_dim = parse_usize_value(args, i, "--decoder-dim")?;
+                i += 2;
+            }
+            "--decoder-layers" | "--decoder_layers" => {
+                parsed.decoder_layers = parse_usize_value(args, i, "--decoder-layers")?;
+                i += 2;
+            }
+            "--decoder-heads" | "--decoder_heads" => {
+                parsed.decoder_heads = parse_usize_value(args, i, "--decoder-heads")?;
+                i += 2;
+            }
+            "--decoder-ff-dim" | "--decoder_ff_dim" => {
+                parsed.decoder_ff_dim = parse_usize_value(args, i, "--decoder-ff-dim")?;
                 i += 2;
             }
             "--setup-latent-steps" | "--setup_latent_steps" => {
@@ -2880,9 +3075,13 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
     if parsed.quick {
         parsed.latent_steps = parsed.latent_steps.min(3);
         parsed.world_steps = parsed.world_steps.min(4);
+        parsed.high_world_steps = parsed.high_world_steps.min(4);
         parsed.decoder_steps = parsed.decoder_steps.min(3);
         parsed.min_headroom_mb = parsed.min_headroom_mb.min(128);
         parsed.max_late_growth_mb = 0;
+    }
+    if parsed.max_vram {
+        apply_max_vram_probe_defaults(&mut parsed);
     }
     Ok(parsed)
 }
@@ -3000,6 +3199,13 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         "2".to_string(),
     );
     env.insert("TOFY_WORLD_ROLLOUT_STEPS".to_string(), "2".to_string());
+    if args.max_vram {
+        env.insert("TOFY_WORLD_LOG_EVERY".to_string(), "25".to_string());
+        env.insert("TOFY_HIGH_WORLD_LOG_EVERY".to_string(), "25".to_string());
+        env.insert("TOFY_DECODER_LOG_EVERY".to_string(), "25".to_string());
+        env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "2".to_string());
+        env.insert("TOFY_PLANNER_SEGMENT_BATCH".to_string(), "64".to_string());
+    }
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());
     env
@@ -3075,6 +3281,46 @@ fn world_probe_cmd(
     ]
 }
 
+fn default_world_encoder_path_for_probe(model_path: &Path) -> PathBuf {
+    let raw = model_path.to_string_lossy();
+    if let Some(prefix) = raw.strip_suffix(".safetensors") {
+        PathBuf::from(format!("{prefix}.encoder.safetensors"))
+    } else {
+        PathBuf::from(format!("{raw}.encoder.safetensors"))
+    }
+}
+
+fn high_world_probe_cmd(
+    args: &OomProbeArgs,
+    data_path: &Path,
+    encoder: &Path,
+    vocab: &Path,
+    world: &Path,
+    steps: usize,
+    output_path: &Path,
+) -> Vec<String> {
+    vec![
+        args.binary.to_string_lossy().to_string(),
+        "--train-high-world".to_string(),
+        encoder.to_string_lossy().to_string(),
+        vocab.to_string_lossy().to_string(),
+        world.to_string_lossy().to_string(),
+        data_path.to_string_lossy().to_string(),
+        steps.to_string(),
+        args.high_world_batch.to_string(),
+        args.dim.to_string(),
+        args.max_seq.to_string(),
+        args.layers.to_string(),
+        args.heads.to_string(),
+        args.bridge_dim.to_string(),
+        args.planner_slots.to_string(),
+        "--grad-accum".to_string(),
+        args.high_world_accum.to_string(),
+        "--output".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ]
+}
+
 fn decoder_probe_cmd(
     args: &OomProbeArgs,
     data_path: &Path,
@@ -3103,6 +3349,14 @@ fn decoder_probe_cmd(
         "code".to_string(),
         "--decoder-max-vocab".to_string(),
         args.decoder_max_vocab.to_string(),
+        "--decoder-dim".to_string(),
+        args.decoder_dim.to_string(),
+        "--decoder-layers".to_string(),
+        args.decoder_layers.to_string(),
+        "--decoder-heads".to_string(),
+        args.decoder_heads.to_string(),
+        "--decoder-ff-dim".to_string(),
+        args.decoder_ff_dim.to_string(),
         "--decoder-output".to_string(),
         output_path.to_string_lossy().to_string(),
         "--grad-accum".to_string(),
@@ -3326,8 +3580,66 @@ fn run_measured_probe(
 
 fn write_probe_summary(probe_dir: &Path, results: &[ProbeResult]) -> Result<PathBuf> {
     let path = probe_dir.join("summary.json");
-    write_json_atomic(&path, &results)?;
+    write_json_atomic(
+        &path,
+        &ProbeSummary {
+            results: results.to_vec(),
+            full_run_estimates: full_run_vram_estimates(results),
+        },
+    )?;
     Ok(path)
+}
+
+fn historical_vram_multiplier(stage: &str) -> (f64, &'static str) {
+    match stage {
+        "latent" => (
+            1.19,
+            "latest/prior latent runs grew about 17-19% from early samples to the 10k/plateau sample",
+        ),
+        "world" => (
+            3.65,
+            "world has only 1000-step early historical samples; latest run grew from 2093MB at step 1000 to 7629MB plateau",
+        ),
+        "high_world" => (
+            1.05,
+            "latest high-world grew about 4.6% from step 100 to 10k and 2.8% from step 500 to plateau",
+        ),
+        "decoder" => (
+            1.02,
+            "decoder runs historically grew 0-1.7% from step 500 to 10k/plateau",
+        ),
+        _ => (1.0, "no historical multiplier available for this stage"),
+    }
+}
+
+fn full_run_vram_estimates(results: &[ProbeResult]) -> Vec<FullRunVramEstimate> {
+    results
+        .iter()
+        .map(|result| {
+            let (multiplier, rationale) = historical_vram_multiplier(&result.name);
+            let estimated_full_peak_mb = result
+                .peak_used_mb
+                .map(|peak| ((peak as f64) * multiplier).ceil() as i64);
+            FullRunVramEstimate {
+                stage: result.name.clone(),
+                measured_peak_mb: result.peak_used_mb,
+                historical_multiplier: multiplier,
+                estimated_full_peak_mb,
+                rationale: rationale.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn print_full_run_vram_estimates(results: &[ProbeResult]) -> Result<()> {
+    let estimates = full_run_vram_estimates(results);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "full_run_vram_estimates": estimates,
+        }))?
+    );
+    Ok(())
 }
 
 fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
@@ -3365,6 +3677,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             ProbeStage::All => "all",
             ProbeStage::Latent => "latent",
             ProbeStage::World => "world",
+            ProbeStage::HighWorld => "high-world",
             ProbeStage::Decoder => "decoder",
         }
     );
@@ -3397,7 +3710,10 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             }
             latent = Some(latest_artifact_with_prefix("model_latent_")?);
             vocab = Some(model_dir().join("vocabs/vocab_encoder.txt"));
-        } else if matches!(args.stage, ProbeStage::World | ProbeStage::Decoder) {
+        } else if matches!(
+            args.stage,
+            ProbeStage::World | ProbeStage::HighWorld | ProbeStage::Decoder
+        ) {
             let (latent_path, vocab_path) = ensure_setup_latent(&args, &data_path)?;
             latent = Some(latent_path);
             vocab = Some(vocab_path);
@@ -3421,12 +3737,47 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
                 bail!("OOM probe failed");
             }
             world = Some(latest_artifact_with_prefix("model_world_")?);
-        } else if matches!(args.stage, ProbeStage::Decoder) {
+        } else if matches!(args.stage, ProbeStage::HighWorld | ProbeStage::Decoder) {
             let latent_ref = latent.as_ref().context("latent setup missing")?;
             let vocab_ref = vocab.as_ref().context("vocab setup missing")?;
             world = Some(ensure_setup_world(
                 &args, &data_path, latent_ref, vocab_ref,
             )?);
+        }
+
+        if matches!(args.stage, ProbeStage::All | ProbeStage::HighWorld) {
+            let latent_ref = latent.as_ref().context("latent setup missing")?;
+            let vocab_ref = vocab.as_ref().context("vocab setup missing")?;
+            let world_ref = world.as_ref().context("world setup missing")?;
+            let encoder_ref = default_world_encoder_path_for_probe(world_ref);
+            let encoder_ref = if encoder_ref.exists() {
+                encoder_ref
+            } else {
+                latent_ref.clone()
+            };
+            let output_path = probe_dir.join("high_world_oom_probe.safetensors");
+            let cmd = high_world_probe_cmd(
+                &args,
+                &data_path,
+                &encoder_ref,
+                vocab_ref,
+                world_ref,
+                args.high_world_steps,
+                &output_path,
+            );
+            let result = run_measured_probe(
+                "high_world",
+                &cmd,
+                &probe_base_env(&args, "high_world"),
+                &probe_dir,
+                &args,
+            )?;
+            results.push(result.clone());
+            if !result.passed {
+                let summary = write_probe_summary(&probe_dir, &results)?;
+                println!("Summary: {}", summary.display());
+                bail!("OOM probe failed");
+            }
         }
 
         if matches!(args.stage, ProbeStage::All | ProbeStage::Decoder) {
@@ -3460,6 +3811,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             }
         }
 
+        print_full_run_vram_estimates(&results)?;
         let summary = write_probe_summary(&probe_dir, &results)?;
         let failed: Vec<&ProbeResult> = results.iter().filter(|result| !result.passed).collect();
         println!("Summary: {}", summary.display());
@@ -3496,4 +3848,11 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
         println!("Restored local_models after probe.");
     }
     result
+}
+
+fn run_max_vram_probe(args: &[String]) -> Result<()> {
+    let mut probe_args = Vec::with_capacity(args.len() + 1);
+    probe_args.push("--max-vram".to_string());
+    probe_args.extend(args.iter().cloned());
+    run_sustained_oom_probe(&probe_args)
 }

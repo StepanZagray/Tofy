@@ -27,9 +27,9 @@ use crate::model::vocab::vocab_signature;
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
     save_vocab_to_file, sigreg_epps_pulley, tensor_rms, CandleCrossAttnDecoder, CodeDecoder,
-    DecoderAdapter, DecoderKind, HighLevelWorldTransition, LlamaCppDecoder, LocalDecoderRuntime,
-    MacroActionEncoder, OnlineEncoder, OrchestratorActionHead, PlannerMemory, StubLocalDecoder,
-    Vocab, WorldTransition,
+    DecoderAdapter, DecoderArchitecture, DecoderKind, HighLevelWorldTransition, LlamaCppDecoder,
+    LocalDecoderRuntime, MacroActionEncoder, OnlineEncoder, OrchestratorActionHead, PlannerMemory,
+    StubLocalDecoder, Vocab, WorldTransition,
 };
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_prediction_metrics,
@@ -1884,14 +1884,6 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     Ok(())
 }
 
-/// Decoder training: load frozen planner stack (encoder + planner_memory + transition),
-/// train decoder adapter + decoder jointly on top of planner memory.
-/// Defaults sized for the shared-width proof-of-concept architecture.
-const DECODER_DIM: usize = 640;
-const DECODER_LAYERS: usize = 6;
-const DECODER_HEADS: usize = 8;
-const DECODER_FF_DIM: usize = 2560;
-
 /// Approximate parameter count for decoder checkpoint: decoder adapter + decoder.
 fn decoder_param_count(
     vocab_size: usize,
@@ -1899,10 +1891,11 @@ fn decoder_param_count(
     world_dim: usize,
     kind: DecoderKind,
     planner_slots: usize,
+    arch: DecoderArchitecture,
 ) -> usize {
-    let dim = DECODER_DIM;
-    let n_layers = DECODER_LAYERS;
-    let ff = DECODER_FF_DIM;
+    let dim = arch.dim;
+    let n_layers = arch.num_layers;
+    let ff = arch.ff_dim;
     let embed = vocab_size * dim;
     let lm_head = dim * vocab_size;
     let ln_final = 2 * dim;
@@ -2282,14 +2275,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         None
     };
     let vocab_size = decoder_vocab.id_to_token.len();
+    let decoder_arch = DecoderArchitecture::new(
+        config.decoder_dim,
+        config.decoder_layers,
+        config.decoder_heads,
+        config.decoder_ff_dim,
+    )?;
     let decoder = CodeDecoder::new(
         decoder_vb.pp("decoder"),
         vocab_size,
-        DECODER_DIM,
+        decoder_arch.dim,
         config.bridge_dim,
-        DECODER_LAYERS,
-        DECODER_HEADS,
-        DECODER_FF_DIM,
+        decoder_arch.num_layers,
+        decoder_arch.num_heads,
+        decoder_arch.ff_dim,
         config.decoder_kind,
     )?;
     util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
@@ -2339,6 +2338,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.bridge_dim,
         config.decoder_kind,
         config.num_latent_tokens,
+        decoder_arch,
     );
 
     println!(
@@ -2363,10 +2363,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     println!(
         "Decoder: kind={} dim={} layers={} heads={} ff={} (~{} params)",
         config.decoder_kind.as_str(),
-        DECODER_DIM,
-        DECODER_LAYERS,
-        DECODER_HEADS,
-        DECODER_FF_DIM,
+        decoder_arch.dim,
+        decoder_arch.num_layers,
+        decoder_arch.num_heads,
+        decoder_arch.ff_dim,
         util::format_params(decoder_params)
     );
     println!("Save path: {:?}", decoder_path);
@@ -2965,6 +2965,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.decoder_kind,
         config.bridge_dim,
         config.num_latent_tokens,
+        decoder_arch,
     )?;
     println!("Decoder vocab saved to {:?}", decoder_vocab_path);
     if config.decoder_kind == DecoderKind::TextGeneralist {

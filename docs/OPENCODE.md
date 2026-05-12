@@ -131,7 +131,7 @@ The in-repo decoder (codeDecoder / textDecoder) is a small transformer (embed + 
 | **Medium** | 512 | 4 | 8 | 2048 | ~26M | ~100 MB | **Default.** 6–8GB GPU; good tradeoff. |
 | **Large**  | 768 | 6 | 12 | 3072 | ~80M | ~320 MB | 8GB+ GPU; better quality, slower. |
 
-The current build uses the **large** preset (~90M decoder: dim 768, 8 layers; see `DECODER_DIM`, `DECODER_LAYERS` in `src/tasks/world.rs`). To use small or medium, change those constants and re-train; inference VRAM is dominated by decoder + world model.
+The decoder architecture is saved in each checkpoint's sibling `*.meta.txt` file and loaded from that metadata at runtime. For training, set it with `--decoder-dim`, `--decoder-layers`, `--decoder-heads`, and `--decoder-ff-dim` or the matching `TOFY_DECODER_*` environment variables, then re-train; inference VRAM is dominated by decoder + world model.
 
 ## Using the Candle decoders
 
