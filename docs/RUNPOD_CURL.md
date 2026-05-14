@@ -5,8 +5,13 @@ This runbook creates a RunPod pod through the REST API with:
 - template `obgryfbuad`
 - one `NVIDIA L40S`
 - CUDA host filter `13.0`
-- a network volume mounted at `/workspace`
-- SSH enabled by the template
+- no fixed datacenter
+- regular pod volume storage mounted at `/workspace`
+
+This is the recommended flow for the 48 GB profile because availability matters
+more than storage portability. A network volume is tied to one datacenter, which
+can make it hard to find an L40S with the needed CUDA host version in the same
+place.
 
 Do not paste API keys or full RunPod API responses into public logs. RunPod pod
 responses can include environment variables.
@@ -30,64 +35,24 @@ echo "key length: ${#RUNPOD_API_KEY}"
 
 If the printed length is `0`, the key is not set.
 
-## Pick A Datacenter
-
-Network volumes are tied to one datacenter. The pod must be created in the same
-datacenter as the network volume.
-
-If `runpodctl` is installed:
-
-```bash
-runpodctl datacenter list
-```
-
-Set the datacenter ID. Replace `SE` with the exact ID you want to use:
-
-```bash
-export RUNPOD_DC_ID="SE"
-```
-
-## Create Network Volume
-
-Create a persistent network volume:
-
-```bash
-curl -sS -X POST "https://rest.runpod.io/v1/networkvolumes" \
-  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
-  -H "Content-Type: application/json" \
-  --data-binary @- <<EOF | tee /tmp/runpod-network-volume.json | jq '{id, name, dataCenterId, size, volumeType}'
-{
-  "dataCenterId": "${RUNPOD_DC_ID}",
-  "name": "tofy-netvol",
-  "size": 200
-}
-EOF
-```
-
-Save the volume ID:
-
-```bash
-export RUNPOD_NETWORK_VOLUME_ID="$(jq -r '.id' /tmp/runpod-network-volume.json)"
-echo "$RUNPOD_NETWORK_VOLUME_ID"
-```
-
 ## Create The Pod
 
-Create the pod with the repo template, L40S only, and CUDA 13.0 host filter:
+Create the pod with availability-based datacenter selection:
 
 ```bash
-cat > /tmp/runpod-tofy-l40s-cuda13-netvol.json <<EOF
+cat > /tmp/runpod-tofy-l40s-cuda13.json <<'EOF'
 {
   "name": "tofy-l40s-cuda13-full-run",
   "cloudType": "SECURE",
   "computeType": "GPU",
   "templateId": "obgryfbuad",
   "gpuTypeIds": ["NVIDIA L40S"],
+  "gpuTypePriority": "availability",
   "gpuCount": 1,
   "allowedCudaVersions": ["13.0"],
-  "dataCenterIds": ["${RUNPOD_DC_ID}"],
+  "dataCenterPriority": "availability",
   "containerDiskInGb": 50,
-  "networkVolumeId": "${RUNPOD_NETWORK_VOLUME_ID}",
+  "volumeInGb": 200,
   "volumeMountPath": "/workspace"
 }
 EOF
@@ -95,13 +60,14 @@ EOF
 curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
   -H "Content-Type: application/json" \
-  --data-binary @/tmp/runpod-tofy-l40s-cuda13-netvol.json \
+  --data-binary @/tmp/runpod-tofy-l40s-cuda13.json \
   | tee /tmp/runpod-pod.json \
-  | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, networkVolumeId, volumeMountPath} end'
+  | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, volumeInGb, volumeMountPath} end'
 ```
 
 If the response is an array, it is an API validation or availability error. Read
-the error text and adjust the datacenter or GPU choice.
+the error text and try again later, loosen CUDA to `["12.9", "12.8"]`, or switch
+GPU type.
 
 Save the pod ID:
 
@@ -132,13 +98,14 @@ nvcc --version || true
 
 ## GitHub Deploy Key
 
-Create a deploy key on the network volume so it persists across pod recreations:
+Create a deploy key on the pod volume. This persists while the pod exists, but
+regular pod volume storage is deleted when the pod is terminated.
 
 ```bash
 mkdir -p /workspace/.ssh ~/.ssh
 chmod 700 /workspace/.ssh ~/.ssh
 
-ssh-keygen -t ed25519 -C "runpod-tofy-netvol" -f /workspace/.ssh/runpod_tofy -N ""
+ssh-keygen -t ed25519 -C "runpod-tofy-pod-volume" -f /workspace/.ssh/runpod_tofy -N ""
 
 cat > ~/.ssh/config <<'EOF'
 Host github.com
@@ -299,12 +266,20 @@ tail -f /workspace/tofy-train-48gb.log
 nvidia-smi
 ```
 
-## Reuse The Network Volume
+## Storage Notes
 
-For a later pod, skip network volume creation and reuse:
+Regular pod volume storage:
 
-```bash
-export RUNPOD_NETWORK_VOLUME_ID="<existing-network-volume-id>"
-```
+- mounted at `/workspace`
+- persists across stop/start of the same pod
+- is deleted when the pod is terminated
+- lets RunPod place the pod wherever an eligible GPU is available
 
-Then create a new pod with the same `networkVolumeId` and `volumeMountPath`.
+Network volumes:
+
+- can survive pod termination
+- can be reused by later pods
+- are tied to one datacenter
+- are not the default here because they reduce the chance of finding an L40S
+  with CUDA `13.0`
+
