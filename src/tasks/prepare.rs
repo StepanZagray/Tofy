@@ -3364,7 +3364,27 @@ fn decoder_probe_cmd(
     ]
 }
 
-fn latest_artifact_with_prefix(prefix: &str) -> Result<PathBuf> {
+fn is_base_model_artifact(name: &str, prefix: &str) -> bool {
+    let Some(param_part) = name
+        .strip_prefix(prefix)
+        .and_then(|name| name.strip_suffix(".safetensors"))
+    else {
+        return false;
+    };
+    let Some((suffix, number)) = param_part
+        .chars()
+        .last()
+        .map(|suffix| (suffix, &param_part[..param_part.len() - suffix.len_utf8()]))
+    else {
+        return false;
+    };
+    matches!(suffix, 'k' | 'M' | 'B')
+        && !number.is_empty()
+        && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        && number.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn latest_base_model_artifact_with_prefix(prefix: &str) -> Result<PathBuf> {
     let mut latest: Option<(SystemTime, PathBuf)> = None;
     for entry in fs::read_dir(model_dir())? {
         let entry = entry?;
@@ -3375,10 +3395,7 @@ fn latest_artifact_with_prefix(prefix: &str) -> Result<PathBuf> {
         let Some(name) = path.file_name().and_then(OsStr::to_str) else {
             continue;
         };
-        if !name.starts_with(prefix) || !name.ends_with(".safetensors") {
-            continue;
-        }
-        if name.matches(".safetensors").count() != 1 {
+        if !is_base_model_artifact(name, prefix) {
             continue;
         }
         let modified = fs::metadata(&path)?
@@ -3394,7 +3411,7 @@ fn latest_artifact_with_prefix(prefix: &str) -> Result<PathBuf> {
     }
     latest
         .map(|(_, path)| path)
-        .with_context(|| format!("no artifact found for prefix {prefix}"))
+        .with_context(|| format!("no base model artifact found for prefix {prefix}"))
 }
 
 fn run_checked_command(cmd: &[String], env: &HashMap<String, String>) -> Result<()> {
@@ -3424,7 +3441,7 @@ fn ensure_setup_latent(args: &OomProbeArgs, data_path: &Path) -> Result<(PathBuf
     let cmd = latent_probe_cmd(args, data_path, args.setup_latent_steps);
     run_checked_command(&cmd, &probe_base_env(args, "setup_latent"))?;
     Ok((
-        latest_artifact_with_prefix("model_latent_")?,
+        latest_base_model_artifact_with_prefix("model_latent_")?,
         model_dir().join("vocabs/vocab_encoder.txt"),
     ))
 }
@@ -3440,7 +3457,7 @@ fn ensure_setup_world(
     }
     let cmd = world_probe_cmd(args, data_path, latent, vocab, args.setup_world_steps);
     run_checked_command(&cmd, &probe_world_env(args, "setup_world"))?;
-    latest_artifact_with_prefix("model_world_")
+    latest_base_model_artifact_with_prefix("model_world_")
 }
 
 fn tail_lines(text: &str, lines: usize) -> String {
@@ -3708,7 +3725,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
                 println!("Summary: {}", summary.display());
                 bail!("OOM probe failed");
             }
-            latent = Some(latest_artifact_with_prefix("model_latent_")?);
+            latent = Some(latest_base_model_artifact_with_prefix("model_latent_")?);
             vocab = Some(model_dir().join("vocabs/vocab_encoder.txt"));
         } else if matches!(
             args.stage,
@@ -3736,7 +3753,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
                 println!("Summary: {}", summary.display());
                 bail!("OOM probe failed");
             }
-            world = Some(latest_artifact_with_prefix("model_world_")?);
+            world = Some(latest_base_model_artifact_with_prefix("model_world_")?);
         } else if matches!(args.stage, ProbeStage::HighWorld | ProbeStage::Decoder) {
             let latent_ref = latent.as_ref().context("latent setup missing")?;
             let vocab_ref = vocab.as_ref().context("vocab setup missing")?;
@@ -3784,7 +3801,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             let latent_ref = latent.as_ref().context("latent setup missing")?;
             let vocab_ref = vocab.as_ref().context("vocab setup missing")?;
             let world_ref = world
-                .or_else(|| latest_artifact_with_prefix("model_world_").ok())
+                .or_else(|| latest_base_model_artifact_with_prefix("model_world_").ok())
                 .context("world setup missing")?;
             let output_path = probe_dir.join("code_decoder_oom_probe.safetensors");
             let cmd = decoder_probe_cmd(
@@ -3855,4 +3872,45 @@ fn run_max_vram_probe(args: &[String]) -> Result<()> {
     probe_args.push("--max-vram".to_string());
     probe_args.extend(args.iter().cloned());
     run_sustained_oom_probe(&probe_args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_base_model_artifact;
+
+    #[test]
+    fn base_model_artifact_accepts_param_count_names() {
+        assert!(is_base_model_artifact(
+            "model_latent_94.12M.safetensors",
+            "model_latent_"
+        ));
+        assert!(is_base_model_artifact(
+            "model_world_977.0k.safetensors",
+            "model_world_"
+        ));
+        assert!(is_base_model_artifact(
+            "model_world_1.25B.safetensors",
+            "model_world_"
+        ));
+    }
+
+    #[test]
+    fn base_model_artifact_rejects_sidecars_and_wrong_prefixes() {
+        assert!(!is_base_model_artifact(
+            "model_world_19.56M.encoder.safetensors",
+            "model_world_"
+        ));
+        assert!(!is_base_model_artifact(
+            "model_world_19.56M.high_world.safetensors",
+            "model_world_"
+        ));
+        assert!(!is_base_model_artifact(
+            "model_world_19.56M.train.safetensors",
+            "model_world_"
+        ));
+        assert!(!is_base_model_artifact(
+            "model_latent_94.12M.safetensors",
+            "model_world_"
+        ));
+    }
 }
