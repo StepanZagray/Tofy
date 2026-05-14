@@ -357,6 +357,9 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
 }
 
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
+    if is_remote_source_path(path) {
+        return Ok(remote_source_fingerprint(path));
+    }
     let metadata = fs::metadata(path).with_context(|| format!("stat input {}", path.display()))?;
     let modified = metadata
         .modified()
@@ -373,6 +376,20 @@ fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
     })
 }
 
+fn is_remote_source_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with("hub:")
+}
+
+fn remote_source_fingerprint(path: &Path) -> SourceFingerprint {
+    let source = path.to_string_lossy().to_string();
+    SourceFingerprint {
+        path: source.clone(),
+        len: 0,
+        modified_unix_nanos: 0,
+        content_hash: sha256_text(&source),
+    }
+}
+
 fn stat_probe(path: &Path) -> Result<(u64, u128)> {
     let metadata = fs::metadata(path).with_context(|| format!("stat input {}", path.display()))?;
     let modified = metadata
@@ -382,6 +399,13 @@ fn stat_probe(path: &Path) -> Result<(u64, u128)> {
         .unwrap_or_default()
         .as_nanos();
     Ok((metadata.len(), modified))
+}
+
+fn sha256_text(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -419,6 +443,12 @@ fn artifact_cache_hit(
         return Ok(None);
     }
     for (path, stored) in input_paths.iter().zip(manifest.inputs.iter()) {
+        if is_remote_source_path(path) {
+            if &remote_source_fingerprint(path) != stored {
+                return Ok(None);
+            }
+            continue;
+        }
         if !path.exists() || stored.path != path.to_string_lossy() {
             return Ok(None);
         }
@@ -1105,12 +1135,10 @@ fn run_prepare_github_top_code(args: &[String]) -> Result<()> {
         "min_lines_completion": min_lines_completion,
         "split_ratio": split_ratio,
     });
-    let mut input_paths = vec![PathBuf::from(format!(
+    let input_paths = vec![PathBuf::from(format!(
         "hub:{GITHUB_TOP_CODE_DATASET_ID}:{split}"
     ))];
     if !force && output.exists() {
-        // Keep a stable cache surface; hub inputs are represented only by params here.
-        input_paths.clear();
         if let Some(manifest) =
             artifact_cache_hit("github_top_code", &output, &input_paths, &params)?
         {
@@ -3876,7 +3904,12 @@ fn run_max_vram_probe(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_base_model_artifact;
+    use super::{
+        artifact_cache_hit, is_base_model_artifact, remote_source_fingerprint,
+        write_artifact_manifest,
+    };
+    use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn base_model_artifact_accepts_param_count_names() {
@@ -3912,5 +3945,48 @@ mod tests {
             "model_latent_94.12M.safetensors",
             "model_world_"
         ));
+    }
+
+    #[test]
+    fn remote_hub_source_fingerprint_is_stable_without_filesystem_stat() {
+        let path = PathBuf::from("hub:ronantakizawa/github-top-code:train");
+        let first = remote_source_fingerprint(&path);
+        let second = remote_source_fingerprint(&path);
+
+        assert_eq!(first, second);
+        assert_eq!(first.path, "hub:ronantakizawa/github-top-code:train");
+        assert_eq!(first.len, 0);
+        assert_eq!(first.modified_unix_nanos, 0);
+        assert!(!first.content_hash.is_empty());
+    }
+
+    #[test]
+    fn artifact_cache_hit_accepts_remote_hub_input() {
+        let unique = format!(
+            "tofy_prepare_manifest_test_{}_{}",
+            std::process::id(),
+            super::SystemTime::now()
+                .duration_since(super::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("github_top_code.txt");
+        std::fs::write(&output, "fn main() {}\n").unwrap();
+
+        let inputs = vec![PathBuf::from("hub:ronantakizawa/github-top-code:train")];
+        let params = json!({"split": "train"});
+        write_artifact_manifest("github_top_code", &output, &inputs, params.clone(), 1).unwrap();
+
+        let hit = artifact_cache_hit("github_top_code", &output, &inputs, &params).unwrap();
+        assert!(hit.is_some());
+
+        let changed_inputs = vec![PathBuf::from("hub:ronantakizawa/github-top-code:test")];
+        let miss =
+            artifact_cache_hit("github_top_code", &output, &changed_inputs, &params).unwrap();
+        assert!(miss.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -76,6 +76,9 @@ cargo run --release -- --sustained-oom-probe --stage all
 
 See [OOM_TESTING.md](OOM_TESTING.md).
 
+For RunPod creation through the REST API with `curl`, including CUDA-version
+filtering and network-volume setup, see [RUNPOD_CURL.md](RUNPOD_CURL.md).
+
 Training-side latent context knobs:
 
 - `TOFY_SIGREG_SLICES=<int>` controls SIGReg random projections, default `1024`
