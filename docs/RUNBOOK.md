@@ -58,18 +58,25 @@ cargo run --release -- train 48gb --resume latest
 cargo run --release -- train 48gb --resume code_poc_1234567890
 ```
 
-On rented GPUs, use `--stream` to skip the expensive Stage 1 vocab/token-cache
-prebuild and train from raw streaming tokenization instead:
+Training streams raw tokenization by default. This avoids spending paid GPU time
+on the expensive Stage 1 vocab/token-cache prebuild before training starts:
 
 ```bash
-cargo run --release -- train 48gb --stream
+cargo run --release -- train 48gb
 ```
 
 This still prepares the text datasets, but it does not run
-`--prepare-pipeline-cache`, does not set `TOFY_ENCODER_VOCAB`, and sets
-`TOFY_USE_TOKEN_CACHE=0` for the training stages. Startup is faster and the GPU
-starts useful training sooner, at the cost of more CPU tokenization work during
-training.
+`--prepare-pipeline-cache`, does not set `TOFY_ENCODER_VOCAB`, and disables
+token-cache reads for the training stages. It also avoids materializing the
+large `data/encoder_mix.txt` file; the encoder streams directly from
+`data/encoder_sources.txt`, which points at the prepared source files. Startup
+is faster and the GPU starts useful training sooner, at the cost of more CPU
+tokenization work during training. To opt into the old cache-building path,
+pass:
+
+```bash
+cargo run --release -- train 48gb --cache
+```
 
 The 8 GB profile uses:
 
@@ -199,7 +206,8 @@ Stage 1 builds or validates:
   - Rust GitHub code pairs: `data/rust_code_pairs.txt`
   - UltraChat pairs: `data/ultrachat_pairs.txt`
   - one-parquet Wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
-- prepared encoder corpus: `data/encoder_mix.txt`
+- encoder source manifest: `data/encoder_sources.txt`
+- prepared encoder corpus: `data/encoder_mix.txt` only when `train <profile> --cache`
 - prepared Rust instruction pairs: `data/rust_instruction_pairs.txt`
 - prepared Rust repair pairs: `data/rust_repair_pairs.txt`
 - prepared world mix: `data/world_mix_pairs.txt`
@@ -212,15 +220,21 @@ Stage 1 builds or validates:
 - dual-vocab code-decoder token cache: `data/cache/code_decoder_dual.tokens.bin`
 - JSON manifests under `data/cache/`
 
+Stage 1 runs independent preparation work in parallel. GitHub code pairs,
+UltraChat/Wikipedia source data, Rust docs extraction, and the eval suite can
+prepare at the same time; after instruction pairs exist, repair trajectories,
+world mix, and code-decoder mix are also overlapped where dependencies allow.
+This means Stage 1 log lines can interleave.
+
 The standalone command is:
 
 ```bash
 cargo run --release -- --prepare-pipeline-cache data/encoder_mix.txt data/world_mix_pairs.txt data/code_poc_mix.txt local_models/vocabs/vocab_encoder_8000_default.txt local_models/vocabs/vocab_code_16000_codeaware.txt data/cache --encoder-max-vocab 8000 --code-max-vocab 16000 --encoder-max-seq 1024 --world-max-seq 256 --code-max-seq 128
 ```
 
-The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches. Hub-backed source files are written to temporary files and atomically renamed into place, so a stopped pod should not leave a partially written canonical dataset. Empty source files are treated as missing and regenerated where Stage 1 owns the source.
+The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches. In default streaming mode, the encoder source manifest avoids rewriting the same source rows into a huge combined corpus. Hub-backed source files are written to temporary files and atomically renamed into place, so a stopped pod should not leave a partially written canonical dataset. Empty source files are treated as missing and regenerated where Stage 1 owns the source.
 
-The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. Use `train <profile> --stream` to skip the pipeline cache build and train from raw streams, set `TOFY_USE_TOKEN_CACHE=0` to disable token-cache reads manually, or pass `--force` to the standalone cache command to rebuild those artifacts.
+The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. `train <profile>` skips the pipeline cache build by default and trains from raw streams. Use `train <profile> --cache` to opt into building/reading the pipeline cache, set `TOFY_USE_TOKEN_CACHE=0` to disable token-cache reads manually, or pass `--force` to the standalone cache command to rebuild those artifacts.
 
 Tokenizer behavior is now versioned explicitly:
 

@@ -1,9 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{data, tasks, util};
@@ -13,6 +14,7 @@ const WORLD_DATA: &str = "data/world_mix_pairs.txt";
 const CODE_DATA: &str = "data/rust_code_pairs.txt";
 const WIKI_DATA: &str = "data/cached_wikimedia_wikipedia_1.txt";
 const ENCODER_DATA: &str = "data/encoder_mix.txt";
+const ENCODER_SOURCES: &str = "data/encoder_sources.txt";
 const EVAL_SUITE: &str = "eval/code_assistant_rust_hard.jsonl";
 const RUST_TASK_DATA: &str = "data/rust_instruction_pairs.txt";
 const RUST_REPAIR_DATA: &str = "data/rust_repair_pairs.txt";
@@ -83,7 +85,14 @@ struct PipelineConfig {
     resume: bool,
     resume_selector: Option<String>,
     with_code_eval: bool,
-    stream_training: bool,
+    use_cache: bool,
+}
+
+#[derive(Default)]
+struct DocsPrep {
+    extra_encoder_inputs: Vec<String>,
+    extra_code_mix_args: Vec<String>,
+    rust_std_docs_available: bool,
 }
 
 #[derive(Debug)]
@@ -129,7 +138,7 @@ struct PipelineMeta<'a> {
     eval_suite: &'a str,
     profile: &'a str,
     with_code_eval: bool,
-    stream_training: bool,
+    use_cache: bool,
     latent_steps: usize,
     world_steps: usize,
     high_world_steps: usize,
@@ -201,14 +210,14 @@ impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] [--stream]"
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] [--cache]"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
         let mut with_code_eval = false;
-        let mut stream_training = false;
+        let mut use_cache = false;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -229,12 +238,12 @@ impl PipelineConfig {
                     with_code_eval = true;
                     i += 1;
                 }
-                "--stream" | "--streaming" | "--no-cache" | "--skip-cache" => {
-                    stream_training = true;
+                "--cache" => {
+                    use_cache = true;
                     i += 1;
                 }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval, --stream)"
+                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval, --cache)"
                 ),
             }
         }
@@ -243,7 +252,7 @@ impl PipelineConfig {
             resume,
             resume_selector,
             with_code_eval,
-            stream_training,
+            use_cache,
         })
     }
 }
@@ -283,7 +292,8 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         defaults.high_world_steps
     );
 
-    prepare_data(&paths, &defaults, cfg.resume, cfg.stream_training)?;
+    prepare_data(&paths, &defaults, cfg.resume, cfg.use_cache)?;
+    configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
     train_high_world(&paths, &cfg, &defaults)?;
@@ -357,7 +367,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_HWM_MACRO_MAX_LEN", "4");
     std::env::set_var("TOFY_CACHE_DIR", CACHE_DIR);
     std::env::set_var("TOFY_CACHE_PREFETCH_BATCHES", "1");
-    if cfg.stream_training {
+    if cfg.use_cache {
+        std::env::remove_var("TOFY_USE_TOKEN_CACHE");
+    } else {
         std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
         std::env::remove_var("TOFY_ENCODER_VOCAB");
     }
@@ -445,9 +457,146 @@ fn prepare_data(
     paths: &PipelinePaths,
     defaults: &ProfileDefaults,
     resume: bool,
-    stream_training: bool,
+    use_cache: bool,
 ) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
+    let docs = thread::scope(|scope| -> Result<DocsPrep> {
+        let code_handle = scope.spawn(prepare_code_source_data);
+        let source_handle = scope.spawn(ensure_pipeline_source_data);
+        let docs_handle = scope.spawn(prepare_docs_data);
+        let eval_handle =
+            scope.spawn(|| run_prepare(["--generate-code-eval-suite", "--output", EVAL_SUITE]));
+
+        join_result(code_handle, "github code data")?;
+        join_result(source_handle, "pipeline source data")?;
+        let docs = join_result(docs_handle, "docs data")?;
+        join_result(eval_handle, "eval suite")?;
+        Ok(docs)
+    })?;
+
+    let mut encoder_inputs = vec![
+        WORLD_TEXT_DATA.to_string(),
+        WIKI_DATA.to_string(),
+        CODE_DATA.to_string(),
+    ];
+    encoder_inputs.extend(docs.extra_encoder_inputs);
+    write_pair_source_manifest(ENCODER_SOURCES, &encoder_inputs)?;
+
+    thread::scope(|scope| -> Result<()> {
+        let encoder_inputs_for_corpus = encoder_inputs.clone();
+        let encoder_corpus_handle = use_cache.then(|| {
+            scope.spawn(move || {
+                let mut encoder_args = vec![
+                    "--prepare-encoder-corpus".to_string(),
+                    "--output".to_string(),
+                    ENCODER_DATA.to_string(),
+                ];
+                encoder_args.extend(encoder_inputs_for_corpus);
+                run_prepare_vec(encoder_args)
+            })
+        });
+
+        prepare_rust_task_data()?;
+
+        let trajectory_handle = docs.rust_std_docs_available.then(|| {
+            scope.spawn(|| {
+                run_prepare([
+                    "--prepare-rust-doc-trajectories",
+                    "--input",
+                    RUST_TASK_DATA,
+                    "--output",
+                    RUST_STD_DOC_TRAJECTORY_DATA,
+                    "--code-output",
+                    RUST_STD_DOC_CODE_DATA,
+                    "--max-rows",
+                    "12000",
+                ])
+            })
+        });
+
+        let repair_handle = if command_available("rustc") {
+            Some(scope.spawn(|| {
+                run_prepare([
+                    "--prepare-rust-repair-tasks",
+                    "--input",
+                    RUST_TASK_DATA,
+                    "--output",
+                    RUST_REPAIR_DATA,
+                    "--rustc",
+                    "rustc",
+                    "--variants-per-sample",
+                    "2",
+                    "--timeout-sec",
+                    "4.0",
+                    "--max-rows",
+                    "2000",
+                ])
+            }))
+        } else {
+            println!("Rust compiler-feedback repair pairs skipped: rustc not found.");
+            None
+        };
+
+        if let Some(handle) = trajectory_handle {
+            join_result(handle, "rust doc trajectories")?;
+        }
+        if let Some(handle) = repair_handle {
+            join_result(handle, "rust repair tasks")?;
+        }
+
+        let (world_args, code_mix_args) = build_stage1_mix_args(docs.extra_code_mix_args);
+        let world_handle = scope.spawn(move || run_prepare_vec(world_args));
+        let code_mix_handle = scope.spawn(move || run_prepare_vec(code_mix_args));
+
+        join_result(world_handle, "world mix")?;
+        join_result(code_mix_handle, "code decoder mix")?;
+        if let Some(handle) = encoder_corpus_handle {
+            join_result(handle, "encoder corpus")?;
+        }
+        Ok(())
+    })?;
+
+    if !use_cache {
+        println!("Skipping pipeline vocab/token cache; encoder will stream source files directly.");
+        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
+        if !resume {
+            std::env::remove_var("TOFY_ENCODER_VOCAB");
+        }
+        return Ok(());
+    }
+
+    run_cache(vec![
+        "--prepare-pipeline-cache".to_string(),
+        ENCODER_DATA.to_string(),
+        WORLD_DATA.to_string(),
+        CODE_TRAIN_DATA.to_string(),
+        paths.encoder_cache_vocab.to_string_lossy().to_string(),
+        paths.code_decoder_cache_vocab.to_string_lossy().to_string(),
+        CACHE_DIR.to_string(),
+        "--encoder-max-vocab".to_string(),
+        defaults.max_vocab.to_string(),
+        "--code-max-vocab".to_string(),
+        defaults.code_decoder_max_vocab.to_string(),
+        "--encoder-max-seq".to_string(),
+        (defaults.latent_max_seq * 4).to_string(),
+        "--world-max-seq".to_string(),
+        defaults.world_max_seq.to_string(),
+        "--code-max-seq".to_string(),
+        defaults.code_decoder_max_seq.to_string(),
+    ])?;
+    if paths.code_decoder_cache_vocab.exists() && !paths.code_decoder_vocab.exists() {
+        if let Some(parent) = paths.code_decoder_vocab.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&paths.code_decoder_cache_vocab, &paths.code_decoder_vocab)?;
+    }
+    if !resume {
+        std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
+    }
+    Ok(())
+}
+
+fn prepare_code_source_data() -> Result<()> {
     if !nonempty_file(CODE_DATA) {
         run_prepare([
             "--prepare-github-top-code",
@@ -460,10 +609,11 @@ fn prepare_data(
         ])?;
     }
     ensure_nonempty_file(CODE_DATA)?;
-    ensure_pipeline_source_data()?;
+    Ok(())
+}
 
-    let mut extra_encoder_inputs = Vec::new();
-    let mut extra_code_mix_args = Vec::new();
+fn prepare_docs_data() -> Result<DocsPrep> {
+    let mut docs = DocsPrep::default();
     if Path::new(RUST_DOCS_ROOT).is_dir() {
         run_prepare([
             "--prepare-rust-by-practice",
@@ -475,7 +625,8 @@ fn prepare_data(
             RUST_DOCS_JEPA_DATA,
         ])?;
         if nonempty_file(RUST_DOCS_JEPA_DATA) {
-            extra_encoder_inputs.push(RUST_DOCS_JEPA_DATA.to_string());
+            docs.extra_encoder_inputs
+                .push(RUST_DOCS_JEPA_DATA.to_string());
         }
         run_prepare([
             "--prepare-rust-by-practice",
@@ -487,7 +638,7 @@ fn prepare_data(
             RUST_DOCS_PAIR_DATA,
         ])?;
         if nonempty_file(RUST_DOCS_PAIR_DATA) {
-            extra_code_mix_args.extend([
+            docs.extra_code_mix_args.extend([
                 "--extra-pairs".to_string(),
                 RUST_DOCS_PAIR_DATA.to_string(),
                 "--extra-repeat".to_string(),
@@ -496,6 +647,7 @@ fn prepare_data(
         }
     }
     let rust_std_docs_available = tasks::rust_docs::default_rust_docs_root().is_some();
+    docs.rust_std_docs_available = rust_std_docs_available;
     if rust_std_docs_available {
         run_prepare([
             "--prepare-rust-docs",
@@ -507,7 +659,8 @@ fn prepare_data(
             "20000",
         ])?;
         if nonempty_file(RUST_STD_DOCS_JEPA_DATA) {
-            extra_encoder_inputs.push(RUST_STD_DOCS_JEPA_DATA.to_string());
+            docs.extra_encoder_inputs
+                .push(RUST_STD_DOCS_JEPA_DATA.to_string());
         }
         run_prepare([
             "--prepare-rust-docs",
@@ -521,18 +674,10 @@ fn prepare_data(
     } else {
         println!("Installed Rust docs not found; run `rustup component add rust-docs rust-src` to enable fetch_docs training rows.");
     }
+    Ok(docs)
+}
 
-    let mut encoder_args = vec![
-        "--prepare-encoder-corpus".to_string(),
-        "--output".to_string(),
-        ENCODER_DATA.to_string(),
-        WORLD_TEXT_DATA.to_string(),
-        WIKI_DATA.to_string(),
-        CODE_DATA.to_string(),
-    ];
-    encoder_args.extend(extra_encoder_inputs);
-    run_prepare_vec(encoder_args)?;
-
+fn prepare_rust_task_data() -> Result<()> {
     run_prepare([
         "--prepare-rust-function-tasks",
         "--input",
@@ -550,40 +695,10 @@ fn prepare_data(
             RUST_TASK_DATA,
         ])?;
     }
-    if rust_std_docs_available {
-        run_prepare([
-            "--prepare-rust-doc-trajectories",
-            "--input",
-            RUST_TASK_DATA,
-            "--output",
-            RUST_STD_DOC_TRAJECTORY_DATA,
-            "--code-output",
-            RUST_STD_DOC_CODE_DATA,
-            "--max-rows",
-            "12000",
-        ])?;
-    }
+    Ok(())
+}
 
-    if command_available("rustc") {
-        run_prepare([
-            "--prepare-rust-repair-tasks",
-            "--input",
-            RUST_TASK_DATA,
-            "--output",
-            RUST_REPAIR_DATA,
-            "--rustc",
-            "rustc",
-            "--variants-per-sample",
-            "2",
-            "--timeout-sec",
-            "4.0",
-            "--max-rows",
-            "2000",
-        ])?;
-    } else {
-        println!("Rust compiler-feedback repair pairs skipped: rustc not found.");
-    }
-
+fn build_stage1_mix_args(mut extra_code_mix_args: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut world_args = vec![
         "--prepare-world-mix".to_string(),
         "--output".to_string(),
@@ -632,7 +747,6 @@ fn prepare_data(
         "--max-rows".to_string(),
         "0".to_string(),
     ]);
-    run_prepare_vec(world_args)?;
 
     let mut code_mix_args = vec![
         "--prepare-code-poc-mix".to_string(),
@@ -647,48 +761,45 @@ fn prepare_data(
     ];
     code_mix_args.extend(extra_code_mix_args);
     code_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
-    run_prepare_vec(code_mix_args)?;
+    (world_args, code_mix_args)
+}
 
-    run_prepare(["--generate-code-eval-suite", "--output", EVAL_SUITE])?;
+fn join_result<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>, label: &str) -> Result<T> {
+    handle.join().map_err(|_| anyhow!("{label} panicked"))?
+}
 
-    if stream_training {
-        println!(
-            "Skipping pipeline vocab/token cache; training stages will stream raw tokenization."
-        );
-        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
-        if !resume {
-            std::env::remove_var("TOFY_ENCODER_VOCAB");
+fn write_pair_source_manifest(path: &str, inputs: &[String]) -> Result<()> {
+    let mut manifest = String::new();
+    manifest.push_str(data::PAIR_SOURCE_MANIFEST_HEADER);
+    manifest.push('\n');
+    for input in inputs {
+        manifest.push_str(input);
+        manifest.push('\n');
+    }
+    write_text_atomic(Path::new(path), &manifest)
+        .with_context(|| format!("write encoder source manifest {path}"))?;
+    println!("Wrote encoder source manifest: {path}");
+    Ok(())
+}
+
+fn configure_encoder_vocab_env(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
+    if cfg.resume {
+        let matched_vocab = matched_encoder_vocab(paths);
+        if matched_vocab.exists() {
+            std::env::set_var("TOFY_ENCODER_VOCAB", matched_vocab);
+            return Ok(());
+        }
+        if cfg.use_cache && paths.encoder_cache_vocab.exists() {
+            std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
+            return Ok(());
         }
         return Ok(());
     }
 
-    run_cache(vec![
-        "--prepare-pipeline-cache".to_string(),
-        ENCODER_DATA.to_string(),
-        WORLD_DATA.to_string(),
-        CODE_TRAIN_DATA.to_string(),
-        paths.encoder_cache_vocab.to_string_lossy().to_string(),
-        paths.code_decoder_cache_vocab.to_string_lossy().to_string(),
-        CACHE_DIR.to_string(),
-        "--encoder-max-vocab".to_string(),
-        defaults.max_vocab.to_string(),
-        "--code-max-vocab".to_string(),
-        defaults.code_decoder_max_vocab.to_string(),
-        "--encoder-max-seq".to_string(),
-        (defaults.latent_max_seq * 4).to_string(),
-        "--world-max-seq".to_string(),
-        defaults.world_max_seq.to_string(),
-        "--code-max-seq".to_string(),
-        defaults.code_decoder_max_seq.to_string(),
-    ])?;
-    if paths.code_decoder_cache_vocab.exists() && !paths.code_decoder_vocab.exists() {
-        if let Some(parent) = paths.code_decoder_vocab.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&paths.code_decoder_cache_vocab, &paths.code_decoder_vocab)?;
-    }
-    if !resume {
+    if cfg.use_cache {
         std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
+    } else {
+        std::env::remove_var("TOFY_ENCODER_VOCAB");
     }
     Ok(())
 }
@@ -743,7 +854,7 @@ fn train_encoder(
     let args = vec![
         "jepa_ai".to_string(),
         "--latent".to_string(),
-        ENCODER_DATA.to_string(),
+        encoder_training_input(cfg).to_string(),
         defaults.latent_steps.to_string(),
         defaults.latent_batch.to_string(),
         defaults.dim.to_string(),
@@ -761,6 +872,14 @@ fn train_encoder(
     })?;
     ensure_file(&paths.latent_model)?;
     Ok(())
+}
+
+fn encoder_training_input(cfg: &PipelineConfig) -> &'static str {
+    if cfg.use_cache {
+        ENCODER_DATA
+    } else {
+        ENCODER_SOURCES
+    }
 }
 
 fn train_world(
@@ -1268,7 +1387,7 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     } else {
         ""
     };
-    let stream_flag = if cfg.stream_training { " --stream" } else { "" };
+    let cache_flag = if cfg.use_cache { " --cache" } else { "" };
     let content = format!(
         "timestamp_unix={}\ncommand=train {}{}{}{}\n",
         unix_timestamp()?,
@@ -1279,7 +1398,7 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
             format!(" --resume {selector}")
         },
         eval_flag,
-        stream_flag
+        cache_flag
     );
     write_text_atomic(&paths.run_root.join("launch.txt"), &content)?;
     Ok(())
@@ -1308,13 +1427,13 @@ fn write_meta(
             .to_string_lossy()
             .to_string(),
         code_decoder_vocab: paths.code_decoder_vocab.to_string_lossy().to_string(),
-        encoder_data: ENCODER_DATA,
+        encoder_data: encoder_training_input(cfg),
         world_data: WORLD_DATA,
         code_train_data: CODE_TRAIN_DATA,
         eval_suite: EVAL_SUITE,
         profile: cfg.profile.as_str(),
         with_code_eval: cfg.with_code_eval,
-        stream_training: cfg.stream_training,
+        use_cache: cfg.use_cache,
         latent_steps: defaults.latent_steps,
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,

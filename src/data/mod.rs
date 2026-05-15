@@ -14,5 +14,6 @@ pub use data::{
     CachedPairStream, CachedWorldStream, CurriculumDenoisingConfig, PairStream, RawWorldExample,
     RawWorldStream, TokenizationMode, TokenizerSpec, WorldExample, ACTION_CODE, ACTION_DONE,
     ACTION_FETCH_DOCS, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    PAIR_SOURCE_MANIFEST_HEADER,
 };
 pub use hub::{ensure_hub_dataset_cached, ensure_hub_wikipedia_cached, prepare_ultrachat_pairs};

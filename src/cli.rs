@@ -32,7 +32,7 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval] [--stream]"
+        "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval] [--cache]"
     );
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"

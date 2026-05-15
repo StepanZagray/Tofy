@@ -328,15 +328,17 @@ export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
 
 /workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 48gb --stream \
+  ./target/release/jepa_ai train 48gb \
   2>&1 | tee /workspace/tofy-train-48gb.log
 ```
 
-`--stream` skips the expensive Stage 1 vocab/token-cache prebuild and trains
-from raw streaming tokenization. This is the preferred rented-GPU launch mode:
-the GPU starts training sooner, instead of waiting for hours of CPU-only cache
-construction. On a fresh regular pod volume, Stage 1 still bootstraps the
-required source data in the pod workspace before training.
+Raw streaming tokenization is the default. The command skips the expensive
+Stage 1 vocab/token-cache prebuild and does not materialize the large
+`data/encoder_mix.txt` corpus, so the GPU starts training sooner instead of
+waiting for hours of CPU-only cache construction. On a fresh regular pod volume,
+Stage 1 still bootstraps the required source data in the pod workspace and writes
+`data/encoder_sources.txt` for direct encoder streaming. To opt into the old
+cache-building path, add `--cache`.
 
 Detach:
 

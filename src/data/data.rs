@@ -8,12 +8,14 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread;
 use std::time::Instant;
 
 use crate::model::vocab::{Pair, Vocab};
+
+pub const PAIR_SOURCE_MANIFEST_HEADER: &str = "# tofy-pair-sources-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenizationMode {
@@ -164,6 +166,73 @@ fn extract_text_side_for_vocab(line: &str) -> Option<String> {
         return Some(unescape_pair_field(left.trim()));
     }
     Some(line.to_string())
+}
+
+fn flatten_pair_side(text: &str) -> Option<String> {
+    let flattened = unescape_pair_field(text.trim())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flattened.is_empty() {
+        None
+    } else {
+        Some(flattened)
+    }
+}
+
+fn encoder_texts_from_line(line: &str) -> Vec<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if let Some((left, right)) = line.split_once('\t') {
+        return [left, right]
+            .into_iter()
+            .filter_map(flatten_pair_side)
+            .collect();
+    }
+    if let Some((left, right)) = line.split_once("|||") {
+        return [left, right]
+            .into_iter()
+            .filter_map(flatten_pair_side)
+            .collect();
+    }
+    flatten_pair_side(line).into_iter().collect()
+}
+
+fn pair_source_manifest_paths(path: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line)? == 0 || first_line.trim() != PAIR_SOURCE_MANIFEST_HEADER {
+        return Ok(None);
+    }
+
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut paths = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let direct = PathBuf::from(trimmed);
+        if direct.exists() || direct.is_absolute() {
+            paths.push(direct);
+        } else {
+            paths.push(base_dir.join(direct));
+        }
+    }
+    if paths.is_empty() {
+        bail!("pair source manifest {:?} contains no input paths", path);
+    }
+    Ok(Some(paths))
+}
+
+fn pair_input_paths(path: &PathBuf) -> Result<(Vec<PathBuf>, bool)> {
+    if let Some(paths) = pair_source_manifest_paths(path)? {
+        return Ok((paths, true));
+    }
+    Ok((vec![path.clone()], false))
 }
 
 pub struct VocabStats {
@@ -497,11 +566,14 @@ fn recv_prefetched_batch<T>(
 }
 
 pub struct PairStream {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
+    path_index: usize,
+    source_manifest: bool,
     min_tokens: usize,
     reader: BufReader<File>,
     shuffle_buffer_size: usize,
     shuffle_buffer: Vec<Vec<String>>,
+    pending_texts: VecDeque<String>,
 }
 
 impl PairStream {
@@ -514,25 +586,40 @@ impl PairStream {
         min_tokens: usize,
         shuffle_buffer_size: usize,
     ) -> Result<Self> {
+        let (paths, source_manifest) = pair_input_paths(path)?;
+        let reader = BufReader::new(File::open(&paths[0])?);
         Ok(Self {
-            path: path.clone(),
+            paths,
+            path_index: 0,
+            source_manifest,
             min_tokens,
-            reader: BufReader::new(File::open(path)?),
+            reader,
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
+            pending_texts: VecDeque::new(),
         })
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.reader = BufReader::new(File::open(&self.path)?);
+        self.path_index = (self.path_index + 1) % self.paths.len();
+        self.reader = BufReader::new(File::open(&self.paths[self.path_index])?);
         Ok(())
     }
 
     fn read_next_tokens(&mut self) -> Result<Vec<String>> {
         loop {
+            if let Some(text) = self.pending_texts.pop_front() {
+                if let Some(tokens) = split_line_with_min_tokens(&text, self.min_tokens) {
+                    return Ok(tokens);
+                }
+            }
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
                 self.reset()?;
+                continue;
+            }
+            if self.source_manifest {
+                self.pending_texts.extend(encoder_texts_from_line(&line));
                 continue;
             }
             if let Some(tokens) = split_line_with_min_tokens(&line, self.min_tokens) {
@@ -1281,29 +1368,39 @@ pub fn build_vocab_from_pair_file(
     let mut pair_count = 0usize;
     let mut raw_line_count = 0usize;
     let mut texts = Vec::new();
-    let reader = BufReader::new(File::open(path)?);
 
-    for line in reader.lines() {
-        let line = line?;
-        raw_line_count += 1;
-        let Some(_tokens) = split_line_with_min_tokens(&line, min_tok) else {
+    let (paths, source_manifest) = pair_input_paths(path)?;
+    for input_path in &paths {
+        let reader = BufReader::new(File::open(input_path)?);
+        for line in reader.lines() {
+            let line = line?;
+            raw_line_count += 1;
+            let line_texts = if source_manifest {
+                encoder_texts_from_line(&line)
+            } else {
+                extract_text_side_for_vocab(&line).into_iter().collect()
+            };
+            let mut kept = 0usize;
+            for text in line_texts {
+                if split_line_with_min_tokens(&text, min_tok).is_some() {
+                    texts.push(text);
+                    pair_count += 1;
+                    kept += 1;
+                }
+            }
+            if kept == 0 && raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
+                println!(
+                    "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
+                    raw_line_count, pair_count
+                );
+                continue;
+            }
             if raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
                 println!(
                     "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
                     raw_line_count, pair_count
                 );
             }
-            continue;
-        };
-        if let Some(text) = extract_text_side_for_vocab(&line) {
-            texts.push(text);
-        }
-        pair_count += 1;
-        if raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
-            println!(
-                "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
-                raw_line_count, pair_count
-            );
         }
     }
 
@@ -1324,18 +1421,72 @@ pub fn build_vocab_from_pair_file(
 }
 
 pub fn count_pairs_with_vocab(path: &PathBuf) -> Result<usize> {
-    let reader = BufReader::new(File::open(path)?);
+    let (paths, source_manifest) = pair_input_paths(path)?;
     let mut count = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        if split_line(&line).is_some() {
-            count += 1;
+    for input_path in &paths {
+        let reader = BufReader::new(File::open(input_path)?);
+        for line in reader.lines() {
+            let line = line?;
+            if source_manifest {
+                count += encoder_texts_from_line(&line)
+                    .into_iter()
+                    .filter(|text| split_line(text).is_some())
+                    .count();
+            } else if split_line(&line).is_some() {
+                count += 1;
+            }
         }
     }
     if count == 0 {
         bail!("no usable lines found in {:?}", path);
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{nanos}"))
+    }
+
+    #[test]
+    fn pair_source_manifest_counts_and_streams_both_pair_sides() -> Result<()> {
+        let dir = unique_temp_dir("tofy-pair-source-manifest");
+        fs::create_dir_all(&dir)?;
+        let pairs = dir.join("pairs.txt");
+        let plain = dir.join("plain.txt");
+        let manifest = dir.join("sources.txt");
+        fs::write(&pairs, "hello\tworld\n")?;
+        fs::write(&plain, "plain text\n")?;
+        fs::write(
+            &manifest,
+            format!(
+                "{PAIR_SOURCE_MANIFEST_HEADER}\n{}\n{}\n",
+                pairs.display(),
+                plain.display()
+            ),
+        )?;
+
+        assert_eq!(count_pairs_with_vocab(&manifest)?, 3);
+        let mut stream = PairStream::with_shuffle(&manifest, 1, 1)?;
+        let got: Vec<String> = stream
+            .next_batch(3)?
+            .into_iter()
+            .map(|tokens| tokens.concat())
+            .collect();
+        assert_eq!(got, ["hello", "world", "plain text"]);
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }
 
 pub fn pad_or_truncate(ids: &mut Vec<u32>, max_len: usize, pad_id: u32) {
