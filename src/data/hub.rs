@@ -113,11 +113,22 @@ pub fn ensure_hub_dataset_cached(dataset_id: &str, cache_dir: &Path) -> Result<P
     let cache_file = cache_dir.join(format!("cached_{}.txt", name));
 
     if cache_file.exists() {
-        tracing::info!(
-            "Using cached dataset at {} (delete to re-download)",
-            cache_file.display()
-        );
-        return Ok(cache_file);
+        if cache_file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+            std::fs::remove_file(&cache_file)
+                .with_context(|| format!("remove empty cache file {}", cache_file.display()))?;
+        } else {
+            tracing::info!(
+                "Using cached dataset at {} (delete to re-download)",
+                cache_file.display()
+            );
+            return Ok(cache_file);
+        }
+    }
+
+    let tmp_file = tmp_path_for(&cache_file);
+    if tmp_file.exists() {
+        std::fs::remove_file(&tmp_file)
+            .with_context(|| format!("remove stale temp cache {}", tmp_file.display()))?;
     }
 
     tracing::info!(
@@ -136,7 +147,7 @@ pub fn ensure_hub_dataset_cached(dataset_id: &str, cache_dir: &Path) -> Result<P
     if let Some(parent) = cache_file.parent() {
         std::fs::create_dir_all(parent).context("create cache dir")?;
     }
-    let mut f = BufWriter::new(File::create(&cache_file).context("create cache file")?);
+    let mut f = BufWriter::new(File::create(&tmp_file).context("create temp cache file")?);
 
     let mut line_count: usize = 0;
     for reader in &readers {
@@ -151,6 +162,19 @@ pub fn ensure_hub_dataset_cached(dataset_id: &str, cache_dir: &Path) -> Result<P
     }
 
     f.flush().context("flush cache file")?;
+    if line_count == 0 {
+        anyhow::bail!(
+            "dataset '{}' did not yield any lines (expected a text or list column)",
+            dataset_id
+        );
+    }
+    std::fs::rename(&tmp_file, &cache_file).with_context(|| {
+        format!(
+            "publish cache file {} -> {}",
+            tmp_file.display(),
+            cache_file.display()
+        )
+    })?;
     tracing::info!("Wrote {} lines to {}", line_count, cache_file.display());
 
     Ok(cache_file)
@@ -191,11 +215,22 @@ pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result
     let cache_file = cache_dir.join(format!("cached_{}_{}.txt", name, num_parquets_used));
 
     if cache_file.exists() {
-        tracing::info!(
-            "Using cached Wikipedia at {} (delete to re-download)",
-            cache_file.display()
-        );
-        return Ok(cache_file);
+        if cache_file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+            std::fs::remove_file(&cache_file)
+                .with_context(|| format!("remove empty cache file {}", cache_file.display()))?;
+        } else {
+            tracing::info!(
+                "Using cached Wikipedia at {} (delete to re-download)",
+                cache_file.display()
+            );
+            return Ok(cache_file);
+        }
+    }
+
+    let tmp_file = tmp_path_for(&cache_file);
+    if tmp_file.exists() {
+        std::fs::remove_file(&tmp_file)
+            .with_context(|| format!("remove stale temp cache {}", tmp_file.display()))?;
     }
 
     tracing::info!(
@@ -210,7 +245,7 @@ pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result
     if let Some(parent) = cache_file.parent() {
         std::fs::create_dir_all(parent).context("create cache dir")?;
     }
-    let mut f = BufWriter::new(File::create(&cache_file).context("create cache file")?);
+    let mut f = BufWriter::new(File::create(&tmp_file).context("create temp cache file")?);
 
     let mut line_count: usize = 0;
     for reader in &readers {
@@ -231,6 +266,13 @@ pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result
             dataset_id
         );
     }
+    std::fs::rename(&tmp_file, &cache_file).with_context(|| {
+        format!(
+            "publish cache file {} -> {}",
+            tmp_file.display(),
+            cache_file.display()
+        )
+    })?;
     tracing::info!(
         "Wrote {} paragraphs to {}",
         line_count,
@@ -318,7 +360,12 @@ pub fn prepare_ultrachat_pairs(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).context("create output dir")?;
     }
-    let mut out = BufWriter::new(File::create(output_path).context("create output file")?);
+    let tmp_path = tmp_path_for(output_path);
+    if tmp_path.exists() {
+        std::fs::remove_file(&tmp_path)
+            .with_context(|| format!("remove stale temp output {}", tmp_path.display()))?;
+    }
+    let mut out = BufWriter::new(File::create(&tmp_path).context("create temp output file")?);
 
     let mut written = 0usize;
     for reader in &readers {
@@ -367,6 +414,13 @@ pub fn prepare_ultrachat_pairs(
                 if let Some(max_rows) = max_rows {
                     if written >= max_rows {
                         out.flush().context("flush output")?;
+                        std::fs::rename(&tmp_path, output_path).with_context(|| {
+                            format!(
+                                "publish output file {} -> {}",
+                                tmp_path.display(),
+                                output_path.display()
+                            )
+                        })?;
                         return Ok(written);
                     }
                 }
@@ -374,7 +428,31 @@ pub fn prepare_ultrachat_pairs(
         }
     }
     out.flush().context("flush output")?;
+    if written == 0 {
+        anyhow::bail!(
+            "dataset '{}' did not yield any UltraChat pairs",
+            ULTRACHAT_DATASET_ID
+        );
+    }
+    std::fs::rename(&tmp_path, output_path).with_context(|| {
+        format!(
+            "publish output file {} -> {}",
+            tmp_path.display(),
+            output_path.display()
+        )
+    })?;
     Ok(written)
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp = path.to_path_buf();
+    let tmp_ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!("{ext}.tmp"))
+        .unwrap_or_else(|| "tmp".to_string());
+    tmp.set_extension(tmp_ext);
+    tmp
 }
 
 fn escape_pair_field(s: &str) -> String {

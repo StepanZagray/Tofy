@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{tasks, util};
+use crate::{data, tasks, util};
 
 const WORLD_TEXT_DATA: &str = "data/ultrachat_pairs.txt";
 const WORLD_DATA: &str = "data/world_mix_pairs.txt";
@@ -431,7 +431,7 @@ fn resolve_pipeline_paths(
 
 fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
-    if !Path::new(CODE_DATA).exists() {
+    if !nonempty_file(CODE_DATA) {
         run_prepare([
             "--prepare-github-top-code",
             "--output",
@@ -442,8 +442,8 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             "120000",
         ])?;
     }
-    ensure_file(WORLD_TEXT_DATA)?;
-    ensure_file(WIKI_DATA)?;
+    ensure_nonempty_file(CODE_DATA)?;
+    ensure_pipeline_source_data()?;
 
     let mut extra_encoder_inputs = Vec::new();
     let mut extra_code_mix_args = Vec::new();
@@ -662,6 +662,40 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
     if !resume {
         std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
     }
+    Ok(())
+}
+
+fn ensure_pipeline_source_data() -> Result<()> {
+    if !nonempty_file(WORLD_TEXT_DATA) {
+        run_ultrachat_prepare(["--prepare-ultrachat", WORLD_TEXT_DATA, "6", "2"])?;
+    }
+    ensure_nonempty_file(WORLD_TEXT_DATA)?;
+
+    if !nonempty_file(WIKI_DATA) {
+        if Path::new(WIKI_DATA).exists() {
+            fs::remove_file(WIKI_DATA)
+                .with_context(|| format!("remove empty Wikipedia cache {}", WIKI_DATA))?;
+        }
+        let previous_max_files = std::env::var("JEPA_WIKI_MAX_FILES").ok();
+        std::env::set_var("JEPA_WIKI_MAX_FILES", "1");
+        let cached_result =
+            data::ensure_hub_wikipedia_cached("wikimedia/wikipedia", Path::new("data"));
+        match previous_max_files {
+            Some(value) => std::env::set_var("JEPA_WIKI_MAX_FILES", value),
+            None => std::env::remove_var("JEPA_WIKI_MAX_FILES"),
+        }
+        let cached = cached_result?;
+        if cached != PathBuf::from(WIKI_DATA) && !Path::new(WIKI_DATA).exists() {
+            fs::copy(&cached, WIKI_DATA).with_context(|| {
+                format!(
+                    "copy cached Wikipedia data from {} to {}",
+                    cached.display(),
+                    WIKI_DATA
+                )
+            })?;
+        }
+    }
+    ensure_nonempty_file(WIKI_DATA)?;
     Ok(())
 }
 
@@ -1040,17 +1074,39 @@ fn run_prepare<const N: usize>(args: [&str; N]) -> Result<()> {
     run_prepare_vec(args.into_iter().map(str::to_string).collect())
 }
 
+fn run_ultrachat_prepare<const N: usize>(args: [&str; N]) -> Result<()> {
+    let mut full_args = vec!["jepa_ai".to_string()];
+    full_args.extend(args.into_iter().map(str::to_string));
+    if !tasks::latent::try_run_prepare_ultrachat(&full_args)? {
+        bail!(
+            "UltraChat prepare command was not handled: {}",
+            full_args[1..].join(" ")
+        );
+    }
+    Ok(())
+}
+
 fn run_prepare_vec(args: Vec<String>) -> Result<()> {
     let mut full_args = vec!["jepa_ai".to_string()];
     full_args.extend(args);
-    tasks::prepare::try_run_prepare(&full_args)?;
+    if !tasks::prepare::try_run_prepare(&full_args)? {
+        bail!(
+            "prepare command was not handled: {}",
+            full_args[1..].join(" ")
+        );
+    }
     Ok(())
 }
 
 fn run_cache(args: Vec<String>) -> Result<()> {
     let mut full_args = vec!["jepa_ai".to_string()];
     full_args.extend(args);
-    tasks::cache::try_run_prepare_pipeline_cache(&full_args)?;
+    if !tasks::cache::try_run_prepare_pipeline_cache(&full_args)? {
+        bail!(
+            "cache command was not handled: {}",
+            full_args[1..].join(" ")
+        );
+    }
     Ok(())
 }
 
@@ -1059,8 +1115,9 @@ where
     F: FnOnce() -> Result<bool>,
 {
     std::env::set_var("TOFY_RUN_STAGE_NAME", stage);
-    let handled = f()?;
+    let result = f();
     std::env::remove_var("TOFY_RUN_STAGE_NAME");
+    let handled = result?;
     if !handled {
         bail!("pipeline stage {stage} was not handled by its task entrypoint");
     }
@@ -1293,6 +1350,15 @@ fn ensure_file<P: AsRef<Path>>(path: P) -> Result<()> {
     let path = path.as_ref();
     if !path.exists() {
         bail!("required file not found: {}", path.display());
+    }
+    Ok(())
+}
+
+fn ensure_nonempty_file<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    ensure_file(path)?;
+    if !nonempty_file(path) {
+        bail!("required file is empty: {}", path.display());
     }
     Ok(())
 }
