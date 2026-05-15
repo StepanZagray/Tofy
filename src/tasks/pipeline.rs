@@ -349,6 +349,8 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
     std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
     std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
+    std::env::set_var("TOFY_BPE_MAX_MERGES", "8192");
+    std::env::set_var("TOFY_BPE_PROGRESS_EVERY_MERGES", "128");
     std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_ROWS", "25000");
     std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_BYTES", "16777216");
     std::env::set_var(

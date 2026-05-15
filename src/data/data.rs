@@ -3,9 +3,10 @@ use candle_core::{Device, Tensor};
 use rand::rng;
 use rand::seq::IndexedRandom;
 use rand::RngExt;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -524,6 +525,10 @@ fn bpe_progress_every_merges() -> usize {
     env_usize("TOFY_BPE_PROGRESS_EVERY_MERGES")
         .filter(|&value| value > 0)
         .unwrap_or(DEFAULT_BPE_PROGRESS_EVERY_MERGES)
+}
+
+fn bpe_max_merges() -> Option<usize> {
+    env_usize("TOFY_BPE_MAX_MERGES").filter(|&value| value > 0)
 }
 
 fn token_cache_reader_capacity() -> usize {
@@ -2268,16 +2273,23 @@ pub fn encode_world_examples_with_mode(
         .collect()
 }
 
-fn merge_pair_counts(sequences: &[Vec<u32>]) -> std::collections::HashMap<(u32, u32), usize> {
-    let mut counts = std::collections::HashMap::new();
-    for seq in sequences {
-        for pair in seq.windows(2) {
-            if let [left, right] = pair {
-                *counts.entry((*left, *right)).or_insert(0) += 1;
+fn merge_pair_counts(sequences: &[Vec<u32>]) -> HashMap<(u32, u32), usize> {
+    sequences
+        .par_iter()
+        .fold(HashMap::new, |mut counts, seq| {
+            for pair in seq.windows(2) {
+                if let [left, right] = pair {
+                    *counts.entry((*left, *right)).or_insert(0) += 1;
+                }
             }
-        }
-    }
-    counts
+            counts
+        })
+        .reduce(HashMap::new, |mut left, right| {
+            for (pair, count) in right {
+                *left.entry(pair).or_insert(0) += count;
+            }
+            left
+        })
 }
 
 fn apply_merge_to_sequence(seq: &mut Vec<u32>, left: u32, right: u32, merged: u32) {
@@ -2303,13 +2315,20 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         bail!("cannot train tokenizer on empty text set");
     }
     let start = Instant::now();
-    let mut char_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for text in texts {
-        for ch in text.chars() {
-            *char_counts.entry(ch.to_string()).or_insert(0) += 1;
-        }
-    }
+    let char_counts = texts
+        .par_iter()
+        .fold(HashMap::new, |mut counts, text| {
+            for ch in text.chars() {
+                *counts.entry(ch).or_insert(0) += 1;
+            }
+            counts
+        })
+        .reduce(HashMap::new, |mut left, right| {
+            for (ch, count) in right {
+                *left.entry(ch).or_insert(0) += count;
+            }
+            left
+        });
     let mut chars = char_counts.into_iter().collect::<Vec<_>>();
     chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -2318,27 +2337,45 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         if vocab.id_to_token.len() >= max_vocab {
             break;
         }
-        vocab.add_token(&token);
+        vocab.add_token(&token.to_string());
     }
 
-    let mut sequences = texts
+    let char_ids = vocab
+        .token_to_id
         .iter()
+        .filter_map(|(token, id)| {
+            let mut chars = token.chars();
+            let ch = chars.next()?;
+            if chars.next().is_none() {
+                Some((ch, *id))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    let mut sequences = texts
+        .par_iter()
         .map(|text| {
             text.chars()
-                .map(|ch| {
-                    let token = ch.to_string();
-                    *vocab.token_to_id.get(&token).unwrap_or(&vocab.unk_id)
-                })
+                .map(|ch| *char_ids.get(&ch).unwrap_or(&vocab.unk_id))
                 .collect::<Vec<_>>()
         })
         .filter(|seq| !seq.is_empty())
         .collect::<Vec<_>>();
 
     let initial_vocab_len = vocab.id_to_token.len();
-    let target_merges = max_vocab.saturating_sub(initial_vocab_len);
+    let possible_merges = max_vocab.saturating_sub(initial_vocab_len);
+    let target_merges = bpe_max_merges()
+        .map(|limit| limit.min(possible_merges))
+        .unwrap_or(possible_merges);
+    if target_merges < possible_merges {
+        println!(
+            "BPE merge budget capped: target_merges={target_merges}, requested_vocab={max_vocab}, initial_vocab={initial_vocab_len}"
+        );
+    }
     let progress_every = bpe_progress_every_merges();
     let mut merges_applied = 0usize;
-    while vocab.id_to_token.len() < max_vocab {
+    while vocab.id_to_token.len() < max_vocab && merges_applied < target_merges {
         let pair_counts = merge_pair_counts(&sequences);
         let best = pair_counts
             .into_iter()
@@ -2360,9 +2397,9 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
             vocab.id_to_token[left as usize], vocab.id_to_token[right as usize]
         );
         let merged = vocab.add_merge(left, right, &merged_token);
-        for seq in &mut sequences {
-            apply_merge_to_sequence(seq, left, right, merged);
-        }
+        sequences
+            .par_iter_mut()
+            .for_each(|seq| apply_merge_to_sequence(seq, left, right, merged));
         merges_applied += 1;
         if merges_applied.is_multiple_of(progress_every) {
             let elapsed = start.elapsed().as_secs_f32();
