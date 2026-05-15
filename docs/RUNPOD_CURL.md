@@ -85,6 +85,25 @@ cat > /tmp/runpod-tofy-a100sxm-cuda13.json <<'EOF'
 }
 EOF
 ```
+Template for RTX PRO 6000:
+```bash
+ cat > /tmp/runpod-tofy-l40s-cuda13.json <<'EOF' 
+{
+  "name": "tofy-l40s-cuda13-full-run",
+  "cloudType": "SECURE",
+  "computeType": "GPU",
+  "templateId": "obgryfbuad",
+  "gpuTypeIds": ["NVIDIA RTX PRO 6000 Blackwell Server Edition"],
+  "gpuTypePriority": "availability",
+  "gpuCount": 1,
+  "allowedCudaVersions": ["13.0"],
+  "dataCenterPriority": "availability",
+  "containerDiskInGb": 50,
+  "volumeInGb": 200,
+  "volumeMountPath": "/workspace"
+}
+EOF
+```
 
 If the response is an array, it is an API validation or availability error. Read
 the error text and try again later, loosen CUDA to `["12.9", "12.8"]`, or switch
