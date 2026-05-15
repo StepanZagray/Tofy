@@ -65,6 +65,27 @@ curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, volumeInGb, volumeMountPath} end'
 ```
 
+Template for A100 SXM:
+
+```bash
+cat > /tmp/runpod-tofy-a100sxm-cuda13.json <<'EOF'
+{
+  "name": "tofy-a100sxm-cuda13-full-run",
+  "cloudType": "SECURE",
+  "computeType": "GPU",
+  "templateId": "obgryfbuad",
+  "gpuTypeIds": ["NVIDIA A100-SXM4-80GB"],
+  "gpuTypePriority": "availability",
+  "gpuCount": 1,
+  "allowedCudaVersions": ["13.0"],
+  "dataCenterPriority": "availability",
+  "containerDiskInGb": 50,
+  "volumeInGb": 200,
+  "volumeMountPath": "/workspace"
+}
+EOF
+```
+
 If the response is an array, it is an API validation or availability error. Read
 the error text and try again later, loosen CUDA to `["12.9", "12.8"]`, or switch
 GPU type.
@@ -98,27 +119,32 @@ nvcc --version || true
 
 ## GitHub Deploy Key
 
-Create a deploy key on the pod volume. This persists while the pod exists, but
-regular pod volume storage is deleted when the pod is terminated.
+Create a deploy key, print the public key, then add it to GitHub. Keep the
+private key under `/root/.ssh`, not `/workspace/.ssh`: some RunPod `/workspace`
+mounts report permissive `0666/0777` permissions even after `chmod`, and OpenSSH
+will refuse to use a private key with those permissions.
 
 ```bash
-mkdir -p /workspace/.ssh ~/.ssh
-chmod 700 /workspace/.ssh ~/.ssh
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
 
-ssh-keygen -t ed25519 -C "runpod-tofy-pod-volume" -f /workspace/.ssh/runpod_tofy -N ""
+ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
 
 cat > ~/.ssh/config <<'EOF'
 Host github.com
     HostName github.com
     User git
-    IdentityFile /workspace/.ssh/runpod_tofy
+    IdentityFile ~/.ssh/runpod_tofy
     IdentitiesOnly yes
 EOF
 
+chmod 600 ~/.ssh/runpod_tofy
+chmod 644 ~/.ssh/runpod_tofy.pub
 chmod 600 ~/.ssh/config
 ssh-keyscan github.com >> ~/.ssh/known_hosts
+chmod 644 ~/.ssh/known_hosts
 
-cat /workspace/.ssh/runpod_tofy.pub
+cat ~/.ssh/runpod_tofy.pub
 ```
 
 Add the printed key to:
@@ -140,6 +166,41 @@ Expected result:
 ```text
 Hi StepanZagray/Tofy! You've successfully authenticated, but GitHub does not provide shell access.
 ```
+
+If SSH fails with this warning:
+
+```text
+WARNING: UNPROTECTED PRIVATE KEY FILE!
+Permissions 0666 for '/workspace/.ssh/runpod_tofy' are too open.
+Load key "/workspace/.ssh/runpod_tofy": bad permissions
+```
+
+copy the key into `/root/.ssh` and point SSH there:
+
+```bash
+cp /workspace/.ssh/runpod_tofy ~/.ssh/runpod_tofy
+cp /workspace/.ssh/runpod_tofy.pub ~/.ssh/runpod_tofy.pub
+
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/runpod_tofy
+chmod 644 ~/.ssh/runpod_tofy.pub
+
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/runpod_tofy
+    IdentitiesOnly yes
+EOF
+
+chmod 600 ~/.ssh/config
+ssh -T git@github.com
+```
+
+If GitHub says the key is already in use, the public key is already registered
+somewhere in GitHub. Either reuse that key after fixing local permissions, or
+generate a new key with a different filename and add the new public key as the
+repo deploy key.
 
 ## Clone Or Update
 
@@ -252,6 +313,13 @@ export TOFY_TRAIN_DTYPE=bf16
   2>&1 | tee /workspace/tofy-train-48gb.log
 ```
 
+On a fresh regular pod volume, Stage 1 bootstraps the required source data in
+the pod workspace before training: Rust code pairs, UltraChat pairs, and
+`data/cached_wikimedia_wikipedia_1.txt`. Hub-backed conversions publish through
+temporary files, so if the wrapper stops the pod after a failure, rerun the same
+command after fixing the issue; stale `*.tmp` conversion outputs are removed on
+the next attempt.
+
 Detach:
 
 ```text
@@ -282,4 +350,3 @@ Network volumes:
 - are tied to one datacenter
 - are not the default here because they reduce the chance of finding an L40S
   with CUDA `13.0`
-

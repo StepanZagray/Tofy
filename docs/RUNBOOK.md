@@ -182,6 +182,10 @@ cargo run --release -- --sustained-oom-probe --stage all --dim 1536 --layers 7 -
 
 Stage 1 builds or validates:
 
+- source data on fresh pods:
+  - Rust GitHub code pairs: `data/rust_code_pairs.txt`
+  - UltraChat pairs: `data/ultrachat_pairs.txt`
+  - one-parquet Wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
 - prepared encoder corpus: `data/encoder_mix.txt`
 - prepared Rust instruction pairs: `data/rust_instruction_pairs.txt`
 - prepared Rust repair pairs: `data/rust_repair_pairs.txt`
@@ -201,7 +205,7 @@ The standalone command is:
 cargo run --release -- --prepare-pipeline-cache data/encoder_mix.txt data/world_mix_pairs.txt data/code_poc_mix.txt local_models/vocabs/vocab_encoder_8000_default.txt local_models/vocabs/vocab_code_16000_codeaware.txt data/cache --encoder-max-vocab 8000 --code-max-vocab 16000 --encoder-max-seq 1024 --world-max-seq 256 --code-max-seq 128
 ```
 
-The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches.
+The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches. Hub-backed source files are written to temporary files and atomically renamed into place, so a stopped pod should not leave a partially written canonical dataset. Empty source files are treated as missing and regenerated where Stage 1 owns the source.
 
 The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. Set `TOFY_PRETOKENIZE=0` to skip the binary token-cache portion, or pass `--force` to the standalone cache command to rebuild those artifacts.
 
@@ -366,7 +370,7 @@ cargo run --release -- --prepare-github-top-code --output data/multilang_pairs.t
 
 ## 3. Build the mixed encoder corpus
 
-Assumes you already have the downloaded Wikipedia cache such as `data/cached_wikimedia_wikipedia_1.txt`.
+The one-command `train` pipeline creates `data/cached_wikimedia_wikipedia_1.txt` automatically on a fresh pod. For this manual flow, make sure that cache exists first; set `JEPA_WIKI_MAX_FILES=1` when creating it so the filename matches the command below.
 
 ```bash
 cargo run --release -- --prepare-encoder-corpus --output data/encoder_mix.txt data/ultrachat_pairs.txt data/cached_wikimedia_wikipedia_1.txt data/multilang_pairs.txt

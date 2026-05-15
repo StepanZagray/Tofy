@@ -51,7 +51,7 @@ The **encoder and world model are not the same artifact anymore**.
 
 1. **Prepare data**
 - chat pairs: `data/ultrachat_pairs.txt`
-- code pairs: `data/multilang_pairs.txt`
+- code pairs: `data/rust_code_pairs.txt`
 - wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
 - encoder mix: generated from all of the above
 
@@ -117,12 +117,14 @@ The code-first POC now biases the decoder toward the hard Rust eval format:
 
 Default behavior:
 
-- encoder corpus = UltraChat + downloaded Wikipedia + multilingual code pairs
+- fresh runs generate missing or empty Stage 1 source files on the current machine: Rust code pairs, UltraChat pairs, and a one-parquet Wikipedia cache
+- encoder corpus = UltraChat + downloaded Wikipedia + Rust code pairs
 - world model data = balanced chat+code mix from `--prepare-world-mix`
 - world/orchestrator rows now carry explicit action labels and synthetic terminal `done` rows
 - text decoder data = UltraChat
-- code decoder data = multilingual code pairs from `--prepare-github-top-code`
-- Stage 1 now covers both prepared-data artifacts and vocab/token caches; the encoder corpus, Rust instruction pairs, Rust repair pairs, world mix, and code POC mix all use sidecar manifest caches so unchanged reruns avoid rebuilding them
+- code decoder data = Rust-heavy code POC mix built from GitHub code, synthetic function tasks, optional Rust docs rows, and compiler-feedback repair rows when `rustc` is available
+- Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
+- hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
 - the Rust pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
 - training now streams batches from disk with a small shuffle buffer instead of loading whole corpora into RAM first
 - cached token streams prefetch two ordered chunks by default; set `TOFY_CACHE_PREFETCH_BATCHES=0` to disable, `TOFY_CACHE_PREFETCH_BATCHES=N` to tune queue depth, `TOFY_CACHE_PREFETCH_CHUNK=N` to force chunk size, or `TOFY_TOKEN_CACHE_READER_MB=N` to tune the cache reader buffer

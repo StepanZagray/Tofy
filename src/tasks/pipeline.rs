@@ -1251,7 +1251,7 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
         },
         eval_flag
     );
-    fs::write(paths.run_root.join("launch.txt"), content)?;
+    write_text_atomic(&paths.run_root.join("launch.txt"), &content)?;
     Ok(())
 }
 
@@ -1307,10 +1307,25 @@ fn write_meta(
         decoder_heads: defaults.decoder_heads,
         decoder_ff_dim: defaults.decoder_ff_dim,
     };
-    fs::write(
-        paths.run_root.join("meta.json"),
-        format!("{}\n", serde_json::to_string_pretty(&meta)?),
+    write_text_atomic(
+        &paths.run_root.join("meta.json"),
+        &format!("{}\n", serde_json::to_string_pretty(&meta)?),
     )?;
+    Ok(())
+}
+
+fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!("{ext}.tmp"))
+            .unwrap_or_else(|| "tmp".to_string()),
+    );
+    fs::write(&tmp_path, content)?;
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 
