@@ -75,16 +75,13 @@ pub(crate) fn default_rust_docs_root() -> Option<PathBuf> {
             }
         })?;
     let sysroot = PathBuf::from(sysroot);
-    for candidate in [
+    [
         sysroot.join("share/doc/rust/html/std"),
         sysroot.join("share/doc/rust/html/core"),
         sysroot.join("lib/rustlib/src/rust/library"),
-    ] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
 }
 
 impl RustDocIndex {

@@ -16,4 +16,7 @@ pub use data::{
     ACTION_FETCH_DOCS, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
     PAIR_SOURCE_MANIFEST_HEADER,
 };
-pub use hub::{ensure_hub_dataset_cached, ensure_hub_wikipedia_cached, prepare_ultrachat_pairs};
+pub use hub::{
+    ensure_hub_dataset_cached, ensure_hub_wikipedia_cached,
+    ensure_hub_wikipedia_cached_with_max_files, prepare_ultrachat_pairs,
+};

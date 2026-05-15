@@ -1337,8 +1337,8 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             tb.add_scalar("metrics/target_rms", target_rms, step);
             tb.add_scalar("metrics/selection", selection_metric, step);
             if let Some(snapshot) = vram_tracker.sample() {
-                tb.add_scalar("memory/used_mb", snapshot.used_mb as f32, step);
-                tb.add_scalar("memory/free_mb", snapshot.free_mb as f32, step);
+                tb.add_scalar("memory/used_mb", snapshot.used_mb, step);
+                tb.add_scalar("memory/free_mb", snapshot.free_mb, step);
             }
             tb.flush();
 

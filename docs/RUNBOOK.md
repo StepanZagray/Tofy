@@ -140,6 +140,7 @@ Token-cache throughput knobs:
 - `TOFY_CACHE_PREFETCH_CHUNK=<int>` overrides the number of cached examples decoded per prefetch chunk, default current training batch size
 - `TOFY_TOKEN_CACHE_READER_MB=<int>` controls the per-stream token-cache read buffer, default `8`
 - `TOFY_PLANNER_SEGMENT_BATCH=<int>` controls the encoder/planner segment micro-batch used by world, orchestrator, decoder conditioning, and eval paths, default `64`
+- `TOFY_ENCODER_VOCAB_SAMPLE_ROWS=<int>` and `TOFY_ENCODER_VOCAB_SAMPLE_BYTES=<int>` cap the encoder vocab scan before Stage 2 training starts; the pipeline defaults to `500000` usable sequences or `67108864` text bytes
 
 The Rust pipeline also auto-exports `CUDA_COMPUTE_CAP` from `nvidia-smi` when it is available. CUDA toolkit version detection is left to `cudarc`.
 

@@ -31,9 +31,9 @@ const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemoryProfile {
-    EightGb,
-    FortyEightGb,
-    EightyGb,
+    Eight,
+    FortyEight,
+    Eighty,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -175,18 +175,18 @@ pub fn try_run_pipeline(args: &[String]) -> Result<bool> {
 impl MemoryProfile {
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "8gb" => Ok(Self::EightGb),
-            "48gb" => Ok(Self::FortyEightGb),
-            "80gb" => Ok(Self::EightyGb),
+            "8gb" => Ok(Self::Eight),
+            "48gb" => Ok(Self::FortyEight),
+            "80gb" => Ok(Self::Eighty),
             other => bail!("unsupported train profile '{other}' (expected 8gb, 48gb, or 80gb)"),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::EightGb => "8gb",
-            Self::FortyEightGb => "48gb",
-            Self::EightyGb => "80gb",
+            Self::Eight => "8gb",
+            Self::FortyEight => "48gb",
+            Self::Eighty => "80gb",
         }
     }
 
@@ -199,9 +199,9 @@ impl MemoryProfile {
         let profiles: ModelProfiles = serde_json::from_str(&raw)
             .with_context(|| format!("parse model profile config from {:?}", path))?;
         Ok(match self {
-            Self::EightGb => profiles.eight_gb,
-            Self::FortyEightGb => profiles.forty_eight_gb,
-            Self::EightyGb => profiles.eighty_gb,
+            Self::Eight => profiles.eight_gb,
+            Self::FortyEight => profiles.forty_eight_gb,
+            Self::Eighty => profiles.eighty_gb,
         })
     }
 }
@@ -347,6 +347,8 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.0");
     std::env::set_var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT", "0.0");
     std::env::set_var("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
+    std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
+    std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
     std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_ROWS", "25000");
     std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_BYTES", "16777216");
     std::env::set_var(
@@ -373,7 +375,7 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
         std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
         std::env::remove_var("TOFY_ENCODER_VOCAB");
     }
-    if cfg.profile == MemoryProfile::EightGb {
+    if cfg.profile == MemoryProfile::Eight {
         std::env::set_var("TOFY_PLANNER_SEGMENT_BATCH", "16");
     }
     if cfg.resume {
@@ -815,16 +817,12 @@ fn ensure_pipeline_source_data() -> Result<()> {
             fs::remove_file(WIKI_DATA)
                 .with_context(|| format!("remove empty Wikipedia cache {}", WIKI_DATA))?;
         }
-        let previous_max_files = std::env::var("JEPA_WIKI_MAX_FILES").ok();
-        std::env::set_var("JEPA_WIKI_MAX_FILES", "1");
-        let cached_result =
-            data::ensure_hub_wikipedia_cached("wikimedia/wikipedia", Path::new("data"));
-        match previous_max_files {
-            Some(value) => std::env::set_var("JEPA_WIKI_MAX_FILES", value),
-            None => std::env::remove_var("JEPA_WIKI_MAX_FILES"),
-        }
-        let cached = cached_result?;
-        if cached != PathBuf::from(WIKI_DATA) && !Path::new(WIKI_DATA).exists() {
+        let cached = data::ensure_hub_wikipedia_cached_with_max_files(
+            "wikimedia/wikipedia",
+            Path::new("data"),
+            Some(1),
+        )?;
+        if cached != Path::new(WIKI_DATA) && !Path::new(WIKI_DATA).exists() {
             fs::copy(&cached, WIKI_DATA).with_context(|| {
                 format!(
                     "copy cached Wikipedia data from {} to {}",
@@ -923,14 +921,14 @@ fn train_world(
         "--action-loss-weight".to_string(),
         "0.0".to_string(),
     ];
-    if cfg.profile == MemoryProfile::EightGb {
+    if cfg.profile == MemoryProfile::Eight {
         args.push("--freeze-encoder".to_string());
     }
     with_stage("world", || {
         tasks::world::try_run_train(&append_resume(args, cfg.resume))
     })?;
     ensure_file(&paths.world_model)?;
-    if cfg.profile == MemoryProfile::EightGb && !paths.world_encoder_model.exists() {
+    if cfg.profile == MemoryProfile::Eight && !paths.world_encoder_model.exists() {
         fs::copy(&paths.latent_model, &paths.world_encoder_model).with_context(|| {
             format!(
                 "copy frozen encoder export from {:?} to {:?}",

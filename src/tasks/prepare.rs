@@ -2868,11 +2868,11 @@ fn apply_oom_probe_profile(args: &mut OomProbeArgs, profile: OomProbeProfile) {
 fn apply_max_vram_probe_defaults(args: &mut OomProbeArgs) {
     args.max_vram = true;
     args.latent_steps = args.latent_steps.min(480);
-    args.world_steps = args.world_steps.min(1000).max(1000);
+    args.world_steps = 1000;
     args.high_world_steps = args.high_world_steps.min(480);
     args.decoder_steps = args.decoder_steps.min(480);
-    args.setup_latent_steps = args.setup_latent_steps.max(4).min(32);
-    args.setup_world_steps = args.setup_world_steps.max(4).min(32);
+    args.setup_latent_steps = args.setup_latent_steps.clamp(4, 32);
+    args.setup_world_steps = args.setup_world_steps.clamp(4, 32);
     args.world_warmup_steps = Some(args.world_warmup_steps.unwrap_or(1).min(1));
     args.max_late_growth_mb = 0;
     args.sample_interval_sec = args.sample_interval_sec.min(0.10);

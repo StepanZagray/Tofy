@@ -25,7 +25,7 @@ impl DecoderArchitecture {
         if dim == 0 || num_layers == 0 || num_heads == 0 || ff_dim == 0 {
             anyhow::bail!("decoder architecture values must be non-zero");
         }
-        if dim % num_heads != 0 {
+        if !dim.is_multiple_of(num_heads) {
             anyhow::bail!("decoder dim {dim} must be divisible by heads {num_heads}");
         }
         Ok(Self {

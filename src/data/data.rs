@@ -228,11 +228,11 @@ fn pair_source_manifest_paths(path: &Path) -> Result<Option<Vec<PathBuf>>> {
     Ok(Some(paths))
 }
 
-fn pair_input_paths(path: &PathBuf) -> Result<(Vec<PathBuf>, bool)> {
+fn pair_input_paths(path: &Path) -> Result<(Vec<PathBuf>, bool)> {
     if let Some(paths) = pair_source_manifest_paths(path)? {
         return Ok((paths, true));
     }
-    Ok((vec![path.clone()], false))
+    Ok((vec![path.to_path_buf()], false))
 }
 
 pub struct VocabStats {
@@ -513,6 +513,13 @@ fn code_vocab_sample_budget() -> VocabSampleBudget {
     }
 }
 
+fn encoder_vocab_sample_budget() -> VocabSampleBudget {
+    VocabSampleBudget {
+        max_rows: env_usize("TOFY_ENCODER_VOCAB_SAMPLE_ROWS").filter(|&value| value > 0),
+        max_text_bytes: env_usize("TOFY_ENCODER_VOCAB_SAMPLE_BYTES").filter(|&value| value > 0),
+    }
+}
+
 fn bpe_progress_every_merges() -> usize {
     env_usize("TOFY_BPE_PROGRESS_EVERY_MERGES")
         .filter(|&value| value > 0)
@@ -577,12 +584,12 @@ pub struct PairStream {
 }
 
 impl PairStream {
-    pub fn new(path: &PathBuf, min_tokens: usize) -> Result<Self> {
+    pub fn new(path: &Path, min_tokens: usize) -> Result<Self> {
         Self::with_shuffle(path, min_tokens, DEFAULT_STREAM_SHUFFLE_BUFFER)
     }
 
     pub fn with_shuffle(
-        path: &PathBuf,
+        path: &Path,
         min_tokens: usize,
         shuffle_buffer_size: usize,
     ) -> Result<Self> {
@@ -1367,10 +1374,17 @@ pub fn build_vocab_from_pair_file(
     let min_tok = min_tokens_per_line.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE);
     let mut pair_count = 0usize;
     let mut raw_line_count = 0usize;
+    let mut sampled_text_bytes = 0usize;
     let mut texts = Vec::new();
+    let budget = encoder_vocab_sample_budget();
+    println!(
+        "encoder vocab sampling budget for {}: {}",
+        path.display(),
+        budget.describe()
+    );
 
     let (paths, source_manifest) = pair_input_paths(path)?;
-    for input_path in &paths {
+    'sources: for input_path in &paths {
         let reader = BufReader::new(File::open(input_path)?);
         for line in reader.lines() {
             let line = line?;
@@ -1383,6 +1397,26 @@ pub fn build_vocab_from_pair_file(
             let mut kept = 0usize;
             for text in line_texts {
                 if split_line_with_min_tokens(&text, min_tok).is_some() {
+                    if let Some(limit) = budget.max_rows {
+                        if pair_count >= limit {
+                            println!(
+                                "encoder vocab row budget reached for {}: kept {pair_count} usable sequences",
+                                path.display()
+                            );
+                            break 'sources;
+                        }
+                    }
+                    if let Some(limit) = budget.max_text_bytes {
+                        if pair_count > 0 && sampled_text_bytes.saturating_add(text.len()) > limit {
+                            println!(
+                                "encoder vocab byte budget reached for {}: kept {pair_count} usable sequences and {} text bytes",
+                                path.display(),
+                                sampled_text_bytes
+                            );
+                            break 'sources;
+                        }
+                    }
+                    sampled_text_bytes = sampled_text_bytes.saturating_add(text.len());
                     texts.push(text);
                     pair_count += 1;
                     kept += 1;
@@ -1441,52 +1475,6 @@ pub fn count_pairs_with_vocab(path: &PathBuf) -> Result<usize> {
         bail!("no usable lines found in {:?}", path);
     }
     Ok(count)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("{name}-{nanos}"))
-    }
-
-    #[test]
-    fn pair_source_manifest_counts_and_streams_both_pair_sides() -> Result<()> {
-        let dir = unique_temp_dir("tofy-pair-source-manifest");
-        fs::create_dir_all(&dir)?;
-        let pairs = dir.join("pairs.txt");
-        let plain = dir.join("plain.txt");
-        let manifest = dir.join("sources.txt");
-        fs::write(&pairs, "hello\tworld\n")?;
-        fs::write(&plain, "plain text\n")?;
-        fs::write(
-            &manifest,
-            format!(
-                "{PAIR_SOURCE_MANIFEST_HEADER}\n{}\n{}\n",
-                pairs.display(),
-                plain.display()
-            ),
-        )?;
-
-        assert_eq!(count_pairs_with_vocab(&manifest)?, 3);
-        let mut stream = PairStream::with_shuffle(&manifest, 1, 1)?;
-        let got: Vec<String> = stream
-            .next_batch(3)?
-            .into_iter()
-            .map(|tokens| tokens.concat())
-            .collect();
-        assert_eq!(got, ["hello", "world", "plain text"]);
-
-        fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
 }
 
 pub fn pad_or_truncate(ids: &mut Vec<u32>, max_len: usize, pad_id: u32) {
@@ -2625,4 +2613,50 @@ pub fn make_world_batch_from_slice(
     let state_ids = Tensor::from_vec(state_buf, (batch_size, max_seq), device)?;
     let next_ids = Tensor::from_vec(next_buf, (batch_size, max_seq), device)?;
     Ok((state_ids, next_ids, state_lens, next_lens, action_labels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{nanos}"))
+    }
+
+    #[test]
+    fn pair_source_manifest_counts_and_streams_both_pair_sides() -> Result<()> {
+        let dir = unique_temp_dir("tofy-pair-source-manifest");
+        fs::create_dir_all(&dir)?;
+        let pairs = dir.join("pairs.txt");
+        let plain = dir.join("plain.txt");
+        let manifest = dir.join("sources.txt");
+        fs::write(&pairs, "hello\tworld\n")?;
+        fs::write(&plain, "plain text\n")?;
+        fs::write(
+            &manifest,
+            format!(
+                "{PAIR_SOURCE_MANIFEST_HEADER}\n{}\n{}\n",
+                pairs.display(),
+                plain.display()
+            ),
+        )?;
+
+        assert_eq!(count_pairs_with_vocab(&manifest)?, 3);
+        let mut stream = PairStream::with_shuffle(&manifest, 1, 1)?;
+        let got: Vec<String> = stream
+            .next_batch(3)?
+            .into_iter()
+            .map(|tokens| tokens.concat())
+            .collect();
+        assert_eq!(got, ["hello", "world", "plain text"]);
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

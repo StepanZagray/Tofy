@@ -185,6 +185,18 @@ pub fn ensure_hub_dataset_cached(dataset_id: &str, cache_dir: &Path) -> Result<P
 /// Cache file is named `cached_<id>_<N>.txt` where N = number of parquet files used (e.g. cached_wikimedia_wikipedia_64.txt).
 /// Set env `JEPA_WIKI_MAX_FILES` to limit how many parquet files to download (e.g. 1 for ~400MB).
 pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result<PathBuf> {
+    let max_files = std::env::var("JEPA_WIKI_MAX_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
+    ensure_hub_wikipedia_cached_with_max_files(dataset_id, cache_dir, max_files)
+}
+
+pub fn ensure_hub_wikipedia_cached_with_max_files(
+    dataset_id: &str,
+    cache_dir: &Path,
+    max_files: Option<usize>,
+) -> Result<PathBuf> {
     let name = sanitize_dataset_id(dataset_id);
 
     let api = hf_hub::api::sync::Api::new().context("hf-hub API")?;
@@ -197,10 +209,6 @@ pub fn ensure_hub_wikipedia_cached(dataset_id: &str, cache_dir: &Path) -> Result
         );
     }
 
-    let max_files: Option<usize> = std::env::var("JEPA_WIKI_MAX_FILES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0);
     if let Some(cap) = max_files {
         rfilenames.truncate(cap.min(rfilenames.len()));
         tracing::info!(
