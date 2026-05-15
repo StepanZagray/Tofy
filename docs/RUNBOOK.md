@@ -58,6 +58,19 @@ cargo run --release -- train 48gb --resume latest
 cargo run --release -- train 48gb --resume code_poc_1234567890
 ```
 
+On rented GPUs, use `--stream` to skip the expensive Stage 1 vocab/token-cache
+prebuild and train from raw streaming tokenization instead:
+
+```bash
+cargo run --release -- train 48gb --stream
+```
+
+This still prepares the text datasets, but it does not run
+`--prepare-pipeline-cache`, does not set `TOFY_ENCODER_VOCAB`, and sets
+`TOFY_USE_TOKEN_CACHE=0` for the training stages. Startup is faster and the GPU
+starts useful training sooner, at the cost of more CPU tokenization work during
+training.
+
 The 8 GB profile uses:
 
 - encoder/world keep `256` context
@@ -207,7 +220,7 @@ cargo run --release -- --prepare-pipeline-cache data/encoder_mix.txt data/world_
 
 The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches. Hub-backed source files are written to temporary files and atomically renamed into place, so a stopped pod should not leave a partially written canonical dataset. Empty source files are treated as missing and regenerated where Stage 1 owns the source.
 
-The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. Set `TOFY_PRETOKENIZE=0` to skip the binary token-cache portion, or pass `--force` to the standalone cache command to rebuild those artifacts.
+The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. Use `train <profile> --stream` to skip the pipeline cache build and train from raw streams, set `TOFY_USE_TOKEN_CACHE=0` to disable token-cache reads manually, or pass `--force` to the standalone cache command to rebuild those artifacts.
 
 Tokenizer behavior is now versioned explicitly:
 

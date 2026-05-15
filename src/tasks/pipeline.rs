@@ -83,6 +83,7 @@ struct PipelineConfig {
     resume: bool,
     resume_selector: Option<String>,
     with_code_eval: bool,
+    stream_training: bool,
 }
 
 #[derive(Debug)]
@@ -128,6 +129,7 @@ struct PipelineMeta<'a> {
     eval_suite: &'a str,
     profile: &'a str,
     with_code_eval: bool,
+    stream_training: bool,
     latent_steps: usize,
     world_steps: usize,
     high_world_steps: usize,
@@ -199,13 +201,14 @@ impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] [--stream]"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
         let mut with_code_eval = false;
+        let mut stream_training = false;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -226,8 +229,12 @@ impl PipelineConfig {
                     with_code_eval = true;
                     i += 1;
                 }
+                "--stream" | "--streaming" | "--no-cache" | "--skip-cache" => {
+                    stream_training = true;
+                    i += 1;
+                }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval)"
+                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval, --stream)"
                 ),
             }
         }
@@ -236,6 +243,7 @@ impl PipelineConfig {
             resume,
             resume_selector,
             with_code_eval,
+            stream_training,
         })
     }
 }
@@ -275,7 +283,7 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         defaults.high_world_steps
     );
 
-    prepare_data(&paths, &defaults, cfg.resume)?;
+    prepare_data(&paths, &defaults, cfg.resume, cfg.stream_training)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
     train_high_world(&paths, &cfg, &defaults)?;
@@ -349,6 +357,10 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_HWM_MACRO_MAX_LEN", "4");
     std::env::set_var("TOFY_CACHE_DIR", CACHE_DIR);
     std::env::set_var("TOFY_CACHE_PREFETCH_BATCHES", "1");
+    if cfg.stream_training {
+        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
+        std::env::remove_var("TOFY_ENCODER_VOCAB");
+    }
     if cfg.profile == MemoryProfile::EightGb {
         std::env::set_var("TOFY_PLANNER_SEGMENT_BATCH", "16");
     }
@@ -429,7 +441,12 @@ fn resolve_pipeline_paths(
     })
 }
 
-fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool) -> Result<()> {
+fn prepare_data(
+    paths: &PipelinePaths,
+    defaults: &ProfileDefaults,
+    resume: bool,
+    stream_training: bool,
+) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
     if !nonempty_file(CODE_DATA) {
         run_prepare([
@@ -633,6 +650,17 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
     run_prepare_vec(code_mix_args)?;
 
     run_prepare(["--generate-code-eval-suite", "--output", EVAL_SUITE])?;
+
+    if stream_training {
+        println!(
+            "Skipping pipeline vocab/token cache; training stages will stream raw tokenization."
+        );
+        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
+        if !resume {
+            std::env::remove_var("TOFY_ENCODER_VOCAB");
+        }
+        return Ok(());
+    }
 
     run_cache(vec![
         "--prepare-pipeline-cache".to_string(),
@@ -1240,8 +1268,9 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     } else {
         ""
     };
+    let stream_flag = if cfg.stream_training { " --stream" } else { "" };
     let content = format!(
-        "timestamp_unix={}\ncommand=train {}{}{}\n",
+        "timestamp_unix={}\ncommand=train {}{}{}{}\n",
         unix_timestamp()?,
         cfg.profile.as_str(),
         if selector.is_empty() {
@@ -1249,7 +1278,8 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
         } else {
             format!(" --resume {selector}")
         },
-        eval_flag
+        eval_flag,
+        stream_flag
     );
     write_text_atomic(&paths.run_root.join("launch.txt"), &content)?;
     Ok(())
@@ -1284,6 +1314,7 @@ fn write_meta(
         eval_suite: EVAL_SUITE,
         profile: cfg.profile.as_str(),
         with_code_eval: cfg.with_code_eval,
+        stream_training: cfg.stream_training,
         latent_steps: defaults.latent_steps,
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,

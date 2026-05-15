@@ -309,16 +309,15 @@ export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
 
 /workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 48gb \
+  ./target/release/jepa_ai train 48gb --stream \
   2>&1 | tee /workspace/tofy-train-48gb.log
 ```
 
-On a fresh regular pod volume, Stage 1 bootstraps the required source data in
-the pod workspace before training: Rust code pairs, UltraChat pairs, and
-`data/cached_wikimedia_wikipedia_1.txt`. Hub-backed conversions publish through
-temporary files, so if the wrapper stops the pod after a failure, rerun the same
-command after fixing the issue; stale `*.tmp` conversion outputs are removed on
-the next attempt.
+`--stream` skips the expensive Stage 1 vocab/token-cache prebuild and trains
+from raw streaming tokenization. This is the preferred rented-GPU launch mode:
+the GPU starts training sooner, instead of waiting for hours of CPU-only cache
+construction. On a fresh regular pod volume, Stage 1 still bootstraps the
+required source data in the pod workspace before training.
 
 Detach:
 
