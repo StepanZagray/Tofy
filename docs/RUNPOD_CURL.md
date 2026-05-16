@@ -332,13 +332,11 @@ export TOFY_TRAIN_DTYPE=bf16
   2>&1 | tee /workspace/tofy-train-48gb.log
 ```
 
-Raw streaming tokenization is the default. The command skips the expensive
-Stage 1 vocab/token-cache prebuild and does not materialize the large
-`data/encoder_mix.txt` corpus, so the GPU starts training sooner instead of
-waiting for hours of CPU-only cache construction. On a fresh regular pod volume,
-Stage 1 still bootstraps the required source data in the pod workspace and writes
-`data/encoder_sources.txt` for direct encoder streaming. To build the pipeline
-token caches without training, run `./target/release/jepa_ai train-cache 48gb`.
+Pipeline caching is the default. On a fresh regular pod volume, Stage 1
+bootstraps source data, materializes `data/encoder_mix.txt`, builds vocabs, and
+writes token caches before Stage 2 starts. Reruns reuse compatible manifests and
+token caches, so after the first successful Stage 1 pass the startup path should
+be much shorter.
 
 Detach:
 

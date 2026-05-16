@@ -14,7 +14,6 @@ const WORLD_DATA: &str = "data/world_mix_pairs.txt";
 const CODE_DATA: &str = "data/rust_code_pairs.txt";
 const WIKI_DATA: &str = "data/cached_wikimedia_wikipedia_1.txt";
 const ENCODER_DATA: &str = "data/encoder_mix.txt";
-const ENCODER_SOURCES: &str = "data/encoder_sources.txt";
 const EVAL_SUITE: &str = "eval/code_assistant_rust_hard.jsonl";
 const RUST_TASK_DATA: &str = "data/rust_instruction_pairs.txt";
 const RUST_REPAIR_DATA: &str = "data/rust_repair_pairs.txt";
@@ -85,8 +84,6 @@ struct PipelineConfig {
     resume: bool,
     resume_selector: Option<String>,
     with_code_eval: bool,
-    use_cache: bool,
-    cache_only: bool,
 }
 
 #[derive(Default)]
@@ -139,7 +136,6 @@ struct PipelineMeta<'a> {
     eval_suite: &'a str,
     profile: &'a str,
     with_code_eval: bool,
-    use_cache: bool,
     latent_steps: usize,
     world_steps: usize,
     high_world_steps: usize,
@@ -165,16 +161,10 @@ struct PipelineMeta<'a> {
 }
 
 pub fn try_run_pipeline(args: &[String]) -> Result<bool> {
-    if args.len() < 2
-        || !matches!(
-            args[1].as_str(),
-            "train" | "--train" | "train-cache" | "--train-cache"
-        )
-    {
+    if args.len() < 2 || !matches!(args[1].as_str(), "train" | "--train") {
         return Ok(false);
     }
-    let cache_only = matches!(args[1].as_str(), "train-cache" | "--train-cache");
-    let cfg = PipelineConfig::from_args(&args[2..], cache_only)?;
+    let cfg = PipelineConfig::from_args(&args[2..])?;
     run_pipeline(cfg)?;
     Ok(true)
 }
@@ -214,17 +204,16 @@ impl MemoryProfile {
 }
 
 impl PipelineConfig {
-    fn from_args(args: &[String], cache_only: bool) -> Result<Self> {
+    fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] OR train-cache <8gb|48gb|80gb>"
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
         let mut with_code_eval = false;
-        let use_cache = cache_only;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -242,27 +231,19 @@ impl PipelineConfig {
                     }
                 }
                 "--with-code-eval" => {
-                    if cache_only {
-                        bail!("train-cache does not run evaluation");
-                    }
                     with_code_eval = true;
                     i += 1;
                 }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval; use train-cache <profile> for offline cache builds)"
+                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval)"
                 ),
             }
-        }
-        if cache_only && resume {
-            bail!("train-cache does not support --resume");
         }
         Ok(Self {
             profile,
             resume,
             resume_selector,
             with_code_eval,
-            use_cache,
-            cache_only,
         })
     }
 }
@@ -302,11 +283,7 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         defaults.high_world_steps
     );
 
-    prepare_data(&paths, &defaults, cfg.resume, cfg.use_cache)?;
-    if cfg.cache_only {
-        println!("Pipeline cache preparation complete. No training was run.");
-        return Ok(());
-    }
+    prepare_data(&paths, &defaults, cfg.resume)?;
     configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
@@ -467,12 +444,7 @@ fn resolve_pipeline_paths(
     })
 }
 
-fn prepare_data(
-    paths: &PipelinePaths,
-    defaults: &ProfileDefaults,
-    resume: bool,
-    use_cache: bool,
-) -> Result<()> {
+fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
     let docs = thread::scope(|scope| -> Result<DocsPrep> {
         let code_handle = scope.spawn(prepare_code_source_data);
@@ -494,20 +466,17 @@ fn prepare_data(
         CODE_DATA.to_string(),
     ];
     encoder_inputs.extend(docs.extra_encoder_inputs);
-    write_pair_source_manifest(ENCODER_SOURCES, &encoder_inputs)?;
 
     thread::scope(|scope| -> Result<()> {
         let encoder_inputs_for_corpus = encoder_inputs.clone();
-        let encoder_corpus_handle = use_cache.then(|| {
-            scope.spawn(move || {
-                let mut encoder_args = vec![
-                    "--prepare-encoder-corpus".to_string(),
-                    "--output".to_string(),
-                    ENCODER_DATA.to_string(),
-                ];
-                encoder_args.extend(encoder_inputs_for_corpus);
-                run_prepare_vec(encoder_args)
-            })
+        let encoder_corpus_handle = scope.spawn(move || {
+            let mut encoder_args = vec![
+                "--prepare-encoder-corpus".to_string(),
+                "--output".to_string(),
+                ENCODER_DATA.to_string(),
+            ];
+            encoder_args.extend(encoder_inputs_for_corpus);
+            run_prepare_vec(encoder_args)
         });
 
         prepare_rust_task_data()?;
@@ -564,21 +533,9 @@ fn prepare_data(
 
         join_result(world_handle, "world mix")?;
         join_result(code_mix_handle, "code decoder mix")?;
-        if let Some(handle) = encoder_corpus_handle {
-            join_result(handle, "encoder corpus")?;
-        }
+        join_result(encoder_corpus_handle, "encoder corpus")?;
         Ok(())
     })?;
-
-    if !use_cache {
-        println!(
-            "Skipping pipeline token-cache prebuild; training will stream sources and read compatible existing caches when present."
-        );
-        if !resume {
-            std::env::remove_var("TOFY_ENCODER_VOCAB");
-        }
-        return Ok(());
-    }
 
     run_cache(vec![
         "--prepare-pipeline-cache".to_string(),
@@ -783,20 +740,6 @@ fn join_result<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>, label: &str) 
     handle.join().map_err(|_| anyhow!("{label} panicked"))?
 }
 
-fn write_pair_source_manifest(path: &str, inputs: &[String]) -> Result<()> {
-    let mut manifest = String::new();
-    manifest.push_str(data::PAIR_SOURCE_MANIFEST_HEADER);
-    manifest.push('\n');
-    for input in inputs {
-        manifest.push_str(input);
-        manifest.push('\n');
-    }
-    write_text_atomic(Path::new(path), &manifest)
-        .with_context(|| format!("write encoder source manifest {path}"))?;
-    println!("Wrote encoder source manifest: {path}");
-    Ok(())
-}
-
 fn configure_encoder_vocab_env(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     if cfg.resume {
         let matched_vocab = matched_encoder_vocab(paths);
@@ -821,19 +764,14 @@ fn configure_encoder_vocab_env(paths: &PipelinePaths, cfg: &PipelineConfig) -> R
     if paths.encoder_cache_vocab.exists() {
         std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
         println!(
-            "Streaming training will reuse existing encoder cache vocab {}",
+            "Training will use cached encoder vocab {}",
             paths.encoder_cache_vocab.display()
         );
-    } else if Path::new("local_models/vocabs/vocab_encoder.txt").exists() {
-        std::env::set_var(
-            "TOFY_ENCODER_VOCAB",
-            "local_models/vocabs/vocab_encoder.txt",
-        );
-        println!(
-            "Streaming training will reuse existing encoder vocab local_models/vocabs/vocab_encoder.txt"
-        );
     } else {
-        std::env::remove_var("TOFY_ENCODER_VOCAB");
+        bail!(
+            "pipeline cache did not produce encoder vocab: {}",
+            paths.encoder_cache_vocab.display()
+        );
     }
     Ok(())
 }
@@ -884,7 +822,7 @@ fn train_encoder(
     let args = vec![
         "jepa_ai".to_string(),
         "--latent".to_string(),
-        encoder_training_input(cfg).to_string(),
+        ENCODER_DATA.to_string(),
         defaults.latent_steps.to_string(),
         defaults.latent_batch.to_string(),
         defaults.dim.to_string(),
@@ -902,14 +840,6 @@ fn train_encoder(
     })?;
     ensure_file(&paths.latent_model)?;
     Ok(())
-}
-
-fn encoder_training_input(cfg: &PipelineConfig) -> &'static str {
-    if cfg.use_cache {
-        ENCODER_DATA
-    } else {
-        ENCODER_SOURCES
-    }
 }
 
 fn train_world(
@@ -1280,7 +1210,7 @@ fn run_cache(args: Vec<String>) -> Result<()> {
     full_args.extend(args);
     if !tasks::cache::try_run_prepare_pipeline_cache(&full_args)? {
         bail!(
-            "cache command was not handled: {}",
+            "pipeline cache preparation was not handled: {}",
             full_args[1..].join(" ")
         );
     }
@@ -1417,20 +1347,16 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     } else {
         ""
     };
-    let command = if cfg.cache_only {
-        format!("train-cache {}", cfg.profile.as_str())
-    } else {
-        format!(
-            "train {}{}{}",
-            cfg.profile.as_str(),
-            if selector.is_empty() {
-                String::new()
-            } else {
-                format!(" --resume {selector}")
-            },
-            eval_flag
-        )
-    };
+    let command = format!(
+        "train {}{}{}",
+        cfg.profile.as_str(),
+        if selector.is_empty() {
+            String::new()
+        } else {
+            format!(" --resume {selector}")
+        },
+        eval_flag
+    );
     let content = format!(
         "timestamp_unix={}\ncommand={}\n",
         unix_timestamp()?,
@@ -1463,13 +1389,12 @@ fn write_meta(
             .to_string_lossy()
             .to_string(),
         code_decoder_vocab: paths.code_decoder_vocab.to_string_lossy().to_string(),
-        encoder_data: encoder_training_input(cfg),
+        encoder_data: ENCODER_DATA,
         world_data: WORLD_DATA,
         code_train_data: CODE_TRAIN_DATA,
         eval_suite: EVAL_SUITE,
         profile: cfg.profile.as_str(),
         with_code_eval: cfg.with_code_eval,
-        use_cache: cfg.use_cache,
         latent_steps: defaults.latent_steps,
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,

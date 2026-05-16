@@ -34,7 +34,6 @@ pub fn print_usage(program: &str) {
     eprintln!(
         "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
     );
-    eprintln!("    {program} train-cache <8gb|48gb|80gb>    # prepare pipeline token caches only");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );
@@ -57,9 +56,6 @@ pub fn print_usage(program: &str) {
     );
     eprintln!(
         "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile 48gb] ..."
-    );
-    eprintln!(
-        "    {program} --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] [--encoder-max-vocab N] [--code-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--code-max-seq N] [--force]"
     );
     eprintln!(
         "    {program} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--grad-accum <int>] [--output <path>] [--resume]"

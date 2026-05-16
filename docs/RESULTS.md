@@ -31,7 +31,7 @@ These were existing TensorBoard runs in `runs/` before the current training-code
 - The code-first pipeline now generates compiler-feedback Rust repair rows when `rustc` is available, mixes them into both world/code data as code-route examples, and uses tool/context tags while preserving three-action checkpoint compatibility.
 - The Rust pipeline saves stage checkpoints inside run-owned directories under `runs/` and resumes by explicit run id or `latest`, which prevents stale checkpoints from unrelated runs being reused.
 - Tokenization and token caching now use an explicit tokenizer-spec fingerprint plus UTF-8 byte fallback, so tokenizer/cache invalidation is tied to tokenizer behavior rather than only source hashes and mode names.
-- Stage 1 now bootstraps missing or empty fresh-pod source data for the canonical pipeline, including Rust code pairs, UltraChat pairs, and the one-parquet Wikipedia cache. Hub-backed dataset conversions and pipeline metadata writes publish atomically to avoid trusting partial files after a stopped pod.
+- Stage 1 now bootstraps missing or empty fresh-pod source data for the canonical pipeline, including Rust code pairs, UltraChat pairs, and the one-parquet Wikipedia cache. Pipeline training builds/uses vocab and token caches by default, while hub-backed dataset conversions and pipeline metadata writes publish atomically to avoid trusting partial files after a stopped pod.
 
 ## OOM Testing Notes
 
