@@ -127,6 +127,7 @@ Default behavior:
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
 - the Rust pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
 - training now streams cached token batches from disk instead of retokenizing raw text in the hot loop
+- cache preparation overlaps independent CPU jobs and encodes cache misses with Rayon; set `RAYON_NUM_THREADS=N` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=N` to tune Stage 1 text chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=N` to tune token-cache build chunks, or `TOFY_VOCAB_SCAN_CHUNK_LINES=N` to tune vocab sampling chunks
 - cached token streams prefetch two ordered chunks by default; set `TOFY_CACHE_PREFETCH_BATCHES=0` to disable, `TOFY_CACHE_PREFETCH_BATCHES=N` to tune queue depth, `TOFY_CACHE_PREFETCH_CHUNK=N` to force chunk size, or `TOFY_TOKEN_CACHE_READER_MB=N` to tune the cache reader buffer
 - world/orchestrator/decoder planner encoding batches token segments on GPU; set `TOFY_PLANNER_SEGMENT_BATCH=N` to tune the segment micro-batch size, default `64`
 - the canonical training entrypoint is `cargo run --release -- train <8gb|48gb|80gb>`:

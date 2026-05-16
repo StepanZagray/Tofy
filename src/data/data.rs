@@ -477,6 +477,7 @@ const DEFAULT_TOKEN_CACHE_READER_MB: usize = 8;
 const DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 2;
 const MAX_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 16;
 const DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS: usize = 500_000;
+const DEFAULT_VOCAB_SCAN_CHUNK_LINES: usize = 16_384;
 const DEFAULT_BPE_PROGRESS_EVERY_MERGES: usize = 250;
 type TokenCacheRecord = (Vec<u32>, Vec<u32>, u32);
 type PrefetchRx<T> = Receiver<Result<Vec<T>>>;
@@ -555,6 +556,26 @@ fn token_cache_reader(path: &PathBuf) -> Result<BufReader<File>> {
         token_cache_reader_capacity(),
         File::open(path)?,
     ))
+}
+
+fn vocab_scan_chunk_lines() -> usize {
+    env_usize("TOFY_VOCAB_SCAN_CHUNK_LINES")
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_VOCAB_SCAN_CHUNK_LINES)
+}
+
+fn read_line_chunk<I>(lines: &mut I, max_lines: usize) -> Result<Vec<String>>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+{
+    let mut chunk = Vec::with_capacity(max_lines);
+    for _ in 0..max_lines {
+        let Some(line) = lines.next() else {
+            break;
+        };
+        chunk.push(line?);
+    }
+    Ok(chunk)
 }
 
 fn recv_prefetched_batch<T>(
@@ -1387,54 +1408,64 @@ pub fn build_vocab_from_pair_file(
         path.display(),
         budget.describe()
     );
+    let chunk_lines = vocab_scan_chunk_lines();
+    println!(
+        "encoder vocab parallel scan for {}: chunk_lines={} rayon_threads={}",
+        path.display(),
+        chunk_lines,
+        rayon::current_num_threads()
+    );
 
     let (paths, source_manifest) = pair_input_paths(path)?;
     'sources: for input_path in &paths {
-        let reader = BufReader::new(File::open(input_path)?);
-        for line in reader.lines() {
-            let line = line?;
-            raw_line_count += 1;
-            let line_texts = if source_manifest {
-                encoder_texts_from_line(&line)
-            } else {
-                extract_text_side_for_vocab(&line).into_iter().collect()
-            };
-            let mut kept = 0usize;
-            for text in line_texts {
-                if split_line_with_min_tokens(&text, min_tok).is_some() {
-                    if let Some(limit) = budget.max_rows {
-                        if pair_count >= limit {
-                            println!(
-                                "encoder vocab row budget reached for {}: kept {pair_count} usable sequences",
-                                path.display()
-                            );
-                            break 'sources;
-                        }
+        let mut lines = BufReader::new(File::open(input_path)?).lines();
+        loop {
+            let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+            if chunk.is_empty() {
+                break;
+            }
+            raw_line_count += chunk.len();
+            let chunk_texts = chunk
+                .par_iter()
+                .flat_map_iter(|line| {
+                    let line_texts = if source_manifest {
+                        encoder_texts_from_line(line)
+                    } else {
+                        extract_text_side_for_vocab(line).into_iter().collect()
+                    };
+                    line_texts
+                        .into_iter()
+                        .filter(move |text| split_line_with_min_tokens(text, min_tok).is_some())
+                })
+                .collect::<Vec<_>>();
+            for text in chunk_texts {
+                let text_len = text.len();
+                if let Some(limit) = budget.max_rows {
+                    if pair_count >= limit {
+                        println!(
+                            "encoder vocab row budget reached for {}: kept {pair_count} usable sequences",
+                            path.display()
+                        );
+                        break 'sources;
                     }
-                    if let Some(limit) = budget.max_text_bytes {
-                        if pair_count > 0 && sampled_text_bytes.saturating_add(text.len()) > limit {
-                            println!(
-                                "encoder vocab byte budget reached for {}: kept {pair_count} usable sequences and {} text bytes",
-                                path.display(),
-                                sampled_text_bytes
-                            );
-                            break 'sources;
-                        }
-                    }
-                    sampled_text_bytes = sampled_text_bytes.saturating_add(text.len());
-                    texts.push(text);
-                    pair_count += 1;
-                    kept += 1;
                 }
+                if let Some(limit) = budget.max_text_bytes {
+                    if pair_count > 0 && sampled_text_bytes.saturating_add(text_len) > limit {
+                        println!(
+                            "encoder vocab byte budget reached for {}: kept {pair_count} usable sequences and {} text bytes",
+                            path.display(),
+                            sampled_text_bytes
+                        );
+                        break 'sources;
+                    }
+                }
+                sampled_text_bytes = sampled_text_bytes.saturating_add(text_len);
+                texts.push(text);
+                pair_count += 1;
             }
-            if kept == 0 && raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
-                println!(
-                    "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
-                    raw_line_count, pair_count
-                );
-                continue;
-            }
-            if raw_line_count.is_multiple_of(PROGRESS_EVERY_LINES) {
+            if raw_line_count / PROGRESS_EVERY_LINES
+                != raw_line_count.saturating_sub(chunk_lines) / PROGRESS_EVERY_LINES
+            {
                 println!(
                     "Vocab scan progress: {} raw lines read, {} usable sequences kept...",
                     raw_line_count, pair_count
@@ -2439,49 +2470,69 @@ pub fn build_vocab_from_raw_world_file_with_mode(
         VocabSampleBudget::default()
     };
     let mut sampled_text_bytes = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let chunk_lines = vocab_scan_chunk_lines();
+    println!(
+        "{} vocab parallel scan for {}: chunk_lines={} rayon_threads={}",
+        mode.as_str(),
+        path.display(),
+        chunk_lines,
+        rayon::current_num_threads()
+    );
+    let mut lines = reader.lines();
+    let mut next_progress = DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS;
+    'scan: loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
         }
-        let Some((left, right, _)) = parse_world_line_fields(line) else {
-            continue;
-        };
-        let state_tokens = tokenize_with_mode(&left, mode);
-        let next_tokens = tokenize_with_mode(&right, mode);
-        if state_tokens.is_empty() || next_tokens.is_empty() {
-            continue;
-        }
-        if let Some(limit) = budget.max_rows {
-            if row_count >= limit {
+        let rows = chunk
+            .par_iter()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let (left, right, _) = parse_world_line_fields(line)?;
+                let state_tokens = tokenize_with_mode(&left, mode);
+                let next_tokens = tokenize_with_mode(&right, mode);
+                if state_tokens.is_empty() || next_tokens.is_empty() {
+                    return None;
+                }
+                Some((left, right))
+            })
+            .collect::<Vec<_>>();
+        for (left, right) in rows {
+            if let Some(limit) = budget.max_rows {
+                if row_count >= limit {
+                    println!(
+                        "vocab sampling row budget reached for {}: kept {row_count} rows",
+                        path.display()
+                    );
+                    break 'scan;
+                }
+            }
+            let pair_text_bytes = left.len() + right.len();
+            if let Some(limit) = budget.max_text_bytes {
+                if row_count > 0 && sampled_text_bytes.saturating_add(pair_text_bytes) > limit {
+                    println!(
+                        "vocab sampling byte budget reached for {}: kept {row_count} rows and {} text bytes",
+                        path.display(),
+                        sampled_text_bytes
+                    );
+                    break 'scan;
+                }
+            }
+            texts.push(left);
+            texts.push(right);
+            sampled_text_bytes = sampled_text_bytes.saturating_add(pair_text_bytes);
+            row_count += 1;
+            while row_count >= next_progress {
                 println!(
-                    "vocab sampling row budget reached for {}: kept {row_count} rows",
+                    "Vocab scan progress: {row_count} usable rows kept for {} (sampled_text_bytes={sampled_text_bytes})",
                     path.display()
                 );
-                break;
+                next_progress += DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS;
             }
-        }
-        let pair_text_bytes = left.len() + right.len();
-        if let Some(limit) = budget.max_text_bytes {
-            if row_count > 0 && sampled_text_bytes.saturating_add(pair_text_bytes) > limit {
-                println!(
-                    "vocab sampling byte budget reached for {}: kept {row_count} rows and {} text bytes",
-                    path.display(),
-                    sampled_text_bytes
-                );
-                break;
-            }
-        }
-        texts.push(left);
-        texts.push(right);
-        sampled_text_bytes = sampled_text_bytes.saturating_add(pair_text_bytes);
-        row_count += 1;
-        if row_count.is_multiple_of(DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS) {
-            println!(
-                "Vocab scan progress: {row_count} usable rows kept for {} (sampled_text_bytes={sampled_text_bytes})",
-                path.display()
-            );
         }
     }
     if row_count == 0 {

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Field, Row};
 use rand::{seq::SliceRandom, RngExt, SeedableRng};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,11 +34,34 @@ const DEFAULT_GITHUB_LANGUAGES: &[&str] = &[
     "HTML",
 ];
 const CODE_EVAL_SUITE_JSONL: &str = include_str!("../../eval/code_assistant_rust_hard.jsonl");
+const DEFAULT_PREPARE_CHUNK_LINES: usize = 16_384;
 const FORBIDDEN_DTYPE_PATTERNS: &[&str] = &[
     ".to_scalar::<f32>()",
     ".to_vec1::<f32>()",
     ".to_vec2::<f32>()",
 ];
+
+fn prepare_chunk_lines() -> usize {
+    std::env::var("TOFY_PREPARE_CHUNK_LINES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_PREPARE_CHUNK_LINES)
+}
+
+fn read_line_chunk<I>(lines: &mut I, max_lines: usize) -> Result<Vec<String>>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+{
+    let mut chunk = Vec::with_capacity(max_lines);
+    for _ in 0..max_lines {
+        let Some(line) = lines.next() else {
+            break;
+        };
+        chunk.push(line?);
+    }
+    Ok(chunk)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct SourceFingerprint {
@@ -584,24 +608,41 @@ fn run_prepare_encoder_corpus(args: &[String]) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let mut out = BufWriter::new(File::create(&tmp)?);
+    let chunk_lines = prepare_chunk_lines();
+    println!(
+        "Encoder corpus parallel prepare: chunk_lines={} rayon_threads={}",
+        chunk_lines,
+        rayon::current_num_threads()
+    );
     for path in &inputs {
-        let reader = BufReader::new(File::open(path)?);
-        for raw in reader.lines() {
-            let line = raw?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        let mut lines = BufReader::new(File::open(path)?).lines();
+        loop {
+            let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+            if chunk.is_empty() {
+                break;
             }
-            if let Some((left, right)) = split_pair_line(trimmed) {
-                for part in [left, right] {
-                    if !part.trim().is_empty() {
-                        writeln!(out, "{}", flatten_for_encoder(part.trim()))?;
-                        written += 1;
+            let prepared = chunk
+                .par_iter()
+                .flat_map_iter(|line| {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return Vec::new();
                     }
+                    if let Some((left, right)) = split_pair_line(trimmed) {
+                        return [left, right]
+                            .into_iter()
+                            .filter(|part| !part.trim().is_empty())
+                            .map(|part| flatten_for_encoder(part.trim()))
+                            .collect::<Vec<_>>();
+                    }
+                    vec![flatten_for_encoder(trimmed)]
+                })
+                .collect::<Vec<_>>();
+            for line in prepared {
+                if !line.is_empty() {
+                    writeln!(out, "{line}")?;
+                    written += 1;
                 }
-            } else {
-                writeln!(out, "{}", flatten_for_encoder(trimmed))?;
-                written += 1;
             }
         }
     }
@@ -2177,17 +2218,27 @@ fn world_mix_code_action(left: &str, right: &str) -> &'static str {
 }
 
 fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
-    let reader = BufReader::new(File::open(path)?);
+    let mut lines = BufReader::new(File::open(path)?).lines();
+    let chunk_lines = prepare_chunk_lines();
     let mut rows = Vec::new();
-    for raw in reader.lines() {
-        let line = raw?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
         }
-        if let Some((left, right)) = split_pair_line_first_two(trimmed) {
-            rows.push((left.to_string(), right.to_string()));
-        }
+        rows.extend(
+            chunk
+                .par_iter()
+                .filter_map(|line| {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    let (left, right) = split_pair_line_first_two(trimmed)?;
+                    Some((left.to_string(), right.to_string()))
+                })
+                .collect::<Vec<_>>(),
+        );
     }
     Ok(rows)
 }
@@ -2312,13 +2363,20 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
 }
 
 fn load_non_empty_lines(path: &Path) -> Result<Vec<String>> {
-    let reader = BufReader::new(File::open(path)?);
+    let mut lines = BufReader::new(File::open(path)?).lines();
+    let chunk_lines = prepare_chunk_lines();
     let mut rows = Vec::new();
-    for raw in reader.lines() {
-        let line = raw?;
-        if !line.trim().is_empty() {
-            rows.push(line);
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
         }
+        rows.extend(
+            chunk
+                .into_par_iter()
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>(),
+        );
     }
     Ok(rows)
 }

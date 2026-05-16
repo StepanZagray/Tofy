@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 use crate::data::{
@@ -18,6 +20,15 @@ const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
 const PROGRESS_EVERY_LINES: usize = 500_000;
+const DEFAULT_TOKEN_CACHE_ENCODE_CHUNK_LINES: usize = 16_384;
+
+struct DualWorldCacheRow {
+    encoder_state_tokens: Vec<u32>,
+    encoder_next_tokens: Vec<u32>,
+    decoder_state_tokens: Vec<u32>,
+    decoder_next_tokens: Vec<u32>,
+    action_label: u32,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -192,6 +203,12 @@ fn parse_next_usize(args: &[String], index: usize, flag: &str) -> Result<usize> 
         .with_context(|| format!("{flag} must be an integer"))
 }
 
+fn join_result<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>, label: &str) -> Result<T> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} panicked"))?
+}
+
 fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
     fs::create_dir_all(&config.cache_dir)?;
     if let Some(parent) = config.encoder_vocab_path.parent() {
@@ -202,86 +219,129 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
     }
     println!("Preparing pipeline vocab/token cache");
     println!("cache dir: {}", config.cache_dir.display());
-    let encoder_source = source_fingerprint(&config.encoder_data)?;
-    let world_source = source_fingerprint(&config.world_data)?;
-    let code_source = source_fingerprint(&config.code_data)?;
 
-    let encoder_vocab = ensure_vocab_cache(VocabCacheSpec {
-        kind: "encoder",
-        data_path: &config.encoder_data,
-        source: &encoder_source,
-        mode: TokenizationMode::Default,
-        max_vocab: config.encoder_max_vocab,
-        vocab_path: &config.encoder_vocab_path,
-        manifest_path: &config.cache_dir.join("encoder_vocab.manifest.json"),
-        force: config.force,
-    })?;
-    let code_vocab = ensure_vocab_cache(VocabCacheSpec {
-        kind: "code_decoder",
-        data_path: &config.code_data,
-        source: &code_source,
-        mode: TokenizationMode::CodeAware,
-        max_vocab: config.code_max_vocab,
-        vocab_path: &config.code_vocab_path,
-        manifest_path: &config.cache_dir.join("code_decoder_vocab.manifest.json"),
-        force: config.force,
+    let (encoder_source, world_source, code_source) = thread::scope(|scope| -> Result<_> {
+        let encoder = scope.spawn(|| source_fingerprint(&config.encoder_data));
+        let world = scope.spawn(|| source_fingerprint(&config.world_data));
+        let code = scope.spawn(|| source_fingerprint(&config.code_data));
+        Ok((
+            join_result(encoder, "encoder source fingerprint")?,
+            join_result(world, "world source fingerprint")?,
+            join_result(code, "code source fingerprint")?,
+        ))
     })?;
 
-    ensure_sequence_token_cache(
-        TokenCacheSpec {
-            kind: "encoder",
-            data_path: &config.encoder_data,
-            source: &encoder_source,
-            mode: TokenizationMode::Default,
-            max_seq: config.encoder_max_seq,
-            token_cache_path: &config.cache_dir.join("encoder.tokens.bin"),
-            manifest_path: &config.cache_dir.join("encoder_tokens.manifest.json"),
-            force: config.force,
-        },
-        &encoder_vocab,
-    )?;
-    ensure_world_token_cache(
-        TokenCacheSpec {
-            kind: "world",
-            data_path: &config.world_data,
-            source: &world_source,
-            mode: TokenizationMode::Default,
-            max_seq: config.world_max_seq,
-            token_cache_path: &config.cache_dir.join("world.tokens.bin"),
-            manifest_path: &config.cache_dir.join("world_tokens.manifest.json"),
-            force: config.force,
-        },
-        &encoder_vocab,
-    )?;
-    ensure_world_token_cache(
-        TokenCacheSpec {
-            kind: "code_decoder",
-            data_path: &config.code_data,
-            source: &code_source,
-            mode: TokenizationMode::CodeAware,
-            max_seq: config.code_max_seq,
-            token_cache_path: &config.cache_dir.join("code_decoder.tokens.bin"),
-            manifest_path: &config.cache_dir.join("code_decoder_tokens.manifest.json"),
-            force: config.force,
-        },
-        &code_vocab,
-    )?;
-    ensure_dual_world_token_cache(
-        TokenCacheSpec {
-            kind: "code_decoder_dual",
-            data_path: &config.code_data,
-            source: &code_source,
-            mode: TokenizationMode::CodeAware,
-            max_seq: config.code_max_seq,
-            token_cache_path: &config.cache_dir.join("code_decoder_dual.tokens.bin"),
-            manifest_path: &config
-                .cache_dir
-                .join("code_decoder_dual_tokens.manifest.json"),
-            force: config.force,
-        },
-        &encoder_vocab,
-        &code_vocab,
-    )?;
+    let encoder_vocab_manifest = config.cache_dir.join("encoder_vocab.manifest.json");
+    let code_vocab_manifest = config.cache_dir.join("code_decoder_vocab.manifest.json");
+    let (encoder_vocab, code_vocab) = thread::scope(|scope| -> Result<_> {
+        let encoder = scope.spawn(|| {
+            ensure_vocab_cache(VocabCacheSpec {
+                kind: "encoder",
+                data_path: &config.encoder_data,
+                source: &encoder_source,
+                mode: TokenizationMode::Default,
+                max_vocab: config.encoder_max_vocab,
+                vocab_path: &config.encoder_vocab_path,
+                manifest_path: &encoder_vocab_manifest,
+                force: config.force,
+            })
+        });
+        let code = scope.spawn(|| {
+            ensure_vocab_cache(VocabCacheSpec {
+                kind: "code_decoder",
+                data_path: &config.code_data,
+                source: &code_source,
+                mode: TokenizationMode::CodeAware,
+                max_vocab: config.code_max_vocab,
+                vocab_path: &config.code_vocab_path,
+                manifest_path: &code_vocab_manifest,
+                force: config.force,
+            })
+        });
+        Ok((
+            join_result(encoder, "encoder vocab cache")?,
+            join_result(code, "code decoder vocab cache")?,
+        ))
+    })?;
+
+    let encoder_tokens = config.cache_dir.join("encoder.tokens.bin");
+    let encoder_tokens_manifest = config.cache_dir.join("encoder_tokens.manifest.json");
+    let world_tokens = config.cache_dir.join("world.tokens.bin");
+    let world_tokens_manifest = config.cache_dir.join("world_tokens.manifest.json");
+    let code_tokens = config.cache_dir.join("code_decoder.tokens.bin");
+    let code_tokens_manifest = config.cache_dir.join("code_decoder_tokens.manifest.json");
+    let dual_tokens = config.cache_dir.join("code_decoder_dual.tokens.bin");
+    let dual_tokens_manifest = config
+        .cache_dir
+        .join("code_decoder_dual_tokens.manifest.json");
+    thread::scope(|scope| -> Result<()> {
+        let encoder = scope.spawn(|| {
+            ensure_sequence_token_cache(
+                TokenCacheSpec {
+                    kind: "encoder",
+                    data_path: &config.encoder_data,
+                    source: &encoder_source,
+                    mode: TokenizationMode::Default,
+                    max_seq: config.encoder_max_seq,
+                    token_cache_path: &encoder_tokens,
+                    manifest_path: &encoder_tokens_manifest,
+                    force: config.force,
+                },
+                &encoder_vocab,
+            )
+        });
+        let world = scope.spawn(|| {
+            ensure_world_token_cache(
+                TokenCacheSpec {
+                    kind: "world",
+                    data_path: &config.world_data,
+                    source: &world_source,
+                    mode: TokenizationMode::Default,
+                    max_seq: config.world_max_seq,
+                    token_cache_path: &world_tokens,
+                    manifest_path: &world_tokens_manifest,
+                    force: config.force,
+                },
+                &encoder_vocab,
+            )
+        });
+        let code = scope.spawn(|| {
+            ensure_world_token_cache(
+                TokenCacheSpec {
+                    kind: "code_decoder",
+                    data_path: &config.code_data,
+                    source: &code_source,
+                    mode: TokenizationMode::CodeAware,
+                    max_seq: config.code_max_seq,
+                    token_cache_path: &code_tokens,
+                    manifest_path: &code_tokens_manifest,
+                    force: config.force,
+                },
+                &code_vocab,
+            )
+        });
+        let dual = scope.spawn(|| {
+            ensure_dual_world_token_cache(
+                TokenCacheSpec {
+                    kind: "code_decoder_dual",
+                    data_path: &config.code_data,
+                    source: &code_source,
+                    mode: TokenizationMode::CodeAware,
+                    max_seq: config.code_max_seq,
+                    token_cache_path: &dual_tokens,
+                    manifest_path: &dual_tokens_manifest,
+                    force: config.force,
+                },
+                &encoder_vocab,
+                &code_vocab,
+            )
+        });
+        join_result(encoder, "encoder token cache")?;
+        join_result(world, "world token cache")?;
+        join_result(code, "code decoder token cache")?;
+        join_result(dual, "dual code decoder token cache")?;
+        Ok(())
+    })?;
     println!("Pipeline cache ready.");
     Ok(())
 }
@@ -377,25 +437,46 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
     let tmp_path = tmp_path_for(spec.token_cache_path);
     let mut writer = BufWriter::new(File::create(&tmp_path)?);
     writer.write_all(TOKEN_CACHE_MAGIC)?;
-    let reader = BufReader::new(File::open(spec.data_path)?);
+    let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
+    let chunk_lines = token_cache_encode_chunk_lines();
+    println!(
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        spec.kind,
+        chunk_lines,
+        rayon::current_num_threads()
+    );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        raw_lines += 1;
-        let Some(mut ids) =
-            encode_line_with_vocab_mode(&line, vocab, spec.mode, DEFAULT_MIN_TOKENS_PER_LINE)
-        else {
-            continue;
-        };
-        truncate_ids(&mut ids, spec.max_seq);
-        write_token_record(&mut writer, &ids, &[], NO_ACTION)?;
-        rows += 1;
-        if raw_lines.is_multiple_of(PROGRESS_EVERY_LINES) {
+    let mut next_progress = PROGRESS_EVERY_LINES;
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        raw_lines += chunk.len();
+        let encoded = chunk
+            .par_iter()
+            .filter_map(|line| {
+                let mut ids = encode_line_with_vocab_mode(
+                    line,
+                    vocab,
+                    spec.mode,
+                    DEFAULT_MIN_TOKENS_PER_LINE,
+                )?;
+                truncate_ids(&mut ids, spec.max_seq);
+                Some(ids)
+            })
+            .collect::<Vec<_>>();
+        for ids in &encoded {
+            write_token_record(&mut writer, ids, &[], NO_ACTION)?;
+        }
+        rows += encoded.len();
+        while raw_lines >= next_progress {
             println!(
                 "{} token cache progress: {raw_lines} raw lines, {rows} rows",
                 spec.kind
             );
+            next_progress += PROGRESS_EVERY_LINES;
         }
     }
     writer.flush()?;
@@ -440,30 +521,47 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
     let tmp_path = tmp_path_for(spec.token_cache_path);
     let mut writer = BufWriter::new(File::create(&tmp_path)?);
     writer.write_all(TOKEN_CACHE_MAGIC)?;
-    let reader = BufReader::new(File::open(spec.data_path)?);
+    let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
+    let chunk_lines = token_cache_encode_chunk_lines();
+    println!(
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        spec.kind,
+        chunk_lines,
+        rayon::current_num_threads()
+    );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        raw_lines += 1;
-        let Some(mut example) = encode_raw_world_line_with_vocab_mode(&line, vocab, spec.mode)
-        else {
-            continue;
-        };
-        truncate_ids(&mut example.state_tokens, spec.max_seq);
-        truncate_ids(&mut example.next_tokens, spec.max_seq);
-        write_token_record(
-            &mut writer,
-            &example.state_tokens,
-            &example.next_tokens,
-            example.action_label,
-        )?;
-        rows += 1;
-        if raw_lines.is_multiple_of(PROGRESS_EVERY_LINES) {
+    let mut next_progress = PROGRESS_EVERY_LINES;
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        raw_lines += chunk.len();
+        let encoded = chunk
+            .par_iter()
+            .filter_map(|line| {
+                let mut example = encode_raw_world_line_with_vocab_mode(line, vocab, spec.mode)?;
+                truncate_ids(&mut example.state_tokens, spec.max_seq);
+                truncate_ids(&mut example.next_tokens, spec.max_seq);
+                Some(example)
+            })
+            .collect::<Vec<_>>();
+        for example in &encoded {
+            write_token_record(
+                &mut writer,
+                &example.state_tokens,
+                &example.next_tokens,
+                example.action_label,
+            )?;
+        }
+        rows += encoded.len();
+        while raw_lines >= next_progress {
             println!(
                 "{} token cache progress: {raw_lines} raw lines, {rows} rows",
                 spec.kind
             );
+            next_progress += PROGRESS_EVERY_LINES;
         }
     }
     writer.flush()?;
@@ -516,40 +614,63 @@ fn ensure_dual_world_token_cache(
     let tmp_path = tmp_path_for(spec.token_cache_path);
     let mut writer = BufWriter::new(File::create(&tmp_path)?);
     writer.write_all(DUAL_TOKEN_CACHE_MAGIC)?;
-    let reader = BufReader::new(File::open(spec.data_path)?);
+    let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
+    let chunk_lines = token_cache_encode_chunk_lines();
+    println!(
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        spec.kind,
+        chunk_lines,
+        rayon::current_num_threads()
+    );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        raw_lines += 1;
-        let Some(mut encoder_example) =
-            encode_raw_world_line_with_vocab_mode(&line, encoder_vocab, TokenizationMode::Default)
-        else {
-            continue;
-        };
-        let Some(mut decoder_example) =
-            encode_raw_world_line_with_vocab_mode(&line, decoder_vocab, spec.mode)
-        else {
-            continue;
-        };
-        truncate_ids(&mut encoder_example.state_tokens, spec.max_seq);
-        truncate_ids(&mut encoder_example.next_tokens, spec.max_seq);
-        truncate_ids(&mut decoder_example.state_tokens, spec.max_seq);
-        truncate_ids(&mut decoder_example.next_tokens, spec.max_seq);
-        write_dual_token_record(
-            &mut writer,
-            &encoder_example.state_tokens,
-            &encoder_example.next_tokens,
-            &decoder_example.state_tokens,
-            &decoder_example.next_tokens,
-            decoder_example.action_label,
-        )?;
-        rows += 1;
-        if raw_lines.is_multiple_of(PROGRESS_EVERY_LINES) {
+    let mut next_progress = PROGRESS_EVERY_LINES;
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        raw_lines += chunk.len();
+        let encoded = chunk
+            .par_iter()
+            .filter_map(|line| {
+                let mut encoder_example = encode_raw_world_line_with_vocab_mode(
+                    line,
+                    encoder_vocab,
+                    TokenizationMode::Default,
+                )?;
+                let mut decoder_example =
+                    encode_raw_world_line_with_vocab_mode(line, decoder_vocab, spec.mode)?;
+                truncate_ids(&mut encoder_example.state_tokens, spec.max_seq);
+                truncate_ids(&mut encoder_example.next_tokens, spec.max_seq);
+                truncate_ids(&mut decoder_example.state_tokens, spec.max_seq);
+                truncate_ids(&mut decoder_example.next_tokens, spec.max_seq);
+                Some(DualWorldCacheRow {
+                    encoder_state_tokens: encoder_example.state_tokens,
+                    encoder_next_tokens: encoder_example.next_tokens,
+                    decoder_state_tokens: decoder_example.state_tokens,
+                    decoder_next_tokens: decoder_example.next_tokens,
+                    action_label: decoder_example.action_label,
+                })
+            })
+            .collect::<Vec<_>>();
+        for row in &encoded {
+            write_dual_token_record(
+                &mut writer,
+                &row.encoder_state_tokens,
+                &row.encoder_next_tokens,
+                &row.decoder_state_tokens,
+                &row.decoder_next_tokens,
+                row.action_label,
+            )?;
+        }
+        rows += encoded.len();
+        while raw_lines >= next_progress {
             println!(
                 "{} token cache progress: {raw_lines} raw lines, {rows} rows",
                 spec.kind
             );
+            next_progress += PROGRESS_EVERY_LINES;
         }
     }
     writer.flush()?;
@@ -589,6 +710,28 @@ fn token_cache_is_valid(spec: &TokenCacheSpec<'_>, vocab_signature: &str) -> boo
         && manifest.max_seq >= spec.max_seq
         && manifest.vocab_signature == vocab_signature
         && manifest.token_cache_path == path_string(spec.token_cache_path)
+}
+
+fn token_cache_encode_chunk_lines() -> usize {
+    std::env::var("TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_TOKEN_CACHE_ENCODE_CHUNK_LINES)
+}
+
+fn read_line_chunk<I>(lines: &mut I, max_lines: usize) -> Result<Vec<String>>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+{
+    let mut chunk = Vec::with_capacity(max_lines);
+    for _ in 0..max_lines {
+        let Some(line) = lines.next() else {
+            break;
+        };
+        chunk.push(line?);
+    }
+    Ok(chunk)
 }
 
 fn write_token_record<W: Write>(

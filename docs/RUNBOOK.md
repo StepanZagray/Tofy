@@ -130,6 +130,8 @@ Token-cache throughput knobs:
 - `TOFY_CACHE_PREFETCH_BATCHES=<int>` controls the bounded cached-stream prefetch queue, default `2`; set `0` to disable
 - `TOFY_CACHE_PREFETCH_CHUNK=<int>` overrides the number of cached examples decoded per prefetch chunk, default current training batch size
 - `TOFY_TOKEN_CACHE_READER_MB=<int>` controls the per-stream token-cache read buffer, default `8`
+- cache preparation overlaps independent source fingerprinting, vocab builds, and token-cache builds; token-cache misses are encoded in parallel with Rayon
+- set `RAYON_NUM_THREADS=<int>` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=<int>` to tune Stage 1 text-artifact chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=<int>` to tune token-cache build chunk size, and `TOFY_VOCAB_SCAN_CHUNK_LINES=<int>` to tune vocab sampling chunk size; chunk defaults are `16384`
 - `TOFY_PLANNER_SEGMENT_BATCH=<int>` controls the encoder/planner segment micro-batch used by world, orchestrator, decoder conditioning, and eval paths, default `64`
 - `TOFY_ENCODER_VOCAB_SAMPLE_ROWS=<int>` and `TOFY_ENCODER_VOCAB_SAMPLE_BYTES=<int>` cap the encoder vocab scan before Stage 2 training starts; the pipeline defaults to `500000` usable sequences or `67108864` text bytes
 - `TOFY_BPE_MAX_MERGES=<int>` caps tokenizer merge training; the pipeline defaults to `8192` to bound CPU-only startup time
