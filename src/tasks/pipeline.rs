@@ -86,6 +86,7 @@ struct PipelineConfig {
     resume_selector: Option<String>,
     with_code_eval: bool,
     use_cache: bool,
+    cache_only: bool,
 }
 
 #[derive(Default)]
@@ -164,10 +165,16 @@ struct PipelineMeta<'a> {
 }
 
 pub fn try_run_pipeline(args: &[String]) -> Result<bool> {
-    if args.len() < 2 || (args[1] != "train" && args[1] != "--train") {
+    if args.len() < 2
+        || !matches!(
+            args[1].as_str(),
+            "train" | "--train" | "train-cache" | "--train-cache"
+        )
+    {
         return Ok(false);
     }
-    let cfg = PipelineConfig::from_args(&args[2..])?;
+    let cache_only = matches!(args[1].as_str(), "train-cache" | "--train-cache");
+    let cfg = PipelineConfig::from_args(&args[2..], cache_only)?;
     run_pipeline(cfg)?;
     Ok(true)
 }
@@ -207,17 +214,17 @@ impl MemoryProfile {
 }
 
 impl PipelineConfig {
-    fn from_args(args: &[String]) -> Result<Self> {
+    fn from_args(args: &[String], cache_only: bool) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] [--cache]"
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval] OR train-cache <8gb|48gb|80gb>"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
         let mut with_code_eval = false;
-        let mut use_cache = false;
+        let use_cache = cache_only;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -235,17 +242,19 @@ impl PipelineConfig {
                     }
                 }
                 "--with-code-eval" => {
+                    if cache_only {
+                        bail!("train-cache does not run evaluation");
+                    }
                     with_code_eval = true;
                     i += 1;
                 }
-                "--cache" => {
-                    use_cache = true;
-                    i += 1;
-                }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval, --cache)"
+                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval; use train-cache <profile> for offline cache builds)"
                 ),
             }
+        }
+        if cache_only && resume {
+            bail!("train-cache does not support --resume");
         }
         Ok(Self {
             profile,
@@ -253,6 +262,7 @@ impl PipelineConfig {
             resume_selector,
             with_code_eval,
             use_cache,
+            cache_only,
         })
     }
 }
@@ -293,6 +303,10 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
     );
 
     prepare_data(&paths, &defaults, cfg.resume, cfg.use_cache)?;
+    if cfg.cache_only {
+        println!("Pipeline cache preparation complete. No training was run.");
+        return Ok(());
+    }
     configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
@@ -371,12 +385,8 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     std::env::set_var("TOFY_HWM_MACRO_MAX_LEN", "4");
     std::env::set_var("TOFY_CACHE_DIR", CACHE_DIR);
     std::env::set_var("TOFY_CACHE_PREFETCH_BATCHES", "1");
-    if cfg.use_cache {
-        std::env::remove_var("TOFY_USE_TOKEN_CACHE");
-    } else {
-        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
-        std::env::remove_var("TOFY_ENCODER_VOCAB");
-    }
+    std::env::remove_var("TOFY_USE_TOKEN_CACHE");
+    std::env::remove_var("TOFY_ENCODER_VOCAB");
     if cfg.profile == MemoryProfile::Eight {
         std::env::set_var("TOFY_PLANNER_SEGMENT_BATCH", "16");
     }
@@ -561,8 +571,9 @@ fn prepare_data(
     })?;
 
     if !use_cache {
-        println!("Skipping pipeline vocab/token cache; encoder will stream source files directly.");
-        std::env::set_var("TOFY_USE_TOKEN_CACHE", "0");
+        println!(
+            "Skipping pipeline token-cache prebuild; training will stream sources and read compatible existing caches when present."
+        );
         if !resume {
             std::env::remove_var("TOFY_ENCODER_VOCAB");
         }
@@ -793,15 +804,34 @@ fn configure_encoder_vocab_env(paths: &PipelinePaths, cfg: &PipelineConfig) -> R
             std::env::set_var("TOFY_ENCODER_VOCAB", matched_vocab);
             return Ok(());
         }
-        if cfg.use_cache && paths.encoder_cache_vocab.exists() {
+        if paths.encoder_cache_vocab.exists() {
             std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
+            return Ok(());
+        }
+        if Path::new("local_models/vocabs/vocab_encoder.txt").exists() {
+            std::env::set_var(
+                "TOFY_ENCODER_VOCAB",
+                "local_models/vocabs/vocab_encoder.txt",
+            );
             return Ok(());
         }
         return Ok(());
     }
 
-    if cfg.use_cache {
+    if paths.encoder_cache_vocab.exists() {
         std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
+        println!(
+            "Streaming training will reuse existing encoder cache vocab {}",
+            paths.encoder_cache_vocab.display()
+        );
+    } else if Path::new("local_models/vocabs/vocab_encoder.txt").exists() {
+        std::env::set_var(
+            "TOFY_ENCODER_VOCAB",
+            "local_models/vocabs/vocab_encoder.txt",
+        );
+        println!(
+            "Streaming training will reuse existing encoder vocab local_models/vocabs/vocab_encoder.txt"
+        );
     } else {
         std::env::remove_var("TOFY_ENCODER_VOCAB");
     }
@@ -1387,18 +1417,24 @@ fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     } else {
         ""
     };
-    let cache_flag = if cfg.use_cache { " --cache" } else { "" };
+    let command = if cfg.cache_only {
+        format!("train-cache {}", cfg.profile.as_str())
+    } else {
+        format!(
+            "train {}{}{}",
+            cfg.profile.as_str(),
+            if selector.is_empty() {
+                String::new()
+            } else {
+                format!(" --resume {selector}")
+            },
+            eval_flag
+        )
+    };
     let content = format!(
-        "timestamp_unix={}\ncommand=train {}{}{}{}\n",
+        "timestamp_unix={}\ncommand={}\n",
         unix_timestamp()?,
-        cfg.profile.as_str(),
-        if selector.is_empty() {
-            String::new()
-        } else {
-            format!(" --resume {selector}")
-        },
-        eval_flag,
-        cache_flag
+        command
     );
     write_text_atomic(&paths.run_root.join("launch.txt"), &content)?;
     Ok(())

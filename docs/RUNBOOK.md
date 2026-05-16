@@ -59,23 +59,24 @@ cargo run --release -- train 48gb --resume code_poc_1234567890
 ```
 
 Training streams raw tokenization by default. This avoids spending paid GPU time
-on the expensive Stage 1 vocab/token-cache prebuild before training starts:
+on the expensive Stage 1 token-cache prebuild before training starts:
 
 ```bash
 cargo run --release -- train 48gb
 ```
 
 This still prepares the text datasets, but it does not run
-`--prepare-pipeline-cache`, does not set `TOFY_ENCODER_VOCAB`, and disables
-token-cache reads for the training stages. It also avoids materializing the
+`--prepare-pipeline-cache`, but it will read compatible token caches when they
+already exist. It reuses `local_models/vocabs/vocab_encoder.txt` or the
+profile-specific cache vocab when a previous run has already saved one. It also avoids materializing the
 large `data/encoder_mix.txt` file; the encoder streams directly from
 `data/encoder_sources.txt`, which points at the prepared source files. Startup
 is faster and the GPU starts useful training sooner, at the cost of more CPU
-tokenization work during training. To opt into the old cache-building path,
-pass:
+tokenization work during training. To build caches intentionally without
+training, run:
 
 ```bash
-cargo run --release -- train 48gb --cache
+cargo run --release -- train-cache 48gb
 ```
 
 The 8 GB profile uses:
@@ -156,7 +157,7 @@ Important: the encoder now also saves a checkpoint-matched vocab next to the lat
 
 ## Vocab and Token Cache
 
-The Rust pipeline runs the cache stage before training by default:
+The Rust pipeline trains from streaming inputs by default:
 
 ```bash
 cargo run --release -- train 8gb
@@ -209,7 +210,7 @@ Stage 1 builds or validates:
   - UltraChat pairs: `data/ultrachat_pairs.txt`
   - one-parquet Wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
 - encoder source manifest: `data/encoder_sources.txt`
-- prepared encoder corpus: `data/encoder_mix.txt` only when `train <profile> --cache`
+- prepared encoder corpus: `data/encoder_mix.txt` only when `train-cache <profile>`
 - prepared Rust instruction pairs: `data/rust_instruction_pairs.txt`
 - prepared Rust repair pairs: `data/rust_repair_pairs.txt`
 - prepared world mix: `data/world_mix_pairs.txt`
@@ -236,7 +237,7 @@ cargo run --release -- --prepare-pipeline-cache data/encoder_mix.txt data/world_
 
 The prepared-data commands also use sidecar manifests keyed by their input files and relevant generation settings, so Stage 1 skips rebuilding unchanged text artifacts before it reaches the binary vocab/token caches. In default streaming mode, the encoder source manifest avoids rewriting the same source rows into a huge combined corpus. Hub-backed source files are written to temporary files and atomically renamed into place, so a stopped pod should not leave a partially written canonical dataset. Empty source files are treated as missing and regenerated where Stage 1 owns the source.
 
-The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the stage skips rebuilding even if the source file mtime changed. `train <profile>` skips the pipeline cache build by default and trains from raw streams. Use `train <profile> --cache` to opt into building/reading the pipeline cache, set `TOFY_USE_TOKEN_CACHE=0` to disable token-cache reads manually, or pass `--force` to the standalone cache command to rebuild those artifacts.
+The vocab/token manifests include source path, byte length, content hash, tokenizer mode, tokenizer-spec fingerprint, vocab signature, max sequence length, and row count. If source/tokenizer-spec/vocab match and the cached max sequence is at least the requested max sequence, the cache command skips rebuilding even if the source file mtime changed. `train <profile>` skips the pipeline cache build, but it reads compatible existing caches automatically. Use `train-cache <profile>` to build/read the pipeline cache without running training, set `TOFY_USE_TOKEN_CACHE=0` to disable token-cache reads manually, or pass `--force` to the standalone cache command to rebuild those artifacts.
 
 Tokenizer behavior is now versioned explicitly:
 
@@ -245,7 +246,7 @@ Tokenizer behavior is now versioned explicitly:
 - code-aware mode still does identifier-aware splitting first, then falls back to UTF-8 bytes only for uncovered pieces
 - cache invalidation no longer depends only on the source file and the loose mode label; changing the tokenizer spec bumps the cache/vocab manifests automatically
 
-Fresh non-resume pipeline runs export the cached encoder vocab to latent training and pass the cached code vocab to code-decoder training. Resume runs keep using the checkpoint-matched vocabs to avoid accidentally pairing old weights with a new vocab.
+Fresh streaming pipeline runs save the encoder vocab immediately after BPE finishes and then keep training. Resume runs keep using checkpoint-matched vocabs to avoid accidentally pairing old weights with a new vocab.
 
 Latent training consumes `data/cache/encoder.tokens.bin` only when the manifest vocab signature matches the active encoder vocab and the cache max sequence is large enough for segmented context. The Rust pipeline sets `--encoder-max-seq` to `LATENT_MAX_SEQ * 4`, which is `1024` with the current defaults.
 

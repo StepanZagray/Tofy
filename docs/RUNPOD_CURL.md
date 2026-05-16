@@ -337,8 +337,8 @@ Stage 1 vocab/token-cache prebuild and does not materialize the large
 `data/encoder_mix.txt` corpus, so the GPU starts training sooner instead of
 waiting for hours of CPU-only cache construction. On a fresh regular pod volume,
 Stage 1 still bootstraps the required source data in the pod workspace and writes
-`data/encoder_sources.txt` for direct encoder streaming. To opt into the old
-cache-building path, add `--cache`.
+`data/encoder_sources.txt` for direct encoder streaming. To build the pipeline
+token caches without training, run `./target/release/jepa_ai train-cache 48gb`.
 
 Detach:
 

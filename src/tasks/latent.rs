@@ -262,8 +262,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             config.data_path, vocab_path
         );
         let vocab = load_vocab_from_file(&vocab_path)?;
-        let pair_count = count_pairs_with_vocab(&config.data_path)?;
-        (vocab, None, pair_count)
+        (vocab, None, 0)
     } else {
         println!(
             "Preparing latent training input from {:?}: scanning dataset and building encoder vocab...",
@@ -301,7 +300,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         println!("Encoder init: {:?}", p);
     }
     println!(
-        "Vocab size: {} (includes <mask>) | pairs {} | seq_len {} | lambda {:.3}",
+        "Vocab size: {} (includes <mask>) | sampled pairs {} | seq_len {} | lambda {:.3}",
         vocab_size, pair_count, seq_len, config.lambda
     );
     if let Some(vocab_stats) = vocab_stats {
@@ -345,6 +344,18 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             util::format_params(latent_params)
         ))
     });
+    if let Some(parent) = model_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let vocab_path = PathBuf::from("local_models/vocabs/vocab_encoder.txt");
+    save_vocab_to_file(&vocab, &vocab_path)?;
+    println!("Encoder vocab saved before training to {:?}", vocab_path);
+    let matched_vocab_path = model_path.with_extension("vocab.txt");
+    save_vocab_to_file(&vocab, &matched_vocab_path)?;
+    println!(
+        "Matched encoder vocab saved before training to {:?}",
+        matched_vocab_path
+    );
     let resume_stage = util::resume_stage_name("latent");
     let train_checkpoint_path =
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "train.safetensors");
@@ -709,10 +720,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         );
     }
 
-    let vocab_path = PathBuf::from("local_models/vocabs/vocab_encoder.txt");
     save_vocab_to_file(&vocab, &vocab_path)?;
     println!("Encoder vocab saved to {:?}", vocab_path);
-    let matched_vocab_path = model_path.with_extension("vocab.txt");
     save_vocab_to_file(&vocab, &matched_vocab_path)?;
     println!("Matched encoder vocab saved to {:?}", matched_vocab_path);
     println!("\nTo run JEPA-native evaluation:");
