@@ -42,8 +42,8 @@ pub fn parse_dtype_name(value: &str) -> Option<DType> {
     }
 }
 
-pub fn resolve_runtime_dtype(device: &Device) -> DType {
-    let requested = std::env::var("TOFY_RUNTIME_DTYPE")
+pub fn requested_runtime_dtype() -> Option<DType> {
+    std::env::var("TOFY_RUNTIME_DTYPE")
         .ok()
         .and_then(|value| parse_dtype_name(&value))
         .or_else(|| {
@@ -51,7 +51,10 @@ pub fn resolve_runtime_dtype(device: &Device) -> DType {
                 .ok()
                 .and_then(|value| parse_dtype_name(&value))
         })
-        .unwrap_or(DType::F32);
+}
+
+pub fn resolve_runtime_dtype(device: &Device) -> DType {
+    let requested = requested_runtime_dtype().unwrap_or(DType::BF16);
     resolve_train_dtype(device, requested)
 }
 

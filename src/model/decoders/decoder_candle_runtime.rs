@@ -164,9 +164,17 @@ impl CandleCrossAttnDecoder {
         kind: DecoderKind,
     ) -> Result<Self> {
         let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-        let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
         let checkpoint_dtype =
-            crate::util::checkpoint_float_dtype(&checkpoint_path)?.unwrap_or(runtime_dtype);
+            crate::util::checkpoint_float_dtype(&checkpoint_path)?.unwrap_or(DType::F32);
+        let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
+        if runtime_dtype != checkpoint_dtype {
+            anyhow::bail!(
+                "decoder runtime dtype {:?} does not match checkpoint dtype {:?} for {:?}",
+                runtime_dtype,
+                checkpoint_dtype,
+                checkpoint_path
+            );
+        }
         let mut varmap = VarMap::new();
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
