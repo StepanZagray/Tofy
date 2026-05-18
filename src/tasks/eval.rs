@@ -7,6 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::model::decoders::{CandleCrossAttnDecoder, DecoderKind, LocalDecoderRuntime};
 use crate::tasks::orchestrator::Action;
 use crate::tasks::world::AgentEngine;
 use crate::util;
@@ -122,6 +123,15 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+pub fn try_run_decoder_only_eval(args: &[String]) -> Result<bool> {
+    if args.len() < 4 || (args[1] != "--eval-decoder-only" && args[1] != "eval-decoder-only") {
+        return Ok(false);
+    }
+    let cfg = DecoderOnlyEvalConfig::from_args_after(&args[2..])?;
+    run_decoder_only_eval(cfg)?;
+    Ok(true)
+}
+
 impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
@@ -230,6 +240,78 @@ impl EvalConfig {
     }
 }
 
+#[derive(Clone)]
+struct DecoderOnlyEvalConfig {
+    decoder_path: PathBuf,
+    decoder_vocab_path: PathBuf,
+    suite_path: PathBuf,
+    max_new_tokens: usize,
+    planner_dim: usize,
+    num_planner_slots: usize,
+    rustc_bin: String,
+    rust_timeout_secs: u64,
+    candidates: usize,
+}
+
+impl DecoderOnlyEvalConfig {
+    fn from_args_after(args: &[String]) -> Result<Self> {
+        if args.len() < 3 {
+            bail!(
+                "usage: --eval-decoder-only <decoder.safetensors> <decoder_vocab.txt> <suite.jsonl> [max_new_tokens] [planner_dim] [num_planner_slots] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>]"
+            );
+        }
+        let mut filtered = Vec::new();
+        let mut rustc_bin = "rustc".to_string();
+        let mut rust_timeout_secs = DEFAULT_RUST_TIMEOUT_SECS;
+        let mut candidates = 1usize;
+        let mut i = 0usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--rustc" => {
+                    rustc_bin = args
+                        .get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--rustc requires binary path"))?;
+                    i += 2;
+                }
+                "--rust-timeout-sec" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--rust-timeout-sec requires integer"))?;
+                    rust_timeout_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--rust-timeout-sec must be integer"))?;
+                    i += 2;
+                }
+                "--candidates" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--candidates requires integer"))?;
+                    candidates = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--candidates must be integer"))?;
+                    i += 2;
+                }
+                _ => {
+                    filtered.push(args[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        Ok(Self {
+            decoder_path: PathBuf::from(&filtered[0]),
+            decoder_vocab_path: PathBuf::from(&filtered[1]),
+            suite_path: PathBuf::from(&filtered[2]),
+            max_new_tokens: filtered.get(3).and_then(|v| v.parse().ok()).unwrap_or(384),
+            planner_dim: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(640),
+            num_planner_slots: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(64),
+            rustc_bin,
+            rust_timeout_secs: rust_timeout_secs.max(1),
+            candidates: candidates.max(1),
+        })
+    }
+}
+
 fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     if let Some(path) = cfg.code_decoder_path.as_ref() {
         std::env::set_var("JEPA_USE_CANDLE_DECODER", "1");
@@ -324,6 +406,122 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
             result.route_ok,
             result.rlm_used,
             result.docs_used,
+            result.constraints_ok,
+            result.compile_ok,
+            result.tests_ok,
+            result.pass,
+            if result.detail.is_empty() {
+                String::new()
+            } else {
+                format!("detail={}", result.detail)
+            }
+        );
+    }
+
+    let summary_text = format!(
+        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
+        summary.pass_ok as f32 / summary.task_count.max(1) as f32,
+        summary.route_ok as f32 / summary.task_count.max(1) as f32,
+        summary.rlm_used as f32 / summary.task_count.max(1) as f32,
+        summary.docs_used as f32 / summary.task_count.max(1) as f32,
+        summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
+        summary.compile_ok as f32 / summary.task_count.max(1) as f32,
+        summary.tests_ok as f32 / summary.task_count.max(1) as f32,
+        summary.task_count,
+    );
+    fs::write(run_path.join("summary.txt"), &summary_text)?;
+    println!("\n{}", summary_text);
+    Ok(())
+}
+
+fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
+    let tasks = load_suite(&cfg.suite_path)?;
+    if tasks.is_empty() {
+        bail!("suite {:?} contains no tasks", cfg.suite_path);
+    }
+
+    let decoder = CandleCrossAttnDecoder::new(
+        cfg.decoder_path.clone(),
+        cfg.decoder_vocab_path.clone(),
+        cfg.planner_dim,
+        cfg.planner_dim,
+        cfg.num_planner_slots,
+        std::env::var("JEPA_DECODER_TEMP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        DecoderKind::CodeSpecialist,
+    )?;
+    let conditioning = vec![0.0f32; cfg.planner_dim * cfg.num_planner_slots];
+    let run_dir = util::create_run_dir("decoder_only_eval")?;
+    let run_path = PathBuf::from(&run_dir);
+    let scratch_dir = run_path.join("scratch");
+    fs::create_dir_all(&scratch_dir)?;
+    let mut results_file = File::create(run_path.join("results.jsonl"))?;
+
+    println!("Decoder-only code eval suite");
+    println!("suite: {:?}", cfg.suite_path);
+    println!("tasks: {}", tasks.len());
+    println!("run dir: {}", run_dir);
+    println!("decoder: {}", cfg.decoder_path.display());
+    println!(
+        "conditioning: zero planner slots={} dim={}",
+        cfg.num_planner_slots, cfg.planner_dim
+    );
+    println!("search: candidates={}", cfg.candidates);
+
+    let mut summary = CodeEvalSummary {
+        task_count: tasks.len(),
+        ..CodeEvalSummary::default()
+    };
+    for task in tasks {
+        let started = Instant::now();
+        let mut best = None;
+        let max_new_tokens = task.max_new_tokens.min(cfg.max_new_tokens);
+        for _ in 0..cfg.candidates {
+            let response = decoder.generate(&task.prompt, "code", &conditioning, max_new_tokens)?;
+            let candidate = evaluate_candidate_response(
+                &scratch_dir,
+                &cfg.rustc_bin,
+                cfg.rust_timeout_secs,
+                &task,
+                true,
+                response,
+                0,
+            )?;
+            best = Some(select_better_candidate(best, candidate));
+        }
+        let best = best.context("decoder-only eval produced no candidates")?;
+        let pass = best.constraints_ok && best.compile_ok && best.tests_ok;
+        summary.route_ok += 1;
+        summary.rlm_used += 1;
+        summary.constraints_ok += usize::from(best.constraints_ok);
+        summary.compile_ok += usize::from(best.compile_ok);
+        summary.tests_ok += usize::from(best.tests_ok);
+        summary.pass_ok += usize::from(pass);
+        let result = CodeEvalTaskResult {
+            id: task.id,
+            predicted_action: "code".to_string(),
+            expected_action: task.expected_action,
+            rlm_used: true,
+            docs_used: false,
+            candidate_count: cfg.candidates,
+            repair_attempts_used: 0,
+            route_ok: true,
+            constraints_ok: best.constraints_ok,
+            compile_ok: best.compile_ok,
+            tests_ok: best.tests_ok,
+            pass,
+            duration_ms: started.elapsed().as_millis(),
+            response_preview: preview_text(&best.response, 240),
+            code_preview: preview_text(&best.code, 240),
+            detail: preview_text(&best.detail, 600),
+            tags: task.tags,
+        };
+        writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
+        println!(
+            "{} constraints={} compile={} tests={} pass={} {}",
+            result.id,
             result.constraints_ok,
             result.compile_ok,
             result.tests_ok,

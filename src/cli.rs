@@ -76,6 +76,9 @@ pub fn print_usage(program: &str) {
         "    {program} --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning]"
     );
     eprintln!(
+        "    {program} --eval-decoder-only <decoder.safetensors> <decoder_vocab.txt> <suite.jsonl> [max_new_tokens] [planner_dim] [num_planner_slots] [--candidates <int>]"
+    );
+    eprintln!(
         "    {program} --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--debug]"
     );
 }
