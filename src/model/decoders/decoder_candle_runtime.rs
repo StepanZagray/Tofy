@@ -165,6 +165,8 @@ impl CandleCrossAttnDecoder {
     ) -> Result<Self> {
         let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
         let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
+        let checkpoint_dtype =
+            crate::util::checkpoint_float_dtype(&checkpoint_path)?.unwrap_or(runtime_dtype);
         let mut varmap = VarMap::new();
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
@@ -197,13 +199,13 @@ impl CandleCrossAttnDecoder {
             1.0
         };
         let adapter = DecoderAdapter::new(
-            VarBuilder::from_varmap(&varmap, runtime_dtype, &device).pp("decoder_adapter"),
+            VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device).pp("decoder_adapter"),
             planner_dim,
             world_dim,
             DecoderAdapter::output_slots_for(kind, planner_slots),
         )?;
         let decoder = CodeDecoder::new(
-            VarBuilder::from_varmap(&varmap, runtime_dtype, &device).pp("decoder"),
+            VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device).pp("decoder"),
             vocab_size,
             architecture.dim,
             world_dim,

@@ -55,6 +55,21 @@ pub fn resolve_runtime_dtype(device: &Device) -> DType {
     resolve_train_dtype(device, requested)
 }
 
+pub fn checkpoint_float_dtype(path: &Path) -> Result<Option<DType>> {
+    use candle_core::safetensors::MmapedSafetensors;
+
+    let mapped = unsafe { MmapedSafetensors::new(path) }
+        .with_context(|| format!("read safetensors metadata from {:?}", path))?;
+    for (_, view) in mapped.tensors() {
+        let dtype = DType::try_from(view.dtype())
+            .with_context(|| format!("read tensor dtype from {:?}", path))?;
+        if dtype.is_float() {
+            return Ok(Some(dtype));
+        }
+    }
+    Ok(None)
+}
+
 pub fn scalar_f32(tensor: &Tensor) -> Result<f32> {
     tensor
         .to_dtype(DType::F32)?
