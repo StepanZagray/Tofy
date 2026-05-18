@@ -1111,11 +1111,11 @@ fn select_decoder_checkpoint(paths: &PipelinePaths, defaults: &ProfileDefaults) 
 }
 
 fn select_trained_decoder_checkpoint(paths: &PipelinePaths) -> PathBuf {
-    if paths.code_decoder_polish_model.exists() {
-        paths.code_decoder_polish_model.clone()
-    } else {
-        paths.code_decoder_base_model.clone()
-    }
+    println!(
+        "Code eval skipped; selecting base decoder by default: {}",
+        paths.code_decoder_base_model.display()
+    );
+    paths.code_decoder_base_model.clone()
 }
 
 fn final_eval(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<()> {

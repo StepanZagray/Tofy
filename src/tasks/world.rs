@@ -4397,9 +4397,19 @@ impl AgentEngine {
         let planner_vec = util::vec1_f32(&next_planner_slots.flatten_all()?)?;
         let pooled_planner = self.planner_memory.pool(next_planner_slots)?.squeeze(0)?;
         let pooled_planner = util::vec1_f32(&pooled_planner)?;
-        let code_decoder =
-            CandleCrossAttnDecoder::try_new_from_env_code(self.bridge_dim, self.num_latent_tokens)
-                .ok();
+        let explicit_code_decoder = std::env::var("JEPA_USE_CANDLE_DECODER")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let code_decoder = match CandleCrossAttnDecoder::try_new_from_env_code(
+            self.bridge_dim,
+            self.num_latent_tokens,
+        ) {
+            Ok(decoder) => Some(decoder),
+            Err(err) if explicit_code_decoder => {
+                anyhow::bail!("explicit Candle code decoder failed to load: {err:#}")
+            }
+            Err(_) => None,
+        };
         let text_decoder =
             CandleCrossAttnDecoder::try_new_from_env_text(self.bridge_dim, self.num_latent_tokens)
                 .ok();
