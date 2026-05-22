@@ -14,9 +14,9 @@ cargo run --release -- --sustained-oom-probe --stage all
 
 This runs the release binary with the current 8 GB proof-of-concept shapes:
 
-- latent: `12x2`, `seq_len=256`, `dim=640`, `layers=7`
-- world: warmup `64x1`, then `64x2`, `seq_len=256`, `bridge_dim=640`, `planner_slots=64`
-- code decoder: `6x4`, `max_seq=128`, `dim=640`
+- latent: `16x16`, `seq_len=256`, `dim=640`, `layers=7`
+- world: warmup `32x1`, then `32x8`, `seq_len=256`, `bridge_dim=640`, `context_slots=64`
+- code decoder: `8x16`, `max_seq=160`, `dim=640`, `ff_dim=3072`, `max_vocab=24000`
 
 The probe samples `nvidia-smi` externally every `0.1s`, writes per-stage logs and `*.vram_samples.jsonl`, and restores `local_models/` afterward.
 
@@ -79,20 +79,6 @@ historical stage growth factors from saved runs. It is still an empirical check
 rather than a formal guarantee: allocator behavior, driver version, background
 processes, and longer-run checkpoint cadence can still change the exact peak.
 
-## 80 GB Cloud Profile Probe
-
-Run the sustained probe manually before launching the long 80 GB pipeline:
-
-```bash
-cargo run --release -- --sustained-oom-probe --stage all --dim 2048 --layers 7 --heads 16 --bridge-dim 2048 --planner-slots 128 --decoder-max-vocab 32000
-```
-
-That profile uses `DIM=2048`, `BRIDGE_DIM=2048`, `LAYERS=7`, `HEADS=16`,
-`NUM_LATENT_TOKENS=128`, encoder/world context `256`, and code-decoder context
-`128`. The probe defaults to at least `4096 MB` free headroom and allows up to
-`2048 MB` late-run growth; override with `TOFY_80GB_MIN_HEADROOM_MB` and
-`TOFY_80GB_MAX_LATE_GROWTH_MB` if a specific cloud GPU needs different margins.
-
 ## 48 GB A40 Profile Probe
 
 Run the sustained probe manually before launching the long 48 GB pipeline:
@@ -102,21 +88,25 @@ cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 ```
 
 The probe loads the current `48gb` shape from `config/model_profiles.json`.
+That profile now uses encoder `256x2` (`512` effective), world `256x2`
+(`512` effective), decoder `128x2` (`256` effective), and Go feedback `256x1`
+(`256` effective), replacing the old recorded decoder `4x1` run that used only
+about 5.6 GB VRAM in the decoder stage.
 Prefer `--max-vram-probe --profile 48gb` for the first rental check, then run
 the sustained probe only after the short probe passes.
 
 ## High-Level World Stage
 
 HWM is part of the standard training pipeline. The profile defaults train the
-high-world stage after the low-level world model: `12000` steps for `8gb`,
-`36000` for `48gb`, and `120000` for `80gb`. It is not toggled on separately:
+high-world stage after the low-level world model: `12000` steps for `8gb` and
+`36000` for `48gb`. It is not toggled on separately:
 the model uses the high-world checkpoint automatically when the profile run
 creates it.
 
-The high-level world model reuses frozen encoder/planner memory and trains only
+The macro-action state transition reuses frozen encoder/context compressor and trains only
 the macro-action encoder plus high-level transition, so it should be smaller
 than decoder training but still depends on `WORLD_BATCH`, `WORLD_GRAD_ACCUM`,
-and the planner segment-batch settings.
+and the context segment-batch settings.
 
 ## Testing Candidate Batches
 

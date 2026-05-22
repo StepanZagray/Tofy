@@ -27,7 +27,7 @@ impl Action {
     }
 }
 
-/// Maps orchestrator head output index to Action.
+/// Maps action_classifier output index to Action.
 /// Indices: 0=TextReply, 1=Code, 2=Done, 3=FetchDocs.
 #[inline]
 pub fn action_from_index(idx: usize) -> Action {
@@ -201,7 +201,7 @@ pub fn guard_inference_action(prompt: &str, predicted: Action, logits: Option<&[
     predicted
 }
 
-/// Fallback when no trained orchestrator head is loaded.
+/// Fallback when no trained action_classifier is loaded.
 #[inline]
 pub fn decide_next_action(prompt: &str, assistant_so_far: &str) -> Action {
     if prompt.trim().is_empty() {

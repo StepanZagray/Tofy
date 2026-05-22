@@ -9,6 +9,8 @@
 ## Edits
 - Use repository-native tooling and normal editor operations for file changes.
 - Keep changes minimal and targeted; avoid unrelated refactors.
+- Do not preserve backward compatibility unless the user explicitly asks for it.
+- Write as little code as possible while still solving the problem clearly.
 
 ## Validation
 - After code edits, run lint/compile checks when possible.

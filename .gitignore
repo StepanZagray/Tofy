@@ -1,6 +1,7 @@
 # Rust
 /target/
-Cargo.lock
+*.rlib
+vendor/*/Cargo.lock
 
 # Locally trained models and vocabs (encoder, world, code/text decoders)
 local_models/

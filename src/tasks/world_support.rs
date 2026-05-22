@@ -8,11 +8,12 @@ use crate::data::{
     TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
 };
 use crate::model::{
-    flatten_latent_slots, mean_cosine_similarity, prediction_loss, tensor_rms, CodeDecoder,
-    DecoderAdapter, OnlineEncoder, PlannerMemory, Vocab, WorldTransition,
+    flatten_latent_slots, mean_cosine_similarity, prediction_loss, tensor_rms,
+    ActionStateTransition, CodeDecoder, ContextCompressor, DecoderConditioningAdapter,
+    OnlineEncoder, Vocab,
 };
 use crate::tasks::world::{
-    decoder_tokenization_mode, env_bool, env_usize, planner_slots_from_token_sequences,
+    context_slots_from_token_sequences, decoder_tokenization_mode, env_bool, env_usize,
     rollout_transition_slots,
 };
 use crate::util;
@@ -55,6 +56,10 @@ pub(crate) struct DecoderBatchMetrics {
     pub(crate) raw_loss: f32,
     pub(crate) ablated_loss: f32,
     pub(crate) conditioning_gain: f32,
+    pub(crate) zero_gain: f32,
+    pub(crate) shuffled_loss: f32,
+    pub(crate) shuffle_gain: f32,
+    pub(crate) hard_negative_gain: f32,
     pub(crate) syntax_loss: f32,
     pub(crate) signature_loss: f32,
     pub(crate) structure_loss: f32,
@@ -72,6 +77,29 @@ pub(crate) struct DecoderBatchMetrics {
     pub(crate) signature_exact_rate: f32,
     pub(crate) function_name_token_accuracy: f32,
     pub(crate) function_name_exact_rate: f32,
+}
+
+pub(crate) fn shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
+    shifted_conditioning_latent(world_latent, 1)
+}
+
+pub(crate) fn hard_mismatched_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
+    let (batch, _, _) = world_latent.dims3()?;
+    shifted_conditioning_latent(world_latent, (batch / 2).max(1))
+}
+
+fn shifted_conditioning_latent(world_latent: &Tensor, offset: usize) -> Result<Tensor> {
+    let (batch, _, _) = world_latent.dims3()?;
+    if batch <= 1 {
+        return world_latent.affine(0.0, 0.0).map_err(Into::into);
+    }
+    let offset = offset % batch;
+    if offset == 0 {
+        return Ok(world_latent.clone());
+    }
+    let tail = world_latent.narrow(0, offset, batch - offset)?;
+    let head = world_latent.narrow(0, 0, offset)?;
+    Tensor::cat(&[&tail, &head], 0).map_err(Into::into)
 }
 
 pub(crate) struct DecoderPredictionMetrics {
@@ -784,10 +812,10 @@ pub(crate) fn evaluate_world_encoded_batch(
     batch: &[WorldExample],
     encoder_vocab: &Vocab,
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
-    transition: &WorldTransition,
-    orchestrator_head: &crate::model::OrchestratorActionHead,
-    inverse_action_head: &crate::model::OrchestratorActionHead,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    action_classifier_head: &crate::model::NextActionClassifier,
+    inverse_action_head: &crate::model::NextActionClassifier,
     max_seq: usize,
     lambda: f64,
     action_loss_weight: f64,
@@ -798,17 +826,18 @@ pub(crate) fn evaluate_world_encoded_batch(
     let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
-    let (state_slots, next_slots) = crate::tasks::world::planner_slots_from_world_pair_sequences(
+    let (state_slots, next_slots) = crate::tasks::world::context_slots_from_world_pair_sequences(
         encoder,
-        planner_memory,
+        context_compressor,
         batch,
         encoder_vocab.pad_id,
         max_seq,
         context_segments,
         recent_full_segments,
-        recursive_planner_memory,
+        recursive_context_compressor,
         device,
     )?;
     let pred_slots = transition.forward(&state_slots, &action_labels)?;
@@ -832,7 +861,7 @@ pub(crate) fn evaluate_world_encoded_batch(
         .broadcast_add(&next_sigreg)?
         .broadcast_add(&pred_sigreg)?
         .affine(1.0 / 3.0, 0.0)?;
-    let action_logits = orchestrator_head.forward(&state_slots)?;
+    let action_logits = action_classifier_head.forward(&state_slots)?;
     let action_loss = action_cross_entropy(&action_logits, &action_labels, device)?;
     let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
     let pred_delta_slots = slot_delta_slots(&pred_slots, &state_slots)?;
@@ -865,9 +894,9 @@ pub(crate) fn evaluate_decoder_batch(
     encoder_vocab: &Vocab,
     decoder_vocab: &Vocab,
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
-    transition: &WorldTransition,
-    decoder_adapter: &DecoderAdapter,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    decoder_conditioning_adapter: &DecoderConditioningAdapter,
     decoder: &CodeDecoder,
     decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
@@ -892,9 +921,9 @@ pub(crate) fn evaluate_decoder_batch(
         encoder_vocab,
         decoder_vocab,
         encoder,
-        planner_memory,
+        context_compressor,
         transition,
-        decoder_adapter,
+        decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
         max_seq,
@@ -908,9 +937,9 @@ pub(crate) fn evaluate_decoder_cached_batch(
     encoder_vocab: &Vocab,
     decoder_vocab: &Vocab,
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
-    transition: &WorldTransition,
-    decoder_adapter: &DecoderAdapter,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    decoder_conditioning_adapter: &DecoderConditioningAdapter,
     decoder: &CodeDecoder,
     _decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
@@ -933,9 +962,9 @@ pub(crate) fn evaluate_decoder_cached_batch(
         encoder_vocab,
         decoder_vocab,
         encoder,
-        planner_memory,
+        context_compressor,
         transition,
-        decoder_adapter,
+        decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
         max_seq,
@@ -951,9 +980,9 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     encoder_vocab: &Vocab,
     decoder_vocab: &Vocab,
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
-    transition: &WorldTransition,
-    decoder_adapter: &DecoderAdapter,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    decoder_conditioning_adapter: &DecoderConditioningAdapter,
     decoder: &CodeDecoder,
     decoder_action_label: u32,
     max_seq: usize,
@@ -961,7 +990,8 @@ pub(crate) fn evaluate_decoder_encoded_batch(
 ) -> Result<DecoderBatchMetrics> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
     let conditioning_loss_weight = std::env::var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT")
         .ok()
@@ -974,19 +1004,19 @@ pub(crate) fn evaluate_decoder_encoded_batch(
         .iter()
         .map(|row| row.state_tokens.as_slice())
         .collect::<Vec<_>>();
-    let state_slots = planner_slots_from_token_sequences(
+    let state_slots = context_slots_from_token_sequences(
         encoder,
-        planner_memory,
+        context_compressor,
         &state_tokens,
         encoder_vocab.pad_id,
         max_seq,
         context_segments,
         recent_full_segments,
-        recursive_planner_memory,
+        recursive_context_compressor,
         device,
     )?;
     let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
-    let next_planner_slots = if rollout_steps <= 1 {
+    let next_context_slots = if rollout_steps <= 1 {
         transition.forward(&state_slots, &decoder_action_labels)?
     } else {
         rollout_transition_slots(
@@ -996,7 +1026,8 @@ pub(crate) fn evaluate_decoder_encoded_batch(
             rollout_steps,
         )?
     };
-    let world_latent = decoder_adapter.forward(&next_planner_slots.detach())?;
+    let world_latent = decoder_conditioning_adapter
+        .forward_with_action(&next_context_slots.detach(), decoder_action_label)?;
     let zero_world_latent = world_latent.affine(0.0, 0.0)?;
     let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
         make_world_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
@@ -1028,6 +1059,23 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     } else {
         loss_val
     };
+    let shuffled_loss_val = if compute_conditioning_metrics {
+        let shuffled_world_latent = shuffled_conditioning_latent(&world_latent)?;
+        let shuffled_logits = decoder.forward(&dec_input, &shuffled_world_latent)?;
+        let shuffled_loss = masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
+        util::scalar_f32(&shuffled_loss)?
+    } else {
+        loss_val
+    };
+    let hard_mismatch_loss_val = if compute_conditioning_metrics {
+        let hard_mismatch_world_latent = hard_mismatched_conditioning_latent(&world_latent)?;
+        let hard_mismatch_logits = decoder.forward(&dec_input, &hard_mismatch_world_latent)?;
+        let hard_mismatch_loss =
+            masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
+        util::scalar_f32(&hard_mismatch_loss)?
+    } else {
+        loss_val
+    };
     let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
     let signature_loss_val = util::scalar_f32(&signature_loss)?;
     let structure_loss_val = util::scalar_f32(&structure_loss)?;
@@ -1040,6 +1088,13 @@ pub(crate) fn evaluate_decoder_encoded_batch(
         raw_loss: raw_loss_val,
         ablated_loss: ablated_loss_val,
         conditioning_gain: ablated_loss_val - loss_val,
+        zero_gain: ablated_loss_val - loss_val,
+        shuffled_loss: shuffled_loss_val,
+        shuffle_gain: shuffled_loss_val - loss_val,
+        hard_negative_gain: ablated_loss_val
+            .min(shuffled_loss_val)
+            .min(hard_mismatch_loss_val)
+            - loss_val,
         syntax_loss: syntax_loss_val,
         signature_loss: signature_loss_val,
         structure_loss: structure_loss_val,
@@ -1097,6 +1152,8 @@ pub(crate) fn decoder_selection_score(
 ) -> f32 {
     metrics.loss
         + 0.20 * (0.05 - metrics.conditioning_gain).max(0.0)
+        + 0.25 * (0.05 - metrics.shuffle_gain).max(0.0)
+        + 0.25 * (0.05 - metrics.hard_negative_gain).max(0.0)
         + (syntax_loss_weight as f32 * 0.5 * metrics.syntax_loss)
         + (signature_loss_weight as f32 * 0.5 * metrics.signature_loss)
         + (structure_loss_weight as f32 * 0.7 * metrics.structure_loss)
@@ -1108,4 +1165,6 @@ pub(crate) fn decoder_selection_score(
         - 0.08 * metrics.signature_exact_rate
         - 0.12 * metrics.function_name_exact_rate
         - 0.04 * metrics.conditioning_gain.max(0.0)
+        - 0.04 * metrics.shuffle_gain.max(0.0)
+        - 0.04 * metrics.hard_negative_gain.max(0.0)
 }

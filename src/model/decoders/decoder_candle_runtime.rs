@@ -9,14 +9,16 @@ use rand::RngExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{CodeDecoder, DecoderAdapter, DecoderArchitecture, DecoderKind, LocalDecoderRuntime};
+use super::{
+    CodeDecoder, DecoderArchitecture, DecoderConditioningAdapter, DecoderKind, LocalDecoderRuntime,
+};
 use crate::data::{encode_text_with_vocab_mode, TokenizationMode};
 use crate::model::vocab::{load_vocab_from_file, vocab_signature, Vocab};
 
 /// Decoder backend that runs the Candle CodeDecoder with cross-attention to the world latent sequence.
 /// Expects conditioning to be the **flattened** latent sequence (length = num_latent_tokens * world_dim).
 pub struct CandleCrossAttnDecoder {
-    adapter: DecoderAdapter,
+    adapter: DecoderConditioningAdapter,
     decoder: CodeDecoder,
     vocab: Vocab,
     device: Device,
@@ -41,16 +43,16 @@ impl CandleCrossAttnDecoder {
         vocab: &Vocab,
         kind: DecoderKind,
         planner_dim: usize,
-        planner_slots: usize,
+        context_slots: usize,
         architecture: DecoderArchitecture,
     ) -> Result<()> {
         let metadata = format!(
-            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\nplanner_slots={}\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v1\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
             kind.as_str(),
             vocab_signature(vocab),
             vocab.id_to_token.len(),
             planner_dim,
-            planner_slots,
+            context_slots,
             architecture.dim,
             architecture.num_layers,
             architecture.num_heads,
@@ -65,7 +67,7 @@ impl CandleCrossAttnDecoder {
         vocab: &Vocab,
         kind: DecoderKind,
         planner_dim: usize,
-        planner_slots: usize,
+        context_slots: usize,
     ) -> Result<DecoderArchitecture> {
         let metadata_path = Self::metadata_path(checkpoint_path);
         if !metadata_path.exists() {
@@ -113,13 +115,13 @@ impl CandleCrossAttnDecoder {
                 );
             }
         }
-        if let Some(saved_slots) = parsed.get("planner_slots") {
-            if saved_slots.parse::<usize>().ok() != Some(planner_slots) {
+        if let Some(saved_slots) = parsed.get("context_slots") {
+            if saved_slots.parse::<usize>().ok() != Some(context_slots) {
                 anyhow::bail!(
-                    "decoder planner_slots mismatch for {:?}: metadata says {}, runtime requested {}",
+                    "decoder context_slots mismatch for {:?}: metadata says {}, runtime requested {}",
                     checkpoint_path,
                     saved_slots,
-                    planner_slots
+                    context_slots
                 );
             }
         }
@@ -159,7 +161,7 @@ impl CandleCrossAttnDecoder {
         vocab_path: PathBuf,
         planner_dim: usize,
         world_dim: usize,
-        planner_slots: usize,
+        context_slots: usize,
         temperature: f32,
         kind: DecoderKind,
     ) -> Result<Self> {
@@ -183,7 +185,7 @@ impl CandleCrossAttnDecoder {
             &vocab,
             kind,
             planner_dim,
-            planner_slots,
+            context_slots,
         )?;
         let vocab_size = vocab.id_to_token.len();
         let default_repeat_penalty = if kind == DecoderKind::CodeSpecialist {
@@ -206,11 +208,12 @@ impl CandleCrossAttnDecoder {
         } else {
             1.0
         };
-        let adapter = DecoderAdapter::new(
-            VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device).pp("decoder_adapter"),
+        let adapter = DecoderConditioningAdapter::new(
+            VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device)
+                .pp("decoder_conditioning_adapter"),
             planner_dim,
             world_dim,
-            DecoderAdapter::output_slots_for(kind, planner_slots),
+            DecoderConditioningAdapter::output_slots_for(kind, context_slots),
         )?;
         let decoder = CodeDecoder::new(
             VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device).pp("decoder"),
@@ -263,7 +266,7 @@ impl CandleCrossAttnDecoder {
     }
 
     /// Code decoder: JEPA_USE_CANDLE_DECODER=1 and JEPA_CANDLE_DECODER=<path>. Optional JEPA_DECODER_TEMP.
-    pub fn try_new_from_env_code(planner_dim: usize, planner_slots: usize) -> Result<Self> {
+    pub fn try_new_from_env_code(planner_dim: usize, context_slots: usize) -> Result<Self> {
         let use_candle = std::env::var("JEPA_USE_CANDLE_DECODER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -284,7 +287,7 @@ impl CandleCrossAttnDecoder {
                     vocab_path,
                     planner_dim,
                     planner_dim,
-                    planner_slots,
+                    context_slots,
                     temp,
                     DecoderKind::CodeSpecialist,
                 )
@@ -297,7 +300,7 @@ impl CandleCrossAttnDecoder {
 
     /// Text decoder: JEPA_USE_TEXT_DECODER=1 and JEPA_TEXT_DECODER=<path>. Optional JEPA_TEXT_DECODER_TEMP (default 0.7).
     /// Same architecture as code decoder; trained on dialog data (e.g. ultrachat_pairs) for general text reply.
-    pub fn try_new_from_env_text(planner_dim: usize, planner_slots: usize) -> Result<Self> {
+    pub fn try_new_from_env_text(planner_dim: usize, context_slots: usize) -> Result<Self> {
         let use_text = std::env::var("JEPA_USE_TEXT_DECODER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -318,7 +321,7 @@ impl CandleCrossAttnDecoder {
                     vocab_path,
                     planner_dim,
                     planner_dim,
-                    planner_slots,
+                    context_slots,
                     temp,
                     DecoderKind::TextGeneralist,
                 )
@@ -481,25 +484,28 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
     fn generate(
         &self,
         prompt: &str,
-        _action: &str,
+        action: &str,
         conditioning: &[f32],
         max_new_tokens: usize,
     ) -> Result<String> {
-        let num_planner_slots = conditioning.len() / self.planner_dim;
-        if num_planner_slots == 0 || conditioning.len() != num_planner_slots * self.planner_dim {
+        let num_context_slots = conditioning.len() / self.planner_dim;
+        if num_context_slots == 0 || conditioning.len() != num_context_slots * self.planner_dim {
             anyhow::bail!(
-                "conditioning length {} must equal num_planner_slots * planner_dim ({})",
+                "conditioning length {} must equal num_context_slots * planner_dim ({})",
                 conditioning.len(),
                 self.planner_dim
             );
         }
         let dtype_ref = Tensor::zeros((1,), self.runtime_dtype, &self.device)?;
-        let planner_slots = crate::util::from_vec_like(
+        let context_slots = crate::util::from_vec_like(
             conditioning.to_vec(),
-            (1, num_planner_slots, self.planner_dim),
+            (1, num_context_slots, self.planner_dim),
             &dtype_ref,
         )?;
-        let world_latent = self.adapter.forward(&planner_slots)?;
+        let context_slots = apply_conditioning_budget(context_slots)?;
+        let world_latent = self
+            .adapter
+            .forward_with_action(&context_slots, decoder_action_id(action))?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
         if let Some(limit) = self.max_prompt_tokens {
@@ -531,26 +537,29 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
     fn generate_stream(
         &self,
         prompt: &str,
-        _action: &str,
+        action: &str,
         conditioning: &[f32],
         max_new_tokens: usize,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
-        let num_planner_slots = conditioning.len() / self.planner_dim;
-        if num_planner_slots == 0 || conditioning.len() != num_planner_slots * self.planner_dim {
+        let num_context_slots = conditioning.len() / self.planner_dim;
+        if num_context_slots == 0 || conditioning.len() != num_context_slots * self.planner_dim {
             anyhow::bail!(
-                "conditioning length {} must equal num_planner_slots * planner_dim ({})",
+                "conditioning length {} must equal num_context_slots * planner_dim ({})",
                 conditioning.len(),
                 self.planner_dim
             );
         }
         let dtype_ref = Tensor::zeros((1,), self.runtime_dtype, &self.device)?;
-        let planner_slots = crate::util::from_vec_like(
+        let context_slots = crate::util::from_vec_like(
             conditioning.to_vec(),
-            (1, num_planner_slots, self.planner_dim),
+            (1, num_context_slots, self.planner_dim),
             &dtype_ref,
         )?;
-        let world_latent = self.adapter.forward(&planner_slots)?;
+        let context_slots = apply_conditioning_budget(context_slots)?;
+        let world_latent = self
+            .adapter
+            .forward_with_action(&context_slots, decoder_action_id(action))?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
         if let Some(limit) = self.max_prompt_tokens {
@@ -581,6 +590,35 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         }
         Ok(())
     }
+}
+
+fn decoder_action_id(action: &str) -> u32 {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "code" => 1,
+        "done" => 2,
+        "fetch_docs" | "fetch-docs" | "docs" => 3,
+        _ => 0,
+    }
+}
+
+fn apply_conditioning_budget(context_slots: Tensor) -> Result<Tensor> {
+    let budget = std::env::var("TOFY_DECODER_CONDITION_BUDGET")
+        .or_else(|_| std::env::var("JEPA_DECODER_CONDITION_BUDGET"))
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let Some(budget) = budget else {
+        return Ok(context_slots);
+    };
+    let (_, slots, _) = context_slots.dims3()?;
+    if budget == 0 {
+        return context_slots.affine(0.0, 0.0).map_err(Into::into);
+    }
+    if budget >= slots {
+        return Ok(context_slots);
+    }
+    context_slots
+        .narrow(1, slots - budget, budget)
+        .map_err(Into::into)
 }
 
 /// Strip prompt echo and UI junk from Candle decoder output (e.g. "assistant", "/", ">", repeated prompt).

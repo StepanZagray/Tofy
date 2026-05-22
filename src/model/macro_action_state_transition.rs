@@ -2,11 +2,11 @@ use anyhow::Result;
 use candle_core::Tensor;
 use candle_nn::{self as nn, Module, VarBuilder};
 
+use super::action_classifier_head::NUM_ACTIONS;
 use super::attention::TransformerBlock;
-use super::orchestrator_head::NUM_ACTIONS;
 
 /// Encodes a variable-length sequence of primitive actions into one macro-action vector.
-pub struct MacroActionEncoder {
+pub struct ActionSequenceEncoder {
     action_embed: nn::Embedding,
     len_embed: nn::Embedding,
     ln: nn::LayerNorm,
@@ -15,7 +15,7 @@ pub struct MacroActionEncoder {
     max_len: usize,
 }
 
-impl MacroActionEncoder {
+impl ActionSequenceEncoder {
     pub fn new(vb: VarBuilder<'_>, dim: usize, max_len: usize) -> Result<Self> {
         let max_len = max_len.max(1);
         let action_embed = nn::embedding(NUM_ACTIONS, dim, vb.pp("action_embed"))?;
@@ -96,14 +96,14 @@ impl MacroActionEncoder {
 }
 
 /// Long-horizon latent transition conditioned on a learned macro-action vector.
-pub struct HighLevelWorldTransition {
+pub struct MacroActionStateTransition {
     macro_proj: nn::Linear,
     blocks: Vec<TransformerBlock>,
     delta_ln: nn::LayerNorm,
     dim: usize,
 }
 
-impl HighLevelWorldTransition {
+impl MacroActionStateTransition {
     pub fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
         let macro_proj = nn::linear(dim, dim, vb.pp("macro_proj"))?;
         let num_blocks = 3;

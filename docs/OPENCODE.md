@@ -1,6 +1,6 @@
 # Running Tofy in OpenCode
 
-Use [OpenCode](https://opencode.ai) with your local Tofy server so the coding agent runs the current planner-memory pipeline.
+Use [OpenCode](https://opencode.ai) with your local Tofy server so the coding agent runs the current context-compressor pipeline.
 
 ## Prerequisites
 
@@ -85,9 +85,9 @@ Restart OpenCode so it picks up the new provider. In the UI, use the model switc
 
 Chat or run agent tasks as usual. Requests go to your local Tofy server, which runs:
 
-`encoder -> planner memory -> router/orchestrator -> decoder adapter -> decoder`
+`encoder -> context compressor -> router/action classifier -> decoder conditioning adapter -> decoder`
 
-**How to test:** Open a new chat in OpenCode, select the **Tofy** model (e.g. `tofy/tofy`), and send a message. The first reply may be slow (encoder + planner/world + decoder). For code: ask for a snippet or “write a function …”; for chat: ask a normal question. Check the Tofy server terminal for logs and any errors. To confirm the API: `curl http://localhost:8080/health` and `curl http://localhost:8080/v1/models`.
+**How to test:** Open a new chat in OpenCode, select the **Tofy** model (e.g. `tofy/tofy`), and send a message. The first reply may be slow (encoder + context/state + decoder). For code: ask for a snippet or “write a function …”; for chat: ask a normal question. Check the Tofy server terminal for logs and any errors. To confirm the API: `curl http://localhost:8080/health` and `curl http://localhost:8080/v1/models`.
 
 **Token stream / generation animation:** The Tofy server supports **streaming** (`stream: true`). When OpenCode sends that, the server returns Server-Sent Events (SSE) so tokens appear as they’re generated and you get the usual typing animation. If you previously saw no animation and no response, ensure your OpenCode client sends `stream: true` (many do by default); the server now responds with SSE in that case.
 
@@ -102,8 +102,8 @@ Chat or run agent tasks as usual. Requests go to your local Tofy server, which r
 - **Wrong base URL**: Use `http://localhost:8080/v1` (with `/v1`). Do not use a trailing slash after `v1`.
 - **Model not listed**: Confirm `GET /v1/models` returns `tofy`; then check that the `models` key in `opencode.json` matches (e.g. `"tofy": { "name": "..." }`).
 - **Paths differ**: OpenCode may use different config paths on your OS; see [OpenCode docs](https://opencode.ai/docs/) for the correct locations of `auth.json` and `opencode.json`.
-- **No response / no generation animation**: (1) The server supports **streaming** (`stream: true`); if your client sends that, you should get SSE and a token-by-token animation. (2) The first reply can be slow (encoder + planner/world + decoder); wait for the decoder to finish. (3) Check the server terminal for errors.
-- **Empty response in OpenCode**: (1) Ensure **both** decoders are set (`JEPA_USE_CANDLE_DECODER` + `JEPA_CANDLE_DECODER` and `JEPA_USE_TEXT_DECODER` + `JEPA_TEXT_DECODER`) so the server can do text reply. (2) If the orchestrator predicts `done`, the server can legitimately return no content. (3) Run with `--debug` or `JEPA_DEBUG=1` and watch the server terminal for errors or decoder output.
+- **No response / no generation animation**: (1) The server supports **streaming** (`stream: true`); if your client sends that, you should get SSE and a token-by-token animation. (2) The first reply can be slow (encoder + context/state + decoder); wait for the decoder to finish. (3) Check the server terminal for errors.
+- **Empty response in OpenCode**: (1) Ensure **both** decoders are set (`JEPA_USE_CANDLE_DECODER` + `JEPA_CANDLE_DECODER` and `JEPA_USE_TEXT_DECODER` + `JEPA_TEXT_DECODER`) so the server can do text reply. (2) If the action classifier predicts `done`, the server can legitimately return no content. (3) Run with `--debug` or `JEPA_DEBUG=1` and watch the server terminal for errors or decoder output.
 - **GPU not utilized**: The **decoder** (llama-completion / llama-cli) uses the GPU via `-ngl`. Set `JEPA_DECODER_NGL=99` (default) so all layers run on GPU. Ensure `JEPA_DECODER_MODEL` points to your GGUF and the decoder binary is built with GPU support.
 - **`--no-conversation is not supported` / broken output**: The default decoder binary is **llama-completion** (non-interactive). If you see this error or banner/prompt echo in the response, set `JEPA_DECODER_BIN=llama-completion` and restart the server. If your llama.cpp build only provides `llama-cli`, use a build that includes `llama-completion` or see [DECODER_RUNTIME.md](DECODER_RUNTIME.md).
 
@@ -114,10 +114,10 @@ Chat or run agent tasks as usual. Requests go to your local Tofy server, which r
 When the server runs for OpenCode, generation uses two decoders:
 
 - **Code path** → **codeDecoder**  
-  The server turns planner-memory slots into code-decoder conditioning via the code decoder adapter. Train this decoder on **code** data (`code_prefix\tcompletion` pairs). Set `JEPA_USE_CANDLE_DECODER=1` and `JEPA_CANDLE_DECODER=<path>`. The decoder loads its own sibling vocab file or `JEPA_CANDLE_DECODER_VOCAB`.
+  The server turns context-compressor slots into code-decoder conditioning via the code decoder conditioning adapter. Train this decoder on **code** data (`code_prefix\tcompletion` pairs). Set `JEPA_USE_CANDLE_DECODER=1` and `JEPA_CANDLE_DECODER=<path>`. The decoder loads its own sibling vocab file or `JEPA_CANDLE_DECODER_VOCAB`.
 
 - **Text path** → **textDecoder**  
-  The server turns planner-memory slots into text-decoder conditioning via the text decoder adapter. The **textDecoder** generates chat replies. It shares the same decoder family as the code decoder, but is trained on **text** data. Set `JEPA_USE_TEXT_DECODER=1` and `JEPA_TEXT_DECODER=<path>`. The decoder loads its own sibling vocab file or `JEPA_TEXT_DECODER_VOCAB`.
+  The server turns context-compressor slots into text-decoder conditioning via the text decoder conditioning adapter. The **textDecoder** generates chat replies. It shares the same decoder family as the code decoder, but is trained on **text** data. Set `JEPA_USE_TEXT_DECODER=1` and `JEPA_TEXT_DECODER=<path>`. The decoder loads its own sibling vocab file or `JEPA_TEXT_DECODER_VOCAB`.
 
 **Action selection:** The server chooses Code vs Text from the **prompt**: if the prompt looks like code (e.g. contains `fn `, `impl `, `def `, `struct `, `->`, `::`), it uses the code path and codeDecoder; otherwise it uses the text path and textDecoder. You can run with one or both decoders; if a decoder is not set, the server falls back to llama.cpp or the stub for that action.
 
@@ -135,7 +135,7 @@ The decoder architecture is saved in each checkpoint's sibling `*.meta.txt` file
 
 ## Using the Candle decoders
 
-You can use the in-repo decoders instead of llama.cpp. Both use cross-attention, but each has its own decoder adapter and decoder kind.
+You can use the in-repo decoders instead of llama.cpp. Both use cross-attention, but each has its own decoder conditioning adapter and decoder kind.
 
 ### 1. Train the world model (if not already)
 
@@ -143,11 +143,11 @@ You can use the in-repo decoders instead of llama.cpp. Both use cross-attention,
 cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/ultrachat_pairs.txt 40000 32 768 256 9 8 256 64 --lambda 0.2
 ```
 
-Replace encoder path with yours (see [RUNBOOK.md](RUNBOOK.md)). The world checkpoint includes planner memory, world transition, and the orchestrator head, but not the encoder or its vocab.
+Replace encoder path with yours (see [RUNBOOK.md](RUNBOOK.md)). The world checkpoint includes context compressor, action-state transition, and the action classifier, but not the encoder or its vocab.
 
 ### 2. Train the decoder(s)
 
-Same data format: one line per example, `context\treply`. The decoder is trained to predict the reply given the context and planner-derived conditioning from the frozen world model.
+Same data format: one line per example, `context\treply`. The decoder is trained to predict the reply given the context and context-derived conditioning from the frozen world model.
 
 - **textDecoder** (chat): train on **ultrachat_pairs** (or similar dialog data); saved under `local_models/`:
   ```bash
@@ -159,7 +159,7 @@ Same data format: one line per example, `context\treply`. The decoder is trained
   cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 16 128 --decoder-kind code --decoder-output local_models/code_decoder_90M.safetensors
   ```
 
-Optional: `[steps] [batch] [max_seq] [dim] [num_layers] [num_heads] [planner_dim] [num_planner_slots]`, `--lr <float>`, `--init-decoder <path>`, `--decoder-output <path>`, `--decoder-vocab <path>`.
+Optional: `[steps] [batch] [max_seq] [dim] [num_layers] [num_heads] [planner_dim] [num_context_slots]`, `--lr <float>`, `--init-decoder <path>`, `--decoder-output <path>`, `--decoder-vocab <path>`.
 
 ### 3. Serve with code and/or text decoders
 

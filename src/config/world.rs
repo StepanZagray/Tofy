@@ -471,6 +471,8 @@ pub struct DecoderTrainConfig {
     pub syntax_loss_weight: f64,
     pub signature_loss_weight: f64,
     pub structure_loss_weight: f64,
+    pub conditioning_loss_weight: f64,
+    pub conditioning_margin: f64,
     pub init_decoder_path: Option<PathBuf>,
     pub decoder_kind: DecoderKind,
     pub decoder_vocab_path: Option<PathBuf>,
@@ -486,7 +488,7 @@ impl DecoderTrainConfig {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
+                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
             );
         }
         let mut init_decoder_path = None;
@@ -503,6 +505,8 @@ impl DecoderTrainConfig {
         let mut decoder_layers = None;
         let mut decoder_heads = None;
         let mut decoder_ff_dim = None;
+        let mut conditioning_loss_weight = None;
+        let mut conditioning_margin = None;
         let mut filtered = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -623,6 +627,29 @@ impl DecoderTrainConfig {
                 i += 2;
                 continue;
             }
+            if args[i] == "--conditioning-loss-weight" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--conditioning-loss-weight requires float"))?;
+                conditioning_loss_weight =
+                    Some(value.parse().map_err(|_| {
+                        anyhow::anyhow!("--conditioning-loss-weight must be float")
+                    })?);
+                i += 2;
+                continue;
+            }
+            if args[i] == "--conditioning-margin" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--conditioning-margin requires float"))?;
+                conditioning_margin = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--conditioning-margin must be float"))?,
+                );
+                i += 2;
+                continue;
+            }
             if args[i] == "--resume" {
                 resume = true;
                 i += 1;
@@ -677,6 +704,22 @@ impl DecoderTrainConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.9f64)
+                .max(0.0),
+            conditioning_loss_weight: conditioning_loss_weight
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0.30f64)
+                .max(0.0),
+            conditioning_margin: conditioning_margin
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_CONDITIONING_MARGIN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0.10f64)
                 .max(0.0),
             init_decoder_path,
             decoder_vocab_path,

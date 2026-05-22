@@ -3,7 +3,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,16 +26,18 @@ use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::vocab_signature;
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
-    save_vocab_to_file, sigreg_epps_pulley, tensor_rms, CandleCrossAttnDecoder, CodeDecoder,
-    DecoderAdapter, DecoderArchitecture, DecoderKind, HighLevelWorldTransition, LlamaCppDecoder,
-    LocalDecoderRuntime, MacroActionEncoder, OnlineEncoder, OrchestratorActionHead, PlannerMemory,
-    StubLocalDecoder, Vocab, WorldTransition,
+    save_vocab_to_file, sigreg_epps_pulley, tensor_rms, ActionSequenceEncoder,
+    ActionStateTransition, CandleCrossAttnDecoder, CodeDecoder, ContextCompressor,
+    DecoderArchitecture, DecoderConditioningAdapter, DecoderKind, LlamaCppDecoder,
+    LocalDecoderRuntime, MacroActionStateTransition, NextActionClassifier, OnlineEncoder,
+    RlmDecoderRuntime, StubLocalDecoder, Vocab,
 };
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_prediction_metrics,
     decoder_selection_score, encoded_examples_oov_rate, evaluate_decoder_batch,
-    evaluate_decoder_cached_batch, evaluate_world_encoded_batch, importance_weight_mask,
-    masked_cross_entropy, masked_weighted_cross_entropy, raw_examples_oov_rate,
+    evaluate_decoder_cached_batch, evaluate_world_encoded_batch,
+    hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
+    masked_weighted_cross_entropy, raw_examples_oov_rate, shuffled_conditioning_latent,
     signature_weight_mask, slot_delta_slots, structure_weight_mask, syntax_weight_mask,
     world_selection_score, DecoderBatchMetrics, WorldBatchMetrics,
 };
@@ -330,34 +332,39 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let planner_memory = PlannerMemory::new(
-        world_vb.pp("planner_memory"),
+    let context_compressor = ContextCompressor::new(
+        world_vb.pp("context_compressor"),
         config.dim,
         config.bridge_dim,
         config.num_latent_tokens,
     )?;
-    let transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
-    let orchestrator_head =
-        OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
-    let inverse_action_head =
-        OrchestratorActionHead::new(world_vb.pp("inverse_action_head"), config.bridge_dim)?;
+    let transition =
+        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+    let action_classifier_head =
+        NextActionClassifier::new(world_vb.pp("next_action_classifier"), config.bridge_dim)?;
+    let inverse_action_classifier =
+        NextActionClassifier::new(world_vb.pp("inverse_action_classifier"), config.bridge_dim)?;
 
     let transition_params = 3
         * (config.bridge_dim * config.bridge_dim * 4
             + config.bridge_dim * config.bridge_dim * 2
             + 4 * config.bridge_dim);
+    let learned_memory_params =
+        2 * config.dim + 2 * (config.dim + 1) + 2 * (config.dim * config.dim + config.dim);
     let planner_params = config.num_latent_tokens * config.dim
         + 2 * (config.dim * config.dim + config.dim * 4 * config.dim)
         + config.dim * config.bridge_dim
-        + config.bridge_dim;
-    let orchestrator_hidden = (config.bridge_dim * 2).max(256);
-    const ORCH_N: usize = crate::model::orchestrator_head::NUM_ACTIONS;
-    let orchestrator_params = config.bridge_dim * orchestrator_hidden
-        + orchestrator_hidden
-        + orchestrator_hidden * ORCH_N
+        + config.bridge_dim
+        + learned_memory_params;
+    let action_classifier_hidden = (config.bridge_dim * 2).max(256);
+    const ORCH_N: usize = crate::model::action_classifier_head::NUM_ACTIONS;
+    let action_classifier_params = config.bridge_dim * action_classifier_hidden
+        + action_classifier_hidden
+        + action_classifier_hidden * ORCH_N
         + ORCH_N;
-    let inverse_params = orchestrator_params;
-    let total_params = transition_params + planner_params + orchestrator_params + inverse_params;
+    let inverse_params = action_classifier_params;
+    let total_params =
+        transition_params + planner_params + action_classifier_params + inverse_params;
     let _ = fs::create_dir_all("local_models");
     let model_path = config.output_path.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
@@ -448,7 +455,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     );
     println!("Encoder vocab: {:?}", config.encoder_vocab_path);
     println!(
-        "Rows: train {} | val {} | encoder vocab {} | max_seq {} | planner_slots {} | lambda {:.3}",
+        "Rows: train {} | val {} | encoder vocab {} | max_seq {} | context_slots {} | lambda {:.3}",
         train_row_count,
         val_row_count,
         vocab_size,
@@ -465,11 +472,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         DEFAULT_STREAM_SHUFFLE_BUFFER
     );
     println!(
-        "Estimated parameters: ~{} [planner_memory {} + transition {} + orchestrator {} + inverse {}]",
+        "Estimated parameters: ~{} [context_compressor {} + transition {} + action_classifier {} + inverse {}]",
         util::format_params(total_params),
         util::format_params(planner_params),
         util::format_params(transition_params),
-        util::format_params(orchestrator_params),
+        util::format_params(action_classifier_params),
         util::format_params(inverse_params)
     );
 
@@ -499,7 +506,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     );
     tb.add_scalar("config/dim", config.dim as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
-    tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
+    tb.add_scalar("config/context_slots", config.num_latent_tokens as f32, 0);
     tb.add_scalar("config/estimated_params", total_params as f32, 0);
     tb.add_scalar(
         "config/train_encoder",
@@ -558,7 +565,19 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     tb.add_scalar("config/sigreg_points", sigreg_points as f32, 0);
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
+    tb.add_scalar(
+        "config/post_state_loss_weight",
+        world_post_state_loss_weight() as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/rollout_loss_weight",
+        world_rollout_loss_weight() as f32,
+        0,
+    );
+    tb.add_scalar("config/rollout_steps", world_rollout_steps() as f32, 0);
     if start_step >= config.steps {
         println!(
             "World resume checkpoint already reached step {}/{}; skipping training.",
@@ -571,6 +590,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let mut last_sigreg_loss = None;
         let mut last_action_loss = None;
         let mut last_inverse_loss = None;
+        let mut last_post_state_loss = None;
+        let mut last_rollout_loss = None;
         let mut last_loss = None;
         let mut last_action_logits = None;
         let mut last_inverse_logits = None;
@@ -599,21 +620,41 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 encode_world_examples(&raw_batch, &encoder_vocab)
             };
             let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
-            let (state_slots, next_slots) = planner_slots_from_world_pair_batch(
+            let (state_slots, next_slots) = context_slots_from_world_pair_batch(
                 &encoder,
-                &planner_memory,
+                &context_compressor,
                 &batch,
                 encoder_vocab.pad_id,
                 config.max_seq,
                 context_segments,
                 recent_full_segments,
-                recursive_planner_memory,
+                recursive_context_compressor,
                 !config.train_encoder,
                 &device,
             )?;
             let pred_next_slots = transition.forward(&state_slots, &action_labels)?;
 
             let transition_loss = prediction_loss(&pred_next_slots, &next_slots)?;
+            let post_state_loss = if world_post_state_loss_weight() > 0.0 {
+                let post_state_slots = context_slots_from_world_post_state_batch(
+                    &encoder,
+                    &context_compressor,
+                    &batch,
+                    encoder_vocab.pad_id,
+                    config.max_seq,
+                    context_segments,
+                    recent_full_segments,
+                    recursive_context_compressor,
+                    !config.train_encoder,
+                    &device,
+                )?;
+                prediction_loss(&pred_next_slots, &post_state_slots)?
+            } else {
+                transition_loss.affine(0.0, 0.0)?
+            };
+            let rollout_loss =
+                rollout_loss_from_batch(&transition, &state_slots, &batch, world_rollout_steps())?
+                    .unwrap_or(transition_loss.affine(0.0, 0.0)?);
             let state_sigreg = sigreg_epps_pulley(
                 &flatten_latent_slots(&state_slots)?,
                 sigreg_slices,
@@ -634,12 +675,12 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 .broadcast_add(&pred_sigreg)?
                 .affine(1.0 / 3.0, 0.0)?;
 
-            let action_logits = orchestrator_head.forward(&state_slots)?;
+            let action_logits = action_classifier_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
             let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
             let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
-            let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
-            let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;
+            let inverse_logits_true = inverse_action_classifier.forward(&true_delta_slots)?;
+            let inverse_logits_pred = inverse_action_classifier.forward(&pred_delta_slots)?;
             let inverse_true_loss =
                 action_cross_entropy(&inverse_logits_true, &action_labels, &device)?;
             let inverse_pred_loss =
@@ -648,6 +689,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 .broadcast_add(&inverse_pred_loss)?
                 .affine(0.5, 0.0)?;
             let loss = transition_loss
+                .broadcast_add(&post_state_loss.affine(world_post_state_loss_weight(), 0.0)?)?
+                .broadcast_add(&rollout_loss.affine(world_rollout_loss_weight(), 0.0)?)?
                 .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?
                 .broadcast_add(&action_loss.affine(config.action_loss_weight, 0.0)?)?
                 .broadcast_add(&inverse_loss.affine(inverse_loss_weight, 0.0)?)?;
@@ -663,6 +706,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             last_sigreg_loss = Some(sigreg_loss);
             last_action_loss = Some(action_loss);
             last_inverse_loss = Some(inverse_loss);
+            last_post_state_loss = Some(post_state_loss);
+            last_rollout_loss = Some(rollout_loss);
             last_loss = Some(loss);
             last_action_logits = Some(action_logits);
             last_inverse_logits = Some(inverse_logits_pred);
@@ -683,6 +728,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 last_action_loss.context("world grad accumulation produced no action loss")?;
             let inverse_loss =
                 last_inverse_loss.context("world grad accumulation produced no inverse loss")?;
+            let post_state_loss = last_post_state_loss
+                .context("world grad accumulation produced no post-state loss")?;
+            let rollout_loss =
+                last_rollout_loss.context("world grad accumulation produced no rollout loss")?;
             let loss = last_loss.context("world grad accumulation produced no total loss")?;
             let action_logits =
                 last_action_logits.context("world grad accumulation produced no action logits")?;
@@ -699,6 +748,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let sigreg_val = util::scalar_f32(&sigreg_loss)?;
             let act_val = util::scalar_f32(&action_loss)?;
             let inv_val = util::scalar_f32(&inverse_loss)?;
+            let post_state_val = util::scalar_f32(&post_state_loss)?;
+            let rollout_val = util::scalar_f32(&rollout_loss)?;
             let action_metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
             let inverse_metrics = compute_action_metrics(&inverse_logits, &last_action_labels)?;
             let pred_slots_flat = flatten_latent_slots(&pred_next_slots)?;
@@ -713,6 +764,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             tb.add_scalar("loss/sigreg", sigreg_val, step);
             tb.add_scalar("loss/action", act_val, step);
             tb.add_scalar("loss/inverse_action", inv_val, step);
+            tb.add_scalar("loss/post_state", post_state_val, step);
+            tb.add_scalar("loss/rollout", rollout_val, step);
             tb.add_scalar("metrics/action_acc", action_metrics.accuracy, step);
             tb.add_scalar(
                 "metrics/action_balanced_acc",
@@ -824,10 +877,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     &val_batch,
                     &encoder_vocab,
                     &encoder,
-                    &planner_memory,
+                    &context_compressor,
                     &transition,
-                    &orchestrator_head,
-                    &inverse_action_head,
+                    &action_classifier_head,
+                    &inverse_action_classifier,
                     config.max_seq,
                     config.lambda,
                     config.action_loss_weight,
@@ -952,7 +1005,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 }
                 saved_checkpoint = true;
                 println!(
-                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{} [saved best]",
+                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} post {post_state_val:.4} rollout {rollout_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{} [saved best]",
                     config.steps,
                     action_metrics.accuracy,
                     action_metrics.balanced_accuracy,
@@ -972,7 +1025,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}",
+                    "step {step}/{} total {loss_val:.4} trans {trans_val:.4} post {post_state_val:.4} rollout {rollout_val:.4} sigreg {sigreg_val:.4} action {act_val:.4} inverse {inv_val:.4} action_acc {:.3} bal_acc {:.3} macro_f1 {:.3} inv_acc {:.3} inv_bal {:.3} inv_f1 {:.3} code_p {:.3} code_r {:.3} code_f1 {:.3} done_f1 {:.3} trans_cos {trans_cos:.4} code_rate {:.3} pred_code {:.3} done_rate {:.3} pred_done {:.3} sel {selection_metric:.4}{}",
                     config.steps,
                     action_metrics.accuracy,
                     action_metrics.balanced_accuracy,
@@ -1133,8 +1186,8 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let planner_memory = PlannerMemory::new(
-        world_vb.pp("planner_memory"),
+    let context_compressor = ContextCompressor::new(
+        world_vb.pp("context_compressor"),
         config.dim,
         config.bridge_dim,
         config.num_latent_tokens,
@@ -1144,13 +1197,15 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
 
     let mut high_varmap = VarMap::new();
     let high_vb = VarBuilder::from_varmap(&high_varmap, train_dtype, &device);
-    let macro_encoder = MacroActionEncoder::new(
-        high_vb.pp("macro_action_encoder"),
+    let macro_encoder = ActionSequenceEncoder::new(
+        high_vb.pp("action_sequence_encoder"),
         config.bridge_dim,
         config.macro_max_len,
     )?;
-    let high_transition =
-        HighLevelWorldTransition::new(high_vb.pp("high_world_transition"), config.bridge_dim)?;
+    let macro_transition = MacroActionStateTransition::new(
+        high_vb.pp("macro_action_state_transition"),
+        config.bridge_dim,
+    )?;
 
     let total_params = config.bridge_dim * config.bridge_dim * 8
         + config.bridge_dim * config.macro_max_len
@@ -1231,7 +1286,8 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
 
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let sigreg_slices = env_usize("TOFY_SIGREG_SLICES", 1024);
     let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
     let mut best_metric = resume_state.best_metric;
@@ -1265,21 +1321,21 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
                 config.macro_min_len,
                 config.macro_max_len,
             )?;
-            let (state_slots, target_slots) = planner_slots_from_world_pair_batch(
+            let (state_slots, target_slots) = context_slots_from_world_pair_batch(
                 &encoder,
-                &planner_memory,
+                &context_compressor,
                 &batch.examples,
                 encoder_vocab.pad_id,
                 config.max_seq,
                 context_segments,
                 recent_full_segments,
-                recursive_planner_memory,
+                recursive_context_compressor,
                 true,
                 &device,
             )?;
             let macro_action =
                 macro_encoder.forward_from_slices(&batch.action_sequences, &device)?;
-            let pred_slots = high_transition.forward(&state_slots, &macro_action)?;
+            let pred_slots = macro_transition.forward(&state_slots, &macro_action)?;
             let transition_loss = prediction_loss(&pred_slots, &target_slots)?;
             let target_sigreg = sigreg_epps_pulley(
                 &flatten_latent_slots(&target_slots)?,
@@ -1450,7 +1506,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     };
     let mut cached_train_stream = if let Some(cache_path) = token_cache_path("world") {
         println!(
-            "Token cache: using orchestrator world cache {:?}",
+            "Token cache: using action_classifier world cache {:?}",
             cache_path
         );
         Some(CachedWorldStream::with_split(
@@ -1461,7 +1517,9 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
             true,
         )?)
     } else {
-        println!("Token cache: no orchestrator world cache found; using raw tokenization stream");
+        println!(
+            "Token cache: no action_classifier world cache found; using raw tokenization stream"
+        );
         None
     };
     let mut cached_val_stream = if val_row_count > 0 {
@@ -1494,19 +1552,20 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let planner_memory = PlannerMemory::new(
-        world_vb.pp("planner_memory"),
+    let context_compressor = ContextCompressor::new(
+        world_vb.pp("context_compressor"),
         config.dim,
         config.bridge_dim,
         config.num_latent_tokens,
     )?;
-    let _transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
-    let orchestrator_head =
-        OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
-    let _inverse_action_head =
-        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_head.") {
-            Some(OrchestratorActionHead::new(
-                world_vb.pp("inverse_action_head"),
+    let _transition =
+        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+    let action_classifier_head =
+        NextActionClassifier::new(world_vb.pp("next_action_classifier"), config.bridge_dim)?;
+    let _inverse_action_classifier =
+        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_classifier.") {
+            Some(NextActionClassifier::new(
+                world_vb.pp("inverse_action_classifier"),
                 config.bridge_dim,
             )?)
         } else {
@@ -1519,7 +1578,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         .output_path
         .clone()
         .unwrap_or_else(|| config.world_model_path.clone());
-    let resume_stage = util::resume_stage_name("orchestrator");
+    let resume_stage = util::resume_stage_name("action_classifier");
     let train_checkpoint_path =
         util::checkpoint_sidecar_path(&output_path, &resume_stage, "train.safetensors");
     let optimizer_checkpoint_path =
@@ -1531,7 +1590,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         world_varmap.load(&train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         println!(
-            "Resuming orchestrator weights from {:?}",
+            "Resuming action_classifier weights from {:?}",
             train_checkpoint_path
         );
     }
@@ -1552,17 +1611,17 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 resume_state.step = opt.step_t();
             }
             println!(
-                "Resuming orchestrator optimizer from {:?} at step {}",
+                "Resuming action_classifier optimizer from {:?} at step {}",
                 optimizer_checkpoint_path, resume_state.step
             );
         }
     }
 
-    println!("Training (planner/orchestrator action model)");
+    println!("Training (context compressor/action_classifier action model)");
     println!("Encoder checkpoint: {:?}", config.encoder_model_path);
     println!("World checkpoint: {:?}", config.world_model_path);
     println!(
-        "Rows: train {} | val {} | max_seq {} | planner_slots {} | tune_planner {}",
+        "Rows: train {} | val {} | max_seq {} | context_slots {} | tune_planner {}",
         train_row_count,
         val_row_count,
         config.max_seq,
@@ -1570,7 +1629,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         config.tune_planner
     );
 
-    let run_dir = util::create_run_dir("orchestrator")?;
+    let run_dir = util::create_run_dir("action_classifier")?;
     let mut tb = SummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
     println!(
@@ -1586,7 +1645,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
-    tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
+    tb.add_scalar("config/context_slots", config.num_latent_tokens as f32, 0);
     tb.add_scalar("config/grad_accum", config.grad_accum_steps as f32, 0);
     tb.add_scalar(
         "config/train_dtype",
@@ -1614,7 +1673,8 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     const TARGET_DONE_RATE: f32 = 0.20;
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let mut best_score = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
 
@@ -1652,21 +1712,21 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 .iter()
                 .map(|row| row.state_tokens.as_slice())
                 .collect::<Vec<_>>();
-            let mut state_slots = planner_slots_from_token_sequences(
+            let mut state_slots = context_slots_from_token_sequences(
                 &encoder,
-                &planner_memory,
+                &context_compressor,
                 &state_tokens,
                 encoder_vocab.pad_id,
                 config.max_seq,
                 context_segments,
                 recent_full_segments,
-                recursive_planner_memory,
+                recursive_context_compressor,
                 &device,
             )?;
             if !config.tune_planner {
                 state_slots = state_slots.detach();
             }
-            let action_logits = orchestrator_head.forward(&state_slots)?;
+            let action_logits = action_classifier_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
 
             util::accumulate_scaled_gradients(
@@ -1685,9 +1745,9 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
 
         if step % config.log_every == 0 {
             let action_loss = last_action_loss
-                .context("orchestrator grad accumulation produced no action loss")?;
+                .context("action_classifier grad accumulation produced no action loss")?;
             let action_logits = last_action_logits
-                .context("orchestrator grad accumulation produced no action logits")?;
+                .context("action_classifier grad accumulation produced no action logits")?;
             let metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
             let action_loss_val = util::scalar_f32(&action_loss)?;
             let mut selection_score = 1.0
@@ -1749,7 +1809,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 } else {
                     let stream = val_stream
                         .as_mut()
-                        .context("orchestrator validation stream missing")?;
+                        .context("action_classifier validation stream missing")?;
                     let raw_batch = collect_action_training_batch(
                         stream,
                         config.batch_size,
@@ -1763,19 +1823,19 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                     .iter()
                     .map(|row| row.state_tokens.as_slice())
                     .collect::<Vec<_>>();
-                let state_slots = planner_slots_from_token_sequences(
+                let state_slots = context_slots_from_token_sequences(
                     &encoder,
-                    &planner_memory,
+                    &context_compressor,
                     &state_tokens,
                     encoder_vocab.pad_id,
                     config.max_seq,
                     context_segments,
                     recent_full_segments,
-                    recursive_planner_memory,
+                    recursive_context_compressor,
                     &device,
                 )?
                 .detach();
-                let action_logits = orchestrator_head.forward(&state_slots)?;
+                let action_logits = action_classifier_head.forward(&state_slots)?;
                 let val_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
                 let val_loss_val = util::scalar_f32(&val_loss)?;
                 let val_metrics = compute_action_metrics(&action_logits, &action_labels)?;
@@ -1876,21 +1936,21 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
-    let _ = vram_tracker.write_summary(&run_dir, "orchestrator");
+    let _ = vram_tracker.write_summary(&run_dir, "action_classifier");
     println!(
-        "Best planner/orchestrator checkpoint saved to {:?} (selection {:.4})",
+        "Best context compressor/action_classifier checkpoint saved to {:?} (selection {:.4})",
         output_path, best_score
     );
     Ok(())
 }
 
-/// Approximate parameter count for decoder checkpoint: decoder adapter + decoder.
+/// Approximate parameter count for decoder checkpoint: decoder conditioning adapter + decoder.
 fn decoder_param_count(
     vocab_size: usize,
     planner_dim: usize,
     world_dim: usize,
     kind: DecoderKind,
-    planner_slots: usize,
+    context_slots: usize,
     arch: DecoderArchitecture,
 ) -> usize {
     let dim = arch.dim;
@@ -1916,12 +1976,13 @@ fn decoder_param_count(
         + ff
         + ff * dim
         + dim;
-    let adapter_slots = DecoderAdapter::output_slots_for(kind, planner_slots);
-    let decoder_adapter = adapter_slots * planner_dim
+    let adapter_slots = DecoderConditioningAdapter::output_slots_for(kind, context_slots);
+    let decoder_conditioning_adapter = adapter_slots * planner_dim
+        + crate::model::action_classifier_head::NUM_ACTIONS * planner_dim
         + 2 * (planner_dim * planner_dim + planner_dim * 4 * planner_dim)
         + planner_dim * world_dim
         + world_dim;
-    decoder_adapter
+    decoder_conditioning_adapter
         + embed
         + kind_embed
         + structure_proj
@@ -1932,6 +1993,169 @@ fn decoder_param_count(
 
 fn default_decoder_vocab_path(decoder_path: &Path) -> PathBuf {
     decoder_path.with_extension("vocab.txt")
+}
+
+struct DecoderContextCache {
+    capacity: usize,
+    map: HashMap<Vec<u32>, Tensor>,
+    order: VecDeque<Vec<u32>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl DecoderContextCache {
+    fn from_env() -> Self {
+        let capacity = std::env::var("TOFY_DECODER_CONTEXT_CACHE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024);
+        Self {
+            capacity,
+            map: HashMap::with_capacity(capacity.min(1024)),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.capacity > 0
+    }
+
+    fn get(&mut self, tokens: &[u32]) -> Option<Tensor> {
+        let value = self.map.get(tokens).cloned();
+        if value.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        value
+    }
+
+    fn insert(&mut self, tokens: Vec<u32>, slots: Tensor) {
+        if self.capacity == 0 || self.map.contains_key(&tokens) {
+            return;
+        }
+        self.map.insert(tokens.clone(), slots.detach());
+        self.order.push_back(tokens);
+        while self.map.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn hit_rate(&self) -> f32 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f32 / total as f32
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decoder_next_context_slots(
+    cache: &mut DecoderContextCache,
+    encoder: &OnlineEncoder,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    encoder_batch: &[WorldExample],
+    decoder_action_label: u32,
+    pad_id: u32,
+    max_seq: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
+    rollout_steps: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if encoder_batch.is_empty() {
+        bail!("decoder context batch is empty");
+    }
+    if !cache.is_enabled() {
+        let state_tokens = encoder_batch
+            .iter()
+            .map(|row| row.state_tokens.as_slice())
+            .collect::<Vec<_>>();
+        let state_slots = context_slots_from_token_sequences(
+            encoder,
+            context_compressor,
+            &state_tokens,
+            pad_id,
+            max_seq,
+            context_segments,
+            recent_full_segments,
+            recursive_context_compressor,
+            device,
+        )?;
+        let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
+        return if rollout_steps <= 1 {
+            transition.forward(&state_slots, &decoder_action_labels)
+        } else {
+            rollout_transition_slots(
+                transition,
+                &state_slots,
+                decoder_action_label,
+                rollout_steps,
+            )
+        };
+    }
+
+    let mut slots_by_row: Vec<Option<Tensor>> = (0..encoder_batch.len()).map(|_| None).collect();
+    let mut miss_positions = Vec::new();
+    let mut miss_token_refs = Vec::new();
+
+    for (idx, row) in encoder_batch.iter().enumerate() {
+        if let Some(slots) = cache.get(&row.state_tokens) {
+            slots_by_row[idx] = Some(slots);
+        } else {
+            miss_positions.push(idx);
+            miss_token_refs.push(row.state_tokens.as_slice());
+        }
+    }
+
+    if !miss_positions.is_empty() {
+        let state_slots = context_slots_from_token_sequences(
+            encoder,
+            context_compressor,
+            &miss_token_refs,
+            pad_id,
+            max_seq,
+            context_segments,
+            recent_full_segments,
+            recursive_context_compressor,
+            device,
+        )?;
+        let decoder_action_labels = vec![decoder_action_label; miss_positions.len()];
+        let next_slots = if rollout_steps <= 1 {
+            transition.forward(&state_slots, &decoder_action_labels)?
+        } else {
+            rollout_transition_slots(
+                transition,
+                &state_slots,
+                decoder_action_label,
+                rollout_steps,
+            )?
+        };
+        for (miss_idx, row_idx) in miss_positions.iter().copied().enumerate() {
+            let row_slots = next_slots.narrow(0, miss_idx, 1)?.detach();
+            cache.insert(
+                encoder_batch[row_idx].state_tokens.clone(),
+                row_slots.clone(),
+            );
+            slots_by_row[row_idx] = Some(row_slots);
+        }
+    }
+
+    let slots = slots_by_row
+        .iter()
+        .map(|slots| slots.as_ref().context("decoder context cache missing row"))
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&slots, 0).map_err(Into::into)
 }
 
 pub(crate) fn decoder_tokenization_mode(kind: DecoderKind) -> TokenizationMode {
@@ -2169,17 +2393,18 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let planner_memory = PlannerMemory::new(
-        world_vb.pp("planner_memory"),
+    let context_compressor = ContextCompressor::new(
+        world_vb.pp("context_compressor"),
         config.dim,
         config.bridge_dim,
         config.num_latent_tokens,
     )?;
-    let transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
-    let _inverse_action_head =
-        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_head.") {
-            Some(OrchestratorActionHead::new(
-                world_vb.pp("inverse_action_head"),
+    let transition =
+        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+    let _inverse_action_classifier =
+        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_classifier.") {
+            Some(NextActionClassifier::new(
+                world_vb.pp("inverse_action_classifier"),
                 config.bridge_dim,
             )?)
         } else {
@@ -2190,11 +2415,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
 
     let mut decoder_varmap = VarMap::new();
     let decoder_vb = VarBuilder::from_varmap(&decoder_varmap, train_dtype, &device);
-    let decoder_adapter = DecoderAdapter::new(
-        decoder_vb.pp("decoder_adapter"),
+    let decoder_conditioning_adapter = DecoderConditioningAdapter::new(
+        decoder_vb.pp("decoder_conditioning_adapter"),
         config.bridge_dim,
         config.bridge_dim,
-        DecoderAdapter::output_slots_for(config.decoder_kind, config.num_latent_tokens),
+        DecoderConditioningAdapter::output_slots_for(config.decoder_kind, config.num_latent_tokens),
     )?;
     let decoder_path = config.decoder_output_path.clone().unwrap_or_else(|| {
         config
@@ -2381,18 +2606,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let run_dir = util::create_run_dir("decoder")?;
     let mut tb = SummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
-    let conditioning_loss_weight = std::env::var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.30f64)
-        .max(0.0);
+    let conditioning_loss_weight = config.conditioning_loss_weight;
     let compute_conditioning_metrics =
         conditioning_loss_weight > 0.0 || env_bool("TOFY_DECODER_ABLATION_METRICS", false);
-    let conditioning_margin = std::env::var("TOFY_DECODER_CONDITIONING_MARGIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.10f64)
-        .max(0.0);
+    let conditioning_margin = config.conditioning_margin;
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
         run_dir
@@ -2406,7 +2623,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     tb.add_scalar("resume/start_step", start_step as f32, 0);
     tb.add_scalar("config/batch_size", config.batch_size as f32, 0);
     tb.add_scalar("config/max_seq", config.max_seq as f32, 0);
-    tb.add_scalar("config/planner_slots", config.num_latent_tokens as f32, 0);
+    tb.add_scalar("config/context_slots", config.num_latent_tokens as f32, 0);
     tb.add_scalar("config/estimated_params", decoder_params as f32, 0);
     tb.add_scalar(
         "config/syntax_loss_weight",
@@ -2471,8 +2688,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     };
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
+    let mut decoder_context_cache = DecoderContextCache::from_env();
+    tb.add_scalar(
+        "config/decoder_context_cache_rows",
+        decoder_context_cache.capacity as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/decoder_prefill_batch_rows",
+        (config.batch_size * config.grad_accum_steps.max(1)) as f32,
+        0,
+    );
 
     if start_step >= config.steps {
         println!(
@@ -2485,17 +2714,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_oov_rate = None;
         let mut last_world_latent = None;
         let mut last_logits = None;
+        let mut last_dec_input = None;
         let mut last_dec_target = None;
         let mut last_loss_mask = None;
         let mut last_loss = None;
-        let mut last_raw_loss = None;
-        let mut last_ablated_loss = None;
-        let mut last_conditioning_loss = None;
-        let mut last_syntax_loss = None;
-        let mut last_signature_loss = None;
-        let mut last_structure_loss = None;
+        let mut last_conditioning_loss_val = 0.0f32;
+        let grad_accum_steps = config.grad_accum_steps.max(1);
+        let mut micro_batches = Vec::with_capacity(grad_accum_steps);
+        let mut prefill_encoder_batch = Vec::with_capacity(config.batch_size * grad_accum_steps);
 
-        for _micro_step in 0..config.grad_accum_steps.max(1) {
+        for _micro_step in 0..grad_accum_steps {
             let (encoder_batch, decoder_batch, oov_rate) = if let Some(ref mut cached_stream) =
                 cached_decoder_stream
             {
@@ -2519,34 +2747,34 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
                 (encoder_batch, decoder_batch, oov_rate)
             };
-            let state_tokens = encoder_batch
-                .iter()
-                .map(|row| row.state_tokens.as_slice())
-                .collect::<Vec<_>>();
-            let state_slots = planner_slots_from_token_sequences(
-                &encoder,
-                &planner_memory,
-                &state_tokens,
-                encoder_vocab.pad_id,
-                config.max_seq,
-                context_segments,
-                recent_full_segments,
-                recursive_planner_memory,
-                &device,
-            )?;
-            let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
-            let next_planner_slots = if rollout_steps <= 1 {
-                transition.forward(&state_slots, &decoder_action_labels)?
-            } else {
-                rollout_transition_slots(
-                    &transition,
-                    &state_slots,
-                    decoder_action_label,
-                    rollout_steps,
-                )?
-            };
-            let world_latent = decoder_adapter.forward(&next_planner_slots.detach())?;
-            let zero_world_latent = world_latent.affine(0.0, 0.0)?;
+            prefill_encoder_batch.extend(encoder_batch.iter().cloned());
+            micro_batches.push((encoder_batch, decoder_batch, oov_rate));
+        }
+
+        let next_context_slots = decoder_next_context_slots(
+            &mut decoder_context_cache,
+            &encoder,
+            &context_compressor,
+            &transition,
+            &prefill_encoder_batch,
+            decoder_action_label,
+            encoder_vocab.pad_id,
+            config.max_seq,
+            context_segments,
+            recent_full_segments,
+            recursive_context_compressor,
+            rollout_steps,
+            &device,
+        )?
+        .detach();
+
+        let mut row_offset = 0usize;
+        for (encoder_batch, decoder_batch, oov_rate) in micro_batches {
+            let micro_next_context_slots =
+                next_context_slots.narrow(0, row_offset, encoder_batch.len())?;
+            row_offset += encoder_batch.len();
+            let world_latent = decoder_conditioning_adapter
+                .forward_with_action(&micro_next_context_slots, decoder_action_label)?;
 
             let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
                 make_world_batch_from_slice(
@@ -2568,37 +2796,71 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let logits = decoder.forward(&dec_input, &world_latent)?;
             let importance_mask =
                 importance_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
-            let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let signature_mask =
-                signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let structure_mask =
-                structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let token_loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
-            let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
-            let signature_loss =
-                masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
-            let structure_loss =
-                masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
-            let ablated_loss = if compute_conditioning_metrics {
-                let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
-                masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?
-            } else {
-                raw_loss.detach()
-            };
+            let mut loss = token_loss.clone();
+            if config.syntax_loss_weight > 0.0 {
+                let syntax_mask =
+                    syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let syntax_loss =
+                    masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
+                loss = loss.broadcast_add(&syntax_loss.affine(config.syntax_loss_weight, 0.0)?)?;
+            }
+            if config.signature_loss_weight > 0.0 {
+                let signature_mask =
+                    signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let signature_loss =
+                    masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+                loss =
+                    loss.broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?;
+            }
+            if config.structure_loss_weight > 0.0 {
+                let structure_mask =
+                    structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let structure_loss =
+                    masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
+                loss =
+                    loss.broadcast_add(&structure_loss.affine(config.structure_loss_weight, 0.0)?)?;
+            }
             let conditioning_loss = if conditioning_loss_weight > 0.0 {
-                token_loss
+                let zero_world_latent = world_latent.affine(0.0, 0.0)?;
+                let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
+                let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
+                let shuffled_world_latent = shuffled_conditioning_latent(&world_latent)?;
+                let shuffled_logits = decoder.forward(&dec_input, &shuffled_world_latent)?;
+                let shuffled_loss =
+                    masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
+                let hard_mismatch_world_latent =
+                    hard_mismatched_conditioning_latent(&world_latent)?;
+                let hard_mismatch_logits =
+                    decoder.forward(&dec_input, &hard_mismatch_world_latent)?;
+                let hard_mismatch_loss =
+                    masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
+                let zero_margin_loss = token_loss
                     .broadcast_sub(&ablated_loss.detach())?
                     .affine(1.0, conditioning_margin)?
-                    .relu()?
+                    .relu()?;
+                let shuffle_margin_loss = token_loss
+                    .broadcast_sub(&shuffled_loss.detach())?
+                    .affine(1.0, conditioning_margin)?
+                    .relu()?;
+                let hard_margin_loss = token_loss
+                    .broadcast_sub(&hard_mismatch_loss.detach())?
+                    .affine(1.0, conditioning_margin)?
+                    .relu()?;
+                zero_margin_loss
+                    .broadcast_add(&shuffle_margin_loss)?
+                    .broadcast_add(&hard_margin_loss)?
+                    .affine(1.0 / 3.0, 0.0)?
             } else {
                 token_loss.affine(0.0, 0.0)?
             };
-            let loss = token_loss
-                .broadcast_add(&syntax_loss.affine(config.syntax_loss_weight, 0.0)?)?
-                .broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?
-                .broadcast_add(&structure_loss.affine(config.structure_loss_weight, 0.0)?)?
-                .broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
+            if conditioning_loss_weight > 0.0 {
+                last_conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
+                loss =
+                    loss.broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
+            } else {
+                last_conditioning_loss_val = 0.0;
+            }
 
             util::accumulate_scaled_gradients(
                 &mut accumulated_grads,
@@ -2610,15 +2872,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             last_oov_rate = Some(oov_rate);
             last_world_latent = Some(world_latent);
             last_logits = Some(logits);
+            last_dec_input = Some(dec_input);
             last_dec_target = Some(dec_target);
             last_loss_mask = Some(loss_mask);
             last_loss = Some(loss);
-            last_raw_loss = Some(raw_loss);
-            last_ablated_loss = Some(ablated_loss);
-            last_conditioning_loss = Some(conditioning_loss);
-            last_syntax_loss = Some(syntax_loss);
-            last_signature_loss = Some(signature_loss);
-            last_structure_loss = Some(structure_loss);
         }
 
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
@@ -2629,27 +2886,51 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let world_latent =
                 last_world_latent.context("decoder grad accumulation produced no latent")?;
             let logits = last_logits.context("decoder grad accumulation produced no logits")?;
+            let dec_input =
+                last_dec_input.context("decoder grad accumulation produced no inputs")?;
             let dec_target =
                 last_dec_target.context("decoder grad accumulation produced no targets")?;
             let loss_mask =
                 last_loss_mask.context("decoder grad accumulation produced no loss mask")?;
             let loss = last_loss.context("decoder grad accumulation produced no loss")?;
-            let raw_loss =
-                last_raw_loss.context("decoder grad accumulation produced no raw loss")?;
-            let ablated_loss =
-                last_ablated_loss.context("decoder grad accumulation produced no ablated loss")?;
-            let conditioning_loss = last_conditioning_loss
-                .context("decoder grad accumulation produced no conditioning loss")?;
-            let syntax_loss =
-                last_syntax_loss.context("decoder grad accumulation produced no syntax loss")?;
-            let signature_loss = last_signature_loss
-                .context("decoder grad accumulation produced no signature loss")?;
-            let structure_loss = last_structure_loss
-                .context("decoder grad accumulation produced no structure loss")?;
             let loss_val = util::scalar_f32(&loss)?;
+            let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
             let raw_loss_val = util::scalar_f32(&raw_loss)?;
-            let ablated_loss_val = util::scalar_f32(&ablated_loss)?;
-            let conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
+            let (ablated_loss_val, shuffled_loss_val, hard_mismatch_loss_val) =
+                if compute_conditioning_metrics {
+                    let zero_world_latent = world_latent.affine(0.0, 0.0)?;
+                    let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
+                    let ablated_loss =
+                        masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
+                    let shuffled_world_latent = shuffled_conditioning_latent(&world_latent)?;
+                    let shuffled_logits = decoder.forward(&dec_input, &shuffled_world_latent)?;
+                    let shuffled_loss =
+                        masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
+                    let hard_mismatch_world_latent =
+                        hard_mismatched_conditioning_latent(&world_latent)?;
+                    let hard_mismatch_logits =
+                        decoder.forward(&dec_input, &hard_mismatch_world_latent)?;
+                    let hard_mismatch_loss =
+                        masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
+                    (
+                        util::scalar_f32(&ablated_loss)?,
+                        util::scalar_f32(&shuffled_loss)?,
+                        util::scalar_f32(&hard_mismatch_loss)?,
+                    )
+                } else {
+                    (loss_val, loss_val, loss_val)
+                };
+            let conditioning_loss_val = last_conditioning_loss_val;
+            let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+            let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
+            let signature_mask =
+                signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+            let signature_loss =
+                masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+            let structure_mask =
+                structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+            let structure_loss =
+                masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
             let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
             let signature_loss_val = util::scalar_f32(&signature_loss)?;
             let structure_loss_val = util::scalar_f32(&structure_loss)?;
@@ -2659,6 +2940,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let perplexity = loss_val.exp();
             let conditioning_gain = if compute_conditioning_metrics {
                 ablated_loss_val - loss_val
+            } else {
+                0.0
+            };
+            let zero_gain = conditioning_gain;
+            let shuffle_gain = if compute_conditioning_metrics {
+                shuffled_loss_val - loss_val
+            } else {
+                0.0
+            };
+            let hard_negative_gain = if compute_conditioning_metrics {
+                ablated_loss_val
+                    .min(shuffled_loss_val)
+                    .min(hard_mismatch_loss_val)
+                    - loss_val
             } else {
                 0.0
             };
@@ -2678,6 +2973,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             tb.add_scalar("loss/token_ce", loss_val, step);
             tb.add_scalar("loss/raw_token_ce", raw_loss_val, step);
             tb.add_scalar("loss/ablated_token_ce", ablated_loss_val, step);
+            tb.add_scalar("loss/shuffled_token_ce", shuffled_loss_val, step);
+            tb.add_scalar("loss/hard_mismatch_token_ce", hard_mismatch_loss_val, step);
             tb.add_scalar("loss/conditioning_margin", conditioning_loss_val, step);
             tb.add_scalar("loss/syntax_ce", syntax_loss_val, step);
             tb.add_scalar("loss/signature_ce", signature_loss_val, step);
@@ -2687,7 +2984,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             tb.add_scalar("metrics/active_frac", active_frac, step);
             tb.add_scalar("metrics/world_latent_rms", world_rms, step);
             tb.add_scalar("metrics/conditioning_gain", conditioning_gain, step);
+            tb.add_scalar("metrics/zero_gain", zero_gain, step);
+            tb.add_scalar("metrics/shuffle_gain", shuffle_gain, step);
+            tb.add_scalar("metrics/hard_negative_gain", hard_negative_gain, step);
             tb.add_scalar("metrics/oov_rate", oov_rate, step);
+            tb.add_scalar(
+                "metrics/decoder_context_cache_hit_rate",
+                decoder_context_cache.hit_rate(),
+                step,
+            );
             tb.add_scalar("metrics/token_accuracy", token_accuracy, step);
             tb.add_scalar("metrics/identifier_accuracy", identifier_accuracy, step);
             tb.add_scalar("metrics/syntax_token_accuracy", syntax_token_accuracy, step);
@@ -2733,6 +3038,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 raw_loss: raw_loss_val,
                 ablated_loss: ablated_loss_val,
                 conditioning_gain,
+                zero_gain,
+                shuffled_loss: shuffled_loss_val,
+                shuffle_gain,
+                hard_negative_gain,
                 syntax_loss: syntax_loss_val,
                 signature_loss: signature_loss_val,
                 structure_loss: structure_loss_val,
@@ -2765,9 +3074,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &encoder_vocab,
                         &decoder_vocab,
                         &encoder,
-                        &planner_memory,
+                        &context_compressor,
                         &transition,
-                        &decoder_adapter,
+                        &decoder_conditioning_adapter,
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
@@ -2784,9 +3093,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &encoder_vocab,
                         &decoder_vocab,
                         &encoder,
-                        &planner_memory,
+                        &context_compressor,
                         &transition,
-                        &decoder_adapter,
+                        &decoder_conditioning_adapter,
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
@@ -2804,6 +3113,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 tb.add_scalar("val/token_ce", val_metrics.loss, step);
                 tb.add_scalar("val/raw_token_ce", val_metrics.raw_loss, step);
                 tb.add_scalar("val/ablated_token_ce", val_metrics.ablated_loss, step);
+                tb.add_scalar("val/shuffled_token_ce", val_metrics.shuffled_loss, step);
                 tb.add_scalar("val/syntax_ce", val_metrics.syntax_loss, step);
                 tb.add_scalar("val/signature_ce", val_metrics.signature_loss, step);
                 tb.add_scalar("val/structure_ce", val_metrics.structure_loss, step);
@@ -2812,6 +3122,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 tb.add_scalar("val/active_frac", val_metrics.active_frac, step);
                 tb.add_scalar("val/world_latent_rms", val_metrics.world_rms, step);
                 tb.add_scalar("val/conditioning_gain", val_metrics.conditioning_gain, step);
+                tb.add_scalar("val/zero_gain", val_metrics.zero_gain, step);
+                tb.add_scalar("val/shuffle_gain", val_metrics.shuffle_gain, step);
+                tb.add_scalar(
+                    "val/hard_negative_gain",
+                    val_metrics.hard_negative_gain,
+                    step,
+                );
                 tb.add_scalar("val/oov_rate", val_metrics.oov_rate, step);
                 tb.add_scalar("val/token_accuracy", val_metrics.token_accuracy, step);
                 tb.add_scalar(
@@ -2863,12 +3180,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
                 saved_checkpoint = true;
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
                     step,
                     config.steps,
                     loss_val,
                     ablated_loss_val,
-                    conditioning_gain,
+                    shuffled_loss_val,
+                    zero_gain,
+                    shuffle_gain,
+                    hard_negative_gain,
                     conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
@@ -2890,12 +3210,15 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} cond_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
                     step,
                     config.steps,
                     loss_val,
                     ablated_loss_val,
-                    conditioning_gain,
+                    shuffled_loss_val,
+                    zero_gain,
+                    shuffle_gain,
+                    hard_negative_gain,
                     conditioning_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
@@ -3026,15 +3349,16 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
     world_varmap.load(&config.model_path)?;
     util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
     let world_vb = VarBuilder::from_varmap(&world_varmap, runtime_dtype, &device);
-    let planner_memory = PlannerMemory::new(
-        world_vb.pp("planner_memory"),
+    let context_compressor = ContextCompressor::new(
+        world_vb.pp("context_compressor"),
         config.dim,
         config.bridge_dim,
         config.num_latent_tokens,
     )?;
-    let transition = WorldTransition::new(world_vb.pp("world_transition"), config.bridge_dim)?;
-    let orchestrator_head =
-        OrchestratorActionHead::new(world_vb.pp("orchestrator_action_head"), config.bridge_dim)?;
+    let transition =
+        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+    let action_classifier_head =
+        NextActionClassifier::new(world_vb.pp("next_action_classifier"), config.bridge_dim)?;
 
     println!("World-model evaluation");
     println!("model: {:?}", config.model_path);
@@ -3046,7 +3370,7 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
         DEFAULT_STREAM_SHUFFLE_BUFFER
     );
     println!(
-        "eval config: steps={} batch={} dim={} max_seq={} layers={} heads={} planner_dim={} planner_slots={}",
+        "eval config: steps={} batch={} dim={} max_seq={} layers={} heads={} planner_dim={} context_slots={}",
         config.eval_steps,
         config.batch_size,
         config.dim,
@@ -3076,20 +3400,21 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
     let mut batches = 0usize;
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_planner_memory = env_bool("TOFY_RECURSIVE_PLANNER_MEMORY", context_segments > 1);
+    let recursive_context_compressor =
+        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     for _ in 0..config.eval_steps.max(1) {
         let raw_batch = raw_stream.next_batch(config.batch_size.max(1))?;
         let chunk = encode_world_examples(&raw_batch, &encoder_vocab);
         let action_labels = chunk.iter().map(|row| row.action_label).collect::<Vec<_>>();
-        let (state_slots, next_slots) = planner_slots_from_world_pair_sequences(
+        let (state_slots, next_slots) = context_slots_from_world_pair_sequences(
             &encoder,
-            &planner_memory,
+            &context_compressor,
             &chunk,
             encoder_vocab.pad_id,
             config.max_seq,
             context_segments,
             recent_full_segments,
-            recursive_planner_memory,
+            recursive_context_compressor,
             &device,
         )?;
         let pred_slots = transition.forward(&state_slots, &action_labels)?;
@@ -3099,7 +3424,7 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
             128,
             17,
         )?)?;
-        let action_logits = orchestrator_head.forward(&state_slots)?;
+        let action_logits = action_classifier_head.forward(&state_slots)?;
         let action_metrics = compute_action_metrics(&action_logits, &action_labels)?;
         n_total += chunk.len();
         sum_pred += pred_loss as f64;
@@ -3198,27 +3523,19 @@ pub struct AgentEngine {
     _high_world_varmap: Option<VarMap>,
     encoder_vocab: Vocab,
     encoder: OnlineEncoder,
-    planner_memory: PlannerMemory,
-    transition: WorldTransition,
+    context_compressor: ContextCompressor,
+    transition: ActionStateTransition,
     high_world_model_path: Option<PathBuf>,
-    macro_action_encoder: Option<MacroActionEncoder>,
-    high_transition: Option<HighLevelWorldTransition>,
-    /// JEPA-style orchestrator head: predicts next action from transition latent. None if checkpoint has no head.
-    orchestrator_head: Option<OrchestratorActionHead>,
+    action_sequence_encoder: Option<ActionSequenceEncoder>,
+    macro_transition: Option<MacroActionStateTransition>,
+    /// JEPA-style action_classifier: predicts next action from transition latent. None if checkpoint has no head.
+    action_classifier_head: Option<NextActionClassifier>,
     max_seq: usize,
-    #[allow(dead_code)]
-    dim: usize,
-    #[allow(dead_code)]
-    num_layers: usize,
-    #[allow(dead_code)]
-    num_heads: usize,
-    #[allow(dead_code)]
     bridge_dim: usize,
-    #[allow(dead_code)]
     num_latent_tokens: usize,
     context_segments: usize,
     recent_full_segments: usize,
-    recursive_planner_memory: bool,
+    recursive_context_compressor: bool,
     world_rollout_steps: usize,
     high_macro_max_len: usize,
 }
@@ -3241,13 +3558,6 @@ fn likely_rust_request(prompt: &str) -> bool {
         || lower.contains("return only rust code")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CodeWorkUnit {
-    signature: Option<String>,
-    requirements: Vec<String>,
-    source_excerpt: String,
-}
-
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
@@ -3256,62 +3566,6 @@ fn env_flag(name: &str, default: bool) -> bool {
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(default)
-}
-
-fn rlm_code_enabled() -> bool {
-    env_flag("TOFY_RLM_CODE", true)
-}
-
-#[derive(Debug, Clone)]
-struct RlmConfig {
-    max_units: usize,
-    unit_tokens: usize,
-    max_depth: usize,
-    max_ops: usize,
-    root_context_chars: usize,
-    model_program: bool,
-    program_tokens: usize,
-}
-
-impl RlmConfig {
-    fn from_env(max_new_tokens: usize) -> Self {
-        let max_units = std::env::var("TOFY_RLM_MAX_UNITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4usize)
-            .max(1);
-        let unit_tokens = std::env::var("TOFY_RLM_UNIT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(192usize)
-            .max(32)
-            .min(max_new_tokens.max(1));
-        Self {
-            max_units,
-            unit_tokens,
-            max_depth: std::env::var("TOFY_RLM_MAX_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2usize)
-                .max(1),
-            max_ops: std::env::var("TOFY_RLM_MAX_OPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(max_units.saturating_mul(4).saturating_add(8))
-                .max(4),
-            root_context_chars: std::env::var("TOFY_RLM_ROOT_CONTEXT_CHARS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1200usize)
-                .max(256),
-            model_program: env_flag("TOFY_RLM_MODEL_PROGRAM", false),
-            program_tokens: std::env::var("TOFY_RLM_PROGRAM_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(160usize)
-                .max(32),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -3332,6 +3586,70 @@ struct HwmPlanningConfig {
     low_horizon: usize,
     macro_candidates: usize,
     subgoal_weight: f32,
+}
+
+#[derive(Debug, Clone)]
+struct LatentReasoningConfig {
+    enabled: bool,
+    min_steps: usize,
+    max_steps: usize,
+    patience: usize,
+    alpha: f64,
+    goal_weight: f32,
+    route_weight: f32,
+    stability_weight: f32,
+    improvement_eps: f32,
+}
+
+impl LatentReasoningConfig {
+    fn from_env(prompt: &str, action: crate::tasks::orchestrator::Action) -> Self {
+        let code_like = action == crate::tasks::orchestrator::Action::Code
+            || action == crate::tasks::orchestrator::Action::FetchDocs
+            || likely_rust_request(prompt);
+        let default_max = if code_like { 8usize } else { 3usize };
+        let default_min = if code_like { 2usize } else { 1usize };
+        let max_steps = std::env::var("TOFY_LATENT_REASONING_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_max)
+            .clamp(1usize, 64usize);
+        Self {
+            enabled: env_flag("TOFY_LATENT_REASONING", true),
+            min_steps: std::env::var("TOFY_LATENT_REASONING_MIN_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_min)
+                .clamp(1usize, max_steps),
+            max_steps,
+            patience: std::env::var("TOFY_LATENT_REASONING_PATIENCE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2usize)
+                .max(1),
+            alpha: std::env::var("TOFY_LATENT_REASONING_ALPHA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.35f64)
+                .clamp(0.01, 1.0),
+            goal_weight: std::env::var("TOFY_LATENT_REASONING_GOAL_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0f32),
+            route_weight: std::env::var("TOFY_LATENT_REASONING_ROUTE_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.25f32),
+            stability_weight: std::env::var("TOFY_LATENT_REASONING_STABILITY_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.05f32),
+            improvement_eps: std::env::var("TOFY_LATENT_REASONING_EPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1e-4f32)
+                .max(0.0),
+        }
+    }
 }
 
 impl HwmPlanningConfig {
@@ -3436,7 +3754,7 @@ fn enumerate_action_sequences(
     max_candidates: usize,
 ) -> Vec<Vec<crate::tasks::orchestrator::Action>> {
     let horizon = horizon.max(1);
-    let base = crate::model::orchestrator_head::NUM_ACTIONS.max(1);
+    let base = crate::model::action_classifier_head::NUM_ACTIONS.max(1);
     let total = (0..horizon).fold(1usize, |acc, _| acc.saturating_mul(base));
     let count = total.min(max_candidates.max(1));
     let mut out = Vec::with_capacity(count);
@@ -3458,352 +3776,12 @@ fn enumerate_action_sequences(
     out
 }
 
-#[derive(Debug, Clone)]
-enum RlmProgramOp {
-    Unit {
-        index: usize,
-        var: String,
-    },
-    Peek {
-        start: usize,
-        len: usize,
-        var: String,
-    },
-    FetchDocs {
-        query_var: String,
-        output_var: String,
-    },
-    SubRlm {
-        input_var: String,
-        docs_var: Option<String>,
-        output_var: String,
-    },
-    Append {
-        var: String,
-    },
-    Final,
-}
-
-#[derive(Debug, Clone)]
-struct RlmEnvironment {
-    prompt: String,
-    units: Vec<CodeWorkUnit>,
-    vars: HashMap<String, String>,
-    final_parts: Vec<String>,
-    trace: Vec<String>,
-}
-
-impl RlmEnvironment {
-    fn new(prompt: &str, cfg: &RlmConfig) -> Self {
-        Self {
-            prompt: prompt.to_string(),
-            units: extract_rust_work_units(prompt, cfg.max_units),
-            vars: HashMap::new(),
-            final_parts: Vec::new(),
-            trace: Vec::new(),
-        }
-    }
-
-    fn metadata(&self, cfg: &RlmConfig) -> String {
-        let char_count = self.prompt.chars().count();
-        let line_count = self.prompt.lines().count();
-        let mut out = format!(
-            "Prompt is stored externally as P. chars={char_count} lines={line_count} rust_units={}\n",
-            self.units.len()
-        );
-        for (idx, unit) in self.units.iter().enumerate() {
-            let signature = unit.signature.as_deref().unwrap_or("<whole_prompt>");
-            out.push_str(&format!("unit[{idx}] signature={signature}\n"));
-        }
-        out.push_str("prefix:\n");
-        out.push_str(&excerpt_chars(&self.prompt, cfg.root_context_chars));
-        out
-    }
-
-    fn record(&mut self, msg: impl Into<String>) {
-        self.trace.push(msg.into());
-    }
-
-    fn store(&mut self, name: &str, value: String) {
-        self.vars.insert(name.to_string(), value);
-    }
-
-    fn load(&self, name: &str) -> Option<String> {
-        self.vars.get(name).cloned()
-    }
-
-    fn peek_chars(&self, start: usize, len: usize) -> String {
-        self.prompt.chars().skip(start).take(len).collect()
-    }
-}
-
-fn valid_rlm_var(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn parse_as_var(tokens: &[&str], as_pos: usize) -> Option<String> {
-    if tokens.get(as_pos)?.eq_ignore_ascii_case("AS") {
-        let var = tokens.get(as_pos + 1)?.trim();
-        if valid_rlm_var(var) {
-            return Some((*var).to_string());
-        }
-    }
-    None
-}
-
-fn clean_rlm_program_text(raw: &str) -> String {
-    let parts = raw.split("```").collect::<Vec<_>>();
-    if parts.len() >= 3 {
-        return parts[1].trim().to_string();
-    }
-    raw.trim().to_string()
-}
-
-fn parse_rlm_program(raw: &str) -> Vec<RlmProgramOp> {
-    let cleaned = clean_rlm_program_text(raw);
-    let mut ops = Vec::new();
-    for line in cleaned.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-            continue;
-        }
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if tokens.is_empty() {
-            continue;
-        }
-        match tokens[0].to_ascii_uppercase().as_str() {
-            "UNIT" if tokens.len() >= 4 => {
-                let Some(var) = parse_as_var(&tokens, 2) else {
-                    continue;
-                };
-                if let Ok(index) = tokens[1].parse::<usize>() {
-                    ops.push(RlmProgramOp::Unit { index, var });
-                }
-            }
-            "PEEK" if tokens.len() >= 5 => {
-                let Some(var) = parse_as_var(&tokens, 3) else {
-                    continue;
-                };
-                if let (Ok(start), Ok(len)) =
-                    (tokens[1].parse::<usize>(), tokens[2].parse::<usize>())
-                {
-                    ops.push(RlmProgramOp::Peek { start, len, var });
-                }
-            }
-            "FETCH_DOCS" if tokens.len() >= 4 => {
-                let Some(output_var) = parse_as_var(&tokens, 2) else {
-                    continue;
-                };
-                let query_var = tokens[1];
-                if valid_rlm_var(query_var) {
-                    ops.push(RlmProgramOp::FetchDocs {
-                        query_var: query_var.to_string(),
-                        output_var,
-                    });
-                }
-            }
-            "SUB_RLM" if tokens.len() >= 4 => {
-                let input_var = tokens[1];
-                if !valid_rlm_var(input_var) {
-                    continue;
-                }
-                if tokens.len() >= 6 && tokens[2].eq_ignore_ascii_case("WITH") {
-                    let docs_var = tokens[3];
-                    let Some(output_var) = parse_as_var(&tokens, 4) else {
-                        continue;
-                    };
-                    if valid_rlm_var(docs_var) {
-                        ops.push(RlmProgramOp::SubRlm {
-                            input_var: input_var.to_string(),
-                            docs_var: Some(docs_var.to_string()),
-                            output_var,
-                        });
-                    }
-                } else {
-                    let Some(output_var) = parse_as_var(&tokens, 2) else {
-                        continue;
-                    };
-                    ops.push(RlmProgramOp::SubRlm {
-                        input_var: input_var.to_string(),
-                        docs_var: None,
-                        output_var,
-                    });
-                }
-            }
-            "APPEND" if tokens.len() >= 2 && valid_rlm_var(tokens[1]) => {
-                ops.push(RlmProgramOp::Append {
-                    var: tokens[1].to_string(),
-                });
-            }
-            "FINAL" => ops.push(RlmProgramOp::Final),
-            _ => {}
-        }
-    }
-    ops
-}
-
-fn build_default_rlm_program(unit_count: usize) -> Vec<RlmProgramOp> {
-    let mut ops = Vec::new();
-    for idx in 0..unit_count.max(1) {
-        let unit_var = format!("unit_{idx}");
-        let out_var = format!("out_{idx}");
-        ops.push(RlmProgramOp::Unit {
-            index: idx,
-            var: unit_var.clone(),
-        });
-        ops.push(RlmProgramOp::FetchDocs {
-            query_var: unit_var.clone(),
-            output_var: format!("docs_{idx}"),
-        });
-        ops.push(RlmProgramOp::SubRlm {
-            input_var: unit_var,
-            docs_var: Some(format!("docs_{idx}")),
-            output_var: out_var.clone(),
-        });
-        ops.push(RlmProgramOp::Append { var: out_var });
-    }
-    ops.push(RlmProgramOp::Final);
-    ops
-}
-
-fn build_rlm_program_prompt(env: &RlmEnvironment, cfg: &RlmConfig) -> String {
-    let mut out = String::new();
-    out.push_str("Write an RLM program. The full user prompt is an external string P, not in your context.\n");
-    out.push_str("Allowed commands only:\n");
-    out.push_str("UNIT <index> AS <var>\n");
-    out.push_str("PEEK <start_char> <len_chars> AS <var>\n");
-    out.push_str("FETCH_DOCS <query_var> AS <out_var>\n");
-    out.push_str("SUB_RLM <var> AS <out_var>\n");
-    out.push_str("SUB_RLM <var> WITH <docs_var> AS <out_var>\n");
-    out.push_str("APPEND <var>\n");
-    out.push_str("FINAL\n\n");
-    out.push_str("Use UNIT, FETCH_DOCS, and SUB_RLM WITH docs for each Rust work unit. Keep docs in a separate variable. Return only commands.\n\n");
-    out.push_str(&env.metadata(cfg));
-    out
-}
-
-fn extract_rust_work_units(prompt: &str, max_units: usize) -> Vec<CodeWorkUnit> {
-    let max_units = max_units.max(1);
-    let requirements = extract_prompt_requirements(prompt);
-    let mut units = Vec::new();
-    let mut seen = HashSet::new();
-    for line in prompt.lines() {
-        let trimmed = line.trim();
-        if !(trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ")) {
-            continue;
-        }
-        let signature = trimmed.trim_end_matches('{').trim().to_string();
-        if signature.is_empty() || !seen.insert(signature.clone()) {
-            continue;
-        }
-        units.push(CodeWorkUnit {
-            signature: Some(signature),
-            requirements: requirements.clone(),
-            source_excerpt: excerpt_chars(prompt, 1200),
-        });
-        if units.len() >= max_units {
-            break;
-        }
-    }
-    if units.is_empty() {
-        units.push(CodeWorkUnit {
-            signature: None,
-            requirements,
-            source_excerpt: excerpt_chars(prompt, 1600),
-        });
-    }
-    units
-}
-
-fn extract_prompt_requirements(prompt: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_rules = false;
-    for line in prompt.lines() {
-        let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case("rules:") {
-            in_rules = true;
-            continue;
-        }
-        if in_rules {
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(rule) = trimmed.strip_prefix("- ") {
-                out.push(rule.trim().to_string());
-            } else if trimmed.ends_with(':') {
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn excerpt_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(max_chars).collect::<String>();
-    out.push_str("\n...");
-    out
-}
-
-fn build_rlm_code_prompt(
-    prompt: &str,
-    unit: &CodeWorkUnit,
-    unit_idx: usize,
-    total: usize,
-) -> String {
-    let mut out = String::new();
-    out.push_str("<action:code>\n");
-    out.push_str("<tool:edit_file>\n");
-    out.push_str("Return only Rust code for this recursive local work unit.\n");
-    out.push_str("Do not explain. Prefer one complete function unless helper code is required.\n");
-    if total > 1 {
-        out.push_str(&format!("Work unit {}/{}.\n", unit_idx + 1, total));
-    }
-    if let Some(signature) = unit.signature.as_ref() {
-        out.push_str("\nExact function signature:\n");
-        out.push_str(signature);
-        out.push('\n');
-    }
-    if !unit.requirements.is_empty() {
-        out.push_str("\nRequirements:\n");
-        for requirement in &unit.requirements {
-            out.push_str("- ");
-            out.push_str(requirement);
-            out.push('\n');
-        }
-    }
-    out.push_str("\nOriginal request excerpt:\n");
-    out.push_str(&unit.source_excerpt);
-    if !prompt.contains(&unit.source_excerpt) {
-        out.push_str(
-            "\n\nFull request was truncated; obey the exact signature and requirements above.",
-        );
-    }
-    out
-}
-
 fn augment_prompt_with_rust_docs(prompt: &str) -> String {
     if prompt.contains("<ctx:rust_docs>") {
         return prompt.to_string();
     }
     let docs = crate::tasks::rust_docs::retrieve_rust_docs(prompt, 5, 2600);
     if docs.trim().is_empty() {
-        prompt.to_string()
-    } else {
-        format!("{prompt}\n\n{docs}")
-    }
-}
-
-fn build_ephemeral_docs_prompt(prompt: &str, docs: Option<&str>) -> String {
-    let Some(docs) = docs.map(str::trim).filter(|docs| !docs.is_empty()) else {
-        return prompt.to_string();
-    };
-    if prompt.contains("<ctx:rust_docs>") {
         prompt.to_string()
     } else {
         format!("{prompt}\n\n{docs}")
@@ -3928,17 +3906,18 @@ impl AgentEngine {
         world_varmap.load(world_model_path)?;
         util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
         let world_vb = VarBuilder::from_varmap(&world_varmap, runtime_dtype, &device);
-        let planner_memory = PlannerMemory::new(
-            world_vb.pp("planner_memory"),
+        let context_compressor = ContextCompressor::new(
+            world_vb.pp("context_compressor"),
             dim,
             bridge_dim,
             num_latent_tokens,
         )?;
-        let transition = WorldTransition::new(world_vb.pp("world_transition"), bridge_dim)?;
-        let orchestrator_head =
-            if checkpoint_has_prefix(world_model_path, "orchestrator_action_head.") {
-                Some(OrchestratorActionHead::new(
-                    world_vb.pp("orchestrator_action_head"),
+        let transition =
+            ActionStateTransition::new(world_vb.pp("action_state_transition"), bridge_dim)?;
+        let action_classifier_head =
+            if checkpoint_has_prefix(world_model_path, "next_action_classifier.") {
+                Some(NextActionClassifier::new(
+                    world_vb.pp("next_action_classifier"),
                     bridge_dim,
                 )?)
             } else {
@@ -3964,23 +3943,25 @@ impl AgentEngine {
             .exists()
             .then_some(high_world_model_path);
         let high_macro_max_len = env_usize("TOFY_HWM_MACRO_MAX_LEN", 4);
-        let (high_world_varmap, macro_action_encoder, high_transition) =
+        let (high_world_varmap, action_sequence_encoder, macro_transition) =
             if let Some(path) = high_world_model_path.as_ref().filter(|path| path.exists()) {
                 let mut high_varmap = VarMap::new();
                 high_varmap.load(path)?;
                 util::cast_varmap_dtype(&mut high_varmap, runtime_dtype)?;
                 let high_vb = VarBuilder::from_varmap(&high_varmap, runtime_dtype, &device);
-                let macro_encoder = MacroActionEncoder::new(
-                    high_vb.pp("macro_action_encoder"),
+                let macro_encoder = ActionSequenceEncoder::new(
+                    high_vb.pp("action_sequence_encoder"),
                     bridge_dim,
                     high_macro_max_len,
                 )?;
-                let high_transition =
-                    HighLevelWorldTransition::new(high_vb.pp("high_world_transition"), bridge_dim)?;
+                let macro_transition = MacroActionStateTransition::new(
+                    high_vb.pp("macro_action_state_transition"),
+                    bridge_dim,
+                )?;
                 (
                     Some(high_varmap),
                     Some(macro_encoder),
-                    Some(high_transition),
+                    Some(macro_transition),
                 )
             } else {
                 (None, None, None)
@@ -3992,16 +3973,13 @@ impl AgentEngine {
             _high_world_varmap: high_world_varmap,
             encoder_vocab,
             encoder,
-            planner_memory,
+            context_compressor,
             transition,
             high_world_model_path,
-            macro_action_encoder,
-            high_transition,
-            orchestrator_head,
+            action_sequence_encoder,
+            macro_transition,
+            action_classifier_head,
             max_seq,
-            dim,
-            num_layers,
-            num_heads,
             bridge_dim,
             num_latent_tokens,
             context_segments: std::env::var("TOFY_ENCODER_CONTEXT_SEGMENTS")
@@ -4016,8 +3994,8 @@ impl AgentEngine {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1usize)
                 .max(1),
-            recursive_planner_memory: env_bool(
-                "TOFY_RECURSIVE_PLANNER_MEMORY",
+            recursive_context_compressor: env_bool(
+                "TOFY_RECURSIVE_CONTEXT_COMPRESSION",
                 std::env::var("TOFY_ENCODER_CONTEXT_SEGMENTS")
                     .ok()
                     .or_else(|| std::env::var("TOFY_WORLD_CONTEXT_SEGMENTS").ok())
@@ -4034,23 +4012,23 @@ impl AgentEngine {
         })
     }
 
-    /// Encode current prompt into private planner memory slots.
-    fn encode_prompt_planner_memory(&self, current_prompt: &str) -> Result<Tensor> {
+    /// Encode current prompt into private context compressor slots.
+    fn encode_prompt_context_compressor(&self, current_prompt: &str) -> Result<Tensor> {
         let tokens = tokenize_for_inference(current_prompt);
         if tokens.is_empty() {
             bail!("prompt tokenized to empty sequence");
         }
         let ids = self.encoder_vocab.encode(&tokens);
         let token_sequences = [ids.as_slice()];
-        planner_slots_from_token_sequences(
+        context_slots_from_token_sequences(
             &self.encoder,
-            &self.planner_memory,
+            &self.context_compressor,
             &token_sequences,
             self.encoder_vocab.pad_id,
             self.max_seq,
             self.context_segments,
             self.recent_full_segments,
-            self.recursive_planner_memory,
+            self.recursive_context_compressor,
             &self.device,
         )
     }
@@ -4063,12 +4041,12 @@ impl AgentEngine {
         use crate::tasks::orchestrator::{
             action_from_index, decide_next_action, guard_inference_action,
         };
-        if let Some(ref h) = self.orchestrator_head {
+        if let Some(ref h) = self.action_classifier_head {
             let logits = h.forward(state_slots)?;
             let rows = crate::util::vec2_f32(&logits)?;
             let row = rows
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("empty orchestrator logits"))?;
+                .ok_or_else(|| anyhow::anyhow!("empty action_classifier logits"))?;
             let predicted = row
                 .iter()
                 .enumerate()
@@ -4086,7 +4064,7 @@ impl AgentEngine {
         prompt: &str,
         action: crate::tasks::orchestrator::Action,
     ) -> Result<Tensor> {
-        self.encode_prompt_planner_memory(&lewm_prompt_goal(prompt, action))
+        self.encode_prompt_context_compressor(&lewm_prompt_goal(prompt, action))
     }
 
     fn lewm_action_prior(&self, prompt: &str, action: crate::tasks::orchestrator::Action) -> f32 {
@@ -4106,7 +4084,7 @@ impl AgentEngine {
         slots: &Tensor,
         action: crate::tasks::orchestrator::Action,
     ) -> Result<f32> {
-        let Some(head) = self.orchestrator_head.as_ref() else {
+        let Some(head) = self.action_classifier_head.as_ref() else {
             return Ok(0.0);
         };
         let logits = head.forward(slots)?;
@@ -4115,6 +4093,73 @@ impl AgentEngine {
             .first()
             .ok_or_else(|| anyhow::anyhow!("empty planner route logits"))?;
         Ok(softmax_probability(row, action as usize).ln())
+    }
+
+    fn latent_reasoning_score(
+        &self,
+        slots: &Tensor,
+        anchor_slots: &Tensor,
+        goal_slots: &Tensor,
+        action: crate::tasks::orchestrator::Action,
+        cfg: &LatentReasoningConfig,
+    ) -> Result<f32> {
+        let goal_loss = util::scalar_f32(&prediction_loss(slots, goal_slots)?)?;
+        let stability_loss = util::scalar_f32(&prediction_loss(slots, anchor_slots)?)?;
+        let route_reward = self.lewm_route_reward(slots, action)?;
+        Ok(
+            cfg.goal_weight * goal_loss + cfg.stability_weight * stability_loss
+                - cfg.route_weight * route_reward,
+        )
+    }
+
+    fn refine_latent_for_decoder(
+        &self,
+        prompt: &str,
+        action: crate::tasks::orchestrator::Action,
+        anchor_slots: &Tensor,
+    ) -> Result<Tensor> {
+        let cfg = LatentReasoningConfig::from_env(prompt, action);
+        if !cfg.enabled {
+            return Ok(anchor_slots.clone());
+        }
+        let goal_slots = self.lewm_goal_slots(prompt, action)?;
+        let mut current = anchor_slots.clone();
+        let mut best = anchor_slots.clone();
+        let mut best_score =
+            self.latent_reasoning_score(&best, anchor_slots, &goal_slots, action, &cfg)?;
+        let mut stale_steps = 0usize;
+
+        for depth in 1..=cfg.max_steps {
+            let proposed = self.transition.forward_one(&current, action as u32)?;
+            let refined = proposed
+                .affine(cfg.alpha, 0.0)?
+                .broadcast_add(&anchor_slots.affine(1.0 - cfg.alpha, 0.0)?)?;
+            let score =
+                self.latent_reasoning_score(&refined, anchor_slots, &goal_slots, action, &cfg)?;
+            if score + cfg.improvement_eps < best_score {
+                best_score = score;
+                best = refined.clone();
+                stale_steps = 0;
+            } else {
+                stale_steps += 1;
+            }
+            current = refined;
+            if depth >= cfg.min_steps && stale_steps >= cfg.patience {
+                break;
+            }
+        }
+
+        if std::env::var("JEPA_DEBUG").is_ok() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[tofy] latent reasoning action={} score={:.4} max_steps={}",
+                action.as_str(),
+                best_score,
+                cfg.max_steps
+            );
+            let _ = std::io::stderr().flush();
+        }
+        Ok(best)
     }
 
     fn lewm_score_sequence(
@@ -4217,9 +4262,9 @@ impl AgentEngine {
         lewm_cfg: &LeWmPlanningConfig,
     ) -> Result<Option<LeWmPlan>> {
         let hwm_cfg = HwmPlanningConfig::from_env();
-        let (Some(macro_encoder), Some(high_transition)) = (
-            self.macro_action_encoder.as_ref(),
-            self.high_transition.as_ref(),
+        let (Some(macro_encoder), Some(macro_transition)) = (
+            self.action_sequence_encoder.as_ref(),
+            self.macro_transition.as_ref(),
         ) else {
             return Ok(None);
         };
@@ -4239,7 +4284,7 @@ impl AgentEngine {
                 .map(|action| *action as u32)
                 .collect::<Vec<_>>()];
             let macro_action = macro_encoder.forward_from_slices(&action_ids, &self.device)?;
-            let subgoal_slots = high_transition.forward(state_slots, &macro_action)?;
+            let subgoal_slots = macro_transition.forward(state_slots, &macro_action)?;
             let goal_loss = util::scalar_f32(&prediction_loss(&subgoal_slots, &goal_slots)?)?;
             let prior = self.lewm_action_prior(prompt, first_action);
             let score = lewm_cfg.goal_weight * goal_loss - lewm_cfg.prior_weight * prior;
@@ -4366,36 +4411,18 @@ impl AgentEngine {
         self.high_world_model_path.as_deref()
     }
 
-    fn conditioning_for_action_prompt(
+    /// Build decoder + conditioning from predicted next context compressor.
+    fn get_decoder_and_cond_from_context_compressor(
         &self,
-        prompt: &str,
-        action: crate::tasks::orchestrator::Action,
-        ablate_conditioning: bool,
-    ) -> Result<Vec<f32>> {
-        let state_slots = self.encode_prompt_planner_memory(prompt)?;
-        let next_slots = rollout_transition_slots(
-            &self.transition,
-            &state_slots,
-            action as u32,
-            self.world_rollout_steps,
-        )
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        let mut cond_vec = util::vec1_f32(&next_slots.flatten_all()?)?;
-        if ablate_conditioning {
-            cond_vec.fill(0.0);
-        }
-        Ok(cond_vec)
-    }
-
-    /// Build decoder + conditioning from predicted next planner memory.
-    fn get_decoder_and_cond_from_planner_memory(
-        &self,
-        next_planner_slots: &Tensor,
+        next_context_slots: &Tensor,
         action: crate::tasks::orchestrator::Action,
         ablate_conditioning: bool,
     ) -> Result<(Box<dyn LocalDecoderRuntime>, Vec<f32>)> {
-        let planner_vec = util::vec1_f32(&next_planner_slots.flatten_all()?)?;
-        let pooled_planner = self.planner_memory.pool(next_planner_slots)?.squeeze(0)?;
+        let planner_vec = util::vec1_f32(&next_context_slots.flatten_all()?)?;
+        let pooled_planner = self
+            .context_compressor
+            .pool(next_context_slots)?
+            .squeeze(0)?;
         let pooled_planner = util::vec1_f32(&pooled_planner)?;
         let explicit_code_decoder = std::env::var("JEPA_USE_CANDLE_DECODER")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -4442,204 +4469,12 @@ impl AgentEngine {
         if ablate_conditioning {
             cond_vec.fill(0.0);
         }
-        Ok((decoder, cond_vec))
-    }
-
-    fn generate_code_rlm(
-        &self,
-        decoder: &dyn LocalDecoderRuntime,
-        prompt: &str,
-        max_new_tokens: usize,
-        ablate_conditioning: bool,
-    ) -> Result<String> {
-        let cfg = RlmConfig::from_env(max_new_tokens);
-        let mut env = RlmEnvironment::new(prompt, &cfg);
-        let mut program = if cfg.model_program {
-            self.generate_rlm_program(decoder, &env, &cfg, ablate_conditioning)
-                .unwrap_or_default()
+        let decoder = if RlmDecoderRuntime::should_wrap_action(action.as_str()) {
+            Box::new(RlmDecoderRuntime::new(decoder)) as Box<dyn LocalDecoderRuntime>
         } else {
-            Vec::new()
+            decoder
         };
-        if program.is_empty() {
-            program = build_default_rlm_program(env.units.len());
-            env.record("root: using deterministic RLM program");
-        } else {
-            env.record("root: using model-generated RLM program");
-        }
-        let output =
-            self.execute_rlm_program(decoder, &mut env, &program, 0, &cfg, ablate_conditioning)?;
-        if std::env::var("JEPA_DEBUG").is_ok() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "[tofy] rlm trace: {}",
-                env.trace.join(" | ")
-            );
-            let _ = std::io::stderr().flush();
-        }
-        Ok(output)
-    }
-
-    fn generate_rlm_program(
-        &self,
-        decoder: &dyn LocalDecoderRuntime,
-        env: &RlmEnvironment,
-        cfg: &RlmConfig,
-        ablate_conditioning: bool,
-    ) -> Result<Vec<RlmProgramOp>> {
-        use crate::tasks::orchestrator::Action;
-        let program_prompt = build_rlm_program_prompt(env, cfg);
-        let cond_vec = self.conditioning_for_action_prompt(
-            &program_prompt,
-            Action::Code,
-            ablate_conditioning,
-        )?;
-        let raw = decoder.generate(
-            &program_prompt,
-            Action::Code.as_str(),
-            &cond_vec,
-            cfg.program_tokens,
-        )?;
-        Ok(parse_rlm_program(&raw))
-    }
-
-    fn execute_rlm_program(
-        &self,
-        decoder: &dyn LocalDecoderRuntime,
-        env: &mut RlmEnvironment,
-        program: &[RlmProgramOp],
-        depth: usize,
-        cfg: &RlmConfig,
-        ablate_conditioning: bool,
-    ) -> Result<String> {
-        let mut ops_run = 0usize;
-        let truncated = program.len() > cfg.max_ops;
-        for op in program.iter().take(cfg.max_ops) {
-            ops_run += 1;
-            match op {
-                RlmProgramOp::Unit { index, var } => {
-                    let Some(unit) = env.units.get(*index) else {
-                        env.record(format!("depth={depth} UNIT {index} skipped"));
-                        continue;
-                    };
-                    let local_prompt =
-                        build_rlm_code_prompt(&env.prompt, unit, *index, env.units.len());
-                    env.store(var, local_prompt);
-                    env.record(format!("depth={depth} UNIT {index} AS {var}"));
-                }
-                RlmProgramOp::FetchDocs {
-                    query_var,
-                    output_var,
-                } => {
-                    let Some(query) = env.load(query_var) else {
-                        env.record(format!("depth={depth} FETCH_DOCS missing {query_var}"));
-                        continue;
-                    };
-                    let docs = crate::tasks::rust_docs::retrieve_rust_docs(&query, 4, 2200);
-                    env.store(output_var, docs);
-                    env.record(format!(
-                        "depth={depth} FETCH_DOCS {query_var} AS {output_var}"
-                    ));
-                }
-                RlmProgramOp::Peek { start, len, var } => {
-                    let value = env.peek_chars(*start, *len);
-                    env.store(var, value);
-                    env.record(format!("depth={depth} PEEK {start} {len} AS {var}"));
-                }
-                RlmProgramOp::SubRlm {
-                    input_var,
-                    docs_var,
-                    output_var,
-                } => {
-                    let Some(input) = env.load(input_var) else {
-                        env.record(format!("depth={depth} SUB_RLM missing {input_var}"));
-                        continue;
-                    };
-                    let docs = docs_var.as_deref().and_then(|name| env.load(name));
-                    let output = self.invoke_code_sub_rlm(
-                        decoder,
-                        &input,
-                        docs.as_deref(),
-                        depth + 1,
-                        cfg,
-                        ablate_conditioning,
-                    )?;
-                    env.store(output_var, output);
-                    if let Some(docs_var) = docs_var {
-                        env.record(format!(
-                            "depth={depth} SUB_RLM {input_var} WITH {docs_var} AS {output_var}"
-                        ));
-                    } else {
-                        env.record(format!("depth={depth} SUB_RLM {input_var} AS {output_var}"));
-                    }
-                }
-                RlmProgramOp::Append { var } => {
-                    if let Some(value) = env.load(var) {
-                        if !value.trim().is_empty() {
-                            env.final_parts.push(value.trim().to_string());
-                        }
-                    }
-                    env.record(format!("depth={depth} APPEND {var}"));
-                }
-                RlmProgramOp::Final => {
-                    env.record(format!("depth={depth} FINAL"));
-                    break;
-                }
-            }
-        }
-        if truncated && ops_run >= cfg.max_ops {
-            env.record(format!("depth={depth} max_ops reached"));
-        }
-        Ok(env.final_parts.join("\n\n"))
-    }
-
-    fn invoke_code_sub_rlm(
-        &self,
-        decoder: &dyn LocalDecoderRuntime,
-        prompt: &str,
-        docs: Option<&str>,
-        depth: usize,
-        cfg: &RlmConfig,
-        ablate_conditioning: bool,
-    ) -> Result<String> {
-        use crate::tasks::orchestrator::Action;
-        let nested_units = extract_rust_work_units(prompt, cfg.max_units);
-        if depth < cfg.max_depth
-            && nested_units.len() > 1
-            && !prompt.starts_with("Return only Rust code for this recursive local work unit.")
-        {
-            let mut child_env = RlmEnvironment::new(prompt, cfg);
-            child_env.record(format!("child depth={depth}: decomposed recursively"));
-            let child_program = build_default_rlm_program(child_env.units.len());
-            return self.execute_rlm_program(
-                decoder,
-                &mut child_env,
-                &child_program,
-                depth,
-                cfg,
-                ablate_conditioning,
-            );
-        }
-        let prompt_for_decoder = build_ephemeral_docs_prompt(prompt, docs);
-        let cond_vec = self.conditioning_for_action_prompt(
-            &prompt_for_decoder,
-            Action::Code,
-            ablate_conditioning,
-        )?;
-        let mut code = decoder.generate(
-            &prompt_for_decoder,
-            Action::Code.as_str(),
-            &cond_vec,
-            cfg.unit_tokens,
-        )?;
-        code = maybe_repair_code_output(
-            decoder,
-            &prompt_for_decoder,
-            Action::Code.as_str(),
-            &cond_vec,
-            cfg.unit_tokens,
-            code,
-        );
-        Ok(code)
+        Ok((decoder, cond_vec))
     }
 
     /// Max tokens per decoder chunk for text (brief reply) and code (block).
@@ -4655,7 +4490,7 @@ impl AgentEngine {
     ) -> Result<String> {
         let start = Instant::now();
         use crate::tasks::orchestrator::Action;
-        let state_slots = self.encode_prompt_planner_memory(prompt)?;
+        let state_slots = self.encode_prompt_context_compressor(prompt)?;
         let plan = self.lewm_plan_from_state(prompt, &state_slots)?;
         let mut action = plan.first_action;
         let next_slots = plan.planned_slots;
@@ -4677,40 +4512,34 @@ impl AgentEngine {
             Action::Done => 0,
             Action::FetchDocs => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
         };
-        let (decoder, cond_vec) = self.get_decoder_and_cond_from_planner_memory(
+        if fetched_docs_action {
+            generation_prompt = augment_prompt_with_rust_docs(prompt);
+        }
+        effective_slots =
+            self.refine_latent_for_decoder(&generation_prompt, action, &effective_slots)?;
+        let (decoder, cond_vec) = self.get_decoder_and_cond_from_context_compressor(
             &effective_slots,
             action,
             ablate_conditioning,
         )?;
-        if self.uses_recursive_code_generation(&generation_prompt, action) {
-            let assistant_content = self.generate_code_rlm(
-                decoder.as_ref(),
-                &generation_prompt,
-                max_new_tokens,
-                ablate_conditioning,
-            )?;
-            if std::env::var("JEPA_DEBUG").is_ok() {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "[tofy] rlm response in {:.2}s",
-                    start.elapsed().as_secs_f64()
-                );
-                let _ = std::io::stderr().flush();
-            }
-            return Ok(assistant_content);
-        }
-        if fetched_docs_action {
-            generation_prompt = augment_prompt_with_rust_docs(prompt);
-        }
-        let mut assistant_content =
-            decoder.generate(&generation_prompt, action.as_str(), &cond_vec, chunk_tokens)?;
+        let decoder_tokens = if RlmDecoderRuntime::should_wrap_action(action.as_str()) {
+            max_new_tokens
+        } else {
+            chunk_tokens
+        };
+        let mut assistant_content = decoder.generate(
+            &generation_prompt,
+            action.as_str(),
+            &cond_vec,
+            decoder_tokens,
+        )?;
         if action == Action::Code && likely_rust_request(&generation_prompt) {
             assistant_content = maybe_repair_code_output(
                 decoder.as_ref(),
                 &generation_prompt,
                 action.as_str(),
                 &cond_vec,
-                chunk_tokens,
+                decoder_tokens,
                 assistant_content,
             );
         }
@@ -4726,7 +4555,7 @@ impl AgentEngine {
     }
 
     pub fn predict_action(&self, prompt: &str) -> Result<crate::tasks::orchestrator::Action> {
-        let state_slots = self.encode_prompt_planner_memory(prompt)?;
+        let state_slots = self.encode_prompt_context_compressor(prompt)?;
         Ok(self
             .lewm_plan_from_state(prompt, &state_slots)?
             .first_action)
@@ -4737,9 +4566,13 @@ impl AgentEngine {
         prompt: &str,
         action: crate::tasks::orchestrator::Action,
     ) -> bool {
-        action == crate::tasks::orchestrator::Action::Code
-            && likely_rust_request(prompt)
-            && rlm_code_enabled()
+        let cfg_min_chars = std::env::var("TOFY_DECODER_RLM_MIN_CHARS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3600usize);
+        RlmDecoderRuntime::should_wrap_action(action.as_str())
+            && (action == crate::tasks::orchestrator::Action::Code
+                || prompt.chars().count() >= cfg_min_chars)
     }
 
     pub fn uses_rust_docs(&self, prompt: &str, action: crate::tasks::orchestrator::Action) -> bool {
@@ -4749,7 +4582,7 @@ impl AgentEngine {
                 && crate::tasks::rust_docs::rust_docs_enabled())
     }
 
-    /// Stream generated text in chunks (for SSE). The orchestrator chooses a single decoder mode for the reply.
+    /// Stream generated text in chunks (for SSE). The action_classifier chooses a single decoder mode for the reply.
     pub fn generate_stream(
         &self,
         prompt: &str,
@@ -4760,7 +4593,7 @@ impl AgentEngine {
         let start = Instant::now();
         use crate::tasks::orchestrator::Action;
         on_chunk("Thinking... ");
-        let state_slots = self.encode_prompt_planner_memory(prompt)?;
+        let state_slots = self.encode_prompt_context_compressor(prompt)?;
         let plan = self.lewm_plan_from_state(prompt, &state_slots)?;
         let mut action = plan.first_action;
         if action == Action::Done {
@@ -4789,39 +4622,25 @@ impl AgentEngine {
             Action::Done => 0,
             Action::FetchDocs => Self::CODE_CHUNK_TOKENS.min(max_new_tokens),
         };
-        let (decoder, cond_vec) = self.get_decoder_and_cond_from_planner_memory(
+        if fetched_docs_action {
+            generation_prompt = augment_prompt_with_rust_docs(prompt);
+        }
+        next_slots = self.refine_latent_for_decoder(&generation_prompt, action, &next_slots)?;
+        let (decoder, cond_vec) = self.get_decoder_and_cond_from_context_compressor(
             &next_slots,
             action,
             ablate_conditioning,
         )?;
-        if self.uses_recursive_code_generation(&generation_prompt, action) {
-            let assistant_content = self.generate_code_rlm(
-                decoder.as_ref(),
-                &generation_prompt,
-                max_new_tokens,
-                ablate_conditioning,
-            )?;
-            if !assistant_content.is_empty() {
-                on_chunk(&assistant_content);
-            }
-            if std::env::var("JEPA_DEBUG").is_ok() {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "[tofy] rlm streamed response in {:.2}s",
-                    start.elapsed().as_secs_f64()
-                );
-                let _ = std::io::stderr().flush();
-            }
-            return Ok(());
-        }
-        if fetched_docs_action {
-            generation_prompt = augment_prompt_with_rust_docs(prompt);
-        }
+        let decoder_tokens = if RlmDecoderRuntime::should_wrap_action(action.as_str()) {
+            max_new_tokens
+        } else {
+            chunk_tokens
+        };
         decoder.generate_stream(
             &generation_prompt,
             action.as_str(),
             &cond_vec,
-            chunk_tokens,
+            decoder_tokens,
             &mut |chunk: &str| on_chunk(chunk),
         )?;
         if std::env::var("JEPA_DEBUG").is_ok() {
@@ -4836,7 +4655,7 @@ impl AgentEngine {
     }
 }
 
-fn planner_memory_mask_from_lengths(
+fn context_compressor_mask_from_lengths(
     features: &EncoderFeatures,
     token_lengths: &[usize],
 ) -> Result<Tensor> {
@@ -4866,7 +4685,7 @@ fn planner_memory_mask_from_lengths(
 }
 
 fn planner_forward_encoder_masked(
-    planner_memory: &PlannerMemory,
+    context_compressor: &ContextCompressor,
     features: &EncoderFeatures,
     token_lengths: &[usize],
 ) -> Result<Tensor> {
@@ -4882,8 +4701,8 @@ fn planner_forward_encoder_masked(
         ],
         1,
     )?;
-    let mask = planner_memory_mask_from_lengths(features, token_lengths)?;
-    planner_memory.forward_masked(&memory, Some(&mask))
+    let mask = context_compressor_mask_from_lengths(features, token_lengths)?;
+    context_compressor.forward_masked(&memory, Some(&mask))
 }
 
 fn maybe_detach_features(features: EncoderFeatures, detach: bool) -> EncoderFeatures {
@@ -4916,7 +4735,7 @@ fn context_segment_ranges(
     ranges
 }
 
-fn planner_memory_segment_batch_from_features(
+fn context_compressor_segment_batch_from_features(
     features: &EncoderFeatures,
     token_lengths: &[usize],
     include_tokens: bool,
@@ -5104,60 +4923,68 @@ fn select_encoder_features(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn planner_slots_from_token_sequences(
+pub(crate) fn context_slots_from_token_sequences(
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
+    context_compressor: &ContextCompressor,
     token_sequences: &[&[u32]],
     pad_id: u32,
     max_seq: usize,
     context_segments: usize,
     recent_full_segments: usize,
-    recursive_planner_memory: bool,
+    recursive_context_compressor: bool,
     device: &Device,
 ) -> Result<Tensor> {
-    planner_slots_from_token_sequences_with_detach(
+    context_slots_from_token_sequences_with_detach(
         encoder,
-        planner_memory,
+        context_compressor,
         token_sequences,
         pad_id,
         max_seq,
         context_segments,
         recent_full_segments,
-        recursive_planner_memory,
+        recursive_context_compressor,
         true,
         device,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn planner_slots_from_token_sequences_with_detach(
+fn context_slots_from_token_sequences_with_detach(
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
+    context_compressor: &ContextCompressor,
     token_sequences: &[&[u32]],
     pad_id: u32,
     max_seq: usize,
     context_segments: usize,
     recent_full_segments: usize,
-    recursive_planner_memory: bool,
+    recursive_context_compressor: bool,
     detach_encoder: bool,
     device: &Device,
 ) -> Result<Tensor> {
     if token_sequences.is_empty() {
-        bail!("planner slot batch is empty");
+        bail!("context slot batch is empty");
     }
     let max_seq = max_seq.max(1);
     let context_segments = context_segments.max(1);
-    let segment_batch_limit = env_usize("TOFY_PLANNER_SEGMENT_BATCH", 64);
+    let segment_batch_limit = env_usize("TOFY_CONTEXT_SEGMENT_BATCH", 64);
+    let hybrid_context = env_bool("TOFY_CONTEXT_HYBRID_MEMORY", true);
+    let hybrid_exact_tail = env_usize(
+        "TOFY_CONTEXT_HYBRID_EXACT_TAIL",
+        max_seq.saturating_mul(recent_full_segments.max(1)),
+    );
+    let hybrid_block_size = env_usize("TOFY_CONTEXT_HYBRID_BLOCK_SIZE", 16);
+    let hybrid_retrieval_slots = env_usize("TOFY_CONTEXT_RETRIEVAL_SLOTS", 8);
 
-    if context_segments == 1 && !recursive_planner_memory {
-        let mut chunk_slots = Vec::new();
+    if context_segments == 1 && !recursive_context_compressor {
+        let mut chunk_slots =
+            Vec::with_capacity(token_sequences.len().div_ceil(segment_batch_limit));
         for chunk in token_sequences.chunks(segment_batch_limit) {
             let (input_buf, token_lengths) = make_tail_token_batch(chunk, max_seq, pad_id);
             let input_ids = Tensor::from_vec(input_buf, (chunk.len(), max_seq), device)?;
             let features =
                 maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
             chunk_slots.push(planner_forward_encoder_masked(
-                planner_memory,
+                context_compressor,
                 &features,
                 &token_lengths,
             )?);
@@ -5174,7 +5001,7 @@ fn planner_slots_from_token_sequences_with_detach(
         pad_id,
     );
     let mut sample_slots = Vec::with_capacity(token_sequences.len());
-    if recursive_planner_memory {
+    if recursive_context_compressor {
         let mut slots_by_record: Vec<Option<Tensor>> = (0..records.len()).map(|_| None).collect();
         for chunk_start in (0..records.len()).step_by(segment_batch_limit) {
             let chunk_end = (chunk_start + segment_batch_limit).min(records.len());
@@ -5188,12 +5015,17 @@ fn planner_slots_from_token_sequences_with_detach(
             )?;
             let features =
                 maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
-            for include_tokens in [false, true] {
-                let local_indices = (0..chunk_len)
-                    .filter(|local_idx| {
-                        records[chunk_start + *local_idx].include_tokens == include_tokens
-                    })
-                    .collect::<Vec<_>>();
+            let mut summary_indices = Vec::new();
+            let mut full_indices = Vec::new();
+            for local_idx in 0..chunk_len {
+                if records[chunk_start + local_idx].include_tokens {
+                    full_indices.push(local_idx);
+                } else {
+                    summary_indices.push(local_idx);
+                }
+            }
+            for (include_tokens, local_indices) in [(false, summary_indices), (true, full_indices)]
+            {
                 if local_indices.is_empty() {
                     continue;
                 }
@@ -5202,12 +5034,12 @@ fn planner_slots_from_token_sequences_with_detach(
                     .iter()
                     .map(|idx| records[chunk_start + *idx].token_len)
                     .collect::<Vec<_>>();
-                let (memory, mask) = planner_memory_segment_batch_from_features(
+                let (memory, mask) = context_compressor_segment_batch_from_features(
                     &selected,
                     &token_lengths,
                     include_tokens,
                 )?;
-                let slots = planner_memory.forward_masked(&memory, Some(&mask))?;
+                let slots = context_compressor.forward_masked(&memory, Some(&mask))?;
                 for (group_pos, local_idx) in local_indices.iter().copied().enumerate() {
                     let record_idx = chunk_start + local_idx;
                     slots_by_record[record_idx] = Some(slots.narrow(0, group_pos, 1)?);
@@ -5222,9 +5054,9 @@ fn planner_slots_from_token_sequences_with_detach(
                 debug_assert_eq!(record.sample_idx, sample_slots.len());
                 let segment_slots = slots_by_record[*record_idx]
                     .as_ref()
-                    .context("missing planner slots for segment record")?;
+                    .context("missing context slots for segment record")?;
                 folded_slots = Some(match folded_slots {
-                    Some(prev_slots) => planner_memory.fold_slots(
+                    Some(prev_slots) => context_compressor.fold_slots(
                         &prev_slots,
                         segment_slots,
                         recursive_memory_retain(
@@ -5253,12 +5085,17 @@ fn planner_slots_from_token_sequences_with_detach(
             )?;
             let features =
                 maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
-            for include_tokens in [false, true] {
-                let local_indices = (0..chunk_len)
-                    .filter(|local_idx| {
-                        records[chunk_start + *local_idx].include_tokens == include_tokens
-                    })
-                    .collect::<Vec<_>>();
+            let mut summary_indices = Vec::new();
+            let mut full_indices = Vec::new();
+            for local_idx in 0..chunk_len {
+                if records[chunk_start + local_idx].include_tokens {
+                    full_indices.push(local_idx);
+                } else {
+                    summary_indices.push(local_idx);
+                }
+            }
+            for (include_tokens, local_indices) in [(false, summary_indices), (true, full_indices)]
+            {
                 if local_indices.is_empty() {
                     continue;
                 }
@@ -5267,7 +5104,7 @@ fn planner_slots_from_token_sequences_with_detach(
                     .iter()
                     .map(|idx| records[chunk_start + *idx].token_len)
                     .collect::<Vec<_>>();
-                let (memory, mask) = planner_memory_segment_batch_from_features(
+                let (memory, mask) = context_compressor_segment_batch_from_features(
                     &selected,
                     &token_lengths,
                     include_tokens,
@@ -5288,13 +5125,23 @@ fn planner_slots_from_token_sequences_with_detach(
             for record_idx in sample_records {
                 let (memory, mask) = memory_by_record[*record_idx]
                     .as_ref()
-                    .context("missing planner memory for segment record")?;
+                    .context("missing context compressor for segment record")?;
                 memory_refs.push(memory);
                 mask_refs.push(mask);
             }
             let memory = Tensor::cat(&memory_refs, 1)?;
             let mask = Tensor::cat(&mask_refs, 1)?;
-            sample_slots.push(planner_memory.forward_masked(&memory, Some(&mask))?);
+            if hybrid_context && sample_records.len() > 1 {
+                sample_slots.push(context_compressor.forward_hybrid_masked(
+                    &memory,
+                    Some(&mask),
+                    hybrid_exact_tail,
+                    hybrid_block_size,
+                    hybrid_retrieval_slots,
+                )?);
+            } else {
+                sample_slots.push(context_compressor.forward_masked(&memory, Some(&mask))?);
+            }
         }
     }
 
@@ -5303,34 +5150,34 @@ fn planner_slots_from_token_sequences_with_detach(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn planner_slots_from_world_pair_batch(
+fn context_slots_from_world_pair_batch(
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
+    context_compressor: &ContextCompressor,
     batch: &[WorldExample],
     pad_id: u32,
     max_seq: usize,
     context_segments: usize,
     recent_full_segments: usize,
-    recursive_planner_memory: bool,
+    recursive_context_compressor: bool,
     detach_encoder: bool,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     if batch.is_empty() {
         bail!("world pair batch is empty");
     }
-    if context_segments > 1 || recursive_planner_memory {
+    if context_segments > 1 || recursive_context_compressor {
         let mut token_sequences = Vec::with_capacity(batch.len() * 2);
         token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
         token_sequences.extend(batch.iter().map(|row| row.next_tokens.as_slice()));
-        let slots = planner_slots_from_token_sequences_with_detach(
+        let slots = context_slots_from_token_sequences_with_detach(
             encoder,
-            planner_memory,
+            context_compressor,
             &token_sequences,
             pad_id,
             max_seq,
             context_segments,
             recent_full_segments,
-            recursive_planner_memory,
+            recursive_context_compressor,
             detach_encoder,
             device,
         )?;
@@ -5344,7 +5191,7 @@ fn planner_slots_from_world_pair_batch(
         token_lengths.extend(next_lens);
         let input_ids = Tensor::cat(&[&state_ids, &next_ids], 0)?;
         let features = maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
-        let slots = planner_forward_encoder_masked(planner_memory, &features, &token_lengths)?;
+        let slots = planner_forward_encoder_masked(context_compressor, &features, &token_lengths)?;
         let batch_size = batch.len();
         let state_slots = slots.narrow(0, 0, batch_size)?;
         let next_slots = slots.narrow(0, batch_size, batch_size)?;
@@ -5353,15 +5200,56 @@ fn planner_slots_from_world_pair_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn planner_slots_from_world_pair_sequences(
+fn context_slots_from_world_post_state_batch(
     encoder: &OnlineEncoder,
-    planner_memory: &PlannerMemory,
+    context_compressor: &ContextCompressor,
     batch: &[WorldExample],
     pad_id: u32,
     max_seq: usize,
     context_segments: usize,
     recent_full_segments: usize,
-    recursive_planner_memory: bool,
+    recursive_context_compressor: bool,
+    detach_encoder: bool,
+    device: &Device,
+) -> Result<Tensor> {
+    if batch.is_empty() {
+        bail!("world post-state batch is empty");
+    }
+    let mut owned_sequences = Vec::with_capacity(batch.len());
+    for row in batch {
+        let mut tokens = Vec::with_capacity(row.state_tokens.len() + row.next_tokens.len());
+        tokens.extend(row.state_tokens.iter().copied());
+        tokens.extend(row.next_tokens.iter().copied());
+        owned_sequences.push(tokens);
+    }
+    let refs = owned_sequences
+        .iter()
+        .map(|tokens| tokens.as_slice())
+        .collect::<Vec<_>>();
+    context_slots_from_token_sequences_with_detach(
+        encoder,
+        context_compressor,
+        &refs,
+        pad_id,
+        max_seq,
+        context_segments,
+        recent_full_segments,
+        recursive_context_compressor,
+        detach_encoder,
+        device,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn context_slots_from_world_pair_sequences(
+    encoder: &OnlineEncoder,
+    context_compressor: &ContextCompressor,
+    batch: &[WorldExample],
+    pad_id: u32,
+    max_seq: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     if batch.is_empty() {
@@ -5370,15 +5258,15 @@ pub(crate) fn planner_slots_from_world_pair_sequences(
     let mut token_sequences = Vec::with_capacity(batch.len() * 2);
     token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
     token_sequences.extend(batch.iter().map(|row| row.next_tokens.as_slice()));
-    let slots = planner_slots_from_token_sequences(
+    let slots = context_slots_from_token_sequences(
         encoder,
-        planner_memory,
+        context_compressor,
         &token_sequences,
         pad_id,
         max_seq,
         context_segments,
         recent_full_segments,
-        recursive_planner_memory,
+        recursive_context_compressor,
         device,
     )?;
     let batch_size = batch.len();
@@ -5387,8 +5275,153 @@ pub(crate) fn planner_slots_from_world_pair_sequences(
     Ok((state_slots, next_slots))
 }
 
+fn world_post_state_loss_weight() -> f64 {
+    std::env::var("TOFY_WORLD_POST_STATE_LOSS_WEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.35)
+        .max(0.0)
+}
+
+fn world_rollout_loss_weight() -> f64 {
+    std::env::var("TOFY_WORLD_ROLLOUT_LOSS_WEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.25)
+        .max(0.0)
+}
+
+fn world_rollout_steps() -> usize {
+    std::env::var("TOFY_WORLD_TRAIN_ROLLOUT_STEPS")
+        .or_else(|_| std::env::var("TOFY_WORLD_ROLLOUT_STEPS"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn continuation_overlap(left: &[u32], right: &[u32]) -> usize {
+    let max = left.len().min(right.len());
+    for len in (1..=max).rev() {
+        if left[left.len() - len..] == right[..len] {
+            return len;
+        }
+    }
+    0
+}
+
+fn continuation_edge_score(from: &WorldExample, to: &WorldExample) -> usize {
+    if from.state_tokens.is_empty() || from.next_tokens.is_empty() || to.state_tokens.is_empty() {
+        return 0;
+    }
+    let mut combined = Vec::with_capacity(from.state_tokens.len() + from.next_tokens.len());
+    combined.extend(from.state_tokens.iter().copied());
+    combined.extend(from.next_tokens.iter().copied());
+    if to.state_tokens.starts_with(&combined) {
+        return combined.len();
+    }
+    if combined.ends_with(&to.state_tokens) {
+        return to.state_tokens.len();
+    }
+    let next_overlap = continuation_overlap(&from.next_tokens, &to.state_tokens);
+    let combined_overlap = continuation_overlap(&combined, &to.state_tokens);
+    next_overlap.max(combined_overlap)
+}
+
+fn continuation_edges(batch: &[WorldExample]) -> Vec<Option<usize>> {
+    let min_overlap = env_usize("TOFY_WORLD_ROLLOUT_MIN_OVERLAP", 24);
+    let mut edges = vec![None; batch.len()];
+    for (from_idx, from) in batch.iter().enumerate() {
+        let mut best = None;
+        let mut best_score = min_overlap.saturating_sub(1);
+        for (to_idx, to) in batch.iter().enumerate() {
+            if from_idx == to_idx {
+                continue;
+            }
+            let score = continuation_edge_score(from, to);
+            if score > best_score {
+                best = Some(to_idx);
+                best_score = score;
+            }
+        }
+        edges[from_idx] = best;
+    }
+    edges
+}
+
+fn index_slot_rows(slots: &Tensor, indices: &[usize]) -> Result<Tensor> {
+    let ids = Tensor::from_vec(
+        indices.iter().map(|idx| *idx as u32).collect::<Vec<_>>(),
+        (indices.len(),),
+        slots.device(),
+    )?;
+    slots
+        .contiguous()?
+        .index_select(&ids, 0)
+        .map_err(Into::into)
+}
+
+fn rollout_loss_from_batch(
+    transition: &ActionStateTransition,
+    state_slots: &Tensor,
+    batch: &[WorldExample],
+    rollout_steps: usize,
+) -> Result<Option<Tensor>> {
+    if batch.len() < 2 || world_rollout_loss_weight() == 0.0 {
+        return Ok(None);
+    }
+    let edges = continuation_edges(batch);
+    let mut starts = Vec::new();
+    let mut current_indices = Vec::new();
+    for (idx, edge) in edges.iter().enumerate() {
+        if edge.is_some() {
+            starts.push(idx);
+            current_indices.push(idx);
+        }
+    }
+    if starts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut pred = index_slot_rows(state_slots, &starts)?;
+    let mut losses = Vec::new();
+    for depth in 0..rollout_steps.max(1) {
+        let mut labels = Vec::with_capacity(current_indices.len());
+        let mut target_indices = Vec::with_capacity(current_indices.len());
+        let mut kept_positions = Vec::with_capacity(current_indices.len());
+        for (pos, &current_idx) in current_indices.iter().enumerate() {
+            if let Some(target_idx) = edges[current_idx] {
+                labels.push(batch[current_idx].action_label);
+                target_indices.push(target_idx);
+                kept_positions.push(pos);
+            }
+        }
+        if target_indices.is_empty() {
+            break;
+        }
+        if kept_positions.len() != current_indices.len() {
+            pred = index_slot_rows(&pred, &kept_positions)?;
+        }
+        let next_pred = transition.forward(&pred, &labels)?;
+        let target = index_slot_rows(state_slots, &target_indices)?;
+        let weight = 0.5f64.powi(depth as i32);
+        losses.push(prediction_loss(&next_pred, &target.detach())?.affine(weight, 0.0)?);
+        pred = next_pred;
+        current_indices = target_indices;
+    }
+
+    if losses.is_empty() {
+        return Ok(None);
+    }
+    let refs = losses.iter().collect::<Vec<_>>();
+    Tensor::stack(&refs, 0)?
+        .mean_all()
+        .map(Some)
+        .map_err(Into::into)
+}
+
 pub(crate) fn rollout_transition_slots(
-    transition: &WorldTransition,
+    transition: &ActionStateTransition,
     state_slots: &Tensor,
     action_label: u32,
     rollout_steps: usize,

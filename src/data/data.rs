@@ -592,7 +592,7 @@ fn recv_prefetched_batch<T>(
         }
         let chunk = rx
             .recv()
-            .map_err(|_| anyhow!("{label} token-cache prefetch worker stopped"))??;
+            .map_err(|_| anyhow!("{label} prefetch worker stopped"))??;
         stash.extend(chunk);
     }
     Ok(batch)
@@ -824,6 +824,8 @@ pub struct RawWorldStream {
     split_remainder: usize,
     exclude_split_matches: bool,
     line_index: usize,
+    prefetch_rx: Option<PrefetchRx<RawWorldExample>>,
+    prefetch_stash: VecDeque<RawWorldExample>,
 }
 
 pub struct CachedWorldStream {
@@ -1305,6 +1307,8 @@ impl RawWorldStream {
             split_remainder,
             exclude_split_matches,
             line_index: 0,
+            prefetch_rx: None,
+            prefetch_stash: VecDeque::new(),
         })
     }
 
@@ -1381,12 +1385,69 @@ impl RawWorldStream {
         Ok(self.shuffle_buffer.swap_remove(idx))
     }
 
-    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<RawWorldExample>> {
+    fn next_batch_direct(&mut self, batch_size: usize) -> Result<Vec<RawWorldExample>> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             batch.push(self.next_example()?);
         }
         Ok(batch)
+    }
+
+    fn start_prefetch(&mut self, batch_size: usize) -> Result<()> {
+        if self.prefetch_rx.is_some() {
+            return Ok(());
+        }
+        let prefetch_chunks = token_cache_prefetch_chunks();
+        if prefetch_chunks == 0 {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let shuffle_buffer_size = self.shuffle_buffer_size;
+        let tokenization_mode = self.tokenization_mode;
+        let split_modulus = self.split_modulus;
+        let split_remainder = self.split_remainder;
+        let exclude_split_matches = self.exclude_split_matches;
+        let chunk_size = token_cache_prefetch_chunk_size(batch_size);
+        let (tx, rx) = sync_channel(prefetch_chunks);
+        thread::Builder::new()
+            .name("tofy-raw-prefetch-world".to_string())
+            .spawn(move || {
+                let mut stream = match RawWorldStream::with_split_mode(
+                    &path,
+                    shuffle_buffer_size,
+                    tokenization_mode,
+                    split_modulus,
+                    split_remainder,
+                    exclude_split_matches,
+                ) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        return;
+                    }
+                };
+                loop {
+                    let result = stream.next_batch_direct(chunk_size);
+                    let should_continue = result.is_ok();
+                    if tx.send(result).is_err() || !should_continue {
+                        break;
+                    }
+                }
+            })?;
+        println!(
+            "Raw world prefetch: chunks={} chunk_size={}",
+            prefetch_chunks, chunk_size
+        );
+        self.prefetch_rx = Some(rx);
+        Ok(())
+    }
+
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<RawWorldExample>> {
+        self.start_prefetch(batch_size)?;
+        if let Some(rx) = &self.prefetch_rx {
+            return recv_prefetched_batch(rx, &mut self.prefetch_stash, batch_size, "raw-world");
+        }
+        self.next_batch_direct(batch_size)
     }
 }
 

@@ -12,11 +12,15 @@ use crate::{data, tasks, util};
 const WORLD_TEXT_DATA: &str = "data/ultrachat_pairs.txt";
 const WORLD_DATA: &str = "data/world_mix_pairs.txt";
 const CODE_DATA: &str = "data/rust_code_pairs.txt";
+const GO_CODE_DATA: &str = "data/go_code_pairs.txt";
 const WIKI_DATA: &str = "data/cached_wikimedia_wikipedia_1.txt";
 const ENCODER_DATA: &str = "data/encoder_mix.txt";
-const EVAL_SUITE: &str = "eval/code_assistant_rust_hard.jsonl";
+const EVAL_SUITE: &str = "eval/code_assistant_go_hard.jsonl";
 const RUST_TASK_DATA: &str = "data/rust_instruction_pairs.txt";
 const RUST_REPAIR_DATA: &str = "data/rust_repair_pairs.txt";
+const GO_TASK_DATA: &str = "data/go_instruction_pairs.txt";
+const GO_REPAIR_DATA: &str = "data/go_repair_pairs.txt";
+const GO_FEEDBACK_TRAIN_DATA: &str = "data/code_poc_go_mix.txt";
 const RUST_DOCS_ROOT: &str = "data/sunface_rust-by-practice_en";
 const RUST_DOCS_JEPA_DATA: &str = "data/rust_docs_jepa.txt";
 const RUST_DOCS_PAIR_DATA: &str = "data/rust_docs_pairs.txt";
@@ -32,7 +36,6 @@ const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
 enum MemoryProfile {
     Eight,
     FortyEight,
-    Eighty,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -41,7 +44,7 @@ struct ProfileDefaults {
     world_steps: usize,
     high_world_steps: usize,
     code_decoder_steps: usize,
-    code_polish_steps: usize,
+    go_feedback_steps: usize,
     dim: usize,
     latent_max_seq: usize,
     world_max_seq: usize,
@@ -61,11 +64,11 @@ struct ProfileDefaults {
     world_batch: usize,
     world_warmup_batch: usize,
     code_decoder_batch: usize,
-    code_polish_batch: usize,
+    go_feedback_batch: usize,
     latent_grad_accum: usize,
     world_grad_accum: usize,
     code_decoder_grad_accum: usize,
-    code_polish_grad_accum: usize,
+    go_feedback_grad_accum: usize,
 }
 
 #[derive(Deserialize)]
@@ -74,8 +77,6 @@ struct ModelProfiles {
     eight_gb: ProfileDefaults,
     #[serde(rename = "48gb")]
     forty_eight_gb: ProfileDefaults,
-    #[serde(rename = "80gb")]
-    eighty_gb: ProfileDefaults,
 }
 
 #[derive(Debug)]
@@ -101,14 +102,14 @@ struct PipelinePaths {
     world_stage_dir: PathBuf,
     high_world_stage_dir: PathBuf,
     decoder_stage_dir: PathBuf,
-    decoder_polish_stage_dir: PathBuf,
+    decoder_go_feedback_stage_dir: PathBuf,
     code_eval_stage_dir: PathBuf,
     latent_model: PathBuf,
     world_model: PathBuf,
     world_encoder_model: PathBuf,
     high_world_model: PathBuf,
     code_decoder_base_model: PathBuf,
-    code_decoder_polish_model: PathBuf,
+    code_decoder_go_feedback_model: PathBuf,
     code_decoder_model: PathBuf,
     code_decoder_vocab: PathBuf,
     encoder_cache_vocab: PathBuf,
@@ -128,7 +129,7 @@ struct PipelineMeta<'a> {
     high_world_model: String,
     code_decoder_model: String,
     code_decoder_base_model: String,
-    code_decoder_polish_model: String,
+    code_decoder_go_feedback_model: String,
     code_decoder_vocab: String,
     encoder_data: &'a str,
     world_data: &'a str,
@@ -140,15 +141,15 @@ struct PipelineMeta<'a> {
     world_steps: usize,
     high_world_steps: usize,
     code_decoder_steps: usize,
-    code_polish_steps: usize,
+    go_feedback_steps: usize,
     latent_batch: usize,
     world_batch: usize,
     code_decoder_batch: usize,
-    code_polish_batch: usize,
+    go_feedback_batch: usize,
     latent_grad_accum: usize,
     world_grad_accum: usize,
     code_decoder_grad_accum: usize,
-    code_polish_grad_accum: usize,
+    go_feedback_grad_accum: usize,
     dim: usize,
     layers: usize,
     heads: usize,
@@ -174,8 +175,7 @@ impl MemoryProfile {
         match value {
             "8gb" => Ok(Self::Eight),
             "48gb" => Ok(Self::FortyEight),
-            "80gb" => Ok(Self::Eighty),
-            other => bail!("unsupported train profile '{other}' (expected 8gb, 48gb, or 80gb)"),
+            other => bail!("unsupported train profile '{other}' (expected 8gb or 48gb)"),
         }
     }
 
@@ -183,7 +183,6 @@ impl MemoryProfile {
         match self {
             Self::Eight => "8gb",
             Self::FortyEight => "48gb",
-            Self::Eighty => "80gb",
         }
     }
 
@@ -198,7 +197,6 @@ impl MemoryProfile {
         Ok(match self {
             Self::Eight => profiles.eight_gb,
             Self::FortyEight => profiles.forty_eight_gb,
-            Self::Eighty => profiles.eighty_gb,
         })
     }
 }
@@ -206,9 +204,7 @@ impl MemoryProfile {
 impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
-            anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
-            )
+            anyhow::anyhow!("usage: train <8gb|48gb> [--resume [latest|run]] [--with-code-eval]")
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
@@ -260,7 +256,7 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         &paths.world_stage_dir,
         &paths.high_world_stage_dir,
         &paths.decoder_stage_dir,
-        &paths.decoder_polish_stage_dir,
+        &paths.decoder_go_feedback_stage_dir,
         &paths.code_eval_stage_dir,
     ] {
         fs::create_dir_all(dir)?;
@@ -289,7 +285,7 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
     train_world(&paths, &cfg, &defaults)?;
     train_high_world(&paths, &cfg, &defaults)?;
     train_code_decoder(&paths, &cfg, &defaults)?;
-    train_code_polish(&paths, &cfg, &defaults)?;
+    train_go_feedback_decoder(&paths, &cfg, &defaults)?;
     let selected_decoder = if cfg.with_code_eval {
         select_decoder_checkpoint(&paths, &defaults)?
     } else {
@@ -306,10 +302,11 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
 
     println!("Pipeline complete.");
     println!(
-        "Serve with: cargo run --release -- --serve {} {} {} 0.0.0.0:8080 {} {} {} {} {} {}",
+        "Serve with: cargo run --release -- --serve {} {} {} {} {} {} {} {} {} {}",
         paths.world_encoder_model.display(),
         matched_encoder_vocab(&paths).display(),
         paths.world_model.display(),
+        pipeline_serve_bind(),
         defaults.dim,
         defaults.world_max_seq,
         defaults.layers,
@@ -321,51 +318,51 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
 }
 
 fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
-    std::env::set_var("TOFY_TRAIN_DTYPE", "bf16");
-    std::env::set_var("TOFY_SIGREG_SLICES", "1024");
-    std::env::set_var("TOFY_SIGREG_POINTS", "17");
-    std::env::set_var("TOFY_LATENT_CONTEXT_SEGMENTS", "4");
-    std::env::set_var("TOFY_LATENT_RECENT_FULL_SEGMENTS", "1");
-    std::env::set_var("TOFY_LATENT_HISTORY_RATIO", "0.35");
-    std::env::set_var("TOFY_WORLD_CONTEXT_SEGMENTS", "2");
-    std::env::set_var("TOFY_WORLD_RECENT_FULL_SEGMENTS", "1");
-    std::env::set_var("TOFY_RECURSIVE_PLANNER_MEMORY", "1");
-    std::env::set_var("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", "2");
-    std::env::set_var("TOFY_WORLD_ROLLOUT_STEPS", "2");
-    std::env::set_var("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.0");
-    std::env::set_var("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.0");
-    std::env::set_var("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.0");
-    std::env::set_var("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.0");
-    std::env::set_var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT", "0.0");
-    std::env::set_var("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
-    std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
-    std::env::set_var("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
-    std::env::set_var("TOFY_BPE_MAX_MERGES", "8192");
-    std::env::set_var("TOFY_BPE_PROGRESS_EVERY_MERGES", "128");
-    std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_ROWS", "25000");
-    std::env::set_var("TOFY_CODE_VOCAB_SAMPLE_BYTES", "16777216");
-    std::env::set_var(
+    set_env_default("TOFY_TRAIN_DTYPE", "bf16");
+    set_env_default("TOFY_SIGREG_SLICES", "1024");
+    set_env_default("TOFY_SIGREG_POINTS", "17");
+    set_env_default("TOFY_LATENT_CONTEXT_SEGMENTS", "4");
+    set_env_default("TOFY_LATENT_RECENT_FULL_SEGMENTS", "1");
+    set_env_default("TOFY_LATENT_HISTORY_RATIO", "0.35");
+    set_env_default("TOFY_WORLD_CONTEXT_SEGMENTS", "2");
+    set_env_default("TOFY_WORLD_RECENT_FULL_SEGMENTS", "1");
+    set_env_default("TOFY_RECURSIVE_CONTEXT_COMPRESSION", "1");
+    set_env_default("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", "2");
+    set_env_default("TOFY_WORLD_ROLLOUT_STEPS", "2");
+    set_env_default("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
+    set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
+    set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
+    set_env_default("TOFY_BPE_MAX_MERGES", "8192");
+    set_env_default("TOFY_BPE_PROGRESS_EVERY_MERGES", "128");
+    set_env_default("TOFY_CODE_VOCAB_SAMPLE_ROWS", "25000");
+    set_env_default("TOFY_CODE_VOCAB_SAMPLE_BYTES", "16777216");
+    set_env_default_owned(
         "TOFY_LATENT_WARMUP_BATCH",
         defaults.latent_warmup_batch.to_string(),
     );
-    std::env::set_var("TOFY_LATENT_WARMUP_GRAD_ACCUM", "1");
-    std::env::set_var(
+    set_env_default("TOFY_LATENT_WARMUP_GRAD_ACCUM", "1");
+    set_env_default_owned(
         "TOFY_WORLD_WARMUP_BATCH",
         defaults.world_warmup_batch.to_string(),
     );
-    std::env::set_var("TOFY_WORLD_WARMUP_GRAD_ACCUM", "1");
-    std::env::set_var("TOFY_WORLD_WARMUP_STEPS", "1200");
-    std::env::set_var("TOFY_WORLD_LOG_EVERY", "1000");
-    std::env::set_var("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
-    std::env::set_var("TOFY_DECODER_LOG_EVERY", "500");
-    std::env::set_var("TOFY_HWM_MACRO_MIN_LEN", "2");
-    std::env::set_var("TOFY_HWM_MACRO_MAX_LEN", "4");
-    std::env::set_var("TOFY_CACHE_DIR", CACHE_DIR);
-    std::env::set_var("TOFY_CACHE_PREFETCH_BATCHES", "1");
+    set_env_default("TOFY_WORLD_WARMUP_GRAD_ACCUM", "1");
+    set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
+    set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
+    set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
+    set_env_default("TOFY_DECODER_LOG_EVERY", "500");
+    set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
+    set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");
+    set_env_default("TOFY_CACHE_DIR", CACHE_DIR);
+    set_env_default("TOFY_CACHE_PREFETCH_BATCHES", "4");
     std::env::remove_var("TOFY_USE_TOKEN_CACHE");
     std::env::remove_var("TOFY_ENCODER_VOCAB");
     if cfg.profile == MemoryProfile::Eight {
-        std::env::set_var("TOFY_PLANNER_SEGMENT_BATCH", "16");
+        set_env_default("TOFY_CONTEXT_SEGMENT_BATCH", "16");
     }
     if cfg.resume {
         std::env::set_var("TOFY_RESUME", "1");
@@ -389,7 +386,7 @@ fn resolve_pipeline_paths(
         (run_id, run_root)
     } else {
         let run_id = format!("code_poc_{}", unix_timestamp()?);
-        let run_root = PathBuf::from("runs").join(&run_id);
+        let run_root = runs_dir().join(&run_id);
         if run_root.exists() {
             bail!("run directory already exists: {}", run_root.display());
         }
@@ -400,25 +397,23 @@ fn resolve_pipeline_paths(
     let world_stage_dir = run_root.join("world");
     let high_world_stage_dir = run_root.join("high_world");
     let decoder_stage_dir = run_root.join("decoder_code");
-    let decoder_polish_stage_dir = run_root.join("decoder_code_polish");
+    let decoder_go_feedback_stage_dir = run_root.join("decoder_code_go_feedback");
     let code_eval_stage_dir = run_root.join("code_eval");
     let latent_model = latent_stage_dir.join("model.safetensors");
     let world_model = world_stage_dir.join("model.safetensors");
     let world_encoder_model = world_stage_dir.join("model.encoder.safetensors");
     let high_world_model = high_world_stage_dir.join("model.safetensors");
     let code_decoder_base_model = decoder_stage_dir.join("model.safetensors");
-    let code_decoder_polish_model = decoder_polish_stage_dir.join("model.safetensors");
+    let code_decoder_go_feedback_model = decoder_go_feedback_stage_dir.join("model.safetensors");
     let code_decoder_model = code_decoder_base_model.clone();
     let code_decoder_vocab = PathBuf::from(format!(
         "{}.vocab.txt",
         trim_safetensors(&code_decoder_base_model)
     ));
-    let encoder_cache_vocab = PathBuf::from(format!(
-        "local_models/vocabs/vocab_encoder_{}_default.txt",
-        defaults.max_vocab
-    ));
-    let code_decoder_cache_vocab = PathBuf::from(format!(
-        "local_models/vocabs/vocab_code_{}_codeaware.txt",
+    let encoder_cache_vocab =
+        vocab_dir().join(format!("vocab_encoder_{}_default.txt", defaults.max_vocab));
+    let code_decoder_cache_vocab = vocab_dir().join(format!(
+        "vocab_code_{}_codeaware.txt",
         defaults.code_decoder_max_vocab
     ));
 
@@ -429,14 +424,14 @@ fn resolve_pipeline_paths(
         world_stage_dir,
         high_world_stage_dir,
         decoder_stage_dir,
-        decoder_polish_stage_dir,
+        decoder_go_feedback_stage_dir,
         code_eval_stage_dir,
         latent_model,
         world_model,
         world_encoder_model,
         high_world_model,
         code_decoder_base_model,
-        code_decoder_polish_model,
+        code_decoder_go_feedback_model,
         code_decoder_model,
         code_decoder_vocab,
         encoder_cache_vocab,
@@ -451,7 +446,7 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         let source_handle = scope.spawn(ensure_pipeline_source_data);
         let docs_handle = scope.spawn(prepare_docs_data);
         let eval_handle =
-            scope.spawn(|| run_prepare(["--generate-code-eval-suite", "--output", EVAL_SUITE]));
+            scope.spawn(|| run_prepare(["--generate-go-code-eval-suite", "--output", EVAL_SUITE]));
 
         join_result(code_handle, "github code data")?;
         join_result(source_handle, "pipeline source data")?;
@@ -480,6 +475,7 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         });
 
         prepare_rust_task_data()?;
+        prepare_go_task_data()?;
 
         let trajectory_handle = docs.rust_std_docs_available.then(|| {
             scope.spawn(|| {
@@ -519,6 +515,28 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             println!("Rust compiler-feedback repair pairs skipped: rustc not found.");
             None
         };
+        let go_repair_handle = if command_available("go") {
+            Some(scope.spawn(|| {
+                run_prepare([
+                    "--prepare-go-repair-tasks",
+                    "--input",
+                    GO_TASK_DATA,
+                    "--output",
+                    GO_REPAIR_DATA,
+                    "--go",
+                    "go",
+                    "--variants-per-sample",
+                    "2",
+                    "--timeout-sec",
+                    "3.0",
+                    "--max-rows",
+                    "4000",
+                ])
+            }))
+        } else {
+            println!("Go compiler-feedback repair pairs skipped: go not found.");
+            None
+        };
 
         if let Some(handle) = trajectory_handle {
             join_result(handle, "rust doc trajectories")?;
@@ -526,13 +544,19 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         if let Some(handle) = repair_handle {
             join_result(handle, "rust repair tasks")?;
         }
+        if let Some(handle) = go_repair_handle {
+            join_result(handle, "go repair tasks")?;
+        }
 
-        let (world_args, code_mix_args) = build_stage1_mix_args(docs.extra_code_mix_args);
+        let (world_args, code_mix_args, go_feedback_mix_args) =
+            build_stage1_mix_args(docs.extra_code_mix_args);
         let world_handle = scope.spawn(move || run_prepare_vec(world_args));
         let code_mix_handle = scope.spawn(move || run_prepare_vec(code_mix_args));
+        let go_feedback_mix_handle = scope.spawn(move || run_prepare_vec(go_feedback_mix_args));
 
         join_result(world_handle, "world mix")?;
         join_result(code_mix_handle, "code decoder mix")?;
+        join_result(go_feedback_mix_handle, "go feedback decoder mix")?;
         join_result(encoder_corpus_handle, "encoder corpus")?;
         Ok(())
     })?;
@@ -544,7 +568,7 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         CODE_TRAIN_DATA.to_string(),
         paths.encoder_cache_vocab.to_string_lossy().to_string(),
         paths.code_decoder_cache_vocab.to_string_lossy().to_string(),
-        CACHE_DIR.to_string(),
+        cache_dir().to_string_lossy().to_string(),
         "--encoder-max-vocab".to_string(),
         defaults.max_vocab.to_string(),
         "--code-max-vocab".to_string(),
@@ -581,6 +605,18 @@ fn prepare_code_source_data() -> Result<()> {
         ])?;
     }
     ensure_nonempty_file(CODE_DATA)?;
+    if !nonempty_file(GO_CODE_DATA) {
+        run_prepare([
+            "--prepare-github-top-code",
+            "--output",
+            GO_CODE_DATA,
+            "--languages",
+            "Go",
+            "--max-files",
+            "120000",
+        ])?;
+    }
+    ensure_nonempty_file(GO_CODE_DATA)?;
     Ok(())
 }
 
@@ -670,7 +706,30 @@ fn prepare_rust_task_data() -> Result<()> {
     Ok(())
 }
 
-fn build_stage1_mix_args(mut extra_code_mix_args: Vec<String>) -> (Vec<String>, Vec<String>) {
+fn prepare_go_task_data() -> Result<()> {
+    run_prepare([
+        "--prepare-go-function-tasks",
+        "--input",
+        GO_CODE_DATA,
+        "--output",
+        GO_TASK_DATA,
+    ])?;
+    if !nonempty_file(GO_TASK_DATA) {
+        run_prepare([
+            "--prepare-go-function-tasks",
+            "--github-top-code",
+            "--max-files",
+            "120000",
+            "--output",
+            GO_TASK_DATA,
+        ])?;
+    }
+    Ok(())
+}
+
+fn build_stage1_mix_args(
+    mut extra_code_mix_args: Vec<String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut world_args = vec![
         "--prepare-world-mix".to_string(),
         "--output".to_string(),
@@ -681,6 +740,10 @@ fn build_stage1_mix_args(mut extra_code_mix_args: Vec<String>) -> (Vec<String>, 
         CODE_DATA.to_string(),
         "--code-pairs".to_string(),
         RUST_TASK_DATA.to_string(),
+        "--code-pairs".to_string(),
+        GO_CODE_DATA.to_string(),
+        "--code-pairs".to_string(),
+        GO_TASK_DATA.to_string(),
     ];
     if nonempty_file(RUST_REPAIR_DATA) {
         world_args.extend(["--code-pairs".to_string(), RUST_REPAIR_DATA.to_string()]);
@@ -690,6 +753,9 @@ fn build_stage1_mix_args(mut extra_code_mix_args: Vec<String>) -> (Vec<String>, 
             "--extra-repeat".to_string(),
             "2".to_string(),
         ]);
+    }
+    if nonempty_file(GO_REPAIR_DATA) {
+        world_args.extend(["--code-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
     }
     if nonempty_file(RUST_STD_DOC_TOOL_DATA) {
         world_args.extend([
@@ -733,7 +799,27 @@ fn build_stage1_mix_args(mut extra_code_mix_args: Vec<String>) -> (Vec<String>, 
     ];
     code_mix_args.extend(extra_code_mix_args);
     code_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
-    (world_args, code_mix_args)
+    let mut go_feedback_mix_args = vec![
+        "--prepare-code-poc-mix".to_string(),
+        "--output".to_string(),
+        GO_FEEDBACK_TRAIN_DATA.to_string(),
+        "--base-pairs".to_string(),
+        GO_CODE_DATA.to_string(),
+        "--instruction-pairs".to_string(),
+        GO_TASK_DATA.to_string(),
+        "--instruction-repeat".to_string(),
+        "6".to_string(),
+    ];
+    if nonempty_file(GO_REPAIR_DATA) {
+        go_feedback_mix_args.extend([
+            "--extra-pairs".to_string(),
+            GO_REPAIR_DATA.to_string(),
+            "--extra-repeat".to_string(),
+            "3".to_string(),
+        ]);
+    }
+    go_feedback_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
+    (world_args, code_mix_args, go_feedback_mix_args)
 }
 
 fn join_result<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>, label: &str) -> Result<T> {
@@ -751,11 +837,9 @@ fn configure_encoder_vocab_env(paths: &PipelinePaths, cfg: &PipelineConfig) -> R
             std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
             return Ok(());
         }
-        if Path::new("local_models/vocabs/vocab_encoder.txt").exists() {
-            std::env::set_var(
-                "TOFY_ENCODER_VOCAB",
-                "local_models/vocabs/vocab_encoder.txt",
-            );
+        let default_vocab = vocab_dir().join("vocab_encoder.txt");
+        if default_vocab.exists() {
+            std::env::set_var("TOFY_ENCODER_VOCAB", default_vocab);
             return Ok(());
         }
         return Ok(());
@@ -789,7 +873,7 @@ fn ensure_pipeline_source_data() -> Result<()> {
         }
         let cached = data::ensure_hub_wikipedia_cached_with_max_files(
             "wikimedia/wikipedia",
-            Path::new("data"),
+            &hub_cache_dir(),
             Some(1),
         )?;
         if cached != Path::new(WIKI_DATA) && !Path::new(WIKI_DATA).exists() {
@@ -847,10 +931,10 @@ fn train_world(
     cfg: &PipelineConfig,
     defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 3/6: world transition ==");
+    println!("== Stage 3/6: action-conditioned state transition ==");
     if stage_complete(cfg, &paths.world_model, "world", defaults.world_steps)? {
         println!(
-            "Skipping world transition; resume state already reached {} steps.",
+            "Skipping action-conditioned state transition; resume state already reached {} steps.",
             defaults.world_steps
         );
         return Ok(());
@@ -907,7 +991,7 @@ fn train_high_world(
     cfg: &PipelineConfig,
     defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 3b/6: integrated high-level world transition ==");
+    println!("== Stage 3b/6: integrated high-level action-conditioned state transition ==");
     if stage_complete(
         cfg,
         &paths.high_world_model,
@@ -915,7 +999,7 @@ fn train_high_world(
         defaults.high_world_steps,
     )? {
         println!(
-            "Skipping high-level world transition; resume state already reached {} steps.",
+            "Skipping high-level action-conditioned state transition; resume state already reached {} steps.",
             defaults.high_world_steps
         );
         std::env::set_var("TOFY_HIGH_WORLD_MODEL", &paths.high_world_model);
@@ -986,6 +1070,7 @@ fn train_code_decoder(
         &paths.code_decoder_base_model,
         None,
         "3e-4",
+        "0.0",
     );
     with_stage("decoder_code", || {
         tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
@@ -994,39 +1079,40 @@ fn train_code_decoder(
     Ok(())
 }
 
-fn train_code_polish(
+fn train_go_feedback_decoder(
     paths: &PipelinePaths,
     cfg: &PipelineConfig,
     defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 5b/6: code decoder instruction polish ==");
+    println!("== Stage 5b/6: Go execution-feedback decoder training ==");
     if stage_complete(
         cfg,
-        &paths.code_decoder_polish_model,
-        "decoder_code_polish",
-        defaults.code_polish_steps,
+        &paths.code_decoder_go_feedback_model,
+        "decoder_code_go_feedback",
+        defaults.go_feedback_steps,
     )? {
         println!(
-            "Skipping code decoder polish; resume state already reached {} steps.",
-            defaults.code_polish_steps
+            "Skipping Go feedback decoder training; resume state already reached {} steps.",
+            defaults.go_feedback_steps
         );
         return Ok(());
     }
     let args = decoder_args(
         paths,
         defaults,
-        RUST_TASK_DATA,
-        defaults.code_polish_steps,
-        defaults.code_polish_batch,
-        defaults.code_polish_grad_accum,
-        &paths.code_decoder_polish_model,
+        GO_FEEDBACK_TRAIN_DATA,
+        defaults.go_feedback_steps,
+        defaults.go_feedback_batch,
+        defaults.go_feedback_grad_accum,
+        &paths.code_decoder_go_feedback_model,
         Some(&paths.code_decoder_base_model),
         "1e-4",
+        "0.0",
     );
-    with_stage("decoder_code_polish", || {
+    with_stage("decoder_code_go_feedback", || {
         tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
     })?;
-    ensure_file(&paths.code_decoder_polish_model)?;
+    ensure_file(&paths.code_decoder_go_feedback_model)?;
     Ok(())
 }
 
@@ -1041,6 +1127,7 @@ fn decoder_args(
     output: &Path,
     init_decoder: Option<&Path>,
     lr: &str,
+    conditioning_loss_weight: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "jepa_ai".to_string(),
@@ -1077,6 +1164,8 @@ fn decoder_args(
         grad_accum.to_string(),
         "--lr".to_string(),
         lr.to_string(),
+        "--conditioning-loss-weight".to_string(),
+        conditioning_loss_weight.to_string(),
     ];
     if let Some(init_decoder) = init_decoder {
         args.extend([
@@ -1090,16 +1179,25 @@ fn decoder_args(
 fn select_decoder_checkpoint(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<PathBuf> {
     println!("== Stage 5c/6: verifier-guided checkpoint selection ==");
     run_code_eval_with_label(paths, defaults, &paths.code_decoder_base_model, "base")?;
-    if paths.code_decoder_polish_model.exists() {
-        run_code_eval_with_label(paths, defaults, &paths.code_decoder_polish_model, "polish")?;
+    if paths.code_decoder_go_feedback_model.exists() {
+        run_code_eval_with_label(
+            paths,
+            defaults,
+            &paths.code_decoder_go_feedback_model,
+            "go_feedback",
+        )?;
     }
     let base = read_summary_metrics(&paths.code_eval_stage_dir.join("base_summary.txt"))?;
     let mut selected = (&paths.code_decoder_base_model, "base", base);
-    let polish_summary = paths.code_eval_stage_dir.join("polish_summary.txt");
-    if polish_summary.exists() {
-        let polish = read_summary_metrics(&polish_summary)?;
-        if metrics_better(&polish, &selected.2) {
-            selected = (&paths.code_decoder_polish_model, "polish", polish);
+    let go_feedback_summary = paths.code_eval_stage_dir.join("go_feedback_summary.txt");
+    if go_feedback_summary.exists() {
+        let go_feedback = read_summary_metrics(&go_feedback_summary)?;
+        if metrics_better(&go_feedback, &selected.2) {
+            selected = (
+                &paths.code_decoder_go_feedback_model,
+                "go_feedback",
+                go_feedback,
+            );
         }
     }
     println!(
@@ -1111,11 +1209,19 @@ fn select_decoder_checkpoint(paths: &PipelinePaths, defaults: &ProfileDefaults) 
 }
 
 fn select_trained_decoder_checkpoint(paths: &PipelinePaths) -> PathBuf {
-    println!(
-        "Code eval skipped; selecting base decoder by default: {}",
-        paths.code_decoder_base_model.display()
-    );
-    paths.code_decoder_base_model.clone()
+    if paths.code_decoder_go_feedback_model.exists() {
+        println!(
+            "Code eval skipped; selecting Go feedback decoder by default: {}",
+            paths.code_decoder_go_feedback_model.display()
+        );
+        paths.code_decoder_go_feedback_model.clone()
+    } else {
+        println!(
+            "Code eval skipped; selecting base decoder by default: {}",
+            paths.code_decoder_base_model.display()
+        );
+        paths.code_decoder_base_model.clone()
+    }
 }
 
 fn final_eval(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<()> {
@@ -1171,6 +1277,8 @@ fn run_code_eval(
         "4".to_string(),
         "--repair-attempts".to_string(),
         "2".to_string(),
+        "--go-timeout-sec".to_string(),
+        "6".to_string(),
     ];
     with_stage(stage, || tasks::eval::try_run_code_eval(&args))?;
     args.clear();
@@ -1262,7 +1370,7 @@ fn resolve_run_root(selector: &str) -> Result<PathBuf> {
     if direct.is_dir() {
         return Ok(direct);
     }
-    let under_runs = PathBuf::from("runs").join(selector);
+    let under_runs = runs_dir().join(selector);
     if under_runs.is_dir() {
         return Ok(under_runs);
     }
@@ -1271,7 +1379,10 @@ fn resolve_run_root(selector: &str) -> Result<PathBuf> {
 
 fn latest_run_root(prefix: &str) -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    for entry in fs::read_dir("runs").context("read runs directory")? {
+    let runs_dir = runs_dir();
+    for entry in fs::read_dir(&runs_dir)
+        .with_context(|| format!("read runs directory {}", runs_dir.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -1384,8 +1495,8 @@ fn write_meta(
         high_world_model: paths.high_world_model.to_string_lossy().to_string(),
         code_decoder_model: paths.code_decoder_model.to_string_lossy().to_string(),
         code_decoder_base_model: paths.code_decoder_base_model.to_string_lossy().to_string(),
-        code_decoder_polish_model: paths
-            .code_decoder_polish_model
+        code_decoder_go_feedback_model: paths
+            .code_decoder_go_feedback_model
             .to_string_lossy()
             .to_string(),
         code_decoder_vocab: paths.code_decoder_vocab.to_string_lossy().to_string(),
@@ -1399,15 +1510,15 @@ fn write_meta(
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,
         code_decoder_steps: defaults.code_decoder_steps,
-        code_polish_steps: defaults.code_polish_steps,
+        go_feedback_steps: defaults.go_feedback_steps,
         latent_batch: defaults.latent_batch,
         world_batch: defaults.world_batch,
         code_decoder_batch: defaults.code_decoder_batch,
-        code_polish_batch: defaults.code_polish_batch,
+        go_feedback_batch: defaults.go_feedback_batch,
         latent_grad_accum: defaults.latent_grad_accum,
         world_grad_accum: defaults.world_grad_accum,
         code_decoder_grad_accum: defaults.code_decoder_grad_accum,
-        code_polish_grad_accum: defaults.code_polish_grad_accum,
+        go_feedback_grad_accum: defaults.go_feedback_grad_accum,
         dim: defaults.dim,
         layers: defaults.layers,
         heads: defaults.heads,
@@ -1509,4 +1620,45 @@ fn unix_timestamp() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX_EPOCH")?
         .as_secs())
+}
+
+fn set_env_default(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+fn set_env_default_owned(key: &str, value: String) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+fn pipeline_serve_bind() -> String {
+    std::env::var("TOFY_SERVE_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+}
+
+fn runs_dir() -> PathBuf {
+    std::env::var("TOFY_RUNS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("runs"))
+}
+
+fn cache_dir() -> PathBuf {
+    std::env::var("TOFY_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(CACHE_DIR))
+}
+
+fn vocab_dir() -> PathBuf {
+    std::env::var("TOFY_VOCAB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("local_models/vocabs"))
+}
+
+fn hub_cache_dir() -> PathBuf {
+    std::env::var("TOFY_HUB_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("TOFY_DATA_DIR").map(|dir| PathBuf::from(dir).join("hub")))
+        .unwrap_or_else(|_| PathBuf::from("data"))
 }

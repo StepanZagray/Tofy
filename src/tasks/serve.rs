@@ -6,7 +6,7 @@ pub const TOFY_MODEL_ID: &str = "tofy";
 
 /// Short description for model list and responses.
 const TOFY_MODEL_DESCRIPTION: &str =
-    "Tofy: JEPA-style dialog-transition agent (encoder -> planner memory -> router -> decoder adapter -> decoder). Local inference with text/code decoder routing.";
+    "Tofy: JEPA-style dialog-transition agent (encoder -> context compressor -> router -> decoder conditioning adapter -> decoder). Local inference with text/code decoder routing.";
 
 use anyhow::{Context, Result};
 use axum::{
@@ -296,9 +296,9 @@ pub async fn run(
     )
     .context("load world model for server")?;
     if let Some(path) = engine.high_world_model_path() {
-        tracing::info!("Integrated high-world planner: {}", path.display());
+        tracing::info!("Integrated macro-action transition: {}", path.display());
     } else {
-        tracing::warn!("Integrated high-world planner checkpoint was not found");
+        tracing::warn!("Integrated macro-action transition checkpoint was not found");
     }
 
     let state = std::sync::Arc::new(Mutex::new(engine));

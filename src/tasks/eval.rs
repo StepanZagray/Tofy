@@ -14,8 +14,9 @@ use crate::util;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 384;
 const DEFAULT_RUST_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_GO_TIMEOUT_SECS: u64 = 6;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CodeEvalTask {
     id: String,
     prompt: String,
@@ -85,9 +86,14 @@ struct EvalConfig {
     code_decoder_path: Option<PathBuf>,
     code_decoder_vocab_path: Option<PathBuf>,
     rustc_bin: String,
+    go_bin: String,
     rust_timeout_secs: u64,
+    go_timeout_secs: u64,
     candidates: usize,
     repair_attempts: usize,
+    conditioning_pareto: bool,
+    condition_budgets: Vec<usize>,
+    cross_schedules: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -114,6 +120,22 @@ fn default_max_new_tokens() -> usize {
     DEFAULT_MAX_NEW_TOKENS
 }
 
+fn parse_usize_csv(value: &str) -> Result<Vec<usize>> {
+    let parsed = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("invalid integer in csv: {s}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        bail!("csv list must not be empty");
+    }
+    Ok(parsed)
+}
+
 pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     if args.len() < 6 || (args[1] != "--eval-code-assistant" && args[1] != "eval-code-assistant") {
         return Ok(false);
@@ -136,7 +158,7 @@ impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>]"
+                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>] [--conditioning-pareto] [--condition-budgets <csv>] [--cross-schedules <csv>]"
             );
         }
         let mut filtered = Vec::new();
@@ -145,12 +167,26 @@ impl EvalConfig {
         let mut code_decoder_vocab_path = None;
         let mut high_world_model_path = None;
         let mut rustc_bin = "rustc".to_string();
+        let mut go_bin = "go".to_string();
         let mut rust_timeout_secs = DEFAULT_RUST_TIMEOUT_SECS;
+        let mut go_timeout_secs = DEFAULT_GO_TIMEOUT_SECS;
         let mut candidates = 1usize;
         let mut repair_attempts = 0usize;
+        let mut conditioning_pareto = false;
+        let mut condition_budgets = vec![0, 4, 8, 16, 32, 64];
+        let mut cross_schedules = vec![
+            "last-only".to_string(),
+            "every-3rd".to_string(),
+            "every-2nd".to_string(),
+            "all".to_string(),
+        ];
         let mut i = 0usize;
         while i < args.len() {
             match args[i].as_str() {
+                "--conditioning-pareto" => {
+                    conditioning_pareto = true;
+                    i += 1;
+                }
                 "--ablate-conditioning" => {
                     ablate_conditioning = true;
                     i += 1;
@@ -183,6 +219,13 @@ impl EvalConfig {
                         .ok_or_else(|| anyhow::anyhow!("--rustc requires binary path"))?;
                     i += 2;
                 }
+                "--go" => {
+                    go_bin = args
+                        .get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--go requires binary path"))?;
+                    i += 2;
+                }
                 "--rust-timeout-sec" => {
                     let value = args
                         .get(i + 1)
@@ -190,6 +233,15 @@ impl EvalConfig {
                     rust_timeout_secs = value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--rust-timeout-sec must be integer"))?;
+                    i += 2;
+                }
+                "--go-timeout-sec" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--go-timeout-sec requires integer"))?;
+                    go_timeout_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--go-timeout-sec must be integer"))?;
                     i += 2;
                 }
                 "--candidates" => {
@@ -208,6 +260,27 @@ impl EvalConfig {
                     repair_attempts = value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--repair-attempts must be integer"))?;
+                    i += 2;
+                }
+                "--condition-budgets" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--condition-budgets requires csv"))?;
+                    condition_budgets = parse_usize_csv(value)?;
+                    i += 2;
+                }
+                "--cross-schedules" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--cross-schedules requires csv"))?;
+                    cross_schedules = value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if cross_schedules.is_empty() {
+                        bail!("--cross-schedules produced no schedules");
+                    }
                     i += 2;
                 }
                 _ => {
@@ -233,9 +306,14 @@ impl EvalConfig {
             code_decoder_path,
             code_decoder_vocab_path,
             rustc_bin,
+            go_bin,
             rust_timeout_secs: rust_timeout_secs.max(1),
+            go_timeout_secs: go_timeout_secs.max(1),
             candidates: candidates.max(1),
             repair_attempts,
+            conditioning_pareto,
+            condition_budgets,
+            cross_schedules,
         })
     }
 }
@@ -247,9 +325,11 @@ struct DecoderOnlyEvalConfig {
     suite_path: PathBuf,
     max_new_tokens: usize,
     planner_dim: usize,
-    num_planner_slots: usize,
+    num_context_slots: usize,
     rustc_bin: String,
+    go_bin: String,
     rust_timeout_secs: u64,
+    go_timeout_secs: u64,
     candidates: usize,
 }
 
@@ -257,12 +337,14 @@ impl DecoderOnlyEvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 3 {
             bail!(
-                "usage: --eval-decoder-only <decoder.safetensors> <decoder_vocab.txt> <suite.jsonl> [max_new_tokens] [planner_dim] [num_planner_slots] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>]"
+                "usage: --eval-decoder-only <decoder.safetensors> <decoder_vocab.txt> <suite.jsonl> [max_new_tokens] [planner_dim] [num_context_slots] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>]"
             );
         }
         let mut filtered = Vec::new();
         let mut rustc_bin = "rustc".to_string();
+        let mut go_bin = "go".to_string();
         let mut rust_timeout_secs = DEFAULT_RUST_TIMEOUT_SECS;
+        let mut go_timeout_secs = DEFAULT_GO_TIMEOUT_SECS;
         let mut candidates = 1usize;
         let mut i = 0usize;
         while i < args.len() {
@@ -274,6 +356,13 @@ impl DecoderOnlyEvalConfig {
                         .ok_or_else(|| anyhow::anyhow!("--rustc requires binary path"))?;
                     i += 2;
                 }
+                "--go" => {
+                    go_bin = args
+                        .get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--go requires binary path"))?;
+                    i += 2;
+                }
                 "--rust-timeout-sec" => {
                     let value = args
                         .get(i + 1)
@@ -281,6 +370,15 @@ impl DecoderOnlyEvalConfig {
                     rust_timeout_secs = value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("--rust-timeout-sec must be integer"))?;
+                    i += 2;
+                }
+                "--go-timeout-sec" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--go-timeout-sec requires integer"))?;
+                    go_timeout_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--go-timeout-sec must be integer"))?;
                     i += 2;
                 }
                 "--candidates" => {
@@ -304,9 +402,11 @@ impl DecoderOnlyEvalConfig {
             suite_path: PathBuf::from(&filtered[2]),
             max_new_tokens: filtered.get(3).and_then(|v| v.parse().ok()).unwrap_or(384),
             planner_dim: filtered.get(4).and_then(|v| v.parse().ok()).unwrap_or(640),
-            num_planner_slots: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(64),
+            num_context_slots: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(64),
             rustc_bin,
+            go_bin,
             rust_timeout_secs: rust_timeout_secs.max(1),
+            go_timeout_secs: go_timeout_secs.max(1),
             candidates: candidates.max(1),
         })
     }
@@ -343,7 +443,6 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
     let run_path = PathBuf::from(&run_dir);
     let scratch_dir = run_path.join("scratch");
     fs::create_dir_all(&scratch_dir)?;
-    let mut results_file = File::create(run_path.join("results.jsonl"))?;
 
     println!("Code-first eval suite");
     println!("suite: {:?}", cfg.suite_path);
@@ -358,11 +457,76 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         cfg.candidates, cfg.repair_attempts
     );
 
+    let pareto_points = if cfg.conditioning_pareto {
+        cfg.condition_budgets
+            .iter()
+            .flat_map(|&budget| {
+                cfg.cross_schedules
+                    .iter()
+                    .map(move |schedule| (budget, schedule.clone()))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![(
+            std::env::var("TOFY_DECODER_CONDITION_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(cfg.num_latent_tokens),
+            std::env::var("TOFY_DECODER_CROSS_ATTN_SCHEDULE").unwrap_or_else(|_| "all".to_string()),
+        )]
+    };
+
+    let mut pareto_rows = Vec::new();
+    for (budget, schedule) in pareto_points {
+        std::env::set_var("TOFY_DECODER_CONDITION_BUDGET", budget.to_string());
+        std::env::set_var("TOFY_DECODER_CROSS_ATTN_SCHEDULE", &schedule);
+        let label = format!("budget_{budget}_schedule_{}", schedule.replace('-', "_"));
+        let results_name = if cfg.conditioning_pareto {
+            format!("results_{label}.jsonl")
+        } else {
+            "results.jsonl".to_string()
+        };
+        let mut results_file = File::create(run_path.join(results_name))?;
+        println!("\npareto_point: condition_budget={budget} cross_schedule={schedule}");
+        let summary =
+            evaluate_code_suite_once(&engine, &cfg, &scratch_dir, &tasks, &mut results_file)?;
+        let summary_text = code_eval_summary_text(&summary);
+        fs::write(run_path.join(format!("summary_{label}.txt")), &summary_text)?;
+        pareto_rows.push(format!(
+            "{budget},{schedule},{:.4},{:.4},{:.4},{:.4}",
+            summary.pass_ok as f32 / summary.task_count.max(1) as f32,
+            summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
+            summary.compile_ok as f32 / summary.task_count.max(1) as f32,
+            summary.tests_ok as f32 / summary.task_count.max(1) as f32,
+        ));
+        if !cfg.conditioning_pareto {
+            fs::write(run_path.join("summary.txt"), &summary_text)?;
+            println!("\n{}", summary_text);
+        }
+    }
+    if cfg.conditioning_pareto {
+        let mut csv =
+            "condition_budget,cross_schedule,suite_pass_rate,constraint_pass_rate,compile_rate,test_pass_rate\n"
+                .to_string();
+        csv.push_str(&pareto_rows.join("\n"));
+        csv.push('\n');
+        fs::write(run_path.join("conditioning_pareto.csv"), &csv)?;
+        println!("\n{csv}");
+    }
+    Ok(())
+}
+
+fn evaluate_code_suite_once(
+    engine: &AgentEngine,
+    cfg: &EvalConfig,
+    scratch_dir: &Path,
+    tasks: &[CodeEvalTask],
+    results_file: &mut File,
+) -> Result<CodeEvalSummary> {
     let mut summary = CodeEvalSummary {
         task_count: tasks.len(),
         ..CodeEvalSummary::default()
     };
-
     for task in tasks {
         let started = Instant::now();
         let predicted_action = engine.predict_action(&task.prompt)?;
@@ -371,7 +535,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         let expected_action = parse_expected_action(&task.expected_action)?;
         let route_ok = predicted_action == expected_action
             || (expected_action == Action::Code && predicted_action == Action::FetchDocs);
-        let best = evaluate_best_candidate(&engine, &cfg, &scratch_dir, &task, route_ok)?;
+        let best = evaluate_best_candidate(engine, cfg, scratch_dir, task, route_ok)?;
         let pass = best.route_ok && best.constraints_ok && best.compile_ok && best.tests_ok;
         summary.route_ok += usize::from(route_ok);
         summary.rlm_used += usize::from(rlm_used);
@@ -381,9 +545,9 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
         let result = CodeEvalTaskResult {
-            id: task.id,
+            id: task.id.clone(),
             predicted_action: action_name(predicted_action).to_string(),
-            expected_action: task.expected_action,
+            expected_action: task.expected_action.clone(),
             rlm_used,
             docs_used,
             candidate_count: cfg.candidates,
@@ -397,7 +561,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
             response_preview: preview_text(&best.response, 240),
             code_preview: preview_text(&best.code, 240),
             detail: preview_text(&best.detail, 600),
-            tags: task.tags,
+            tags: task.tags.clone(),
         };
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
         println!(
@@ -417,8 +581,11 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
             }
         );
     }
+    Ok(summary)
+}
 
-    let summary_text = format!(
+fn code_eval_summary_text(summary: &CodeEvalSummary) -> String {
+    format!(
         "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
@@ -428,10 +595,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         summary.compile_ok as f32 / summary.task_count.max(1) as f32,
         summary.tests_ok as f32 / summary.task_count.max(1) as f32,
         summary.task_count,
-    );
-    fs::write(run_path.join("summary.txt"), &summary_text)?;
-    println!("\n{}", summary_text);
-    Ok(())
+    )
 }
 
 fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
@@ -445,14 +609,14 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         cfg.decoder_vocab_path.clone(),
         cfg.planner_dim,
         cfg.planner_dim,
-        cfg.num_planner_slots,
+        cfg.num_context_slots,
         std::env::var("JEPA_DECODER_TEMP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
         DecoderKind::CodeSpecialist,
     )?;
-    let conditioning = vec![0.0f32; cfg.planner_dim * cfg.num_planner_slots];
+    let conditioning = vec![0.0f32; cfg.planner_dim * cfg.num_context_slots];
     let run_dir = util::create_run_dir("decoder_only_eval")?;
     let run_path = PathBuf::from(&run_dir);
     let scratch_dir = run_path.join("scratch");
@@ -465,8 +629,8 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
     println!("run dir: {}", run_dir);
     println!("decoder: {}", cfg.decoder_path.display());
     println!(
-        "conditioning: zero planner slots={} dim={}",
-        cfg.num_planner_slots, cfg.planner_dim
+        "conditioning: zero context slots={} dim={}",
+        cfg.num_context_slots, cfg.planner_dim
     );
     println!("search: candidates={}", cfg.candidates);
 
@@ -483,7 +647,9 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
             let candidate = evaluate_candidate_response(
                 &scratch_dir,
                 &cfg.rustc_bin,
+                &cfg.go_bin,
                 cfg.rust_timeout_secs,
+                cfg.go_timeout_secs,
                 &task,
                 true,
                 response,
@@ -564,7 +730,9 @@ fn evaluate_best_candidate(
         let mut candidate = evaluate_candidate_response(
             scratch_dir,
             &cfg.rustc_bin,
+            &cfg.go_bin,
             cfg.rust_timeout_secs,
+            cfg.go_timeout_secs,
             task,
             route_ok,
             response,
@@ -585,7 +753,9 @@ fn evaluate_best_candidate(
             candidate = evaluate_candidate_response(
                 scratch_dir,
                 &cfg.rustc_bin,
+                &cfg.go_bin,
                 cfg.rust_timeout_secs,
+                cfg.go_timeout_secs,
                 task,
                 route_ok,
                 repaired_response,
@@ -597,28 +767,37 @@ fn evaluate_best_candidate(
     best.context("eval produced no candidates")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_candidate_response(
     scratch_dir: &Path,
     rustc_bin: &str,
+    go_bin: &str,
     timeout_secs: u64,
+    go_timeout_secs: u64,
     task: &CodeEvalTask,
     route_ok: bool,
     response: String,
     repair_attempts_used: usize,
 ) -> Result<CandidateEval> {
-    let code = extract_code_candidate(&response);
+    let code = extract_code_candidate_for_language(&response, &task.language);
     let (constraints_ok, constraint_detail) = check_constraints(&code, task);
-    let (compile_ok, tests_ok, exec_detail) = if task.language.eq_ignore_ascii_case("rust") {
-        match run_rust_harness(scratch_dir, rustc_bin, timeout_secs, task, &code) {
+    let language = task.language.to_ascii_lowercase();
+    let (compile_ok, tests_ok, exec_detail) = match language.as_str() {
+        "rust" => match run_rust_harness(scratch_dir, rustc_bin, timeout_secs, task, &code) {
             Ok(result) => result,
             Err(err) => (false, false, format!("harness_error: {err}")),
+        },
+        "go" | "golang" => {
+            match run_go_harness(scratch_dir, go_bin, go_timeout_secs, task, &code) {
+                Ok(result) => result,
+                Err(err) => (false, false, format!("harness_error: {err}")),
+            }
         }
-    } else {
-        (
+        _ => (
             false,
             false,
             format!("unsupported language {}", task.language),
-        )
+        ),
     };
     let detail = if !constraint_detail.is_empty() {
         constraint_detail
@@ -662,8 +841,21 @@ fn candidate_rank(candidate: &CandidateEval) -> i32 {
 }
 
 fn build_repair_prompt(task: &CodeEvalTask, previous_code: &str, failure_detail: &str) -> String {
+    let language = task.language.trim();
+    let language_name =
+        if language.eq_ignore_ascii_case("go") || language.eq_ignore_ascii_case("golang") {
+            "Go"
+        } else {
+            "Rust"
+        };
+    let fence = if language_name == "Go" { "go" } else { "rust" };
+    let signature_rule = if language_name == "Go" {
+        "- Keep the exact requested function name and signature.\n- Return Go code for package main only; imports are allowed.\n"
+    } else {
+        "- Keep the exact requested function name and signature.\n"
+    };
     format!(
-        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected Rust code.\nFix the previous attempt while preserving the requested function name and signature.\n\n<ctx:original_request>\n{}\n\n<ctx:previous_attempt>\n```rust\n{}\n```\n\n<ctx:failure_feedback>\n{}\n",
+        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected {language_name} code.\nFix the previous attempt while preserving the requested function name and signature.\n\n<ctx:original_request>\n{}\n\n<ctx:previous_attempt>\n```{fence}\n{}\n```\n\n<ctx:failure_feedback>\n{}\n\n<ctx:constraints>\nRules:\n{signature_rule}- Do not add explanation.\n",
         task.prompt,
         previous_code,
         failure_detail
@@ -715,10 +907,16 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn extract_code_candidate(response: &str) -> String {
+fn extract_code_candidate_for_language(response: &str, language: &str) -> String {
     let cleaned =
         crate::model::decoders::decoder_candle_runtime::clean_candle_decoder_output(response);
-    let mut best_rust = None;
+    let wanted = language.to_ascii_lowercase();
+    let wanted_aliases = match wanted.as_str() {
+        "go" | "golang" => &["go", "golang"][..],
+        "rust" => &["rust", "rs"][..],
+        _ => &[wanted.as_str()][..],
+    };
+    let mut best_lang = None;
     let mut best_any = None;
     let parts: Vec<&str> = cleaned.split("```").collect();
     for fenced in parts.iter().skip(1).step_by(2) {
@@ -737,14 +935,19 @@ fn extract_code_candidate(response: &str) -> String {
         if body.trim().is_empty() {
             continue;
         }
-        if looks_like_lang && first.eq_ignore_ascii_case("rust") && best_rust.is_none() {
-            best_rust = Some(body.trim().to_string());
+        if looks_like_lang
+            && wanted_aliases
+                .iter()
+                .any(|alias| first.eq_ignore_ascii_case(alias))
+            && best_lang.is_none()
+        {
+            best_lang = Some(body.trim().to_string());
         }
         if best_any.is_none() {
             best_any = Some(body.trim().to_string());
         }
     }
-    best_rust
+    best_lang
         .or(best_any)
         .unwrap_or_else(|| cleaned.trim().to_string())
 }
@@ -823,6 +1026,71 @@ fn run_rust_harness(
     )?;
     let tests_ok = test_output.status.success();
     Ok((true, tests_ok, summarize_output("tests", &test_output)))
+}
+
+fn run_go_harness(
+    scratch_dir: &Path,
+    go_bin: &str,
+    timeout_secs: u64,
+    task: &CodeEvalTask,
+    code: &str,
+) -> Result<(bool, bool, String)> {
+    let stem = sanitize_id(&task.id);
+    let task_dir = scratch_dir.join(format!("{stem}_go"));
+    if task_dir.exists() {
+        fs::remove_dir_all(&task_dir)?;
+    }
+    fs::create_dir_all(&task_dir)?;
+    fs::write(task_dir.join("go.mod"), "module tofy_eval\n\ngo 1.22\n")?;
+    let source = task
+        .harness_template
+        .replace("{{code}}", &sanitize_go_submission(code));
+    fs::write(task_dir.join("solution_test.go"), source)?;
+
+    let compile_output = run_command_with_timeout(
+        Command::new(go_bin)
+            .arg("test")
+            .arg("-c")
+            .arg("-o")
+            .arg("solution.test")
+            .arg(".")
+            .current_dir(&task_dir)
+            .env("GOCACHE", scratch_dir.join("go-build-cache"))
+            .env("GOMODCACHE", scratch_dir.join("go-mod-cache"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        Duration::from_secs(timeout_secs),
+    )?;
+    if !compile_output.status.success() {
+        return Ok((false, false, summarize_output("compile", &compile_output)));
+    }
+
+    let test_output = run_command_with_timeout(
+        Command::new(task_dir.join("solution.test"))
+            .arg("-test.v")
+            .current_dir(&task_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        Duration::from_secs(timeout_secs),
+    )?;
+    let tests_ok = test_output.status.success();
+    Ok((true, tests_ok, summarize_output("tests", &test_output)))
+}
+
+fn sanitize_go_submission(code: &str) -> String {
+    let mut lines = code.lines().peekable();
+    while lines
+        .peek()
+        .is_some_and(|line| line.trim().is_empty() || line.trim_start().starts_with("//"))
+    {
+        lines.next();
+    }
+    let mut out = lines.collect::<Vec<_>>().join("\n");
+    let package_re = regex::Regex::new(r"(?m)^\s*package\s+\w+\s*$").unwrap();
+    out = package_re.replace_all(&out, "").to_string();
+    out.trim().to_string()
 }
 
 fn summarize_output(stage: &str, output: &Output) -> String {

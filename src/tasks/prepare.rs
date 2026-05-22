@@ -33,7 +33,7 @@ const DEFAULT_GITHUB_LANGUAGES: &[&str] = &[
     "CSS",
     "HTML",
 ];
-const CODE_EVAL_SUITE_JSONL: &str = include_str!("../../eval/code_assistant_rust_hard.jsonl");
+const CODE_EVAL_SUITE_JSONL: &str = include_str!("../../eval/code_assistant_go_hard.jsonl");
 const DEFAULT_PREPARE_CHUNK_LINES: usize = 16_384;
 const FORBIDDEN_DTYPE_PATTERNS: &[&str] = &[
     ".to_scalar::<f32>()",
@@ -197,8 +197,6 @@ struct OomProbeProfileFile {
     eight_gb: OomProbeProfile,
     #[serde(rename = "48gb")]
     forty_eight_gb: OomProbeProfile,
-    #[serde(rename = "80gb")]
-    eighty_gb: OomProbeProfile,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -259,8 +257,16 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
             run_prepare_rust_function_tasks(&args[2..])?;
             Ok(true)
         }
+        "--prepare-go-function-tasks" | "prepare-go-function-tasks" => {
+            run_prepare_go_function_tasks(&args[2..])?;
+            Ok(true)
+        }
         "--prepare-rust-repair-tasks" | "prepare-rust-repair-tasks" => {
             run_prepare_rust_repair_tasks(&args[2..])?;
+            Ok(true)
+        }
+        "--prepare-go-repair-tasks" | "prepare-go-repair-tasks" => {
+            run_prepare_go_repair_tasks(&args[2..])?;
             Ok(true)
         }
         "--prepare-world-mix" | "prepare-world-mix" => {
@@ -281,6 +287,10 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
         }
         "--generate-code-eval-suite" | "generate-code-eval-suite" => {
             run_generate_code_eval_suite(&args[2..])?;
+            Ok(true)
+        }
+        "--generate-go-code-eval-suite" | "generate-go-code-eval-suite" => {
+            run_generate_go_code_eval_suite(&args[2..])?;
             Ok(true)
         }
         "--check-dtype-discipline" | "check-dtype-discipline" => {
@@ -1591,10 +1601,221 @@ fn run_prepare_rust_function_tasks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut github_top_code = false;
+    let mut split = "train".to_string();
+    let mut max_files: Option<usize> = None;
+    let mut max_rows: Option<usize> = None;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--input" => {
+                input = Some(parse_path_value(args, i, "--input")?);
+                i += 2;
+            }
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--github-top-code" => {
+                github_top_code = true;
+                i += 1;
+            }
+            "--split" => {
+                split = parse_flag_value(args, i, "--split")?;
+                i += 2;
+            }
+            "--max-files" => {
+                max_files = Some(parse_usize_value(args, i, "--max-files")?);
+                i += 2;
+            }
+            "--max-rows" => {
+                max_rows = Some(parse_usize_value(args, i, "--max-rows")?);
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let output = output.context("--output is required")?;
+    if !github_top_code && input.is_none() {
+        bail!("either --input or --github-top-code is required");
+    }
+    let input_paths = input.clone().into_iter().collect::<Vec<_>>();
+    let params = json!({
+        "github_top_code": github_top_code,
+        "split": split,
+        "max_files": max_files,
+        "max_rows": max_rows,
+    });
+    if !force {
+        if let Some(manifest) =
+            artifact_cache_hit("go_function_tasks", &output, &input_paths, &params)?
+        {
+            println!(
+                "Go instruction-pair cache hit: {} (rows={})",
+                output.display(),
+                manifest.rows
+            );
+            return Ok(());
+        }
+    }
+    let samples = if github_top_code {
+        collect_go_functions_from_github_top_code(&split, max_files)?
+    } else {
+        collect_go_functions_from_pairs(input.as_ref().unwrap())?
+    };
+    let written = write_go_instruction_pairs(&samples, &output, max_rows)?;
+    write_artifact_manifest("go_function_tasks", &output, &input_paths, params, written)?;
+    println!(
+        "Wrote {written} Go instruction pairs to {}",
+        output.display()
+    );
+    Ok(())
+}
+
 fn strip_tags(text: &str) -> String {
     let unescaped = unescape_pair_field(text);
     let re = Regex::new(r"(?i)<lang:rust>\s*<(?:ctx|reply)>\s*").unwrap();
     re.replace(&unescaped, "").trim().to_string()
+}
+
+fn collect_go_functions_from_pairs(input: &Path) -> Result<Vec<(String, String)>> {
+    let mut samples = Vec::new();
+    let reader = BufReader::new(File::open(input)?);
+    for raw in reader.lines() {
+        let line = raw?;
+        let Some((left, right)) = line.split_once('\t') else {
+            continue;
+        };
+        let combined = [strip_code_tags(left), strip_code_tags(right)]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        samples.extend(extract_go_functions(&combined));
+    }
+    Ok(samples)
+}
+
+fn collect_go_functions_from_github_top_code(
+    split: &str,
+    max_files: Option<usize>,
+) -> Result<Vec<(String, String)>> {
+    let mut samples = Vec::new();
+    let mut seen_files = 0usize;
+    for row in iter_dataset_rows(GITHUB_TOP_CODE_DATASET_ID, split)? {
+        let language = row_string(&row, "file_language").unwrap_or_default();
+        if language != "Go" {
+            continue;
+        }
+        let Some(content) = row_string(&row, "content") else {
+            continue;
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        samples.extend(extract_go_functions(&content));
+        seen_files += 1;
+        if max_files.is_some_and(|max| seen_files >= max) {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
+fn strip_code_tags(text: &str) -> String {
+    let unescaped = unescape_pair_field(text);
+    let re = Regex::new(r"(?i)<lang:[a-z0-9_+\-#]+>\s*<(?:ctx|reply)>\s*").unwrap();
+    re.replace(&unescaped, "").trim().to_string()
+}
+
+fn extract_go_functions(src: &str) -> Vec<(String, String)> {
+    let func_start_re = Regex::new(
+        r"(?m)^(?P<sig>\s*func\s+(?:\([^)]+\)\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?:\([^{};]*\)|[A-Za-z_][A-Za-z0-9_\.\*\[\]]*)?\s*)\{",
+    )
+    .unwrap();
+    let mut results = Vec::new();
+    for capture in func_start_re.captures_iter(src) {
+        let Some(sig_match) = capture.name("sig") else {
+            continue;
+        };
+        if sig_match.as_str().contains("func (") {
+            continue;
+        }
+        let open_idx = capture.get(0).unwrap().end() - 1;
+        let Some(close_idx) = find_matching_brace(src, open_idx) else {
+            continue;
+        };
+        let signature = sig_match
+            .as_str()
+            .lines()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        let body = src[sig_match.start()..=close_idx].trim().to_string();
+        let line_count = body.lines().count();
+        if !(2..=120).contains(&line_count) || signature.len() > 240 || body.len() > 8_000 {
+            continue;
+        }
+        results.push((signature, body));
+    }
+    results
+}
+
+fn build_go_prompt_variants(signature: &str) -> [String; 3] {
+    let rules = "Rules:\n- Keep the exact function name and signature.\n- Return compilable Go code for package main.\n- Imports are allowed.\n- Do not add explanation.\n";
+    [
+        format!("Return only Go code. Implement exactly this function:\n{signature}\n\n{rules}"),
+        format!("Write the Go function below and return code only:\n{signature}\n\n{rules}"),
+        format!("Complete this Go function implementation. Output only the complete function and required imports:\n{signature}\n\n{rules}"),
+    ]
+}
+
+fn write_go_instruction_pairs(
+    samples: &[(String, String)],
+    output: &Path,
+    max_rows: Option<usize>,
+) -> Result<usize> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = output.with_extension("txt.tmp");
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    let mut seen = HashSet::new();
+    let mut written = 0usize;
+    for (signature, body) in samples {
+        if max_rows.is_some_and(|max| written >= max) {
+            break;
+        }
+        for prompt in build_go_prompt_variants(signature) {
+            if max_rows.is_some_and(|max| written >= max) {
+                break;
+            }
+            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
+            if !seen.insert(digest) {
+                continue;
+            }
+            writeln!(
+                out,
+                "{}\t{}",
+                escape_pair_field(&prompt),
+                escape_pair_field(body)
+            )?;
+            written += 1;
+        }
+    }
+    out.flush()?;
+    fs::rename(tmp, output)?;
+    Ok(written)
 }
 
 fn collect_rust_functions_from_pairs(input: &Path) -> Result<Vec<(String, String)>> {
@@ -1925,6 +2146,136 @@ fn run_prepare_rust_repair_tasks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut go_bin = "go".to_string();
+    let mut seed = 0u64;
+    let mut timeout_sec = 3.0f64;
+    let mut variants_per_sample = 2usize;
+    let mut max_rows = 0usize;
+    let mut progress_every = 5000usize;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--input" => {
+                input = Some(parse_path_value(args, i, "--input")?);
+                i += 2;
+            }
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--go" => {
+                go_bin = parse_flag_value(args, i, "--go")?;
+                i += 2;
+            }
+            "--seed" => {
+                seed = parse_usize_value(args, i, "--seed")? as u64;
+                i += 2;
+            }
+            "--timeout-sec" => {
+                timeout_sec = parse_f64_value(args, i, "--timeout-sec")?;
+                i += 2;
+            }
+            "--variants-per-sample" => {
+                variants_per_sample = parse_usize_value(args, i, "--variants-per-sample")?;
+                i += 2;
+            }
+            "--max-rows" => {
+                max_rows = parse_usize_value(args, i, "--max-rows")?;
+                i += 2;
+            }
+            "--progress-every" => {
+                progress_every = parse_usize_value(args, i, "--progress-every")?;
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let input = input.context("--input is required")?;
+    let output = output.context("--output is required")?;
+    let go_version = go_version_string(&go_bin)?;
+    let params = json!({
+        "go_bin": go_bin,
+        "go_version": go_version,
+        "seed": seed,
+        "timeout_sec": timeout_sec,
+        "variants_per_sample": variants_per_sample,
+        "max_rows": max_rows,
+    });
+    let inputs = vec![input.clone()];
+    if !force {
+        if let Some(manifest) = artifact_cache_hit("go_repair_pairs", &output, &inputs, &params)? {
+            println!(
+                "Go repair-pair cache hit: {} (rows={})",
+                output.display(),
+                manifest.rows
+            );
+            return Ok(());
+        }
+    }
+    let pairs = load_escaped_pairs(&input)?;
+    if pairs.is_empty() {
+        bail!("no usable pairs found in {}", input.display());
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut seen = HashSet::new();
+    let mut written = 0usize;
+    let tmp = output.with_extension("txt.tmp");
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    for (idx, (task_prompt, correct_code)) in pairs.iter().enumerate() {
+        let mut variants = go_corruption_variants(correct_code);
+        variants.shuffle(&mut rng);
+        let mut kept = 0usize;
+        for (_name, broken_code) in variants {
+            if max_rows > 0 && written >= max_rows {
+                break;
+            }
+            let feedback = go_compile_feedback(&go_bin, &broken_code, timeout_sec)?;
+            if feedback.is_empty() {
+                continue;
+            }
+            let prompt =
+                build_language_repair_prompt("Go", "go", task_prompt, &broken_code, &feedback);
+            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{correct_code}")));
+            if !seen.insert(digest) {
+                continue;
+            }
+            writeln!(
+                out,
+                "{}\t{}",
+                escape_pair_field(&prompt),
+                escape_pair_field(correct_code)
+            )?;
+            written += 1;
+            kept += 1;
+            if kept >= variants_per_sample.max(1) {
+                break;
+            }
+        }
+        if progress_every > 0 && (idx + 1) % progress_every == 0 {
+            println!(
+                "Go repair pairs progress: processed={} written={written}",
+                idx + 1
+            );
+        }
+        if max_rows > 0 && written >= max_rows {
+            break;
+        }
+    }
+    out.flush()?;
+    fs::rename(tmp, &output)?;
+    write_artifact_manifest("go_repair_pairs", &output, &inputs, params, written)?;
+    println!("Wrote {written} Go repair rows to {}", output.display());
+    Ok(())
+}
+
 fn rustc_version_string(rustc_bin: &str) -> Result<String> {
     for args in [["--version", "--verbose"], ["--version", ""]] {
         let mut cmd = Command::new(rustc_bin);
@@ -1941,6 +2292,17 @@ fn rustc_version_string(rustc_bin: &str) -> Result<String> {
         }
     }
     bail!("failed to query rustc version from '{rustc_bin}'")
+}
+
+fn go_version_string(go_bin: &str) -> Result<String> {
+    let out = Command::new(go_bin).arg("version").output()?;
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            return Ok(stdout);
+        }
+    }
+    bail!("failed to query Go version from '{go_bin}'")
 }
 
 fn load_escaped_pairs(path: &Path) -> Result<Vec<(String, String)>> {
@@ -1982,6 +2344,40 @@ fn corruption_variants(code: &str) -> Vec<(String, String)> {
         variants.push((
             "wrong_fn_name".to_string(),
             code.replacen(&format!("fn {name}"), &format!("fn broken_{name}"), 1),
+        ));
+    }
+    variants
+}
+
+fn go_corruption_variants(code: &str) -> Vec<(String, String)> {
+    let mut variants = vec![(
+        "stray_role_prefix".to_string(),
+        format!("assistant\n{code}"),
+    )];
+    if code.contains('{') {
+        variants.push(("missing_open_brace".to_string(), code.replacen('{', "", 1)));
+    }
+    if let Some(idx) = code.rfind('}') {
+        variants.push((
+            "missing_close_brace".to_string(),
+            format!("{}{}", &code[..idx], &code[idx + 1..]),
+        ));
+    }
+    if code.contains(":=") {
+        variants.push((
+            "broken_short_assign".to_string(),
+            code.replacen(":=", "=", 1),
+        ));
+    }
+    if code.contains("!=") {
+        variants.push(("broken_comparison".to_string(), code.replacen("!=", "=", 1)));
+    }
+    let func_name_re = Regex::new(r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+    if let Some(capture) = func_name_re.captures(code) {
+        let name = capture.get(1).unwrap().as_str();
+        variants.push((
+            "wrong_func_name".to_string(),
+            code.replacen(&format!("func {name}"), &format!("func Broken{name}"), 1),
         ));
     }
     variants
@@ -2042,9 +2438,63 @@ fn compile_feedback(rustc_bin: &str, code: &str, timeout_sec: f64) -> Result<Str
     Ok(lines.join("\n"))
 }
 
+fn go_compile_feedback(go_bin: &str, code: &str, timeout_sec: f64) -> Result<String> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("tofy-go-repair-{unique}"));
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("go.mod"), "module tofy_repair\n\ngo 1.22\n")?;
+    fs::write(
+        dir.join("candidate.go"),
+        format!("package main\n\n{}\n", strip_go_package_line(code)),
+    )?;
+    let mut cmd = Command::new(go_bin);
+    cmd.arg("test")
+        .arg("-c")
+        .arg(".")
+        .current_dir(&dir)
+        .env("GOCACHE", dir.join("gocache"))
+        .env("GOMODCACHE", dir.join("gomodcache"));
+    let output = run_command_with_timeout(&mut cmd, timeout_sec)?;
+    let _ = fs::remove_dir_all(&dir);
+    if output.status.success() {
+        return Ok(String::new());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = Vec::new();
+    for line in stderr.lines().chain(stdout.lines()) {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+        if lines.len() >= 12 {
+            break;
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn strip_go_package_line(code: &str) -> String {
+    let package_re = Regex::new(r"(?m)^\s*package\s+\w+\s*$").unwrap();
+    package_re.replace_all(code, "").trim().to_string()
+}
+
 fn build_repair_prompt(task_prompt: &str, broken_code: &str, feedback: &str) -> String {
+    build_language_repair_prompt("Rust", "rust", task_prompt, broken_code, feedback)
+}
+
+fn build_language_repair_prompt(
+    language: &str,
+    fence: &str,
+    task_prompt: &str,
+    broken_code: &str,
+    feedback: &str,
+) -> String {
     format!(
-        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected Rust code.\nFix the previous attempt using the compiler feedback.\n\n<ctx:original_request>\nOriginal request:\n{task_prompt}\n\n<ctx:previous_attempt>\nPrevious attempt:\n```rust\n{broken_code}\n```\n\n<ctx:compiler_feedback>\nCompiler feedback:\n{feedback}\n\n<ctx:constraints>\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable Rust code.\n- Do not add explanation.\n"
+        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected {language} code.\nFix the previous attempt using the compiler feedback.\n\n<ctx:original_request>\nOriginal request:\n{task_prompt}\n\n<ctx:previous_attempt>\nPrevious attempt:\n```{fence}\n{broken_code}\n```\n\n<ctx:compiler_feedback>\nCompiler feedback:\n{feedback}\n\n<ctx:constraints>\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable {language} code.\n- Do not add explanation.\n"
     )
 }
 
@@ -2629,7 +3079,7 @@ fn run_prepare_casual_conversation(args: &[String]) -> Result<()> {
 }
 
 fn run_generate_code_eval_suite(args: &[String]) -> Result<()> {
-    let mut output = PathBuf::from("eval/code_assistant_rust_hard.jsonl");
+    let mut output = PathBuf::from("eval/code_assistant_go_hard.jsonl");
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -2645,7 +3095,28 @@ fn run_generate_code_eval_suite(args: &[String]) -> Result<()> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    println!("Wrote {rows} tasks to {}", output.display());
+    println!("Wrote {rows} Go tasks to {}", output.display());
+    Ok(())
+}
+
+fn run_generate_go_code_eval_suite(args: &[String]) -> Result<()> {
+    let mut output = PathBuf::from("eval/code_assistant_go_hard.jsonl");
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" => {
+                output = parse_path_value(args, i, "--output")?;
+                i += 2;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    write_text_atomic(&output, CODE_EVAL_SUITE_JSONL)?;
+    let rows = CODE_EVAL_SUITE_JSONL
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    println!("Wrote {rows} Go tasks to {}", output.display());
     Ok(())
 }
 
@@ -2859,12 +3330,12 @@ fn default_oom_probe_args() -> OomProbeArgs {
         decoder_steps: 1000,
         decoder_batch: 6,
         decoder_accum: 4,
-        decoder_max_seq: 128,
-        decoder_max_vocab: 16_000,
+        decoder_max_seq: 160,
+        decoder_max_vocab: 24_000,
         decoder_dim: 640,
         decoder_layers: 6,
         decoder_heads: 8,
-        decoder_ff_dim: 2560,
+        decoder_ff_dim: 3072,
         setup_latent_steps: 1,
         setup_world_steps: 2,
         latent_model: None,
@@ -2888,8 +3359,7 @@ fn load_oom_probe_profile(name: &str) -> Result<OomProbeProfile> {
     match name {
         "8gb" => Ok(profiles.eight_gb),
         "48gb" => Ok(profiles.forty_eight_gb),
-        "80gb" => Ok(profiles.eighty_gb),
-        other => bail!("--profile must be one of 8gb|48gb|80gb, got {other}"),
+        other => bail!("--profile must be one of 8gb|48gb, got {other}"),
     }
 }
 
@@ -3279,7 +3749,10 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         "TOFY_WORLD_RECENT_FULL_SEGMENTS".to_string(),
         "1".to_string(),
     );
-    env.insert("TOFY_RECURSIVE_PLANNER_MEMORY".to_string(), "1".to_string());
+    env.insert(
+        "TOFY_RECURSIVE_CONTEXT_COMPRESSION".to_string(),
+        "1".to_string(),
+    );
     env.insert(
         "TOFY_WORLD_TRAIN_ROLLOUT_STEPS".to_string(),
         "2".to_string(),
@@ -3290,7 +3763,7 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         env.insert("TOFY_HIGH_WORLD_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_DECODER_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "2".to_string());
-        env.insert("TOFY_PLANNER_SEGMENT_BATCH".to_string(), "64".to_string());
+        env.insert("TOFY_CONTEXT_SEGMENT_BATCH".to_string(), "64".to_string());
     }
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());

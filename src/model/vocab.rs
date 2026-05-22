@@ -46,7 +46,15 @@ impl Vocab {
             merge_ranks: HashMap::new(),
         }
     }
+}
 
+impl Default for Vocab {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vocab {
     fn push_token(
         token_to_id: &mut HashMap<String, u32>,
         id_to_token: &mut Vec<String>,

@@ -8,17 +8,17 @@ use anyhow::Result;
 use candle_core::{Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
-/// Number of actions the orchestrator can predict.
+/// Number of actions the action_classifier can predict.
 pub const NUM_ACTIONS: usize = 4;
 
 /// MLP head on top of pooled latent slots → action logits.
-pub struct OrchestratorActionHead {
+pub struct NextActionClassifier {
     slot_score: nn::Linear,
     fc1: nn::Linear,
     fc2: nn::Linear,
 }
 
-impl OrchestratorActionHead {
+impl NextActionClassifier {
     pub fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
         let hidden = (dim * 2).max(256);
         let slot_score = nn::linear(dim, 1, vb.pp("slot_score"))?;

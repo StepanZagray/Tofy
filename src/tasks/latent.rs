@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +13,7 @@ use crate::data::{
     CachedPairStream, CurriculumDenoisingConfig, PairStream, DEFAULT_MIN_TOKENS_PER_LINE,
     DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
+use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::{vocab_signature, Pair};
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
@@ -48,6 +49,40 @@ fn latent_batch_size_for_step(step: usize, config: &LatentTrainConfig) -> usize 
     } else {
         config.batch_size.max(1)
     }
+}
+
+fn split_encoder_features(
+    features: &EncoderFeatures,
+    batch_size: usize,
+) -> Result<[EncoderFeatures; 3]> {
+    Ok([
+        EncoderFeatures {
+            token_states: features.token_states.narrow(0, 0, batch_size)?,
+            chunk_states: features.chunk_states.narrow(0, 0, batch_size)?,
+            global_states: features.global_states.narrow(0, 0, batch_size)?,
+            pooled_queries: features.pooled_queries.narrow(0, 0, batch_size)?,
+        },
+        EncoderFeatures {
+            token_states: features.token_states.narrow(0, batch_size, batch_size)?,
+            chunk_states: features.chunk_states.narrow(0, batch_size, batch_size)?,
+            global_states: features.global_states.narrow(0, batch_size, batch_size)?,
+            pooled_queries: features.pooled_queries.narrow(0, batch_size, batch_size)?,
+        },
+        EncoderFeatures {
+            token_states: features
+                .token_states
+                .narrow(0, batch_size * 2, batch_size)?,
+            chunk_states: features
+                .chunk_states
+                .narrow(0, batch_size * 2, batch_size)?,
+            global_states: features
+                .global_states
+                .narrow(0, batch_size * 2, batch_size)?,
+            pooled_queries: features
+                .pooled_queries
+                .narrow(0, batch_size * 2, batch_size)?,
+        },
+    ])
 }
 
 fn token_cache_path(kind: &str) -> Option<PathBuf> {
@@ -510,9 +545,13 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
             };
 
-            let view_a_features = encoder.forward_features(&batch.view_a_ids)?;
-            let target_features = encoder.forward_features(&batch.target_ids)?;
-            let paired_view_targets = encoder.forward_features(&batch.view_b_ids)?;
+            let all_view_ids = Tensor::cat(
+                &[&batch.view_a_ids, &batch.target_ids, &batch.view_b_ids],
+                0,
+            )?;
+            let all_view_features = encoder.forward_features(&all_view_ids)?;
+            let [view_a_features, target_features, paired_view_targets] =
+                split_encoder_features(&all_view_features, batch_size)?;
             let context_hidden = view_a_features.token_states.clone();
             let target_hidden = target_features.token_states.clone();
             let (b, t, d) = context_hidden.dims3()?;

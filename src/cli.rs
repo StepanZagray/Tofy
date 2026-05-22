@@ -19,10 +19,14 @@ pub fn resolve_data_path(data_arg: &str) -> Result<ResolvedDataPath> {
 
     let dataset_id = data_arg.strip_prefix("hub:").unwrap_or(data_arg);
     let is_wikipedia = dataset_id.to_ascii_lowercase().contains("wikipedia");
+    let cache_dir = std::env::var("TOFY_HUB_CACHE_DIR")
+        .or_else(|_| std::env::var("TOFY_DATA_DIR").map(|dir| format!("{dir}/hub")))
+        .unwrap_or_else(|_| "data".to_string());
+    let cache_dir = Path::new(&cache_dir);
     let path = if is_wikipedia {
-        ensure_hub_wikipedia_cached(dataset_id, Path::new("data"))?
+        ensure_hub_wikipedia_cached(dataset_id, cache_dir)?
     } else {
-        ensure_hub_dataset_cached(dataset_id, Path::new("data"))?
+        ensure_hub_dataset_cached(dataset_id, cache_dir)?
     };
 
     Ok(ResolvedDataPath { path, is_wikipedia })
@@ -32,7 +36,7 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
+        "    {program} train <8gb|48gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
     );
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
@@ -67,7 +71,7 @@ pub fn print_usage(program: &str) {
         "    {program} --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>] [--resume]"
     );
     eprintln!(
-        "    {program} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
+        "    {program} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--conditioning-loss-weight <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
     );
     eprintln!(
         "    {program} --eval-world <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots]"

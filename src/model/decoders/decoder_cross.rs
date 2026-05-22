@@ -79,6 +79,66 @@ impl DecoderKind {
             Self::CodeSpecialist => 3,
         }
     }
+
+    fn csa_compress_rate(self) -> usize {
+        match self {
+            Self::TextGeneralist => 4,
+            Self::CodeSpecialist => 4,
+        }
+    }
+
+    fn hca_compress_rate(self) -> usize {
+        match self {
+            Self::TextGeneralist => 64,
+            Self::CodeSpecialist => 128,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecoderSelfAttentionKind {
+    Sliding,
+    CompressedSparse,
+    HeavilyCompressed,
+}
+
+fn decoder_self_attention_kind(
+    kind: DecoderKind,
+    layer_idx: usize,
+    num_layers: usize,
+) -> DecoderSelfAttentionKind {
+    if layer_idx == 0 {
+        return DecoderSelfAttentionKind::Sliding;
+    }
+    if layer_idx + 1 == num_layers || layer_idx.is_multiple_of(kind.anchor_period()) {
+        DecoderSelfAttentionKind::CompressedSparse
+    } else {
+        DecoderSelfAttentionKind::HeavilyCompressed
+    }
+}
+
+fn decoder_cross_attention_enabled(layer_idx: usize, num_layers: usize) -> bool {
+    match std::env::var("TOFY_DECODER_CROSS_ATTN_SCHEDULE")
+        .unwrap_or_else(|_| "all".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "last" | "last-only" | "last_only" => layer_idx + 1 == num_layers,
+        "every-3rd" | "every_3rd" | "third" => {
+            layer_idx + 1 == num_layers || layer_idx.is_multiple_of(3)
+        }
+        "every-2nd" | "every_2nd" | "half" => {
+            layer_idx + 1 == num_layers || layer_idx.is_multiple_of(2)
+        }
+        _ => true,
+    }
+}
+
+fn decoder_latent_prefix_enabled() -> bool {
+    std::env::var("TOFY_DECODER_LATENT_PREFIX")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
 }
 
 /// One decoder layer: causal self-attention + cross-attention to world latent + FFN.
@@ -102,6 +162,7 @@ pub struct DecoderGenerationState {
     pub(crate) cross_kv_caches: Vec<AttentionKvCache>,
     pub(crate) domain_state: Tensor,
     pub(crate) structure_state: Tensor,
+    pub(crate) prefix_len: usize,
     pub(crate) last_logits: Option<Tensor>,
 }
 
@@ -138,34 +199,53 @@ impl CodeDecoderBlock {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Tensor,
         world_latent: &Tensor,
         domain_state: &Tensor,
-        use_full_attention: bool,
+        attention_kind: DecoderSelfAttentionKind,
         local_window: usize,
+        csa_compress_rate: usize,
+        hca_compress_rate: usize,
+        use_cross_attention: bool,
     ) -> Result<Tensor> {
         let normed = self.ln1.forward(x)?;
-        let self_out = if use_full_attention {
-            self.self_attn.forward_causal(&normed)?
-        } else {
-            self.self_attn.forward_causal_local(&normed, local_window)?
+        let self_out = match attention_kind {
+            DecoderSelfAttentionKind::Sliding => {
+                self.self_attn.forward_causal_local(&normed, local_window)?
+            }
+            DecoderSelfAttentionKind::CompressedSparse => {
+                self.self_attn.forward_causal_compressed_sparse(
+                    &normed,
+                    local_window,
+                    csa_compress_rate,
+                    self.kind_index_topk(csa_compress_rate),
+                )?
+            }
+            DecoderSelfAttentionKind::HeavilyCompressed => self
+                .self_attn
+                .forward_causal_heavily_compressed(&normed, local_window, hca_compress_rate)?,
         };
         let x = (x + self_out)?;
 
-        let normed = self.ln2.forward(&x)?;
-        let cross_gate_in = normed.broadcast_add(domain_state)?;
-        let cross_gate = self
-            .cross_gate
-            .forward(&cross_gate_in)?
-            .relu()?
-            .clamp(0.0, 1.0)?;
-        let cross_out = self
-            .cross_attn
-            .forward(&normed, world_latent)?
-            .broadcast_mul(&cross_gate)?;
-        let x = (x + cross_out)?;
+        let x = if use_cross_attention {
+            let normed = self.ln2.forward(&x)?;
+            let cross_gate_in = normed.broadcast_add(domain_state)?;
+            let cross_gate = self
+                .cross_gate
+                .forward(&cross_gate_in)?
+                .relu()?
+                .clamp(0.0, 1.0)?;
+            let cross_out = self
+                .cross_attn
+                .forward(&normed, world_latent)?
+                .broadcast_mul(&cross_gate)?;
+            (x + cross_out)?
+        } else {
+            x
+        };
 
         let normed = self.ln3.forward(&x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
@@ -182,35 +262,65 @@ impl CodeDecoderBlock {
         self.cross_attn.project_kv(world_latent)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_prefill(
         &self,
         x: &Tensor,
         cross_kv_cache: &AttentionKvCache,
         domain_state: &Tensor,
-        use_full_attention: bool,
+        attention_kind: DecoderSelfAttentionKind,
         local_window: usize,
+        csa_compress_rate: usize,
+        hca_compress_rate: usize,
+        use_cross_attention: bool,
+        prefix_len: usize,
     ) -> Result<(Tensor, AttentionKvCache)> {
         let normed = self.ln1.forward(x)?;
-        let self_kv_cache = self.self_attn.project_self_kv(&normed)?;
-        let self_out = if use_full_attention {
-            self.self_attn.forward_causal(&normed)?
-        } else {
-            self.self_attn.forward_causal_local(&normed, local_window)?
+        let self_out = match attention_kind {
+            DecoderSelfAttentionKind::Sliding => {
+                self.self_attn.forward_causal_local(&normed, local_window)?
+            }
+            DecoderSelfAttentionKind::CompressedSparse => {
+                self.self_attn.forward_causal_compressed_sparse(
+                    &normed,
+                    local_window,
+                    csa_compress_rate,
+                    self.kind_index_topk(csa_compress_rate),
+                )?
+            }
+            DecoderSelfAttentionKind::HeavilyCompressed => self
+                .self_attn
+                .forward_causal_heavily_compressed(&normed, local_window, hca_compress_rate)?,
+        };
+        let self_kv_cache = match attention_kind {
+            DecoderSelfAttentionKind::Sliding => self
+                .self_attn
+                .project_self_kv_with_prefix(&normed, prefix_len)?,
+            DecoderSelfAttentionKind::CompressedSparse => self
+                .self_attn
+                .project_self_kv_compressed(&normed, local_window, csa_compress_rate, prefix_len)?,
+            DecoderSelfAttentionKind::HeavilyCompressed => self
+                .self_attn
+                .project_self_kv_compressed(&normed, local_window, hca_compress_rate, prefix_len)?,
         };
         let x = (x + self_out)?;
 
-        let normed = self.ln2.forward(&x)?;
-        let cross_gate_in = normed.broadcast_add(domain_state)?;
-        let cross_gate = self
-            .cross_gate
-            .forward(&cross_gate_in)?
-            .relu()?
-            .clamp(0.0, 1.0)?;
-        let cross_out = self
-            .cross_attn
-            .forward_precomputed(&normed, cross_kv_cache, None)?
-            .broadcast_mul(&cross_gate)?;
-        let x = (x + cross_out)?;
+        let x = if use_cross_attention {
+            let normed = self.ln2.forward(&x)?;
+            let cross_gate_in = normed.broadcast_add(domain_state)?;
+            let cross_gate = self
+                .cross_gate
+                .forward(&cross_gate_in)?
+                .relu()?
+                .clamp(0.0, 1.0)?;
+            let cross_out = self
+                .cross_attn
+                .forward_precomputed(&normed, cross_kv_cache, None)?
+                .broadcast_mul(&cross_gate)?;
+            (x + cross_out)?
+        } else {
+            x
+        };
 
         let normed = self.ln3.forward(&x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
@@ -223,37 +333,61 @@ impl CodeDecoderBlock {
         Ok(((x + ff_out)?, self_kv_cache))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_incremental(
         &self,
         x: &Tensor,
         cross_kv_cache: &AttentionKvCache,
         domain_state: &Tensor,
-        use_full_attention: bool,
+        attention_kind: DecoderSelfAttentionKind,
         local_window: usize,
+        csa_compress_rate: usize,
+        hca_compress_rate: usize,
+        use_cross_attention: bool,
         self_kv_cache: Option<&AttentionKvCache>,
     ) -> Result<(Tensor, AttentionKvCache)> {
         let normed = self.ln1.forward(x)?;
-        let (self_out, next_self_kv_cache) = if use_full_attention {
-            self.self_attn
-                .forward_causal_incremental(&normed, self_kv_cache)?
-        } else {
-            self.self_attn
-                .forward_causal_local_incremental(&normed, self_kv_cache, local_window)?
-        };
+        let (self_out, next_self_kv_cache) =
+            match attention_kind {
+                DecoderSelfAttentionKind::Sliding => self
+                    .self_attn
+                    .forward_causal_local_incremental(&normed, self_kv_cache, local_window)?,
+                DecoderSelfAttentionKind::CompressedSparse => self
+                    .self_attn
+                    .forward_causal_compressed_sparse_incremental(
+                        &normed,
+                        self_kv_cache,
+                        local_window,
+                        csa_compress_rate,
+                        self.kind_index_topk(csa_compress_rate),
+                    )?,
+                DecoderSelfAttentionKind::HeavilyCompressed => self
+                    .self_attn
+                    .forward_causal_heavily_compressed_incremental(
+                        &normed,
+                        self_kv_cache,
+                        local_window,
+                        hca_compress_rate,
+                    )?,
+            };
         let x = (x + self_out)?;
 
-        let normed = self.ln2.forward(&x)?;
-        let cross_gate_in = normed.broadcast_add(domain_state)?;
-        let cross_gate = self
-            .cross_gate
-            .forward(&cross_gate_in)?
-            .relu()?
-            .clamp(0.0, 1.0)?;
-        let cross_out = self
-            .cross_attn
-            .forward_precomputed(&normed, cross_kv_cache, None)?
-            .broadcast_mul(&cross_gate)?;
-        let x = (x + cross_out)?;
+        let x = if use_cross_attention {
+            let normed = self.ln2.forward(&x)?;
+            let cross_gate_in = normed.broadcast_add(domain_state)?;
+            let cross_gate = self
+                .cross_gate
+                .forward(&cross_gate_in)?
+                .relu()?
+                .clamp(0.0, 1.0)?;
+            let cross_out = self
+                .cross_attn
+                .forward_precomputed(&normed, cross_kv_cache, None)?
+                .broadcast_mul(&cross_gate)?;
+            (x + cross_out)?
+        } else {
+            x
+        };
 
         let normed = self.ln3.forward(&x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
@@ -264,6 +398,14 @@ impl CodeDecoderBlock {
             .forward(&self.adapter_down.forward(&adapter_in)?.gelu()?)?;
         let ff_out = ff_out.broadcast_add(&adapter.affine(0.5, 0.0)?)?;
         Ok(((x + ff_out)?, next_self_kv_cache))
+    }
+
+    fn kind_index_topk(&self, fallback: usize) -> usize {
+        std::env::var("TOFY_DECODER_CSA_TOPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(fallback.max(1) * 2)
+            .max(1)
     }
 }
 
@@ -325,27 +467,72 @@ impl CodeDecoder {
     /// Returns logits [B, T, vocab_size].
     pub fn forward(&self, input_ids: &Tensor, world_latent: &Tensor) -> Result<Tensor> {
         let (b, t) = input_ids.dims2()?;
-        let mut h = self.embed.forward(input_ids)?;
-        let pe = positional_encoding(t, self.dim, input_ids.device())?.to_dtype(h.dtype())?;
-        h = h.broadcast_add(&pe)?;
-        let domain_state = self.domain_state(input_ids.device(), b, t)?;
-        let structure_state = self.structure_state(world_latent, b, t)?;
-        h = h.broadcast_add(&domain_state)?;
-        h = h.broadcast_add(&structure_state)?;
+        let device = input_ids.device();
+        let prefix = self.latent_prefix(world_latent)?;
+        let prefix_len = prefix.dim(1)?;
+        let mut token_h = self.embed.forward(input_ids)?;
+        let token_pe =
+            positional_encoding_from(prefix_len, t, self.dim, device)?.to_dtype(token_h.dtype())?;
+        token_h = token_h.broadcast_add(&token_pe)?;
+        let token_domain_state = self.domain_state(device, b, t)?;
+        let token_structure_state = self.structure_state(world_latent, b, t)?;
+        token_h = token_h.broadcast_add(&token_domain_state)?;
+        token_h = token_h.broadcast_add(&token_structure_state)?;
+
+        let mut h = if prefix_len > 0 {
+            let prefix_domain_state = self.domain_state(device, b, prefix_len)?;
+            let prefix_pe =
+                positional_encoding(prefix_len, self.dim, device)?.to_dtype(prefix.dtype())?;
+            let prefix_h = prefix
+                .broadcast_add(&prefix_domain_state)?
+                .broadcast_add(&prefix_pe)?;
+            Tensor::cat(&[prefix_h, token_h], 1)?
+        } else {
+            token_h
+        };
+        let total_len = h.dim(1)?;
+        let domain_state = self.domain_state(device, b, total_len)?;
+        let structure_state = self.structure_state(world_latent, b, total_len)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let use_full_attention =
-                layer_idx % self.kind.anchor_period() == 0 || layer_idx + 1 == self.blocks.len();
+            let attention_kind =
+                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
             h = block.forward(
                 &h,
                 world_latent,
                 &domain_state.broadcast_add(&structure_state)?,
-                use_full_attention,
+                attention_kind,
                 self.kind.local_window(),
+                self.kind.csa_compress_rate(),
+                self.kind.hca_compress_rate(),
+                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
             )?;
         }
         h = self.ln_final.forward(&h)?;
+        let token_h = h.narrow(1, prefix_len, t)?;
         self.lm_head
-            .forward(&h)
+            .forward(&token_h)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+
+    fn latent_prefix(&self, world_latent: &Tensor) -> Result<Tensor> {
+        if !decoder_latent_prefix_enabled() {
+            let (batch, _, _) = world_latent.dims3()?;
+            return Tensor::zeros(
+                (batch, 0, self.dim),
+                world_latent.dtype(),
+                world_latent.device(),
+            )
+            .map_err(Into::into);
+        }
+        self.structure_proj
+            .forward(world_latent)?
+            .tanh()
+            .map_err(Into::into)
+    }
+
+    fn token_logits(&self, h: &Tensor) -> Result<Tensor> {
+        self.lm_head
+            .forward(h)
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
 
@@ -390,28 +577,30 @@ impl CodeDecoder {
     ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), device)?;
         let mut h = self.embed.forward(&input)?;
-        let pe = positional_encoding_from(position, 1, self.dim, device)?.to_dtype(h.dtype())?;
+        let pe = positional_encoding_from(state.prefix_len + position, 1, self.dim, device)?
+            .to_dtype(h.dtype())?;
         h = h.broadcast_add(&pe)?;
         h = h.broadcast_add(&state.domain_state)?;
         h = h.broadcast_add(&state.structure_state)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let use_full_attention =
-                layer_idx % self.kind.anchor_period() == 0 || layer_idx + 1 == self.blocks.len();
+            let attention_kind =
+                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
             let (next_h, next_cache) = block.forward_incremental(
                 &h,
                 &state.cross_kv_caches[layer_idx],
                 &state.domain_state.broadcast_add(&state.structure_state)?,
-                use_full_attention,
+                attention_kind,
                 self.kind.local_window(),
+                self.kind.csa_compress_rate(),
+                self.kind.hca_compress_rate(),
+                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
                 state.self_kv_caches[layer_idx].as_ref(),
             )?;
             h = next_h;
             state.self_kv_caches[layer_idx] = Some(next_cache);
         }
         h = self.ln_final.forward(&h)?;
-        self.lm_head
-            .forward(&h)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))
+        self.token_logits(&h)
     }
 
     pub fn begin_generation(
@@ -427,45 +616,67 @@ impl CodeDecoder {
                 cross_kv_caches: self.precompute_cross_kv_caches(world_latent)?,
                 domain_state: self.domain_state(device, 1, 1)?,
                 structure_state: self.structure_state(world_latent, 1, 1)?,
+                prefix_len: 0,
                 last_logits: None,
             });
         }
         let prompt_len = prompt_ids.len();
+        let prefix = self.latent_prefix(world_latent)?;
+        let prefix_len = prefix.dim(1)?;
         let input = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_len), device)?;
-        let mut h = self.embed.forward(&input)?;
-        let pe = positional_encoding(prompt_len, self.dim, device)?.to_dtype(h.dtype())?;
-        h = h.broadcast_add(&pe)?;
-        let domain_state_full = self.domain_state(device, 1, prompt_len)?;
-        let structure_state_full = self.structure_state(world_latent, 1, prompt_len)?;
-        h = h.broadcast_add(&domain_state_full)?;
-        h = h.broadcast_add(&structure_state_full)?;
+        let mut token_h = self.embed.forward(&input)?;
+        let token_pe = positional_encoding_from(prefix_len, prompt_len, self.dim, device)?
+            .to_dtype(token_h.dtype())?;
+        token_h = token_h.broadcast_add(&token_pe)?;
+        let token_domain_state = self.domain_state(device, 1, prompt_len)?;
+        let token_structure_state = self.structure_state(world_latent, 1, prompt_len)?;
+        token_h = token_h.broadcast_add(&token_domain_state)?;
+        token_h = token_h.broadcast_add(&token_structure_state)?;
+
+        let mut h = if prefix_len > 0 {
+            let prefix_domain_state = self.domain_state(device, 1, prefix_len)?;
+            let prefix_pe =
+                positional_encoding(prefix_len, self.dim, device)?.to_dtype(prefix.dtype())?;
+            let prefix_h = prefix
+                .broadcast_add(&prefix_domain_state)?
+                .broadcast_add(&prefix_pe)?;
+            Tensor::cat(&[prefix_h, token_h], 1)?
+        } else {
+            token_h
+        };
+        let total_len = h.dim(1)?;
+        let domain_state_full = self.domain_state(device, 1, total_len)?;
+        let structure_state_full = self.structure_state(world_latent, 1, total_len)?;
         let cross_kv_caches = self.precompute_cross_kv_caches(world_latent)?;
         let mut self_kv_caches = Vec::with_capacity(self.blocks.len());
 
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let use_full_attention =
-                layer_idx % self.kind.anchor_period() == 0 || layer_idx + 1 == self.blocks.len();
+            let attention_kind =
+                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
             let (next_h, self_kv_cache) = block.forward_prefill(
                 &h,
                 &cross_kv_caches[layer_idx],
                 &domain_state_full.broadcast_add(&structure_state_full)?,
-                use_full_attention,
+                attention_kind,
                 self.kind.local_window(),
+                self.kind.csa_compress_rate(),
+                self.kind.hca_compress_rate(),
+                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
+                prefix_len,
             )?;
             h = next_h;
             self_kv_caches.push(Some(self_kv_cache));
         }
         h = self.ln_final.forward(&h)?;
-        let logits = self
-            .lm_head
-            .forward(&h)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let token_h = h.narrow(1, prefix_len, prompt_len)?;
+        let logits = self.token_logits(&token_h)?;
         Ok(DecoderGenerationState {
             token_ids: prompt_ids.to_vec(),
             self_kv_caches,
             cross_kv_caches,
             domain_state: self.domain_state(device, 1, 1)?,
             structure_state: self.structure_state(world_latent, 1, 1)?,
+            prefix_len,
             last_logits: Some(logits.narrow(1, prompt_len - 1, 1)?),
         })
     }

@@ -13,7 +13,7 @@ Formats and paths for JEPA, world model, and decoder training. See [RUNBOOK.md](
 - **Format:** `context<TAB>next_turn` (tab-separated). Also supported: `context|||next_turn`.
 - **Explicit action labels:** `context<TAB>next_turn<TAB>action` is also supported. Core labels are `text_reply`, `code`, and `done`. Code-tool aliases such as `inspect_file`, `edit_file`, `run_tests`, `read_error`, and `repair_patch` are accepted and collapse to the existing `code` route for checkpoint compatibility.
 - **Implicit action labels:** if the third field is absent, the repo falls back to the heuristic classifier on `next_turn`.
-- **World interpretation:** `context` is the current latent state, `action` conditions the transition, and `next_turn` is encoded into the next latent state. Action labels condition the world transition; router training is a separate downstream stage.
+- **World interpretation:** `context` is the current latent state, `action` conditions the transition, and `next_turn` is encoded into the next latent state. Action labels condition the action-conditioned state transition; router training is a separate downstream stage.
 - **Prepare from UltraChat:** `--prepare-ultrachat` produces this format from Hugging Face UltraChat (see [RUNBOOK.md](RUNBOOK.md)).
 - **Code:** Use `context<TAB>completion` pairs (e.g. from [CODE_DATA.md](CODE_DATA.md)). Compiler-feedback repair rows can include tags such as `<action:repair_patch>` and `<ctx:compiler_feedback>` on the left side; they still train the same code decoder route.
 
@@ -21,7 +21,7 @@ Formats and paths for JEPA, world model, and decoder training. See [RUNBOOK.md](
 
 - **Path:** Use `hub:<dataset_id>` as the data path (e.g. `hub:wikimedia/wikipedia`, `hub:stingning/ultrachat`). The first run downloads the dataset under `data/` (or the path you pass to the prepare/train command).
 - **Atomic publishes:** Hub conversion writes to a temporary file first and renames it only after rows were produced. If a pod is stopped during conversion, reruns remove stale temp files instead of trusting them as canonical data.
-- **Pipeline bootstrap:** `cargo run --release -- train <8gb|48gb|80gb>` creates missing or empty Stage 1 source files on the current machine, including `data/ultrachat_pairs.txt`, `data/rust_code_pairs.txt`, and `data/cached_wikimedia_wikipedia_1.txt`. The pipeline temporarily sets `JEPA_WIKI_MAX_FILES=1` for the Wikipedia source so fresh pods use the expected one-parquet cache file.
+- **Pipeline bootstrap:** `cargo run --release -- train <8gb|48gb>` creates missing or empty Stage 1 source files on the current machine, including `data/ultrachat_pairs.txt`, `data/rust_code_pairs.txt`, and `data/cached_wikimedia_wikipedia_1.txt`. The pipeline temporarily sets `JEPA_WIKI_MAX_FILES=1` for the Wikipedia source so fresh pods use the expected one-parquet cache file.
 - **HF CLI:** `hf auth login` (or a read-only token) is required for gated or private datasets. See [RUNBOOK.md](RUNBOOK.md) for installing the `hf` CLI.
 
 ## Technical / wiki-like / expert world model data

@@ -51,7 +51,7 @@ cargo run --release -- --train-orchestrator local_models/model_latent_<size>.saf
 
 ### Rust instruction/function tasks for the code-first POC
 
-The hard Rust eval suite is not a generic code-continuation benchmark. It asks for:
+The Rust function-task generator is not building generic code-continuation rows. It asks for:
 
 - natural-language instruction
 - exact Rust function signature
@@ -74,10 +74,12 @@ What this does:
 
 This is a decoder-training improvement, not a router/world-model change. It specifically targets the failure mode where `route_code_acc` is high but the decoder still emits generic multilingual code-token soup instead of a Rust function body.
 
-The code-first pipeline now uses these rows twice:
+The code-first pipeline uses these Rust rows in the base decoder mix:
 
-- first as part of the mixed decoder dataset
-- then again in a short instruction-only polish phase to improve exact signature retention
+- base code decoder data: `data/code_poc_mix.txt`
+- world/action data: `data/world_mix_pairs.txt`
+
+The second decoder stage is now Go execution-feedback training.
 
 ### Rust compiler-feedback repair tasks
 
@@ -99,7 +101,19 @@ Repair prompts include tool/context tags:
 - `<tool:repair_patch>`
 - `<ctx:compiler_feedback>`
 
-These tags are text conditioning for the decoder and training signal for the planner/world path. They intentionally still map to the existing `code` action label so current three-way router checkpoints remain usable.
+These tags are text conditioning for the decoder and training signal for the context/state path. They intentionally still map to the existing `code` action label so current three-way router checkpoints remain usable.
+
+### Go execution-feedback curriculum
+
+Go is now supported as a fast execution-feedback language for decoder training. Use it when you want dense compile/test rewards without paying Rust compile latency on every candidate. The eval JSONL format is shared with Rust, but `language: "go"` runs a temporary `go test` harness and accepts Go compiler/test output as repair feedback.
+
+```bash
+cargo run --release -- --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
+cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
+```
+
+Go repair rows use the same tags as Rust repair rows: `<action:repair_patch>`, `<tool:read_error>`, `<tool:repair_patch>`, and `<ctx:compiler_feedback>`. The canonical pipeline now builds `data/code_poc_go_mix.txt` from Go code, Go instruction pairs, and Go repair rows, then trains `runs/.../decoder_code_go_feedback/model.safetensors` initialized from the base code decoder.
 
 ---
 
