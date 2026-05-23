@@ -1613,6 +1613,11 @@ fn command_available(program: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+        || Command::new(program)
+            .arg("version")
+            .output()
+            .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn unix_timestamp() -> Result<u64> {

@@ -3,6 +3,9 @@
 *.rlib
 vendor/*/Cargo.lock
 
+# Local secrets
+.env
+
 # Locally trained models and vocabs (encoder, world, code/text decoders)
 local_models/
 

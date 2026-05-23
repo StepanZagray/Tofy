@@ -7,7 +7,6 @@ Current recommended pod target:
 
 - one high-VRAM NVIDIA GPU: L40S 48 GB minimum, A100/H100/RTX PRO 6000 preferred when available
 - Ubuntu-like CUDA image with Rust build tools installed manually
-- Pi coding agent installed with `curl -fsSL https://pi.dev/install.sh | sh`
 - regular pod volume mounted at `/workspace`
 - repo checkout at `/workspace/Tofy`
 - canonical training command: `./target/release/jepa_ai train 48gb`
@@ -124,16 +123,6 @@ Install Go for autonomous Go-feedback repair data generation and hard eval:
 ```bash
 apt-get install -y golang-go
 go version
-```
-
-Install Pi on the pod. The installer is the official Linux/macOS path from
-Pi's quickstart docs.
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
-command -v pi
-pi --version || true
 ```
 
 ## 4. GitHub Deploy Key
@@ -370,139 +359,7 @@ Use `--with-code-eval` only for deliberate debug runs where eval should be
 attached to a resumed pipeline invocation. It is not the default pod training
 path.
 
-## 10. Manual Go Training With Pi Harness
-
-Use this manual path only when you want to regenerate Go-feedback data or train
-a separate Go decoder outside the autonomous `train 48gb` pipeline. Go is the
-fast language curriculum; Pi is the coding-agent harness used to exercise the
-trained checkpoint through the same OpenAI-compatible server a user would call.
-
-Important boundary: the current Rust binary trains with supervised decoder CE
-over generated pair files. Pi does not run inside the optimizer. The full
-pipeline is already Go-feedback-driven after base decoder training by creating Go
-instruction and repair pairs, training the `decoder_code_go_feedback` stage on
-that data, then using Pi as the harness for end-to-end coding-agent checks
-against the served checkpoint.
-
-Generate Go execution-feedback data:
-
-```bash
-cd /workspace/Tofy
-source "$HOME/.cargo/env"
-
-./target/release/jepa_ai --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
-./target/release/jepa_ai --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-./target/release/jepa_ai --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
-./target/release/jepa_ai --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
-```
-
-Train a Go-feedback code decoder against the current encoder/world checkpoint.
-Replace `<run_id>` with the run you want to continue from:
-
-```bash
-./target/release/jepa_ai --train-decoder \
-  runs/<run_id>/world/model.encoder.safetensors \
-  runs/<run_id>/latent/model.vocab.txt \
-  runs/<run_id>/world/model.safetensors \
-  data/code_poc_go_mix.txt \
-  24000 256 192 1024 12 16 1024 96 \
-  --decoder-kind code \
-  --decoder-output runs/<run_id>/decoder_code_go/model.safetensors \
-  --decoder-max-vocab 32000 \
-  --grad-accum 1 \
-  --conditioning-loss-weight 0.0 \
-  --init-decoder runs/<run_id>/decoder_code/model.safetensors
-```
-
-Run the Go hard eval directly through Tofy's verifier:
-
-Generate and run the Go hard eval suite:
-
-```bash
-./target/release/jepa_ai --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
-
-./target/release/jepa_ai --eval-code-assistant \
-  runs/<run_id>/world/model.encoder.safetensors \
-  runs/<run_id>/latent/model.vocab.txt \
-  runs/<run_id>/world/model.safetensors \
-  eval/code_assistant_go_hard.jsonl \
-  384 1024 256 12 16 1024 96 \
-  --high-world-model runs/<run_id>/high_world/model.safetensors \
-  --code-decoder runs/<run_id>/decoder_code_go/model.safetensors \
-  --go-timeout-sec 6
-```
-
-Serve the Go-trained checkpoint for Pi:
-
-```bash
-export JEPA_USE_CANDLE_DECODER=1
-export JEPA_CANDLE_DECODER=/workspace/Tofy/runs/<run_id>/decoder_code_go/model.safetensors
-export JEPA_CANDLE_DECODER_VOCAB=/workspace/Tofy/runs/<run_id>/decoder_code_go/model.vocab.txt
-export TOFY_SERVE_BIND=127.0.0.1:8080
-
-./target/release/jepa_ai --serve \
-  runs/<run_id>/world/model.encoder.safetensors \
-  runs/<run_id>/latent/model.vocab.txt \
-  runs/<run_id>/world/model.safetensors \
-  127.0.0.1:8080 \
-  1024 256 12 16 1024 96 \
-  --high-world-model runs/<run_id>/high_world/model.safetensors \
-  2>&1 | tee /workspace/tofy-serve-pi.log
-```
-
-In another tmux pane, configure Pi to use the local Tofy server. Pi custom
-models live at `~/.pi/agent/models.json`; use OpenAI Chat Completions
-compatibility and disable unsupported reasoning/developer-role fields:
-
-```bash
-mkdir -p ~/.pi/agent
-cat > ~/.pi/agent/models.json <<'EOF'
-{
-  "providers": {
-    "tofy": {
-      "baseUrl": "http://127.0.0.1:8080/v1",
-      "api": "openai-completions",
-      "apiKey": "sk-local",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false
-      },
-      "models": [
-        {
-          "id": "tofy",
-          "name": "Tofy Go Harness",
-          "reasoning": false,
-          "input": ["text"],
-          "contextWindow": 8192,
-          "maxTokens": 2048,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-        }
-      ]
-    }
-  }
-}
-EOF
-```
-
-Run Pi in JSON mode against the repo as the harness. Keep prompts Go-specific
-so the model exercises the Go-trained decoder path:
-
-```bash
-cd /workspace/Tofy
-mkdir -p runs/<run_id>/pi_go_harness
-
-pi --model tofy/tofy --mode json \
-  "Implement a small Go function and tests in /tmp/tofy-pi-go-smoke. Use go test and fix failures until it passes. Return only a concise summary." \
-  2>/workspace/pi-go-smoke.stderr \
-  | tee runs/<run_id>/pi_go_harness/smoke.jsonl
-```
-
-The Pi harness output is not automatically fed back into decoder training yet.
-For now, use it as an end-to-end agent check beside `--eval-code-assistant`.
-If a Pi run produces useful repair traces, convert them into TSV pairs before
-the next Go feedback decoder pass.
-
-## 11. Resume
+## 10. Resume
 
 Resume the newest run:
 
@@ -533,7 +390,7 @@ Resume a specific run:
 Resume requires matching architecture/profile arguments. Do not resume a run
 created with a different `config/model_profiles.json` shape.
 
-## 12. Artifact Recovery
+## 11. Artifact Recovery
 
 Before terminating a pod, copy the run artifacts back:
 
@@ -570,7 +427,7 @@ After a completed run reports a better metric, update `docs/RESULTS.md` with
 the exact command and metric. Do not update it for failed probes or unchanged
 metrics.
 
-## 13. Stop Or Terminate
+## 12. Stop Or Terminate
 
 Stop keeps the regular pod volume attached to the same pod:
 

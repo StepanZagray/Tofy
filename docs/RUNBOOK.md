@@ -508,6 +508,107 @@ cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt 
 
 Go repair generation uses `go test -c` on corrupted known-good answers, keeping short compiler diagnostics as the repair signal. This is cheaper than Rust for on-policy or frequent-refresh repair datasets, while still giving static type errors and executable unit-test feedback.
 
+### Manual Go-feedback decoder and Pi harness
+
+Use this only when you want to regenerate Go-feedback data, train a separate Go
+decoder outside the autonomous `train <profile>` pipeline, or exercise a trained
+checkpoint through Pi. The normal `train 48gb` pipeline already prepares
+`data/code_poc_go_mix.txt` and trains
+`runs/<run_id>/decoder_code_go_feedback/model.safetensors`.
+
+Important boundary: the Rust binary trains with supervised decoder CE over
+generated pair files. Pi does not run inside the optimizer; it is an end-to-end
+agent harness for a served checkpoint. If a Pi run produces useful repair
+traces, convert them into TSV pairs before the next decoder pass.
+
+Generate Go execution-feedback data manually:
+
+```bash
+cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
+cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
+```
+
+Train a separate Go-feedback decoder from an existing run:
+
+```bash
+RUN_ID=code_poc_1234567890
+
+cargo run --release -- --train-decoder \
+  runs/${RUN_ID}/world/model.encoder.safetensors \
+  runs/${RUN_ID}/latent/model.vocab.txt \
+  runs/${RUN_ID}/world/model.safetensors \
+  data/code_poc_go_mix.txt \
+  24000 256 192 1024 12 16 1024 96 \
+  --decoder-kind code \
+  --decoder-output runs/${RUN_ID}/decoder_code_go/model.safetensors \
+  --decoder-max-vocab 32000 \
+  --grad-accum 1 \
+  --conditioning-loss-weight 0.0 \
+  --init-decoder runs/${RUN_ID}/decoder_code/model.safetensors
+```
+
+Serve that decoder for Pi:
+
+```bash
+export JEPA_USE_CANDLE_DECODER=1
+export JEPA_CANDLE_DECODER=$PWD/runs/${RUN_ID}/decoder_code_go/model.safetensors
+export JEPA_CANDLE_DECODER_VOCAB=$PWD/runs/${RUN_ID}/decoder_code_go/model.vocab.txt
+
+cargo run --release -- --serve \
+  runs/${RUN_ID}/world/model.encoder.safetensors \
+  runs/${RUN_ID}/latent/model.vocab.txt \
+  runs/${RUN_ID}/world/model.safetensors \
+  127.0.0.1:8080 \
+  1024 256 12 16 1024 96 \
+  --high-world-model runs/${RUN_ID}/high_world/model.safetensors
+```
+
+Configure Pi to call the local OpenAI-compatible server:
+
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+mkdir -p ~/.pi/agent
+cat > ~/.pi/agent/models.json <<'EOF'
+{
+  "providers": {
+    "tofy": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "sk-local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "tofy",
+          "name": "Tofy Go Harness",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 8192,
+          "maxTokens": 2048,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}
+EOF
+```
+
+Run a Go-specific Pi smoke:
+
+```bash
+mkdir -p runs/${RUN_ID}/pi_go_harness
+
+pi --model tofy/tofy --mode json \
+  "Implement a small Go function and tests in /tmp/tofy-pi-go-smoke. Use go test and fix failures until it passes. Return only a concise summary." \
+  2>runs/${RUN_ID}/pi_go_harness/smoke.stderr \
+  | tee runs/${RUN_ID}/pi_go_harness/smoke.jsonl
+```
+
 ## 10. Serve
 
 With GGUF fallback:
