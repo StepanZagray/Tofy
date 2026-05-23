@@ -302,6 +302,5 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 	  - `TOFY_LATENT_REASONING_ALPHA=<float>` blends recurrent proposals with the selected next-action latent anchor, default `0.35`
 	- the code-first POC decoder path now uses Go-only code pairs plus oversampled synthetic Go instruction/function tasks and a Go execution-feedback decoder stage because the default hard eval suite measures fast compile/test repair behavior in Go
 - the code-first pipeline now adds compiler-feedback Go repair pairs when `go` is available; repair prompts use tool/context tags like `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>` while remaining compatible with the existing three-action router
-- generated Rust repair pairs now use a manifest-validated cache keyed by the instruction-pair input hash, `rustc` version, and generation settings; reruns print `Repair pair cache hit: ...` when the artifact can be reused
 - encoder TensorBoard now includes `loss/pred_token`, `loss/pred_chunk`, `loss/pred_global`, `metrics/chunk_cosine`, and `metrics/global_cosine`
 - view metrics with `tensorboard --logdir runs/`

@@ -133,7 +133,6 @@ Decoder training knobs:
 - `TOFY_DECODER_SYNTAX_LOSS_WEIGHT=<float>` mixes syntax-weighted CE into decoder training
 - `TOFY_DECODER_SIGNATURE_LOSS_WEIGHT=<float>` upweights the predicted function-signature span during decoder training
 - `TOFY_PREPARE_REPAIR_TASKS=auto|0|1` controls compiler-feedback repair data generation, default `auto`
-- `RUST_REPAIR_VARIANTS_PER_SAMPLE=<int>` controls synthetic corruptions per manual Rust repair-task generation, default `2`
 - `CODE_REPAIR_REPEAT=<int>` controls repair-row oversampling in the code decoder mix, default `2`
 - `go_feedback_steps`, `go_feedback_batch`, and `go_feedback_grad_accum` in `config/model_profiles.json` control the Go execution-feedback decoder stage
 

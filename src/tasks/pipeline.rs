@@ -472,6 +472,8 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
                     "3.0",
                     "--max-rows",
                     "4000",
+                    "--progress-every",
+                    "100",
                 ])
             }))
         } else {

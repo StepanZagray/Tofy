@@ -22,7 +22,6 @@ const CASUAL_CONVERSATION_DATASET_ID: &str = "SohamGhadge/casual-conversation";
 const SCIQ_DATASET_ID: &str = "sciq";
 const SQUAD_V2_DATASET_ID: &str = "rajpurkar/squad_v2";
 const DEFAULT_GITHUB_LANGUAGES: &[&str] = &[
-    "Rust",
     "TypeScript",
     "Go",
     "JavaScript",
@@ -237,32 +236,12 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
             run_prepare_encoder_corpus(&args[2..])?;
             Ok(true)
         }
-        "--prepare-rust-by-practice" | "prepare-rust-by-practice" => {
-            run_prepare_rust_by_practice(&args[2..])?;
-            Ok(true)
-        }
-        "--prepare-rust-docs" | "prepare-rust-docs" => {
-            run_prepare_rust_docs(&args[2..])?;
-            Ok(true)
-        }
-        "--prepare-rust-doc-trajectories" | "prepare-rust-doc-trajectories" => {
-            run_prepare_rust_doc_trajectories(&args[2..])?;
-            Ok(true)
-        }
         "--prepare-github-top-code" | "prepare-github-top-code" => {
             run_prepare_github_top_code(&args[2..])?;
             Ok(true)
         }
-        "--prepare-rust-function-tasks" | "prepare-rust-function-tasks" => {
-            run_prepare_rust_function_tasks(&args[2..])?;
-            Ok(true)
-        }
         "--prepare-go-function-tasks" | "prepare-go-function-tasks" => {
             run_prepare_go_function_tasks(&args[2..])?;
-            Ok(true)
-        }
-        "--prepare-rust-repair-tasks" | "prepare-rust-repair-tasks" => {
-            run_prepare_rust_repair_tasks(&args[2..])?;
             Ok(true)
         }
         "--prepare-go-repair-tasks" | "prepare-go-repair-tasks" => {
@@ -671,438 +650,6 @@ fn split_pair_line(line: &str) -> Option<(&str, &str)> {
         return Some((left, right));
     }
     None
-}
-
-fn run_prepare_rust_by_practice(args: &[String]) -> Result<()> {
-    let mut input = PathBuf::from("data/sunface_rust-by-practice_en");
-    let mut output = None;
-    let mut mode = None;
-    let mut no_split_headings = false;
-    let mut force = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--input" => {
-                input = parse_path_value(args, i, "--input")?;
-                i += 2;
-            }
-            "--output" => {
-                output = Some(parse_path_value(args, i, "--output")?);
-                i += 2;
-            }
-            "--mode" => {
-                mode = Some(parse_flag_value(args, i, "--mode")?);
-                i += 2;
-            }
-            "--no-split-headings" => {
-                no_split_headings = true;
-                i += 1;
-            }
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            value => bail!("unknown flag: {value}"),
-        }
-    }
-    let output = output.context("--output is required")?;
-    let mode = mode.context("--mode is required (jepa|pairs)")?;
-    let files = iter_md_files(&input)?;
-    let input_paths = files.clone();
-    let params = json!({
-        "mode": mode,
-        "split_headings": !no_split_headings,
-    });
-    if !force {
-        if let Some(manifest) =
-            artifact_cache_hit("rust_by_practice", &output, &input_paths, &params)?
-        {
-            println!(
-                "Rust-by-Practice cache hit: {} (rows={})",
-                output.display(),
-                manifest.rows
-            );
-            return Ok(());
-        }
-    }
-    let mut rows = Vec::new();
-    match mode.as_str() {
-        "jepa" => {
-            for path in &files {
-                let text = fs::read_to_string(path)?.trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                if no_split_headings {
-                    let line = text.replace(['\t', '\n'], " ");
-                    if line.split_whitespace().count() >= 5 {
-                        rows.push(line);
-                    }
-                } else {
-                    for chunk in split_markdown_by_heading(&text) {
-                        if chunk.split_whitespace().count() >= 5 {
-                            rows.push(chunk.replace(['\n', '\t'], " "));
-                        }
-                    }
-                }
-            }
-        }
-        "pairs" => {
-            for path in &files {
-                let text = fs::read_to_string(path)?.trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                let chunks = split_markdown_by_heading(&text);
-                for pair in chunks.windows(2) {
-                    let prev = pair[0].replace('\t', " ");
-                    let next = pair[1].replace('\t', " ");
-                    if prev.split_whitespace().count() >= 3 && next.split_whitespace().count() >= 3
-                    {
-                        rows.push(format!("{prev}\t{next}"));
-                    }
-                }
-            }
-        }
-        _ => bail!("--mode must be jepa or pairs"),
-    }
-    let mut content = String::new();
-    for row in &rows {
-        content.push_str(row.trim());
-        content.push('\n');
-    }
-    write_text_atomic(&output, &content)?;
-    write_artifact_manifest(
-        "rust_by_practice",
-        &output,
-        &input_paths,
-        params,
-        rows.len(),
-    )?;
-    println!("Wrote {} lines to {}", rows.len(), output.display());
-    Ok(())
-}
-
-fn run_prepare_rust_docs(args: &[String]) -> Result<()> {
-    let mut input = crate::tasks::rust_docs::default_rust_docs_root();
-    let mut output = None;
-    let mut mode = None;
-    let mut max_rows = 20_000usize;
-    let mut force = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--input" => {
-                input = Some(parse_path_value(args, i, "--input")?);
-                i += 2;
-            }
-            "--output" => {
-                output = Some(parse_path_value(args, i, "--output")?);
-                i += 2;
-            }
-            "--mode" => {
-                mode = Some(parse_flag_value(args, i, "--mode")?);
-                i += 2;
-            }
-            "--max-rows" => {
-                max_rows = parse_usize_value(args, i, "--max-rows")?.max(1);
-                i += 2;
-            }
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            value => bail!("unknown flag: {value}"),
-        }
-    }
-    let input =
-        input.context("Rust docs root not found; install rust-docs/rust-src or pass --input")?;
-    let output = output.context("--output is required")?;
-    let mode = mode.context("--mode is required (jepa|tool-pairs)")?;
-    let params = json!({
-        "mode": mode,
-        "max_rows": max_rows,
-        "source": "installed-rust-docs",
-        "input": input.to_string_lossy(),
-    });
-    let inputs = Vec::new();
-    if !force {
-        if let Some(manifest) = artifact_cache_hit("rust_docs", &output, &inputs, &params)? {
-            println!(
-                "Rust docs cache hit: {} (rows={})",
-                output.display(),
-                manifest.rows
-            );
-            return Ok(());
-        }
-    }
-    let index = crate::tasks::rust_docs::RustDocIndex::load_from_root(&input)?;
-    let rows = match mode.as_str() {
-        "jepa" => index.jepa_rows(max_rows),
-        "tool-pairs" => index.tool_pairs(max_rows),
-        _ => bail!("--mode must be jepa or tool-pairs"),
-    };
-    let mut content = String::new();
-    for row in &rows {
-        content.push_str(row.trim());
-        content.push('\n');
-    }
-    write_text_atomic(&output, &content)?;
-    write_artifact_manifest("rust_docs", &output, &inputs, params, rows.len())?;
-    println!(
-        "Wrote {} Rust docs rows to {} from {}",
-        rows.len(),
-        output.display(),
-        input.display()
-    );
-    Ok(())
-}
-
-fn run_prepare_rust_doc_trajectories(args: &[String]) -> Result<()> {
-    let mut input = None;
-    let mut output = None;
-    let mut code_output = None;
-    let mut docs_root = crate::tasks::rust_docs::default_rust_docs_root();
-    let mut max_rows = 12_000usize;
-    let mut docs_top_k = 4usize;
-    let mut docs_chars = 2200usize;
-    let mut force = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--input" => {
-                input = Some(parse_path_value(args, i, "--input")?);
-                i += 2;
-            }
-            "--output" => {
-                output = Some(parse_path_value(args, i, "--output")?);
-                i += 2;
-            }
-            "--code-output" => {
-                code_output = Some(parse_path_value(args, i, "--code-output")?);
-                i += 2;
-            }
-            "--docs-root" => {
-                docs_root = Some(parse_path_value(args, i, "--docs-root")?);
-                i += 2;
-            }
-            "--max-rows" => {
-                max_rows = parse_usize_value(args, i, "--max-rows")?.max(1);
-                i += 2;
-            }
-            "--docs-top-k" => {
-                docs_top_k = parse_usize_value(args, i, "--docs-top-k")?.max(1);
-                i += 2;
-            }
-            "--docs-chars" => {
-                docs_chars = parse_usize_value(args, i, "--docs-chars")?.max(256);
-                i += 2;
-            }
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            value => bail!("unknown flag: {value}"),
-        }
-    }
-    let input = input.context("--input is required")?;
-    let output = output.context("--output is required")?;
-    let docs_root = docs_root
-        .context("Rust docs root not found; install rust-docs/rust-src or pass --docs-root")?;
-    let params = json!({
-        "max_rows": max_rows,
-        "docs_top_k": docs_top_k,
-        "docs_chars": docs_chars,
-        "docs_root": docs_root.to_string_lossy(),
-        "code_output": code_output.as_ref().map(|path: &PathBuf| path.to_string_lossy().to_string()),
-        "trajectory": "prompt->fetch_docs->docs_conditioned_code",
-    });
-    let inputs = vec![input.clone()];
-    if !force {
-        if let Some(manifest) =
-            artifact_cache_hit("rust_doc_trajectories", &output, &inputs, &params)?
-        {
-            if code_output
-                .as_ref()
-                .map(|path| path.exists())
-                .unwrap_or(true)
-            {
-                println!(
-                    "Rust doc trajectory cache hit: {} (rows={})",
-                    output.display(),
-                    manifest.rows
-                );
-                return Ok(());
-            }
-        }
-    }
-    let index = crate::tasks::rust_docs::RustDocIndex::load_from_root(&docs_root)?;
-    let task_pairs = load_raw_pairs(&input)?;
-    let mut rows = Vec::new();
-    let mut code_rows = Vec::new();
-    for (prompt, code) in task_pairs {
-        if rows.len() >= max_rows {
-            break;
-        }
-        let Some(query_hint) = rust_doc_query_hint(&prompt) else {
-            continue;
-        };
-        let docs = index.format_hits(&query_hint, docs_top_k, docs_chars);
-        if docs.trim().is_empty() {
-            continue;
-        }
-        let fetch_state = format!(
-            "<action:fetch_docs>\n<tool:fetch_docs>\nUser request:\n{}\n\nQuery:\n{}",
-            prompt, query_hint
-        );
-        rows.push(format!(
-            "{}\t{}\tfetch_docs",
-            escape_pair_field(&fetch_state),
-            escape_pair_field(&docs)
-        ));
-        if rows.len() >= max_rows {
-            break;
-        }
-        let code_state = format!(
-            "<action:code>\n<ctx:user_request>\n{}\n</ctx:user_request>\n\n{}",
-            prompt, docs
-        );
-        rows.push(format!(
-            "{}\t{}\tcode",
-            escape_pair_field(&code_state),
-            escape_pair_field(&code)
-        ));
-        code_rows.push(format!(
-            "{}\t{}",
-            escape_pair_field(&code_state),
-            escape_pair_field(&code)
-        ));
-    }
-    let mut content = String::new();
-    for row in &rows {
-        content.push_str(row);
-        content.push('\n');
-    }
-    write_text_atomic(&output, &content)?;
-    if let Some(code_output) = code_output.as_ref() {
-        let mut code_content = String::new();
-        for row in &code_rows {
-            code_content.push_str(row);
-            code_content.push('\n');
-        }
-        write_text_atomic(code_output, &code_content)?;
-    }
-    write_artifact_manifest(
-        "rust_doc_trajectories",
-        &output,
-        &inputs,
-        params,
-        rows.len(),
-    )?;
-    println!(
-        "Wrote {} Rust doc trajectory rows to {} from {}",
-        rows.len(),
-        output.display(),
-        input.display()
-    );
-    Ok(())
-}
-
-fn rust_doc_query_hint(prompt: &str) -> Option<String> {
-    let mut terms = Vec::new();
-    for token in prompt.split(|ch: char| {
-        !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
-    }) {
-        let clean = token.trim_matches(|ch: char| ch == '<' || ch == '>' || ch == ',');
-        if clean.len() < 3 {
-            continue;
-        }
-        let lower = clean.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "rust"
-                | "return"
-                | "rules"
-                | "keep"
-                | "exact"
-                | "function"
-                | "signature"
-                | "code"
-                | "only"
-                | "write"
-                | "complete"
-                | "implement"
-                | "output"
-                | "compilable"
-        ) {
-            continue;
-        }
-        if clean.contains("::")
-            || (clean.chars().any(|ch| ch.is_ascii_uppercase()) && !clean.ends_with(':'))
-            || matches!(
-                lower.as_str(),
-                "iterator"
-                    | "hashmap"
-                    | "btree"
-                    | "binaryheap"
-                    | "vecdeque"
-                    | "fromstr"
-                    | "result"
-                    | "option"
-                    | "trait"
-                    | "lifetime"
-            )
-        {
-            terms.push(clean.to_string());
-        }
-        if terms.len() >= 12 {
-            break;
-        }
-    }
-    (!terms.is_empty()).then(|| terms.join(" "))
-}
-
-fn iter_md_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, out)?;
-            } else if path.extension().and_then(OsStr::to_str) == Some("md") {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-    walk(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn split_markdown_by_heading(content: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for line in content.lines() {
-        let is_heading = line.starts_with("# ") || line.starts_with("## ");
-        if is_heading && !current.trim().is_empty() {
-            chunks.push(current.trim().to_string());
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-    if !current.trim().is_empty() {
-        chunks.push(current.trim().to_string());
-    }
-    chunks
 }
 
 fn run_prepare_github_top_code(args: &[String]) -> Result<()> {
@@ -1516,91 +1063,6 @@ fn json_answers_texts(value: &Value) -> Vec<String> {
     out
 }
 
-fn run_prepare_rust_function_tasks(args: &[String]) -> Result<()> {
-    let mut input: Option<PathBuf> = None;
-    let mut output: Option<PathBuf> = None;
-    let mut github_top_code = false;
-    let mut split = "train".to_string();
-    let mut max_files: Option<usize> = None;
-    let mut max_rows: Option<usize> = None;
-    let mut force = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--input" => {
-                input = Some(parse_path_value(args, i, "--input")?);
-                i += 2;
-            }
-            "--output" => {
-                output = Some(parse_path_value(args, i, "--output")?);
-                i += 2;
-            }
-            "--github-top-code" => {
-                github_top_code = true;
-                i += 1;
-            }
-            "--split" => {
-                split = parse_flag_value(args, i, "--split")?;
-                i += 2;
-            }
-            "--max-files" => {
-                max_files = Some(parse_usize_value(args, i, "--max-files")?);
-                i += 2;
-            }
-            "--max-rows" => {
-                max_rows = Some(parse_usize_value(args, i, "--max-rows")?);
-                i += 2;
-            }
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            value => bail!("unknown flag: {value}"),
-        }
-    }
-    let output = output.context("--output is required")?;
-    if !github_top_code && input.is_none() {
-        bail!("either --input or --github-top-code is required");
-    }
-    let input_paths = input.clone().into_iter().collect::<Vec<_>>();
-    let params = json!({
-        "github_top_code": github_top_code,
-        "split": split,
-        "max_files": max_files,
-        "max_rows": max_rows,
-    });
-    if !force {
-        if let Some(manifest) =
-            artifact_cache_hit("rust_function_tasks", &output, &input_paths, &params)?
-        {
-            println!(
-                "Rust instruction-pair cache hit: {} (rows={})",
-                output.display(),
-                manifest.rows
-            );
-            return Ok(());
-        }
-    }
-    let samples = if github_top_code {
-        collect_rust_functions_from_github_top_code(&split, max_files)?
-    } else {
-        collect_rust_functions_from_pairs(input.as_ref().unwrap())?
-    };
-    let written = write_rust_instruction_pairs(&samples, &output, max_rows)?;
-    write_artifact_manifest(
-        "rust_function_tasks",
-        &output,
-        &input_paths,
-        params,
-        written,
-    )?;
-    println!(
-        "Wrote {written} Rust instruction pairs to {}",
-        output.display()
-    );
-    Ok(())
-}
-
 fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
@@ -1678,12 +1140,6 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
         output.display()
     );
     Ok(())
-}
-
-fn strip_tags(text: &str) -> String {
-    let unescaped = unescape_pair_field(text);
-    let re = Regex::new(r"(?i)<lang:rust>\s*<(?:ctx|reply)>\s*").unwrap();
-    re.replace(&unescaped, "").trim().to_string()
 }
 
 fn collect_go_functions_from_pairs(input: &Path) -> Result<Vec<(String, String)>> {
@@ -1818,85 +1274,6 @@ fn write_go_instruction_pairs(
     Ok(written)
 }
 
-fn collect_rust_functions_from_pairs(input: &Path) -> Result<Vec<(String, String)>> {
-    let mut samples = Vec::new();
-    let reader = BufReader::new(File::open(input)?);
-    for raw in reader.lines() {
-        let line = raw?;
-        let Some((left, right)) = line.split_once('\t') else {
-            continue;
-        };
-        let combined = [strip_tags(left), strip_tags(right)]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        samples.extend(extract_rust_functions(&combined));
-    }
-    Ok(samples)
-}
-
-fn collect_rust_functions_from_github_top_code(
-    split: &str,
-    max_files: Option<usize>,
-) -> Result<Vec<(String, String)>> {
-    let mut samples = Vec::new();
-    let mut seen_files = 0usize;
-    for row in iter_dataset_rows(GITHUB_TOP_CODE_DATASET_ID, split)? {
-        let language = row_string(&row, "file_language").unwrap_or_default();
-        if language != "Rust" {
-            continue;
-        }
-        let Some(content) = row_string(&row, "content") else {
-            continue;
-        };
-        if content.trim().is_empty() {
-            continue;
-        }
-        samples.extend(extract_rust_functions(&content));
-        seen_files += 1;
-        if max_files.is_some_and(|max| seen_files >= max) {
-            break;
-        }
-    }
-    Ok(samples)
-}
-
-fn extract_rust_functions(src: &str) -> Vec<(String, String)> {
-    let func_start_re = Regex::new(
-        r"(?m)^(?P<indent>\s*)(?P<sig>(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+[A-Za-z_][A-Za-z0-9_]*[\s\S]*?)\{",
-    )
-    .unwrap();
-    let mut results = Vec::new();
-    for capture in func_start_re.captures_iter(src) {
-        let Some(sig_match) = capture.name("sig") else {
-            continue;
-        };
-        let open_idx = capture.get(0).unwrap().end() - 1;
-        let Some(close_idx) = find_matching_brace(src, open_idx) else {
-            continue;
-        };
-        let signature = sig_match
-            .as_str()
-            .lines()
-            .map(|line| line.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
-        let body = src[sig_match.start()..=close_idx].trim().to_string();
-        let line_count = body.lines().count();
-        if !(2..=120).contains(&line_count) || signature.len() > 240 || body.len() > 8_000 {
-            continue;
-        }
-        if !signature.contains("fn ") {
-            continue;
-        }
-        results.push((signature, body));
-    }
-    results
-}
-
 fn find_matching_brace(src: &str, open_idx: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     let mut depth = 0i32;
@@ -1962,190 +1339,6 @@ fn find_matching_brace(src: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
-fn build_prompt_variants(signature: &str) -> [String; 3] {
-    let rules = "Rules:\n- Keep the exact function name and signature.\n- Return only compilable Rust code for that function.\n- Do not add explanation.\n";
-    [
-        format!(
-            "Return only Rust code. Implement exactly this function:\n{signature}\n\n{rules}"
-        ),
-        format!("Write the Rust function below and return code only:\n{signature}\n\n{rules}"),
-        format!("Complete this Rust function implementation. Output only the function body in its full function form:\n{signature}\n\n{rules}"),
-    ]
-}
-
-fn write_rust_instruction_pairs(
-    samples: &[(String, String)],
-    output: &Path,
-    max_rows: Option<usize>,
-) -> Result<usize> {
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = output.with_extension("txt.tmp");
-    let mut out = BufWriter::new(File::create(&tmp)?);
-    let mut seen = HashSet::new();
-    let mut written = 0usize;
-    for (signature, body) in samples {
-        if max_rows.is_some_and(|max| written >= max) {
-            break;
-        }
-        for prompt in build_prompt_variants(signature) {
-            if max_rows.is_some_and(|max| written >= max) {
-                break;
-            }
-            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
-            if !seen.insert(digest) {
-                continue;
-            }
-            writeln!(
-                out,
-                "{}\t{}",
-                escape_pair_field(&prompt),
-                escape_pair_field(body)
-            )?;
-            written += 1;
-        }
-    }
-    out.flush()?;
-    fs::rename(tmp, output)?;
-    Ok(written)
-}
-
-fn run_prepare_rust_repair_tasks(args: &[String]) -> Result<()> {
-    let mut input = None;
-    let mut output = None;
-    let mut rustc_bin = "rustc".to_string();
-    let mut seed = 0u64;
-    let mut timeout_sec = 4.0f64;
-    let mut variants_per_sample = 2usize;
-    let mut max_rows = 0usize;
-    let mut progress_every = 5000usize;
-    let mut force = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--input" => {
-                input = Some(parse_path_value(args, i, "--input")?);
-                i += 2;
-            }
-            "--output" => {
-                output = Some(parse_path_value(args, i, "--output")?);
-                i += 2;
-            }
-            "--rustc" => {
-                rustc_bin = parse_flag_value(args, i, "--rustc")?;
-                i += 2;
-            }
-            "--seed" => {
-                seed = parse_usize_value(args, i, "--seed")? as u64;
-                i += 2;
-            }
-            "--timeout-sec" => {
-                timeout_sec = parse_f64_value(args, i, "--timeout-sec")?;
-                i += 2;
-            }
-            "--variants-per-sample" => {
-                variants_per_sample = parse_usize_value(args, i, "--variants-per-sample")?;
-                i += 2;
-            }
-            "--max-rows" => {
-                max_rows = parse_usize_value(args, i, "--max-rows")?;
-                i += 2;
-            }
-            "--progress-every" => {
-                progress_every = parse_usize_value(args, i, "--progress-every")?;
-                i += 2;
-            }
-            "--force" => {
-                force = true;
-                i += 1;
-            }
-            value => bail!("unknown flag: {value}"),
-        }
-    }
-    let input = input.context("--input is required")?;
-    let output = output.context("--output is required")?;
-    let rustc_version = rustc_version_string(&rustc_bin)?;
-    let params = json!({
-        "rustc_bin": rustc_bin,
-        "rustc_version": rustc_version,
-        "seed": seed,
-        "timeout_sec": timeout_sec,
-        "variants_per_sample": variants_per_sample,
-        "max_rows": max_rows,
-    });
-    let inputs = vec![input.clone()];
-    if !force {
-        if let Some(manifest) = artifact_cache_hit("rust_repair_pairs", &output, &inputs, &params)?
-        {
-            println!(
-                "Repair pair cache hit: {} (rows={})",
-                output.display(),
-                manifest.rows
-            );
-            return Ok(());
-        }
-    }
-    let pairs = load_escaped_pairs(&input)?;
-    if pairs.is_empty() {
-        bail!("no usable pairs found in {}", input.display());
-    }
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut seen = HashSet::new();
-    let mut written = 0usize;
-    let tmp = output.with_extension("txt.tmp");
-    let mut out = BufWriter::new(File::create(&tmp)?);
-    for (idx, (task_prompt, correct_code)) in pairs.iter().enumerate() {
-        let mut variants = corruption_variants(correct_code);
-        variants.shuffle(&mut rng);
-        let mut kept = 0usize;
-        for (name, broken_code) in variants {
-            if max_rows > 0 && written >= max_rows {
-                break;
-            }
-            let mut feedback = compile_feedback(&rustc_bin, &broken_code, timeout_sec)?;
-            if feedback.is_empty() {
-                if name == "wrong_fn_name" {
-                    feedback =
-                        "error: function name does not match the requested signature".to_string();
-                } else {
-                    continue;
-                }
-            }
-            let prompt = build_repair_prompt(task_prompt, &broken_code, &feedback);
-            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{correct_code}")));
-            if !seen.insert(digest) {
-                continue;
-            }
-            writeln!(
-                out,
-                "{}\t{}",
-                escape_pair_field(&prompt),
-                escape_pair_field(correct_code)
-            )?;
-            written += 1;
-            kept += 1;
-            if kept >= variants_per_sample.max(1) {
-                break;
-            }
-        }
-        if progress_every > 0 && (idx + 1) % progress_every == 0 {
-            println!(
-                "Repair pairs progress: processed={} written={written}",
-                idx + 1
-            );
-        }
-        if max_rows > 0 && written >= max_rows {
-            break;
-        }
-    }
-    out.flush()?;
-    fs::rename(tmp, &output)?;
-    write_artifact_manifest("rust_repair_pairs", &output, &inputs, params, written)?;
-    println!("Wrote {written} repair rows to {}", output.display());
-    Ok(())
-}
-
 fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     let mut input = None;
     let mut output = None;
@@ -2208,6 +1401,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
         "timeout_sec": timeout_sec,
         "variants_per_sample": variants_per_sample,
         "max_rows": max_rows,
+        "cache_strategy": "shared-warmed-go-build-cache-v1",
     });
     let inputs = vec![input.clone()];
     if !force {
@@ -2229,6 +1423,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     let mut written = 0usize;
     let tmp = output.with_extension("txt.tmp");
     let mut out = BufWriter::new(File::create(&tmp)?);
+    let go_feedback = GoCompileFeedback::new(&go_bin, &go_version, timeout_sec)?;
     for (idx, (task_prompt, correct_code)) in pairs.iter().enumerate() {
         let mut variants = go_corruption_variants(correct_code);
         variants.shuffle(&mut rng);
@@ -2237,7 +1432,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
             if max_rows > 0 && written >= max_rows {
                 break;
             }
-            let feedback = go_compile_feedback(&go_bin, &broken_code, timeout_sec)?;
+            let feedback = go_feedback.compile(&broken_code)?;
             if feedback.is_empty() {
                 continue;
             }
@@ -2276,24 +1471,6 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn rustc_version_string(rustc_bin: &str) -> Result<String> {
-    for args in [["--version", "--verbose"], ["--version", ""]] {
-        let mut cmd = Command::new(rustc_bin);
-        cmd.arg(args[0]);
-        if !args[1].is_empty() {
-            cmd.arg(args[1]);
-        }
-        let out = cmd.output()?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                return Ok(stdout);
-            }
-        }
-    }
-    bail!("failed to query rustc version from '{rustc_bin}'")
-}
-
 fn go_version_string(go_bin: &str) -> Result<String> {
     let out = Command::new(go_bin).arg("version").output()?;
     if out.status.success() {
@@ -2303,6 +1480,57 @@ fn go_version_string(go_bin: &str) -> Result<String> {
         }
     }
     bail!("failed to query Go version from '{go_bin}'")
+}
+
+struct GoCompileFeedback {
+    go_bin: String,
+    timeout_sec: f64,
+    cache_dir: PathBuf,
+    mod_cache_dir: PathBuf,
+}
+
+impl GoCompileFeedback {
+    fn new(go_bin: &str, go_version: &str, timeout_sec: f64) -> Result<Self> {
+        let cache_root = std::env::var_os("TOFY_GO_REPAIR_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "tofy-go-repair-cache-{:x}",
+                    md5::compute(go_version)
+                ))
+            });
+        let cache_dir = std::env::var_os("GOCACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cache_root.join("go-build"));
+        let mod_cache_dir = std::env::var_os("GOMODCACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cache_root.join("go-mod"));
+        fs::create_dir_all(&cache_dir)?;
+        fs::create_dir_all(&mod_cache_dir)?;
+        let runner = Self {
+            go_bin: go_bin.to_string(),
+            timeout_sec,
+            cache_dir,
+            mod_cache_dir,
+        };
+        runner.warm_cache()?;
+        Ok(runner)
+    }
+
+    fn warm_cache(&self) -> Result<()> {
+        let _ = self.compile("func tofyGoRepairCacheWarmup() {}")?;
+        Ok(())
+    }
+
+    fn compile(&self, code: &str) -> Result<String> {
+        go_compile_feedback(
+            &self.go_bin,
+            code,
+            self.timeout_sec,
+            &self.cache_dir,
+            &self.mod_cache_dir,
+        )
+    }
 }
 
 fn load_escaped_pairs(path: &Path) -> Result<Vec<(String, String)>> {
@@ -2316,37 +1544,6 @@ fn load_escaped_pairs(path: &Path) -> Result<Vec<(String, String)>> {
         rows.push((unescape_pair_field(left), unescape_pair_field(right)));
     }
     Ok(rows)
-}
-
-fn corruption_variants(code: &str) -> Vec<(String, String)> {
-    let mut variants = vec![(
-        "stray_role_prefix".to_string(),
-        format!("assistant\n{code}"),
-    )];
-    if code.contains('{') {
-        variants.push(("missing_open_brace".to_string(), code.replacen('{', "", 1)));
-    }
-    if let Some(idx) = code.rfind('}') {
-        variants.push((
-            "missing_close_brace".to_string(),
-            format!("{}{}", &code[..idx], &code[idx + 1..]),
-        ));
-    }
-    if code.contains("->") {
-        variants.push(("broken_arrow".to_string(), code.replacen("->", "=>", 1)));
-    }
-    if code.contains(')') {
-        variants.push(("broken_paren".to_string(), code.replacen(')', "]", 1)));
-    }
-    let func_name_re = Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    if let Some(capture) = func_name_re.captures(code) {
-        let name = capture.get(1).unwrap().as_str();
-        variants.push((
-            "wrong_fn_name".to_string(),
-            code.replacen(&format!("fn {name}"), &format!("fn broken_{name}"), 1),
-        ));
-    }
-    variants
 }
 
 fn go_corruption_variants(code: &str) -> Vec<(String, String)> {
@@ -2405,40 +1602,13 @@ fn run_command_with_timeout(cmd: &mut Command, timeout_sec: f64) -> Result<std::
     }
 }
 
-fn compile_feedback(rustc_bin: &str, code: &str, timeout_sec: f64) -> Result<String> {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("tofy-rust-repair-{unique}"));
-    fs::create_dir_all(&dir)?;
-    let src = dir.join("bad.rs");
-    fs::write(&src, format!("{code}\n"))?;
-    let mut cmd = Command::new(rustc_bin);
-    cmd.arg("--crate-type")
-        .arg("lib")
-        .arg("--edition")
-        .arg("2021")
-        .arg(&src);
-    let output = run_command_with_timeout(&mut cmd, timeout_sec)?;
-    let _ = fs::remove_dir_all(&dir);
-    if output.status.success() {
-        return Ok(String::new());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut lines = Vec::new();
-    for line in stderr.lines() {
-        if !line.trim().is_empty() {
-            lines.push(line.trim().to_string());
-        }
-        if lines.len() >= 12 {
-            break;
-        }
-    }
-    Ok(lines.join("\n"))
-}
-
-fn go_compile_feedback(go_bin: &str, code: &str, timeout_sec: f64) -> Result<String> {
+fn go_compile_feedback(
+    go_bin: &str,
+    code: &str,
+    timeout_sec: f64,
+    cache_dir: &Path,
+    mod_cache_dir: &Path,
+) -> Result<String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2455,8 +1625,8 @@ fn go_compile_feedback(go_bin: &str, code: &str, timeout_sec: f64) -> Result<Str
         .arg("-c")
         .arg(".")
         .current_dir(&dir)
-        .env("GOCACHE", dir.join("gocache"))
-        .env("GOMODCACHE", dir.join("gomodcache"));
+        .env("GOCACHE", cache_dir)
+        .env("GOMODCACHE", mod_cache_dir);
     let output = run_command_with_timeout(&mut cmd, timeout_sec)?;
     let _ = fs::remove_dir_all(&dir);
     if output.status.success() {
@@ -2480,10 +1650,6 @@ fn go_compile_feedback(go_bin: &str, code: &str, timeout_sec: f64) -> Result<Str
 fn strip_go_package_line(code: &str) -> String {
     let package_re = Regex::new(r"(?m)^\s*package\s+\w+\s*$").unwrap();
     package_re.replace_all(code, "").trim().to_string()
-}
-
-fn build_repair_prompt(task_prompt: &str, broken_code: &str, feedback: &str) -> String {
-    build_language_repair_prompt("Rust", "rust", task_prompt, broken_code, feedback)
 }
 
 fn build_language_repair_prompt(
@@ -2654,13 +1820,9 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn world_mix_code_action(left: &str, right: &str) -> &'static str {
+fn world_mix_code_action(left: &str, _right: &str) -> &'static str {
     let left_lower = left.to_ascii_lowercase();
-    let right_lower = right.to_ascii_lowercase();
-    if left_lower.contains("<action:fetch_docs>")
-        || left_lower.contains("<tool:fetch_docs>")
-        || right_lower.contains("<ctx:rust_docs>")
-    {
+    if left_lower.contains("<action:fetch_docs>") || left_lower.contains("<tool:fetch_docs>") {
         "fetch_docs"
     } else {
         "code"
@@ -3720,11 +2882,11 @@ fn write_probe_data(path: &Path, rows: usize) -> Result<()> {
     let mut out = BufWriter::new(File::create(path)?);
     for i in 0..rows {
         let prompt = format!(
-            "user asks rust task {i} value_{i} condition_{} context_token_{i} helper_name_{i} return only rust code",
+            "user asks go task {i} value_{i} condition_{} context_token_{i} helper_name_{i} return only go code",
             i % 97
         );
         let answer = format!(
-            "<action:code> fn function_{i}(value_{i}: i32) -> i32 {{ let shifted_{i} = value_{i} + {}; if shifted_{i} > {} {{ shifted_{i} }} else {{ shifted_{i} + 1 }} }} unique_code_token_{i}",
+            "<action:code> func function{i}(value{i} int) int {{ shifted{i} := value{i} + {}; if shifted{i} > {} {{ return shifted{i} }}; return shifted{i} + 1 }} unique_code_token_{i}",
             i % 17,
             i % 31
         );

@@ -224,40 +224,6 @@ impl RustDocIndex {
         out.push_str("</ctx:rust_docs>");
         out
     }
-
-    pub(crate) fn jepa_rows(&self, max_rows: usize) -> Vec<String> {
-        self.chunks
-            .iter()
-            .take(max_rows.max(1))
-            .map(|chunk| chunk.text.replace(['\t', '\n'], " "))
-            .collect()
-    }
-
-    pub(crate) fn tool_pairs(&self, max_rows: usize) -> Vec<String> {
-        let mut rows = Vec::new();
-        for chunk in self.chunks.iter().take(max_rows.max(1)) {
-            let symbol = chunk
-                .symbols
-                .iter()
-                .find(|value| value.len() >= 3)
-                .cloned()
-                .unwrap_or_else(|| chunk.title.clone());
-            let query = format!(
-                "<action:fetch_docs>\n<tool:fetch_docs>\nNeed installed Rust docs for `{}` before writing code.\nQuery: {}",
-                symbol, symbol
-            )
-            .replace(['\t', '\n'], " ");
-            let result = format!(
-                "<ctx:rust_docs>\n[1] {} path={}\n{}\n</ctx:rust_docs>",
-                chunk.title,
-                chunk.path.display(),
-                excerpt_for_budget(&chunk.text, 1000)
-            )
-            .replace(['\t', '\n'], " ");
-            rows.push(format!("{query}\t{result}\tfetch_docs"));
-        }
-        rows
-    }
 }
 
 fn collect_doc_files(root: &Path, out: &mut Vec<PathBuf>, max_files: usize) -> Result<()> {

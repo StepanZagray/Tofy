@@ -53,7 +53,7 @@ pub fn print_usage(program: &str) {
         "    {program} --prepare-ultrachat [output_path] [context_window] [min_tokens] [max_rows]"
     );
     eprintln!(
-        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-rust-function-tasks|--prepare-rust-repair-tasks|--prepare-world-mix|--prepare-code-poc-mix|--prepare-rust-by-practice ..."
+        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-repair-tasks|--prepare-world-mix|--prepare-code-poc-mix ..."
     );
     eprintln!(
         "    {program} --prepare-expert-pairs|--prepare-casual-conversation|--generate-code-eval-suite|--convert-jsonl-context-response-to-tsv ..."
