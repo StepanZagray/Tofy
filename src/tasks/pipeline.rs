@@ -11,23 +11,13 @@ use crate::{data, tasks, util};
 
 const WORLD_TEXT_DATA: &str = "data/ultrachat_pairs.txt";
 const WORLD_DATA: &str = "data/world_mix_pairs.txt";
-const CODE_DATA: &str = "data/rust_code_pairs.txt";
 const GO_CODE_DATA: &str = "data/go_code_pairs.txt";
 const WIKI_DATA: &str = "data/cached_wikimedia_wikipedia_1.txt";
 const ENCODER_DATA: &str = "data/encoder_mix.txt";
 const EVAL_SUITE: &str = "eval/code_assistant_go_hard.jsonl";
-const RUST_TASK_DATA: &str = "data/rust_instruction_pairs.txt";
-const RUST_REPAIR_DATA: &str = "data/rust_repair_pairs.txt";
 const GO_TASK_DATA: &str = "data/go_instruction_pairs.txt";
 const GO_REPAIR_DATA: &str = "data/go_repair_pairs.txt";
 const GO_FEEDBACK_TRAIN_DATA: &str = "data/code_poc_go_mix.txt";
-const RUST_DOCS_ROOT: &str = "data/sunface_rust-by-practice_en";
-const RUST_DOCS_JEPA_DATA: &str = "data/rust_docs_jepa.txt";
-const RUST_DOCS_PAIR_DATA: &str = "data/rust_docs_pairs.txt";
-const RUST_STD_DOCS_JEPA_DATA: &str = "data/rust_std_docs_jepa.txt";
-const RUST_STD_DOC_TOOL_DATA: &str = "data/rust_std_doc_tool_pairs.txt";
-const RUST_STD_DOC_TRAJECTORY_DATA: &str = "data/rust_std_doc_trajectories.txt";
-const RUST_STD_DOC_CODE_DATA: &str = "data/rust_std_doc_code_pairs.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
 const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
@@ -85,13 +75,6 @@ struct PipelineConfig {
     resume: bool,
     resume_selector: Option<String>,
     with_code_eval: bool,
-}
-
-#[derive(Default)]
-struct DocsPrep {
-    extra_encoder_inputs: Vec<String>,
-    extra_code_mix_args: Vec<String>,
-    rust_std_docs_available: bool,
 }
 
 #[derive(Debug)]
@@ -441,26 +424,23 @@ fn resolve_pipeline_paths(
 
 fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
-    let docs = thread::scope(|scope| -> Result<DocsPrep> {
+    thread::scope(|scope| -> Result<()> {
         let code_handle = scope.spawn(prepare_code_source_data);
         let source_handle = scope.spawn(ensure_pipeline_source_data);
-        let docs_handle = scope.spawn(prepare_docs_data);
         let eval_handle =
             scope.spawn(|| run_prepare(["--generate-go-code-eval-suite", "--output", EVAL_SUITE]));
 
         join_result(code_handle, "github code data")?;
         join_result(source_handle, "pipeline source data")?;
-        let docs = join_result(docs_handle, "docs data")?;
         join_result(eval_handle, "eval suite")?;
-        Ok(docs)
+        Ok(())
     })?;
 
-    let mut encoder_inputs = vec![
+    let encoder_inputs = vec![
         WORLD_TEXT_DATA.to_string(),
         WIKI_DATA.to_string(),
-        CODE_DATA.to_string(),
+        GO_CODE_DATA.to_string(),
     ];
-    encoder_inputs.extend(docs.extra_encoder_inputs);
 
     thread::scope(|scope| -> Result<()> {
         let encoder_inputs_for_corpus = encoder_inputs.clone();
@@ -474,47 +454,8 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             run_prepare_vec(encoder_args)
         });
 
-        prepare_rust_task_data()?;
         prepare_go_task_data()?;
 
-        let trajectory_handle = docs.rust_std_docs_available.then(|| {
-            scope.spawn(|| {
-                run_prepare([
-                    "--prepare-rust-doc-trajectories",
-                    "--input",
-                    RUST_TASK_DATA,
-                    "--output",
-                    RUST_STD_DOC_TRAJECTORY_DATA,
-                    "--code-output",
-                    RUST_STD_DOC_CODE_DATA,
-                    "--max-rows",
-                    "12000",
-                ])
-            })
-        });
-
-        let repair_handle = if command_available("rustc") {
-            Some(scope.spawn(|| {
-                run_prepare([
-                    "--prepare-rust-repair-tasks",
-                    "--input",
-                    RUST_TASK_DATA,
-                    "--output",
-                    RUST_REPAIR_DATA,
-                    "--rustc",
-                    "rustc",
-                    "--variants-per-sample",
-                    "2",
-                    "--timeout-sec",
-                    "4.0",
-                    "--max-rows",
-                    "2000",
-                ])
-            }))
-        } else {
-            println!("Rust compiler-feedback repair pairs skipped: rustc not found.");
-            None
-        };
         let go_repair_handle = if command_available("go") {
             Some(scope.spawn(|| {
                 run_prepare([
@@ -538,18 +479,11 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
             None
         };
 
-        if let Some(handle) = trajectory_handle {
-            join_result(handle, "rust doc trajectories")?;
-        }
-        if let Some(handle) = repair_handle {
-            join_result(handle, "rust repair tasks")?;
-        }
         if let Some(handle) = go_repair_handle {
             join_result(handle, "go repair tasks")?;
         }
 
-        let (world_args, code_mix_args, go_feedback_mix_args) =
-            build_stage1_mix_args(docs.extra_code_mix_args);
+        let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
         let world_handle = scope.spawn(move || run_prepare_vec(world_args));
         let code_mix_handle = scope.spawn(move || run_prepare_vec(code_mix_args));
         let go_feedback_mix_handle = scope.spawn(move || run_prepare_vec(go_feedback_mix_args));
@@ -593,18 +527,6 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
 }
 
 fn prepare_code_source_data() -> Result<()> {
-    if !nonempty_file(CODE_DATA) {
-        run_prepare([
-            "--prepare-github-top-code",
-            "--output",
-            CODE_DATA,
-            "--languages",
-            "Rust",
-            "--max-files",
-            "120000",
-        ])?;
-    }
-    ensure_nonempty_file(CODE_DATA)?;
     if !nonempty_file(GO_CODE_DATA) {
         run_prepare([
             "--prepare-github-top-code",
@@ -617,92 +539,6 @@ fn prepare_code_source_data() -> Result<()> {
         ])?;
     }
     ensure_nonempty_file(GO_CODE_DATA)?;
-    Ok(())
-}
-
-fn prepare_docs_data() -> Result<DocsPrep> {
-    let mut docs = DocsPrep::default();
-    if Path::new(RUST_DOCS_ROOT).is_dir() {
-        run_prepare([
-            "--prepare-rust-by-practice",
-            "--input",
-            RUST_DOCS_ROOT,
-            "--mode",
-            "jepa",
-            "--output",
-            RUST_DOCS_JEPA_DATA,
-        ])?;
-        if nonempty_file(RUST_DOCS_JEPA_DATA) {
-            docs.extra_encoder_inputs
-                .push(RUST_DOCS_JEPA_DATA.to_string());
-        }
-        run_prepare([
-            "--prepare-rust-by-practice",
-            "--input",
-            RUST_DOCS_ROOT,
-            "--mode",
-            "pairs",
-            "--output",
-            RUST_DOCS_PAIR_DATA,
-        ])?;
-        if nonempty_file(RUST_DOCS_PAIR_DATA) {
-            docs.extra_code_mix_args.extend([
-                "--extra-pairs".to_string(),
-                RUST_DOCS_PAIR_DATA.to_string(),
-                "--extra-repeat".to_string(),
-                "1".to_string(),
-            ]);
-        }
-    }
-    let rust_std_docs_available = tasks::rust_docs::default_rust_docs_root().is_some();
-    docs.rust_std_docs_available = rust_std_docs_available;
-    if rust_std_docs_available {
-        run_prepare([
-            "--prepare-rust-docs",
-            "--mode",
-            "jepa",
-            "--output",
-            RUST_STD_DOCS_JEPA_DATA,
-            "--max-rows",
-            "20000",
-        ])?;
-        if nonempty_file(RUST_STD_DOCS_JEPA_DATA) {
-            docs.extra_encoder_inputs
-                .push(RUST_STD_DOCS_JEPA_DATA.to_string());
-        }
-        run_prepare([
-            "--prepare-rust-docs",
-            "--mode",
-            "tool-pairs",
-            "--output",
-            RUST_STD_DOC_TOOL_DATA,
-            "--max-rows",
-            "12000",
-        ])?;
-    } else {
-        println!("Installed Rust docs not found; run `rustup component add rust-docs rust-src` to enable fetch_docs training rows.");
-    }
-    Ok(docs)
-}
-
-fn prepare_rust_task_data() -> Result<()> {
-    run_prepare([
-        "--prepare-rust-function-tasks",
-        "--input",
-        CODE_DATA,
-        "--output",
-        RUST_TASK_DATA,
-    ])?;
-    if !nonempty_file(RUST_TASK_DATA) {
-        run_prepare([
-            "--prepare-rust-function-tasks",
-            "--github-top-code",
-            "--max-files",
-            "120000",
-            "--output",
-            RUST_TASK_DATA,
-        ])?;
-    }
     Ok(())
 }
 
@@ -727,9 +563,8 @@ fn prepare_go_task_data() -> Result<()> {
     Ok(())
 }
 
-fn build_stage1_mix_args(
-    mut extra_code_mix_args: Vec<String>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut extra_code_mix_args = Vec::new();
     let mut world_args = vec![
         "--prepare-world-mix".to_string(),
         "--output".to_string(),
@@ -737,42 +572,15 @@ fn build_stage1_mix_args(
         "--text-pairs".to_string(),
         WORLD_TEXT_DATA.to_string(),
         "--code-pairs".to_string(),
-        CODE_DATA.to_string(),
-        "--code-pairs".to_string(),
-        RUST_TASK_DATA.to_string(),
-        "--code-pairs".to_string(),
         GO_CODE_DATA.to_string(),
         "--code-pairs".to_string(),
         GO_TASK_DATA.to_string(),
     ];
-    if nonempty_file(RUST_REPAIR_DATA) {
-        world_args.extend(["--code-pairs".to_string(), RUST_REPAIR_DATA.to_string()]);
-        extra_code_mix_args.extend([
-            "--extra-pairs".to_string(),
-            RUST_REPAIR_DATA.to_string(),
-            "--extra-repeat".to_string(),
-            "2".to_string(),
-        ]);
-    }
     if nonempty_file(GO_REPAIR_DATA) {
         world_args.extend(["--code-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
-    }
-    if nonempty_file(RUST_STD_DOC_TOOL_DATA) {
-        world_args.extend([
-            "--code-pairs".to_string(),
-            RUST_STD_DOC_TOOL_DATA.to_string(),
-        ]);
-    }
-    if nonempty_file(RUST_STD_DOC_TRAJECTORY_DATA) {
-        world_args.extend([
-            "--code-pairs".to_string(),
-            RUST_STD_DOC_TRAJECTORY_DATA.to_string(),
-        ]);
-    }
-    if nonempty_file(RUST_STD_DOC_CODE_DATA) {
         extra_code_mix_args.extend([
             "--extra-pairs".to_string(),
-            RUST_STD_DOC_CODE_DATA.to_string(),
+            GO_REPAIR_DATA.to_string(),
             "--extra-repeat".to_string(),
             "2".to_string(),
         ]);
@@ -791,9 +599,9 @@ fn build_stage1_mix_args(
         "--output".to_string(),
         CODE_TRAIN_DATA.to_string(),
         "--base-pairs".to_string(),
-        CODE_DATA.to_string(),
+        GO_CODE_DATA.to_string(),
         "--instruction-pairs".to_string(),
-        RUST_TASK_DATA.to_string(),
+        GO_TASK_DATA.to_string(),
         "--instruction-repeat".to_string(),
         "6".to_string(),
     ];
@@ -1617,7 +1425,7 @@ fn command_available(program: &str) -> bool {
             .arg("version")
             .output()
             .map(|output| output.status.success())
-        .unwrap_or(false)
+            .unwrap_or(false)
 }
 
 fn unix_timestamp() -> Result<u64> {

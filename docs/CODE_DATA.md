@@ -49,45 +49,50 @@ cargo run --release -- --train-orchestrator local_models/model_latent_<size>.saf
 
 **Options:** `--split` (train/test/validation), `--min-lines`, `--split-ratio` (prefix/completion split). See `cargo run --release -- --prepare-github-top-code --help`.
 
-### Rust instruction/function tasks for the code-first POC
+### Go instruction/function tasks for the code-first POC
 
-The Rust function-task generator is not building generic code-continuation rows. It asks for:
+The canonical code-first pipeline is Go-focused. The Go function-task generator is not building generic code-continuation rows. It asks for:
 
 - natural-language instruction
-- exact Rust function signature
+- exact Go function signature
 - compilable function implementation
 
 So for the code-first proof of concept, build a second decoder dataset that matches that shape:
 
 ```bash
-cargo run --release -- --prepare-rust-function-tasks --input data/rust_code_pairs.txt --output data/rust_instruction_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/rust_code_pairs.txt --instruction-pairs data/rust_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/rust_docs_pairs.txt --extra-repeat 1
+cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
+cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
 ```
 
 What this does:
 
-- scans Rust code pairs
-- extracts `pub fn ... { ... }` functions
+- scans Go code pairs
+- extracts `func ... { ... }` functions
 - turns them into multiple prompt variants around the same exact function signature
-- optionally mixes in Rust-by-Practice section pairs
+- optionally mixes in Go compiler-feedback repair pairs
 - shuffles and oversamples those instruction-shaped rows before code-decoder training
 
-This is a decoder-training improvement, not a router/world-model change. It specifically targets the failure mode where `route_code_acc` is high but the decoder still emits generic multilingual code-token soup instead of a Rust function body.
+This is a decoder-training improvement, not a router/world-model change. It specifically targets the failure mode where `route_code_acc` is high but the decoder still emits generic multilingual code-token soup instead of a Go function body.
 
-The code-first pipeline uses these Rust rows in the base decoder mix:
+The code-first pipeline uses these Go rows in the base decoder mix:
 
 - base code decoder data: `data/code_poc_mix.txt`
 - world/action data: `data/world_mix_pairs.txt`
 
-The second decoder stage is now Go execution-feedback training.
+The second decoder stage is also Go execution-feedback training.
 
-### Rust compiler-feedback repair tasks
+### Manual Rust compiler-feedback repair tasks
+
+These commands are retained for manual Rust experiments. The canonical
+`train <8gb|48gb>` pipeline is Go-focused and does not include these Rust rows.
 
 Use `cargo run --release -- --prepare-rust-repair-tasks` to turn instruction/function rows into repair trajectories. The generator corrupts a known-good Rust answer, runs `rustc --crate-type lib`, keeps the compiler diagnostics, and writes a new pair whose left side asks the decoder to repair the failed attempt.
 
 The generated `data/rust_repair_pairs.txt` artifact is cached with a sidecar manifest. If the instruction-pair input hash, `rustc` version, and generation settings still match, reruns print `Repair pair cache hit: ...` and skip regeneration.
 
-The same manifest-cache pattern is now used for the other Stage 1 prepared-data artifacts as well, including `data/encoder_mix.txt`, `data/rust_instruction_pairs.txt`, `data/world_mix_pairs.txt`, and `data/code_poc_mix.txt`.
+The same manifest-cache pattern is used for prepared-data artifacts so manual reruns can skip unchanged generated files.
 
 ```bash
 cargo run --release -- --prepare-rust-repair-tasks --input data/rust_instruction_pairs.txt --output data/rust_repair_pairs.txt

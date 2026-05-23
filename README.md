@@ -52,7 +52,7 @@ The **encoder and world model are not the same artifact anymore**.
 
 1. **Prepare data**
 - chat pairs: `data/ultrachat_pairs.txt`
-- code pairs: `data/rust_code_pairs.txt`
+- Go code pairs: `data/go_code_pairs.txt`
 - wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
 - encoder mix: generated from all of the above
 
@@ -109,22 +109,23 @@ cargo run --release -- --check-dtype-discipline
 
 For VRAM headroom and batch-shape decisions on GPU, use the sustained probe in `docs/OOM_TESTING.md`.
 
-The code-first POC now biases the decoder toward fast Go execution feedback:
+The code-first POC is now Go-focused rather than programming-language
+generalist:
 
-- base code data defaults to Rust-only code pairs
-- `--prepare-rust-function-tasks` derives synthetic instruction -> function pairs from the Rust code corpus
+- base code data defaults to Go code pairs
+- `--prepare-go-function-tasks` derives synthetic instruction -> function pairs from the Go code corpus
 - `--prepare-code-poc-mix` oversamples those instruction-shaped rows before code-decoder training
 - the second decoder stage trains on `data/code_poc_go_mix.txt`, built from Go code, Go instruction pairs, and Go compiler-feedback repair rows
 - `--with-code-eval` defaults to `eval/code_assistant_go_hard.jsonl`
 
 Default behavior:
 
-- fresh runs generate missing or empty Stage 1 source files on the current machine: Rust code pairs, Go code pairs, UltraChat pairs, and a one-parquet Wikipedia cache
-- encoder corpus = UltraChat + downloaded Wikipedia + Rust code pairs
+- fresh runs generate missing or empty Stage 1 source files on the current machine: Go code pairs, UltraChat pairs, and a one-parquet Wikipedia cache
+- encoder corpus = UltraChat + downloaded Wikipedia + Go code pairs
 - world model data = balanced chat+code mix from `--prepare-world-mix`
 - world/action classifier rows now carry explicit action labels and synthetic terminal `done` rows
 - text decoder data = UltraChat
-- code decoder data = Rust-heavy code POC mix built from GitHub code, synthetic function tasks, optional Rust docs rows, and compiler-feedback repair rows when `rustc` is available
+- code decoder data = Go-only code POC mix built from GitHub Go code, synthetic Go function tasks, and Go compiler-feedback repair rows when `go` is available
 - Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
 - the Rust pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
@@ -299,8 +300,8 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 	  - `TOFY_LATENT_REASONING=0|1` disables/enables recurrent latent refinement, default `1`
 	  - `TOFY_LATENT_REASONING_STEPS=<int>` caps refinement depth, default `8` for code-like requests and `3` for text
 	  - `TOFY_LATENT_REASONING_ALPHA=<float>` blends recurrent proposals with the selected next-action latent anchor, default `0.35`
-	- the code-first POC decoder path now uses Rust-only code pairs plus oversampled synthetic Rust instruction/function tasks, optional Rust-by-Practice pairs, shuffled mixed-code training data, and a Go execution-feedback decoder stage because the default hard eval suite now measures fast compile/test repair behavior in Go
-- the code-first pipeline now adds compiler-feedback Rust repair pairs when `rustc` is available; repair prompts use tool/context tags like `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>` while remaining compatible with the existing three-action router
+	- the code-first POC decoder path now uses Go-only code pairs plus oversampled synthetic Go instruction/function tasks and a Go execution-feedback decoder stage because the default hard eval suite measures fast compile/test repair behavior in Go
+- the code-first pipeline now adds compiler-feedback Go repair pairs when `go` is available; repair prompts use tool/context tags like `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>` while remaining compatible with the existing three-action router
 - generated Rust repair pairs now use a manifest-validated cache keyed by the instruction-pair input hash, `rustc` version, and generation settings; reruns print `Repair pair cache hit: ...` when the artifact can be reused
 - encoder TensorBoard now includes `loss/pred_token`, `loss/pred_chunk`, `loss/pred_global`, `metrics/chunk_cosine`, and `metrics/global_cosine`
 - view metrics with `tensorboard --logdir runs/`

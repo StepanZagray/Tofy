@@ -31,8 +31,6 @@ The pipeline now does Go execution-feedback decoder training after the mixed dec
 
 - base decoder run on `data/code_poc_mix.txt`
 - Go feedback decoder run on `data/code_poc_go_mix.txt`
-- compiler-feedback repair rows from `data/rust_repair_pairs.txt` are added when `rustc` is available
-  reruns reuse `data/rust_repair_pairs.txt` when its manifest still matches the instruction-pair input hash, `rustc` version, and generation settings
 - compiler-feedback Go repair rows from `data/go_repair_pairs.txt` are added when `go` is available
   reruns reuse `data/go_repair_pairs.txt` when its manifest still matches the instruction-pair input hash, Go version, and generation settings
 
@@ -133,9 +131,9 @@ Decoder training knobs:
 - `TOFY_DECODER_CONTEXT_CACHE_ROWS=<int>` bounds the in-memory cache of frozen world/context slots during decoder training, default `1024`; set `0` to disable
 - Decoder training batches all gradient-accumulation rows into one frozen encoder/world prefill before slicing latents back into decoder microbatches; the logged `config/decoder_prefill_batch_rows` is `batch * grad_accum`
 - `TOFY_DECODER_SYNTAX_LOSS_WEIGHT=<float>` mixes syntax-weighted CE into decoder training
-- `TOFY_DECODER_SIGNATURE_LOSS_WEIGHT=<float>` upweights the predicted Rust function-signature span during decoder training
+- `TOFY_DECODER_SIGNATURE_LOSS_WEIGHT=<float>` upweights the predicted function-signature span during decoder training
 - `TOFY_PREPARE_REPAIR_TASKS=auto|0|1` controls compiler-feedback repair data generation, default `auto`
-- `RUST_REPAIR_VARIANTS_PER_SAMPLE=<int>` controls synthetic corruptions per Rust task, default `2`
+- `RUST_REPAIR_VARIANTS_PER_SAMPLE=<int>` controls synthetic corruptions per manual Rust repair-task generation, default `2`
 - `CODE_REPAIR_REPEAT=<int>` controls repair-row oversampling in the code decoder mix, default `2`
 - `go_feedback_steps`, `go_feedback_batch`, and `go_feedback_grad_accum` in `config/model_profiles.json` control the Go execution-feedback decoder stage
 
@@ -200,13 +198,10 @@ cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 Stage 1 builds or validates:
 
 - source data on fresh pods:
-  - Rust GitHub code pairs: `data/rust_code_pairs.txt`
   - Go GitHub code pairs: `data/go_code_pairs.txt`
   - UltraChat pairs: `data/ultrachat_pairs.txt`
   - one-parquet Wikipedia cache: `data/cached_wikimedia_wikipedia_1.txt`
 - prepared encoder corpus: `data/encoder_mix.txt`
-- prepared Rust instruction pairs: `data/rust_instruction_pairs.txt`
-- prepared Rust repair pairs: `data/rust_repair_pairs.txt`
 - prepared Go instruction pairs: `data/go_instruction_pairs.txt`
 - prepared Go repair pairs: `data/go_repair_pairs.txt`
 - prepared world mix: `data/world_mix_pairs.txt`
@@ -220,8 +215,8 @@ Stage 1 builds or validates:
 - dual-vocab code-decoder token cache: `data/cache/code_decoder_dual.tokens.bin`
 - JSON manifests under `data/cache/`
 
-Stage 1 runs independent preparation work in parallel. GitHub code pairs,
-UltraChat/Wikipedia source data, Rust docs extraction, and the eval suite can
+Stage 1 runs independent preparation work in parallel. Go GitHub code pairs,
+UltraChat/Wikipedia source data, and the eval suite can
 prepare at the same time; after instruction pairs exist, repair trajectories,
 world mix, and code-decoder mix are also overlapped where dependencies allow.
 This means Stage 1 log lines can interleave.
@@ -486,18 +481,18 @@ Artifacts:
 - `local_models/code_decoder_90M.safetensors`
 - `local_models/code_decoder_90M.vocab.txt`
 
-For the narrow code-first POC, prefer Rust-only code data plus instruction-shaped Rust tasks:
+For the current Go-focused code-first POC, use Go-only code data plus instruction-shaped Go tasks:
 
 ```bash
-cargo run --release -- --prepare-github-top-code --output data/rust_code_pairs.txt --languages Rust --max-files 120000
-cargo run --release -- --prepare-rust-function-tasks --input data/rust_code_pairs.txt --output data/rust_instruction_pairs.txt
-cargo run --release -- --prepare-rust-repair-tasks --input data/rust_instruction_pairs.txt --output data/rust_repair_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/rust_code_pairs.txt --instruction-pairs data/rust_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/rust_repair_pairs.txt --extra-repeat 2
+cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
+cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
 ```
 
-Then train the base code decoder on `data/code_poc_mix.txt`. The canonical pipeline follows that with Go execution-feedback training on `data/code_poc_go_mix.txt`. Repair rows include compiler feedback and tool-like tags such as `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>`; these tags still collapse to the existing `code` router label so old three-action checkpoints remain compatible.
+Then train the base code decoder on `data/code_poc_mix.txt`. The canonical pipeline follows that with an additional Go execution-feedback pass on `data/code_poc_go_mix.txt`. Repair rows include compiler feedback and tool-like tags such as `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>`; these tags still collapse to the existing `code` router label so old three-action checkpoints remain compatible.
 
-For a faster execution-feedback curriculum, add Go repair rows before returning to Rust:
+For the second Go execution-feedback pass, build `data/code_poc_go_mix.txt`:
 
 ```bash
 cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
