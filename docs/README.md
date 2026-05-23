@@ -7,7 +7,7 @@ All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-pa
 | [RUNBOOK.md](RUNBOOK.md) | End-to-end: clone -> HF CLI -> data -> `train 8gb|48gb` (or per-stage flags) -> optional eval -> serve. Includes TensorBoard. |
 | [OPENCODE.md](OPENCODE.md) | Run Tofy in OpenCode; auth and provider config; code-specialist and text-generalist decoders. |
 | [ARCHITECTURE_AND_CAPACITY.md](ARCHITECTURE_AND_CAPACITY.md) | Current context-compressor architecture, cross-action awareness, capacity, and multi-step replies. |
-| [CODE_DATA.md](CODE_DATA.md) | Code training data: CLI `--prepare-*` generators, Rust-by-Practice corpus, pair formats. |
+| [CODE_DATA.md](CODE_DATA.md) | Code training data: CLI `--prepare-*` generators, Go code pairs, pair formats. |
 | [DATA_FORMATS.md](DATA_FORMATS.md) | Data formats for LeJEPA/context-state/decoder training; hub caching; expert/technical data. |
 | [DECODER_RUNTIME.md](DECODER_RUNTIME.md) | Decoder backends (GGUF/llama.cpp, Candle code/text decoders) and env vars. |
 | [OOM_TESTING.md](OOM_TESTING.md) | Sustained CUDA OOM probes for batch/VRAM decisions. |

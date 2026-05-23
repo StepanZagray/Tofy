@@ -153,7 +153,7 @@ Input prefetch throughput knobs:
 - `TOFY_ENCODER_VOCAB_SAMPLE_ROWS=<int>` and `TOFY_ENCODER_VOCAB_SAMPLE_BYTES=<int>` cap the encoder vocab scan before Stage 2 training starts; the pipeline defaults to `500000` usable sequences or `67108864` text bytes
 - `TOFY_BPE_MAX_MERGES=<int>` caps tokenizer merge training; the pipeline defaults to `8192` to bound CPU-only startup time
 
-The Rust pipeline also auto-exports `CUDA_COMPUTE_CAP` from `nvidia-smi` when it is available. CUDA toolkit version detection is left to `cudarc`.
+The training pipeline also auto-exports `CUDA_COMPUTE_CAP` from `nvidia-smi` when it is available. CUDA toolkit version detection is left to `cudarc`.
 
 Artifact ownership:
 
@@ -166,7 +166,7 @@ Important: the encoder now also saves a checkpoint-matched vocab next to the lat
 
 ## Vocab and Token Cache
 
-The Rust pipeline trains from streaming inputs by default:
+The training pipeline streams inputs by default:
 
 ```bash
 cargo run --release -- train 8gb
@@ -234,7 +234,7 @@ Tokenizer behavior is now versioned explicitly:
 
 Fresh streaming pipeline runs save the encoder vocab immediately after BPE finishes and then keep training. Resume runs keep using checkpoint-matched vocabs to avoid accidentally pairing old weights with a new vocab.
 
-Latent training consumes `data/cache/encoder.tokens.bin` only when the manifest vocab signature matches the active encoder vocab and the cache max sequence is large enough for segmented context. The Rust pipeline sets `--encoder-max-seq` to `LATENT_MAX_SEQ * 4`, which is `1024` with the current defaults.
+Latent training consumes `data/cache/encoder.tokens.bin` only when the manifest vocab signature matches the active encoder vocab and the cache max sequence is large enough for segmented context. The full pipeline sets `--encoder-max-seq` to `LATENT_MAX_SEQ * 4`, which is `1024` with the current defaults.
 
 World and orchestrator training consume `data/cache/world.tokens.bin` directly when it exists, so both stages skip raw-text tokenization in per-step training and validation batches.
 
@@ -244,7 +244,7 @@ Disable token-cache reads with `TOFY_USE_TOKEN_CACHE=0`.
 
 ## Resuming training
 
-Training stages support resumable sidecar checkpoints. The Rust pipeline keeps model files, optimizer state, TensorBoard logs, and metadata inside a single run directory under `runs/`, so resume targets a specific run instead of scanning `local_models/`.
+Training stages support resumable sidecar checkpoints. The full pipeline keeps model files, optimizer state, TensorBoard logs, and metadata inside a single run directory under `runs/`, so resume targets a specific run instead of scanning `local_models/`.
 
 ```bash
 cargo run --release -- train 8gb --resume latest
@@ -292,7 +292,7 @@ Resume rules:
 
 - Keep the same architecture arguments: `DIM`, `LAYERS`, `HEADS`, `BRIDGE_DIM`, `NUM_LATENT_TOKENS`, vocab size, and decoder architecture must match the saved sidecars.
 - Keep the same model output path. Changing output paths creates a new resume namespace.
-- For the Rust pipeline, use the same run directory. `--resume latest` picks the newest matching run directory by timestamp; `--resume <run_id>` resumes that exact run.
+- For the full pipeline, use the same run directory. `--resume latest` picks the newest matching run directory by timestamp; `--resume <run_id>` resumes that exact run.
 - If optimizer sidecars do not exist, `--resume` can still load the exported best/final model weights when available, but optimizer momentum and exact step continuation are not restored.
 - If `resume.json` already reached the profile step count, the stage exits without doing more training.
 - Do not use old checkpoints from a different architecture, for example previous `DIM=768` 48 GB encoder/world checkpoints with the current `DIM=1024` 48 GB setup.
@@ -501,7 +501,7 @@ cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pai
 cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
 ```
 
-Go repair generation uses `go test -c` on corrupted known-good answers, keeping short compiler diagnostics as the repair signal. This is cheaper than Rust for on-policy or frequent-refresh repair datasets, while still giving static type errors and executable unit-test feedback.
+Go repair generation uses `go test -c` on corrupted known-good answers, keeping short compiler diagnostics as the repair signal while still giving static type errors and executable unit-test feedback.
 
 ### Manual Go-feedback decoder and Pi harness
 

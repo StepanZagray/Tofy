@@ -128,7 +128,7 @@ Default behavior:
 - code decoder data = Go-only code POC mix built from GitHub Go code, synthetic Go function tasks, and Go compiler-feedback repair rows when `go` is available
 - Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
-- the Rust pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
+- the pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
 - training now streams cached token batches from disk instead of retokenizing raw text in the hot loop
 - pipeline locations are configurable with `TOFY_RUNS_DIR`, `TOFY_CACHE_DIR`, `TOFY_VOCAB_DIR`, `TOFY_HUB_CACHE_DIR`, and `TOFY_SERVE_BIND`; `TOFY_DATA_DIR` also redirects default hub cache files to `$TOFY_DATA_DIR/hub`
 - cache preparation overlaps independent CPU jobs and encodes cache misses with Rayon; set `RAYON_NUM_THREADS=N` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=N` to tune Stage 1 text chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=N` to tune token-cache build chunks, or `TOFY_VOCAB_SCAN_CHUNK_LINES=N` to tune vocab sampling chunks
