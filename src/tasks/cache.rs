@@ -15,12 +15,14 @@ use crate::data::{
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
 const PROGRESS_EVERY_LINES: usize = 500_000;
 const DEFAULT_TOKEN_CACHE_ENCODE_CHUNK_LINES: usize = 16_384;
+const DEFAULT_TOKEN_CACHE_RAW_CHARS_PER_TOKEN: usize = 24;
+const DEFAULT_TOKEN_CACHE_RAW_CHAR_CAP: usize = 64 * 1024;
 
 struct DualWorldCacheRow {
     encoder_state_tokens: Vec<u32>,
@@ -92,6 +94,10 @@ struct VocabCacheSpec<'a> {
     vocab_path: &'a Path,
     manifest_path: &'a Path,
     force: bool,
+}
+
+struct TokenCacheRawCaps {
+    world_side: usize,
 }
 
 struct TokenCacheSpec<'a> {
@@ -439,11 +445,13 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
     writer.write_all(TOKEN_CACHE_MAGIC)?;
     let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
     let chunk_lines = token_cache_encode_chunk_lines();
+    let raw_cap = token_cache_raw_sequence_cap(spec.max_seq);
     println!(
-        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={} raw_char_cap={}",
         spec.kind,
         chunk_lines,
-        rayon::current_num_threads()
+        rayon::current_num_threads(),
+        raw_cap
     );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
@@ -457,6 +465,7 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
         let encoded = chunk
             .par_iter()
             .filter_map(|line| {
+                let line = cap_str_chars(line, raw_cap);
                 let mut ids = encode_line_with_vocab_mode(
                     line,
                     vocab,
@@ -523,11 +532,13 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
     writer.write_all(TOKEN_CACHE_MAGIC)?;
     let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
     let chunk_lines = token_cache_encode_chunk_lines();
+    let raw_caps = token_cache_raw_world_caps(spec.max_seq);
     println!(
-        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={} raw_side_char_cap={}",
         spec.kind,
         chunk_lines,
-        rayon::current_num_threads()
+        rayon::current_num_threads(),
+        raw_caps.world_side
     );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
@@ -541,7 +552,8 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
         let encoded = chunk
             .par_iter()
             .filter_map(|line| {
-                let mut example = encode_raw_world_line_with_vocab_mode(line, vocab, spec.mode)?;
+                let capped = cap_raw_world_line(line, raw_caps.world_side);
+                let mut example = encode_raw_world_line_with_vocab_mode(&capped, vocab, spec.mode)?;
                 truncate_ids(&mut example.state_tokens, spec.max_seq);
                 truncate_ids(&mut example.next_tokens, spec.max_seq);
                 Some(example)
@@ -616,11 +628,13 @@ fn ensure_dual_world_token_cache(
     writer.write_all(DUAL_TOKEN_CACHE_MAGIC)?;
     let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
     let chunk_lines = token_cache_encode_chunk_lines();
+    let raw_caps = token_cache_raw_world_caps(spec.max_seq);
     println!(
-        "{} token cache parallel encode: chunk_lines={} rayon_threads={}",
+        "{} token cache parallel encode: chunk_lines={} rayon_threads={} raw_side_char_cap={}",
         spec.kind,
         chunk_lines,
-        rayon::current_num_threads()
+        rayon::current_num_threads(),
+        raw_caps.world_side
     );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
@@ -634,13 +648,14 @@ fn ensure_dual_world_token_cache(
         let encoded = chunk
             .par_iter()
             .filter_map(|line| {
+                let capped = cap_raw_world_line(line, raw_caps.world_side);
                 let mut encoder_example = encode_raw_world_line_with_vocab_mode(
-                    line,
+                    &capped,
                     encoder_vocab,
                     TokenizationMode::Default,
                 )?;
                 let mut decoder_example =
-                    encode_raw_world_line_with_vocab_mode(line, decoder_vocab, spec.mode)?;
+                    encode_raw_world_line_with_vocab_mode(&capped, decoder_vocab, spec.mode)?;
                 truncate_ids(&mut encoder_example.state_tokens, spec.max_seq);
                 truncate_ids(&mut encoder_example.next_tokens, spec.max_seq);
                 truncate_ids(&mut decoder_example.state_tokens, spec.max_seq);
@@ -776,6 +791,65 @@ fn truncate_ids(ids: &mut Vec<u32>, max_seq: usize) {
     if max_seq > 0 && ids.len() > max_seq {
         ids.truncate(max_seq);
     }
+}
+
+fn token_cache_raw_sequence_cap(max_seq: usize) -> usize {
+    token_cache_raw_cap_env()
+        .unwrap_or_else(|| {
+            max_seq
+                .saturating_mul(DEFAULT_TOKEN_CACHE_RAW_CHARS_PER_TOKEN)
+                .max(DEFAULT_TOKEN_CACHE_RAW_CHAR_CAP)
+        })
+        .max(1)
+}
+
+fn token_cache_raw_world_caps(max_seq: usize) -> TokenCacheRawCaps {
+    let side = token_cache_raw_sequence_cap(max_seq);
+    TokenCacheRawCaps { world_side: side }
+}
+
+fn token_cache_raw_cap_env() -> Option<usize> {
+    std::env::var("TOFY_TOKEN_CACHE_RAW_CHAR_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+}
+
+fn cap_str_chars(text: &str, max_chars: usize) -> &str {
+    if text.len() <= max_chars {
+        return text;
+    }
+    let mut end = 0usize;
+    for (idx, _) in text.char_indices() {
+        if idx > max_chars {
+            break;
+        }
+        end = idx;
+    }
+    if end == 0 {
+        ""
+    } else {
+        &text[..end]
+    }
+}
+
+fn cap_raw_world_line(line: &str, max_side_chars: usize) -> String {
+    let Some((left, rest)) = line.split_once('\t') else {
+        return cap_str_chars(line, max_side_chars.saturating_mul(2)).to_string();
+    };
+    let Some((right, action)) = rest.split_once('\t') else {
+        return format!(
+            "{}\t{}",
+            cap_str_chars(left, max_side_chars),
+            cap_str_chars(rest, max_side_chars)
+        );
+    };
+    format!(
+        "{}\t{}\t{}",
+        cap_str_chars(left, max_side_chars),
+        cap_str_chars(right, max_side_chars),
+        action
+    )
 }
 
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {

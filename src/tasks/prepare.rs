@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1143,19 +1144,34 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
 }
 
 fn collect_go_functions_from_pairs(input: &Path) -> Result<Vec<(String, String)>> {
+    let mut lines = BufReader::new(File::open(input)?).lines();
+    let chunk_lines = prepare_chunk_lines();
     let mut samples = Vec::new();
-    let reader = BufReader::new(File::open(input)?);
-    for raw in reader.lines() {
-        let line = raw?;
-        let Some((left, right)) = line.split_once('\t') else {
-            continue;
-        };
-        let combined = [strip_code_tags(left), strip_code_tags(right)]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        samples.extend(extract_go_functions(&combined));
+    println!(
+        "Go function extraction parallel prepare: chunk_lines={} rayon_threads={}",
+        chunk_lines,
+        rayon::current_num_threads()
+    );
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        let extracted = chunk
+            .par_iter()
+            .map(|line| {
+                let Some((left, right)) = line.split_once('\t') else {
+                    return Vec::new();
+                };
+                let combined = [strip_code_tags(left), strip_code_tags(right)]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                extract_go_functions(&combined)
+            })
+            .collect::<Vec<_>>();
+        samples.extend(extracted.into_iter().flatten());
     }
     Ok(samples)
 }
@@ -1188,17 +1204,12 @@ fn collect_go_functions_from_github_top_code(
 
 fn strip_code_tags(text: &str) -> String {
     let unescaped = unescape_pair_field(text);
-    let re = Regex::new(r"(?i)<lang:[a-z0-9_+\-#]+>\s*<(?:ctx|reply)>\s*").unwrap();
-    re.replace(&unescaped, "").trim().to_string()
+    code_tag_re().replace(&unescaped, "").trim().to_string()
 }
 
 fn extract_go_functions(src: &str) -> Vec<(String, String)> {
-    let func_start_re = Regex::new(
-        r"(?m)^(?P<sig>\s*func\s+(?:\([^)]+\)\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?:\([^{};]*\)|[A-Za-z_][A-Za-z0-9_\.\*\[\]]*)?\s*)\{",
-    )
-    .unwrap();
     let mut results = Vec::new();
-    for capture in func_start_re.captures_iter(src) {
+    for capture in go_func_start_re().captures_iter(src) {
         let Some(sig_match) = capture.name("sig") else {
             continue;
         };
@@ -1248,15 +1259,26 @@ fn write_go_instruction_pairs(
     let mut out = BufWriter::new(File::create(&tmp)?);
     let mut seen = HashSet::new();
     let mut written = 0usize;
-    for (signature, body) in samples {
+    let prepared = samples
+        .par_iter()
+        .map(|(signature, body)| {
+            build_go_prompt_variants(signature)
+                .into_iter()
+                .map(|prompt| {
+                    let digest = format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
+                    (digest, prompt, body.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for rows in prepared {
         if max_rows.is_some_and(|max| written >= max) {
             break;
         }
-        for prompt in build_go_prompt_variants(signature) {
+        for (digest, prompt, body) in rows {
             if max_rows.is_some_and(|max| written >= max) {
                 break;
             }
-            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
             if !seen.insert(digest) {
                 continue;
             }
@@ -1264,7 +1286,7 @@ fn write_go_instruction_pairs(
                 out,
                 "{}\t{}",
                 escape_pair_field(&prompt),
-                escape_pair_field(body)
+                escape_pair_field(&body)
             )?;
             written += 1;
         }
@@ -1348,6 +1370,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     let mut variants_per_sample = 2usize;
     let mut max_rows = 0usize;
     let mut progress_every = 5000usize;
+    let mut workers = None;
     let mut force = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -1384,6 +1407,10 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
                 progress_every = parse_usize_value(args, i, "--progress-every")?;
                 i += 2;
             }
+            "--workers" => {
+                workers = Some(parse_usize_value(args, i, "--workers")?.max(1));
+                i += 2;
+            }
             "--force" => {
                 force = true;
                 i += 1;
@@ -1394,6 +1421,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     let input = input.context("--input is required")?;
     let output = output.context("--output is required")?;
     let go_version = go_version_string(&go_bin)?;
+    let repair_workers = workers.unwrap_or_else(default_go_repair_workers);
     let params = json!({
         "go_bin": go_bin,
         "go_version": go_version,
@@ -1401,6 +1429,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
         "timeout_sec": timeout_sec,
         "variants_per_sample": variants_per_sample,
         "max_rows": max_rows,
+        "workers": repair_workers,
         "cache_strategy": "shared-warmed-go-build-cache-v1",
     });
     let inputs = vec![input.clone()];
@@ -1418,57 +1447,129 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     if pairs.is_empty() {
         bail!("no usable pairs found in {}", input.display());
     }
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut seen = HashSet::new();
     let mut written = 0usize;
     let tmp = output.with_extension("txt.tmp");
     let mut out = BufWriter::new(File::create(&tmp)?);
     let go_feedback = GoCompileFeedback::new(&go_bin, &go_version, timeout_sec)?;
-    for (idx, (task_prompt, correct_code)) in pairs.iter().enumerate() {
-        let mut variants = go_corruption_variants(correct_code);
-        variants.shuffle(&mut rng);
-        let mut kept = 0usize;
-        for (_name, broken_code) in variants {
-            if max_rows > 0 && written >= max_rows {
-                break;
+    println!(
+        "Go repair pairs parallel prepare: workers={} shared_cache={}",
+        repair_workers,
+        go_feedback.cache_dir.display()
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(repair_workers)
+        .build()
+        .context("build Go repair worker pool")?;
+    let mut processed = 0usize;
+    let mut batch_start = 0usize;
+    while batch_start < pairs.len() && (max_rows == 0 || written < max_rows) {
+        let remaining_rows = max_rows.saturating_sub(written);
+        let target_pairs = if max_rows == 0 {
+            4096
+        } else {
+            ((remaining_rows + variants_per_sample).saturating_div(variants_per_sample.max(1)))
+                .saturating_mul(2)
+                .max(256)
+        };
+        let batch_len = target_pairs.min(4096).min(pairs.len() - batch_start);
+        let batch_end = batch_start + batch_len;
+        let mut batch_rows = pool.install(|| {
+            pairs[batch_start..batch_end]
+                .par_iter()
+                .enumerate()
+                .map(|(offset, (task_prompt, correct_code))| {
+                    let idx = batch_start + offset;
+                    prepare_go_repair_rows_for_pair(
+                        idx,
+                        task_prompt,
+                        correct_code,
+                        seed,
+                        variants_per_sample,
+                        &go_feedback,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        batch_rows.sort_by_key(|rows| rows.pair_index);
+        for pair_rows in batch_rows {
+            processed += 1;
+            for row in pair_rows.rows {
+                if max_rows > 0 && written >= max_rows {
+                    break;
+                }
+                if !seen.insert(row.digest) {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "{}\t{}",
+                    escape_pair_field(&row.prompt),
+                    escape_pair_field(&row.correct_code)
+                )?;
+                written += 1;
             }
-            let feedback = go_feedback.compile(&broken_code)?;
-            if feedback.is_empty() {
-                continue;
-            }
-            let prompt =
-                build_language_repair_prompt("Go", "go", task_prompt, &broken_code, &feedback);
-            let digest = format!("{:x}", md5::compute(format!("{prompt}\t{correct_code}")));
-            if !seen.insert(digest) {
-                continue;
-            }
-            writeln!(
-                out,
-                "{}\t{}",
-                escape_pair_field(&prompt),
-                escape_pair_field(correct_code)
-            )?;
-            written += 1;
-            kept += 1;
-            if kept >= variants_per_sample.max(1) {
-                break;
+            if progress_every > 0 && processed % progress_every == 0 {
+                println!("Go repair pairs progress: processed={processed} written={written}");
             }
         }
-        if progress_every > 0 && (idx + 1) % progress_every == 0 {
-            println!(
-                "Go repair pairs progress: processed={} written={written}",
-                idx + 1
-            );
-        }
-        if max_rows > 0 && written >= max_rows {
-            break;
-        }
+        batch_start = batch_end;
     }
     out.flush()?;
     fs::rename(tmp, &output)?;
     write_artifact_manifest("go_repair_pairs", &output, &inputs, params, written)?;
     println!("Wrote {written} Go repair rows to {}", output.display());
     Ok(())
+}
+
+fn default_go_repair_workers() -> usize {
+    thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or_else(|_| rayon::current_num_threads().max(1))
+        .saturating_sub(2)
+        .max(1)
+}
+
+struct GoRepairPairRows {
+    pair_index: usize,
+    rows: Vec<GoRepairRow>,
+}
+
+struct GoRepairRow {
+    digest: String,
+    prompt: String,
+    correct_code: String,
+}
+
+fn prepare_go_repair_rows_for_pair(
+    pair_index: usize,
+    task_prompt: &str,
+    correct_code: &str,
+    seed: u64,
+    variants_per_sample: usize,
+    go_feedback: &GoCompileFeedback,
+) -> Result<GoRepairPairRows> {
+    let mut variants = go_corruption_variants(correct_code);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ ((pair_index as u64) << 32));
+    variants.shuffle(&mut rng);
+    let mut rows = Vec::new();
+    for (_name, broken_code) in variants {
+        let feedback = go_feedback.compile(&broken_code)?;
+        if feedback.is_empty() {
+            continue;
+        }
+        let prompt = build_language_repair_prompt("Go", "go", task_prompt, &broken_code, &feedback);
+        let digest = format!("{:x}", md5::compute(format!("{prompt}\t{correct_code}")));
+        rows.push(GoRepairRow {
+            digest,
+            prompt,
+            correct_code: correct_code.to_string(),
+        });
+        if rows.len() >= variants_per_sample.max(1) {
+            break;
+        }
+    }
+    Ok(GoRepairPairRows { pair_index, rows })
 }
 
 fn go_version_string(go_bin: &str) -> Result<String> {
@@ -1623,10 +1724,13 @@ fn go_compile_feedback(
     let mut cmd = Command::new(go_bin);
     cmd.arg("test")
         .arg("-c")
+        .arg("-p")
+        .arg("1")
         .arg(".")
         .current_dir(&dir)
         .env("GOCACHE", cache_dir)
-        .env("GOMODCACHE", mod_cache_dir);
+        .env("GOMODCACHE", mod_cache_dir)
+        .env("GOMAXPROCS", "1");
     let output = run_command_with_timeout(&mut cmd, timeout_sec)?;
     let _ = fs::remove_dir_all(&dir);
     if output.status.success() {
@@ -1650,6 +1754,21 @@ fn go_compile_feedback(
 fn strip_go_package_line(code: &str) -> String {
     let package_re = Regex::new(r"(?m)^\s*package\s+\w+\s*$").unwrap();
     package_re.replace_all(code, "").trim().to_string()
+}
+
+fn code_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)<lang:[a-z0-9_+\-#]+>\s*<(?:ctx|reply)>\s*").unwrap())
+}
+
+fn go_func_start_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^(?P<sig>\s*func\s+(?:\([^)]+\)\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?:\([^{};]*\)|[A-Za-z_][A-Za-z0-9_\.\*\[\]]*)?\s*)\{",
+        )
+        .unwrap()
+    })
 }
 
 fn build_language_repair_prompt(
@@ -1735,11 +1854,22 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
         }
     }
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut text_rows = load_raw_pairs(&text_pairs)?;
-    let mut code_rows = Vec::new();
-    for path in &code_pairs {
-        code_rows.extend(load_raw_pairs(path)?);
-    }
+    println!(
+        "World mix parallel load: code_inputs={} rayon_threads={}",
+        code_pairs.len(),
+        rayon::current_num_threads()
+    );
+    let (text_rows_result, code_rows_result) = rayon::join(
+        || load_raw_pairs(&text_pairs),
+        || {
+            code_pairs
+                .par_iter()
+                .map(|path| load_raw_pairs(path))
+                .collect::<Result<Vec<_>>>()
+        },
+    );
+    let mut text_rows = text_rows_result?;
+    let mut code_rows = code_rows_result?.into_iter().flatten().collect::<Vec<_>>();
     if text_rows.is_empty() {
         bail!("no usable text rows found in {}", text_pairs.display());
     }
@@ -1940,12 +2070,28 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let mut rows = load_non_empty_lines(&base_pairs)?;
-    let instruction = load_non_empty_lines(&instruction_pairs)?;
-    let mut extras = Vec::new();
-    for path in &extra_pairs {
-        extras.extend(load_non_empty_lines(path)?);
-    }
+    println!(
+        "Code POC mix parallel load: extra_inputs={} rayon_threads={}",
+        extra_pairs.len(),
+        rayon::current_num_threads()
+    );
+    let ((rows_result, instruction_result), extras_result) = rayon::join(
+        || {
+            rayon::join(
+                || load_non_empty_lines(&base_pairs),
+                || load_non_empty_lines(&instruction_pairs),
+            )
+        },
+        || {
+            extra_pairs
+                .par_iter()
+                .map(|path| load_non_empty_lines(path))
+                .collect::<Result<Vec<_>>>()
+        },
+    );
+    let mut rows = rows_result?;
+    let instruction = instruction_result?;
+    let extras = extras_result?.into_iter().flatten().collect::<Vec<_>>();
     let mut mixed = Vec::new();
     for _ in 0..instruction_repeat.max(1) {
         mixed.extend(instruction.clone());
