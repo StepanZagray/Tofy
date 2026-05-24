@@ -88,7 +88,7 @@ cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 ```
 
 The probe loads the current `48gb` shape from `config/model_profiles.json`.
-That profile now uses encoder `256x2` (`512` effective), world `256x2`
+That profile now uses encoder `128x4` (`512` effective), world `256x2`
 (`512` effective), decoder `128x2` (`256` effective), and Go feedback `256x1`
 (`256` effective), replacing the old recorded decoder `4x1` run that used only
 about 5.6 GB VRAM in the decoder stage.

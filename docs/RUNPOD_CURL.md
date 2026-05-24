@@ -16,7 +16,7 @@ The `48gb` profile is defined in `config/model_profiles.json`: `DIM=1024`,
 decoder `dim=1024`, decoder layers `12`, decoder FF `4096`, code decoder
 `max_seq=192`, and test-scale budgets of latent `75000`, world `180000`,
 high-world `36000`, code decoder `120000`, and Go feedback `24000`.
-Current 48 GB training batches are encoder `256x2` (`512` effective), world
+Current 48 GB training batches are encoder `128x4` (`512` effective), world
 `256x2` (`512` effective), code decoder `128x2` (`256` effective), and Go
 feedback `256x1` (`256` effective). Decoder and Go-feedback pipeline stages
 pass `--conditioning-loss-weight 0.0` explicitly for throughput; direct manual

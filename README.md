@@ -145,7 +145,7 @@ Default behavior:
 - the 48 GB A40 profile is available through `cargo run --release -- train 48gb`:
   - uses shared `DIM=1024`, `BRIDGE_DIM=1024`, `LAYERS=12`, `HEADS=16`
   - uses `MAX_VOCAB=16000`, `CODE_DECODER_MAX_VOCAB=32000`, `NUM_LATENT_TOKENS=96`
-  - encoder uses `256x2` (`512` effective) after a `128x1` warmup
+  - encoder uses `128x4` (`512` effective) after a `64x1` warmup
   - world uses `256x2` (`512` effective) after a `64x1` warmup
   - code decoder uses `128x2` (`256` effective); Go feedback uses `256x1` (`256` effective) with `CODE_DECODER_MAX_SEQ=192`, decoder width `1024`, and FF width `4096`
   - runs test-scale budgets by default: latent `75000`, world `180000`, high-world `36000`, code decoder `120000`, Go feedback `24000`
