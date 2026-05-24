@@ -777,14 +777,12 @@ fn train_world(
         "--action-loss-weight".to_string(),
         "0.0".to_string(),
     ];
-    if cfg.profile == MemoryProfile::Eight {
-        args.push("--freeze-encoder".to_string());
-    }
+    args.push("--freeze-encoder".to_string());
     with_stage("world", || {
         tasks::world::try_run_train(&append_resume(args, cfg.resume))
     })?;
     ensure_file(&paths.world_model)?;
-    if cfg.profile == MemoryProfile::Eight && !paths.world_encoder_model.exists() {
+    if !paths.world_encoder_model.exists() {
         fs::copy(&paths.latent_model, &paths.world_encoder_model).with_context(|| {
             format!(
                 "copy frozen encoder export from {:?} to {:?}",

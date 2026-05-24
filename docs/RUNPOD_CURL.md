@@ -11,14 +11,14 @@ Current recommended pod target:
 - repo checkout at `/workspace/Tofy`
 - canonical training command: `./target/release/jepa_ai train 48gb`
 
-The `48gb` profile is defined in `config/model_profiles.json`: `DIM=1024`,
-`LAYERS=12`, `HEADS=16`, `BRIDGE_DIM=1024`, `NUM_LATENT_TOKENS=96`, code
-decoder `dim=1024`, decoder layers `12`, decoder FF `4096`, code decoder
+The `48gb` profile is defined in `config/model_profiles.json`: `DIM=768`,
+`LAYERS=12`, `HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code
+decoder `dim=768`, decoder layers `12`, decoder FF `3072`, code decoder
 `max_seq=192`, and test-scale budgets of latent `75000`, world `180000`,
 high-world `36000`, code decoder `120000`, and Go feedback `24000`.
-Current 48 GB training batches are encoder `128x4` (`512` effective), world
-`256x2` (`512` effective), code decoder `128x2` (`256` effective), and Go
-feedback `256x1` (`256` effective). Decoder and Go-feedback pipeline stages
+Current 48 GB training batches are encoder `32x16` (`512` effective), world
+`256x2` (`512` effective) with the encoder frozen, code decoder `128x2`
+(`256` effective), and Go feedback `256x1` (`256` effective). Decoder and Go-feedback pipeline stages
 pass `--conditioning-loss-weight 0.0` explicitly for throughput; direct manual
 decoder runs still default to the conditioning-margin loss unless that flag is
 provided.

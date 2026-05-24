@@ -3174,6 +3174,7 @@ fn world_probe_cmd(
         args.world_accum.to_string(),
         "--action-loss-weight".to_string(),
         args.world_action_loss_weight.to_string(),
+        "--freeze-encoder".to_string(),
     ]
 }
 
