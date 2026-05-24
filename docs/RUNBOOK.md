@@ -119,7 +119,7 @@ World/context compressor knobs:
 - `TOFY_LATENT_REASONING_PATIENCE=<int>` stops latent refinement after this many non-improving steps beyond the minimum, default `2`
 - `TOFY_LATENT_REASONING_ALPHA=<float>` blends each recurrent proposal with the selected next-action latent anchor, default `0.35`
 - `TOFY_LATENT_REASONING_GOAL_WEIGHT`, `TOFY_LATENT_REASONING_ROUTE_WEIGHT`, and `TOFY_LATENT_REASONING_STABILITY_WEIGHT` tune the latent selection score
-- the integrated high-world training stage is fixed by profile: `12000` for `8gb` and `36000` for `48gb`
+- the integrated high-world training stage is fixed by profile: `12000` for `8gb` and `2000` for `48gb`
 - `HWM_MACRO_MIN_LEN=<int>` and `HWM_MACRO_MAX_LEN=<int>` set the primitive-action span encoded into each macro-action, defaults `2..4`
 - serve/eval auto-load `runs/.../high_world/model.safetensors` next to the world checkpoint; `TOFY_HIGH_WORLD_MODEL=<path>` or `--high-world-model <path>` overrides that path
 - `TOFY_HWM_HIGH_HORIZON`, `TOFY_HWM_LOW_HORIZON`, `TOFY_HWM_MACRO_CANDIDATES`, and `TOFY_HWM_SUBGOAL_WEIGHT` tune high-level subgoal search and low-level action search
@@ -181,12 +181,12 @@ This is the larger local/cloud profile for checking whether scaling helps the
 coding assistant. It uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
 `HEADS=16`, decoder width `768`, decoder FF width `3072`, and
 `NUM_LATENT_TOKENS=96`.
-Current 48 GB batches are encoder `32x16` (`512` effective), world `128x4`
+Current 48 GB batches are encoder `48x11` (`528` effective), world `128x4`
 (`512` effective) with the encoder frozen, decoder `128x2` (`256` effective),
 and Go feedback `256x1` (`256` effective), replacing the old decoder `4x1`
 microbatch that left most VRAM idle in the recorded RunPod training run. It
-defaults to test-scale budgets: latent `75000`, world
-`180000`, high-world `36000`, code decoder `120000`, and Go feedback `24000`.
+defaults to recorded-checkpoint-scaled budgets: latent `4000`, world `10000`,
+high-world `2000`, code decoder `12000`, and Go feedback `3000`.
 
 Before a long A40 launch, run:
 

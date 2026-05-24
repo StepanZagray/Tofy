@@ -14,9 +14,10 @@ Current recommended pod target:
 The `48gb` profile is defined in `config/model_profiles.json`: `DIM=768`,
 `LAYERS=12`, `HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code
 decoder `dim=768`, decoder layers `12`, decoder FF `3072`, code decoder
-`max_seq=192`, and test-scale budgets of latent `75000`, world `180000`,
-high-world `36000`, code decoder `120000`, and Go feedback `24000`.
-Current 48 GB training batches are encoder `32x16` (`512` effective), world
+`max_seq=192`, and recorded-checkpoint-scaled budgets of latent `4000`,
+world `10000`, high-world `2000`, code decoder `12000`, and Go feedback
+`3000`.
+Current 48 GB training batches are encoder `48x11` (`528` effective), world
 `128x4` (`512` effective) with the encoder frozen, code decoder `128x2`
 (`256` effective), and Go feedback `256x1` (`256` effective). Decoder and Go-feedback pipeline stages
 pass `--conditioning-loss-weight 0.0` explicitly for throughput; direct manual

@@ -66,10 +66,9 @@ cargo run --release -- --max-vram-probe --profile 48gb --stage all
 ```
 
 This uses `config/model_profiles.json`, runs latent, world, high-world, and
-decoder probes. Latent, high-world, and decoder are capped under 500 measured
-steps; world runs 1000 measured steps because previous runs only provide a
-meaningful early world VRAM baseline at step 1000. It forces the world warmup
-transition early and uses frequent world/high-world/decoder logging so
+decoder probes. Each measured stage is capped at 200 steps because VRAM peaks
+stabilized early in recent profile probes. It forces warmup transitions after
+10 steps and uses frequent world/high-world/decoder logging so
 validation/checkpoint paths are exercised during the short run.
 
 The output includes `peak_used_mb`, `min_free_mb`, per-stage
@@ -88,8 +87,8 @@ cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 ```
 
 The probe loads the current `48gb` shape from `config/model_profiles.json`.
-That profile now uses encoder `128x4` (`512` effective), world `256x2`
-(`512` effective), decoder `128x2` (`256` effective), and Go feedback `256x1`
+That profile now uses encoder `48x11` (`528` effective), frozen-encoder world
+`128x4` (`512` effective), decoder `128x2` (`256` effective), and Go feedback `256x1`
 (`256` effective), replacing the old recorded decoder `4x1` run that used only
 about 5.6 GB VRAM in the decoder stage.
 Prefer `--max-vram-probe --profile 48gb` for the first rental check, then run
@@ -99,7 +98,7 @@ the sustained probe only after the short probe passes.
 
 HWM is part of the standard training pipeline. The profile defaults train the
 high-world stage after the low-level world model: `12000` steps for `8gb` and
-`36000` for `48gb`. It is not toggled on separately:
+`2000` for `48gb`. It is not toggled on separately:
 the model uses the high-world checkpoint automatically when the profile run
 creates it.
 
