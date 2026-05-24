@@ -534,6 +534,19 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         let mut log_snapshot = None;
         let batch_size = latent_batch_size_for_step(step, &config);
         let grad_accum_steps = latent_grad_accum_for_step(step, &config);
+        if config.batch_warmup_steps > 0
+            && step == config.batch_warmup_steps + 1
+            && (config.batch_warmup_value != config.batch_size
+                || config.grad_accum_warmup_value < config.grad_accum_steps)
+        {
+            println!(
+                "Latent warmup complete at step {}; switching to batch={} grad_accum={} (effective={})",
+                config.batch_warmup_steps,
+                batch_size,
+                grad_accum_steps,
+                batch_size * grad_accum_steps
+            );
+        }
 
         for micro_step in 0..grad_accum_steps {
             let curriculum = latent_curriculum(step, config.steps, &config);

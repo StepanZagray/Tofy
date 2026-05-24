@@ -221,6 +221,10 @@ pub struct HighWorldTrainConfig {
     pub lr: f64,
     pub log_every: usize,
     pub grad_accum_steps: usize,
+    pub grad_accum_warmup_steps: usize,
+    pub grad_accum_warmup_value: usize,
+    pub batch_warmup_steps: usize,
+    pub batch_warmup_value: usize,
     pub resume: bool,
     pub train_dtype: DType,
 }
@@ -311,17 +315,39 @@ impl HighWorldTrainConfig {
         if macro_min_len > macro_max_len {
             std::mem::swap(&mut macro_min_len, &mut macro_max_len);
         }
+        let steps = filtered
+            .get(4)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let batch_size = filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(24);
+        let grad_accum_steps = grad_accum_steps.max(1);
+        let batch_warmup_value = std::env::var("TOFY_HIGH_WORLD_WARMUP_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(batch_size)
+            .max(1);
+        let grad_accum_warmup_value = std::env::var("TOFY_HIGH_WORLD_WARMUP_GRAD_ACCUM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize)
+            .max(1)
+            .min(grad_accum_steps);
+        let warmup_is_active =
+            batch_warmup_value != batch_size || grad_accum_warmup_value < grad_accum_steps;
+        let grad_accum_warmup_steps = std::env::var("TOFY_HIGH_WORLD_WARMUP_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if warmup_is_active { steps / 5 } else { 0 })
+            .min(steps);
+        let batch_warmup_steps = grad_accum_warmup_steps;
         Ok(Self {
             encoder_model_path: PathBuf::from(&filtered[0]),
             encoder_vocab_path: PathBuf::from(&filtered[1]),
             world_model_path: PathBuf::from(&filtered[2]),
             data_path: PathBuf::from(&filtered[3]),
             output_path,
-            steps: filtered
-                .get(4)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000),
-            batch_size: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(24),
+            steps,
+            batch_size,
             dim: filtered.get(6).and_then(|v| v.parse().ok()).unwrap_or(768),
             max_seq: filtered.get(7).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_layers: filtered.get(8).and_then(|v| v.parse().ok()).unwrap_or(9),
@@ -333,7 +359,11 @@ impl HighWorldTrainConfig {
             lambda: lambda_override.unwrap_or(0.2),
             lr: lr_override.unwrap_or(2e-4),
             log_every: env_usize("TOFY_HIGH_WORLD_LOG_EVERY", 100),
-            grad_accum_steps: grad_accum_steps.max(1),
+            grad_accum_steps,
+            grad_accum_warmup_steps,
+            grad_accum_warmup_value,
+            batch_warmup_steps,
+            batch_warmup_value,
             resume,
             train_dtype: parse_train_dtype(),
         })
@@ -466,6 +496,10 @@ pub struct DecoderTrainConfig {
     pub lr: f64,
     pub log_every: usize,
     pub grad_accum_steps: usize,
+    pub grad_accum_warmup_steps: usize,
+    pub grad_accum_warmup_value: usize,
+    pub batch_warmup_steps: usize,
+    pub batch_warmup_value: usize,
     pub resume: bool,
     pub train_dtype: DType,
     pub syntax_loss_weight: f64,
@@ -659,17 +693,39 @@ impl DecoderTrainConfig {
             i += 1;
         }
         let decoder_kind = decoder_kind.unwrap_or(DecoderKind::CodeSpecialist);
+        let steps = filtered
+            .get(4)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40_000);
+        let batch_size = filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(8);
+        let grad_accum_steps = grad_accum_steps.max(1);
+        let batch_warmup_value = std::env::var("TOFY_DECODER_WARMUP_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(batch_size)
+            .max(1);
+        let grad_accum_warmup_value = std::env::var("TOFY_DECODER_WARMUP_GRAD_ACCUM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize)
+            .max(1)
+            .min(grad_accum_steps);
+        let warmup_is_active =
+            batch_warmup_value != batch_size || grad_accum_warmup_value < grad_accum_steps;
+        let grad_accum_warmup_steps = std::env::var("TOFY_DECODER_WARMUP_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if warmup_is_active { steps / 5 } else { 0 })
+            .min(steps);
+        let batch_warmup_steps = grad_accum_warmup_steps;
         Ok(Self {
             decoder_kind,
             encoder_model_path: PathBuf::from(&filtered[0]),
             encoder_vocab_path: PathBuf::from(&filtered[1]),
             world_model_path: PathBuf::from(&filtered[2]),
             data_path: PathBuf::from(&filtered[3]),
-            steps: filtered
-                .get(4)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(40_000),
-            batch_size: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(8),
+            steps,
+            batch_size,
             max_seq: filtered
                 .get(6)
                 .and_then(|v| v.parse().ok())
@@ -687,7 +743,11 @@ impl DecoderTrainConfig {
             num_latent_tokens: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(64),
             lr: lr_override.unwrap_or(3e-4),
             log_every: env_usize("TOFY_DECODER_LOG_EVERY", 100),
-            grad_accum_steps: grad_accum_steps.max(1),
+            grad_accum_steps,
+            grad_accum_warmup_steps,
+            grad_accum_warmup_value,
+            batch_warmup_steps,
+            batch_warmup_value,
             resume,
             train_dtype: parse_train_dtype(),
             syntax_loss_weight: std::env::var("TOFY_DECODER_SYNTAX_LOSS_WEIGHT")

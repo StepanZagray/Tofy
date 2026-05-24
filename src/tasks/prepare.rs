@@ -115,6 +115,9 @@ struct OomProbeArgs {
     latent_steps: usize,
     latent_batch: usize,
     latent_accum: usize,
+    latent_warmup_batch: usize,
+    latent_warmup_accum: usize,
+    latent_warmup_steps: Option<usize>,
     world_steps: usize,
     world_batch: usize,
     world_accum: usize,
@@ -127,9 +130,15 @@ struct OomProbeArgs {
     high_world_steps: usize,
     high_world_batch: usize,
     high_world_accum: usize,
+    high_world_warmup_batch: usize,
+    high_world_warmup_accum: usize,
+    high_world_warmup_steps: Option<usize>,
     decoder_steps: usize,
     decoder_batch: usize,
     decoder_accum: usize,
+    decoder_warmup_batch: usize,
+    decoder_warmup_accum: usize,
+    decoder_warmup_steps: Option<usize>,
     decoder_max_seq: usize,
     decoder_max_vocab: usize,
     decoder_dim: usize,
@@ -220,6 +229,7 @@ struct OomProbeProfile {
     decoder_heads: usize,
     decoder_ff_dim: usize,
     latent_batch: usize,
+    latent_warmup_batch: usize,
     world_batch: usize,
     world_warmup_batch: usize,
     code_decoder_batch: usize,
@@ -2623,6 +2633,9 @@ fn default_oom_probe_args() -> OomProbeArgs {
         latent_steps: 1000,
         latent_batch: 12,
         latent_accum: 2,
+        latent_warmup_batch: 12,
+        latent_warmup_accum: 1,
+        latent_warmup_steps: None,
         world_steps: 8000,
         world_batch: 64,
         world_accum: 2,
@@ -2635,9 +2648,15 @@ fn default_oom_probe_args() -> OomProbeArgs {
         high_world_steps: 1000,
         high_world_batch: 64,
         high_world_accum: 2,
+        high_world_warmup_batch: 64,
+        high_world_warmup_accum: 1,
+        high_world_warmup_steps: None,
         decoder_steps: 1000,
         decoder_batch: 6,
         decoder_accum: 4,
+        decoder_warmup_batch: 6,
+        decoder_warmup_accum: 1,
+        decoder_warmup_steps: None,
         decoder_max_seq: 160,
         decoder_max_vocab: 24_000,
         decoder_dim: 640,
@@ -2682,6 +2701,8 @@ fn apply_oom_probe_profile(args: &mut OomProbeArgs, profile: OomProbeProfile) {
     args.latent_steps = profile.latent_steps;
     args.latent_batch = profile.latent_batch;
     args.latent_accum = profile.latent_grad_accum;
+    args.latent_warmup_batch = profile.latent_warmup_batch;
+    args.latent_warmup_accum = 1;
     args.world_steps = profile.world_steps;
     args.world_batch = profile.world_batch;
     args.world_accum = profile.world_grad_accum;
@@ -2690,9 +2711,13 @@ fn apply_oom_probe_profile(args: &mut OomProbeArgs, profile: OomProbeProfile) {
     args.high_world_steps = profile.high_world_steps;
     args.high_world_batch = profile.world_batch;
     args.high_world_accum = profile.world_grad_accum;
+    args.high_world_warmup_batch = profile.world_warmup_batch.min(args.high_world_batch);
+    args.high_world_warmup_accum = 1;
     args.decoder_steps = profile.code_decoder_steps;
     args.decoder_batch = profile.code_decoder_batch;
     args.decoder_accum = profile.code_decoder_grad_accum;
+    args.decoder_warmup_batch = profile.world_warmup_batch.min(args.decoder_batch);
+    args.decoder_warmup_accum = 1;
     args.decoder_max_seq = profile.code_decoder_max_seq;
     args.decoder_max_vocab = profile.code_decoder_max_vocab;
     args.decoder_dim = profile.decoder_dim;
@@ -2709,7 +2734,10 @@ fn apply_max_vram_probe_defaults(args: &mut OomProbeArgs) {
     args.decoder_steps = args.decoder_steps.min(480);
     args.setup_latent_steps = args.setup_latent_steps.clamp(4, 32);
     args.setup_world_steps = args.setup_world_steps.clamp(4, 32);
-    args.world_warmup_steps = Some(args.world_warmup_steps.unwrap_or(1).min(1));
+    args.latent_warmup_steps = Some(args.latent_warmup_steps.unwrap_or(10).min(10));
+    args.world_warmup_steps = Some(args.world_warmup_steps.unwrap_or(10).min(10));
+    args.high_world_warmup_steps = Some(args.high_world_warmup_steps.unwrap_or(10).min(10));
+    args.decoder_warmup_steps = Some(args.decoder_warmup_steps.unwrap_or(10).min(10));
     args.max_late_growth_mb = 0;
     args.sample_interval_sec = args.sample_interval_sec.min(0.10);
 }
@@ -2821,6 +2849,19 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
                 parsed.latent_accum = parse_usize_value(args, i, "--latent-accum")?;
                 i += 2;
             }
+            "--latent-warmup-batch" | "--latent_warmup_batch" => {
+                parsed.latent_warmup_batch = parse_usize_value(args, i, "--latent-warmup-batch")?;
+                i += 2;
+            }
+            "--latent-warmup-accum" | "--latent_warmup_accum" => {
+                parsed.latent_warmup_accum = parse_usize_value(args, i, "--latent-warmup-accum")?;
+                i += 2;
+            }
+            "--latent-warmup-steps" | "--latent_warmup_steps" => {
+                parsed.latent_warmup_steps =
+                    Some(parse_usize_value(args, i, "--latent-warmup-steps")?);
+                i += 2;
+            }
             "--world-steps" | "--world_steps" => {
                 parsed.world_steps = parse_usize_value(args, i, "--world-steps")?;
                 i += 2;
@@ -2871,6 +2912,21 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
                 parsed.high_world_accum = parse_usize_value(args, i, "--high-world-accum")?;
                 i += 2;
             }
+            "--high-world-warmup-batch" | "--high_world_warmup_batch" => {
+                parsed.high_world_warmup_batch =
+                    parse_usize_value(args, i, "--high-world-warmup-batch")?;
+                i += 2;
+            }
+            "--high-world-warmup-accum" | "--high_world_warmup_accum" => {
+                parsed.high_world_warmup_accum =
+                    parse_usize_value(args, i, "--high-world-warmup-accum")?;
+                i += 2;
+            }
+            "--high-world-warmup-steps" | "--high_world_warmup_steps" => {
+                parsed.high_world_warmup_steps =
+                    Some(parse_usize_value(args, i, "--high-world-warmup-steps")?);
+                i += 2;
+            }
             "--decoder-steps" | "--decoder_steps" => {
                 parsed.decoder_steps = parse_usize_value(args, i, "--decoder-steps")?;
                 i += 2;
@@ -2881,6 +2937,19 @@ fn parse_sustained_oom_probe_args(args: &[String]) -> Result<OomProbeArgs> {
             }
             "--decoder-accum" | "--decoder_accum" => {
                 parsed.decoder_accum = parse_usize_value(args, i, "--decoder-accum")?;
+                i += 2;
+            }
+            "--decoder-warmup-batch" | "--decoder_warmup_batch" => {
+                parsed.decoder_warmup_batch = parse_usize_value(args, i, "--decoder-warmup-batch")?;
+                i += 2;
+            }
+            "--decoder-warmup-accum" | "--decoder_warmup_accum" => {
+                parsed.decoder_warmup_accum = parse_usize_value(args, i, "--decoder-warmup-accum")?;
+                i += 2;
+            }
+            "--decoder-warmup-steps" | "--decoder_warmup_steps" => {
+                parsed.decoder_warmup_steps =
+                    Some(parse_usize_value(args, i, "--decoder-warmup-steps")?);
                 i += 2;
             }
             "--decoder-max-seq" | "--decoder_max_seq" => {
@@ -3057,7 +3126,22 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         "1".to_string(),
     );
     env.insert("TOFY_LATENT_HISTORY_RATIO".to_string(), "0.35".to_string());
-    env.insert("TOFY_LATENT_WARMUP_STEPS".to_string(), "0".to_string());
+    env.insert(
+        "TOFY_LATENT_WARMUP_BATCH".to_string(),
+        args.latent_warmup_batch.to_string(),
+    );
+    env.insert(
+        "TOFY_LATENT_WARMUP_GRAD_ACCUM".to_string(),
+        args.latent_warmup_accum.to_string(),
+    );
+    match args.latent_warmup_steps {
+        Some(steps) => {
+            env.insert("TOFY_LATENT_WARMUP_STEPS".to_string(), steps.to_string());
+        }
+        None => {
+            env.remove("TOFY_LATENT_WARMUP_STEPS");
+        }
+    }
     env.insert("TOFY_WORLD_CONTEXT_SEGMENTS".to_string(), "2".to_string());
     env.insert(
         "TOFY_WORLD_RECENT_FULL_SEGMENTS".to_string(),
@@ -3081,6 +3165,51 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     }
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());
+    env
+}
+
+fn probe_high_world_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, String> {
+    let mut env = probe_base_env(args, stage_name);
+    env.insert(
+        "TOFY_HIGH_WORLD_WARMUP_BATCH".to_string(),
+        args.high_world_warmup_batch.to_string(),
+    );
+    env.insert(
+        "TOFY_HIGH_WORLD_WARMUP_GRAD_ACCUM".to_string(),
+        args.high_world_warmup_accum.to_string(),
+    );
+    match args.high_world_warmup_steps {
+        Some(steps) => {
+            env.insert(
+                "TOFY_HIGH_WORLD_WARMUP_STEPS".to_string(),
+                steps.to_string(),
+            );
+        }
+        None => {
+            env.remove("TOFY_HIGH_WORLD_WARMUP_STEPS");
+        }
+    }
+    env
+}
+
+fn probe_decoder_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, String> {
+    let mut env = probe_base_env(args, stage_name);
+    env.insert(
+        "TOFY_DECODER_WARMUP_BATCH".to_string(),
+        args.decoder_warmup_batch.to_string(),
+    );
+    env.insert(
+        "TOFY_DECODER_WARMUP_GRAD_ACCUM".to_string(),
+        args.decoder_warmup_accum.to_string(),
+    );
+    match args.decoder_warmup_steps {
+        Some(steps) => {
+            env.insert("TOFY_DECODER_WARMUP_STEPS".to_string(), steps.to_string());
+        }
+        None => {
+            env.remove("TOFY_DECODER_WARMUP_STEPS");
+        }
+    }
     env
 }
 
@@ -3690,7 +3819,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             let result = run_measured_probe(
                 "high_world",
                 &cmd,
-                &probe_base_env(&args, "high_world"),
+                &probe_high_world_env(&args, "high_world"),
                 &probe_dir,
                 &args,
             )?;
@@ -3721,7 +3850,7 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
             let result = run_measured_probe(
                 "decoder",
                 &cmd,
-                &probe_base_env(&args, "decoder"),
+                &probe_decoder_env(&args, "decoder"),
                 &probe_dir,
                 &args,
             )?;

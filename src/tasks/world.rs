@@ -157,6 +157,50 @@ fn world_grad_accum_for_step(step: usize, config: &WorldConfig) -> usize {
     }
 }
 
+fn high_world_batch_size_for_step(step: usize, config: &HighWorldTrainConfig) -> usize {
+    if config.batch_warmup_steps > 0
+        && step <= config.batch_warmup_steps
+        && config.batch_warmup_value != config.batch_size
+    {
+        config.batch_warmup_value.max(1)
+    } else {
+        config.batch_size.max(1)
+    }
+}
+
+fn high_world_grad_accum_for_step(step: usize, config: &HighWorldTrainConfig) -> usize {
+    if config.grad_accum_warmup_steps > 0
+        && step <= config.grad_accum_warmup_steps
+        && config.grad_accum_warmup_value < config.grad_accum_steps
+    {
+        config.grad_accum_warmup_value.max(1)
+    } else {
+        config.grad_accum_steps.max(1)
+    }
+}
+
+fn decoder_batch_size_for_step(step: usize, config: &DecoderTrainConfig) -> usize {
+    if config.batch_warmup_steps > 0
+        && step <= config.batch_warmup_steps
+        && config.batch_warmup_value != config.batch_size
+    {
+        config.batch_warmup_value.max(1)
+    } else {
+        config.batch_size.max(1)
+    }
+}
+
+fn decoder_grad_accum_for_step(step: usize, config: &DecoderTrainConfig) -> usize {
+    if config.grad_accum_warmup_steps > 0
+        && step <= config.grad_accum_warmup_steps
+        && config.grad_accum_warmup_value < config.grad_accum_steps
+    {
+        config.grad_accum_warmup_value.max(1)
+    } else {
+        config.grad_accum_steps.max(1)
+    }
+}
+
 pub fn try_run_train(args: &[String]) -> Result<bool> {
     if args.len() < 5 || (args[1] != "--train-world" && args[1] != "train-world") {
         return Ok(false);
@@ -601,6 +645,19 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let mut last_state_slots = None;
         let batch_size = world_batch_size_for_step(step, &config);
         let grad_accum_steps = world_grad_accum_for_step(step, &config);
+        if config.batch_warmup_steps > 0
+            && step == config.batch_warmup_steps + 1
+            && (config.batch_warmup_value != config.batch_size
+                || config.grad_accum_warmup_value < config.grad_accum_steps)
+        {
+            println!(
+                "World warmup complete at step {}; switching to batch={} grad_accum={} (effective={})",
+                config.batch_warmup_steps,
+                batch_size,
+                grad_accum_steps,
+                batch_size * grad_accum_steps
+            );
+        }
 
         for _micro_step in 0..grad_accum_steps {
             let batch = if let Some(ref mut cached_stream) = cached_world_stream {
@@ -1311,13 +1368,27 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
         let mut last_sigreg_loss = None;
         let mut last_pred_slots = None;
         let mut last_target_slots = None;
-        let grad_accum_steps = config.grad_accum_steps.max(1);
+        let batch_size = high_world_batch_size_for_step(step, &config);
+        let grad_accum_steps = high_world_grad_accum_for_step(step, &config);
+        if config.batch_warmup_steps > 0
+            && step == config.batch_warmup_steps + 1
+            && (config.batch_warmup_value != config.batch_size
+                || config.grad_accum_warmup_value < config.grad_accum_steps)
+        {
+            println!(
+                "High-world warmup complete at step {}; switching to batch={} grad_accum={} (effective={})",
+                config.batch_warmup_steps,
+                batch_size,
+                grad_accum_steps,
+                batch_size * grad_accum_steps
+            );
+        }
 
         for _micro_step in 0..grad_accum_steps {
             let batch = collect_high_world_macro_batch(
                 &mut macro_stream,
                 &encoder_vocab,
-                config.batch_size,
+                batch_size,
                 config.macro_min_len,
                 config.macro_max_len,
             )?;
@@ -2719,15 +2790,29 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_loss_mask = None;
         let mut last_loss = None;
         let mut last_conditioning_loss_val = 0.0f32;
-        let grad_accum_steps = config.grad_accum_steps.max(1);
+        let batch_size = decoder_batch_size_for_step(step, &config);
+        let grad_accum_steps = decoder_grad_accum_for_step(step, &config);
+        if config.batch_warmup_steps > 0
+            && step == config.batch_warmup_steps + 1
+            && (config.batch_warmup_value != config.batch_size
+                || config.grad_accum_warmup_value < config.grad_accum_steps)
+        {
+            println!(
+                "Decoder warmup complete at step {}; switching to batch={} grad_accum={} (effective={})",
+                config.batch_warmup_steps,
+                batch_size,
+                grad_accum_steps,
+                batch_size * grad_accum_steps
+            );
+        }
         let mut micro_batches = Vec::with_capacity(grad_accum_steps);
-        let mut prefill_encoder_batch = Vec::with_capacity(config.batch_size * grad_accum_steps);
+        let mut prefill_encoder_batch = Vec::with_capacity(batch_size * grad_accum_steps);
 
         for _micro_step in 0..grad_accum_steps {
             let (encoder_batch, decoder_batch, oov_rate) = if let Some(ref mut cached_stream) =
                 cached_decoder_stream
             {
-                let cached_batch = cached_stream.next_batch(config.batch_size.max(1))?;
+                let cached_batch = cached_stream.next_batch(batch_size.max(1))?;
                 let encoder_batch = cached_batch
                     .iter()
                     .map(|row| row.encoder.clone())
@@ -2739,7 +2824,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
                 (encoder_batch, decoder_batch, oov_rate)
             } else {
-                let raw_batch = raw_stream.next_batch(config.batch_size.max(1))?;
+                let raw_batch = raw_stream.next_batch(batch_size.max(1))?;
                 let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
                 let decoder_batch =
                     encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
@@ -2866,7 +2951,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 &mut accumulated_grads,
                 &train_vars,
                 &loss,
-                config.grad_accum_steps,
+                grad_accum_steps,
             )?;
 
             last_oov_rate = Some(oov_rate);
