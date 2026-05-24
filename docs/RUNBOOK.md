@@ -181,7 +181,7 @@ This is the larger local/cloud profile for checking whether scaling helps the
 coding assistant. It uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
 `HEADS=16`, decoder width `768`, decoder FF width `3072`, and
 `NUM_LATENT_TOKENS=96`.
-Current 48 GB batches are encoder `32x16` (`512` effective), world `256x2`
+Current 48 GB batches are encoder `32x16` (`512` effective), world `128x4`
 (`512` effective) with the encoder frozen, decoder `128x2` (`256` effective),
 and Go feedback `256x1` (`256` effective), replacing the old decoder `4x1`
 microbatch that left most VRAM idle in the recorded RunPod training run. It
