@@ -3045,6 +3045,12 @@ fn write_probe_data(path: &Path, rows: usize) -> Result<()> {
 fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.insert("TOFY_TRAIN_DTYPE".to_string(), args.dtype.clone());
+    if let Some(path) = cached_encoder_vocab_for_probe(args) {
+        env.insert(
+            "TOFY_ENCODER_VOCAB".to_string(),
+            path.to_string_lossy().to_string(),
+        );
+    }
     env.insert("TOFY_LATENT_CONTEXT_SEGMENTS".to_string(), "4".to_string());
     env.insert(
         "TOFY_LATENT_RECENT_FULL_SEGMENTS".to_string(),
@@ -3076,6 +3082,29 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());
     env
+}
+
+fn cached_encoder_vocab_for_probe(args: &OomProbeArgs) -> Option<PathBuf> {
+    if let Some(path) = &args.encoder_vocab {
+        if path.exists() {
+            return Some(path.clone());
+        }
+    }
+    [
+        model_dir().join(format!("vocabs/vocab_encoder_{}_default.txt", args.vocab)),
+        model_dir().join("vocabs/vocab_encoder.txt"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn cached_decoder_vocab_for_probe(args: &OomProbeArgs) -> Option<PathBuf> {
+    [model_dir().join(format!(
+        "vocabs/vocab_code_{}_codeaware.txt",
+        args.decoder_max_vocab
+    ))]
+    .into_iter()
+    .find(|path| path.exists())
 }
 
 fn probe_world_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, String> {
@@ -3197,7 +3226,7 @@ fn decoder_probe_cmd(
     steps: usize,
     output_path: &Path,
 ) -> Vec<String> {
-    vec![
+    let mut cmd = vec![
         args.binary.to_string_lossy().to_string(),
         "--train-decoder".to_string(),
         latent.to_string_lossy().to_string(),
@@ -3228,7 +3257,12 @@ fn decoder_probe_cmd(
         output_path.to_string_lossy().to_string(),
         "--grad-accum".to_string(),
         args.decoder_accum.to_string(),
-    ]
+    ];
+    if let Some(path) = cached_decoder_vocab_for_probe(args) {
+        cmd.push("--decoder-vocab".to_string());
+        cmd.push(path.to_string_lossy().to_string());
+    }
+    cmd
 }
 
 fn is_base_model_artifact(name: &str, prefix: &str) -> bool {
@@ -3299,17 +3333,17 @@ fn run_checked_command(cmd: &[String], env: &HashMap<String, String>) -> Result<
 
 fn ensure_setup_latent(args: &OomProbeArgs, data_path: &Path) -> Result<(PathBuf, PathBuf)> {
     if let Some(latent) = &args.latent_model {
-        let vocab = args
-            .encoder_vocab
-            .clone()
+        let vocab = cached_encoder_vocab_for_probe(args)
             .unwrap_or_else(|| model_dir().join("vocabs/vocab_encoder.txt"));
         return Ok((latent.clone(), vocab));
     }
     let cmd = latent_probe_cmd(args, data_path, args.setup_latent_steps);
     run_checked_command(&cmd, &probe_base_env(args, "setup_latent"))?;
+    let vocab = cached_encoder_vocab_for_probe(args)
+        .unwrap_or_else(|| model_dir().join("vocabs/vocab_encoder.txt"));
     Ok((
         latest_base_model_artifact_with_prefix("model_latent_")?,
-        model_dir().join("vocabs/vocab_encoder.txt"),
+        vocab,
     ))
 }
 
@@ -3593,7 +3627,10 @@ fn run_sustained_oom_probe(args: &[String]) -> Result<()> {
                 bail!("OOM probe failed");
             }
             latent = Some(latest_base_model_artifact_with_prefix("model_latent_")?);
-            vocab = Some(model_dir().join("vocabs/vocab_encoder.txt"));
+            vocab = Some(
+                cached_encoder_vocab_for_probe(&args)
+                    .unwrap_or_else(|| model_dir().join("vocabs/vocab_encoder.txt")),
+            );
         } else if matches!(
             args.stage,
             ProbeStage::World | ProbeStage::HighWorld | ProbeStage::Decoder
