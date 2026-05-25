@@ -1198,6 +1198,45 @@ fn collect_high_world_macro_batch(
     })
 }
 
+fn collect_high_world_macro_batch_cached(
+    stream: &mut CachedWorldStream,
+    batch_size: usize,
+    macro_min_len: usize,
+    macro_max_len: usize,
+) -> Result<HighWorldMacroBatch> {
+    let macro_min_len = macro_min_len.max(1);
+    let macro_max_len = macro_max_len.max(macro_min_len);
+    let span_range = macro_max_len - macro_min_len + 1;
+    let span_lens = (0..batch_size)
+        .map(|sample_idx| macro_min_len + (sample_idx % span_range))
+        .collect::<Vec<_>>();
+    let total_rows = span_lens.iter().sum();
+    let rows = stream.next_batch(total_rows)?;
+    let mut examples = Vec::with_capacity(batch_size);
+    let mut action_sequences = Vec::with_capacity(batch_size);
+    let mut offset = 0usize;
+    for span_len in span_lens {
+        let span = &rows[offset..offset + span_len];
+        offset += span_len;
+        let first = span
+            .first()
+            .context("cached high-world macro span unexpectedly empty")?;
+        let last = span
+            .last()
+            .context("cached high-world macro span unexpectedly empty")?;
+        action_sequences.push(span.iter().map(|row| row.action_label).collect());
+        examples.push(WorldExample {
+            state_tokens: first.state_tokens.clone(),
+            next_tokens: last.next_tokens.clone(),
+            action_label: first.action_label,
+        });
+    }
+    Ok(HighWorldMacroBatch {
+        examples,
+        action_sequences,
+    })
+}
+
 fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     let device = match Device::new_cuda(0) {
         Ok(d) => {
@@ -1220,13 +1259,30 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     )
     .unwrap_or(0);
     let train_row_count = row_count.saturating_sub(val_row_count);
-    let mut macro_stream = RawWorldStream::with_split(
-        &config.data_path,
-        1,
-        Some(HELDOUT_SPLIT_MODULUS),
-        HELDOUT_SPLIT_REMAINDER,
-        true,
-    )?;
+    let mut cached_macro_stream = if let Some(cache_path) = token_cache_path("world") {
+        println!("Token cache: using high-world cache {:?}", cache_path);
+        Some(CachedWorldStream::with_split(
+            &cache_path,
+            1,
+            Some(HELDOUT_SPLIT_MODULUS),
+            HELDOUT_SPLIT_REMAINDER,
+            true,
+        )?)
+    } else {
+        println!("Token cache: no high-world cache found; using raw tokenization stream");
+        None
+    };
+    let mut macro_stream = if cached_macro_stream.is_none() {
+        Some(RawWorldStream::with_split(
+            &config.data_path,
+            1,
+            Some(HELDOUT_SPLIT_MODULUS),
+            HELDOUT_SPLIT_REMAINDER,
+            true,
+        )?)
+    } else {
+        None
+    };
     let vocab_size = encoder_vocab.id_to_token.len();
 
     let mut encoder_varmap = VarMap::new();
@@ -1385,13 +1441,24 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
         }
 
         for _micro_step in 0..grad_accum_steps {
-            let batch = collect_high_world_macro_batch(
-                &mut macro_stream,
-                &encoder_vocab,
-                batch_size,
-                config.macro_min_len,
-                config.macro_max_len,
-            )?;
+            let batch = if let Some(stream) = cached_macro_stream.as_mut() {
+                collect_high_world_macro_batch_cached(
+                    stream,
+                    batch_size,
+                    config.macro_min_len,
+                    config.macro_max_len,
+                )?
+            } else {
+                collect_high_world_macro_batch(
+                    macro_stream
+                        .as_mut()
+                        .context("high-world raw stream missing")?,
+                    &encoder_vocab,
+                    batch_size,
+                    config.macro_min_len,
+                    config.macro_max_len,
+                )?
+            };
             let (state_slots, target_slots) = context_slots_from_world_pair_batch(
                 &encoder,
                 &context_compressor,
