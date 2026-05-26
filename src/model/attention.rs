@@ -327,7 +327,7 @@ impl MultiHeadAttention {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
         let (q, k, v) = self.project_self_qkv(&x)?;
-        let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         util::ensure_same_dtype(&q, &k, "self attention q/k")?;
         let mut scores = q.matmul(&k_t)?;
         scores = (scores / self.scale)?;
@@ -364,7 +364,7 @@ impl MultiHeadAttention {
 
         // Attention scores: Q @ K^T / sqrt(d_k)
         // [B, num_heads, T_q, head_dim] @ [B, num_heads, head_dim, T_kv] -> [B, num_heads, T_q, T_kv]
-        let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         util::ensure_same_dtype(&q, &k, "cross attention q/k")?;
         let scores = q.matmul(&k_t)?;
         let scores = (scores / self.scale)?;
@@ -613,7 +613,9 @@ impl MultiHeadAttention {
         )?];
         if let (Some(comp_k), Some(comp_v)) = (&full_kv.compressed_k, &full_kv.compressed_v) {
             let comp_bias = if let Some(topk) = index_topk {
-                let scores = q.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?)?;
+                let scores = q
+                    .contiguous()?
+                    .matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
                 topk_bias_from_scores(&scores, topk, x.device())?
             } else {
                 Tensor::zeros(
@@ -631,9 +633,10 @@ impl MultiHeadAttention {
         let v_all = Tensor::cat(&v_parts, 2)?;
         let bias = Tensor::cat(&bias_parts, 3)?.to_dtype(q.dtype())?;
         util::ensure_same_dtype(&q, &k_all, "compressed incremental attention q/k")?;
-        let scores = (q.matmul(&k_all.transpose(D::Minus2, D::Minus1)?)? / self.scale)?;
+        let scores =
+            (q.matmul(&k_all.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.scale)?;
         let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v_all)?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v_all.contiguous()?)?;
         let out = attn_output.transpose(1, 2)?.contiguous()?.reshape((
             b,
             t_q,
@@ -664,16 +667,18 @@ impl MultiHeadAttention {
             };
             let kv_len = kv_end.saturating_sub(kv_start).max(1);
 
-            let q_chunk = q.narrow(2, q_start, q_len)?;
+            let q_chunk = q.narrow(2, q_start, q_len)?.contiguous()?;
             let k_chunk = k.narrow(2, kv_start, kv_len)?;
             let v_chunk = v.narrow(2, kv_start, kv_len)?;
             util::ensure_same_dtype(&q_chunk, &k_chunk, "local attention q/k")?;
-            let scores = (q_chunk.matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?)? / self.scale)?;
+            let scores = (q_chunk
+                .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+                / self.scale)?;
             let bias =
                 local_chunk_bias(q_start, q_len, kv_start, kv_len, window, causal, x.device())?;
             let bias = bias.to_dtype(scores.dtype())?;
             let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-            outputs.push(attn_weights.matmul(&v_chunk)?);
+            outputs.push(attn_weights.contiguous()?.matmul(&v_chunk.contiguous()?)?);
         }
 
         let attn_output = Tensor::cat(&outputs, 2)?;
@@ -731,7 +736,9 @@ impl MultiHeadAttention {
 
             let compressed = compressed_causal_blocks(&k, &v, q_start + q_len, compress_rate)?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
-                let index_scores = q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?)?;
+                let index_scores = q_chunk
+                    .contiguous()?
+                    .matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
                 let index_bias = topk_bias_from_scores(&index_scores, index_topk, x.device())?;
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
@@ -743,10 +750,13 @@ impl MultiHeadAttention {
             let v_chunk = Tensor::cat(&v_parts, 2)?;
             let bias = Tensor::cat(&bias_parts, 3)?;
             util::ensure_same_dtype(&q_chunk, &k_chunk, "compressed causal attention q/k")?;
-            let scores = (q_chunk.matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?)? / self.scale)?;
+            let q_chunk = q_chunk.contiguous()?;
+            let scores = (q_chunk
+                .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+                / self.scale)?;
             let bias = bias.to_dtype(scores.dtype())?;
             let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-            outputs.push(attn_weights.matmul(&v_chunk)?);
+            outputs.push(attn_weights.contiguous()?.matmul(&v_chunk.contiguous()?)?);
         }
 
         let attn_output = Tensor::cat(&outputs, 2)?;
@@ -819,10 +829,13 @@ impl MultiHeadAttention {
                 &k_chunk,
                 "heavily compressed causal attention q/k",
             )?;
-            let scores = (q_chunk.matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?)? / self.scale)?;
+            let q_chunk = q_chunk.contiguous()?;
+            let scores = (q_chunk
+                .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+                / self.scale)?;
             let bias = bias.to_dtype(scores.dtype())?;
             let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-            outputs.push(attn_weights.matmul(&v_chunk)?);
+            outputs.push(attn_weights.contiguous()?.matmul(&v_chunk.contiguous()?)?);
         }
 
         let attn_output = Tensor::cat(&outputs, 2)?;
@@ -1104,12 +1117,12 @@ impl CrossAttention {
             .reshape((b, t_kv, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k_t = k.transpose(D::Minus2, D::Minus1)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         util::ensure_same_dtype(&q, &k, "masked cross attention q/k")?;
         let scores =
             self.add_key_padding_bias((q.matmul(&k_t)? / self.scale)?, key_padding_mask)?;
         let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v)?;
         let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
             b,
             t_q,
