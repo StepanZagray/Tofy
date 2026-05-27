@@ -337,6 +337,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
+    set_env_default("TOFY_DECODER_WARMUP_BATCH", "16");
+    set_env_default("TOFY_DECODER_WARMUP_GRAD_ACCUM", "16");
+    set_env_default("TOFY_DECODER_WARMUP_STEPS", "1000");
     set_env_default("TOFY_DECODER_LOG_EVERY", "500");
     set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
     set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");

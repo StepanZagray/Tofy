@@ -193,7 +193,7 @@ fn decoder_batch_size_for_step(step: usize, config: &DecoderTrainConfig) -> usiz
 fn decoder_grad_accum_for_step(step: usize, config: &DecoderTrainConfig) -> usize {
     if config.grad_accum_warmup_steps > 0
         && step <= config.grad_accum_warmup_steps
-        && config.grad_accum_warmup_value < config.grad_accum_steps
+        && config.grad_accum_warmup_value != config.grad_accum_steps
     {
         config.grad_accum_warmup_value.max(1)
     } else {

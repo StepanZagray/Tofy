@@ -708,10 +708,9 @@ impl DecoderTrainConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1usize)
-            .max(1)
-            .min(grad_accum_steps);
+            .max(1);
         let warmup_is_active =
-            batch_warmup_value != batch_size || grad_accum_warmup_value < grad_accum_steps;
+            batch_warmup_value != batch_size || grad_accum_warmup_value != grad_accum_steps;
         let grad_accum_warmup_steps = std::env::var("TOFY_DECODER_WARMUP_STEPS")
             .ok()
             .and_then(|v| v.parse().ok())
