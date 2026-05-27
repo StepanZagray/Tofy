@@ -6,7 +6,6 @@ use crate::model::DecoderKind;
 
 use super::common::{env_usize, parse_train_dtype};
 
-const DEFAULT_DECODER_WARMUP_MAX_BATCH: usize = 32;
 const DEFAULT_DECODER_WARMUP_STEPS: usize = 500;
 const DEFAULT_DECODER_SYNTAX_LOSS_WEIGHT: f64 = 0.0;
 const DEFAULT_DECODER_SIGNATURE_LOSS_WEIGHT: f64 = 0.0;
@@ -234,19 +233,16 @@ impl DecoderTrainConfig {
             .unwrap_or(40_000);
         let batch_size = filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(8);
         let grad_accum_steps = grad_accum_steps.max(1);
-        let effective_batch = batch_size.max(1) * grad_accum_steps;
-        let default_warmup_batch = batch_size.min(DEFAULT_DECODER_WARMUP_MAX_BATCH).max(1);
-        let default_warmup_grad_accum = effective_batch.div_ceil(default_warmup_batch).max(1);
         let batch_warmup_value = std::env::var("TOFY_DECODER_WARMUP_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(default_warmup_batch)
+            .unwrap_or(batch_size)
             .min(batch_size.max(1))
             .max(1);
         let grad_accum_warmup_value = std::env::var("TOFY_DECODER_WARMUP_GRAD_ACCUM")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(default_warmup_grad_accum)
+            .unwrap_or(grad_accum_steps)
             .max(1);
         let warmup_is_active =
             batch_warmup_value != batch_size || grad_accum_warmup_value != grad_accum_steps;

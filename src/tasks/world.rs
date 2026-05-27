@@ -3175,7 +3175,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let signature_loss_val = util::scalar_f32(&signature_loss)?;
             let structure_loss_val = util::scalar_f32(&structure_loss)?;
             let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
-            let total_tokens = (config.batch_size.max(1) * config.max_seq * 2) as f32;
+            let total_tokens = (batch_size.max(1) * config.max_seq * 2) as f32;
             let active_frac = active_tokens / total_tokens.max(1.0);
             let perplexity = loss_val.exp();
             let conditioning_gain = if compute_conditioning_metrics {
@@ -3307,8 +3307,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 config.structure_loss_weight,
             );
             if val_stream.is_some() || cached_decoder_val_stream.is_some() {
+                let eval_batch_size = std::env::var("TOFY_DECODER_EVAL_BATCH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(config.batch_size)
+                    .max(1)
+                    .min(config.batch_size.max(1));
                 let val_metrics = if let Some(ref mut cached_stream) = cached_decoder_val_stream {
-                    let cached_batch = cached_stream.next_batch(config.batch_size.max(1))?;
+                    let cached_batch = cached_stream.next_batch(eval_batch_size)?;
                     evaluate_decoder_cached_batch(
                         &cached_batch,
                         &encoder_vocab,
@@ -3320,6 +3326,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
+                        config.conditioning_loss_weight,
                         config.max_seq,
                         &device,
                     )?
@@ -3327,7 +3334,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     let val_stream = val_stream
                         .as_mut()
                         .context("decoder validation stream missing")?;
-                    let val_raw_batch = val_stream.next_batch(config.batch_size.max(1))?;
+                    let val_raw_batch = val_stream.next_batch(eval_batch_size)?;
                     evaluate_decoder_batch(
                         &val_raw_batch,
                         &encoder_vocab,
@@ -3339,6 +3346,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
+                        config.conditioning_loss_weight,
                         config.max_seq,
                         &device,
                     )?

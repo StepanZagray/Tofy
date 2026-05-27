@@ -900,6 +900,7 @@ pub(crate) fn evaluate_decoder_batch(
     decoder: &CodeDecoder,
     decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
+    conditioning_loss_weight: f64,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -926,6 +927,7 @@ pub(crate) fn evaluate_decoder_batch(
         decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
+        conditioning_loss_weight,
         max_seq,
         device,
     )
@@ -943,6 +945,7 @@ pub(crate) fn evaluate_decoder_cached_batch(
     decoder: &CodeDecoder,
     _decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
+    conditioning_loss_weight: f64,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -967,6 +970,7 @@ pub(crate) fn evaluate_decoder_cached_batch(
         decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
+        conditioning_loss_weight,
         max_seq,
         device,
     )
@@ -985,6 +989,7 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     decoder_conditioning_adapter: &DecoderConditioningAdapter,
     decoder: &CodeDecoder,
     decoder_action_label: u32,
+    conditioning_loss_weight: f64,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -993,11 +998,6 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let recursive_context_compressor =
         env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
-    let conditioning_loss_weight = std::env::var("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.30f64)
-        .max(0.0);
     let compute_conditioning_metrics =
         conditioning_loss_weight > 0.0 || env_bool("TOFY_DECODER_ABLATION_METRICS", false);
     let state_tokens = encoder_batch
