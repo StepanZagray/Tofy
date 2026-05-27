@@ -363,16 +363,41 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let vocab_size = encoder_vocab.id_to_token.len();
 
     let mut encoder_varmap = VarMap::new();
-    let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
-    let encoder = OnlineEncoder::new(
-        encoder_vb.pp("encoder"),
-        vocab_size,
-        config.dim,
-        config.num_layers,
-        config.num_heads,
-    )?;
-    encoder_varmap.load(&config.encoder_model_path)?;
-    util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+    let encoder = if config.train_encoder {
+        let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
+        let encoder = OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            vocab_size,
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?;
+        encoder_varmap.load(&config.encoder_model_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+        encoder
+    } else {
+        let mut frozen_encoder_varmap = VarMap::new();
+        let encoder_vb = VarBuilder::from_varmap(&frozen_encoder_varmap, train_dtype, &device);
+        let loaded_encoder = OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            vocab_size,
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?;
+        frozen_encoder_varmap.load(&config.encoder_model_path)?;
+        util::cast_varmap_dtype(&mut frozen_encoder_varmap, train_dtype)?;
+        let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&frozen_encoder_varmap)?;
+        drop(loaded_encoder);
+        let encoder_vb = VarBuilder::from_tensors(frozen_encoder_tensors, train_dtype, &device);
+        OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            vocab_size,
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?
+    };
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
@@ -1285,28 +1310,51 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     };
     let vocab_size = encoder_vocab.id_to_token.len();
 
-    let mut encoder_varmap = VarMap::new();
-    let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
-    let encoder = OnlineEncoder::new(
-        encoder_vb.pp("encoder"),
-        vocab_size,
-        config.dim,
-        config.num_layers,
-        config.num_heads,
-    )?;
-    encoder_varmap.load(&config.encoder_model_path)?;
-    util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+    let encoder = {
+        let mut encoder_varmap = VarMap::new();
+        let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
+        let loaded_encoder = OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            vocab_size,
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?;
+        encoder_varmap.load(&config.encoder_model_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+        let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
+        drop(loaded_encoder);
+        let encoder_vb = VarBuilder::from_tensors(frozen_encoder_tensors, train_dtype, &device);
+        OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            vocab_size,
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?
+    };
 
-    let mut world_varmap = VarMap::new();
-    let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let context_compressor = ContextCompressor::new(
-        world_vb.pp("context_compressor"),
-        config.dim,
-        config.bridge_dim,
-        config.num_latent_tokens,
-    )?;
-    world_varmap.load(&config.world_model_path)?;
-    util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+    let context_compressor = {
+        let mut world_varmap = VarMap::new();
+        let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
+        let loaded_context_compressor = ContextCompressor::new(
+            world_vb.pp("context_compressor"),
+            config.dim,
+            config.bridge_dim,
+            config.num_latent_tokens,
+        )?;
+        world_varmap.load(&config.world_model_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+        let frozen_world_tensors = util::frozen_tensors_from_varmap(&world_varmap)?;
+        drop(loaded_context_compressor);
+        let world_vb = VarBuilder::from_tensors(frozen_world_tensors, train_dtype, &device);
+        ContextCompressor::new(
+            world_vb.pp("context_compressor"),
+            config.dim,
+            config.bridge_dim,
+            config.num_latent_tokens,
+        )?
+    };
 
     let mut high_varmap = VarMap::new();
     let high_vb = VarBuilder::from_varmap(&high_varmap, train_dtype, &device);
@@ -1676,17 +1724,29 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         None
     };
 
-    let mut encoder_varmap = VarMap::new();
-    let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
-    let encoder = OnlineEncoder::new(
-        encoder_vb.pp("encoder"),
-        encoder_vocab.id_to_token.len(),
-        config.dim,
-        config.num_layers,
-        config.num_heads,
-    )?;
-    encoder_varmap.load(&config.encoder_model_path)?;
-    util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+    let encoder = {
+        let mut encoder_varmap = VarMap::new();
+        let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
+        let loaded_encoder = OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            encoder_vocab.id_to_token.len(),
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?;
+        encoder_varmap.load(&config.encoder_model_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+        let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
+        drop(loaded_encoder);
+        let encoder_vb = VarBuilder::from_tensors(frozen_encoder_tensors, train_dtype, &device);
+        OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            encoder_vocab.id_to_token.len(),
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?
+    };
 
     let mut world_varmap = VarMap::new();
     let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
@@ -2518,39 +2578,66 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
     let encoder_vocab_sig = vocab_signature(&encoder_vocab);
 
-    let mut encoder_varmap = VarMap::new();
-    let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
-    let encoder = OnlineEncoder::new(
-        encoder_vb.pp("encoder"),
-        encoder_vocab.id_to_token.len(),
-        config.dim,
-        config.num_layers,
-        config.num_heads,
-    )?;
-    encoder_varmap.load(&config.encoder_model_path)?;
-    util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+    let encoder = {
+        let mut encoder_varmap = VarMap::new();
+        let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, train_dtype, &device);
+        let loaded_encoder = OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            encoder_vocab.id_to_token.len(),
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?;
+        encoder_varmap.load(&config.encoder_model_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+        let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
+        drop(loaded_encoder);
+        let encoder_vb = VarBuilder::from_tensors(frozen_encoder_tensors, train_dtype, &device);
+        OnlineEncoder::new(
+            encoder_vb.pp("encoder"),
+            encoder_vocab.id_to_token.len(),
+            config.dim,
+            config.num_layers,
+            config.num_heads,
+        )?
+    };
 
-    let mut world_varmap = VarMap::new();
-    let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
-    let context_compressor = ContextCompressor::new(
-        world_vb.pp("context_compressor"),
-        config.dim,
-        config.bridge_dim,
-        config.num_latent_tokens,
-    )?;
-    let transition =
-        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
-    let _inverse_action_classifier =
-        if checkpoint_has_prefix(&config.world_model_path, "inverse_action_classifier.") {
-            Some(NextActionClassifier::new(
-                world_vb.pp("inverse_action_classifier"),
-                config.bridge_dim,
-            )?)
-        } else {
-            None
-        };
-    world_varmap.load(&config.world_model_path)?;
-    util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+    let (context_compressor, transition) = {
+        let mut world_varmap = VarMap::new();
+        let world_vb = VarBuilder::from_varmap(&world_varmap, train_dtype, &device);
+        let loaded_context_compressor = ContextCompressor::new(
+            world_vb.pp("context_compressor"),
+            config.dim,
+            config.bridge_dim,
+            config.num_latent_tokens,
+        )?;
+        let loaded_transition =
+            ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+        let _inverse_action_classifier =
+            if checkpoint_has_prefix(&config.world_model_path, "inverse_action_classifier.") {
+                Some(NextActionClassifier::new(
+                    world_vb.pp("inverse_action_classifier"),
+                    config.bridge_dim,
+                )?)
+            } else {
+                None
+            };
+        world_varmap.load(&config.world_model_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+        let frozen_world_tensors = util::frozen_tensors_from_varmap(&world_varmap)?;
+        drop(loaded_context_compressor);
+        drop(loaded_transition);
+        let world_vb = VarBuilder::from_tensors(frozen_world_tensors, train_dtype, &device);
+        let context_compressor = ContextCompressor::new(
+            world_vb.pp("context_compressor"),
+            config.dim,
+            config.bridge_dim,
+            config.num_latent_tokens,
+        )?;
+        let transition =
+            ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
+        (context_compressor, transition)
+    };
 
     let mut decoder_varmap = VarMap::new();
     let decoder_vb = VarBuilder::from_varmap(&decoder_varmap, train_dtype, &device);

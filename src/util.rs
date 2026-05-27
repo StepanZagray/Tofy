@@ -155,6 +155,17 @@ pub fn named_train_vars(varmap: &VarMap) -> Result<Vec<NamedVar>> {
     Ok(vars)
 }
 
+pub fn frozen_tensors_from_varmap(varmap: &VarMap) -> Result<HashMap<String, Tensor>> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to lock varmap for frozen tensors"))?;
+    Ok(data
+        .iter()
+        .map(|(name, var)| (name.clone(), var.as_tensor().detach()))
+        .collect())
+}
+
 #[derive(Debug)]
 struct AdamWVarState {
     name: String,
