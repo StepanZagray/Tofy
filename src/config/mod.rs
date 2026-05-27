@@ -1,8 +1,10 @@
+mod common;
+pub mod decoder;
 pub mod latent;
 pub mod world;
 
+pub use decoder::DecoderTrainConfig;
 pub use latent::{LatentEvalConfig, LatentTrainConfig};
 pub use world::{
-    DecoderTrainConfig, HighWorldTrainConfig, OrchestratorTrainConfig, ServeConfig,
-    WorldEvalConfig, WorldTrainConfig,
+    HighWorldTrainConfig, OrchestratorTrainConfig, ServeConfig, WorldEvalConfig, WorldTrainConfig,
 };

@@ -2231,7 +2231,7 @@ fn decoder_next_context_slots(
             device,
         )?;
         let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
-        return if rollout_steps <= 1 {
+        let next_slots = if rollout_steps <= 1 {
             transition.forward(&state_slots, &decoder_action_labels)
         } else {
             rollout_transition_slots(
@@ -2240,7 +2240,8 @@ fn decoder_next_context_slots(
                 decoder_action_label,
                 rollout_steps,
             )
-        };
+        }?;
+        return Ok(next_slots.detach());
     }
 
     let mut slots_by_row: Vec<Option<Tensor>> = (0..encoder_batch.len()).map(|_| None).collect();
@@ -2293,7 +2294,7 @@ fn decoder_next_context_slots(
         .iter()
         .map(|slots| slots.as_ref().context("decoder context cache missing row"))
         .collect::<Result<Vec<_>>>()?;
-    Tensor::cat(&slots, 0).map_err(Into::into)
+    Ok(Tensor::cat(&slots, 0)?.detach())
 }
 
 pub(crate) fn decoder_tokenization_mode(kind: DecoderKind) -> TokenizationMode {

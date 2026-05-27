@@ -313,11 +313,6 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", "2");
     set_env_default("TOFY_WORLD_ROLLOUT_STEPS", "2");
     set_env_default("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.0");
-    set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.0");
-    set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.0");
-    set_env_default("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.0");
-    set_env_default("TOFY_DECODER_CONDITIONING_LOSS_WEIGHT", "0.0");
-    set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
     set_env_default("TOFY_BPE_MAX_MERGES", "8192");
@@ -337,10 +332,6 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
-    set_env_default("TOFY_DECODER_WARMUP_BATCH", "16");
-    set_env_default("TOFY_DECODER_WARMUP_GRAD_ACCUM", "16");
-    set_env_default("TOFY_DECODER_WARMUP_STEPS", "1000");
-    set_env_default("TOFY_DECODER_LOG_EVERY", "500");
     set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
     set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");
     set_env_default("TOFY_CACHE_DIR", CACHE_DIR);

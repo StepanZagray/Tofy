@@ -3196,7 +3196,6 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     if args.max_vram {
         env.insert("TOFY_WORLD_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_HIGH_WORLD_LOG_EVERY".to_string(), "25".to_string());
-        env.insert("TOFY_DECODER_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "2".to_string());
         env.insert("TOFY_CONTEXT_SEGMENT_BATCH".to_string(), "64".to_string());
     }
