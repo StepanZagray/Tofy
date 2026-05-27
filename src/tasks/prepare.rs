@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -1598,6 +1600,7 @@ struct GoCompileFeedback {
     timeout_sec: f64,
     cache_dir: PathBuf,
     mod_cache_dir: PathBuf,
+    tmp_dir: PathBuf,
 }
 
 impl GoCompileFeedback {
@@ -1616,20 +1619,33 @@ impl GoCompileFeedback {
         let mod_cache_dir = std::env::var_os("GOMODCACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| cache_root.join("go-mod"));
+        let tmp_dir = std::env::var_os("GOTMPDIR")
+            .or_else(|| std::env::var_os("TMPDIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cache_root.join("go-tmp"));
         fs::create_dir_all(&cache_dir)?;
         fs::create_dir_all(&mod_cache_dir)?;
+        fs::create_dir_all(&tmp_dir)?;
         let runner = Self {
             go_bin: go_bin.to_string(),
             timeout_sec,
             cache_dir,
             mod_cache_dir,
+            tmp_dir,
         };
         runner.warm_cache()?;
         Ok(runner)
     }
 
     fn warm_cache(&self) -> Result<()> {
-        let _ = self.compile("func tofyGoRepairCacheWarmup() {}")?;
+        let _ = go_compile_feedback(
+            &self.go_bin,
+            "func tofyGoRepairCacheWarmup() {}",
+            self.timeout_sec.max(120.0),
+            &self.cache_dir,
+            &self.mod_cache_dir,
+            &self.tmp_dir,
+        )?;
         Ok(())
     }
 
@@ -1640,6 +1656,7 @@ impl GoCompileFeedback {
             self.timeout_sec,
             &self.cache_dir,
             &self.mod_cache_dir,
+            &self.tmp_dir,
         )
     }
 }
@@ -1695,6 +1712,10 @@ fn run_command_with_timeout(cmd: &mut Command, timeout_sec: f64) -> Result<std::
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
     if timeout_sec <= 0.0 {
         return Ok(cmd.output()?);
     }
@@ -1706,11 +1727,24 @@ fn run_command_with_timeout(cmd: &mut Command, timeout_sec: f64) -> Result<std::
             return Ok(child.wait_with_output()?);
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_timed_out_child(&mut child);
             return Ok(child.wait_with_output()?);
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn terminate_timed_out_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = format!("-{}", child.id());
+        let _ = Command::new("kill").arg("-TERM").arg(&pgid).status();
+        thread::sleep(Duration::from_millis(100));
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("kill").arg("-KILL").arg(&pgid).status();
+        }
+    }
+    let _ = child.kill();
 }
 
 fn go_compile_feedback(
@@ -1719,6 +1753,7 @@ fn go_compile_feedback(
     timeout_sec: f64,
     cache_dir: &Path,
     mod_cache_dir: &Path,
+    tmp_dir: &Path,
 ) -> Result<String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1740,6 +1775,8 @@ fn go_compile_feedback(
         .current_dir(&dir)
         .env("GOCACHE", cache_dir)
         .env("GOMODCACHE", mod_cache_dir)
+        .env("GOTMPDIR", tmp_dir)
+        .env("TMPDIR", tmp_dir)
         .env("GOMAXPROCS", "1");
     let output = run_command_with_timeout(&mut cmd, timeout_sec)?;
     let _ = fs::remove_dir_all(&dir);
