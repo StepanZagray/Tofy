@@ -736,9 +736,8 @@ impl MultiHeadAttention {
 
             let compressed = compressed_causal_blocks(&k, &v, q_start + q_len, compress_rate)?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
-                let index_scores = q_chunk
-                    .contiguous()?
-                    .matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+                let index_scores =
+                    q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
                 let index_bias = topk_bias_from_scores(&index_scores, index_topk, x.device())?;
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
@@ -750,7 +749,6 @@ impl MultiHeadAttention {
             let v_chunk = Tensor::cat(&v_parts, 2)?;
             let bias = Tensor::cat(&bias_parts, 3)?;
             util::ensure_same_dtype(&q_chunk, &k_chunk, "compressed causal attention q/k")?;
-            let q_chunk = q_chunk.contiguous()?;
             let scores = (q_chunk
                 .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
                 / self.scale)?;
@@ -829,7 +827,6 @@ impl MultiHeadAttention {
                 &k_chunk,
                 "heavily compressed causal attention q/k",
             )?;
-            let q_chunk = q_chunk.contiguous()?;
             let scores = (q_chunk
                 .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
                 / self.scale)?;

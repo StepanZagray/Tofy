@@ -54,11 +54,11 @@
     "latent_warmup_batch": 32,
     "world_batch": 128,
     "world_warmup_batch": 64,
-    "code_decoder_batch": 128,
-    "go_feedback_batch": 256,
+    "code_decoder_batch": 64,
+    "go_feedback_batch": 64,
     "latent_grad_accum": 11,
     "world_grad_accum": 4,
-    "code_decoder_grad_accum": 2,
-    "go_feedback_grad_accum": 1
+    "code_decoder_grad_accum": 4,
+    "go_feedback_grad_accum": 4
   }
 }
