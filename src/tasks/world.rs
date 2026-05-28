@@ -18,9 +18,9 @@ use crate::config::{
 use crate::data::{
     build_vocab_from_raw_world_file_with_mode, count_raw_world_rows, count_raw_world_rows_split,
     count_raw_world_rows_split_with_mode, encode_world_examples, encode_world_examples_with_mode,
-    make_decoder_batch, make_world_batch_from_slice, tokenize_for_inference, CachedDecoderStream,
-    CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode, WorldExample,
-    ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    make_decoder_batch_from_slice, make_world_batch_from_slice, tokenize_for_inference,
+    CachedDecoderStream, CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode,
+    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::vocab_signature;
@@ -3016,18 +3016,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let world_latent = decoder_conditioning_adapter
                 .forward_with_action(&micro_next_context_slots, decoder_action_label)?;
 
-            let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
-                make_world_batch_from_slice(
-                    &decoder_batch,
-                    config.max_seq,
-                    decoder_vocab.pad_id,
-                    &device,
-                )?;
-            let (dec_input, dec_target, loss_mask) = make_decoder_batch(
-                &dec_state_ids,
-                &dec_next_ids,
-                &state_lens,
-                &next_lens,
+            let (dec_input, dec_target, loss_mask) = make_decoder_batch_from_slice(
+                &decoder_batch,
                 config.max_seq,
                 decoder_vocab.pad_id,
                 &device,

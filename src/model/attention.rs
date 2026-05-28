@@ -195,7 +195,14 @@ fn topk_bias_from_scores(
 ) -> Result<Tensor> {
     let (batch, heads, queries, keys) = scores.dims4()?;
     if keys == 0 || topk >= keys {
-        return Tensor::zeros((batch, heads, queries, keys), scores.dtype(), device)
+        return Tensor::zeros((batch, heads, queries, keys), DType::F32, device)
+            .map_err(Into::into);
+    }
+    let cpu_topk_enabled = std::env::var("TOFY_DECODER_CPU_TOPK_BIAS")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !cpu_topk_enabled {
+        return Tensor::zeros((batch, heads, queries, keys), DType::F32, device)
             .map_err(Into::into);
     }
     let values = scores

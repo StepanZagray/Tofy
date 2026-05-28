@@ -2735,6 +2735,57 @@ pub fn make_decoder_batch(
     Ok((input_ids, target_ids, loss_mask))
 }
 
+/// Build decoder teacher-forcing tensors directly from CPU token rows.
+///
+/// This matches `make_decoder_batch` without the state/next GPU tensor round trip.
+pub fn make_decoder_batch_from_slice(
+    rows: &[WorldExample],
+    max_seq: usize,
+    pad_id: u32,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let batch_size = rows.len();
+    let decoder_len = 2 * max_seq;
+    let mut input_buf = Vec::with_capacity(batch_size * decoder_len);
+    let mut target_buf = Vec::with_capacity(batch_size * decoder_len);
+    let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
+
+    for row in rows {
+        let (state_seq, state_len) = encode_sequence(&row.state_tokens, max_seq, pad_id);
+        let (next_seq, next_len) = encode_sequence(&row.next_tokens, max_seq, pad_id);
+        let sl = state_len.min(max_seq);
+        let nl = next_len.min(max_seq);
+
+        input_buf.extend(state_seq.iter().take(sl).copied());
+        input_buf.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
+        let input_len = sl + nl.saturating_sub(1);
+        input_buf.extend(std::iter::repeat_n(
+            pad_id,
+            decoder_len.saturating_sub(input_len),
+        ));
+
+        target_buf.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
+        target_buf.extend(next_seq.iter().take(nl).copied());
+        let target_len = sl.saturating_sub(1) + nl;
+        target_buf.extend(std::iter::repeat_n(
+            pad_id,
+            decoder_len.saturating_sub(target_len),
+        ));
+
+        mask_buf.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
+        mask_buf.extend(std::iter::repeat_n(1.0f32, nl));
+        mask_buf.extend(std::iter::repeat_n(
+            0.0f32,
+            decoder_len.saturating_sub(target_len),
+        ));
+    }
+
+    let input_ids = Tensor::from_vec(input_buf, (batch_size, decoder_len), device)?;
+    let target_ids = Tensor::from_vec(target_buf, (batch_size, decoder_len), device)?;
+    let loss_mask = Tensor::from_vec(mask_buf, (batch_size, decoder_len), device)?;
+    Ok((input_ids, target_ids, loss_mask))
+}
+
 #[allow(clippy::type_complexity)]
 pub fn make_world_batch_from_slice(
     rows: &[WorldExample],

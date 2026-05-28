@@ -4,8 +4,8 @@ use candle_nn::ops;
 use std::collections::HashSet;
 
 use crate::data::{
-    encode_text_with_vocab_mode, make_decoder_batch, make_world_batch_from_slice, RawWorldExample,
-    TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
+    encode_text_with_vocab_mode, make_decoder_batch_from_slice, RawWorldExample, TokenizationMode,
+    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
 };
 use crate::model::{
     flatten_latent_slots, mean_cosine_similarity, prediction_loss, tensor_rms,
@@ -1029,17 +1029,8 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let world_latent = decoder_conditioning_adapter
         .forward_with_action(&next_context_slots.detach(), decoder_action_label)?;
     let zero_world_latent = world_latent.affine(0.0, 0.0)?;
-    let (dec_state_ids, dec_next_ids, state_lens, next_lens, _) =
-        make_world_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
-    let (dec_input, dec_target, loss_mask) = make_decoder_batch(
-        &dec_state_ids,
-        &dec_next_ids,
-        &state_lens,
-        &next_lens,
-        max_seq,
-        decoder_vocab.pad_id,
-        device,
-    )?;
+    let (dec_input, dec_target, loss_mask) =
+        make_decoder_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
     let logits = decoder.forward(&dec_input, &world_latent)?;
     let importance_mask = importance_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
     let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
@@ -1080,7 +1071,7 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let signature_loss_val = util::scalar_f32(&signature_loss)?;
     let structure_loss_val = util::scalar_f32(&structure_loss)?;
     let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
-    let total_tokens = (state_lens.len().max(1) * max_seq * 2) as f32;
+    let total_tokens = (decoder_batch.len().max(1) * max_seq * 2) as f32;
     let prediction_metrics =
         decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
     Ok(DecoderBatchMetrics {
