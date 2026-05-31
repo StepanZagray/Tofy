@@ -4,7 +4,7 @@ All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-pa
 
 | Doc | Purpose |
 |-----|--------|
-| [RUNBOOK.md](RUNBOOK.md) | End-to-end: clone -> HF CLI -> data -> `train 8gb|48gb` (or per-stage flags) -> optional eval -> serve. Includes TensorBoard. |
+| [RUNBOOK.md](RUNBOOK.md) | End-to-end: clone -> HF CLI -> data -> `train 8gb|48gb|80gb` (or per-stage flags) -> default Go eval -> serve. Includes TensorBoard. |
 | [OPENCODE.md](OPENCODE.md) | Run Tofy in OpenCode; auth and provider config; code-specialist and text-generalist decoders. |
 | [ARCHITECTURE_AND_CAPACITY.md](ARCHITECTURE_AND_CAPACITY.md) | Current context-compressor architecture, cross-action awareness, capacity, and multi-step replies. |
 | [CODE_DATA.md](CODE_DATA.md) | Code training data: CLI `--prepare-*` generators, Go code pairs, pair formats. |
@@ -25,6 +25,6 @@ Recent refactors split command parsing and runtime code more explicitly:
 - [`src/lib.rs`](../src/lib.rs) owns the crate module tree and top-level command dispatch; [`src/main.rs`](../src/main.rs) only initializes logging and forwards CLI args.
 - [`src/config/latent.rs`](../src/config/latent.rs) and [`src/config/world.rs`](../src/config/world.rs) hold typed configs for latent, world, decoder, eval, and serve commands.
 - [`src/tasks/latent.rs`](../src/tasks/latent.rs) owns latent training and JEPA evaluation.
-- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) owns the canonical full `train <8gb|48gb>` multi-stage pipeline (data prep through decoder training, with optional code eval).
+- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) owns the canonical full `train <8gb|48gb|80gb>` multi-stage pipeline (data prep through decoder training and hard Go eval selection).
 - [`src/tasks/world.rs`](../src/tasks/world.rs) owns world/high-world/orchestrator/decoder training plus agent runtime.
 - [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) holds shared world/decoder metrics, masking, and evaluation helpers extracted from `world.rs` for readability.

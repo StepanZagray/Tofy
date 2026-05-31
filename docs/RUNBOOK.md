@@ -23,9 +23,9 @@ For the current repo, the cleanest proof of concept is now paper-strict by defau
 3. train the integrated high-level action-conditioned state transition in the same context-slot latent space
 4. train only the code decoder as a downstream emitter
 5. train a Go execution-feedback decoder stage initialized from the base code decoder
-6. optionally score the result on the hard Go eval suite with `--with-code-eval`
+6. select and score the decoder with the hard Go compile/test eval suite
 
-The canonical pipeline fixes `TOFY_SIGREG_SLICES=1024`, zero world action/inverse auxiliary weights, and zero decoder syntax/signature/structure auxiliary weights.
+The canonical pipeline fixes `TOFY_SIGREG_SLICES=1024`, keeps world action/inverse auxiliary weights off, and enables decoder syntax/signature/structure plus conditioning-margin auxiliary losses.
 
 The pipeline now does Go execution-feedback decoder training after the mixed decoder stage:
 
@@ -40,22 +40,18 @@ The canonical training command is:
 cargo run --release -- train 8gb
 ```
 
-This trains the modules only. To also run verifier-guided decoder selection and
-the hard Go eval suite, pass:
+This also runs verifier-guided decoder selection and the hard Go eval suite by default.
 
-```bash
-cargo run --release -- train 8gb --with-code-eval
-```
-
-The `8gb` and `48gb` model/profile sizes are defined in
+The `8gb`, `48gb`, and `80gb` model/profile sizes are defined in
 `config/model_profiles.json`. Override that file path with
 `TOFY_MODEL_PROFILES=<path>` when testing a different shape.
 
-Use `train 48gb` for the A40 profile. Resume uses the run directory layout:
+Use `train 48gb` for the A40 profile and `train 80gb` for A100/H100/RTX PRO 6000-class pods. Resume uses the run directory layout:
 
 ```bash
 cargo run --release -- train 48gb --resume latest
 cargo run --release -- train 48gb --resume code_poc_1234567890
+cargo run --release -- train 80gb --resume latest
 ```
 
 Training builds and uses the pipeline vocab/token cache by default:
@@ -64,6 +60,20 @@ Training builds and uses the pipeline vocab/token cache by default:
 cargo run --release -- train 48gb
 ```
 
+To do the data-heavy part on a local machine before launching a pod, run the
+same Stage 1 preparation without training:
+
+```bash
+cargo run --release -- prepare cache 48gb
+```
+
+Use the same profile that you plan to train on. This prepares source data,
+prepared mixes, the Go eval suite, profile-sized vocabs, and token caches.
+Add `--auto-hf-upload` to archive `data/`, `eval/`, and `local_models/vocabs/`
+as `tofy-cache-<profile>-<sha>-<timestamp>.tar.zst` and upload it to the
+Hugging Face cache dataset with the `hf` CLI. Override the target dataset with
+`TOFY_HF_CACHE_REPO=<org/name>` if needed.
+
 Stage 1 prepares the text datasets, materializes `data/encoder_mix.txt`, builds
 profile-specific vocabs, and writes binary token caches before Stage 2 starts.
 Later stages stream those token caches instead of retokenizing raw text in the
@@ -71,12 +81,12 @@ training loop.
 
 The 8 GB profile uses:
 
-- encoder/world keep `256` context
-- encoder defaults to `16x16` (`256` effective) after a `16x1` warmup
+- encoder/world keep `256` per-segment context
+- encoder defaults to `16x4` (`64` rows with segmented context) after a `16x1` warmup
 - world defaults to `32x8` (`256` effective) after a `32x1` warmup
 - code decoder defaults to `8x16` (`128` effective)
 - training defaults to `TOFY_TRAIN_DTYPE=bf16` on GPU, with CPU forced back to `f32`
-- code decoder defaults now use `max_seq=160`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
+- code decoder defaults now use `max_seq=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
 - decoder conditioning-margin ablation is disabled by default to keep the decoder downstream rather than part of the LeJEPA objective
 
 For batch/VRAM decisions, use the sustained OOM probe rather than one-step smoke tests:
@@ -92,6 +102,9 @@ For cloud training pod launch, bootstrap, resume, and artifact recovery, see
 
 Training-side latent context knobs:
 
+- `TOFY_OPTIMIZER=adamw|muon` selects the training optimizer; pipeline default `muon`
+- `TOFY_ADAMW_BETA1=<float>`, `TOFY_ADAMW_BETA2=<float>`, `TOFY_ADAMW_EPS=<float>`, and `TOFY_WEIGHT_DECAY=<float>` override AdamW/fallback hyperparameters; pipeline defaults to `beta2=0.95` and `weight_decay=0.1`
+- `TOFY_MUON_MOMENTUM=<float>`, `TOFY_MUON_NS_STEPS=<int>`, and `TOFY_MUON_RMS_SCALE=<float>` tune hybrid Muon; defaults are `0.95`, `5`, and `0.18`
 - `TOFY_SIGREG_SLICES=<int>` controls SIGReg random projections, default `1024`
 - `TOFY_SIGREG_POINTS=<int>` controls Epps-Pulley evaluation points, default `17`
 - `TOFY_LATENT_CONTEXT_SEGMENTS=<int>` widens the source window sampled during latent training
@@ -119,16 +132,20 @@ World/context compressor knobs:
 - `TOFY_LATENT_REASONING_PATIENCE=<int>` stops latent refinement after this many non-improving steps beyond the minimum, default `2`
 - `TOFY_LATENT_REASONING_ALPHA=<float>` blends each recurrent proposal with the selected next-action latent anchor, default `0.35`
 - `TOFY_LATENT_REASONING_GOAL_WEIGHT`, `TOFY_LATENT_REASONING_ROUTE_WEIGHT`, and `TOFY_LATENT_REASONING_STABILITY_WEIGHT` tune the latent selection score
-- the integrated high-world training stage is fixed by profile: `12000` for `8gb` and `2000` for `48gb`
+- `--eval-code-assistant` defaults to `TOFY_LATENT_REASONING=0`, `TOFY_DECODER_RLM=0`, and `JEPA_DECODER_TEMP=0` unless you set those variables yourself, so eval matches direct decoder training before testing extra inference-time wrappers
+- the integrated high-world training stage is fixed by profile: `12000` for `8gb`/`48gb` and `18000` for `80gb`
 - `HWM_MACRO_MIN_LEN=<int>` and `HWM_MACRO_MAX_LEN=<int>` set the primitive-action span encoded into each macro-action, defaults `2..4`
 - serve/eval auto-load `runs/.../high_world/model.safetensors` next to the world checkpoint; `TOFY_HIGH_WORLD_MODEL=<path>` or `--high-world-model <path>` overrides that path
 - `TOFY_HWM_HIGH_HORIZON`, `TOFY_HWM_LOW_HORIZON`, `TOFY_HWM_MACRO_CANDIDATES`, and `TOFY_HWM_SUBGOAL_WEIGHT` tune high-level subgoal search and low-level action search
 
 Decoder training knobs:
 
-- `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` mixes a conditioning-margin loss into decoder training, default `0.30` for direct `--train-decoder` runs and explicitly `0.0` in the canonical pipeline decoder and Go-feedback stages
+- `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` mixes a conditioning-margin loss into decoder training, default `0.20` for direct `--train-decoder` runs and the canonical pipeline decoder stages
 - `TOFY_DECODER_CONDITIONING_MARGIN=<float>` sets the conditioning-loss margin, default `0.10`
+- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all` controls which negative-conditioning forwards are used for the training margin; pipeline default `zero,shuffle` to avoid the full three-negative cost on every microbatch
+- `TOFY_DECODER_PROMPT_DROPOUT=<float>` randomly masks prompt tokens during decoder training so the decoder must use world conditioning; pipeline default `0.12`
 - `TOFY_DECODER_CONTEXT_CACHE_ROWS=<int>` bounds the in-memory cache of frozen world/context slots during decoder training, default `1024`; set `0` to disable
+- decoder conditioning/cache keys include the row action label, so mixed action batches do not reuse a latent generated for a different action
 - Decoder training batches all gradient-accumulation rows into one frozen encoder/world prefill before slicing latents back into decoder microbatches; the logged `config/decoder_prefill_batch_rows` is `batch * grad_accum`
 - `TOFY_DECODER_SYNTAX_LOSS_WEIGHT=<float>` mixes syntax-weighted CE into decoder training
 - `TOFY_DECODER_SIGNATURE_LOSS_WEIGHT=<float>` upweights the predicted function-signature span during decoder training
@@ -143,14 +160,15 @@ Inference-side context hierarchy knobs:
 
 Input prefetch throughput knobs:
 
-- `TOFY_CACHE_PREFETCH_BATCHES=<int>` controls the bounded raw and cached stream prefetch queue, pipeline default `4`; set `0` to disable
+- `TOFY_CACHE_PREFETCH_BATCHES=<int>` controls the bounded raw and cached stream prefetch queue, pipeline default `8`; set `0` to disable
 - `TOFY_CACHE_PREFETCH_CHUNK=<int>` overrides the number of raw/cached examples decoded per prefetch chunk, default current training batch size
-- `TOFY_TOKEN_CACHE_READER_MB=<int>` controls the per-stream token-cache read buffer, default `8`
+- `TOFY_TOKEN_CACHE_READER_MB=<int>` controls the per-stream token-cache read buffer, default `32`
 - cache preparation overlaps independent source fingerprinting, vocab builds, and token-cache builds; token-cache misses are encoded in parallel with Rayon
 - set `RAYON_NUM_THREADS=<int>` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=<int>` to tune Stage 1 text-artifact chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=<int>` to tune token-cache build chunk size, and `TOFY_VOCAB_SCAN_CHUNK_LINES=<int>` to tune vocab sampling chunk size; chunk defaults are `16384`
 - `TOFY_CONTEXT_SEGMENT_BATCH=<int>` controls the encoder/context segment micro-batch used by world, action classifier, decoder conditioning, and eval paths, default `64`
+- `TOFY_ACTION_BATCH_REFILL_ROUNDS=<int>` controls how many stream refills action-balanced world/orchestrator batches attempt before falling back to available rows and logging a one-time shortage warning, default `64`
 - `TOFY_ENCODER_VOCAB_SAMPLE_ROWS=<int>` and `TOFY_ENCODER_VOCAB_SAMPLE_BYTES=<int>` cap the encoder vocab scan before Stage 2 training starts; the pipeline defaults to `500000` usable sequences or `67108864` text bytes
-- `TOFY_BPE_MAX_MERGES=<int>` caps tokenizer merge training; the pipeline defaults to `8192` to bound CPU-only startup time
+- `TOFY_BPE_MAX_MERGES=<int>` caps tokenizer merge training; the pipeline defaults to `24000`
 
 The training pipeline also auto-exports `CUDA_COMPUTE_CAP` from `nvidia-smi` when it is available. CUDA toolkit version detection is left to `cudarc`.
 
@@ -177,22 +195,43 @@ cargo run --release -- train 8gb
 cargo run --release -- train 48gb
 ```
 
+80 GB large-decoder run:
+
+```bash
+cargo run --release -- train 80gb
+```
+
 This is the larger local/cloud profile for checking whether scaling helps the
 coding assistant. It uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
 `HEADS=16`, decoder width `768`, decoder FF width `3072`, and
 `NUM_LATENT_TOKENS=96`.
 Current 48 GB batches are encoder `48x11` (`528` effective), world `128x4`
-(`512` effective) with the encoder frozen, decoder `128x2` (`256` effective),
-and Go feedback `256x1` (`256` effective), replacing the old decoder `4x1`
+(`512` effective) with the encoder frozen, decoder `32x8` (`256` effective),
+and Go feedback `32x8` (`256` effective), replacing the old decoder `4x1`
 microbatch that left most VRAM idle in the recorded RunPod training run. It
-defaults to recorded-checkpoint-scaled budgets: latent `4000`, world `10000`,
-high-world `2000`, code decoder `12000`, and Go feedback `3000`.
+defaults to longer code-quality budgets: latent `16000`, world `60000`,
+high-world `12000`, code decoder `80000`, and Go feedback `20000`.
+
+The `80gb` profile keeps decoder effective batch at `256` but uses microbatch
+`8x32` so activation memory can hold the larger decoder. It sets world/encoder
+width to `1024` and the decoder to width `1536`, `16` layers, and FF width
+`6144` (about a 700M-parameter decoder by the local estimator). Do not raise
+the decoder microbatch just because VRAM is available; probe throughput first.
+After the GPU is saturated, bigger decoder microbatches mostly buy fewer
+optimizer steps per token and higher activation memory pressure.
 
 Before a long A40 launch, run:
 
 ```bash
 cargo run --release -- --max-vram-probe --profile 48gb --stage all
 cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
+```
+
+For 80 GB pods, probe first because the profile uses a much larger decoder:
+
+```bash
+cargo run --release -- --max-vram-probe --profile 80gb --stage all
+cargo run --release -- --sustained-oom-probe --profile 80gb --stage all
 ```
 
 Stage 1 builds or validates:
@@ -231,6 +270,8 @@ Tokenizer behavior is now versioned explicitly:
 - both modes reserve UTF-8 byte tokens and use byte fallback instead of raw `<unk>` collapse
 - code-aware mode still does identifier-aware splitting first, then falls back to UTF-8 bytes only for uncovered pieces
 - cache invalidation no longer depends only on the source file and the loose mode label; changing the tokenizer spec bumps the cache/vocab manifests automatically
+
+Truncation is tail-biased across the training path. Encoder sequence caches, world caches, dual decoder caches, uncached world batches, and decoder teacher-forcing batches keep the newest tokens on both pair sides when a row exceeds `max_seq`. This preserves late user instructions, compiler feedback, function endings, and closing braces.
 
 Fresh streaming pipeline runs save the encoder vocab immediately after BPE finishes and then keep training. Resume runs keep using checkpoint-matched vocabs to avoid accidentally pairing old weights with a new vocab.
 
@@ -273,7 +314,7 @@ cargo run --release -- --train-high-world runs/world/manual_run/model.encoder.sa
 ```
 
 ```bash
-cargo run --release -- --train-decoder runs/latent/manual_run/model.safetensors runs/latent/manual_run/model.vocab.txt runs/world/manual_run/model.safetensors data/code_poc_mix.txt 40000 4 128 640 7 8 640 64 --decoder-kind code --decoder-output runs/decoder/manual_run/model.safetensors --grad-accum 6 --resume
+cargo run --release -- --train-decoder runs/latent/manual_run/model.safetensors runs/latent/manual_run/model.vocab.txt runs/world/manual_run/model.safetensors data/code_poc_mix.txt 40000 4 192 640 7 8 640 64 --decoder-kind code --decoder-max-vocab 24000 --decoder-output runs/decoder/manual_run/model.safetensors --grad-accum 6 --resume
 ```
 
 Resume files are saved next to the target model path:
@@ -360,11 +401,13 @@ Decoder training uses both sides of the pair in teacher forcing:
 - `input = left + shifted(right)`
 - `target = shifted(left) + right`
 
-So if decoder `max_seq = 160`, that means:
+So if decoder `max_seq = 192`, that means:
 
-- up to `160` tokens from the left side
-- up to `160` tokens from the right side
-- effectively up to `320` autoregressive positions in the decoder loss
+- up to `192` tokens from the left side
+- up to `192` tokens from the right side
+- effectively up to `384` autoregressive positions in the decoder loss
+
+Decoder and world training keep the tail of overlong pair sides, so target endings are supervised instead of only the beginning of a long completion.
 
 ### Practical rule of thumb
 
@@ -473,7 +516,7 @@ Default code dataset is the multilingual preset from `--prepare-github-top-code`
 The code decoder uses a stronger code path: pair files are now single-line escaped rows, code formatting is restored before tokenization, identifiers are split on `_`, camelCase, and digit boundaries, literals are normalized, language/context tags are added, and uncovered pieces fall back to reserved UTF-8 byte tokens instead of becoming pure `<unk>`.
 
 ```bash
-cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 160 --decoder-kind code --decoder-max-vocab 16000 --decoder-output local_models/code_decoder_90M.safetensors
+cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 192 --decoder-kind code --decoder-max-vocab 24000 --decoder-output local_models/code_decoder_90M.safetensors
 ```
 
 Artifacts:
@@ -486,19 +529,22 @@ For the current Go-focused code-first POC, use Go-only code data plus instructio
 ```bash
 cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
 cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
+cargo run --release -- --prepare-go-algorithm-tasks --output data/go_algorithm_pairs.txt
+cargo run --release -- --prepare-go-semantics-tasks --output data/go_semantic_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt --max-rows 20000
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_algorithm_pairs.txt --extra-pairs data/go_repair_pairs.txt --extra-repeat 8
 ```
 
-Then train the base code decoder on `data/code_poc_mix.txt`. The canonical pipeline follows that with an additional Go execution-feedback pass on `data/code_poc_go_mix.txt`. Repair rows include compiler feedback and tool-like tags such as `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>`; these tags still collapse to the existing `code` router label so old three-action checkpoints remain compatible.
+Then train the base code decoder on `data/code_poc_mix.txt`. The canonical pipeline follows that with an additional Go execution-feedback pass on `data/code_poc_go_mix.txt`. Repair rows use a simple code-repair prompt with the original request, previous attempt, compiler feedback, and code-only constraints.
 
 For the second Go execution-feedback pass, build `data/code_poc_go_mix.txt`:
 
 ```bash
 cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
 cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
+cargo run --release -- --prepare-go-algorithm-tasks --output data/go_algorithm_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt --max-rows 20000
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_algorithm_pairs.txt --extra-pairs data/go_repair_pairs.txt --extra-repeat 12
 ```
 
 Go repair generation uses `go test -c` on corrupted known-good answers, keeping short compiler diagnostics as the repair signal while still giving static type errors and executable unit-test feedback.
@@ -521,8 +567,9 @@ Generate Go execution-feedback data manually:
 ```bash
 cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
 cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 4 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
+cargo run --release -- --prepare-go-algorithm-tasks --output data/go_algorithm_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt --max-rows 20000
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_go_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_algorithm_pairs.txt --extra-pairs data/go_repair_pairs.txt --extra-repeat 12
 ```
 
 Train a separate Go-feedback decoder from an existing run:
@@ -540,7 +587,7 @@ cargo run --release -- --train-decoder \
   --decoder-output runs/${RUN_ID}/decoder_code_go/model.safetensors \
   --decoder-max-vocab 32000 \
   --grad-accum 1 \
-  --conditioning-loss-weight 0.0 \
+  --conditioning-loss-weight 0.20 \
   --init-decoder runs/${RUN_ID}/decoder_code/model.safetensors
 ```
 
@@ -633,9 +680,10 @@ Optional Candle decoder inference tuning:
 - `JEPA_CANDLE_DECODER_CTX=<tokens>` limits the prompt tokens kept by the Candle decoder runtime before generation
 - `TOFY_DECODER_CONDITION_BUDGET=<slots>` or `JEPA_DECODER_CONDITION_BUDGET=<slots>` caps context-conditioning slots before the decoder conditioning adapter; `0` zeros conditioning for ablation
 - `TOFY_DECODER_CROSS_ATTN_SCHEDULE=all|every-2nd|every-3rd|last-only` controls which decoder layers use context/state cross-attention
-- `TOFY_DECODER_RLM=1` enables the decoder-level recursive scaffold: keep the full prompt as external RLM state, execute a command program over semantic work units, call `SUB_RLM` recursively for bounded snippets, and reuse the selected decoder backend for leaf calls
+- `TOFY_DECODER_RLM=1` enables the decoder-level recursive scaffold for prompts that meet `TOFY_DECODER_RLM_MIN_CHARS`: keep the full prompt as external RLM state, execute a command program over semantic work units, call `SUB_RLM` recursively for bounded snippets, and reuse the selected decoder backend for leaf calls
 - `TOFY_DECODER_RLM=0` disables the recursive wrapper and uses one-shot decoder calls
 - `TOFY_DECODER_RLM_ACTIONS=<csv>` selects wrapped actions, default `code,text,text_reply`
+- `TOFY_DECODER_RLM_MIN_CHARS=<chars>` is the prompt length threshold for recursive decoding, default `3600`
 - `TOFY_DECODER_RLM_LEAF_TOKENS=<tokens>` sets the per-work-unit generation budget, default `256`
 - `TOFY_DECODER_RLM_CHUNK_CHARS=<chars>` sets semantic work-unit size, default `2400`
 - `TOFY_DECODER_RLM_MAX_UNITS=<n>` caps generated work units, default `8`

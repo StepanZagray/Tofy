@@ -7,10 +7,7 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 use rand::RngExt;
 
-use crate::model::attention::{
-    positional_encoding, positional_encoding_from, AttentionKvCache, CrossAttention,
-    MultiHeadAttention,
-};
+use crate::model::attention::{AttentionKvCache, CrossAttention, MultiHeadAttention};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecoderArchitecture {
@@ -67,32 +64,52 @@ impl DecoderKind {
     }
 
     fn local_window(self) -> usize {
-        match self {
-            Self::TextGeneralist => 96,
-            Self::CodeSpecialist => 192,
-        }
+        decoder_env_usize(
+            "TOFY_DECODER_LOCAL_WINDOW",
+            match self {
+                Self::TextGeneralist => 96,
+                Self::CodeSpecialist => 192,
+            },
+        )
     }
 
     fn anchor_period(self) -> usize {
-        match self {
-            Self::TextGeneralist => 4,
-            Self::CodeSpecialist => 3,
-        }
+        decoder_env_usize(
+            "TOFY_DECODER_ANCHOR_PERIOD",
+            match self {
+                Self::TextGeneralist => 4,
+                Self::CodeSpecialist => 3,
+            },
+        )
     }
 
     fn csa_compress_rate(self) -> usize {
-        match self {
-            Self::TextGeneralist => 4,
-            Self::CodeSpecialist => 4,
-        }
+        decoder_env_usize(
+            "TOFY_DECODER_CSA_COMPRESS_RATE",
+            match self {
+                Self::TextGeneralist => 4,
+                Self::CodeSpecialist => 4,
+            },
+        )
     }
 
     fn hca_compress_rate(self) -> usize {
-        match self {
-            Self::TextGeneralist => 64,
-            Self::CodeSpecialist => 128,
-        }
+        decoder_env_usize(
+            "TOFY_DECODER_HCA_COMPRESS_RATE",
+            match self {
+                Self::TextGeneralist => 64,
+                Self::CodeSpecialist => 128,
+            },
+        )
     }
+}
+
+fn decoder_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,11 +162,12 @@ fn decoder_latent_prefix_enabled() -> bool {
 struct CodeDecoderBlock {
     self_attn: MultiHeadAttention,
     cross_attn: CrossAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ln3: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
+    ln1: nn::RmsNorm,
+    ln2: nn::RmsNorm,
+    ln3: nn::RmsNorm,
+    ff_gate: nn::Linear,
+    ff_up: nn::Linear,
+    ff_down: nn::Linear,
     cross_gate: nn::Linear,
     adapter_down: nn::Linear,
     adapter_up: nn::Linear,
@@ -162,7 +180,6 @@ pub struct DecoderGenerationState {
     pub(crate) cross_kv_caches: Vec<AttentionKvCache>,
     pub(crate) domain_state: Tensor,
     pub(crate) structure_state: Tensor,
-    pub(crate) prefix_len: usize,
     pub(crate) last_logits: Option<Tensor>,
 }
 
@@ -174,13 +191,14 @@ impl CodeDecoderBlock {
         num_heads: usize,
         ff_dim: usize,
     ) -> Result<Self> {
-        let self_attn = MultiHeadAttention::new(vb.pp("self_attn"), dim, num_heads)?;
+        let self_attn = MultiHeadAttention::new_with_rope(vb.pp("self_attn"), dim, num_heads)?;
         let cross_attn = CrossAttention::new(vb.pp("cross_attn"), dim, world_dim, num_heads)?;
-        let ln1 = nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?;
-        let ln3 = nn::layer_norm(dim, 1e-5, vb.pp("ln3"))?;
-        let ff1 = nn::linear(dim, ff_dim, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_dim, dim, vb.pp("ff2"))?;
+        let ln1 = nn::rms_norm(dim, 1e-5, vb.pp("ln1"))?;
+        let ln2 = nn::rms_norm(dim, 1e-5, vb.pp("ln2"))?;
+        let ln3 = nn::rms_norm(dim, 1e-5, vb.pp("ln3"))?;
+        let ff_gate = nn::linear(dim, ff_dim, vb.pp("ff_gate"))?;
+        let ff_up = nn::linear(dim, ff_dim, vb.pp("ff_up"))?;
+        let ff_down = nn::linear(ff_dim, dim, vb.pp("ff_down"))?;
         let cross_gate = nn::linear(dim, dim, vb.pp("cross_gate"))?;
         let adapter_rank = (dim / 4).max(64);
         let adapter_down = nn::linear(dim, adapter_rank, vb.pp("adapter_down"))?;
@@ -191,8 +209,9 @@ impl CodeDecoderBlock {
             ln1,
             ln2,
             ln3,
-            ff1,
-            ff2,
+            ff_gate,
+            ff_up,
+            ff_down,
             cross_gate,
             adapter_down,
             adapter_up,
@@ -248,12 +267,13 @@ impl CodeDecoderBlock {
         };
 
         let normed = self.ln3.forward(&x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let ff_gate = self.ff_gate.forward(&normed)?.silu()?;
+        let ff_up = self.ff_up.forward(&normed)?;
+        let ff_out = self.ff_down.forward(&ff_gate.broadcast_mul(&ff_up)?)?;
         let adapter_in = normed.broadcast_add(domain_state)?;
         let adapter = self
             .adapter_up
-            .forward(&self.adapter_down.forward(&adapter_in)?.gelu()?)?;
+            .forward(&self.adapter_down.forward(&adapter_in)?.silu()?)?;
         let ff_out = ff_out.broadcast_add(&adapter.affine(0.5, 0.0)?)?;
         Ok((x + ff_out)?)
     }
@@ -323,12 +343,13 @@ impl CodeDecoderBlock {
         };
 
         let normed = self.ln3.forward(&x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let ff_gate = self.ff_gate.forward(&normed)?.silu()?;
+        let ff_up = self.ff_up.forward(&normed)?;
+        let ff_out = self.ff_down.forward(&ff_gate.broadcast_mul(&ff_up)?)?;
         let adapter_in = normed.broadcast_add(domain_state)?;
         let adapter = self
             .adapter_up
-            .forward(&self.adapter_down.forward(&adapter_in)?.gelu()?)?;
+            .forward(&self.adapter_down.forward(&adapter_in)?.silu()?)?;
         let ff_out = ff_out.broadcast_add(&adapter.affine(0.5, 0.0)?)?;
         Ok(((x + ff_out)?, self_kv_cache))
     }
@@ -390,12 +411,13 @@ impl CodeDecoderBlock {
         };
 
         let normed = self.ln3.forward(&x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let ff_gate = self.ff_gate.forward(&normed)?.silu()?;
+        let ff_up = self.ff_up.forward(&normed)?;
+        let ff_out = self.ff_down.forward(&ff_gate.broadcast_mul(&ff_up)?)?;
         let adapter_in = normed.broadcast_add(domain_state)?;
         let adapter = self
             .adapter_up
-            .forward(&self.adapter_down.forward(&adapter_in)?.gelu()?)?;
+            .forward(&self.adapter_down.forward(&adapter_in)?.silu()?)?;
         let ff_out = ff_out.broadcast_add(&adapter.affine(0.5, 0.0)?)?;
         Ok(((x + ff_out)?, next_self_kv_cache))
     }
@@ -417,9 +439,9 @@ pub struct CodeDecoder {
     kind_embed: nn::Embedding,
     structure_proj: nn::Linear,
     blocks: Vec<CodeDecoderBlock>,
-    ln_final: nn::LayerNorm,
-    lm_head: nn::Linear,
+    ln_final: nn::RmsNorm,
     dim: usize,
+    vocab_size: usize,
     kind: DecoderKind,
 }
 
@@ -449,16 +471,15 @@ impl CodeDecoder {
             )?;
             blocks.push(block);
         }
-        let ln_final = nn::layer_norm(dim, 1e-5, vb.pp("ln_final"))?;
-        let lm_head = nn::linear(dim, vocab_size, vb.pp("lm_head"))?;
+        let ln_final = nn::rms_norm(dim, 1e-5, vb.pp("ln_final"))?;
         Ok(Self {
             embed,
             kind_embed,
             structure_proj,
             blocks,
             ln_final,
-            lm_head,
             dim,
+            vocab_size,
             kind,
         })
     }
@@ -471,9 +492,6 @@ impl CodeDecoder {
         let prefix = self.latent_prefix(world_latent)?;
         let prefix_len = prefix.dim(1)?;
         let mut token_h = self.embed.forward(input_ids)?;
-        let token_pe =
-            positional_encoding_from(prefix_len, t, self.dim, device)?.to_dtype(token_h.dtype())?;
-        token_h = token_h.broadcast_add(&token_pe)?;
         let token_domain_state = self.domain_state(device, b, t)?;
         let token_structure_state = self.structure_state(world_latent, b, t)?;
         token_h = token_h.broadcast_add(&token_domain_state)?;
@@ -481,11 +499,7 @@ impl CodeDecoder {
 
         let mut h = if prefix_len > 0 {
             let prefix_domain_state = self.domain_state(device, b, prefix_len)?;
-            let prefix_pe =
-                positional_encoding(prefix_len, self.dim, device)?.to_dtype(prefix.dtype())?;
-            let prefix_h = prefix
-                .broadcast_add(&prefix_domain_state)?
-                .broadcast_add(&prefix_pe)?;
+            let prefix_h = prefix.broadcast_add(&prefix_domain_state)?;
             Tensor::cat(&[prefix_h, token_h], 1)?
         } else {
             token_h
@@ -509,9 +523,7 @@ impl CodeDecoder {
         }
         h = self.ln_final.forward(&h)?;
         let token_h = h.narrow(1, prefix_len, t)?;
-        self.lm_head
-            .forward(&token_h)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))
+        self.token_logits(&token_h)
     }
 
     fn latent_prefix(&self, world_latent: &Tensor) -> Result<Tensor> {
@@ -531,9 +543,12 @@ impl CodeDecoder {
     }
 
     fn token_logits(&self, h: &Tensor) -> Result<Tensor> {
-        self.lm_head
-            .forward(h)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))
+        let (batch, seq_len, _) = h.dims3()?;
+        let flat = h.reshape((batch * seq_len, self.dim))?;
+        let weights_t = self.embed.embeddings().t()?.contiguous()?;
+        flat.matmul(&weights_t)?
+            .reshape((batch, seq_len, self.vocab_size))
+            .map_err(Into::into)
     }
 
     fn domain_state(&self, device: &Device, batch: usize, seq_len: usize) -> Result<Tensor> {
@@ -572,14 +587,11 @@ impl CodeDecoder {
         &self,
         device: &Device,
         token_id: u32,
-        position: usize,
+        _position: usize,
         state: &mut DecoderGenerationState,
     ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), device)?;
         let mut h = self.embed.forward(&input)?;
-        let pe = positional_encoding_from(state.prefix_len + position, 1, self.dim, device)?
-            .to_dtype(h.dtype())?;
-        h = h.broadcast_add(&pe)?;
         h = h.broadcast_add(&state.domain_state)?;
         h = h.broadcast_add(&state.structure_state)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
@@ -616,7 +628,6 @@ impl CodeDecoder {
                 cross_kv_caches: self.precompute_cross_kv_caches(world_latent)?,
                 domain_state: self.domain_state(device, 1, 1)?,
                 structure_state: self.structure_state(world_latent, 1, 1)?,
-                prefix_len: 0,
                 last_logits: None,
             });
         }
@@ -625,9 +636,6 @@ impl CodeDecoder {
         let prefix_len = prefix.dim(1)?;
         let input = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_len), device)?;
         let mut token_h = self.embed.forward(&input)?;
-        let token_pe = positional_encoding_from(prefix_len, prompt_len, self.dim, device)?
-            .to_dtype(token_h.dtype())?;
-        token_h = token_h.broadcast_add(&token_pe)?;
         let token_domain_state = self.domain_state(device, 1, prompt_len)?;
         let token_structure_state = self.structure_state(world_latent, 1, prompt_len)?;
         token_h = token_h.broadcast_add(&token_domain_state)?;
@@ -635,11 +643,7 @@ impl CodeDecoder {
 
         let mut h = if prefix_len > 0 {
             let prefix_domain_state = self.domain_state(device, 1, prefix_len)?;
-            let prefix_pe =
-                positional_encoding(prefix_len, self.dim, device)?.to_dtype(prefix.dtype())?;
-            let prefix_h = prefix
-                .broadcast_add(&prefix_domain_state)?
-                .broadcast_add(&prefix_pe)?;
+            let prefix_h = prefix.broadcast_add(&prefix_domain_state)?;
             Tensor::cat(&[prefix_h, token_h], 1)?
         } else {
             token_h
@@ -676,7 +680,6 @@ impl CodeDecoder {
             cross_kv_caches,
             domain_state: self.domain_state(device, 1, 1)?,
             structure_state: self.structure_state(world_latent, 1, 1)?,
-            prefix_len,
             last_logits: Some(logits.narrow(1, prompt_len - 1, 1)?),
         })
     }

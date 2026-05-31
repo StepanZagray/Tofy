@@ -36,8 +36,12 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {program} train <8gb|48gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
+        "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
     );
+    eprintln!(
+        "      Go eval selection runs by default; --with-code-eval is accepted for old scripts."
+    );
+    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload]");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );
@@ -53,13 +57,16 @@ pub fn print_usage(program: &str) {
         "    {program} --prepare-ultrachat [output_path] [context_window] [min_tokens] [max_rows]"
     );
     eprintln!(
-        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-repair-tasks|--prepare-world-mix|--prepare-code-poc-mix ..."
+        "    {program} --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] ..."
+    );
+    eprintln!(
+        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-algorithm-tasks|--prepare-go-semantics-tasks|--prepare-go-repair-tasks|--prepare-world-mix|--prepare-code-poc-mix ..."
     );
     eprintln!(
         "    {program} --prepare-expert-pairs|--prepare-casual-conversation|--generate-code-eval-suite|--convert-jsonl-context-response-to-tsv ..."
     );
     eprintln!(
-        "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile 48gb] ..."
+        "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile 48gb|80gb] ..."
     );
     eprintln!(
         "    {program} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--grad-accum <int>] [--output <path>] [--resume]"

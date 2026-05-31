@@ -55,6 +55,27 @@ impl Default for Vocab {
 }
 
 impl Vocab {
+    const BYTE_TOKEN_PREFIX: &'static str = "<byte:";
+
+    fn byte_token(byte: u8) -> String {
+        format!("<byte:{byte:02X}>")
+    }
+
+    fn parse_byte_token(token: &str) -> Option<u8> {
+        let hex = token
+            .strip_prefix(Self::BYTE_TOKEN_PREFIX)?
+            .strip_suffix('>')?;
+        (hex.len() == 2)
+            .then_some(hex)
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+    }
+
+    pub fn ensure_byte_tokens(&mut self) {
+        for byte in u8::MIN..=u8::MAX {
+            self.add_token(&Self::byte_token(byte));
+        }
+    }
+
     fn push_token(
         token_to_id: &mut HashMap<String, u32>,
         id_to_token: &mut Vec<String>,
@@ -102,13 +123,29 @@ impl Vocab {
     }
 
     pub fn encode_boundless(&self, text: &str) -> Vec<u32> {
-        let mut ids = text
-            .chars()
-            .map(|ch| {
-                let token = ch.to_string();
-                *self.token_to_id.get(&token).unwrap_or(&self.unk_id)
-            })
-            .collect::<Vec<_>>();
+        let mut ids = Vec::new();
+        for ch in text.chars() {
+            let token = ch.to_string();
+            if let Some(&id) = self.token_to_id.get(&token) {
+                ids.push(id);
+            } else {
+                let mut fallback_ids = Vec::new();
+                let mut buf = [0u8; 4];
+                for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                    if let Some(&id) = self.token_to_id.get(&Self::byte_token(*byte)) {
+                        fallback_ids.push(id);
+                    } else {
+                        fallback_ids.clear();
+                        break;
+                    }
+                }
+                if fallback_ids.is_empty() {
+                    ids.push(self.unk_id);
+                } else {
+                    ids.extend(fallback_ids);
+                }
+            }
+        }
         if ids.is_empty() {
             return ids;
         }
@@ -132,15 +169,29 @@ impl Vocab {
     }
 
     pub fn decode_ids_lossy(&self, ids: &[u32]) -> String {
-        ids.iter()
-            .filter_map(|&id| {
-                if id == self.pad_id || id == self.mask_id {
-                    None
-                } else {
-                    self.id_to_token.get(id as usize).cloned()
-                }
-            })
-            .collect::<String>()
+        let mut out = String::new();
+        let mut bytes = Vec::new();
+        for &id in ids {
+            if id == self.pad_id || id == self.mask_id {
+                continue;
+            }
+            let Some(token) = self.id_to_token.get(id as usize) else {
+                continue;
+            };
+            if let Some(byte) = Self::parse_byte_token(token) {
+                bytes.push(byte);
+                continue;
+            }
+            if !bytes.is_empty() {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+                bytes.clear();
+            }
+            out.push_str(token);
+        }
+        if !bytes.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        out
     }
 }
 
@@ -216,4 +267,21 @@ pub fn save_vocab_to_file(vocab: &Vocab, vocab_path: impl AsRef<Path>) -> Result
     };
     fs::write(path, serde_json::to_string_pretty(&serialized)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vocab;
+
+    #[test]
+    fn byte_fallback_round_trips_unseen_unicode() {
+        let mut vocab = Vocab::new();
+        vocab.ensure_byte_tokens();
+        vocab.add_token("a");
+
+        let ids = vocab.encode_boundless("a🦀");
+
+        assert!(!ids.contains(&vocab.unk_id));
+        assert_eq!(vocab.decode_ids_lossy(&ids), "a🦀");
+    }
 }

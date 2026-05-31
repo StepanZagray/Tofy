@@ -33,7 +33,7 @@ The repository now mirrors that split more directly in Rust:
 - `src/config/latent.rs`: latent train/eval config parsing
 - `src/config/world.rs`: world/action classifier/decoder/eval/serve config parsing
 - `src/tasks/latent.rs`: latent training and JEPA evaluation
-- `src/tasks/pipeline.rs`: canonical `train 8gb|48gb` full pipeline (prep -> encoder -> world -> high-world -> code decoder; optional eval)
+- `src/tasks/pipeline.rs`: canonical `train 8gb|48gb|80gb` full pipeline (prep -> encoder -> world -> high-world -> code decoder -> Go eval selection)
 - `src/tasks/world.rs`: world/high-world/action classifier/decoder training and runtime engine
 - `src/tasks/world_support.rs`: shared world/decoder metrics, masking, and evaluation helpers
 
@@ -87,11 +87,11 @@ cargo run --release -- train 8gb
 cargo run --release -- train 48gb
 ```
 
-By default, `train` only trains the pipeline modules. Add `--with-code-eval` to
-run verifier-guided decoder selection and the hard Go code-test eval suite:
+By default, `train` runs verifier-guided decoder selection and the hard Go
+code-test eval suite after decoder training:
 
 ```bash
-cargo run --release -- train 8gb --with-code-eval
+cargo run --release -- train 8gb
 ```
 
 Resume an existing run:
@@ -114,9 +114,9 @@ generalist:
 
 - base code data defaults to Go code pairs
 - `--prepare-go-function-tasks` derives synthetic instruction -> function pairs from the Go code corpus
-- `--prepare-code-poc-mix` oversamples those instruction-shaped rows before code-decoder training
+- `--prepare-code-poc-mix` oversamples instruction, semantic, repair, FIM, and EOS-terminated rows before code-decoder training
 - the second decoder stage trains on `data/code_poc_go_mix.txt`, built from Go code, Go instruction pairs, and Go compiler-feedback repair rows
-- `--with-code-eval` defaults to `eval/code_assistant_go_hard.jsonl`
+- the canonical eval suite is `eval/code_assistant_go_hard.jsonl`
 
 Default behavior:
 
@@ -132,23 +132,26 @@ Default behavior:
 - training now streams cached token batches from disk instead of retokenizing raw text in the hot loop
 - pipeline locations are configurable with `TOFY_RUNS_DIR`, `TOFY_CACHE_DIR`, `TOFY_VOCAB_DIR`, `TOFY_HUB_CACHE_DIR`, and `TOFY_SERVE_BIND`; `TOFY_DATA_DIR` also redirects default hub cache files to `$TOFY_DATA_DIR/hub`
 - cache preparation overlaps independent CPU jobs and encodes cache misses with Rayon; set `RAYON_NUM_THREADS=N` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=N` to tune Stage 1 text chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=N` to tune token-cache build chunks, or `TOFY_VOCAB_SCAN_CHUNK_LINES=N` to tune vocab sampling chunks
+- `cargo run --release -- prepare cache <8gb|48gb|80gb>` runs Stage 1 only, so you can prepare source data, mixes, eval data, vocabs, and token caches locally before copying `data/`, `eval/`, and `local_models/vocabs/` to a pod; add `--auto-hf-upload` to archive those handoff directories and upload them to the Hugging Face cache dataset with the `hf` CLI
 - raw and cached training streams prefetch ordered chunks by default; set `TOFY_CACHE_PREFETCH_BATCHES=0` to disable, `TOFY_CACHE_PREFETCH_BATCHES=N` to tune queue depth, `TOFY_CACHE_PREFETCH_CHUNK=N` to force chunk size, or `TOFY_TOKEN_CACHE_READER_MB=N` to tune the cache reader buffer
 - world/action classifier/decoder context encoding batches token segments on GPU; set `TOFY_CONTEXT_SEGMENT_BATCH=N` to tune the segment micro-batch size, default `64`
-- the canonical training entrypoint is `cargo run --release -- train <8gb|48gb>`:
-  - encoder/world keep `256` context
-  - encoder defaults to `16x16` (`256` effective) after a `16x1` warmup
+- token caches and decoder/world batches keep the tail of overlong pair sides so late instructions, compiler feedback, and completion endings are retained
+- the canonical training entrypoint is `cargo run --release -- train <8gb|48gb|80gb>`:
+  - encoder/world keep `256` per-segment context
+  - encoder defaults to `16x4` (`64` rows with segmented context) after a `16x1` warmup
   - world defaults to `32x8` (`256` effective) after a `32x1` warmup
-  - high-world planning is trained by default for `12000` steps and loaded automatically from the run directory
-  - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=160`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
-  - code eval/model code tests are skipped unless `--with-code-eval` is passed
+  - high-world planning is trained by default from the selected profile (`12000` steps for `8gb`/`48gb`, `18000` for `80gb`) and loaded automatically from the run directory
+  - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
+  - Go compile/test eval runs by default for verifier-guided base vs Go-feedback decoder promotion
+  - code eval defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline
 - the 48 GB A40 profile is available through `cargo run --release -- train 48gb`:
   - uses shared `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`, `HEADS=16`
   - uses `MAX_VOCAB=16000`, `CODE_DECODER_MAX_VOCAB=32000`, `NUM_LATENT_TOKENS=96`
   - encoder uses `48x11` (`528` effective) after a `32x1` warmup
   - world uses a frozen encoder with `128x4` (`512` effective) after a `64x1` warmup
-  - code decoder uses `128x2` (`256` effective); Go feedback uses `256x1` (`256` effective) with `CODE_DECODER_MAX_SEQ=192`, decoder width `768`, and FF width `3072`
-  - runs recorded-checkpoint-scaled budgets by default: latent `4000`, world `10000`, high-world `2000`, code decoder `12000`, Go feedback `3000`
+  - code decoder and Go feedback use `32x8` (`256` effective) with `CODE_DECODER_MAX_SEQ=256`, decoder width `768`, and FF width `3072`
+  - runs long code-quality budgets by default: latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, Go feedback `20000`
 - on CUDA, the pipeline auto-exports `CUDA_COMPUTE_CAP` if you did not already set it
 
 ```bash
@@ -208,7 +211,7 @@ cargo run --release -- --train-decoder local_models/model_latent_<size>.safetens
 Train code decoder:
 
 ```bash
-cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 160 --decoder-kind code --decoder-max-vocab 16000 --decoder-output local_models/code_decoder_90M.safetensors
+cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 192 --decoder-kind code --decoder-max-vocab 24000 --decoder-output local_models/code_decoder_90M.safetensors
 ```
 
 Run the code-assistant eval suite:
@@ -235,7 +238,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 
 | Mode | Output |
 |------|--------|
-| `train` | full pipeline for memory profile `8gb` or `48gb`: prep -> encoder -> world -> high-world -> code decoder -> Go feedback decoder; add `--with-code-eval` for hard Go eval (`src/tasks/pipeline.rs`) |
+| `train` | full pipeline for memory profile `8gb`, `48gb`, or `80gb`: prep -> encoder -> world -> high-world -> code decoder -> Go feedback decoder -> hard Go eval selection (`src/tasks/pipeline.rs`) |
 | `--latent` | encoder checkpoint + encoder vocab |
 | `--eval-jepa` | encoder metrics |
 | `--train-world` | pure latent world-model checkpoint |
@@ -260,7 +263,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 - CUDA is enabled by default
 - CPU-only: `cargo run --release --no-default-features -- ...`
 - training logs go to per-run directories under `runs/`
-- the canonical pipeline groups runs as `runs/code_poc_<timestamp>/{latent,world,high_world,decoder_code,decoder_code_go_feedback}` and uses `code_eval` when `--with-code-eval` is passed
+- the canonical pipeline groups runs as `runs/code_poc_<timestamp>/{latent,world,high_world,decoder_code,decoder_code_go_feedback}` and writes Go eval artifacts under `code_eval*`
 - each training run also records GPU memory telemetry under `memory/*` in TensorBoard and `memory_summary.txt` in the run directory
 - latent, world, and decoder training now support `--grad-accum <int>` so you can trade wall-clock time for larger effective batch / context on small GPUs
 - the canonical pipeline fixes training dtype and microbatch schedules through the selected memory profile
@@ -292,7 +295,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 	- context/state training and serving now also support recurrent latent folding across segments:
 	  - `TOFY_WORLD_CONTEXT_SEGMENTS=<int>` sets how many state segments are folded for world/decoder training
 	  - `TOFY_WORLD_RECENT_FULL_SEGMENTS=<int>` sets how many newest world segments keep full token-level memory, default `1`
-	  - the canonical pipeline uses recursive context-slot folding across segments
+	  - the canonical pipeline uses hybrid context memory across segments by default; recursive context-slot folding is available with `TOFY_RECURSIVE_CONTEXT_COMPRESSION=1`
 	  - `TOFY_WORLD_POST_STATE_LOSS_WEIGHT=<float>` and `TOFY_WORLD_ROLLOUT_LOSS_WEIGHT=<float>` add post-turn and chained rollout targets to world training
 	  - `TOFY_WORLD_TRAIN_ROLLOUT_STEPS=<int>` controls world-training rollout depth and decoder-training transition rollouts
 	  - `TOFY_WORLD_ROLLOUT_STEPS=<int>` controls serve/eval transition rollouts before decoder conditioning
@@ -301,6 +304,6 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 	  - `TOFY_LATENT_REASONING_STEPS=<int>` caps refinement depth, default `8` for code-like requests and `3` for text
 	  - `TOFY_LATENT_REASONING_ALPHA=<float>` blends recurrent proposals with the selected next-action latent anchor, default `0.35`
 	- the code-first POC decoder path now uses Go-only code pairs plus oversampled synthetic Go instruction/function tasks and a Go execution-feedback decoder stage because the default hard eval suite measures fast compile/test repair behavior in Go
-- the code-first pipeline now adds compiler-feedback Go repair pairs when `go` is available; repair prompts use tool/context tags like `<action:repair_patch>`, `<tool:read_error>`, and `<ctx:compiler_feedback>` while remaining compatible with the existing three-action router
+- the code-first pipeline now adds compiler-feedback Go repair pairs when `go` is available; repair prompts are plain code-fix instructions with the original request, previous attempt, compiler feedback, and code-only constraints
 - encoder TensorBoard now includes `loss/pred_token`, `loss/pred_chunk`, `loss/pred_global`, `metrics/chunk_cosine`, and `metrics/global_cosine`
 - view metrics with `tensorboard --logdir runs/`

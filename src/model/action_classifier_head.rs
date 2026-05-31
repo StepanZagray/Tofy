@@ -1,7 +1,7 @@
-//! Orchestrator action head: predicts whether the current reply should use text, code, docs, or stop.
+//! Orchestrator action head: predicts whether the current reply should use text, code, legacy docs, or stop.
 //!
 //! Input: planner-state slots. Output: logits over supported actions
-//! (`TextReply`, `Code`, `Done`, `FetchDocs`).
+//! (`TextReply`, `Code`, `Done`, legacy `FetchDocs`).
 //! Trained jointly with the dialog-transition model and used at inference to choose which decoder to run.
 
 use anyhow::Result;

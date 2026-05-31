@@ -14,7 +14,6 @@ use crate::model::{
 };
 use crate::tasks::world::{
     context_slots_from_token_sequences, decoder_tokenization_mode, env_bool, env_usize,
-    rollout_transition_slots,
 };
 use crate::util;
 
@@ -407,29 +406,33 @@ fn is_syntax_token(token: &str) -> bool {
             | ";"
             | ","
             | ":"
-            | "::"
-            | "=>"
-            | "->"
             | "="
             | "=="
             | "<nl>"
             | "<indent_tab>"
-            | "fn"
-            | "pub"
-            | "impl"
+            | "func"
+            | "package"
+            | "import"
             | "struct"
-            | "enum"
-            | "match"
             | "return"
-            | "let"
-            | "use"
+            | "type"
+            | "var"
+            | "const"
+            | "if"
+            | "else"
+            | "for"
+            | "range"
+            | "switch"
+            | "case"
+            | "default"
+            | "map"
     )
 }
 
 fn syntax_weight_for_token(token: &str) -> f32 {
     if matches!(
         token,
-        "{" | "}" | "(" | ")" | "[" | "]" | ";" | "fn" | "pub" | "impl" | "struct" | "enum"
+        "{" | "}" | "(" | ")" | "[" | "]" | ";" | "func" | "struct" | "type"
     ) {
         2.0
     } else if is_syntax_token(token) {
@@ -442,43 +445,38 @@ fn syntax_weight_for_token(token: &str) -> f32 {
 fn is_type_like_token(token: &str) -> bool {
     matches!(
         token,
-        "Result"
-            | "Option"
-            | "Some"
-            | "None"
-            | "Ok"
-            | "Err"
-            | "Vec"
-            | "String"
+        "string"
             | "bool"
-            | "str"
-            | "Self"
-            | "usize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "f32"
-            | "f64"
+            | "byte"
+            | "rune"
+            | "error"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
     )
 }
 
 fn importance_weight_for_token(token: &str) -> f32 {
     if matches!(
         token,
-        "fn" | "pub" | "->" | ":" | "(" | ")" | "{" | "}" | "," | "::"
+        "func" | "type" | "struct" | ":" | "(" | ")" | "{" | "}" | "," | ":="
     ) {
         2.4
     } else if is_type_like_token(token) {
         2.0
     } else if is_syntax_token(token) {
         1.6
-    } else if is_identifier_token(token) {
-        0.35
     } else {
         1.0
     }
@@ -512,33 +510,50 @@ pub(crate) fn syntax_weight_mask(
 }
 
 fn signature_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize> {
-    let mut start = None;
-    let mut end = None;
-    for (idx, (&id, &m)) in ids.iter().zip(mask.iter()).enumerate() {
-        if m <= 0.0 {
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+    while idx < ids.len().min(mask.len()) {
+        if mask[idx] <= 0.0 {
+            idx += 1;
             continue;
         }
         let token = vocab
             .id_to_token
-            .get(id as usize)
+            .get(ids[idx] as usize)
             .map(|s| s.as_str())
             .unwrap_or("<unk>");
-        if start.is_none() && (token == "pub" || token == "fn") {
-            start = Some(idx);
+        if !matches!(token, "func" | "type") {
+            idx += 1;
+            continue;
         }
-        if start.is_some() && token == "{" {
-            end = Some(idx);
-            break;
+        let start = idx;
+        let go_type_decl = token == "type";
+        let mut end = None;
+        idx += 1;
+        while idx < ids.len().min(mask.len()) {
+            let inner = vocab
+                .id_to_token
+                .get(ids[idx] as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("<unk>");
+            if mask[idx] > 0.0
+                && ((!go_type_decl && inner == "{") || (go_type_decl && inner == "}"))
+            {
+                end = Some(idx);
+                idx += 1;
+                break;
+            }
+            idx += 1;
+        }
+        if let Some(end) = end {
+            spans.extend(start..=end);
         }
     }
-    match (start, end) {
-        (Some(s), Some(e)) if e >= s => (s..=e).collect(),
-        _ => Vec::new(),
-    }
+    spans
 }
 
 fn function_name_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize> {
-    let mut seen_fn = false;
+    let mut seen_func = false;
     let mut positions = Vec::new();
     for (idx, (&id, &m)) in ids.iter().zip(mask.iter()).enumerate() {
         if m <= 0.0 {
@@ -549,16 +564,16 @@ fn function_name_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<u
             .get(id as usize)
             .map(|s| s.as_str())
             .unwrap_or("<unk>");
-        if !seen_fn {
-            if token == "fn" {
-                seen_fn = true;
+        if !seen_func {
+            if token == "func" {
+                seen_func = true;
             }
             continue;
         }
         if token == "(" {
             break;
         }
-        if token == "<nl>" || token == "pub" {
+        if token == "<nl>" {
             continue;
         }
         positions.push(idx);
@@ -688,13 +703,13 @@ pub(crate) fn importance_weight_mask(
     util::from_vec_like(weights, (target.elem_count(),), mask)
 }
 
-fn rust_function_skeleton_for_tokens(tokens: &[String]) -> bool {
-    let has_fn = tokens.iter().any(|token| token == "fn");
+fn go_function_skeleton_for_tokens(tokens: &[String]) -> bool {
+    let has_func = tokens.iter().any(|token| token == "func");
     let has_parens =
         tokens.iter().any(|token| token == "(") && tokens.iter().any(|token| token == ")");
     let has_body =
         tokens.iter().any(|token| token == "{") && tokens.iter().any(|token| token == "}");
-    has_fn && has_parens && has_body && delimiter_balance_for_tokens(tokens)
+    has_func && has_parens && has_body && delimiter_balance_for_tokens(tokens)
 }
 
 pub(crate) fn decoder_prediction_metrics(
@@ -781,7 +796,7 @@ pub(crate) fn decoder_prediction_metrics(
         if delimiter_balance_for_tokens(&active_pred_tokens) {
             balanced += 1;
         }
-        if rust_function_skeleton_for_tokens(&active_pred_tokens) {
+        if go_function_skeleton_for_tokens(&active_pred_tokens) {
             function_skeletons += 1;
         }
         if row_signature_ok {
@@ -824,10 +839,9 @@ pub(crate) fn evaluate_world_encoded_batch(
 ) -> Result<WorldBatchMetrics> {
     let sigreg_slices = env_usize("TOFY_SIGREG_SLICES", 1024);
     let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
-    let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
+    let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_context_compressor =
-        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
+    let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let action_labels = batch.iter().map(|row| row.action_label).collect::<Vec<_>>();
     let (state_slots, next_slots) = crate::tasks::world::context_slots_from_world_pair_sequences(
         encoder,
@@ -993,10 +1007,9 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
-    let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 1);
+    let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
-    let recursive_context_compressor =
-        env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", context_segments > 1);
+    let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
     let compute_conditioning_metrics =
         conditioning_loss_weight > 0.0 || env_bool("TOFY_DECODER_ABLATION_METRICS", false);
@@ -1015,19 +1028,22 @@ pub(crate) fn evaluate_decoder_encoded_batch(
         recursive_context_compressor,
         device,
     )?;
-    let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
-    let next_context_slots = if rollout_steps <= 1 {
-        transition.forward(&state_slots, &decoder_action_labels)?
-    } else {
-        rollout_transition_slots(
-            transition,
-            &state_slots,
-            decoder_action_label,
-            rollout_steps,
-        )?
-    };
+    let _ = decoder_action_label;
+    let decoder_action_labels = encoder_batch
+        .iter()
+        .map(|row| row.action_label)
+        .collect::<Vec<_>>();
+    let steps = rollout_steps.max(1);
+    let mut next_context_slots = state_slots;
+    for _ in 0..steps {
+        next_context_slots = transition.forward(&next_context_slots, &decoder_action_labels)?;
+    }
+    let adapter_action_labels = decoder_batch
+        .iter()
+        .map(|row| row.action_label)
+        .collect::<Vec<_>>();
     let world_latent = decoder_conditioning_adapter
-        .forward_with_action(&next_context_slots.detach(), decoder_action_label)?;
+        .forward_with_actions(&next_context_slots.detach(), &adapter_action_labels)?;
     let zero_world_latent = world_latent.affine(0.0, 0.0)?;
     let (dec_input, dec_target, loss_mask) =
         make_decoder_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
@@ -1135,6 +1151,42 @@ pub(crate) fn masked_cross_entropy(
     masked_weighted_cross_entropy(logits, target, mask)
 }
 
+pub(crate) fn multi_token_prediction_loss(
+    logits: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+    max_ahead: usize,
+) -> Result<Tensor> {
+    let (_, seq_len, _) = logits.dims3()?;
+    if max_ahead <= 1 || seq_len <= 1 {
+        return logits.sum_all()?.affine(0.0, 0.0).map_err(Into::into);
+    }
+    let mut loss_sum: Option<Tensor> = None;
+    let mut count = 0usize;
+    for ahead in 2..=max_ahead {
+        let shift = ahead - 1;
+        if seq_len <= shift {
+            break;
+        }
+        let len = seq_len - shift;
+        let shifted_logits = logits.narrow(1, 0, len)?;
+        let shifted_target = target.narrow(1, shift, len)?;
+        let shifted_mask = mask.narrow(1, shift, len)?;
+        let loss = masked_cross_entropy(&shifted_logits, &shifted_target, &shifted_mask)?;
+        loss_sum = Some(match loss_sum {
+            Some(existing) => existing.broadcast_add(&loss)?,
+            None => loss,
+        });
+        count += 1;
+    }
+    match loss_sum {
+        Some(loss) => loss
+            .affine(1.0 / count.max(1) as f64, 0.0)
+            .map_err(Into::into),
+        None => logits.sum_all()?.affine(0.0, 0.0).map_err(Into::into),
+    }
+}
+
 pub(crate) fn decoder_selection_score(
     metrics: &DecoderBatchMetrics,
     syntax_loss_weight: f64,
@@ -1158,4 +1210,61 @@ pub(crate) fn decoder_selection_score(
         - 0.04 * metrics.conditioning_gain.max(0.0)
         - 0.04 * metrics.shuffle_gain.max(0.0)
         - 0.04 * metrics.hard_negative_gain.max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{function_name_span_indices, signature_span_indices};
+    use crate::model::Vocab;
+
+    fn vocab_with(tokens: &[&str]) -> (Vocab, Vec<u32>) {
+        let mut vocab = Vocab::new();
+        let ids = tokens
+            .iter()
+            .map(|token| vocab.add_token(token))
+            .collect::<Vec<_>>();
+        (vocab, ids)
+    }
+
+    #[test]
+    fn signature_spans_include_go_type_and_func_declarations() {
+        let tokens = [
+            "type",
+            "Interval",
+            "struct",
+            "{",
+            "Start",
+            "int",
+            "}",
+            "func",
+            "MergeIntervals",
+            "(",
+            ")",
+            "{",
+            "return",
+            "nil",
+            "}",
+        ];
+        let (vocab, ids) = vocab_with(&tokens);
+        let mask = vec![1.0; ids.len()];
+
+        let spans = signature_span_indices(&ids, &mask, &vocab);
+
+        assert!(spans.contains(&0));
+        assert!(spans.contains(&6));
+        assert!(spans.contains(&7));
+        assert!(spans.contains(&11));
+        assert!(!spans.contains(&12));
+    }
+
+    #[test]
+    fn function_name_span_handles_go_func_keyword() {
+        let tokens = ["func", "ParseSize", "(", "input", "string", ")", "{"];
+        let (vocab, ids) = vocab_with(&tokens);
+        let mask = vec![1.0; ids.len()];
+
+        let positions = function_name_span_indices(&ids, &mask, &vocab);
+
+        assert_eq!(positions, vec![1]);
+    }
 }

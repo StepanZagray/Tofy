@@ -15,7 +15,7 @@ use crate::data::{
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
@@ -465,14 +465,14 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
         let encoded = chunk
             .par_iter()
             .filter_map(|line| {
-                let line = cap_str_chars(line, raw_cap);
+                let line = cap_str_chars_tail(line, raw_cap);
                 let mut ids = encode_line_with_vocab_mode(
                     line,
                     vocab,
                     spec.mode,
                     DEFAULT_MIN_TOKENS_PER_LINE,
                 )?;
-                truncate_ids(&mut ids, spec.max_seq);
+                truncate_ids_tail(&mut ids, spec.max_seq);
                 Some(ids)
             })
             .collect::<Vec<_>>();
@@ -554,8 +554,8 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             .filter_map(|line| {
                 let capped = cap_raw_world_line(line, raw_caps.world_side);
                 let mut example = encode_raw_world_line_with_vocab_mode(&capped, vocab, spec.mode)?;
-                truncate_ids(&mut example.state_tokens, spec.max_seq);
-                truncate_ids(&mut example.next_tokens, spec.max_seq);
+                truncate_ids_tail(&mut example.state_tokens, spec.max_seq);
+                truncate_ids_tail(&mut example.next_tokens, spec.max_seq);
                 Some(example)
             })
             .collect::<Vec<_>>();
@@ -656,10 +656,10 @@ fn ensure_dual_world_token_cache(
                 )?;
                 let mut decoder_example =
                     encode_raw_world_line_with_vocab_mode(&capped, decoder_vocab, spec.mode)?;
-                truncate_ids(&mut encoder_example.state_tokens, spec.max_seq);
-                truncate_ids(&mut encoder_example.next_tokens, spec.max_seq);
-                truncate_ids(&mut decoder_example.state_tokens, spec.max_seq);
-                truncate_ids(&mut decoder_example.next_tokens, spec.max_seq);
+                truncate_ids_tail(&mut encoder_example.state_tokens, spec.max_seq);
+                truncate_ids_tail(&mut encoder_example.next_tokens, spec.max_seq);
+                truncate_ids_tail(&mut decoder_example.state_tokens, spec.max_seq);
+                truncate_ids_tail(&mut decoder_example.next_tokens, spec.max_seq);
                 Some(DualWorldCacheRow {
                     encoder_state_tokens: encoder_example.state_tokens,
                     encoder_next_tokens: encoder_example.next_tokens,
@@ -787,9 +787,10 @@ fn write_ids<W: Write>(writer: &mut W, ids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-fn truncate_ids(ids: &mut Vec<u32>, max_seq: usize) {
+fn truncate_ids_tail(ids: &mut Vec<u32>, max_seq: usize) {
     if max_seq > 0 && ids.len() > max_seq {
-        ids.truncate(max_seq);
+        let start = ids.len() - max_seq;
+        ids.drain(..start);
     }
 }
 
@@ -815,39 +816,35 @@ fn token_cache_raw_cap_env() -> Option<usize> {
         .filter(|&value| value > 0)
 }
 
-fn cap_str_chars(text: &str, max_chars: usize) -> &str {
+fn cap_str_chars_tail(text: &str, max_chars: usize) -> &str {
     if text.len() <= max_chars {
         return text;
     }
-    let mut end = 0usize;
-    for (idx, _) in text.char_indices() {
-        if idx > max_chars {
+    let mut start = text.len();
+    for (idx, _) in text.char_indices().rev() {
+        if text.len().saturating_sub(idx) > max_chars {
             break;
         }
-        end = idx;
+        start = idx;
     }
-    if end == 0 {
-        ""
-    } else {
-        &text[..end]
-    }
+    &text[start..]
 }
 
 fn cap_raw_world_line(line: &str, max_side_chars: usize) -> String {
     let Some((left, rest)) = line.split_once('\t') else {
-        return cap_str_chars(line, max_side_chars.saturating_mul(2)).to_string();
+        return cap_str_chars_tail(line, max_side_chars.saturating_mul(2)).to_string();
     };
     let Some((right, action)) = rest.split_once('\t') else {
         return format!(
             "{}\t{}",
-            cap_str_chars(left, max_side_chars),
-            cap_str_chars(rest, max_side_chars)
+            cap_str_chars_tail(left, max_side_chars),
+            cap_str_chars_tail(rest, max_side_chars)
         );
     };
     format!(
         "{}\t{}\t{}",
-        cap_str_chars(left, max_side_chars),
-        cap_str_chars(right, max_side_chars),
+        cap_str_chars_tail(left, max_side_chars),
+        cap_str_chars_tail(right, max_side_chars),
         action
     )
 }
@@ -913,4 +910,26 @@ fn tmp_path_for(path: &Path) -> PathBuf {
         .to_string();
     name.push_str(&format!(".tmp.{}", std::process::id()));
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_truncation_keeps_recent_state_tokens() {
+        let mut ids = vec![1, 2, 3, 4, 5];
+        truncate_ids_tail(&mut ids, 3);
+        assert_eq!(ids, vec![3, 4, 5]);
+
+        let mut short = vec![7, 8];
+        truncate_ids_tail(&mut short, 3);
+        assert_eq!(short, vec![7, 8]);
+    }
+
+    #[test]
+    fn raw_world_cache_cap_keeps_state_and_target_tail() {
+        let capped = cap_raw_world_line("abcdef\tuvwxyz\tcode", 3);
+        assert_eq!(capped, "def\txyz\tcode");
+    }
 }

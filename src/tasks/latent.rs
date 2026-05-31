@@ -421,7 +421,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         .iter()
         .map(|entry| entry.var.clone())
         .collect::<Vec<_>>();
-    let mut opt = util::ResumableAdamW::new_lr_named(named_train_vars, config.lr)?;
+    let mut opt = util::TrainOptimizer::new_lr_named(named_train_vars, config.lr)?;
     if config.resume {
         if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
             resume_state = state;

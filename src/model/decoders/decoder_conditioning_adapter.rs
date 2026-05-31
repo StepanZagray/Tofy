@@ -78,10 +78,25 @@ impl DecoderConditioningAdapter {
     /// The world/planner state is good at broad routing; this adapter specializes it into
     /// short-horizon memory that the next decoder call can cross-attend to.
     pub fn forward_with_action(&self, context_slots: &Tensor, action_id: u32) -> Result<Tensor> {
+        let batch = context_slots.dim(0)?;
+        self.forward_with_actions(context_slots, &vec![action_id; batch])
+    }
+
+    pub fn forward_with_actions(
+        &self,
+        context_slots: &Tensor,
+        action_ids: &[u32],
+    ) -> Result<Tensor> {
         let (batch, _, _) = context_slots.dims3()?;
+        if action_ids.len() != batch {
+            anyhow::bail!(
+                "decoder conditioning action count {} does not match batch {}",
+                action_ids.len(),
+                batch
+            );
+        }
         let memory = compressed_context_compressor(context_slots, self.num_output_slots)?;
-        let action_ids =
-            Tensor::from_vec(vec![action_id; batch], (batch,), context_slots.device())?;
+        let action_ids = Tensor::from_vec(action_ids.to_vec(), (batch,), context_slots.device())?;
         let action_state = self.action_embed.forward(&action_ids)?;
         let action_memory = memory.broadcast_add(&action_state.unsqueeze(1)?)?;
         let salience = ops::softmax(&self.index_proj.forward(&action_memory)?, D::Minus2)?;

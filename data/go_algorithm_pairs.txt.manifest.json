@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "kind": "go_algorithm_tasks",
+  "output_path": "data/go_algorithm_pairs.txt",
+  "params": {
+    "pairs": 6,
+    "prompt_frames": 8,
+    "semantic_targets": false,
+    "version": "go_algorithm_tasks_v2"
+  },
+  "inputs": [],
+  "rows": 48
+}

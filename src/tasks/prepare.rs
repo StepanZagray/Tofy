@@ -18,23 +18,15 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::data::CODE_EOS_TOKEN;
+
 const ARTIFACT_CACHE_VERSION: u32 = 1;
 const PARQUET_REVISION: &str = "refs/convert/parquet";
 const GITHUB_TOP_CODE_DATASET_ID: &str = "ronantakizawa/github-top-code";
 const CASUAL_CONVERSATION_DATASET_ID: &str = "SohamGhadge/casual-conversation";
 const SCIQ_DATASET_ID: &str = "sciq";
 const SQUAD_V2_DATASET_ID: &str = "rajpurkar/squad_v2";
-const DEFAULT_GITHUB_LANGUAGES: &[&str] = &[
-    "TypeScript",
-    "Go",
-    "JavaScript",
-    "C/C++ Header",
-    "C",
-    "C++",
-    "TSX",
-    "CSS",
-    "HTML",
-];
+const DEFAULT_GITHUB_LANGUAGES: &[&str] = &["Go"];
 const CODE_EVAL_SUITE_JSONL: &str = include_str!("../../eval/code_assistant_go_hard.jsonl");
 const DEFAULT_PREPARE_CHUNK_LINES: usize = 16_384;
 const FORBIDDEN_DTYPE_PATTERNS: &[&str] = &[
@@ -208,6 +200,8 @@ struct OomProbeProfileFile {
     eight_gb: OomProbeProfile,
     #[serde(rename = "48gb")]
     forty_eight_gb: OomProbeProfile,
+    #[serde(rename = "80gb")]
+    eighty_gb: OomProbeProfile,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -255,6 +249,14 @@ pub fn try_run_prepare(args: &[String]) -> Result<bool> {
         }
         "--prepare-go-function-tasks" | "prepare-go-function-tasks" => {
             run_prepare_go_function_tasks(&args[2..])?;
+            Ok(true)
+        }
+        "--prepare-go-algorithm-tasks" | "prepare-go-algorithm-tasks" => {
+            run_prepare_go_algorithm_tasks(&args[2..])?;
+            Ok(true)
+        }
+        "--prepare-go-semantics-tasks" | "prepare-go-semantics-tasks" => {
+            run_prepare_go_semantics_tasks(&args[2..])?;
             Ok(true)
         }
         "--prepare-go-repair-tasks" | "prepare-go-repair-tasks" => {
@@ -560,10 +562,7 @@ fn escape_pair_field(text: &str) -> String {
 }
 
 fn flatten_for_encoder(text: &str) -> String {
-    unescape_pair_field(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    escape_pair_field(unescape_pair_field(text).trim())
 }
 
 fn run_prepare_encoder_corpus(args: &[String]) -> Result<()> {
@@ -1308,6 +1307,536 @@ fn write_go_instruction_pairs(
     Ok(written)
 }
 
+struct CuratedGoPair {
+    id: &'static str,
+    prompt: &'static str,
+    target: &'static str,
+}
+
+fn run_prepare_go_algorithm_tasks(args: &[String]) -> Result<()> {
+    let mut output = None;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let output = output.context("--output is required")?;
+    write_curated_go_pairs(
+        &output,
+        "go_algorithm_tasks",
+        "go_algorithm_tasks_v2",
+        &curated_go_algorithm_pairs(),
+        false,
+        force,
+    )
+}
+
+fn run_prepare_go_semantics_tasks(args: &[String]) -> Result<()> {
+    let mut output = None;
+    let mut force = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" => {
+                output = Some(parse_path_value(args, i, "--output")?);
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            value => bail!("unknown flag: {value}"),
+        }
+    }
+    let output = output.context("--output is required")?;
+    write_curated_go_pairs(
+        &output,
+        "go_semantics_tasks",
+        "go_semantics_tasks_v1",
+        &curated_go_semantics_pairs(),
+        true,
+        force,
+    )
+}
+
+fn write_curated_go_pairs(
+    output: &Path,
+    artifact_name: &str,
+    version: &str,
+    pairs: &[CuratedGoPair],
+    semantic_targets: bool,
+    force: bool,
+) -> Result<()> {
+    let inputs = Vec::new();
+    let prompt_frames = [
+        "Return only the requested Go code.",
+        "Write a complete Go solution. Output code only.",
+        "Implement this Go API exactly. Do not explain.",
+        "Produce compilable Go for package main. Imports are allowed.",
+        "Complete the function and any required helper types. Return code only.",
+        "Use deterministic behavior for ties and errors. Output only Go.",
+        "Solve the task with clear control flow. Code only.",
+        "Implement the specification exactly as written.",
+    ];
+    let semantic_frames = [
+        "Analyze the Go code and return only the requested answer.",
+        "Track the execution state exactly. Do not explain.",
+        "Return the deterministic result for this Go snippet.",
+        "Infer the final values from the Go program.",
+    ];
+    let params = json!({
+        "version": version,
+        "pairs": pairs.len(),
+        "semantic_targets": semantic_targets,
+        "prompt_frames": if semantic_targets { semantic_frames.len() } else { prompt_frames.len() },
+    });
+    if !force {
+        if let Some(manifest) = artifact_cache_hit(artifact_name, output, &inputs, &params)? {
+            println!(
+                "Curated Go pair cache hit: {} (rows={})",
+                output.display(),
+                manifest.rows
+            );
+            return Ok(());
+        }
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = output.with_extension("txt.tmp");
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    let mut seen = HashSet::new();
+    let frames: &[&str] = if semantic_targets {
+        &semantic_frames
+    } else {
+        &prompt_frames
+    };
+    let mut written = 0usize;
+    for pair in pairs {
+        for frame in frames {
+            let prompt = format!("{frame}\n\n{}", pair.prompt);
+            let target = if semantic_targets {
+                format!("<action:text_reply> {}", pair.target)
+            } else {
+                pair.target.to_string()
+            };
+            let digest = format!("{:x}", md5::compute(format!("{}\t{}", pair.id, prompt)));
+            if !seen.insert(digest) {
+                continue;
+            }
+            writeln!(
+                out,
+                "{}\t{}",
+                escape_pair_field(&prompt),
+                escape_pair_field(&target)
+            )?;
+            written += 1;
+        }
+    }
+    out.flush()?;
+    fs::rename(tmp, output)?;
+    write_artifact_manifest(artifact_name, output, &inputs, params, written)?;
+    println!("Wrote {written} curated Go rows to {}", output.display());
+    Ok(())
+}
+
+fn curated_go_algorithm_pairs() -> Vec<CuratedGoPair> {
+    vec![
+        CuratedGoPair {
+            id: "parse_csv_line",
+            prompt: r#"Implement exactly this function:
+func ParseCSVLine(line string) ([]string, error)
+
+Rules:
+- Parse one RFC4180-style CSV record.
+- Commas split fields unless they are inside double quotes.
+- A doubled quote inside a quoted field becomes one quote.
+- Return an error for an unclosed quote or junk after a closing quote.
+- Do not use encoding/csv."#,
+            target: r#"import "errors"
+
+func ParseCSVLine(line string) ([]string, error) {
+	fields := []string{}
+	field := make([]byte, 0, len(line))
+	inQuotes := false
+	quoted := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inQuotes {
+			if c == '"' {
+				if i+1 < len(line) && line[i+1] == '"' {
+					field = append(field, '"')
+					i++
+				} else {
+					inQuotes = false
+					quoted = true
+				}
+			} else {
+				field = append(field, c)
+			}
+			continue
+		}
+		switch c {
+		case ',':
+			fields = append(fields, string(field))
+			field = field[:0]
+			quoted = false
+		case '"':
+			if len(field) != 0 || quoted {
+				return nil, errors.New("unexpected quote")
+			}
+			inQuotes = true
+		default:
+			if quoted {
+				return nil, errors.New("trailing data after quote")
+			}
+			field = append(field, c)
+		}
+	}
+	if inQuotes {
+		return nil, errors.New("unclosed quote")
+	}
+	fields = append(fields, string(field))
+	return fields, nil
+}"#,
+        },
+        CuratedGoPair {
+            id: "stable_toposort",
+            prompt: r#"Implement exactly this function:
+func StableTopoSort(edges [][2]string) ([]string, bool)
+
+Rules:
+- Each edge is [from, to].
+- Include every node mentioned in an edge.
+- Return nodes in topological order.
+- When multiple nodes are ready, pick the lexicographically smallest node.
+- Return false when a cycle exists."#,
+            target: r#"import "sort"
+
+func StableTopoSort(edges [][2]string) ([]string, bool) {
+	adj := map[string][]string{}
+	indeg := map[string]int{}
+	for _, edge := range edges {
+		from, to := edge[0], edge[1]
+		if _, ok := indeg[from]; !ok {
+			indeg[from] = 0
+		}
+		if _, ok := indeg[to]; !ok {
+			indeg[to] = 0
+		}
+		adj[from] = append(adj[from], to)
+		indeg[to]++
+	}
+	ready := make([]string, 0)
+	for node, degree := range indeg {
+		if degree == 0 {
+			ready = append(ready, node)
+		}
+	}
+	out := make([]string, 0, len(indeg))
+	for len(ready) > 0 {
+		sort.Strings(ready)
+		node := ready[0]
+		ready = ready[1:]
+		out = append(out, node)
+		sort.Strings(adj[node])
+		for _, next := range adj[node] {
+			indeg[next]--
+			if indeg[next] == 0 {
+				ready = append(ready, next)
+			}
+		}
+	}
+	return out, len(out) == len(indeg)
+}"#,
+        },
+        CuratedGoPair {
+            id: "shortest_path",
+            prompt: r#"Implement exactly this function:
+func ShortestPath(grid []string) int
+
+Rules:
+- Grid cells are bytes.
+- 'S' is the start, 'E' is the end, '#' is blocked.
+- Move in four directions only.
+- Return the shortest distance in steps, or -1 if unreachable or malformed."#,
+            target: r#"func ShortestPath(grid []string) int {
+	if len(grid) == 0 || len(grid[0]) == 0 {
+		return -1
+	}
+	h, w := len(grid), len(grid[0])
+	sr, sc, er, ec := -1, -1, -1, -1
+	for r := 0; r < h; r++ {
+		if len(grid[r]) != w {
+			return -1
+		}
+		for c := 0; c < w; c++ {
+			if grid[r][c] == 'S' {
+				sr, sc = r, c
+			}
+			if grid[r][c] == 'E' {
+				er, ec = r, c
+			}
+		}
+	}
+	if sr < 0 || er < 0 {
+		return -1
+	}
+	type point struct{ r, c, d int }
+	q := []point{{sr, sc, 0}}
+	seen := make([][]bool, h)
+	for i := range seen {
+		seen[i] = make([]bool, w)
+	}
+	seen[sr][sc] = true
+	dirs := [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+	for len(q) > 0 {
+		cur := q[0]
+		q = q[1:]
+		if cur.r == er && cur.c == ec {
+			return cur.d
+		}
+		for _, dir := range dirs {
+			nr, nc := cur.r+dir[0], cur.c+dir[1]
+			if nr < 0 || nc < 0 || nr >= h || nc >= w || seen[nr][nc] || grid[nr][nc] == '#' {
+				continue
+			}
+			seen[nr][nc] = true
+			q = append(q, point{nr, nc, cur.d + 1})
+		}
+	}
+	return -1
+}"#,
+        },
+        CuratedGoPair {
+            id: "render_template",
+            prompt: r#"Implement exactly this function:
+func RenderTemplate(input string, values map[string]string) (string, error)
+
+Rules:
+- Replace ${name} with values["name"].
+- Names may contain ASCII letters, digits, and underscore.
+- Return an error for an unknown name, empty name, invalid name byte, or unclosed placeholder.
+- Preserve all other bytes."#,
+            target: r#"import "fmt"
+
+func RenderTemplate(input string, values map[string]string) (string, error) {
+	out := make([]byte, 0, len(input))
+	for i := 0; i < len(input); i++ {
+		if input[i] != '$' || i+1 >= len(input) || input[i+1] != '{' {
+			out = append(out, input[i])
+			continue
+		}
+		j := i + 2
+		for j < len(input) && input[j] != '}' {
+			b := input[j]
+			ok := b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+			if !ok {
+				return "", fmt.Errorf("invalid placeholder")
+			}
+			j++
+		}
+		if j >= len(input) {
+			return "", fmt.Errorf("unclosed placeholder")
+		}
+		name := input[i+2 : j]
+		if name == "" {
+			return "", fmt.Errorf("empty placeholder")
+		}
+		value, ok := values[name]
+		if !ok {
+			return "", fmt.Errorf("unknown placeholder %s", name)
+		}
+		out = append(out, value...)
+		i = j
+	}
+	return string(out), nil
+}"#,
+        },
+        CuratedGoPair {
+            id: "compact_sorted_numbers",
+            prompt: r#"Implement exactly this function:
+func CompactSortedNumbers(nums []int) string
+
+Rules:
+- Input is sorted ascending and may contain duplicates.
+- Collapse consecutive runs into "start-end".
+- Single values are rendered as just the number.
+- Remove duplicates before compacting.
+- Join ranges with commas."#,
+            target: r#"import (
+	"strconv"
+	"strings"
+)
+
+func CompactSortedNumbers(nums []int) string {
+	parts := []string{}
+	for i := 0; i < len(nums); {
+		start := nums[i]
+		end := start
+		i++
+		for i < len(nums) && nums[i] == end {
+			i++
+		}
+		for i < len(nums) && nums[i] == end+1 {
+			end = nums[i]
+			i++
+			for i < len(nums) && nums[i] == end {
+				i++
+			}
+		}
+		if start == end {
+			parts = append(parts, strconv.Itoa(start))
+		} else {
+			parts = append(parts, strconv.Itoa(start)+"-"+strconv.Itoa(end))
+		}
+	}
+	return strings.Join(parts, ",")
+}"#,
+        },
+        CuratedGoPair {
+            id: "parse_header_block",
+            prompt: r#"Implement exactly this function:
+func ParseHeaderBlock(input string) (map[string][]string, error)
+
+Rules:
+- Input contains newline-separated HTTP-like headers.
+- Each non-empty line must contain "Name: value".
+- Trim spaces around names and values.
+- Header names are ASCII case-insensitive and must be returned in canonical lowercase.
+- Preserve repeated values in input order."#,
+            target: r#"import (
+	"fmt"
+	"strings"
+)
+
+func ParseHeaderBlock(input string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, line := range strings.Split(input, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("missing colon")
+		}
+		name := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("empty header name")
+		}
+		for i := 0; i < len(name); i++ {
+			b := name[i]
+			if !(b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '-') {
+				return nil, fmt.Errorf("invalid header name")
+			}
+		}
+		out[name] = append(out[name], value)
+	}
+	return out, nil
+}"#,
+        },
+    ]
+}
+
+fn curated_go_semantics_pairs() -> Vec<CuratedGoPair> {
+    vec![
+        CuratedGoPair {
+            id: "trace_loop_accumulator",
+            prompt: r#"Given this Go function call, return JSON with the final local variables and return value.
+
+func score(xs []int) int {
+    total := 0
+    last := 0
+    for i, x := range xs {
+        if x%2 == 0 {
+            total += x * (i + 1)
+            last = x
+        }
+    }
+    return total + last
+}
+
+Call: score([]int{3, 4, 5, 2})"#,
+            target: r#"{"return":18,"locals":{"total":16,"last":2,"i":3,"x":2}}"#,
+        },
+        CuratedGoPair {
+            id: "trace_map_counts",
+            prompt: r#"Given this Go function call, return JSON with the final map and return value.
+
+func count(items []string) (map[string]int, int) {
+    seen := map[string]int{}
+    max := 0
+    for _, item := range items {
+        seen[item]++
+        if seen[item] > max {
+            max = seen[item]
+        }
+    }
+    return seen, max
+}
+
+Call: count([]string{"go", "rs", "go", "go", "rs"})"#,
+            target: r#"{"return":[{"go":3,"rs":2},3],"locals":{"seen":{"go":3,"rs":2},"max":3}}"#,
+        },
+        CuratedGoPair {
+            id: "trace_branching_string",
+            prompt: r#"Given this Go function call, return JSON with the exact return value.
+
+func rewrite(s string) string {
+    out := ""
+    for i := 0; i < len(s); i++ {
+        if s[i] == '-' {
+            out += "_"
+        } else if i%2 == 0 {
+            out += string(s[i] - 32)
+        } else {
+            out += string(s[i])
+        }
+    }
+    return out
+}
+
+Call: rewrite("ab-cd")"#,
+            target: r#"{"return":"Ab_cD"}"#,
+        },
+        CuratedGoPair {
+            id: "trace_nested_control",
+            prompt: r#"Given this Go function call, return JSON with the final local variables and return value.
+
+func firstWindow(xs []int, limit int) int {
+    sum := 0
+    left := 0
+    for right, x := range xs {
+        sum += x
+        for sum > limit {
+            sum -= xs[left]
+            left++
+        }
+        if right-left+1 == 3 {
+            return left
+        }
+    }
+    return -1
+}
+
+Call: firstWindow([]int{4, 2, 3, 7, 1}, 10)"#,
+            target: r#"{"return":0,"locals":{"sum":9,"left":0,"right":2,"x":3}}"#,
+        },
+    ]
+}
+
 fn find_matching_brace(src: &str, open_idx: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     let mut depth = 0i32;
@@ -1521,7 +2050,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
                 )?;
                 written += 1;
             }
-            if progress_every > 0 && processed % progress_every == 0 {
+            if progress_every > 0 && processed.is_multiple_of(progress_every) {
                 println!("Go repair pairs progress: processed={processed} written={written}");
             }
         }
@@ -1826,7 +2355,7 @@ fn build_language_repair_prompt(
     feedback: &str,
 ) -> String {
     format!(
-        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected {language} code.\nFix the previous attempt using the compiler feedback.\n\n<ctx:original_request>\nOriginal request:\n{task_prompt}\n\n<ctx:previous_attempt>\nPrevious attempt:\n```{fence}\n{broken_code}\n```\n\n<ctx:compiler_feedback>\nCompiler feedback:\n{feedback}\n\n<ctx:constraints>\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable {language} code.\n- Do not add explanation.\n"
+        "Return only corrected {language} code.\nFix the previous attempt using the compiler feedback.\n\nOriginal request:\n{task_prompt}\n\nPrevious attempt:\n```{fence}\n{broken_code}\n```\n\nCompiler feedback:\n{feedback}\n\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable {language} code.\n- Do not add explanation.\n"
     )
 }
 
@@ -1942,18 +2471,30 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
         if want_code && !code_rows.is_empty() {
             let (left, right) = code_rows.pop().unwrap();
             let action = world_mix_code_action(&left, &right);
-            output_rows.push(format!("{left}\t{right}\t{action}"));
+            output_rows.push(format!(
+                "{}\t{}\t{action}",
+                escape_pair_field(&left),
+                escape_pair_field(&right)
+            ));
             terminal_candidates.push((left, right, action.to_string()));
             chosen_code += 1;
         } else if !text_rows.is_empty() {
             let (left, right) = text_rows.pop().unwrap();
-            output_rows.push(format!("{left}\t{right}\ttext_reply"));
+            output_rows.push(format!(
+                "{}\t{}\ttext_reply",
+                escape_pair_field(&left),
+                escape_pair_field(&right)
+            ));
             terminal_candidates.push((left, right, "text_reply".to_string()));
             chosen_text += 1;
         } else if !code_rows.is_empty() {
             let (left, right) = code_rows.pop().unwrap();
             let action = world_mix_code_action(&left, &right);
-            output_rows.push(format!("{left}\t{right}\t{action}"));
+            output_rows.push(format!(
+                "{}\t{}\t{action}",
+                escape_pair_field(&left),
+                escape_pair_field(&right)
+            ));
             terminal_candidates.push((left, right, action.to_string()));
             chosen_code += 1;
         }
@@ -1970,7 +2511,10 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
         } else {
             format!("{left}\\n{right}")
         };
-        output_rows.push(format!("{terminal_state}\t<done>\tdone"));
+        output_rows.push(format!(
+            "{}\t<done>\tdone",
+            escape_pair_field(&terminal_state)
+        ));
         chosen_done += 1;
     }
     let mut content = String::new();
@@ -1997,12 +2541,29 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn world_mix_code_action(left: &str, _right: &str) -> &'static str {
+fn world_mix_code_action(left: &str, right: &str) -> &'static str {
+    if let Some(action) = explicit_world_mix_action(right) {
+        return action;
+    }
     let left_lower = left.to_ascii_lowercase();
     if left_lower.contains("<action:fetch_docs>") || left_lower.contains("<tool:fetch_docs>") {
         "fetch_docs"
     } else {
         "code"
+    }
+}
+
+fn explicit_world_mix_action(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("<action:")?;
+    let label = rest.split_once('>')?.0.trim().to_ascii_lowercase();
+    match label.as_str() {
+        "text" | "text_reply" | "explain" | "summarize" => Some("text_reply"),
+        "code" | "inspect_file" | "read_file" | "edit_file" | "apply_patch" | "run_tests"
+        | "read_error" | "repair_patch" | "compiler_feedback" => Some("code"),
+        "done" | "final" | "finalize" | "stop" => Some("done"),
+        "fetch_docs" | "docs" | "retrieve_docs" | "doc_lookup" => Some("fetch_docs"),
+        _ => None,
     }
 }
 
@@ -2023,8 +2584,7 @@ fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
                     if trimmed.is_empty() {
                         return None;
                     }
-                    let (left, right) = split_pair_line_first_two(trimmed)?;
-                    Some((left.to_string(), right.to_string()))
+                    split_pair_line_first_two(trimmed)
                 })
                 .collect::<Vec<_>>(),
         );
@@ -2032,16 +2592,26 @@ fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
     Ok(rows)
 }
 
-fn split_pair_line_first_two(line: &str) -> Option<(&str, &str)> {
-    if line.contains('\t') {
-        let mut parts = line.split('\t');
-        return Some((parts.next()?, parts.next()?));
+fn split_pair_line_first_two(line: &str) -> Option<(String, String)> {
+    let parts = if line.contains('\t') {
+        line.split('\t').collect::<Vec<_>>()
+    } else if line.contains("|||") {
+        line.split("|||").collect::<Vec<_>>()
+    } else {
+        return None;
+    };
+    let left = parts.first()?.trim().to_string();
+    let mut right = parts.get(1)?.trim().to_string();
+    if let Some(action) = parts
+        .get(2)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if !right.trim_start().starts_with("<action:") {
+            right = format!("<action:{action}> {right}");
+        }
     }
-    if line.contains("|||") {
-        let mut parts = line.split("|||");
-        return Some((parts.next()?, parts.next()?));
-    }
-    None
+    Some((left, right))
 }
 
 fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
@@ -2049,8 +2619,10 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
     let mut base_pairs = None;
     let mut instruction_pairs = None;
     let mut extra_pairs = Vec::new();
+    let mut base_repeat = 1usize;
     let mut instruction_repeat = 3usize;
     let mut extra_repeat = 1usize;
+    let mut fim_repeat = 0usize;
     let mut max_rows = 0usize;
     let mut seed = 1337u64;
     let mut force = false;
@@ -2073,12 +2645,20 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
                 extra_pairs.push(parse_path_value(args, i, "--extra-pairs")?);
                 i += 2;
             }
+            "--base-repeat" => {
+                base_repeat = parse_usize_value(args, i, "--base-repeat")?;
+                i += 2;
+            }
             "--instruction-repeat" => {
                 instruction_repeat = parse_usize_value(args, i, "--instruction-repeat")?;
                 i += 2;
             }
             "--extra-repeat" => {
                 extra_repeat = parse_usize_value(args, i, "--extra-repeat")?;
+                i += 2;
+            }
+            "--fim-repeat" => {
+                fim_repeat = parse_usize_value(args, i, "--fim-repeat")?;
                 i += 2;
             }
             "--max-rows" => {
@@ -2102,8 +2682,11 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
     let mut inputs = vec![base_pairs.clone(), instruction_pairs.clone()];
     inputs.extend(extra_pairs.clone());
     let params = json!({
+        "base_repeat": base_repeat,
         "instruction_repeat": instruction_repeat,
         "extra_repeat": extra_repeat,
+        "fim_repeat": fim_repeat,
+        "target_stop_token": CODE_EOS_TOKEN,
         "max_rows": if max_rows > 0 { Some(max_rows) } else { None::<usize> },
         "seed": seed,
     });
@@ -2136,17 +2719,32 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
                 .collect::<Result<Vec<_>>>()
         },
     );
-    let mut rows = rows_result?;
-    let instruction = instruction_result?;
-    let extras = extras_result?.into_iter().flatten().collect::<Vec<_>>();
+    let base_rows = code_poc_rows_with_eos(rows_result?);
+    let instruction = code_poc_rows_with_eos(instruction_result?);
+    let extras = code_poc_rows_with_eos(extras_result?.into_iter().flatten().collect::<Vec<_>>());
+    let fim_source = instruction
+        .iter()
+        .chain(extras.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let fim_rows = if fim_repeat > 0 {
+        code_poc_fim_rows(&fim_source)
+    } else {
+        Vec::new()
+    };
     let mut mixed = Vec::new();
-    for _ in 0..instruction_repeat.max(1) {
+    for _ in 0..instruction_repeat {
         mixed.extend(instruction.clone());
     }
-    for _ in 0..extra_repeat.max(1) {
+    for _ in 0..extra_repeat {
         mixed.extend(extras.clone());
     }
-    mixed.append(&mut rows);
+    for _ in 0..fim_repeat {
+        mixed.extend(fim_rows.clone());
+    }
+    for _ in 0..base_repeat {
+        mixed.extend(base_rows.clone());
+    }
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     mixed.shuffle(&mut rng);
     if max_rows > 0 && mixed.len() > max_rows {
@@ -2160,9 +2758,10 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
     write_text_atomic(&output, &content)?;
     write_artifact_manifest("code_poc_mix", &output, &inputs, params, mixed.len())?;
     println!(
-        "Wrote {} mixed code POC rows to {}",
+        "Wrote {} mixed code POC rows to {} (fim_rows={})",
         mixed.len(),
-        output.display()
+        output.display(),
+        fim_rows.len()
     );
     Ok(())
 }
@@ -2184,6 +2783,103 @@ fn load_non_empty_lines(path: &Path) -> Result<Vec<String>> {
         );
     }
     Ok(rows)
+}
+
+fn code_poc_rows_with_eos(rows: Vec<String>) -> Vec<String> {
+    rows.into_par_iter()
+        .map(|row| code_poc_row_with_eos(&row).unwrap_or(row))
+        .collect()
+}
+
+fn code_poc_row_with_eos(row: &str) -> Option<String> {
+    let (left, right) = row.split_once('\t')?;
+    let state = unescape_pair_field(left);
+    let target = append_code_eos(&unescape_pair_field(right));
+    Some(format!(
+        "{}\t{}",
+        escape_pair_field(&state),
+        escape_pair_field(&target)
+    ))
+}
+
+fn append_code_eos(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(CODE_EOS_TOKEN) {
+        trimmed.to_string()
+    } else if trimmed.is_empty() {
+        CODE_EOS_TOKEN.to_string()
+    } else {
+        format!("{trimmed}\n{CODE_EOS_TOKEN}")
+    }
+}
+
+fn strip_code_eos(text: &str) -> String {
+    text.find(CODE_EOS_TOKEN)
+        .map(|idx| text[..idx].trim_end().to_string())
+        .unwrap_or_else(|| text.trim_end().to_string())
+}
+
+fn code_poc_fim_rows(rows: &[String]) -> Vec<String> {
+    rows.par_iter()
+        .filter_map(|row| code_poc_fim_row(row))
+        .collect()
+}
+
+fn code_poc_fim_row(row: &str) -> Option<String> {
+    let (left, right) = row.split_once('\t')?;
+    let state = unescape_pair_field(left);
+    let code = strip_code_eos(&unescape_pair_field(right));
+    let (prefix, middle, suffix) = split_code_for_fim(&code)?;
+    let middle = middle.trim_matches('\n');
+    if middle.chars().filter(|ch| !ch.is_whitespace()).count() < 12 {
+        return None;
+    }
+    let prompt = format!(
+        "{}\n<fim_prefix>\n{}\n<fim_suffix>\n{}\n<fim_middle>\n",
+        state.trim_end(),
+        prefix.trim_end(),
+        suffix.trim_start()
+    );
+    Some(format!(
+        "{}\t{}",
+        escape_pair_field(&prompt),
+        escape_pair_field(&append_code_eos(middle))
+    ))
+}
+
+fn split_code_for_fim(code: &str) -> Option<(String, String, String)> {
+    if let Some(capture) = go_func_start_re().captures(code) {
+        let whole = capture.get(0)?;
+        let open_idx = whole.end().checked_sub(1)?;
+        let close_idx = find_matching_brace(code, open_idx)?;
+        if close_idx > open_idx + 1 {
+            return Some((
+                code[..=open_idx].to_string(),
+                code[open_idx + 1..close_idx].to_string(),
+                code[close_idx..].to_string(),
+            ));
+        }
+    }
+    split_code_for_fim_by_lines(code)
+}
+
+fn split_code_for_fim_by_lines(code: &str) -> Option<(String, String, String)> {
+    let lines = code.lines().collect::<Vec<_>>();
+    if lines.len() < 6 {
+        return None;
+    }
+    let first_end = (lines.len() / 3).max(1);
+    let middle_end = (lines.len() * 2 / 3)
+        .max(first_end + 1)
+        .min(lines.len() - 1);
+    let prefix = lines[..first_end].join("\n");
+    let middle = lines[first_end..middle_end].join("\n");
+    let suffix = lines[middle_end..].join("\n");
+    if prefix.trim().is_empty() || middle.trim().is_empty() || suffix.trim().is_empty() {
+        None
+    } else {
+        Some((prefix, middle, suffix))
+    }
 }
 
 fn run_prepare_expert_pairs(args: &[String]) -> Result<()> {
@@ -2561,11 +3257,16 @@ fn run_convert_jsonl_context_response_to_tsv(args: &[String]) -> Result<()> {
     let output = output.context("--output is required")?;
     let mut json_files: Vec<PathBuf> = fs::read_dir(&input_dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().and_then(OsStr::to_str) == Some("json"))
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(OsStr::to_str),
+                Some("json") | Some("jsonl")
+            )
+        })
         .collect();
     json_files.sort();
     if json_files.is_empty() {
-        bail!("no .json files found in {}", input_dir.display());
+        bail!("no .json/.jsonl files found in {}", input_dir.display());
     }
     let mut content = String::new();
     let mut written = 0usize;
@@ -2587,26 +3288,32 @@ fn run_convert_jsonl_context_response_to_tsv(args: &[String]) -> Result<()> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
-                .replace('\t', " ");
+                .to_string();
             let rsp = value
                 .get("response")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
-                .replace('\t', " ");
+                .to_string();
+            let ctx_tokens =
+                crate::data::tokenize_with_mode(&ctx, crate::data::TokenizationMode::CodeAware)
+                    .len();
+            let rsp_tokens =
+                crate::data::tokenize_with_mode(&rsp, crate::data::TokenizationMode::CodeAware)
+                    .len();
             if ctx.is_empty()
                 || rsp.is_empty()
-                || ctx.split_whitespace().count() < min_tokens
-                || rsp.split_whitespace().count() < min_tokens
-                || ctx.split_whitespace().count() > max_tokens
-                || rsp.split_whitespace().count() > max_tokens
+                || ctx_tokens < min_tokens
+                || rsp_tokens < min_tokens
+                || ctx_tokens > max_tokens
+                || rsp_tokens > max_tokens
             {
                 skipped += 1;
                 continue;
             }
-            content.push_str(&ctx);
+            content.push_str(&escape_pair_field(&ctx));
             content.push('\t');
-            content.push_str(&rsp);
+            content.push_str(&escape_pair_field(&rsp));
             content.push('\n');
             written += 1;
         }
@@ -2723,7 +3430,8 @@ fn load_oom_probe_profile(name: &str) -> Result<OomProbeProfile> {
     match name {
         "8gb" => Ok(profiles.eight_gb),
         "48gb" => Ok(profiles.forty_eight_gb),
-        other => bail!("--profile must be one of 8gb|48gb, got {other}"),
+        "80gb" => Ok(profiles.eighty_gb),
+        other => bail!("--profile must be one of 8gb|48gb|80gb, got {other}"),
     }
 }
 
@@ -3179,15 +3887,44 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
             env.remove("TOFY_LATENT_WARMUP_STEPS");
         }
     }
-    env.insert("TOFY_WORLD_CONTEXT_SEGMENTS".to_string(), "2".to_string());
+    env.insert("TOFY_WORLD_CONTEXT_SEGMENTS".to_string(), "4".to_string());
+    env.insert("TOFY_ENCODER_CONTEXT_SEGMENTS".to_string(), "4".to_string());
     env.insert(
         "TOFY_WORLD_RECENT_FULL_SEGMENTS".to_string(),
         "1".to_string(),
     );
     env.insert(
         "TOFY_RECURSIVE_CONTEXT_COMPRESSION".to_string(),
-        "1".to_string(),
+        "0".to_string(),
     );
+    env.insert("TOFY_CONTEXT_HYBRID_MEMORY".to_string(), "1".to_string());
+    env.insert(
+        "TOFY_CONTEXT_HYBRID_EXACT_TAIL".to_string(),
+        args.max_seq.to_string(),
+    );
+    env.insert(
+        "TOFY_CONTEXT_HYBRID_BLOCK_SIZE".to_string(),
+        "32".to_string(),
+    );
+    env.insert("TOFY_CONTEXT_RETRIEVAL_SLOTS".to_string(), "8".to_string());
+    env.insert(
+        "TOFY_CONTEXT_EXACT_OLD_TOKENS".to_string(),
+        "16".to_string(),
+    );
+    env.insert(
+        "TOFY_DECODER_LOCAL_WINDOW".to_string(),
+        args.decoder_max_seq.clamp(128, 256).to_string(),
+    );
+    env.insert(
+        "TOFY_DECODER_CSA_COMPRESS_RATE".to_string(),
+        "8".to_string(),
+    );
+    env.insert(
+        "TOFY_DECODER_HCA_COMPRESS_RATE".to_string(),
+        "128".to_string(),
+    );
+    env.insert("TOFY_DECODER_ANCHOR_PERIOD".to_string(), "3".to_string());
+    env.insert("TOFY_DECODER_CSA_TOPK".to_string(), "16".to_string());
     env.insert(
         "TOFY_WORLD_TRAIN_ROLLOUT_STEPS".to_string(),
         "2".to_string(),
@@ -3196,8 +3933,11 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     if args.max_vram {
         env.insert("TOFY_WORLD_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_HIGH_WORLD_LOG_EVERY".to_string(), "25".to_string());
-        env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "2".to_string());
-        env.insert("TOFY_CONTEXT_SEGMENT_BATCH".to_string(), "64".to_string());
+        env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "8".to_string());
+        env.insert(
+            "TOFY_CONTEXT_SEGMENT_BATCH".to_string(),
+            if args.dim >= 1024 { "128" } else { "64" }.to_string(),
+        );
     }
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());
@@ -3947,9 +4687,12 @@ fn run_max_vram_probe(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_cache_hit, is_base_model_artifact, remote_source_fingerprint,
+        artifact_cache_hit, code_poc_fim_row, code_poc_row_with_eos, escape_pair_field,
+        flatten_for_encoder, is_base_model_artifact, remote_source_fingerprint,
+        split_pair_line_first_two, unescape_pair_field, world_mix_code_action,
         write_artifact_manifest,
     };
+    use crate::data::CODE_EOS_TOKEN;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -4015,7 +4758,7 @@ mod tests {
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         let output = dir.join("github_top_code.txt");
-        std::fs::write(&output, "fn main() {}\n").unwrap();
+        std::fs::write(&output, "package main\nfunc main() {}\n").unwrap();
 
         let inputs = vec![PathBuf::from("hub:ronantakizawa/github-top-code:train")];
         let params = json!({"split": "train"});
@@ -4030,5 +4773,80 @@ mod tests {
         assert!(miss.is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn world_mix_code_action_honors_explicit_target_action() {
+        assert_eq!(
+            world_mix_code_action("prompt", "<action:text_reply> 42"),
+            "text_reply"
+        );
+        assert_eq!(
+            world_mix_code_action("prompt", "<action:fetch_docs> fmt.Println"),
+            "fetch_docs"
+        );
+        assert_eq!(world_mix_code_action("prompt", "func add() {}"), "code");
+    }
+
+    #[test]
+    fn pair_field_escape_keeps_jsonl_converter_records_single_line() {
+        let escaped = escape_pair_field("line1\nline2\twith tab");
+        assert_eq!(escaped, "line1\\nline2    with tab");
+    }
+
+    #[test]
+    fn code_poc_rows_append_eos_to_completion_only() {
+        let row = format!(
+            "{}\t{}",
+            escape_pair_field("write add"),
+            escape_pair_field("func Add(a int, b int) int {\n    return a + b\n}")
+        );
+        let transformed = code_poc_row_with_eos(&row).expect("row should transform");
+        let (left, right) = transformed
+            .split_once('\t')
+            .expect("pair should remain a pair");
+
+        assert_eq!(unescape_pair_field(left), "write add");
+        assert!(
+            unescape_pair_field(right).ends_with(CODE_EOS_TOKEN),
+            "completion should end with code EOS"
+        );
+    }
+
+    #[test]
+    fn code_poc_fim_row_uses_go_function_body_as_middle() {
+        let code = "func Add(a int, b int) int {\n    total := a + b\n    return total\n}";
+        let row = format!(
+            "{}\t{}",
+            escape_pair_field("write Add"),
+            escape_pair_field(code)
+        );
+        let fim = code_poc_fim_row(&row).expect("Go function should produce FIM row");
+        let (left, right) = fim.split_once('\t').expect("FIM row should remain a pair");
+        let prompt = unescape_pair_field(left);
+        let target = unescape_pair_field(right);
+
+        assert!(prompt.contains("<fim_prefix>"));
+        assert!(prompt.contains("<fim_suffix>"));
+        assert!(prompt.contains("<fim_middle>"));
+        assert!(prompt.contains("func Add(a int, b int) int {"));
+        assert!(prompt.contains("}"));
+        assert!(target.contains("return total"));
+        assert!(target.ends_with(CODE_EOS_TOKEN));
+    }
+
+    #[test]
+    fn encoder_corpus_escape_preserves_code_layout() {
+        assert_eq!(
+            flatten_for_encoder("func main() {\\n    fmt.Println(\"hi\")\\n}"),
+            "func main() {\\n    fmt.Println(\"hi\")\\n}"
+        );
+    }
+
+    #[test]
+    fn world_mix_pair_parser_preserves_explicit_action_label() {
+        let (_left, right) =
+            split_pair_line_first_two("prompt\tanswer\ttext_reply").expect("pair should parse");
+        assert_eq!(right, "<action:text_reply> answer");
     }
 }

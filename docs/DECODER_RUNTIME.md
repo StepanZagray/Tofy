@@ -66,7 +66,7 @@ Decoder checkpoints written after this change include `conditioner=action_aware_
 
 ## Latent test-time reasoning
 
-Before the Candle or GGUF decoder receives conditioning, Tofy can refine the planned context slots in latent space. This follows the recurrent-depth test-time compute direction: spend compute on latent state updates, then decode once.
+Before the Candle or GGUF decoder receives conditioning, Tofy can refine the planned context slots in latent space. This follows the recurrent-depth test-time compute direction: spend compute on latent state updates, then decode once. Code eval disables this by default unless `TOFY_LATENT_REASONING` is already set, so eval remains comparable to direct decoder training.
 
 Useful controls:
 
@@ -79,13 +79,13 @@ Useful controls:
 
 ## Recursive decoder
 
-Decoder backends can be wrapped with the generic recursive decoder scaffold (`TOFY_DECODER_RLM=1`, default). The wrapper keeps the full request as external environment state, splits it into semantic work units, executes a small RLM command program, invokes `SUB_RLM` recursively on bounded snippets, and joins stored sub-call outputs as the final response. Each leaf call still runs through the selected decoder backend, so Candle leaves continue to use latent-prefix memory, compressed sparse/heavily-compressed self-attention, and precomputed cross-attention K/V.
+Decoder backends can be wrapped with the generic recursive decoder scaffold (`TOFY_DECODER_RLM=1`, default). The wrapper keeps the full request as external environment state, splits long prompts into semantic work units, executes a small RLM command program, invokes `SUB_RLM` recursively on bounded snippets, and joins stored sub-call outputs as the final response. Short code prompts no longer recurse just because the action is `code`; they recurse only when they meet `TOFY_DECODER_RLM_MIN_CHARS`. Code eval also defaults `TOFY_DECODER_RLM=0` unless explicitly overridden.
 
 Useful controls:
 
 - `TOFY_DECODER_RLM=0` disables the recursive decoder wrapper.
 - `TOFY_DECODER_RLM_ACTIONS=<csv>` selects wrapped actions, default `code,text,text_reply`.
-- `TOFY_DECODER_RLM_MIN_CHARS=<n>` is the non-code prompt length threshold, default `3600`.
+- `TOFY_DECODER_RLM_MIN_CHARS=<n>` is the prompt length threshold for recursive decoding, default `3600`.
 - `TOFY_DECODER_RLM_CHUNK_CHARS=<n>` sets semantic work-unit size, default `2400`.
 - `TOFY_DECODER_RLM_MAX_UNITS=<n>` caps root work units, default `8`.
 - `TOFY_DECODER_RLM_MAX_DEPTH=<n>` caps recursive `SUB_RLM` depth, default `3`.
@@ -93,3 +93,62 @@ Useful controls:
 - `TOFY_DECODER_RLM_LEAF_TOKENS=<tokens>` sets each leaf generation budget, default `256`.
 - `TOFY_DECODER_RLM_MODEL_PROGRAM=1` asks the decoder to draft the root command program; default `0` uses the deterministic semantic chunk program.
 - `TOFY_DECODER_RLM_PROGRAM_TOKENS=<tokens>` sets the root program generation budget, default `192`.
+
+## Pi-Style Tool-Calling Decoder
+
+Tofy can run an agentic decoder loop around the existing text/code decoder. The decoder emits one structured tool call, Tofy executes the matching bash command from a Pi-style Markdown skill, appends the `<tool_result>` to the transcript, re-encodes that expanded transcript, and repeats until the decoder returns a final answer or the step budget is exhausted.
+
+Enable it with either:
+
+```bash
+TOFY_AGENTIC_DECODER=1
+TOFY_TOOL_FILE=.pi/skills/read-file/SKILL.md
+```
+
+or point at a directory:
+
+```bash
+TOFY_AGENTIC_DECODER=1
+TOFY_TOOL_DIR=.pi/skills
+```
+
+Discovered default locations follow Pi conventions first:
+
+- `.pi/skills`
+- `.agents/skills`
+- `~/.pi/agent/skills`
+- `~/.agents/skills`
+
+Compatibility fallbacks are also checked: `TOOLS.md`, `.tofy/tools.md`, `.tofy/tools`, `.pi/prompts`, and `docs/TOOLS.md`.
+
+Supported Pi skill shape:
+
+````markdown
+---
+name: read-file
+description: Read a file from the current repository when file contents are needed.
+---
+
+# Read File
+
+## Usage
+
+```bash
+sed -n '1,220p' "$TOFY_ARG_PATH"
+```
+````
+
+The tool call emitted by the decoder should be:
+
+```xml
+<tool_call>{"tool":"read-file","args":{"path":"src/lib.rs"}}</tool_call>
+```
+
+Arguments are exposed to bash as `TOFY_ARG_<UPPER_KEY>`. Tofy also shell-quotes and substitutes `{{key}}` and `<key>` placeholders. Commands run from the skill file's directory with `TOFY_SKILL_DIR` set there and `TOFY_WORKSPACE` set to the served repository root, so Pi-style relative `./scripts/...` commands work.
+
+Useful controls:
+
+- `TOFY_AGENTIC_MAX_STEPS=<n>` caps tool-call rounds, default `4`.
+- `TOFY_AGENTIC_STEP_TOKENS=<n>` sets each tool-call decoding budget, default `384`.
+- `TOFY_TOOL_TIMEOUT_MS=<n>` caps each bash tool process, default `10000`.
+- `TOFY_TOOL_RESULT_CHARS=<n>` caps stdout/stderr returned to the next encoder pass, default `12000`.

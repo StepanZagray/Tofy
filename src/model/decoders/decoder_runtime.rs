@@ -201,7 +201,7 @@ impl RlmDecoderRuntime {
         if !Self::should_wrap_action(action) {
             return false;
         }
-        action.eq_ignore_ascii_case("code") || prompt.chars().count() >= cfg.min_chars
+        prompt.chars().count() >= cfg.min_chars
     }
 
     fn generate_rlm(
@@ -1017,4 +1017,40 @@ fn strip_ansi(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RlmDecoderConfig, RlmDecoderRuntime};
+
+    fn cfg() -> RlmDecoderConfig {
+        RlmDecoderConfig {
+            max_units: 1,
+            max_depth: 1,
+            max_ops: 4,
+            chunk_chars: 512,
+            min_chars: 1000,
+            leaf_tokens: 32,
+            program_tokens: 32,
+            root_prefix_chars: 128,
+            memory_chars: 256,
+            model_program: false,
+        }
+    }
+
+    #[test]
+    fn rlm_does_not_recurse_short_code_prompts() {
+        std::env::set_var("TOFY_DECODER_RLM", "1");
+        std::env::set_var("TOFY_DECODER_RLM_ACTIONS", "code,text,text_reply");
+
+        let should_recurse = RlmDecoderRuntime::should_recurse(
+            "Return only Go code. func Add(a int, b int) int",
+            "code",
+            &cfg(),
+        );
+        std::env::remove_var("TOFY_DECODER_RLM");
+        std::env::remove_var("TOFY_DECODER_RLM_ACTIONS");
+
+        assert!(!should_recurse);
+    }
 }

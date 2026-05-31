@@ -9,20 +9,24 @@ Current recommended pod target:
 - Ubuntu-like CUDA image with Rust build tools installed manually
 - regular pod volume mounted at `/workspace`
 - repo checkout at `/workspace/Tofy`
-- canonical training command: `./target/release/jepa_ai train 48gb`
+- canonical training command: `./target/release/jepa_ai train 48gb` or `./target/release/jepa_ai train 80gb`
 
 The `48gb` profile is defined in `config/model_profiles.json`: `DIM=768`,
 `LAYERS=12`, `HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code
 decoder `dim=768`, decoder layers `12`, decoder FF `3072`, code decoder
-`max_seq=192`, and recorded-checkpoint-scaled budgets of latent `4000`,
-world `10000`, high-world `2000`, code decoder `12000`, and Go feedback
-`3000`.
+`max_seq=256`, and current long-run budgets of latent `16000`, world `60000`,
+high-world `12000`, code decoder `80000`, and Go feedback `20000`.
 Current 48 GB training batches are encoder `48x11` (`528` effective), world
-`128x4` (`512` effective) with the encoder frozen, code decoder `128x2`
-(`256` effective), and Go feedback `256x1` (`256` effective). Decoder and Go-feedback pipeline stages
-pass `--conditioning-loss-weight 0.0` explicitly for throughput; direct manual
-decoder runs still default to the conditioning-margin loss unless that flag is
-provided.
+`128x4` (`512` effective) with the encoder frozen, code decoder `32x8`
+(`256` effective), and Go feedback `32x8` (`256` effective). Decoder and
+Go-feedback pipeline stages use conditioning-margin loss and prompt dropout so
+the decoder cannot solve training rows by ignoring the world state.
+
+The `80gb` profile is intended for A100/H100/RTX PRO 6000-class pods. It uses a
+larger `DIM=1024` world stack and a decoder with `dim=1536`, `layers=16`,
+`heads=16`, and `ff=6144`. Decoder microbatch stays small at `8` with
+`grad_accum=32` because larger microbatches mostly increase activation memory;
+use `--max-vram-probe --profile 80gb` before a long run.
 
 Do not paste API keys or full RunPod API responses into public logs. Pod
 responses can include environment variables.
@@ -284,9 +288,8 @@ Use the sustained probe when changing profile shapes or batch sizes:
 ## 8. Full Training
 
 Start a full 48 GB run. This command is intended to run unattended from data
-prep through latent, world, high-world, base code decoder, and Go-feedback
-decoder training. Do not add `--with-code-eval` to the main training launch;
-eval is a separate post-run step.
+prep through latent, world, high-world, base code decoder, Go-feedback decoder,
+verifier-guided decoder selection, and the final hard Go eval.
 
 ```bash
 cd /workspace/Tofy
@@ -303,7 +306,7 @@ Inside tmux:
 ```bash
 export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
-# Pipeline defaults set TOFY_CACHE_PREFETCH_BATCHES=4; keep this enabled unless
+# Pipeline defaults set TOFY_CACHE_PREFETCH_BATCHES=8 for 48gb and 12 for 80gb; keep this enabled unless
 # debugging input-order or memory issues. It now covers both raw and cached streams.
 
 /workspace/run-tofy-and-stop.sh \
@@ -320,6 +323,10 @@ builds `data/code_poc_go_mix.txt`, initializes the Go-feedback decoder from the
 base code decoder, and trains `runs/<run_id>/decoder_code_go_feedback/model.safetensors`
 without a separate manual command.
 
+You can run `cargo run --release -- prepare cache 48gb` locally first, then
+copy `data/`, `eval/`, and `local_models/vocabs/` to the pod to skip most of
+the CPU-heavy Stage 1 work there. Use the same profile as the pod training run.
+
 Monitor:
 
 ```bash
@@ -328,13 +335,14 @@ tail -f /workspace/tofy-train-48gb.log
 nvidia-smi
 ```
 
-## 9. Post-Training Go Eval
+## 9. Manual Go Eval
 
-Run eval only after the full training command has completed. This is the
-Golang eval path: `--generate-go-code-eval-suite` writes `language: "go"` tasks,
-and `--eval-code-assistant` runs those tasks through a temporary `go test`
-harness. The command below uses the newest `runs/code_poc_*` directory; set
-`RUN_ID` manually if you want to evaluate a specific run.
+The full training pipeline already runs this Go eval and uses it for decoder
+promotion. Use the manual command only when you want to rescore a specific
+checkpoint. `--generate-go-code-eval-suite` writes `language: "go"` tasks, and
+`--eval-code-assistant` runs those tasks through a temporary `go test` harness.
+The command below uses the newest `runs/code_poc_*` directory; set `RUN_ID`
+manually if you want to evaluate a specific run.
 
 ```bash
 cd /workspace/Tofy
@@ -349,16 +357,16 @@ test -n "${RUN_ID}"
   runs/${RUN_ID}/latent/model.vocab.txt \
   runs/${RUN_ID}/world/model.safetensors \
   eval/code_assistant_go_hard.jsonl \
-  384 1024 256 12 16 1024 96 \
+  384 768 256 12 16 768 96 \
   --high-world-model runs/${RUN_ID}/high_world/model.safetensors \
   --code-decoder runs/${RUN_ID}/decoder_code_go_feedback/model.safetensors \
   --go-timeout-sec 6 \
   2>&1 | tee /workspace/tofy-go-eval-${RUN_ID}.log
 ```
 
-Use `--with-code-eval` only for deliberate debug runs where eval should be
-attached to a resumed pipeline invocation. It is not the default pod training
-path.
+Assistant eval defaults to deterministic direct decoding unless you explicitly
+export different values: `JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, and
+`TOFY_LATENT_REASONING=0`.
 
 ## 10. Resume
 

@@ -30,6 +30,8 @@ pub struct TokenizerSpec {
     pub mode: String,
     pub normalization: String,
     pub pretokenizer: String,
+    #[serde(default)]
+    pub code_control_tokens: Vec<String>,
     pub byte_fallback: bool,
     pub reserved_byte_tokens: bool,
     pub subword_identifier_fallback: bool,
@@ -48,21 +50,42 @@ impl TokenizationMode {
     }
 }
 
-const TOKENIZER_SPEC_VERSION: u32 = 5;
+pub const CODE_EOS_TOKEN: &str = "<eos_code>";
+pub const CODE_CONTROL_TOKENS: &[&str] = &[
+    "<fim_prefix>",
+    "<fim_suffix>",
+    "<fim_middle>",
+    CODE_EOS_TOKEN,
+];
+
+const TOKENIZER_SPEC_VERSION: u32 = 8;
 
 pub fn tokenizer_spec(mode: TokenizationMode) -> TokenizerSpec {
+    let code_aware = mode == TokenizationMode::CodeAware;
     TokenizerSpec {
         version: TOKENIZER_SPEC_VERSION,
         mode: mode.as_str().to_string(),
         normalization: "identity_utf8".to_string(),
-        pretokenizer: "none".to_string(),
-        byte_fallback: false,
-        reserved_byte_tokens: false,
+        pretokenizer: if code_aware {
+            "code_lexical_v1".to_string()
+        } else {
+            "none".to_string()
+        },
+        code_control_tokens: if code_aware {
+            CODE_CONTROL_TOKENS
+                .iter()
+                .map(|token| token.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        byte_fallback: true,
+        reserved_byte_tokens: true,
         subword_identifier_fallback: false,
-        byte_token_format: "none".to_string(),
-        byte_native: false,
-        adaptive_boundaries: false,
-        boundaryless_bpe: true,
+        byte_token_format: "<byte:XX>".to_string(),
+        byte_native: true,
+        adaptive_boundaries: code_aware,
+        boundaryless_bpe: !code_aware,
     }
 }
 
@@ -104,9 +127,76 @@ fn tokenize_text(text: &str) -> Vec<String> {
     text.chars().map(|ch| ch.to_string()).collect()
 }
 
-fn tokenize_with_mode(text: &str, mode: TokenizationMode) -> Vec<String> {
+fn code_aware_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let mut chunk = String::new();
+        chunk.push(ch);
+        if ch.is_ascii_whitespace() {
+            while let Some(next) = chars.peek().copied() {
+                if !next.is_ascii_whitespace() {
+                    break;
+                }
+                chunk.push(next);
+                chars.next();
+            }
+        } else if ch == '_' || ch.is_ascii_alphabetic() {
+            while let Some(next) = chars.peek().copied() {
+                if !(next == '_' || next.is_ascii_alphanumeric()) {
+                    break;
+                }
+                chunk.push(next);
+                chars.next();
+            }
+        } else if ch.is_ascii_digit() {
+            while let Some(next) = chars.peek().copied() {
+                if !(next == '_' || next == '.' || next.is_ascii_alphanumeric()) {
+                    break;
+                }
+                chunk.push(next);
+                chars.next();
+            }
+        } else if ch == '"' || ch == '\'' || ch == '`' {
+            let quote = ch;
+            let mut escaped = false;
+            for next in chars.by_ref() {
+                chunk.push(next);
+                if quote != '`' && escaped {
+                    escaped = false;
+                    continue;
+                }
+                if quote != '`' && next == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if next == quote {
+                    break;
+                }
+            }
+        } else if ch.is_ascii_punctuation() {
+            while let Some(next) = chars.peek().copied() {
+                if !next.is_ascii_punctuation()
+                    || next == '_'
+                    || next == '"'
+                    || next == '\''
+                    || next == '`'
+                {
+                    break;
+                }
+                chunk.push(next);
+                chars.next();
+            }
+        }
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+pub fn tokenize_with_mode(text: &str, mode: TokenizationMode) -> Vec<String> {
     match mode {
-        TokenizationMode::Default | TokenizationMode::CodeAware => tokenize_text(text),
+        TokenizationMode::Default => tokenize_text(text),
+        TokenizationMode::CodeAware => code_aware_chunks(text),
     }
 }
 
@@ -128,10 +218,10 @@ pub fn split_line_with_min_tokens_mode(
     if line.is_empty() {
         return None;
     }
-    let tokens = if let Some((left, _right)) = line.split_once("\t") {
-        tokenize_with_mode(left, mode)
-    } else if let Some((left, _right)) = line.split_once("|||") {
-        tokenize_with_mode(left, mode)
+    let tokens = if let Some((left, right)) = line.split_once("\t") {
+        tokenize_with_mode(&format!("{left}\n{right}"), mode)
+    } else if let Some((left, right)) = line.split_once("|||") {
+        tokenize_with_mode(&format!("{left}\n{right}"), mode)
     } else {
         tokenize_with_mode(line, mode)
     };
@@ -152,7 +242,7 @@ pub fn encode_line_with_vocab_mode(
     if token_count < min_tokens {
         return None;
     }
-    Some(vocab.encode_boundless(&text))
+    Some(encode_text_with_vocab_mode(&text, vocab, mode))
 }
 
 fn extract_text_side_for_vocab(line: &str) -> Option<String> {
@@ -160,24 +250,29 @@ fn extract_text_side_for_vocab(line: &str) -> Option<String> {
     if line.is_empty() {
         return None;
     }
-    if let Some((left, _right)) = line.split_once('\t') {
-        return Some(unescape_pair_field(left.trim()));
+    if let Some((left, right)) = line.split_once('\t') {
+        return Some(format!(
+            "{}\n{}",
+            unescape_pair_field(left.trim()),
+            unescape_pair_field(right.trim())
+        ));
     }
-    if let Some((left, _right)) = line.split_once("|||") {
-        return Some(unescape_pair_field(left.trim()));
+    if let Some((left, right)) = line.split_once("|||") {
+        return Some(format!(
+            "{}\n{}",
+            unescape_pair_field(left.trim()),
+            unescape_pair_field(right.trim())
+        ));
     }
-    Some(line.to_string())
+    Some(unescape_pair_field(line))
 }
 
 fn flatten_pair_side(text: &str) -> Option<String> {
-    let flattened = unescape_pair_field(text.trim())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if flattened.is_empty() {
+    let text = unescape_pair_field(text.trim());
+    if text.trim().is_empty() {
         None
     } else {
-        Some(flattened)
+        Some(text)
     }
 }
 
@@ -256,9 +351,7 @@ fn parse_action_label_str(value: &str) -> Option<u32> {
         "1" | "code" | "inspect_file" | "read_file" | "edit_file" | "apply_patch" | "run_tests"
         | "read_error" | "repair_patch" | "compiler_feedback" => Some(ACTION_CODE),
         "2" | "done" | "final" | "finalize" | "stop" => Some(ACTION_DONE),
-        "3" | "fetch_docs" | "docs" | "rust_docs" | "retrieve_docs" | "doc_lookup" => {
-            Some(ACTION_FETCH_DOCS)
-        }
+        "3" | "fetch_docs" | "docs" | "retrieve_docs" | "doc_lookup" => Some(ACTION_FETCH_DOCS),
         _ => None,
     }
 }
@@ -310,37 +403,26 @@ pub fn action_label_heuristic(next_turn: &str) -> u32 {
         return ACTION_CODE; // code block
     }
     let lower = s.to_ascii_lowercase();
-    if lower.contains("<ctx:rust_docs>")
-        || lower.contains("<tool:fetch_docs>")
-        || lower.contains("<action:fetch_docs>")
-    {
+    if lower.contains("<tool:fetch_docs>") || lower.contains("<action:fetch_docs>") {
         return ACTION_FETCH_DOCS;
     }
     let code_keywords = [
-        "fn ",
-        "let ",
         "const ",
         "var ",
-        "function ",
-        "def ",
-        "class ",
-        "struct ",
-        "enum ",
-        "impl ",
-        "import ",
-        "from ",
-        "return ",
-        "pub ",
-        "use ",
-        "async ",
-        "await ",
-        "#include",
+        "func ",
         "package ",
-        "interface ",
+        "package main",
         "type ",
+        "struct ",
+        "interface ",
+        "import ",
+        "return ",
+        "defer ",
+        "go ",
+        "range ",
         "select ",
-        "insert ",
-        "update ",
+        "chan ",
+        "map[",
     ];
     let prose_markers = ["i think", "you can", "here is", "this means", "for example"];
     let mut code_score = 0usize;
@@ -378,19 +460,14 @@ pub fn action_label_heuristic(next_turn: &str) -> u32 {
         if line.starts_with("    ") || line.starts_with('\t') {
             code_score += 2;
         }
-        if trimmed.ends_with('{')
-            || trimmed.ends_with("};")
-            || trimmed.contains("::")
-            || trimmed.contains("->")
-            || trimmed.contains("=>")
-        {
+        if trimmed.ends_with('{') || trimmed.contains(":=") || trimmed.contains("func ") {
             code_score += 2;
         }
         if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
             prose_score += 1;
         }
         let word_count = trimmed.split_whitespace().count();
-        if word_count >= 8 && !trimmed.contains("::") && !trimmed.contains("->") {
+        if word_count >= 8 && !trimmed.contains(":=") && !trimmed.contains("func ") {
             prose_score += 1;
         }
     }
@@ -427,9 +504,13 @@ pub fn raw_world_example_from_line_with_mode(
     let (left, right, explicit_action) = parse_world_line_fields(line)?;
     let state_text = left;
     let mut next_text = right;
+    let embedded_action = explicit_action_from_next_text(&next_text);
     let action_label = if let Some(action) = explicit_action {
+        if let Some((_embedded_action, stripped)) = embedded_action {
+            next_text = stripped;
+        }
         action
-    } else if let Some((action, stripped)) = explicit_action_from_next_text(&next_text) {
+    } else if let Some((action, stripped)) = embedded_action {
         next_text = stripped;
         action
     } else {
@@ -454,16 +535,8 @@ pub fn encode_raw_world_line_with_vocab_mode(
 ) -> Option<WorldExample> {
     let row = raw_world_example_from_line_with_mode(line, mode)?;
     Some(WorldExample {
-        state_tokens: encode_tokens_with_vocab(
-            &tokenize_with_mode(&row.state_text, mode),
-            vocab,
-            mode,
-        ),
-        next_tokens: encode_tokens_with_vocab(
-            &tokenize_with_mode(&row.next_text, mode),
-            vocab,
-            mode,
-        ),
+        state_tokens: encode_text_with_vocab_mode(&row.state_text, vocab, mode),
+        next_tokens: encode_text_with_vocab_mode(&row.next_text, vocab, mode),
         action_label: row.action_label,
     })
 }
@@ -473,9 +546,9 @@ pub const DEFAULT_MIN_TOKENS_PER_LINE: usize = 2;
 pub const DEFAULT_STREAM_SHUFFLE_BUFFER: usize = 1024;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
-const DEFAULT_TOKEN_CACHE_READER_MB: usize = 8;
-const DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 2;
-const MAX_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 16;
+const DEFAULT_TOKEN_CACHE_READER_MB: usize = 32;
+const DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 8;
+const MAX_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 32;
 const DEFAULT_VOCAB_SCAN_PROGRESS_EVERY_ROWS: usize = 500_000;
 const DEFAULT_VOCAB_SCAN_CHUNK_LINES: usize = 16_384;
 const DEFAULT_BPE_PROGRESS_EVERY_MERGES: usize = 250;
@@ -1347,9 +1420,13 @@ impl RawWorldStream {
             };
             let state_text = left;
             let mut next_text = right;
+            let embedded_action = explicit_action_from_next_text(&next_text);
             let action_label = if let Some(action) = explicit_action {
+                if let Some((_embedded_action, stripped)) = embedded_action {
+                    next_text = stripped;
+                }
                 action
-            } else if let Some((action, stripped)) = explicit_action_from_next_text(&next_text) {
+            } else if let Some((action, stripped)) = embedded_action {
                 next_text = stripped;
                 action
             } else {
@@ -2042,33 +2119,39 @@ fn build_masked_view_from_ids(
         .enumerate()
         .filter_map(|(idx, &id)| is_text_boundary_token(token_str(vocab, id)).then_some(idx))
         .collect();
-    let ratio_scale = if code_like {
-        cfg.code_masked_ratio_multiplier
+    let ratio_multiplier = if code_like {
+        cfg.code_masked_ratio_multiplier.max(1.0)
     } else {
         1.0
     };
-    let min_ratio = (cfg.min_masked_ratio * ratio_scale).clamp(0.01, 0.60);
-    let max_ratio = (cfg.max_masked_ratio * ratio_scale).clamp(min_ratio, 0.70);
-    let sampled_ratio = if max_ratio > min_ratio {
-        rng.random_range(min_ratio..=max_ratio)
+    let min_ratio = (cfg.min_masked_ratio * ratio_multiplier).clamp(0.08, 0.9);
+    let max_ratio = (cfg.max_masked_ratio * ratio_multiplier).clamp(min_ratio, 0.9);
+    let min_masked = (valid_positions.len() as f64 * min_ratio).ceil() as usize;
+    let min_masked = min_masked.max(1).min(valid_positions.len());
+    let max_masked = (valid_positions.len() as f64 * max_ratio).ceil() as usize;
+    let max_masked = max_masked.max(min_masked).min(valid_positions.len());
+    let target_masked = if min_masked >= max_masked {
+        max_masked
     } else {
-        min_ratio
+        rng.random_range(min_masked..=max_masked)
     };
-    let target_masked = ((valid_len as f64) * sampled_ratio).ceil() as usize;
-    let target_masked = target_masked.max(1).min(valid_len);
-    let span_len_cap = cfg.max_span_len.max(1).min(valid_len.max(1));
-    let span_count_cap = cfg.max_spans_per_sample.max(1);
+    let span_count = rng.random_range(1..=cfg.max_spans_per_sample.max(1));
+    let mut span_len_cap = cfg.max_span_len.max(1);
+    if code_like {
+        span_len_cap = ((span_len_cap as f64) * cfg.code_span_multiplier).round() as usize;
+        span_len_cap = span_len_cap.max(1);
+    }
     let mut selected: HashSet<usize> = HashSet::new();
 
-    for _ in 0..span_count_cap {
+    for span_idx in 0..span_count {
         if selected.len() >= target_masked {
             break;
         }
         let use_identifier_focus = code_like
             && !identifier_positions.is_empty()
-            && rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0));
-        let use_comment_focus =
-            code_like && !comment_positions.is_empty() && rng.random_bool(cfg.comment_focus_prob);
+            && (span_idx == 0 || rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
+        let use_comment_focus = !comment_positions.is_empty()
+            && rng.random_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
         let use_block_focus = code_like
             && !block_positions.is_empty()
             && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
@@ -2265,6 +2348,10 @@ pub fn make_jepa_batch_from_pairs(
 
     for (b, pair) in pairs.iter().enumerate() {
         let mut seq = pair.tokens.clone();
+        if seq.len() > max_seq {
+            let start = seq.len() - max_seq;
+            seq.drain(..start);
+        }
         pad_or_truncate(&mut seq, max_seq, pad_id);
         let target_seq = seq.clone();
         let mut context_seq = seq;
@@ -2338,13 +2425,54 @@ pub fn tokenize_for_inference_mode(text: &str, mode: TokenizationMode) -> Vec<St
     tokenize_with_mode(text, mode)
 }
 
-fn encode_tokens_with_vocab(tokens: &[String], vocab: &Vocab, _mode: TokenizationMode) -> Vec<u32> {
-    vocab.encode(tokens)
+pub fn encode_text_with_vocab_mode(text: &str, vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
+    match mode {
+        TokenizationMode::Default => vocab.encode_boundless(text),
+        TokenizationMode::CodeAware => encode_code_aware_text(text, vocab),
+    }
 }
 
-pub fn encode_text_with_vocab_mode(text: &str, vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
-    let _ = mode;
-    vocab.encode_boundless(text)
+fn encode_code_aware_text(text: &str, vocab: &Vocab) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        if let Some(token) = CODE_CONTROL_TOKENS
+            .iter()
+            .copied()
+            .find(|token| text[start..].starts_with(token))
+        {
+            if let Some(&id) = vocab.token_to_id.get(token) {
+                ids.push(id);
+                start += token.len();
+                continue;
+            }
+        }
+        let next_special = CODE_CONTROL_TOKENS
+            .iter()
+            .filter_map(|token| text[start..].find(token).map(|idx| start + idx))
+            .filter(|&idx| idx > start)
+            .min()
+            .unwrap_or(text.len());
+        let end = if next_special > start {
+            next_special
+        } else {
+            start
+                + text[start..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1)
+        };
+        for chunk in code_aware_chunks(&text[start..end]) {
+            if let Some(&id) = vocab.token_to_id.get(&chunk) {
+                ids.push(id);
+            } else {
+                ids.extend(vocab.encode_boundless(&chunk));
+            }
+        }
+        start = end;
+    }
+    ids
 }
 
 pub fn encode_world_examples(rows: &[RawWorldExample], vocab: &Vocab) -> Vec<WorldExample> {
@@ -2402,7 +2530,15 @@ fn apply_merge_to_sequence(seq: &mut Vec<u32>, left: u32, right: u32, merged: u3
     *seq = out;
 }
 
-fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
+fn train_bpe_from_texts_by_chunker<F>(
+    texts: &[String],
+    max_vocab: usize,
+    label: &str,
+    chunker: F,
+) -> Result<(Vocab, usize)>
+where
+    F: Fn(&str) -> Vec<String> + Sync,
+{
     if texts.is_empty() {
         bail!("cannot train tokenizer on empty text set");
     }
@@ -2410,8 +2546,10 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
     let char_counts = texts
         .par_iter()
         .fold(HashMap::new, |mut counts, text| {
-            for ch in text.chars() {
-                *counts.entry(ch).or_insert(0) += 1;
+            for chunk in chunker(text) {
+                for ch in chunk.chars() {
+                    *counts.entry(ch).or_insert(0) += 1;
+                }
             }
             counts
         })
@@ -2425,6 +2563,12 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
     chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut vocab = Vocab::new();
+    vocab.ensure_byte_tokens();
+    if label == "code-aware" {
+        for token in CODE_CONTROL_TOKENS {
+            vocab.add_token(token);
+        }
+    }
     for (token, _) in chars {
         if vocab.id_to_token.len() >= max_vocab {
             break;
@@ -2447,10 +2591,25 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         .collect::<HashMap<_, _>>();
     let mut sequences = texts
         .par_iter()
-        .map(|text| {
-            text.chars()
-                .map(|ch| *char_ids.get(&ch).unwrap_or(&vocab.unk_id))
-                .collect::<Vec<_>>()
+        .flat_map_iter(|text| {
+            chunker(text).into_iter().map(|chunk| {
+                let mut ids = Vec::new();
+                for ch in chunk.chars() {
+                    if let Some(&id) = char_ids.get(&ch) {
+                        ids.push(id);
+                    } else {
+                        let mut buf = [0u8; 4];
+                        ids.extend(ch.encode_utf8(&mut buf).as_bytes().iter().map(|byte| {
+                            vocab
+                                .token_to_id
+                                .get(&format!("<byte:{byte:02X}>"))
+                                .copied()
+                                .unwrap_or(vocab.unk_id)
+                        }));
+                    }
+                }
+                ids
+            })
         })
         .filter(|seq| !seq.is_empty())
         .collect::<Vec<_>>();
@@ -2462,7 +2621,7 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         .unwrap_or(possible_merges);
     if target_merges < possible_merges {
         println!(
-            "BPE merge budget capped: target_merges={target_merges}, requested_vocab={max_vocab}, initial_vocab={initial_vocab_len}"
+            "{label} BPE merge budget capped: target_merges={target_merges}, requested_vocab={max_vocab}, initial_vocab={initial_vocab_len}"
         );
     }
     let progress_every = bpe_progress_every_merges();
@@ -2472,6 +2631,10 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         let best = pair_counts
             .into_iter()
             .filter(|(_, count)| *count >= 2)
+            .filter(|((left, right), _)| {
+                !vocab.id_to_token[*left as usize].starts_with("<byte:")
+                    && !vocab.id_to_token[*right as usize].starts_with("<byte:")
+            })
             .max_by(|((l1, r1), c1), ((l2, r2), c2)| {
                 c1.cmp(c2)
                     .then_with(|| {
@@ -2496,7 +2659,7 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
         if merges_applied.is_multiple_of(progress_every) {
             let elapsed = start.elapsed().as_secs_f32();
             println!(
-                "BPE merge progress: {merges_applied}/{target_merges} merges, vocab={}, elapsed={elapsed:.1}s",
+                "{label} BPE merge progress: {merges_applied}/{target_merges} merges, vocab={}, elapsed={elapsed:.1}s",
                 vocab.id_to_token.len()
             );
         }
@@ -2505,10 +2668,18 @@ fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<
     let total_tokens = sequences.iter().map(|seq| seq.len()).sum();
     let elapsed = start.elapsed().as_secs_f32();
     println!(
-        "BPE training complete: merges_applied={merges_applied}, vocab={}, elapsed={elapsed:.1}s",
+        "{label} BPE training complete: merges_applied={merges_applied}, vocab={}, elapsed={elapsed:.1}s",
         vocab.id_to_token.len()
     );
     Ok((vocab, total_tokens))
+}
+
+fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
+    train_bpe_from_texts_by_chunker(texts, max_vocab, "boundless", |text| vec![text.to_string()])
+}
+
+fn train_code_aware_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
+    train_bpe_from_texts_by_chunker(texts, max_vocab, "code-aware", code_aware_chunks)
 }
 
 pub fn build_vocab_from_raw_world_file_with_mode(
@@ -2599,7 +2770,11 @@ pub fn build_vocab_from_raw_world_file_with_mode(
     if row_count == 0 {
         bail!("cannot build vocab from empty raw world file {:?}", path);
     }
-    let (vocab, total_tokens) = train_boundless_bpe_from_texts(&texts, max_vocab)?;
+    let (vocab, total_tokens) = if mode == TokenizationMode::CodeAware {
+        train_code_aware_bpe_from_texts(&texts, max_vocab)?
+    } else {
+        train_boundless_bpe_from_texts(&texts, max_vocab)?
+    };
     let vocab_len = vocab.id_to_token.len();
     Ok((
         vocab,
@@ -2670,11 +2845,16 @@ fn encode_sequence(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32>, us
     for &id in tokens.iter().take(max_seq) {
         seq.push(id);
     }
-    let length = seq.len().max(1);
+    let length = seq.len();
     while seq.len() < max_seq {
         seq.push(pad_id);
     }
     (seq, length)
+}
+
+fn encode_sequence_tail(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32>, usize) {
+    let start = tokens.len().saturating_sub(max_seq);
+    encode_sequence(&tokens[start..], max_seq, pad_id)
 }
 
 /// Build decoder teacher-forcing batch from world batch.
@@ -2737,11 +2917,22 @@ pub fn make_decoder_batch(
 
 /// Build decoder teacher-forcing tensors directly from CPU token rows.
 ///
-/// This matches `make_decoder_batch` without the state/next GPU tensor round trip.
+/// Long prompts keep their tail so late instructions and compiler feedback remain visible.
 pub fn make_decoder_batch_from_slice(
     rows: &[WorldExample],
     max_seq: usize,
     pad_id: u32,
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    make_decoder_batch_from_slice_with_prompt_dropout(rows, max_seq, pad_id, pad_id, 0.0, device)
+}
+
+pub fn make_decoder_batch_from_slice_with_prompt_dropout(
+    rows: &[WorldExample],
+    max_seq: usize,
+    pad_id: u32,
+    drop_id: u32,
+    prompt_dropout: f64,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let batch_size = rows.len();
@@ -2749,14 +2940,22 @@ pub fn make_decoder_batch_from_slice(
     let mut input_buf = Vec::with_capacity(batch_size * decoder_len);
     let mut target_buf = Vec::with_capacity(batch_size * decoder_len);
     let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
+    let prompt_dropout = prompt_dropout.clamp(0.0, 1.0);
+    let mut rng = rng();
 
     for row in rows {
-        let (state_seq, state_len) = encode_sequence(&row.state_tokens, max_seq, pad_id);
-        let (next_seq, next_len) = encode_sequence(&row.next_tokens, max_seq, pad_id);
+        let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
+        let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
         let sl = state_len.min(max_seq);
         let nl = next_len.min(max_seq);
 
-        input_buf.extend(state_seq.iter().take(sl).copied());
+        input_buf.extend(state_seq.iter().take(sl).map(|token| {
+            if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
+                drop_id
+            } else {
+                *token
+            }
+        }));
         input_buf.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
         let input_len = sl + nl.saturating_sub(1);
         input_buf.extend(std::iter::repeat_n(
@@ -2801,8 +3000,8 @@ pub fn make_world_batch_from_slice(
     let mut action_labels = Vec::with_capacity(batch_size);
 
     for row in rows {
-        let (state_seq, state_len) = encode_sequence(&row.state_tokens, max_seq, pad_id);
-        let (next_seq, next_len) = encode_sequence(&row.next_tokens, max_seq, pad_id);
+        let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
+        let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
         state_buf.extend(state_seq);
         next_buf.extend(next_seq);
         state_lens.push(state_len);
@@ -2858,5 +3057,112 @@ mod tests {
 
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn decoder_batch_keeps_tail_of_long_prompt() -> Result<()> {
+        let device = Device::Cpu;
+        let row = WorldExample {
+            state_tokens: vec![10, 11, 12, 13, 14],
+            next_tokens: vec![20, 21, 22],
+            action_label: ACTION_CODE,
+        };
+
+        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
+
+        assert_eq!(input.to_vec2::<u32>()?[0], vec![12, 13, 14, 20, 21, 0]);
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 20, 21, 22, 0]);
+        assert_eq!(
+            mask.to_vec2::<f32>()?[0],
+            vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_batch_does_not_train_on_empty_target_pad() -> Result<()> {
+        let device = Device::Cpu;
+        let row = WorldExample {
+            state_tokens: vec![10, 11],
+            next_tokens: Vec::new(),
+            action_label: ACTION_CODE,
+        };
+
+        let (_input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
+
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 0, 0, 0, 0]);
+        assert_eq!(mask.to_vec2::<f32>()?[0], vec![0.0; 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_batch_keeps_tail_of_long_target() -> Result<()> {
+        let device = Device::Cpu;
+        let row = WorldExample {
+            state_tokens: vec![10, 11],
+            next_tokens: vec![20, 21, 22, 23, 24],
+            action_label: ACTION_CODE,
+        };
+
+        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
+
+        assert_eq!(input.to_vec2::<u32>()?[0], vec![10, 11, 22, 23, 0, 0]);
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 22, 23, 24, 0, 0]);
+        assert_eq!(
+            mask.to_vec2::<f32>()?[0],
+            vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn world_batch_keeps_state_and_next_tail() -> Result<()> {
+        let device = Device::Cpu;
+        let row = WorldExample {
+            state_tokens: vec![10, 11, 12, 13],
+            next_tokens: vec![20, 21, 22, 23],
+            action_label: ACTION_CODE,
+        };
+
+        let (state, next, state_lens, next_lens, labels) =
+            make_world_batch_from_slice(&[row], 3, 0, &device)?;
+
+        assert_eq!(state.to_vec2::<u32>()?[0], vec![11, 12, 13]);
+        assert_eq!(next.to_vec2::<u32>()?[0], vec![21, 22, 23]);
+        assert_eq!(state_lens, vec![3]);
+        assert_eq!(next_lens, vec![3]);
+        assert_eq!(labels, vec![ACTION_CODE]);
+        Ok(())
+    }
+
+    #[test]
+    fn pair_line_tokenization_includes_completion_side() {
+        let tokens = split_line_with_min_tokens_mode(
+            "prompt words\tcompletion_tail",
+            1,
+            TokenizationMode::Default,
+        )
+        .expect("pair should tokenize");
+
+        assert!(tokens.concat().contains("completion_tail"));
+    }
+
+    #[test]
+    fn prose_with_common_words_does_not_default_to_code() {
+        let text = "You can use ideas from the type of example above in your explanation.";
+
+        assert_eq!(action_label_heuristic(text), ACTION_TEXT_REPLY);
+    }
+
+    #[test]
+    fn explicit_column_action_strips_embedded_action_prefix() {
+        let row = raw_world_example_from_line_with_mode(
+            "prompt\t<action:text_reply> This is prose.\ttext_reply",
+            TokenizationMode::Default,
+        )
+        .expect("row should parse");
+
+        assert_eq!(row.action_label, ACTION_TEXT_REPLY);
+        assert_eq!(row.next_text, "This is prose.");
     }
 }

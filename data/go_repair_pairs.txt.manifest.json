@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "kind": "go_repair_pairs",
+  "output_path": "data/go_repair_pairs.txt",
+  "params": {
+    "cache_strategy": "shared-warmed-go-build-cache-v1",
+    "go_bin": "go",
+    "go_version": "go version go1.26.3-X:nodwarf5 linux/amd64",
+    "max_rows": 60000,
+    "seed": 0,
+    "timeout_sec": 5.0,
+    "variants_per_sample": 4,
+    "workers": 14
+  },
+  "inputs": [
+    {
+      "path": "data/go_instruction_pairs.txt",
+      "len": 457985055,
+      "modified_unix_nanos": 1780262004989674300,
+      "content_hash": "81eae4d94d9eec02b7bcb75d85a2d6cc231c4c81364926c8656957d6691498fc"
+    }
+  ],
+  "rows": 60000
+}

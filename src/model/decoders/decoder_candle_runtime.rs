@@ -12,8 +12,18 @@ use std::path::{Path, PathBuf};
 use super::{
     CodeDecoder, DecoderArchitecture, DecoderConditioningAdapter, DecoderKind, LocalDecoderRuntime,
 };
-use crate::data::{encode_text_with_vocab_mode, TokenizationMode};
+use crate::data::{
+    encode_text_with_vocab_mode, TokenizationMode, CODE_CONTROL_TOKENS, CODE_EOS_TOKEN,
+};
 use crate::model::vocab::{load_vocab_from_file, vocab_signature, Vocab};
+
+const DECODER_STOP_TOKENS: &[&str] = &[
+    CODE_EOS_TOKEN,
+    "<eos>",
+    "</s>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+];
 
 /// Decoder backend that runs the Candle CodeDecoder with cross-attention to the world latent sequence.
 /// Expects conditioning to be the **flattened** latent sequence (length = num_latent_tokens * world_dim).
@@ -47,7 +57,7 @@ impl CandleCrossAttnDecoder {
         architecture: DecoderArchitecture,
     ) -> Result<()> {
         let metadata = format!(
-            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v1\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v1\ndecoder_arch=rope_rmsnorm_swiglu_tied_v2\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
             kind.as_str(),
             vocab_signature(vocab),
             vocab.id_to_token.len(),
@@ -474,6 +484,16 @@ impl CandleCrossAttnDecoder {
             })
             .collect())
     }
+
+    fn is_stop_id(&self, token_id: u32) -> bool {
+        if token_id == self.vocab.pad_id {
+            return true;
+        }
+        self.vocab
+            .id_to_token
+            .get(token_id as usize)
+            .is_some_and(|token| DECODER_STOP_TOKENS.contains(&token.as_str()))
+    }
 }
 
 impl LocalDecoderRuntime for CandleCrossAttnDecoder {
@@ -522,7 +542,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         let mut generated = Vec::new();
         for _ in 0..max_new_tokens {
             let next_id = self.sample_next_id(&state)?;
-            if next_id == self.vocab.pad_id {
+            if self.is_stop_id(next_id) {
                 break;
             }
             generated.push(next_id);
@@ -575,7 +595,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             .begin_generation(&self.device, &prompt_ids, &world_latent)?;
         for _ in 0..max_new_tokens {
             let next_id = self.sample_next_id(&state)?;
-            if next_id == self.vocab.pad_id {
+            if self.is_stop_id(next_id) {
                 break;
             }
             let token_str = self
@@ -625,6 +645,15 @@ fn apply_conditioning_budget(context_slots: Tensor) -> Result<Tensor> {
 /// Public so world.rs can clean the accumulated segment when building assistant_content from streamed chunks.
 pub fn clean_candle_decoder_output(raw: &str) -> String {
     let mut s = raw.trim().to_string();
+    for marker in DECODER_STOP_TOKENS
+        .iter()
+        .chain(CODE_CONTROL_TOKENS.iter())
+        .copied()
+    {
+        if let Some(pos) = s.find(marker) {
+            s = s[..pos].to_string();
+        }
+    }
     // Drop content after a new turn (model echoing User: or Assistant:).
     for sep in ["\nUser:", "\nAssistant:", "\n\nUser:", "\n\nAssistant:"] {
         if let Some(pos) = s.find(sep) {

@@ -16,16 +16,20 @@ const WIKI_DATA: &str = "data/cached_wikimedia_wikipedia_1.txt";
 const ENCODER_DATA: &str = "data/encoder_mix.txt";
 const EVAL_SUITE: &str = "eval/code_assistant_go_hard.jsonl";
 const GO_TASK_DATA: &str = "data/go_instruction_pairs.txt";
+const GO_ALGORITHM_TASK_DATA: &str = "data/go_algorithm_pairs.txt";
+const GO_SEMANTIC_TASK_DATA: &str = "data/go_semantic_pairs.txt";
 const GO_REPAIR_DATA: &str = "data/go_repair_pairs.txt";
 const GO_FEEDBACK_TRAIN_DATA: &str = "data/code_poc_go_mix.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
 const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
+const DEFAULT_HF_CACHE_REPO: &str = "Grayza/model-go-cache";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemoryProfile {
     Eight,
     FortyEight,
+    Eighty,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -67,6 +71,8 @@ struct ModelProfiles {
     eight_gb: ProfileDefaults,
     #[serde(rename = "48gb")]
     forty_eight_gb: ProfileDefaults,
+    #[serde(rename = "80gb")]
+    eighty_gb: ProfileDefaults,
 }
 
 #[derive(Debug)]
@@ -153,12 +159,47 @@ pub fn try_run_pipeline(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+pub fn try_run_prepare_cache(args: &[String]) -> Result<bool> {
+    let rest = if args.get(1).is_some_and(|arg| arg == "prepare")
+        && args.get(2).is_some_and(|arg| arg == "cache")
+    {
+        &args[3..]
+    } else if args
+        .get(1)
+        .is_some_and(|arg| arg == "prepare-cache" || arg == "--prepare-cache")
+    {
+        &args[2..]
+    } else {
+        return Ok(false);
+    };
+
+    let profile_arg = rest.first().ok_or_else(|| {
+        anyhow::anyhow!("usage: prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload]")
+    })?;
+    let profile = MemoryProfile::parse(profile_arg)?;
+    let mut force = false;
+    let mut auto_hf_upload = false;
+    for arg in &rest[1..] {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--auto-hf-upload" | "-auto-hf-upload" => auto_hf_upload = true,
+            other => bail!(
+                "unsupported prepare cache argument '{other}' (accepted: --force, --auto-hf-upload)"
+            ),
+        }
+    }
+
+    run_prepare_cache(profile, force, auto_hf_upload)?;
+    Ok(true)
+}
+
 impl MemoryProfile {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "8gb" => Ok(Self::Eight),
             "48gb" => Ok(Self::FortyEight),
-            other => bail!("unsupported train profile '{other}' (expected 8gb or 48gb)"),
+            "80gb" => Ok(Self::Eighty),
+            other => bail!("unsupported train profile '{other}' (expected 8gb, 48gb, or 80gb)"),
         }
     }
 
@@ -166,6 +207,7 @@ impl MemoryProfile {
         match self {
             Self::Eight => "8gb",
             Self::FortyEight => "48gb",
+            Self::Eighty => "80gb",
         }
     }
 
@@ -180,6 +222,7 @@ impl MemoryProfile {
         Ok(match self {
             Self::Eight => profiles.eight_gb,
             Self::FortyEight => profiles.forty_eight_gb,
+            Self::Eighty => profiles.eighty_gb,
         })
     }
 }
@@ -187,12 +230,14 @@ impl MemoryProfile {
 impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
-            anyhow::anyhow!("usage: train <8gb|48gb> [--resume [latest|run]] [--with-code-eval]")
+            anyhow::anyhow!(
+                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
+            )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut resume = false;
         let mut resume_selector = None;
-        let mut with_code_eval = false;
+        let mut with_code_eval = true;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -225,6 +270,27 @@ impl PipelineConfig {
             with_code_eval,
         })
     }
+}
+
+fn run_prepare_cache(profile: MemoryProfile, force: bool, auto_hf_upload: bool) -> Result<()> {
+    let defaults = profile.defaults()?;
+    let cfg = PipelineConfig {
+        profile,
+        resume: false,
+        resume_selector: None,
+        with_code_eval: true,
+    };
+    set_pipeline_env(&cfg, &defaults);
+    println!(
+        "Preparing local data/cache for {} profile; no model training will run.",
+        profile.as_str()
+    );
+    prepare_data(&prepare_cache_paths(&defaults), &defaults, false, force)?;
+    println!("Data/cache preparation complete.");
+    if auto_hf_upload {
+        archive_and_upload_prepare_cache(profile)?;
+    }
+    Ok(())
 }
 
 fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
@@ -261,27 +327,26 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         defaults.num_latent_tokens,
         defaults.high_world_steps
     );
+    let context_defaults = context_defaults_for_profile(cfg.profile, &defaults);
+    println!(
+        "Context: latent={} tokens, world/runtime={} tokens, decoder_prompt={} tokens (hybrid memory)",
+        defaults.latent_max_seq * context_defaults.latent_segments,
+        defaults.world_max_seq * context_defaults.world_segments,
+        context_defaults.decoder_prompt_tokens
+    );
 
-    prepare_data(&paths, &defaults, cfg.resume)?;
+    prepare_data(&paths, &defaults, cfg.resume, false)?;
     configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
     train_high_world(&paths, &cfg, &defaults)?;
     train_code_decoder(&paths, &cfg, &defaults)?;
     train_go_feedback_decoder(&paths, &cfg, &defaults)?;
-    let selected_decoder = if cfg.with_code_eval {
-        select_decoder_checkpoint(&paths, &defaults)?
-    } else {
-        select_trained_decoder_checkpoint(&paths)
-    };
+    let selected_decoder = select_decoder_checkpoint(&paths, &defaults)?;
     let mut paths = paths;
     paths.code_decoder_model = selected_decoder;
     write_meta(&paths, &cfg, &defaults)?;
-    if cfg.with_code_eval {
-        final_eval(&paths, &defaults)?;
-    } else {
-        println!("Skipping code eval suite; pass --with-code-eval to run model code tests.");
-    }
+    final_eval(&paths, &defaults)?;
 
     println!("Pipeline complete.");
     println!(
@@ -301,24 +366,71 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
 }
 
 fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
+    let context_defaults = context_defaults_for_profile(cfg.profile, defaults);
     set_env_default("TOFY_TRAIN_DTYPE", "bf16");
+    set_env_default("TOFY_OPTIMIZER", "muon");
+    set_env_default("TOFY_ADAMW_BETA2", "0.95");
+    set_env_default("TOFY_WEIGHT_DECAY", "0.1");
+    set_env_default("TOFY_MUON_MOMENTUM", "0.95");
+    set_env_default("TOFY_MUON_NS_STEPS", "5");
+    set_env_default("TOFY_MUON_RMS_SCALE", "0.18");
     set_env_default("TOFY_SIGREG_SLICES", "1024");
     set_env_default("TOFY_SIGREG_POINTS", "17");
-    set_env_default("TOFY_LATENT_CONTEXT_SEGMENTS", "4");
+    set_env_default_owned(
+        "TOFY_LATENT_CONTEXT_SEGMENTS",
+        context_defaults.latent_segments.to_string(),
+    );
     set_env_default("TOFY_LATENT_RECENT_FULL_SEGMENTS", "1");
     set_env_default("TOFY_LATENT_HISTORY_RATIO", "0.35");
-    set_env_default("TOFY_WORLD_CONTEXT_SEGMENTS", "2");
+    set_env_default_owned(
+        "TOFY_WORLD_CONTEXT_SEGMENTS",
+        context_defaults.world_segments.to_string(),
+    );
+    set_env_default_owned(
+        "TOFY_ENCODER_CONTEXT_SEGMENTS",
+        context_defaults.world_segments.to_string(),
+    );
     set_env_default("TOFY_WORLD_RECENT_FULL_SEGMENTS", "1");
-    set_env_default("TOFY_RECURSIVE_CONTEXT_COMPRESSION", "1");
+    set_env_default("TOFY_ENCODER_RECENT_FULL_SEGMENTS", "1");
+    set_env_default("TOFY_RECURSIVE_CONTEXT_COMPRESSION", "0");
+    set_env_default("TOFY_CONTEXT_HYBRID_MEMORY", "1");
+    set_env_default_owned(
+        "TOFY_CONTEXT_HYBRID_EXACT_TAIL",
+        context_defaults.hybrid_exact_tail.to_string(),
+    );
+    set_env_default_owned(
+        "TOFY_CONTEXT_HYBRID_BLOCK_SIZE",
+        context_defaults.hybrid_block_size.to_string(),
+    );
+    set_env_default_owned(
+        "TOFY_CONTEXT_RETRIEVAL_SLOTS",
+        context_defaults.hybrid_retrieval_slots.to_string(),
+    );
+    set_env_default_owned(
+        "TOFY_CONTEXT_EXACT_OLD_TOKENS",
+        context_defaults.hybrid_exact_old_tokens.to_string(),
+    );
+    set_env_default_owned(
+        "JEPA_CANDLE_DECODER_CTX",
+        context_defaults.decoder_prompt_tokens.to_string(),
+    );
+    set_env_default_owned(
+        "TOFY_DECODER_LOCAL_WINDOW",
+        context_defaults.decoder_local_window.to_string(),
+    );
+    set_env_default("TOFY_DECODER_CSA_COMPRESS_RATE", "8");
+    set_env_default("TOFY_DECODER_HCA_COMPRESS_RATE", "128");
+    set_env_default("TOFY_DECODER_ANCHOR_PERIOD", "3");
+    set_env_default("TOFY_DECODER_CSA_TOPK", "16");
     set_env_default("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", "2");
     set_env_default("TOFY_WORLD_ROLLOUT_STEPS", "2");
     set_env_default("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.0");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
-    set_env_default("TOFY_BPE_MAX_MERGES", "8192");
+    set_env_default("TOFY_BPE_MAX_MERGES", "24000");
     set_env_default("TOFY_BPE_PROGRESS_EVERY_MERGES", "128");
-    set_env_default("TOFY_CODE_VOCAB_SAMPLE_ROWS", "25000");
-    set_env_default("TOFY_CODE_VOCAB_SAMPLE_BYTES", "16777216");
+    set_env_default("TOFY_CODE_VOCAB_SAMPLE_ROWS", "100000");
+    set_env_default("TOFY_CODE_VOCAB_SAMPLE_BYTES", "67108864");
     set_env_default_owned(
         "TOFY_LATENT_WARMUP_BATCH",
         defaults.latent_warmup_batch.to_string(),
@@ -332,19 +444,68 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
+    set_env_default("TOFY_DECODER_ABLATION_METRICS", "1");
+    set_env_default("TOFY_DECODER_PROMPT_DROPOUT", "0.12");
+    set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.05");
+    set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.15");
+    set_env_default("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.05");
+    set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
+    set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "zero,shuffle");
     set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
     set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");
     set_env_default("TOFY_CACHE_DIR", CACHE_DIR);
-    set_env_default("TOFY_CACHE_PREFETCH_BATCHES", "4");
+    set_env_default(
+        "TOFY_CACHE_PREFETCH_BATCHES",
+        if cfg.profile == MemoryProfile::Eighty {
+            "12"
+        } else {
+            "8"
+        },
+    );
+    set_env_default("TOFY_TOKEN_CACHE_READER_MB", "32");
     std::env::remove_var("TOFY_USE_TOKEN_CACHE");
     std::env::remove_var("TOFY_ENCODER_VOCAB");
-    if cfg.profile == MemoryProfile::Eight {
-        set_env_default("TOFY_CONTEXT_SEGMENT_BATCH", "16");
+    match cfg.profile {
+        MemoryProfile::Eight => set_env_default("TOFY_CONTEXT_SEGMENT_BATCH", "16"),
+        MemoryProfile::FortyEight => set_env_default("TOFY_CONTEXT_SEGMENT_BATCH", "64"),
+        MemoryProfile::Eighty => set_env_default("TOFY_CONTEXT_SEGMENT_BATCH", "128"),
     }
     if cfg.resume {
         std::env::set_var("TOFY_RESUME", "1");
     } else {
         std::env::remove_var("TOFY_RESUME");
+    }
+}
+
+struct ContextDefaults {
+    latent_segments: usize,
+    world_segments: usize,
+    hybrid_exact_tail: usize,
+    hybrid_block_size: usize,
+    hybrid_retrieval_slots: usize,
+    hybrid_exact_old_tokens: usize,
+    decoder_prompt_tokens: usize,
+    decoder_local_window: usize,
+}
+
+fn context_defaults_for_profile(
+    profile: MemoryProfile,
+    defaults: &ProfileDefaults,
+) -> ContextDefaults {
+    let (latent_segments, world_segments, retrieval_slots, exact_old_tokens) = match profile {
+        MemoryProfile::Eight => (4, 4, 8, 16),
+        MemoryProfile::FortyEight => (6, 6, 12, 24),
+        MemoryProfile::Eighty => (8, 8, 16, 32),
+    };
+    ContextDefaults {
+        latent_segments,
+        world_segments,
+        hybrid_exact_tail: defaults.world_max_seq,
+        hybrid_block_size: 32,
+        hybrid_retrieval_slots: retrieval_slots,
+        hybrid_exact_old_tokens: exact_old_tokens,
+        decoder_prompt_tokens: defaults.code_decoder_max_seq.saturating_mul(4).max(768),
+        decoder_local_window: defaults.code_decoder_max_seq.clamp(128, 256),
     }
 }
 
@@ -416,7 +577,42 @@ fn resolve_pipeline_paths(
     })
 }
 
-fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool) -> Result<()> {
+fn prepare_cache_paths(defaults: &ProfileDefaults) -> PipelinePaths {
+    let run_root = runs_dir().join("prepare_cache");
+    let encoder_cache_vocab =
+        vocab_dir().join(format!("vocab_encoder_{}_default.txt", defaults.max_vocab));
+    let code_decoder_cache_vocab = vocab_dir().join(format!(
+        "vocab_code_{}_codeaware.txt",
+        defaults.code_decoder_max_vocab
+    ));
+    PipelinePaths {
+        run_id: "prepare_cache".to_string(),
+        latent_stage_dir: run_root.join("latent"),
+        world_stage_dir: run_root.join("world"),
+        high_world_stage_dir: run_root.join("high_world"),
+        decoder_stage_dir: run_root.join("decoder_code"),
+        decoder_go_feedback_stage_dir: run_root.join("decoder_code_go_feedback"),
+        code_eval_stage_dir: run_root.join("code_eval"),
+        latent_model: run_root.join("latent/model.safetensors"),
+        world_model: run_root.join("world/model.safetensors"),
+        world_encoder_model: run_root.join("world/model.encoder.safetensors"),
+        high_world_model: run_root.join("high_world/model.safetensors"),
+        code_decoder_base_model: run_root.join("decoder_code/model.safetensors"),
+        code_decoder_go_feedback_model: run_root.join("decoder_code_go_feedback/model.safetensors"),
+        code_decoder_model: run_root.join("decoder_code/model.safetensors"),
+        code_decoder_vocab: code_decoder_cache_vocab.clone(),
+        encoder_cache_vocab,
+        code_decoder_cache_vocab,
+        run_root,
+    }
+}
+
+fn prepare_data(
+    paths: &PipelinePaths,
+    defaults: &ProfileDefaults,
+    resume: bool,
+    force_cache: bool,
+) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
     thread::scope(|scope| -> Result<()> {
         let code_handle = scope.spawn(prepare_code_source_data);
@@ -461,11 +657,11 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
                     "--go",
                     "go",
                     "--variants-per-sample",
-                    "2",
+                    "4",
                     "--timeout-sec",
-                    "3.0",
+                    "5.0",
                     "--max-rows",
-                    "4000",
+                    "60000",
                     "--progress-every",
                     "100",
                 ])
@@ -491,7 +687,7 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         Ok(())
     })?;
 
-    run_cache(vec![
+    let mut cache_args = vec![
         "--prepare-pipeline-cache".to_string(),
         ENCODER_DATA.to_string(),
         WORLD_DATA.to_string(),
@@ -509,7 +705,11 @@ fn prepare_data(paths: &PipelinePaths, defaults: &ProfileDefaults, resume: bool)
         defaults.world_max_seq.to_string(),
         "--code-max-seq".to_string(),
         defaults.code_decoder_max_seq.to_string(),
-    ])?;
+    ];
+    if force_cache {
+        cache_args.push("--force".to_string());
+    }
+    run_cache(cache_args)?;
     if paths.code_decoder_cache_vocab.exists() && !paths.code_decoder_vocab.exists() {
         if let Some(parent) = paths.code_decoder_vocab.parent() {
             fs::create_dir_all(parent)?;
@@ -556,11 +756,21 @@ fn prepare_go_task_data() -> Result<()> {
             GO_TASK_DATA,
         ])?;
     }
+    run_prepare([
+        "--prepare-go-algorithm-tasks",
+        "--output",
+        GO_ALGORITHM_TASK_DATA,
+    ])?;
+    run_prepare([
+        "--prepare-go-semantics-tasks",
+        "--output",
+        GO_SEMANTIC_TASK_DATA,
+    ])?;
     Ok(())
 }
 
 fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut extra_code_mix_args = Vec::new();
+    let mut extra_code_pairs = Vec::new();
     let mut world_args = vec![
         "--prepare-world-mix".to_string(),
         "--output".to_string(),
@@ -572,14 +782,23 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         "--code-pairs".to_string(),
         GO_TASK_DATA.to_string(),
     ];
+    if nonempty_file(GO_ALGORITHM_TASK_DATA) {
+        world_args.extend([
+            "--code-pairs".to_string(),
+            GO_ALGORITHM_TASK_DATA.to_string(),
+        ]);
+        extra_code_pairs.push(GO_ALGORITHM_TASK_DATA.to_string());
+    }
+    if nonempty_file(GO_SEMANTIC_TASK_DATA) {
+        world_args.extend([
+            "--code-pairs".to_string(),
+            GO_SEMANTIC_TASK_DATA.to_string(),
+        ]);
+        extra_code_pairs.push(GO_SEMANTIC_TASK_DATA.to_string());
+    }
     if nonempty_file(GO_REPAIR_DATA) {
         world_args.extend(["--code-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
-        extra_code_mix_args.extend([
-            "--extra-pairs".to_string(),
-            GO_REPAIR_DATA.to_string(),
-            "--extra-repeat".to_string(),
-            "2".to_string(),
-        ]);
+        extra_code_pairs.push(GO_REPAIR_DATA.to_string());
     }
     world_args.extend([
         "--code-ratio".to_string(),
@@ -596,12 +815,21 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         CODE_TRAIN_DATA.to_string(),
         "--base-pairs".to_string(),
         GO_CODE_DATA.to_string(),
+        "--base-repeat".to_string(),
+        "1".to_string(),
         "--instruction-pairs".to_string(),
         GO_TASK_DATA.to_string(),
         "--instruction-repeat".to_string(),
-        "6".to_string(),
+        "18".to_string(),
+        "--fim-repeat".to_string(),
+        "4".to_string(),
     ];
-    code_mix_args.extend(extra_code_mix_args);
+    for path in &extra_code_pairs {
+        code_mix_args.extend(["--extra-pairs".to_string(), path.clone()]);
+    }
+    if !extra_code_pairs.is_empty() {
+        code_mix_args.extend(["--extra-repeat".to_string(), "24".to_string()]);
+    }
     code_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
     let mut go_feedback_mix_args = vec![
         "--prepare-code-poc-mix".to_string(),
@@ -609,18 +837,35 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         GO_FEEDBACK_TRAIN_DATA.to_string(),
         "--base-pairs".to_string(),
         GO_CODE_DATA.to_string(),
+        "--base-repeat".to_string(),
+        "1".to_string(),
         "--instruction-pairs".to_string(),
         GO_TASK_DATA.to_string(),
         "--instruction-repeat".to_string(),
+        "20".to_string(),
+        "--fim-repeat".to_string(),
         "6".to_string(),
     ];
-    if nonempty_file(GO_REPAIR_DATA) {
+    if nonempty_file(GO_ALGORITHM_TASK_DATA) {
         go_feedback_mix_args.extend([
             "--extra-pairs".to_string(),
-            GO_REPAIR_DATA.to_string(),
-            "--extra-repeat".to_string(),
-            "3".to_string(),
+            GO_ALGORITHM_TASK_DATA.to_string(),
         ]);
+    }
+    if nonempty_file(GO_SEMANTIC_TASK_DATA) {
+        go_feedback_mix_args.extend([
+            "--extra-pairs".to_string(),
+            GO_SEMANTIC_TASK_DATA.to_string(),
+        ]);
+    }
+    if nonempty_file(GO_REPAIR_DATA) {
+        go_feedback_mix_args.extend(["--extra-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
+    }
+    if nonempty_file(GO_ALGORITHM_TASK_DATA)
+        || nonempty_file(GO_SEMANTIC_TASK_DATA)
+        || nonempty_file(GO_REPAIR_DATA)
+    {
+        go_feedback_mix_args.extend(["--extra-repeat".to_string(), "32".to_string()]);
     }
     go_feedback_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
     (world_args, code_mix_args, go_feedback_mix_args)
@@ -872,7 +1117,7 @@ fn train_code_decoder(
         &paths.code_decoder_base_model,
         None,
         "3e-4",
-        "0.0",
+        "0.20",
     );
     with_stage("decoder_code", || {
         tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
@@ -908,8 +1153,8 @@ fn train_go_feedback_decoder(
         defaults.go_feedback_grad_accum,
         &paths.code_decoder_go_feedback_model,
         Some(&paths.code_decoder_base_model),
-        "1e-4",
-        "0.0",
+        "5e-5",
+        "0.20",
     );
     with_stage("decoder_code_go_feedback", || {
         tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
@@ -1010,22 +1255,6 @@ fn select_decoder_checkpoint(paths: &PipelinePaths, defaults: &ProfileDefaults) 
     Ok(selected.0.clone())
 }
 
-fn select_trained_decoder_checkpoint(paths: &PipelinePaths) -> PathBuf {
-    if paths.code_decoder_go_feedback_model.exists() {
-        println!(
-            "Code eval skipped; selecting Go feedback decoder by default: {}",
-            paths.code_decoder_go_feedback_model.display()
-        );
-        paths.code_decoder_go_feedback_model.clone()
-    } else {
-        println!(
-            "Code eval skipped; selecting base decoder by default: {}",
-            paths.code_decoder_base_model.display()
-        );
-        paths.code_decoder_base_model.clone()
-    }
-}
-
 fn final_eval(paths: &PipelinePaths, defaults: &ProfileDefaults) -> Result<()> {
     println!("== Stage 6/6: code eval suite ==");
     run_code_eval(paths, defaults, &paths.code_decoder_model, "code_eval")
@@ -1064,7 +1293,7 @@ fn run_code_eval(
         EVAL_SUITE.to_string(),
         "384".to_string(),
         defaults.dim.to_string(),
-        defaults.world_max_seq.to_string(),
+        defaults.code_decoder_max_seq.to_string(),
         defaults.layers.to_string(),
         defaults.heads.to_string(),
         defaults.bridge_dim.to_string(),
@@ -1076,11 +1305,11 @@ fn run_code_eval(
         "--code-decoder-vocab".to_string(),
         paths.code_decoder_vocab.to_string_lossy().to_string(),
         "--candidates".to_string(),
-        "4".to_string(),
+        "8".to_string(),
         "--repair-attempts".to_string(),
-        "2".to_string(),
+        "4".to_string(),
         "--go-timeout-sec".to_string(),
-        "6".to_string(),
+        "10".to_string(),
     ];
     with_stage(stage, || tasks::eval::try_run_code_eval(&args))?;
     args.clear();
@@ -1125,6 +1354,150 @@ fn run_cache(args: Vec<String>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn archive_and_upload_prepare_cache(profile: MemoryProfile) -> Result<()> {
+    ensure_cache_upload_tools()?;
+
+    let repo = std::env::var("TOFY_HF_CACHE_REPO")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HF_CACHE_REPO.to_string());
+    let artifact_dir = runs_dir().join("prepare_cache");
+    fs::create_dir_all(&artifact_dir)?;
+
+    let git_sha = short_git_sha();
+    let timestamp = unix_timestamp()?;
+    let base_name = format!("tofy-cache-{}-{}-{}", profile.as_str(), git_sha, timestamp);
+    let archive_path = artifact_dir.join(format!("{base_name}.tar.zst"));
+    let info_path = artifact_dir.join(format!("{base_name}.info.txt"));
+
+    let archive_inputs = prepare_cache_archive_inputs()?;
+    write_prepare_cache_info(&info_path, profile, &repo, &archive_path, &archive_inputs)?;
+
+    println!("Archiving prepared cache to {}", archive_path.display());
+    let mut tar = Command::new("tar");
+    tar.arg("--zstd").arg("-cf").arg(&archive_path);
+    for input in &archive_inputs {
+        tar.arg(input);
+    }
+    run_external_command(&mut tar, "archive prepared cache")?;
+
+    upload_hf_file(&repo, &info_path)?;
+    upload_hf_file(&repo, &archive_path)?;
+    println!(
+        "Uploaded prepared cache archive to Hugging Face dataset {repo}: {}",
+        archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<archive>")
+    );
+    Ok(())
+}
+
+fn ensure_cache_upload_tools() -> Result<()> {
+    for tool in ["tar", "zstd", "hf"] {
+        if !command_available(tool) {
+            bail!(
+                "--auto-hf-upload requires `{tool}` on PATH; install it and authenticate with `hf auth login` if needed"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
+    let mut inputs = vec![PathBuf::from("data"), PathBuf::from("eval"), vocab_dir()];
+    let configured_cache_dir = cache_dir();
+    if configured_cache_dir != PathBuf::from(CACHE_DIR) && !inputs.contains(&configured_cache_dir) {
+        inputs.push(configured_cache_dir);
+    }
+
+    for input in &inputs {
+        if !input.exists() {
+            bail!(
+                "cannot archive prepared cache because {} does not exist",
+                input.display()
+            );
+        }
+    }
+    Ok(inputs)
+}
+
+fn write_prepare_cache_info(
+    path: &Path,
+    profile: MemoryProfile,
+    repo: &str,
+    archive_path: &Path,
+    archive_inputs: &[PathBuf],
+) -> Result<()> {
+    let inputs = archive_inputs
+        .iter()
+        .map(|path| format!("- {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<archive>");
+    let content = format!(
+        "profile: {}\nrepo: {repo}\narchive: {archive_name}\ncreated_unix_secs: {}\ngit_sha: {}\ncommand: cargo run --release -- prepare cache {} --auto-hf-upload\ncontents:\n{inputs}\n",
+        profile.as_str(),
+        unix_timestamp()?,
+        short_git_sha(),
+        profile.as_str()
+    );
+    write_text_atomic(path, &content)
+}
+
+fn upload_hf_file(repo: &str, path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid upload path: {}", path.display()))?;
+    println!(
+        "Uploading {} to Hugging Face dataset {repo}",
+        path.display()
+    );
+    let mut hf = Command::new("hf");
+    hf.args(["upload", "--repo-type", "dataset", repo])
+        .arg(path)
+        .arg(file_name);
+    run_external_command(&mut hf, "upload prepared cache to Hugging Face")?;
+    Ok(())
+}
+
+fn short_git_sha() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "nogit".to_string())
+}
+
+fn run_external_command(command: &mut Command, label: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run {label}"))?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            println!("{stdout}");
+        }
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "{label} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    )
 }
 
 fn with_stage<F>(stage: &str, f: F) -> Result<()>
@@ -1255,20 +1628,14 @@ fn metrics_better(candidate: &SummaryMetrics, current: &SummaryMetrics) -> bool 
 
 fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     let selector = cfg.resume_selector.as_deref().unwrap_or("");
-    let eval_flag = if cfg.with_code_eval {
-        " --with-code-eval"
-    } else {
-        ""
-    };
     let command = format!(
-        "train {}{}{}",
+        "train {}{}",
         cfg.profile.as_str(),
         if selector.is_empty() {
             String::new()
         } else {
             format!(" --resume {selector}")
-        },
-        eval_flag
+        }
     );
     let content = format!(
         "timestamp_unix={}\ncommand={}\n",

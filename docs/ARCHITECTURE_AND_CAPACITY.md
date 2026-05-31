@@ -15,7 +15,7 @@ The runtime architecture above is now reflected more directly in the crate struc
 - [`src/config/latent.rs`](../src/config/latent.rs) contains latent train/eval configs.
 - [`src/config/world.rs`](../src/config/world.rs) contains world, action classifier, decoder, eval, and serve configs.
 - [`src/tasks/latent.rs`](../src/tasks/latent.rs) implements the latent train/eval path.
-- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) wires the canonical `train` pipeline: data prep and caches, encoder, world, high-world, base code decoder, Go execution-feedback decoder, with the hard Go code eval stage behind `--with-code-eval`.
+- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) wires the canonical `train` pipeline: data prep and caches, encoder, world, high-world, base code decoder, Go execution-feedback decoder, and hard Go compile/test eval for decoder promotion.
 - [`src/tasks/world.rs`](../src/tasks/world.rs) implements the world/high-world/action classifier/decoder train paths and runtime engine.
 - [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) contains shared world/decoder metric and masking helpers that used to live inline in `world.rs`.
 
@@ -134,10 +134,10 @@ For Candle decoders:
 - code decoder uses its own code-aware vocab/tokenizer
 - decoder conditioning adapters do not turn context vectors into text. They build a latent memory from exact recent context slots plus compressed older context blocks, then use learned query/cross-attention weights and a gated latent path to produce decoder-facing conditioning slots.
 - decoder-facing context slots are also projected into prefix-LM-style latent memory tokens when `TOFY_DECODER_LATENT_PREFIX=1`: prompt/generated tokens can attend to those latent prefix tokens, while generated text remains causal.
-- decoder self-attention uses a hybrid long-context schedule inspired by DeepSeek-V4: the first layer is sliding local attention, anchor/final layers use compressed sparse long-range attention with query-selected compressed blocks, and the remaining layers use separate heavily compressed global-summary attention
+- decoder self-attention uses RoPE plus a hybrid long-context schedule inspired by DeepSeek-V4: the first layer is sliding local attention, anchor/final layers use compressed sparse long-range attention with query-selected compressed blocks, and the remaining layers use separate heavily compressed global-summary attention
 - context/state cross-attention can be budgeted and scheduled at eval/runtime with `TOFY_DECODER_CONDITION_BUDGET` and `TOFY_DECODER_CROSS_ATTN_SCHEDULE`
 
-Because the tokenizers differ, `max_seq = 256` in the encoder and `max_seq = 128` or `192` in the code decoder do **not** mean the same exact amount of source text. Each module counts its own tokens.
+Because the tokenizers differ, `max_seq = 256` in the encoder and `max_seq = 192` in the 8 GB code decoder do **not** mean the same exact amount of source text. Each module counts its own tokens.
 
 ### 4. Decoder context during training
 
@@ -155,15 +155,17 @@ Teacher forcing is built as:
 - `input = state + shifted(next)`
 - `target = shifted(state) + next`
 
-The decoder objective can include a conditioning-margin term. It compares the matched context/state latent against zero conditioning, a near cyclic batch mismatch, and a farther cyclic batch mismatch, then logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain`. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
+The decoder objective can include a conditioning-margin term. It compares the matched context/state latent against configurable negative conditioning (`TOFY_DECODER_CONDITIONING_NEGATIVES`, default `zero,shuffle`) and logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain` when ablation metrics are enabled. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
 
 So the decoder training sequence length is effectively **`2 * max_seq`**, even though `max_seq` is still the configuration knob for each side individually.
 
-This means `max_seq = 160` for the current 8 GB code-decoder profile really means:
+This means `max_seq = 192` for the current 8 GB code-decoder profile really means:
 
-- up to `160` tokens from the left side
-- up to `160` tokens from the right side
-- up to `320` autoregressive positions inside the decoder loss
+- up to `192` tokens from the left side
+- up to `192` tokens from the right side
+- up to `384` autoregressive positions inside the decoder loss
+
+If either side is longer than its per-side budget, training keeps the tail of that side. The newest prompt tokens and the end of the target completion are usually where instructions, compiler feedback, return values, and closing braces live.
 
 ### 5. Dataset context
 

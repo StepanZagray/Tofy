@@ -8,7 +8,7 @@ Use `cargo run --release -- --prepare-github-top-code` to build `context<TAB>com
 
 For the full training pipeline, use Go-only source rows. The `--default-languages`
 option remains available for manual experiments, but it is not used by
-`train <8gb|48gb>`.
+`train <8gb|48gb|80gb>`.
 
 **Examples:**
 
@@ -32,10 +32,10 @@ Then train the pure world model + code decoder on the output file, e.g.:
 
 ```bash
 cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/go_code_pairs.txt 40000 24 768 256 9 8 256 64 --lambda 0.2
-cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/go_code_pairs.txt 20000 8 160 --decoder-kind code --decoder-max-vocab 16000 --decoder-output local_models/code_decoder_90M.safetensors
+cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/go_code_pairs.txt 20000 8 192 --decoder-kind code --decoder-max-vocab 24000 --decoder-output local_models/code_decoder_90M.safetensors
 ```
 
-For the router/orchestrator, prefer a chat+code mix instead of code-only or chat-only data. `--prepare-world-mix` writes explicit action labels and synthetic terminal `done` rows:
+For the router/orchestrator, prefer a chat+code mix instead of code-only or chat-only data. `--prepare-world-mix` writes explicit action labels, preserves existing third-column labels by embedding them into the target text before mixing, and adds synthetic terminal `done` rows:
 
 ```bash
 cargo run --release -- --prepare-world-mix --output data/world_mix_pairs.txt --text-pairs data/ultrachat_pairs.txt --code-pairs data/go_code_pairs.txt --code-ratio 0.35 --done-ratio 0.18
@@ -58,8 +58,10 @@ So for the code-first proof of concept, build a second decoder dataset that matc
 ```bash
 cargo run --release -- --prepare-github-top-code --output data/go_code_pairs.txt --languages Go --max-files 120000
 cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
-cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_repair_pairs.txt --extra-repeat 2
+cargo run --release -- --prepare-go-algorithm-tasks --output data/go_algorithm_pairs.txt
+cargo run --release -- --prepare-go-semantics-tasks --output data/go_semantic_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt --max-rows 20000
+cargo run --release -- --prepare-code-poc-mix --output data/code_poc_mix.txt --base-pairs data/go_code_pairs.txt --instruction-pairs data/go_instruction_pairs.txt --instruction-repeat 6 --extra-pairs data/go_algorithm_pairs.txt --extra-pairs data/go_repair_pairs.txt --extra-repeat 8
 ```
 
 What this does:
@@ -67,6 +69,7 @@ What this does:
 - scans Go code pairs
 - extracts `func ... { ... }` functions
 - turns them into multiple prompt variants around the same exact function signature
+- adds curated algorithm/parser tasks and execution-semantics trace prompts
 - optionally mixes in Go compiler-feedback repair pairs
 - shuffles and oversamples those instruction-shaped rows before code-decoder training
 
@@ -88,11 +91,16 @@ compiler/test output as repair feedback.
 ```bash
 cargo run --release -- --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
 cargo run --release -- --prepare-go-function-tasks --input data/go_code_pairs.txt --output data/go_instruction_pairs.txt
-cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt
+cargo run --release -- --prepare-go-algorithm-tasks --output data/go_algorithm_pairs.txt
+cargo run --release -- --prepare-go-semantics-tasks --output data/go_semantic_pairs.txt
+cargo run --release -- --prepare-go-repair-tasks --input data/go_instruction_pairs.txt --output data/go_repair_pairs.txt --max-rows 20000
 ```
 
-Go repair rows use tags such as `<action:repair_patch>`, `<tool:read_error>`,
-`<tool:repair_patch>`, and `<ctx:compiler_feedback>`. The full pipeline builds
-`data/code_poc_go_mix.txt` from Go code, Go instruction pairs, and Go repair
-rows, then trains `runs/.../decoder_code_go_feedback/model.safetensors`
-initialized from the base code decoder.
+Go repair rows use plain code-fix prompts containing the original request,
+previous attempt, compiler feedback, and code-only constraints. The full
+pipeline builds `data/code_poc_go_mix.txt` from Go code, Go instruction pairs,
+and Go repair rows, then trains
+`runs/.../decoder_code_go_feedback/model.safetensors` initialized from the base
+code decoder.
+
+The full assistant eval uses the same plain repair prompt shape and defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set before the eval command.

@@ -16,7 +16,7 @@ This runs the release binary with the current 8 GB proof-of-concept shapes:
 
 - latent: `16x16`, `seq_len=256`, `dim=640`, `layers=7`
 - world: warmup `32x1`, then `32x8`, `seq_len=256`, `bridge_dim=640`, `context_slots=64`
-- code decoder: `8x16`, `max_seq=160`, `dim=640`, `ff_dim=3072`, `max_vocab=24000`
+- code decoder: `8x16`, `max_seq=192`, `dim=640`, `ff_dim=3072`, `max_vocab=24000`
 
 The probe samples `nvidia-smi` externally every `0.1s`, writes per-stage logs and `*.vram_samples.jsonl`, and restores `local_models/` afterward.
 
@@ -63,6 +63,8 @@ Before renting a GPU for a long run, use the short max-VRAM probe:
 
 ```bash
 cargo run --release -- --max-vram-probe --profile 48gb --stage all
+# or, for the larger decoder profile:
+cargo run --release -- --max-vram-probe --profile 80gb --stage all
 ```
 
 This uses `config/model_profiles.json`, runs latent, world, high-world, and
@@ -88,9 +90,11 @@ cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 
 The probe loads the current `48gb` shape from `config/model_profiles.json`.
 That profile now uses encoder `48x11` (`528` effective), frozen-encoder world
-`128x4` (`512` effective), decoder `128x2` (`256` effective), and Go feedback `256x1`
-(`256` effective), replacing the old recorded decoder `4x1` run that used only
-about 5.6 GB VRAM in the decoder stage.
+`128x4` (`512` effective), decoder `32x8` (`256` effective), and Go feedback
+`32x8` (`256` effective), replacing the old recorded decoder `4x1` run that
+used only about 5.6 GB VRAM in the decoder stage. The `80gb` profile keeps
+decoder effective batch at `256` but uses decoder microbatch `8` because its
+decoder is much wider.
 Prefer `--max-vram-probe --profile 48gb` for the first rental check, then run
 the sustained probe only after the short probe passes.
 

@@ -7,11 +7,13 @@ use crate::model::DecoderKind;
 use super::common::{env_usize, parse_train_dtype};
 
 const DEFAULT_DECODER_WARMUP_STEPS: usize = 500;
-const DEFAULT_DECODER_SYNTAX_LOSS_WEIGHT: f64 = 0.0;
-const DEFAULT_DECODER_SIGNATURE_LOSS_WEIGHT: f64 = 0.0;
-const DEFAULT_DECODER_STRUCTURE_LOSS_WEIGHT: f64 = 0.0;
-const DEFAULT_DECODER_CONDITIONING_LOSS_WEIGHT: f64 = 0.0;
+const DEFAULT_DECODER_SYNTAX_LOSS_WEIGHT: f64 = 0.05;
+const DEFAULT_DECODER_SIGNATURE_LOSS_WEIGHT: f64 = 0.15;
+const DEFAULT_DECODER_STRUCTURE_LOSS_WEIGHT: f64 = 0.05;
+const DEFAULT_DECODER_CONDITIONING_LOSS_WEIGHT: f64 = 0.20;
 const DEFAULT_DECODER_CONDITIONING_MARGIN: f64 = 0.10;
+const DEFAULT_CODE_DECODER_MTP_LOSS_WEIGHT: f64 = 0.05;
+const DEFAULT_CODE_DECODER_MTP_MAX_AHEAD: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct DecoderTrainConfig {
@@ -41,6 +43,8 @@ pub struct DecoderTrainConfig {
     pub structure_loss_weight: f64,
     pub conditioning_loss_weight: f64,
     pub conditioning_margin: f64,
+    pub mtp_loss_weight: f64,
+    pub mtp_max_ahead: usize,
     pub init_decoder_path: Option<PathBuf>,
     pub decoder_kind: DecoderKind,
     pub decoder_vocab_path: Option<PathBuf>,
@@ -56,7 +60,7 @@ impl DecoderTrainConfig {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
+                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--mtp-loss-weight <float>] [--mtp-max-ahead <int>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
             );
         }
         let mut init_decoder_path = None;
@@ -75,6 +79,8 @@ impl DecoderTrainConfig {
         let mut decoder_ff_dim = None;
         let mut conditioning_loss_weight = None;
         let mut conditioning_margin = None;
+        let mut mtp_loss_weight = None;
+        let mut mtp_max_ahead = None;
         let mut filtered = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -218,6 +224,30 @@ impl DecoderTrainConfig {
                 i += 2;
                 continue;
             }
+            if args[i] == "--mtp-loss-weight" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--mtp-loss-weight requires float"))?;
+                mtp_loss_weight = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--mtp-loss-weight must be float"))?,
+                );
+                i += 2;
+                continue;
+            }
+            if args[i] == "--mtp-max-ahead" {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--mtp-max-ahead requires integer"))?;
+                mtp_max_ahead = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--mtp-max-ahead must be integer"))?,
+                );
+                i += 2;
+                continue;
+            }
             if args[i] == "--resume" {
                 resume = true;
                 i += 1;
@@ -319,6 +349,34 @@ impl DecoderTrainConfig {
                 })
                 .unwrap_or(DEFAULT_DECODER_CONDITIONING_MARGIN)
                 .max(0.0),
+            mtp_loss_weight: mtp_loss_weight
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_MTP_LOSS_WEIGHT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or_else(|| {
+                    if decoder_kind == DecoderKind::CodeSpecialist {
+                        DEFAULT_CODE_DECODER_MTP_LOSS_WEIGHT
+                    } else {
+                        0.0
+                    }
+                })
+                .max(0.0),
+            mtp_max_ahead: mtp_max_ahead
+                .or_else(|| {
+                    std::env::var("TOFY_DECODER_MTP_MAX_AHEAD")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or_else(|| {
+                    if decoder_kind == DecoderKind::CodeSpecialist {
+                        DEFAULT_CODE_DECODER_MTP_MAX_AHEAD
+                    } else {
+                        1
+                    }
+                })
+                .max(1),
             init_decoder_path,
             decoder_vocab_path,
             decoder_max_vocab: decoder_max_vocab.unwrap_or_else(|| {

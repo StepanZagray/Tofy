@@ -156,7 +156,7 @@ Same data format: one line per example, `context\treply`. The decoder is trained
 
 - **codeDecoder** (code): train on **code prefix \t completion** pairs; default save path is `local_models/code_decoder_<size>.safetensors`:
   ```bash
-  cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 16 128 --decoder-kind code --decoder-output local_models/code_decoder_90M.safetensors
+  cargo run --release -- --train-decoder local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors data/multilang_pairs.txt 20000 8 192 --decoder-kind code --decoder-max-vocab 24000 --decoder-output local_models/code_decoder_90M.safetensors
   ```
 
 Optional: `[steps] [batch] [max_seq] [dim] [num_layers] [num_heads] [planner_dim] [num_context_slots]`, `--lr <float>`, `--init-decoder <path>`, `--decoder-output <path>`, `--decoder-vocab <path>`.

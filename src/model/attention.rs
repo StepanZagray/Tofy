@@ -237,6 +237,7 @@ pub struct MultiHeadAttention {
     num_heads: usize,
     head_dim: usize,
     scale: f64,
+    use_rope: bool,
     q_proj: nn::Linear,
     k_proj: nn::Linear,
     v_proj: nn::Linear,
@@ -245,11 +246,22 @@ pub struct MultiHeadAttention {
 
 impl MultiHeadAttention {
     pub fn new(vb: VarBuilder<'_>, dim: usize, num_heads: usize) -> Result<Self> {
+        Self::new_impl(vb, dim, num_heads, false)
+    }
+
+    pub fn new_with_rope(vb: VarBuilder<'_>, dim: usize, num_heads: usize) -> Result<Self> {
+        Self::new_impl(vb, dim, num_heads, true)
+    }
+
+    fn new_impl(vb: VarBuilder<'_>, dim: usize, num_heads: usize, use_rope: bool) -> Result<Self> {
         assert!(
             dim.is_multiple_of(num_heads),
             "dim must be divisible by num_heads"
         );
         let head_dim = dim / num_heads;
+        if use_rope && !head_dim.is_multiple_of(2) {
+            anyhow::bail!("RoPE requires an even attention head dimension, got {head_dim}");
+        }
         let scale = (head_dim as f64).sqrt();
 
         // Use Candle's linear layers for Q, K, V, and output projections
@@ -262,6 +274,7 @@ impl MultiHeadAttention {
             num_heads,
             head_dim,
             scale,
+            use_rope,
             q_proj,
             k_proj,
             v_proj,
@@ -397,18 +410,21 @@ impl MultiHeadAttention {
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        let q = self.apply_rope_if_enabled(q, 0)?;
+        let k = self.apply_rope_if_enabled(k, 0)?;
         Ok((q, k, v))
     }
 
-    fn project_q(&self, x: &Tensor) -> Result<Tensor> {
+    fn project_q_with_offset(&self, x: &Tensor, position_offset: usize) -> Result<Tensor> {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
-        self.q_proj
+        let q = self
+            .q_proj
             .forward(&x)?
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()
-            .map_err(Into::into)
+            .contiguous()?;
+        self.apply_rope_if_enabled(q, position_offset)
     }
 
     pub fn project_self_kv(&self, x: &Tensor) -> Result<AttentionKvCache> {
@@ -420,6 +436,15 @@ impl MultiHeadAttention {
         x: &Tensor,
         prefix_len: usize,
     ) -> Result<AttentionKvCache> {
+        self.project_self_kv_with_prefix_and_offset(x, prefix_len, 0)
+    }
+
+    fn project_self_kv_with_prefix_and_offset(
+        &self,
+        x: &Tensor,
+        prefix_len: usize,
+        position_offset: usize,
+    ) -> Result<AttentionKvCache> {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
         let k = self
@@ -428,6 +453,7 @@ impl MultiHeadAttention {
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        let k = self.apply_rope_if_enabled(k, position_offset)?;
         let v = self
             .v_proj
             .forward(&x)?
@@ -554,8 +580,9 @@ impl MultiHeadAttention {
     ) -> Result<(Tensor, AttentionKvCache)> {
         let x = x.contiguous()?;
         let (b, t_q, _) = x.dims3()?;
-        let q = self.project_q(&x)?;
-        let new_kv = self.project_self_kv(&x)?;
+        let position_offset = cache.map(|cache| cache.token_count).unwrap_or(0);
+        let q = self.project_q_with_offset(&x, position_offset)?;
+        let new_kv = self.project_self_kv_with_prefix_and_offset(&x, 0, position_offset)?;
         let full_kv = self.append_to_cache(cache, new_kv, max_tokens)?;
         let (_, _, t_kv, _) = full_kv.k.dims4()?;
         let q = q
@@ -606,8 +633,9 @@ impl MultiHeadAttention {
     ) -> Result<(Tensor, AttentionKvCache)> {
         let x = x.contiguous()?;
         let (b, t_q, _) = x.dims3()?;
-        let q = self.project_q(&x)?;
-        let new_kv = self.project_self_kv(&x)?;
+        let position_offset = cache.map(|cache| cache.token_count).unwrap_or(0);
+        let q = self.project_q_with_offset(&x, position_offset)?;
+        let new_kv = self.project_self_kv_with_prefix_and_offset(&x, 0, position_offset)?;
         let full_kv =
             append_to_compressed_cache(cache, new_kv, exact_tail.max(1), compress_rate.max(1))?;
 
@@ -879,6 +907,51 @@ impl MultiHeadAttention {
             .forward(&attn_output)
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
+
+    fn apply_rope_if_enabled(&self, x: Tensor, position_offset: usize) -> Result<Tensor> {
+        if self.use_rope {
+            apply_rotary_pos_emb(x, position_offset, 10_000.0)
+        } else {
+            Ok(x)
+        }
+    }
+}
+
+fn apply_rotary_pos_emb(x: Tensor, position_offset: usize, base: f64) -> Result<Tensor> {
+    let (batch, heads, seq_len, head_dim) = x.dims4()?;
+    if seq_len == 0 {
+        return Ok(x);
+    }
+    if !head_dim.is_multiple_of(2) {
+        anyhow::bail!("RoPE requires an even attention head dimension, got {head_dim}");
+    }
+    let half = head_dim / 2;
+    let mut cos_values = Vec::with_capacity(seq_len * half);
+    let mut sin_values = Vec::with_capacity(seq_len * half);
+    for pos in position_offset..position_offset + seq_len {
+        for idx in 0..half {
+            let freq = base.powf(-2.0 * idx as f64 / head_dim as f64);
+            let angle = pos as f64 * freq;
+            cos_values.push(angle.cos() as f32);
+            sin_values.push(angle.sin() as f32);
+        }
+    }
+    let cos =
+        Tensor::from_vec(cos_values, (1, 1, seq_len, half), x.device())?.to_dtype(x.dtype())?;
+    let sin =
+        Tensor::from_vec(sin_values, (1, 1, seq_len, half), x.device())?.to_dtype(x.dtype())?;
+    let pairs = x.reshape((batch, heads, seq_len, half, 2))?;
+    let even = pairs.narrow(4, 0, 1)?.squeeze(4)?;
+    let odd = pairs.narrow(4, 1, 1)?.squeeze(4)?;
+    let even_cos = even.broadcast_mul(&cos)?;
+    let odd_sin = odd.broadcast_mul(&sin)?;
+    let rot_even = (&even_cos - &odd_sin)?;
+    let even_sin = even.broadcast_mul(&sin)?;
+    let odd_cos = odd.broadcast_mul(&cos)?;
+    let rot_odd = (&even_sin + &odd_cos)?;
+    Tensor::stack(&[&rot_even, &rot_odd], 4)?
+        .reshape((batch, heads, seq_len, head_dim))
+        .map_err(Into::into)
 }
 
 /// Transformer block with self-attention, layer norm, and feed-forward

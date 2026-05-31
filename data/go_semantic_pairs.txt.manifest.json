@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "kind": "go_semantics_tasks",
+  "output_path": "data/go_semantic_pairs.txt",
+  "params": {
+    "pairs": 4,
+    "prompt_frames": 4,
+    "semantic_targets": true,
+    "version": "go_semantics_tasks_v1"
+  },
+  "inputs": [],
+  "rows": 16
+}

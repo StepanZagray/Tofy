@@ -104,12 +104,13 @@ struct CandidateEval {
     constraints_ok: bool,
     compile_ok: bool,
     tests_ok: bool,
+    quality_score: i32,
     detail: String,
     repair_attempts_used: usize,
 }
 
 fn default_language() -> String {
-    "rust".to_string()
+    "go".to_string()
 }
 
 fn default_expected_action() -> String {
@@ -154,6 +155,12 @@ pub fn try_run_decoder_only_eval(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+fn set_eval_env_default(name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, value);
+    }
+}
+
 impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
@@ -171,7 +178,7 @@ impl EvalConfig {
         let mut rust_timeout_secs = DEFAULT_RUST_TIMEOUT_SECS;
         let mut go_timeout_secs = DEFAULT_GO_TIMEOUT_SECS;
         let mut candidates = 1usize;
-        let mut repair_attempts = 0usize;
+        let mut repair_attempts = 2usize;
         let mut conditioning_pareto = false;
         let mut condition_budgets = vec![0, 4, 8, 16, 32, 64];
         let mut cross_schedules = vec![
@@ -413,6 +420,11 @@ impl DecoderOnlyEvalConfig {
 }
 
 fn run_code_eval(cfg: EvalConfig) -> Result<()> {
+    set_eval_env_default("TOFY_DECODER_RLM", "0");
+    set_eval_env_default("TOFY_LATENT_REASONING", "0");
+    let default_eval_temp = if cfg.candidates > 1 { "0.35" } else { "0" };
+    set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
+
     if let Some(path) = cfg.code_decoder_path.as_ref() {
         std::env::set_var("JEPA_USE_CANDLE_DECODER", "1");
         std::env::set_var("JEPA_CANDLE_DECODER", path);
@@ -453,8 +465,10 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         None => println!("high_world: unavailable; train the integrated high-world stage"),
     }
     println!(
-        "search: candidates={} repair_attempts={}",
-        cfg.candidates, cfg.repair_attempts
+        "search: candidates={} repair_attempts={} temp={}",
+        cfg.candidates,
+        cfg.repair_attempts,
+        std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string())
     );
 
     let pareto_points = if cfg.conditioning_pareto {
@@ -531,7 +545,7 @@ fn evaluate_code_suite_once(
         let started = Instant::now();
         let predicted_action = engine.predict_action(&task.prompt)?;
         let rlm_used = engine.uses_recursive_code_generation(&task.prompt, predicted_action);
-        let docs_used = engine.uses_rust_docs(&task.prompt, predicted_action);
+        let docs_used = engine.uses_fetch_docs(&task.prompt, predicted_action);
         let expected_action = parse_expected_action(&task.expected_action)?;
         let route_ok = predicted_action == expected_action
             || (expected_action == Action::Code && predicted_action == Action::FetchDocs);
@@ -599,6 +613,8 @@ fn code_eval_summary_text(summary: &CodeEvalSummary) -> String {
 }
 
 fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
+    let default_eval_temp = if cfg.candidates > 1 { "0.35" } else { "0" };
+    set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
     let tasks = load_suite(&cfg.suite_path)?;
     if tasks.is_empty() {
         bail!("suite {:?} contains no tasks", cfg.suite_path);
@@ -632,7 +648,11 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         "conditioning: zero context slots={} dim={}",
         cfg.num_context_slots, cfg.planner_dim
     );
-    println!("search: candidates={}", cfg.candidates);
+    println!(
+        "search: candidates={} temp={}",
+        cfg.candidates,
+        std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string())
+    );
 
     let mut summary = CodeEvalSummary {
         task_count: tasks.len(),
@@ -643,7 +663,8 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         let mut best = None;
         let max_new_tokens = task.max_new_tokens.min(cfg.max_new_tokens);
         for _ in 0..cfg.candidates {
-            let response = decoder.generate(&task.prompt, "code", &conditioning, max_new_tokens)?;
+            let prompt = build_code_eval_prompt(&task);
+            let response = decoder.generate(&prompt, "code", &conditioning, max_new_tokens)?;
             let candidate = evaluate_candidate_response(
                 &scratch_dir,
                 &cfg.rustc_bin,
@@ -725,8 +746,13 @@ fn evaluate_best_candidate(
 ) -> Result<CandidateEval> {
     let mut best = None;
     let max_new_tokens = task.max_new_tokens.min(cfg.max_new_tokens);
+    let repair_route_ok = matches!(
+        parse_expected_action(&task.expected_action),
+        Ok(Action::Code)
+    );
     for _ in 0..cfg.candidates.max(1) {
-        let response = engine.generate(&task.prompt, max_new_tokens, cfg.ablate_conditioning)?;
+        let prompt = build_code_eval_prompt(task);
+        let response = engine.generate(&prompt, max_new_tokens, cfg.ablate_conditioning)?;
         let mut candidate = evaluate_candidate_response(
             scratch_dir,
             &cfg.rustc_bin,
@@ -740,16 +766,16 @@ fn evaluate_best_candidate(
         )?;
         best = Some(select_better_candidate(best, candidate.clone()));
         for repair_idx in 0..cfg.repair_attempts {
-            if candidate.route_ok
-                && candidate.constraints_ok
-                && candidate.compile_ok
-                && candidate.tests_ok
-            {
+            if candidate.constraints_ok && candidate.compile_ok && candidate.tests_ok {
                 break;
             }
             let repair_prompt = build_repair_prompt(task, &candidate.code, &candidate.detail);
-            let repaired_response =
-                engine.generate(&repair_prompt, max_new_tokens, cfg.ablate_conditioning)?;
+            let repaired_response = engine.generate_for_action(
+                &repair_prompt,
+                Action::Code,
+                max_new_tokens,
+                cfg.ablate_conditioning,
+            )?;
             candidate = evaluate_candidate_response(
                 scratch_dir,
                 &cfg.rustc_bin,
@@ -757,7 +783,7 @@ fn evaluate_best_candidate(
                 cfg.rust_timeout_secs,
                 cfg.go_timeout_secs,
                 task,
-                route_ok,
+                route_ok || repair_route_ok,
                 repaired_response,
                 repair_idx + 1,
             )?;
@@ -781,6 +807,7 @@ fn evaluate_candidate_response(
 ) -> Result<CandidateEval> {
     let code = extract_code_candidate_for_language(&response, &task.language);
     let (constraints_ok, constraint_detail) = check_constraints(&code, task);
+    let quality_score = candidate_quality_score(&code, task);
     let language = task.language.to_ascii_lowercase();
     let (compile_ok, tests_ok, exec_detail) = match language.as_str() {
         "rust" => match run_rust_harness(scratch_dir, rustc_bin, timeout_secs, task, &code) {
@@ -811,6 +838,7 @@ fn evaluate_candidate_response(
         constraints_ok,
         compile_ok,
         tests_ok,
+        quality_score,
         detail,
         repair_attempts_used,
     })
@@ -833,10 +861,16 @@ fn select_better_candidate(
 }
 
 fn candidate_rank(candidate: &CandidateEval) -> i32 {
-    32 * i32::from(candidate.route_ok)
+    128 * i32::from(
+        candidate.route_ok
+            && candidate.constraints_ok
+            && candidate.compile_ok
+            && candidate.tests_ok,
+    ) + 64 * i32::from(candidate.tests_ok)
+        + 32 * i32::from(candidate.compile_ok)
         + 16 * i32::from(candidate.constraints_ok)
-        + 8 * i32::from(candidate.compile_ok)
-        + 4 * i32::from(candidate.tests_ok)
+        + 8 * i32::from(candidate.route_ok)
+        + candidate.quality_score.clamp(-8, 8)
         - candidate.repair_attempts_used as i32
 }
 
@@ -849,17 +883,52 @@ fn build_repair_prompt(task: &CodeEvalTask, previous_code: &str, failure_detail:
             "Rust"
         };
     let fence = if language_name == "Go" { "go" } else { "rust" };
-    let signature_rule = if language_name == "Go" {
-        "- Keep the exact requested function name and signature.\n- Return Go code for package main only; imports are allowed.\n"
-    } else {
-        "- Keep the exact requested function name and signature.\n"
-    };
+    let constraints = constraints_prompt_block(task);
     format!(
-        "<action:repair_patch>\n<tool:read_error>\n<tool:repair_patch>\nReturn only corrected {language_name} code.\nFix the previous attempt while preserving the requested function name and signature.\n\n<ctx:original_request>\n{}\n\n<ctx:previous_attempt>\n```{fence}\n{}\n```\n\n<ctx:failure_feedback>\n{}\n\n<ctx:constraints>\nRules:\n{signature_rule}- Do not add explanation.\n",
+        "Return only corrected {language_name} code.\nFix the previous attempt using the compiler feedback.\n\nOriginal request:\n{}\n{constraints}\nPrevious attempt:\n```{fence}\n{}\n```\n\nCompiler feedback:\n{}\n\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable {language_name} code.\n- Do not add markdown fences or explanation.\n",
         task.prompt,
         previous_code,
         failure_detail
     )
+}
+
+fn build_code_eval_prompt(task: &CodeEvalTask) -> String {
+    let language = task.language.trim();
+    let language_name =
+        if language.eq_ignore_ascii_case("go") || language.eq_ignore_ascii_case("golang") {
+            "Go"
+        } else {
+            "Rust"
+        };
+    format!(
+        "Return only {language_name} code. Do not use markdown fences or explanation.\n{constraints}Task:\n{}",
+        task.prompt,
+        constraints = constraints_prompt_block(task)
+    )
+}
+
+fn constraints_prompt_block(task: &CodeEvalTask) -> String {
+    let mut out = String::new();
+    if !task.must_contain.is_empty() {
+        out.push_str("Required exact substrings:\n");
+        for value in &task.must_contain {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+    if !task.must_not_contain.is_empty() {
+        out.push_str("Forbidden substrings:\n");
+        for value in &task.must_not_contain {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 fn load_suite(path: &Path) -> Result<Vec<CodeEvalTask>> {
@@ -884,7 +953,7 @@ fn parse_expected_action(value: &str) -> Result<Action> {
         "code" => Ok(Action::Code),
         "text" | "text_reply" => Ok(Action::TextReply),
         "done" => Ok(Action::Done),
-        "fetch_docs" | "docs" | "rust_docs" => Ok(Action::FetchDocs),
+        "fetch_docs" | "docs" => Ok(Action::FetchDocs),
         other => bail!("unsupported expected action {:?}", other),
     }
 }
@@ -969,6 +1038,75 @@ fn check_constraints(code: &str, task: &CodeEvalTask) -> (bool, String) {
     } else {
         (false, problems.join("; "))
     }
+}
+
+fn candidate_quality_score(code: &str, task: &CodeEvalTask) -> i32 {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return -8;
+    }
+    let mut score = 0;
+    score += task
+        .must_contain
+        .iter()
+        .filter(|needle| trimmed.contains(needle.as_str()))
+        .count() as i32;
+    score -= task
+        .must_not_contain
+        .iter()
+        .filter(|needle| trimmed.contains(needle.as_str()))
+        .count() as i32
+        * 2;
+    if delimiters_look_balanced(trimmed) {
+        score += 2;
+    } else {
+        score -= 2;
+    }
+    if trimmed.contains("```") || trimmed.contains("Return only") {
+        score -= 2;
+    }
+    let language = task.language.to_ascii_lowercase();
+    if language == "go" || language == "golang" {
+        if trimmed.contains("func ") {
+            score += 1;
+        }
+        if trimmed.contains("package ") {
+            score -= 1;
+        }
+    }
+    score
+}
+
+fn delimiters_look_balanced(code: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+    for ch in code.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' | '`' => {
+                in_string = true;
+                quote = ch;
+            }
+            '(' | '[' | '{' => stack.push(ch),
+            ')' if stack.pop() != Some('(') => return false,
+            ']' if stack.pop() != Some('[') => return false,
+            '}' if stack.pop() != Some('{') => return false,
+            ')' | ']' | '}' => {}
+            _ => {}
+        }
+    }
+    !in_string && stack.is_empty()
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -1133,5 +1271,69 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Outp
             ));
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_code_eval_prompt, build_repair_prompt, candidate_quality_score,
+        delimiters_look_balanced, CodeEvalTask,
+    };
+
+    fn go_task() -> CodeEvalTask {
+        CodeEvalTask {
+            id: "add".to_string(),
+            prompt:
+                "Return only Go code. Implement exactly this function:\nfunc Add(a int, b int) int"
+                    .to_string(),
+            harness_template: "{{code}}".to_string(),
+            language: "go".to_string(),
+            expected_action: "code".to_string(),
+            max_new_tokens: 64,
+            must_contain: Vec::new(),
+            must_not_contain: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn repair_prompt_matches_training_feedback_schema() {
+        let prompt =
+            build_repair_prompt(&go_task(), "func Add() int { return 0 }", "compile failed");
+        assert!(prompt.contains("Compiler feedback:\ncompile failed"));
+        assert!(prompt.contains("Original request:\nReturn only Go code."));
+        assert!(prompt.contains("Return only compilable Go code."));
+        assert!(!prompt.contains("<tool:"));
+        assert!(!prompt.contains("<ctx:"));
+        assert!(!prompt.contains("<ctx:failure_feedback>"));
+    }
+
+    #[test]
+    fn eval_prompt_reinforces_code_only_constraints() {
+        let mut task = go_task();
+        task.must_contain = vec!["func Add".to_string()];
+        task.must_not_contain = vec!["panic(".to_string()];
+
+        let prompt = build_code_eval_prompt(&task);
+
+        assert!(prompt.contains("Return only Go code."));
+        assert!(prompt.contains("Do not use markdown fences"));
+        assert!(prompt.contains("Required exact substrings:\n- func Add"));
+        assert!(prompt.contains("Forbidden substrings:\n- panic("));
+    }
+
+    #[test]
+    fn candidate_quality_rewards_required_balanced_code() {
+        let mut task = go_task();
+        task.must_contain = vec!["func Add".to_string()];
+        task.must_not_contain = vec!["panic(".to_string()];
+
+        let good = candidate_quality_score("func Add(a int, b int) int { return a + b }", &task);
+        let bad = candidate_quality_score("func Add(a int, b int) int { panic(\"x\")", &task);
+
+        assert!(good > bad);
+        assert!(delimiters_look_balanced("func Add() int { return 1 }"));
+        assert!(!delimiters_look_balanced("func Add() int { return 1 "));
     }
 }

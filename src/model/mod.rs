@@ -12,6 +12,7 @@ pub use action_classifier_head::NextActionClassifier;
 pub use action_state_transition::ActionStateTransition;
 pub use context_compressor::ContextCompressor;
 pub use decoders::{
+    agentic_decoder_requested, clean_agentic_final, parse_tool_call, BashToolRegistry,
     CandleCrossAttnDecoder, CodeDecoder, DecoderArchitecture, DecoderConditioningAdapter,
     DecoderKind, LlamaCppDecoder, LocalDecoderRuntime, RlmDecoderRuntime, StubLocalDecoder,
 };
