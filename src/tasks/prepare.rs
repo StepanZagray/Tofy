@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -350,12 +350,7 @@ fn load_manifest(path: &Path) -> Option<ArtifactManifest> {
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let tmp = path.with_extension(
-        path.extension()
-            .and_then(OsStr::to_str)
-            .map(|ext| format!("{ext}.tmp"))
-            .unwrap_or_else(|| "tmp".to_string()),
-    );
+    let tmp = atomic_tmp_path(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -368,12 +363,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
-    let tmp = path.with_extension(
-        path.extension()
-            .and_then(OsStr::to_str)
-            .map(|ext| format!("{ext}.tmp"))
-            .unwrap_or_else(|| "tmp".to_string()),
-    );
+    let tmp = atomic_tmp_path(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -382,6 +372,20 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
     writer.flush()?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension(
+        path.extension()
+            .and_then(OsStr::to_str)
+            .map(|ext| format!("{ext}.tmp"))
+            .unwrap_or_else(|| "tmp".to_string()),
+    )
+}
+
+fn side_tmp_path(path: &Path, label: &str) -> PathBuf {
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or("output");
+    path.with_file_name(format!("{file_name}.{label}.tmp"))
 }
 
 fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
@@ -2429,106 +2433,108 @@ fn run_prepare_world_mix(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     println!(
-        "World mix parallel load: code_inputs={} rayon_threads={}",
+        "World mix streaming load: code_inputs={} rayon_threads={}",
         code_pairs.len(),
         rayon::current_num_threads()
     );
-    let (text_rows_result, code_rows_result) = rayon::join(
-        || load_raw_pairs(&text_pairs),
-        || {
-            code_pairs
-                .par_iter()
-                .map(|path| load_raw_pairs(path))
-                .collect::<Result<Vec<_>>>()
-        },
-    );
-    let mut text_rows = text_rows_result?;
-    let mut code_rows = code_rows_result?.into_iter().flatten().collect::<Vec<_>>();
-    if text_rows.is_empty() {
+    let text_total = count_raw_pairs(&text_pairs)?;
+    let code_total = count_raw_pairs_many(&code_pairs)?;
+    if text_total == 0 {
         bail!("no usable text rows found in {}", text_pairs.display());
     }
-    if code_rows.is_empty() {
+    if code_total == 0 {
         bail!("no usable code rows found");
     }
-    text_rows.shuffle(&mut rng);
-    code_rows.shuffle(&mut rng);
-    let max_rows = if max_rows > 0 {
-        max_rows
-    } else {
-        text_rows.len() + code_rows.len()
-    };
+    let total_rows = text_total + code_total;
+    let max_rows = if max_rows > 0 { max_rows } else { total_rows };
+    let target_rows = max_rows.min(total_rows);
     let code_ratio = code_ratio.clamp(0.0, 0.8);
     let done_ratio = done_ratio.clamp(0.0, 0.4);
-    let mut output_rows = Vec::new();
-    let mut terminal_candidates = Vec::new();
-    let mut chosen_code = 0usize;
-    let mut chosen_text = 0usize;
-    let mut chosen_done = 0usize;
-    while output_rows.len() < max_rows && (!text_rows.is_empty() || !code_rows.is_empty()) {
-        let want_code = rng.random::<f64>() < code_ratio;
-        if want_code && !code_rows.is_empty() {
-            let (left, right) = code_rows.pop().unwrap();
-            let action = world_mix_code_action(&left, &right);
-            output_rows.push(format!(
-                "{}\t{}\t{action}",
-                escape_pair_field(&left),
-                escape_pair_field(&right)
-            ));
-            terminal_candidates.push((left, right, action.to_string()));
-            chosen_code += 1;
-        } else if !text_rows.is_empty() {
-            let (left, right) = text_rows.pop().unwrap();
-            output_rows.push(format!(
-                "{}\t{}\ttext_reply",
-                escape_pair_field(&left),
-                escape_pair_field(&right)
-            ));
-            terminal_candidates.push((left, right, "text_reply".to_string()));
-            chosen_text += 1;
-        } else if !code_rows.is_empty() {
-            let (left, right) = code_rows.pop().unwrap();
-            let action = world_mix_code_action(&left, &right);
-            output_rows.push(format!(
-                "{}\t{}\t{action}",
-                escape_pair_field(&left),
-                escape_pair_field(&right)
-            ));
-            terminal_candidates.push((left, right, action.to_string()));
-            chosen_code += 1;
-        }
-    }
-    let target_done = if done_ratio > 0.0 && !output_rows.is_empty() {
-        ((output_rows.len() as f64 * done_ratio) / (1.0 - done_ratio).max(1e-6)).round() as usize
+    let target_done = if done_ratio > 0.0 && target_rows > 0 {
+        ((target_rows as f64 * done_ratio) / (1.0 - done_ratio).max(1e-6)).round() as usize
     } else {
         0
     };
-    terminal_candidates.shuffle(&mut rng);
-    for (left, right, action) in terminal_candidates.into_iter().take(target_done) {
-        let terminal_state = if action == "text_reply" {
-            format!("{left}\\nAssistant: {right}")
+    let tmp = atomic_tmp_path(&output);
+    let done_tmp = side_tmp_path(&output, "done");
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    let mut done_out = BufWriter::new(File::create(&done_tmp)?);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut text_stream = RawPairStream::open(&text_pairs)?;
+    let mut code_stream = MultiRawPairStream::open(&code_pairs)?;
+    let mut remaining_text = text_total;
+    let mut remaining_code = code_total;
+    let mut remaining_candidates = target_rows;
+    let mut remaining_done = target_done;
+    let mut chosen_code = 0usize;
+    let mut chosen_text = 0usize;
+    let mut chosen_done = 0usize;
+    while chosen_code + chosen_text < target_rows && (remaining_text > 0 || remaining_code > 0) {
+        let want_code = rng.random::<f64>() < code_ratio;
+        let use_code = (want_code && remaining_code > 0) || remaining_text == 0;
+        let (left, right, action) = if use_code {
+            let Some((left, right)) = code_stream.next_pair()? else {
+                remaining_code = 0;
+                continue;
+            };
+            remaining_code -= 1;
+            let action = world_mix_code_action(&left, &right);
+            chosen_code += 1;
+            (left, right, action)
         } else {
-            format!("{left}\\n{right}")
+            let Some((left, right)) = text_stream.next_pair()? else {
+                remaining_text = 0;
+                continue;
+            };
+            remaining_text -= 1;
+            chosen_text += 1;
+            (left, right, "text_reply")
         };
-        output_rows.push(format!(
-            "{}\t<done>\tdone",
-            escape_pair_field(&terminal_state)
-        ));
-        chosen_done += 1;
+        writeln!(
+            out,
+            "{}\t{}\t{action}",
+            escape_pair_field(&left),
+            escape_pair_field(&right)
+        )?;
+        if remaining_done > 0
+            && remaining_candidates > 0
+            && rng.random_range(0..remaining_candidates) < remaining_done
+        {
+            let terminal_state = if action == "text_reply" {
+                format!("{left}\\nAssistant: {right}")
+            } else {
+                format!("{left}\\n{right}")
+            };
+            writeln!(
+                done_out,
+                "{}\t<done>\tdone",
+                escape_pair_field(&terminal_state)
+            )?;
+            remaining_done -= 1;
+            chosen_done += 1;
+        }
+        remaining_candidates = remaining_candidates.saturating_sub(1);
     }
-    let mut content = String::new();
-    for row in &output_rows {
-        content.push_str(row);
-        content.push('\n');
-    }
-    write_text_atomic(&output, &content)?;
-    write_artifact_manifest("world_mix", &output, &inputs, params, output_rows.len())?;
-    let actual_code_rate = chosen_code as f64 / output_rows.len().max(1) as f64;
-    let actual_done_rate = chosen_done as f64 / output_rows.len().max(1) as f64;
+    out.flush()?;
+    done_out.flush()?;
+    drop(done_out);
+    let mut done_reader = BufReader::new(File::open(&done_tmp)?);
+    std::io::copy(&mut done_reader, &mut out)?;
+    out.flush()?;
+    drop(out);
+    fs::rename(&tmp, &output)?;
+    let _ = fs::remove_file(&done_tmp);
+    let output_len = chosen_text + chosen_code + chosen_done;
+    write_artifact_manifest("world_mix", &output, &inputs, params, output_len)?;
+    let actual_code_rate = chosen_code as f64 / output_len.max(1) as f64;
+    let actual_done_rate = chosen_done as f64 / output_len.max(1) as f64;
     println!(
         "Wrote {} rows to {} (text_rows={}, code_rows={}, done_rows={}, requested code_ratio={:.2}, requested done_ratio={:.2})",
-        output_rows.len(),
+        output_len,
         output.display(),
         chosen_text,
         chosen_code,
@@ -2567,31 +2573,6 @@ fn explicit_world_mix_action(text: &str) -> Option<&'static str> {
     }
 }
 
-fn load_raw_pairs(path: &Path) -> Result<Vec<(String, String)>> {
-    let mut lines = BufReader::new(File::open(path)?).lines();
-    let chunk_lines = prepare_chunk_lines();
-    let mut rows = Vec::new();
-    loop {
-        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
-        if chunk.is_empty() {
-            break;
-        }
-        rows.extend(
-            chunk
-                .par_iter()
-                .filter_map(|line| {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        return None;
-                    }
-                    split_pair_line_first_two(trimmed)
-                })
-                .collect::<Vec<_>>(),
-        );
-    }
-    Ok(rows)
-}
-
 fn split_pair_line_first_two(line: &str) -> Option<(String, String)> {
     let parts = if line.contains('\t') {
         line.split('\t').collect::<Vec<_>>()
@@ -2612,6 +2593,99 @@ fn split_pair_line_first_two(line: &str) -> Option<(String, String)> {
         }
     }
     Some((left, right))
+}
+
+fn count_raw_pairs(path: &Path) -> Result<usize> {
+    let mut lines = BufReader::new(File::open(path)?).lines();
+    let chunk_lines = prepare_chunk_lines();
+    let mut count = 0usize;
+    loop {
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        count += chunk
+            .par_iter()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && (trimmed.contains('\t') || trimmed.contains("|||"))
+            })
+            .count();
+    }
+    Ok(count)
+}
+
+fn count_raw_pairs_many(paths: &[PathBuf]) -> Result<usize> {
+    paths
+        .par_iter()
+        .map(|path| count_raw_pairs(path))
+        .collect::<Result<Vec<_>>>()
+        .map(|counts| counts.into_iter().sum())
+}
+
+struct RawPairStream {
+    lines: std::io::Lines<BufReader<File>>,
+    buffer: VecDeque<(String, String)>,
+    chunk_lines: usize,
+}
+
+impl RawPairStream {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            lines: BufReader::new(File::open(path)?).lines(),
+            buffer: VecDeque::new(),
+            chunk_lines: prepare_chunk_lines(),
+        })
+    }
+
+    fn next_pair(&mut self) -> Result<Option<(String, String)>> {
+        loop {
+            if let Some(pair) = self.buffer.pop_front() {
+                return Ok(Some(pair));
+            }
+            let chunk = read_line_chunk(&mut self.lines, self.chunk_lines)?;
+            if chunk.is_empty() {
+                return Ok(None);
+            }
+            self.buffer = VecDeque::from(
+                chunk
+                    .par_iter()
+                    .filter_map(|line| {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        split_pair_line_first_two(trimmed)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+struct MultiRawPairStream {
+    streams: Vec<RawPairStream>,
+    index: usize,
+}
+
+impl MultiRawPairStream {
+    fn open(paths: &[PathBuf]) -> Result<Self> {
+        let streams = paths
+            .iter()
+            .map(|path| RawPairStream::open(path))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { streams, index: 0 })
+    }
+
+    fn next_pair(&mut self) -> Result<Option<(String, String)>> {
+        while self.index < self.streams.len() {
+            if let Some(pair) = self.streams[self.index].next_pair()? {
+                return Ok(Some(pair));
+            }
+            self.index += 1;
+        }
+        Ok(None)
+    }
 }
 
 fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
@@ -2701,94 +2775,183 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
         }
     }
     println!(
-        "Code POC mix parallel load: extra_inputs={} rayon_threads={}",
+        "Code POC mix streaming write: extra_inputs={} rayon_threads={}",
         extra_pairs.len(),
         rayon::current_num_threads()
     );
-    let ((rows_result, instruction_result), extras_result) = rayon::join(
-        || {
-            rayon::join(
-                || load_non_empty_lines(&base_pairs),
-                || load_non_empty_lines(&instruction_pairs),
-            )
-        },
-        || {
-            extra_pairs
-                .par_iter()
-                .map(|path| load_non_empty_lines(path))
-                .collect::<Result<Vec<_>>>()
-        },
-    );
-    let base_rows = code_poc_rows_with_eos(rows_result?);
-    let instruction = code_poc_rows_with_eos(instruction_result?);
-    let extras = code_poc_rows_with_eos(extras_result?.into_iter().flatten().collect::<Vec<_>>());
-    let fim_source = instruction
-        .iter()
-        .chain(extras.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    let fim_rows = if fim_repeat > 0 {
-        code_poc_fim_rows(&fim_source)
-    } else {
-        Vec::new()
-    };
-    let mut mixed = Vec::new();
+    let mut units = Vec::new();
     for _ in 0..instruction_repeat {
-        mixed.extend(instruction.clone());
+        units.push(CodePocMixUnit::Instruction);
     }
     for _ in 0..extra_repeat {
-        mixed.extend(extras.clone());
+        for path in &extra_pairs {
+            units.push(CodePocMixUnit::Extra(path.clone()));
+        }
     }
     for _ in 0..fim_repeat {
-        mixed.extend(fim_rows.clone());
+        units.push(CodePocMixUnit::Fim);
     }
     for _ in 0..base_repeat {
-        mixed.extend(base_rows.clone());
+        units.push(CodePocMixUnit::Base);
     }
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    mixed.shuffle(&mut rng);
-    if max_rows > 0 && mixed.len() > max_rows {
-        mixed.truncate(max_rows);
+    units.shuffle(&mut rng);
+    let tmp = atomic_tmp_path(&output);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
     }
-    let mut content = String::new();
-    for row in &mixed {
-        content.push_str(row);
-        content.push('\n');
+    let mut out = BufWriter::new(File::create(&tmp)?);
+    let mut remaining = if max_rows > 0 { Some(max_rows) } else { None };
+    let mut written = 0usize;
+    let mut fim_rows = 0usize;
+    for unit in units {
+        if !has_row_budget(&remaining) {
+            break;
+        }
+        match unit {
+            CodePocMixUnit::Base => {
+                written += write_code_poc_rows_from_path(&mut out, &base_pairs, &mut remaining)?;
+            }
+            CodePocMixUnit::Instruction => {
+                written +=
+                    write_code_poc_rows_from_path(&mut out, &instruction_pairs, &mut remaining)?;
+            }
+            CodePocMixUnit::Extra(path) => {
+                written += write_code_poc_rows_from_path(&mut out, &path, &mut remaining)?;
+            }
+            CodePocMixUnit::Fim => {
+                let wrote = write_code_poc_fim_rows(
+                    &mut out,
+                    &instruction_pairs,
+                    &extra_pairs,
+                    &mut remaining,
+                )?;
+                written += wrote;
+                fim_rows += wrote;
+            }
+        }
     }
-    write_text_atomic(&output, &content)?;
-    write_artifact_manifest("code_poc_mix", &output, &inputs, params, mixed.len())?;
+    out.flush()?;
+    drop(out);
+    fs::rename(&tmp, &output)?;
+    write_artifact_manifest("code_poc_mix", &output, &inputs, params, written)?;
     println!(
-        "Wrote {} mixed code POC rows to {} (fim_rows={})",
-        mixed.len(),
+        "Wrote {} mixed code POC rows to {} (streamed_fim_rows={})",
+        written,
         output.display(),
-        fim_rows.len()
+        fim_rows
     );
     Ok(())
 }
 
-fn load_non_empty_lines(path: &Path) -> Result<Vec<String>> {
+#[derive(Clone)]
+enum CodePocMixUnit {
+    Base,
+    Instruction,
+    Extra(PathBuf),
+    Fim,
+}
+
+fn has_row_budget(remaining: &Option<usize>) -> bool {
+    remaining.map(|rows| rows > 0).unwrap_or(true)
+}
+
+fn write_limited_row<W: Write>(
+    out: &mut W,
+    row: &str,
+    remaining: &mut Option<usize>,
+) -> Result<bool> {
+    if !has_row_budget(remaining) {
+        return Ok(false);
+    }
+    writeln!(out, "{row}")?;
+    if let Some(rows) = remaining.as_mut() {
+        *rows -= 1;
+    }
+    Ok(true)
+}
+
+fn write_code_poc_rows_from_path<W: Write>(
+    out: &mut W,
+    path: &Path,
+    remaining: &mut Option<usize>,
+) -> Result<usize> {
     let mut lines = BufReader::new(File::open(path)?).lines();
     let chunk_lines = prepare_chunk_lines();
-    let mut rows = Vec::new();
+    let mut written = 0usize;
     loop {
+        if !has_row_budget(remaining) {
+            break;
+        }
         let chunk = read_line_chunk(&mut lines, chunk_lines)?;
         if chunk.is_empty() {
             break;
         }
-        rows.extend(
-            chunk
-                .into_par_iter()
-                .filter(|line| !line.trim().is_empty())
-                .collect::<Vec<_>>(),
-        );
+        let rows = chunk
+            .into_par_iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| code_poc_row_with_eos(&line).unwrap_or(line))
+            .collect::<Vec<_>>();
+        for row in rows {
+            if write_limited_row(out, &row, remaining)? {
+                written += 1;
+            } else {
+                break;
+            }
+        }
     }
-    Ok(rows)
+    Ok(written)
 }
 
-fn code_poc_rows_with_eos(rows: Vec<String>) -> Vec<String> {
-    rows.into_par_iter()
-        .map(|row| code_poc_row_with_eos(&row).unwrap_or(row))
-        .collect()
+fn write_code_poc_fim_rows<W: Write>(
+    out: &mut W,
+    instruction_pairs: &Path,
+    extra_pairs: &[PathBuf],
+    remaining: &mut Option<usize>,
+) -> Result<usize> {
+    let mut written = write_code_poc_fim_rows_from_path(out, instruction_pairs, remaining)?;
+    for path in extra_pairs {
+        if !has_row_budget(remaining) {
+            break;
+        }
+        written += write_code_poc_fim_rows_from_path(out, path, remaining)?;
+    }
+    Ok(written)
+}
+
+fn write_code_poc_fim_rows_from_path<W: Write>(
+    out: &mut W,
+    path: &Path,
+    remaining: &mut Option<usize>,
+) -> Result<usize> {
+    let mut lines = BufReader::new(File::open(path)?).lines();
+    let chunk_lines = prepare_chunk_lines();
+    let mut written = 0usize;
+    loop {
+        if !has_row_budget(remaining) {
+            break;
+        }
+        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+        if chunk.is_empty() {
+            break;
+        }
+        let rows = chunk
+            .into_par_iter()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| {
+                let row = code_poc_row_with_eos(&line).unwrap_or(line);
+                code_poc_fim_row(&row)
+            })
+            .collect::<Vec<_>>();
+        for row in rows {
+            if write_limited_row(out, &row, remaining)? {
+                written += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(written)
 }
 
 fn code_poc_row_with_eos(row: &str) -> Option<String> {
@@ -2817,12 +2980,6 @@ fn strip_code_eos(text: &str) -> String {
     text.find(CODE_EOS_TOKEN)
         .map(|idx| text[..idx].trim_end().to_string())
         .unwrap_or_else(|| text.trim_end().to_string())
-}
-
-fn code_poc_fim_rows(rows: &[String]) -> Vec<String> {
-    rows.par_iter()
-        .filter_map(|row| code_poc_fim_row(row))
-        .collect()
 }
 
 fn code_poc_fim_row(row: &str) -> Option<String> {
@@ -4689,12 +4846,24 @@ mod tests {
     use super::{
         artifact_cache_hit, code_poc_fim_row, code_poc_row_with_eos, escape_pair_field,
         flatten_for_encoder, is_base_model_artifact, remote_source_fingerprint,
-        split_pair_line_first_two, unescape_pair_field, world_mix_code_action,
-        write_artifact_manifest,
+        run_prepare_code_poc_mix, run_prepare_world_mix, split_pair_line_first_two,
+        unescape_pair_field, world_mix_code_action, write_artifact_manifest,
     };
     use crate::data::CODE_EOS_TOKEN;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn unique_prepare_test_dir(label: &str) -> PathBuf {
+        let unique = format!(
+            "tofy_prepare_{label}_{}_{}",
+            std::process::id(),
+            super::SystemTime::now()
+                .duration_since(super::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
 
     #[test]
     fn base_model_artifact_accepts_param_count_names() {
@@ -4747,15 +4916,7 @@ mod tests {
 
     #[test]
     fn artifact_cache_hit_accepts_remote_hub_input() {
-        let unique = format!(
-            "tofy_prepare_manifest_test_{}_{}",
-            std::process::id(),
-            super::SystemTime::now()
-                .duration_since(super::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir().join(unique);
+        let dir = unique_prepare_test_dir("manifest");
         std::fs::create_dir_all(&dir).unwrap();
         let output = dir.join("github_top_code.txt");
         std::fs::write(&output, "package main\nfunc main() {}\n").unwrap();
@@ -4771,6 +4932,137 @@ mod tests {
         let miss =
             artifact_cache_hit("github_top_code", &output, &changed_inputs, &params).unwrap();
         assert!(miss.is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn world_mix_streaming_writes_exact_done_rows() {
+        let dir = unique_prepare_test_dir("world_mix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("text.txt");
+        let code = dir.join("code.txt");
+        let output = dir.join("world.txt");
+        std::fs::write(
+            &text,
+            format!(
+                "{}\t{}\n{}\t{}\n",
+                escape_pair_field("hello"),
+                escape_pair_field("world"),
+                escape_pair_field("question"),
+                escape_pair_field("answer")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &code,
+            format!(
+                "{}\t{}\n{}\t{}\n",
+                escape_pair_field("write add"),
+                escape_pair_field("func Add() {}"),
+                escape_pair_field("write sub"),
+                escape_pair_field("func Sub() {}")
+            ),
+        )
+        .unwrap();
+
+        run_prepare_world_mix(&[
+            "--output".to_string(),
+            output.to_string_lossy().to_string(),
+            "--text-pairs".to_string(),
+            text.to_string_lossy().to_string(),
+            "--code-pairs".to_string(),
+            code.to_string_lossy().to_string(),
+            "--code-ratio".to_string(),
+            "0.5".to_string(),
+            "--done-ratio".to_string(),
+            "0.25".to_string(),
+            "--max-rows".to_string(),
+            "4".to_string(),
+            "--seed".to_string(),
+            "7".to_string(),
+        ])
+        .unwrap();
+
+        let rows = std::fs::read_to_string(&output).unwrap();
+        let lines = rows.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.ends_with("\t<done>\tdone"))
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn code_poc_mix_streaming_respects_max_rows() {
+        let dir = unique_prepare_test_dir("code_poc_mix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.txt");
+        let instruction = dir.join("instruction.txt");
+        let extra = dir.join("extra.txt");
+        let output = dir.join("code_mix.txt");
+        let pair = |prompt: &str, code: &str| {
+            format!(
+                "{}\t{}\n",
+                escape_pair_field(prompt),
+                escape_pair_field(code)
+            )
+        };
+        std::fs::write(
+            &base,
+            pair("base", "func Base() {\n    println(\"base\")\n}"),
+        )
+        .unwrap();
+        std::fs::write(
+            &instruction,
+            pair(
+                "instruction",
+                "func Instruction() {\n    println(\"inst\")\n}",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &extra,
+            pair("extra", "func Extra() {\n    println(\"extra\")\n}"),
+        )
+        .unwrap();
+
+        run_prepare_code_poc_mix(&[
+            "--output".to_string(),
+            output.to_string_lossy().to_string(),
+            "--base-pairs".to_string(),
+            base.to_string_lossy().to_string(),
+            "--instruction-pairs".to_string(),
+            instruction.to_string_lossy().to_string(),
+            "--extra-pairs".to_string(),
+            extra.to_string_lossy().to_string(),
+            "--base-repeat".to_string(),
+            "1".to_string(),
+            "--instruction-repeat".to_string(),
+            "2".to_string(),
+            "--extra-repeat".to_string(),
+            "1".to_string(),
+            "--fim-repeat".to_string(),
+            "0".to_string(),
+            "--max-rows".to_string(),
+            "3".to_string(),
+            "--seed".to_string(),
+            "3".to_string(),
+        ])
+        .unwrap();
+
+        let rows = std::fs::read_to_string(&output).unwrap();
+        let lines = rows.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            let (_, right) = line.split_once('\t').expect("row should be a pair");
+            assert!(unescape_pair_field(right).ends_with(CODE_EOS_TOKEN));
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

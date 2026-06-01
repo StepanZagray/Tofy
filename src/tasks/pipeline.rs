@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -675,15 +676,19 @@ fn prepare_data(
             join_result(handle, "go repair tasks")?;
         }
 
-        let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
-        let world_handle = scope.spawn(move || run_prepare_vec(world_args));
-        let code_mix_handle = scope.spawn(move || run_prepare_vec(code_mix_args));
-        let go_feedback_mix_handle = scope.spawn(move || run_prepare_vec(go_feedback_mix_args));
-
-        join_result(world_handle, "world mix")?;
-        join_result(code_mix_handle, "code decoder mix")?;
-        join_result(go_feedback_mix_handle, "go feedback decoder mix")?;
         join_result(encoder_corpus_handle, "encoder corpus")?;
+
+        let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
+        run_stage1_mix_jobs(vec![
+            PrepareMixJob::new("world mix", world_args, 2_048, 4_096),
+            PrepareMixJob::new("code decoder mix", code_mix_args, 1_024, 3_072),
+            PrepareMixJob::new(
+                "go feedback decoder mix",
+                go_feedback_mix_args,
+                1_024,
+                3_072,
+            ),
+        ])?;
         Ok(())
     })?;
 
@@ -869,6 +874,236 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
     }
     go_feedback_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
     (world_args, code_mix_args, go_feedback_mix_args)
+}
+
+struct PrepareMixJob {
+    label: &'static str,
+    args: Vec<String>,
+    estimated_mb: u64,
+}
+
+struct PrepareMixJobResult {
+    label: &'static str,
+    estimated_mb: u64,
+    result: Result<()>,
+}
+
+#[derive(Clone, Copy)]
+struct PrepareMixMemory {
+    mem_available_mb: u64,
+    swap_free_mb: u64,
+}
+
+impl PrepareMixJob {
+    fn new(label: &'static str, args: Vec<String>, base_mb: u64, max_mb: u64) -> Self {
+        let input_mb = prepare_mix_input_mb(&args);
+        let estimated_mb = base_mb.saturating_add(input_mb / 16).clamp(base_mb, max_mb);
+        Self {
+            label,
+            args,
+            estimated_mb,
+        }
+    }
+}
+
+fn run_stage1_mix_jobs(jobs: Vec<PrepareMixJob>) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let max_parallel = prepare_mix_max_parallel(jobs.len());
+    let initial_budget = prepare_mix_memory_budget_mb();
+    let memory_note = prepare_mix_memory_snapshot()
+        .map(|snapshot| {
+            format!(
+                "available={}MB swap_free={}MB",
+                snapshot.mem_available_mb, snapshot.swap_free_mb
+            )
+        })
+        .unwrap_or_else(|| "available=unknown swap_free=unknown".to_string());
+    println!(
+        "Stage 1 mix scheduler: jobs={} max_parallel={} {} budget={}MB",
+        jobs.len(),
+        max_parallel,
+        memory_note,
+        display_memory_budget(initial_budget)
+    );
+
+    let mut pending = VecDeque::from(jobs);
+    let (tx, rx) = std::sync::mpsc::channel::<PrepareMixJobResult>();
+    let mut active_jobs = 0usize;
+    let mut active_estimated_mb = 0u64;
+    let mut first_error: Option<anyhow::Error> = None;
+
+    while !pending.is_empty() || active_jobs > 0 {
+        while first_error.is_none() && active_jobs < max_parallel && !pending.is_empty() {
+            let budget_mb = prepare_mix_memory_budget_mb();
+            let Some(index) =
+                select_prepare_mix_job(&pending, active_estimated_mb, budget_mb, active_jobs == 0)
+            else {
+                break;
+            };
+            let job = pending
+                .remove(index)
+                .expect("pending job index should exist");
+            let label = job.label;
+            let estimated_mb = job.estimated_mb;
+            let args = job.args;
+            println!(
+                "Stage 1 mix scheduler: starting {label} (estimate={}MB active_estimate={}MB budget={}MB)",
+                estimated_mb,
+                active_estimated_mb.saturating_add(estimated_mb),
+                display_memory_budget(budget_mb)
+            );
+            active_jobs += 1;
+            active_estimated_mb = active_estimated_mb.saturating_add(estimated_mb);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_prepare_vec(args).with_context(|| label)
+                }))
+                .map_err(|_| anyhow!("{label} panicked"))
+                .and_then(|result| result);
+                let _ = tx.send(PrepareMixJobResult {
+                    label,
+                    estimated_mb,
+                    result,
+                });
+            });
+        }
+
+        if active_jobs == 0 {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            bail!("stage 1 mix scheduler could not schedule any pending job");
+        }
+
+        let finished = rx.recv().context("stage 1 mix scheduler channel closed")?;
+        active_jobs -= 1;
+        active_estimated_mb = active_estimated_mb.saturating_sub(finished.estimated_mb);
+        match finished.result {
+            Ok(()) => println!("Stage 1 mix scheduler: finished {}", finished.label),
+            Err(error) => {
+                println!("Stage 1 mix scheduler: {} failed", finished.label);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn select_prepare_mix_job(
+    pending: &VecDeque<PrepareMixJob>,
+    active_estimated_mb: u64,
+    budget_mb: u64,
+    force_one: bool,
+) -> Option<usize> {
+    pending
+        .iter()
+        .position(|job| active_estimated_mb.saturating_add(job.estimated_mb) <= budget_mb)
+        .or_else(|| force_one.then_some(0))
+}
+
+fn prepare_mix_max_parallel(job_count: usize) -> usize {
+    let hardware_threads = thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .max(1);
+    let default_parallel = job_count.min(hardware_threads).max(1);
+    std::env::var("TOFY_PREPARE_MIX_MAX_PARALLEL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default_parallel)
+        .min(job_count)
+        .max(1)
+}
+
+fn prepare_mix_input_mb(args: &[String]) -> u64 {
+    let mut total = 0u64;
+    let mut index = 0usize;
+    while index + 1 < args.len() {
+        let flag = args[index].as_str();
+        if matches!(
+            flag,
+            "--text-pairs"
+                | "--code-pairs"
+                | "--base-pairs"
+                | "--instruction-pairs"
+                | "--extra-pairs"
+        ) {
+            total = total.saturating_add(path_len_mb(Path::new(&args[index + 1])));
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    total
+}
+
+fn path_len_mb(path: &Path) -> u64 {
+    const MB: u64 = 1_048_576;
+    path.metadata()
+        .map(|metadata| metadata.len().saturating_add(MB - 1) / MB)
+        .unwrap_or(0)
+}
+
+fn prepare_mix_memory_budget_mb() -> u64 {
+    let Some(snapshot) = prepare_mix_memory_snapshot() else {
+        return u64::MAX;
+    };
+    let headroom_mb = std::env::var("TOFY_PREPARE_MIX_HEADROOM_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(4_096);
+    let swap_divisor = std::env::var("TOFY_PREPARE_MIX_SWAP_DIVISOR")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(4);
+    snapshot
+        .mem_available_mb
+        .saturating_add(snapshot.swap_free_mb / swap_divisor)
+        .saturating_sub(headroom_mb)
+}
+
+fn prepare_mix_memory_snapshot() -> Option<PrepareMixMemory> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut mem_available_mb = None;
+    let mut swap_free_mb = None;
+    for line in text.lines() {
+        if line.starts_with("MemAvailable:") {
+            mem_available_mb = meminfo_line_mb(line);
+        } else if line.starts_with("SwapFree:") {
+            swap_free_mb = meminfo_line_mb(line);
+        }
+    }
+    Some(PrepareMixMemory {
+        mem_available_mb: mem_available_mb?,
+        swap_free_mb: swap_free_mb.unwrap_or(0),
+    })
+}
+
+fn meminfo_line_mb(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+}
+
+fn display_memory_budget(budget_mb: u64) -> String {
+    if budget_mb == u64::MAX {
+        "unknown".to_string()
+    } else {
+        budget_mb.to_string()
+    }
 }
 
 fn join_result<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>, label: &str) -> Result<T> {
@@ -1409,7 +1644,9 @@ fn ensure_cache_upload_tools() -> Result<()> {
 fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
     let mut inputs = vec![PathBuf::from("data"), PathBuf::from("eval"), vocab_dir()];
     let configured_cache_dir = cache_dir();
-    if configured_cache_dir != PathBuf::from(CACHE_DIR) && !inputs.contains(&configured_cache_dir) {
+    if configured_cache_dir.as_path() != Path::new(CACHE_DIR)
+        && !inputs.contains(&configured_cache_dir)
+    {
         inputs.push(configured_cache_dir);
     }
 
