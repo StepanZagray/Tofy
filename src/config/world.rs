@@ -172,7 +172,7 @@ impl WorldTrainConfig {
             batch_warmup_steps,
             batch_warmup_value,
             resume,
-            action_loss_weight: action_loss_weight.unwrap_or(0.0),
+            action_loss_weight: action_loss_weight.unwrap_or(1.0),
             train_encoder,
             encoder_output_path,
             train_dtype: parse_train_dtype(),

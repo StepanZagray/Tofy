@@ -25,6 +25,45 @@ Formats and paths for JEPA, world model, and decoder training. See [RUNBOOK.md](
 - **Pipeline bootstrap:** `cargo run --release -- train <8gb|48gb|80gb>` creates missing or empty Stage 1 source files on the current machine, including `data/ultrachat_pairs.txt`, `data/go_code_pairs.txt`, and `data/cached_wikimedia_wikipedia_1.txt`. The pipeline temporarily sets `JEPA_WIKI_MAX_FILES=1` for the Wikipedia source so fresh pods use the expected one-parquet cache file.
 - **HF CLI:** `hf auth login` (or a read-only token) is required for gated or private datasets. See [RUNBOOK.md](RUNBOOK.md) for installing the `hf` CLI.
 
+## Prepared cache HF upload
+
+After Stage 1 completes locally or on a pod, you can publish the handoff tree to
+a Hugging Face **dataset** you control:
+
+```bash
+cargo run --release -- prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset-name>
+```
+
+Requirements:
+
+- `--auto-hf-upload` enables the archive/upload step and must be paired with
+  `--hf-dataset <org/dataset-name>` (for example `--hf-dataset my-org/tofy-cache`).
+  The command errors if either flag is missing its partner. There is no built-in
+  default dataset.
+- `tar`, `zstd`, and `hf` must be on `PATH`; run `hf auth login` with write
+  access to the target dataset before uploading.
+
+The command archives:
+
+- `data/` (including `data/cache/` token caches and manifests)
+- `eval/`
+- `local_models/vocabs/`
+
+Archives land in `runs/prepare_cache/` as
+`tofy-cache-<profile>-<git-sha>-<timestamp>.tar.zst` with a matching
+`.info.txt` sidecar, then both files are uploaded to the dataset you named.
+
+Restore on another machine (same profile as the archive):
+
+```bash
+hf download --repo-type dataset <org/dataset-name> tofy-cache-80gb-<sha>-<timestamp>.tar.zst
+tar --zstd -xf tofy-cache-80gb-<sha>-<timestamp>.tar.zst
+cargo run --release -- train 80gb
+```
+
+Use the same memory profile (`8gb`, `48gb`, or `80gb`) when training as when the
+cache was built.
+
 ## Technical / wiki-like / expert world model data
 
 For Q&A or expert-style pairs (e.g. SciQ, SQuAD), use `cargo run --release -- --prepare-expert-pairs ...` to produce `context<TAB>next_turn` (e.g. question TAB answer), then train the world model on that file.

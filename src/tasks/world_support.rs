@@ -1028,20 +1028,13 @@ pub(crate) fn evaluate_decoder_encoded_batch(
         recursive_context_compressor,
         device,
     )?;
-    let _ = decoder_action_label;
-    let decoder_action_labels = encoder_batch
-        .iter()
-        .map(|row| row.action_label)
-        .collect::<Vec<_>>();
+    let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
     let steps = rollout_steps.max(1);
     let mut next_context_slots = state_slots;
     for _ in 0..steps {
         next_context_slots = transition.forward(&next_context_slots, &decoder_action_labels)?;
     }
-    let adapter_action_labels = decoder_batch
-        .iter()
-        .map(|row| row.action_label)
-        .collect::<Vec<_>>();
+    let adapter_action_labels = vec![decoder_action_label; decoder_batch.len()];
     let world_latent = decoder_conditioning_adapter
         .forward_with_actions(&next_context_slots.detach(), &adapter_action_labels)?;
     let zero_world_latent = world_latent.affine(0.0, 0.0)?;

@@ -62,9 +62,9 @@ Treat `--quick` as a shallow sanity check only.
 Before renting a GPU for a long run, use the short max-VRAM probe:
 
 ```bash
-cargo run --release -- --max-vram-probe --profile 48gb --stage all
-# or, for the larger decoder profile:
 cargo run --release -- --max-vram-probe --profile 80gb --stage all
+# or, for the L40S/A40 profile:
+cargo run --release -- --max-vram-probe --profile 48gb --stage all
 ```
 
 This uses `config/model_profiles.json`, runs latent, world, high-world, and
@@ -80,23 +80,28 @@ historical stage growth factors from saved runs. It is still an empirical check
 rather than a formal guarantee: allocator behavior, driver version, background
 processes, and longer-run checkpoint cadence can still change the exact peak.
 
-## 48 GB A40 Profile Probe
+## 80 GB Default Profile Probe
 
-Run the sustained probe manually before launching the long 48 GB pipeline:
+Run the sustained probe manually before launching the long 80 GB pipeline:
 
 ```bash
-cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
+cargo run --release -- --sustained-oom-probe --profile 80gb --stage all
 ```
 
-The probe loads the current `48gb` shape from `config/model_profiles.json`.
-That profile now uses encoder `48x11` (`528` effective), frozen-encoder world
-`128x4` (`512` effective), decoder `32x8` (`256` effective), and Go feedback
-`32x8` (`256` effective), replacing the old recorded decoder `4x1` run that
-used only about 5.6 GB VRAM in the decoder stage. The `80gb` profile keeps
-decoder effective batch at `256` but uses decoder microbatch `8` because its
-decoder is much wider.
-Prefer `--max-vram-probe --profile 48gb` for the first rental check, then run
+The probe loads the current `80gb` shape from `config/model_profiles.json`.
+That profile uses encoder `32x16` (`512` effective), frozen-encoder world
+`96x6` (`576` effective), decoder `16x16` (`256` effective), and Go feedback
+`16x16` (`256` effective). Decoder effective batch stays at `256`, but the
+microbatch stays small because the decoder is much wider.
+Prefer `--max-vram-probe --profile 80gb` for the first rental check, then run
 the sustained probe only after the short probe passes.
+
+## 48 GB L40S/A40 Profile Probe
+
+Run the same flow with `--profile 48gb` on 48 GB pods. That profile uses
+encoder `48x11` (`528` effective), frozen-encoder world `128x4` (`512`
+effective), decoder `32x8` (`256` effective), and Go feedback `32x8` (`256`
+effective).
 
 ## High-Level World Stage
 

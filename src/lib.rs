@@ -41,6 +41,9 @@ pub fn run(args: &[String]) -> Result<()> {
     if tasks::eval::try_run_code_eval(args)? {
         return Ok(());
     }
+    if tasks::eval::try_run_prepare_go_model_feedback_pairs(args)? {
+        return Ok(());
+    }
     if tasks::eval::try_run_decoder_only_eval(args)? {
         return Ok(());
     }
@@ -57,6 +60,6 @@ pub fn run(args: &[String]) -> Result<()> {
     let program = args.first().map(String::as_str).unwrap_or("jepa_ai");
     cli::print_usage(program);
     bail!(
-        "specify a mode: train / prepare cache / --prepare-pipeline-cache / --prepare-ultrachat / --prepare-encoder-corpus / --prepare-github-top-code / --prepare-go-function-tasks / --prepare-go-algorithm-tasks / --prepare-go-semantics-tasks / --prepare-go-repair-tasks / --prepare-world-mix / --prepare-code-poc-mix / --prepare-expert-pairs / --prepare-casual-conversation / --generate-code-eval-suite / --generate-go-code-eval-suite / --convert-jsonl-context-response-to-tsv / --check-dtype-discipline / --sustained-oom-probe / --max-vram-probe / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-high-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --eval-decoder-only / --serve"
+        "specify a mode: train / prepare cache / --prepare-pipeline-cache / --prepare-ultrachat / --prepare-encoder-corpus / --prepare-github-top-code / --prepare-go-function-tasks / --prepare-go-algorithm-tasks / --prepare-go-semantics-tasks / --prepare-go-repair-tasks / --prepare-go-model-feedback-pairs / --prepare-world-mix / --prepare-code-poc-mix / --prepare-expert-pairs / --prepare-casual-conversation / --generate-code-eval-suite / --generate-go-code-eval-suite / --convert-jsonl-context-response-to-tsv / --check-dtype-discipline / --sustained-oom-probe / --max-vram-probe / --latent / --latent-from-checkpoint / --eval-jepa / --train-world / --train-high-world / --train-orchestrator / --train-decoder / --eval-world / --eval-code-assistant / --eval-decoder-only / --serve"
     );
 }

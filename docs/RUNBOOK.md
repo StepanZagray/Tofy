@@ -22,8 +22,9 @@ For the current repo, the cleanest proof of concept is now paper-strict by defau
 2. train the action-state transition with next-latent prediction plus SIGReg only
 3. train the integrated high-level action-conditioned state transition in the same context-slot latent space
 4. train only the code decoder as a downstream emitter
-5. train a Go execution-feedback decoder stage initialized from the base code decoder
-6. select and score the decoder with the hard Go compile/test eval suite
+5. mine base-decoder Go failures into compiler-feedback repair rows, preference records, and pass-only rows
+6. train a Go execution-feedback decoder stage initialized from the base code decoder
+7. select and score the decoder with the hard Go compile/test eval suite
 
 The canonical pipeline fixes `TOFY_SIGREG_SLICES=1024`, keeps world action/inverse auxiliary weights off, and enables decoder syntax/signature/structure plus conditioning-margin auxiliary losses.
 
@@ -33,6 +34,7 @@ The pipeline now does Go execution-feedback decoder training after the mixed dec
 - Go feedback decoder run on `data/code_poc_go_mix.txt`
 - compiler-feedback Go repair rows from `data/go_repair_pairs.txt` are added when `go` is available
   reruns reuse `data/go_repair_pairs.txt` when its manifest still matches the instruction-pair input hash, Go version, and generation settings
+- after the base decoder exists, `--prepare-go-model-feedback-pairs` generates model-failure repair rows against canonical Go task solutions, writes chosen/rejected preference JSONL, and enables pass-only self-training rows only when compile rate clears `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
 
 The canonical training command is:
 
@@ -46,33 +48,43 @@ The `8gb`, `48gb`, and `80gb` model/profile sizes are defined in
 `config/model_profiles.json`. Override that file path with
 `TOFY_MODEL_PROFILES=<path>` when testing a different shape.
 
-Use `train 48gb` for the A40 profile and `train 80gb` for A100/H100/RTX PRO 6000-class pods. Resume uses the run directory layout:
+Use `train 80gb` for the default cloud profile on A100/H100/RTX PRO 6000-class
+pods and `train 48gb` for L40S/A40-class GPUs. Resume uses the run directory
+layout:
 
 ```bash
-cargo run --release -- train 48gb --resume latest
-cargo run --release -- train 48gb --resume code_poc_1234567890
 cargo run --release -- train 80gb --resume latest
+cargo run --release -- train 80gb --resume code_poc_1234567890
+cargo run --release -- train 48gb --resume latest
 ```
 
 Training builds and uses the pipeline vocab/token cache by default:
 
 ```bash
-cargo run --release -- train 48gb
+cargo run --release -- train 80gb
 ```
 
 To do the data-heavy part on a local machine before launching a pod, run the
 same Stage 1 preparation without training:
 
 ```bash
-cargo run --release -- prepare cache 48gb
+cargo run --release -- prepare cache 80gb
 ```
 
 Use the same profile that you plan to train on. This prepares source data,
 prepared mixes, the Go eval suite, profile-sized vocabs, and token caches.
-Add `--auto-hf-upload` to archive `data/`, `eval/`, and `local_models/vocabs/`
-as `tofy-cache-<profile>-<sha>-<timestamp>.tar.zst` and upload it to the
-Hugging Face cache dataset with the `hf` CLI. Override the target dataset with
-`TOFY_HF_CACHE_REPO=<org/name>` if needed.
+
+To archive and upload the handoff directories to your own Hugging Face dataset:
+
+```bash
+cargo run --release -- prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset-name>
+```
+
+This writes `tofy-cache-<profile>-<sha>-<timestamp>.tar.zst` plus a sidecar
+`.info.txt` under `runs/prepare_cache/`, then uploads both files with the `hf`
+CLI. You must pass the dataset id on the command line; there is no default repo.
+See [DATA_FORMATS.md](DATA_FORMATS.md#prepared-cache-hf-upload) for restore
+steps and archive contents.
 
 Stage 1 prepares the text datasets, materializes `data/encoder_mix.txt`, builds
 profile-specific vocabs, and writes binary token caches before Stage 2 starts.
@@ -189,49 +201,51 @@ The training pipeline streams inputs by default:
 cargo run --release -- train 8gb
 ```
 
-48 GB A40 test run:
-
-```bash
-cargo run --release -- train 48gb
-```
-
-80 GB large-decoder run:
+80 GB default cloud run:
 
 ```bash
 cargo run --release -- train 80gb
 ```
 
-This is the larger local/cloud profile for checking whether scaling helps the
-coding assistant. It uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
-`HEADS=16`, decoder width `768`, decoder FF width `3072`, and
-`NUM_LATENT_TOKENS=96`.
-Current 48 GB batches are encoder `48x11` (`528` effective), world `128x4`
-(`512` effective) with the encoder frozen, decoder `32x8` (`256` effective),
-and Go feedback `32x8` (`256` effective), replacing the old decoder `4x1`
-microbatch that left most VRAM idle in the recorded RunPod training run. It
-defaults to longer code-quality budgets: latent `16000`, world `60000`,
-high-world `12000`, code decoder `80000`, and Go feedback `20000`.
-
-The `80gb` profile keeps decoder effective batch at `256` but uses microbatch
-`8x32` so activation memory can hold the larger decoder. It sets world/encoder
-width to `1024` and the decoder to width `1536`, `16` layers, and FF width
-`6144` (about a 700M-parameter decoder by the local estimator). Do not raise
+This is the default large local/cloud profile. It uses `DIM=1024`,
+`BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1536`, decoder FF
+width `6144`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder
+`32x16` (`512` effective), world `96x6` (`576` effective) with the encoder
+frozen, decoder `16x16` (`256` effective), and Go feedback `16x16` (`256`
+effective). The profile keeps decoder effective batch at `256` but uses a small
+microbatch so activation memory can hold the much larger decoder. Do not raise
 the decoder microbatch just because VRAM is available; probe throughput first.
 After the GPU is saturated, bigger decoder microbatches mostly buy fewer
-optimizer steps per token and higher activation memory pressure.
+optimizer steps per token and higher activation memory pressure. It defaults to
+longer code-quality budgets: latent `24000`, world `90000`, high-world `18000`,
+code decoder `120000`, and Go feedback `30000`.
 
-Before a long A40 launch, run:
-
-```bash
-cargo run --release -- --max-vram-probe --profile 48gb --stage all
-cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
-```
-
-For 80 GB pods, probe first because the profile uses a much larger decoder:
+Before a long 80 GB launch, run:
 
 ```bash
 cargo run --release -- --max-vram-probe --profile 80gb --stage all
 cargo run --release -- --sustained-oom-probe --profile 80gb --stage all
+```
+
+48 GB L40S/A40 alternative:
+
+```bash
+cargo run --release -- train 48gb
+```
+
+The `48gb` profile uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
+`HEADS=16`, decoder width `768`, decoder FF width `3072`, and
+`NUM_LATENT_TOKENS=96`. Current 48 GB batches are encoder `48x11` (`528`
+effective), world `128x4` (`512` effective) with the encoder frozen, decoder
+`32x8` (`256` effective), and Go feedback `32x8` (`256` effective). It defaults
+to latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, and
+Go feedback `20000`.
+
+Before a long 48 GB launch, run:
+
+```bash
+cargo run --release -- --max-vram-probe --profile 48gb --stage all
+cargo run --release -- --sustained-oom-probe --profile 48gb --stage all
 ```
 
 Stage 1 builds or validates:
@@ -553,7 +567,7 @@ Go repair generation uses `go test -c` on corrupted known-good answers, keeping 
 
 Use this only when you want to regenerate Go-feedback data, train a separate Go
 decoder outside the autonomous `train <profile>` pipeline, or exercise a trained
-checkpoint through Pi. The normal `train 48gb` pipeline already prepares
+checkpoint through Pi. The normal `train 80gb` pipeline already prepares
 `data/code_poc_go_mix.txt` and trains
 `runs/<run_id>/decoder_code_go_feedback/model.safetensors`.
 
@@ -771,7 +785,7 @@ This repository does not ship shell training entrypoints. Use the release binary
 
 ```bash
 cargo run --release -- train 8gb
-cargo run --release -- train 48gb
+cargo run --release -- train 80gb
 ```
 
 After changing dtypes, attention, context/state logic, or decoder runtime, run `--check-dtype-discipline` and use the sustained probe in `docs/OOM_TESTING.md` before long GPU runs.

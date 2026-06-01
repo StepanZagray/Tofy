@@ -8,10 +8,10 @@ All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-pa
 | [OPENCODE.md](OPENCODE.md) | Run Tofy in OpenCode; auth and provider config; code-specialist and text-generalist decoders. |
 | [ARCHITECTURE_AND_CAPACITY.md](ARCHITECTURE_AND_CAPACITY.md) | Current context-compressor architecture, cross-action awareness, capacity, and multi-step replies. |
 | [CODE_DATA.md](CODE_DATA.md) | Code training data: CLI `--prepare-*` generators, Go code pairs, pair formats. |
-| [DATA_FORMATS.md](DATA_FORMATS.md) | Data formats for LeJEPA/context-state/decoder training; hub caching; expert/technical data. |
+| [DATA_FORMATS.md](DATA_FORMATS.md) | Data formats for LeJEPA/context-state/decoder training; hub caching; prepared-cache HF upload/restore; expert/technical data. |
 | [DECODER_RUNTIME.md](DECODER_RUNTIME.md) | Decoder backends (GGUF/llama.cpp, Candle code/text decoders) and env vars. |
 | [OOM_TESTING.md](OOM_TESTING.md) | Sustained CUDA OOM probes for batch/VRAM decisions. |
-| [RUNPOD_CURL.md](RUNPOD_CURL.md) | Cloud training pod launch, bootstrap, 48 GB training, resume, Go feedback data, and artifact recovery. |
+| [RUNPOD_CURL.md](RUNPOD_CURL.md) | Cloud training pod launch, bootstrap, 80 GB training, resume, Go feedback data, and artifact recovery. |
 | [RESULTS.md](RESULTS.md) | Best metrics and commands (updated when runs improve). |
 
 Root [../README.md](../README.md) has quick start, argument order, and project structure.

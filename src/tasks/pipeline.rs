@@ -20,11 +20,13 @@ const GO_TASK_DATA: &str = "data/go_instruction_pairs.txt";
 const GO_ALGORITHM_TASK_DATA: &str = "data/go_algorithm_pairs.txt";
 const GO_SEMANTIC_TASK_DATA: &str = "data/go_semantic_pairs.txt";
 const GO_REPAIR_DATA: &str = "data/go_repair_pairs.txt";
+const GO_MODEL_FAILURE_REPAIR_DATA: &str = "data/go_model_failure_repair_pairs.txt";
+const GO_MODEL_PREFERENCE_DATA: &str = "data/go_model_preference_pairs.jsonl";
+const GO_PASS_SELF_TRAIN_DATA: &str = "data/go_pass_self_train_pairs.txt";
 const GO_FEEDBACK_TRAIN_DATA: &str = "data/code_poc_go_mix.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
 const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
-const DEFAULT_HF_CACHE_REPO: &str = "Grayza/model-go-cache";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemoryProfile {
@@ -79,9 +81,19 @@ struct ModelProfiles {
 #[derive(Debug)]
 struct PipelineConfig {
     profile: MemoryProfile,
+    until: PipelineUntil,
     resume: bool,
     resume_selector: Option<String>,
     with_code_eval: bool,
+    build_conditioned_cache: bool,
+    from_conditioned_cache: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipelineUntil {
+    Decoder,
+    DecoderCache,
+    Full,
 }
 
 #[derive(Debug)]
@@ -126,7 +138,10 @@ struct PipelineMeta<'a> {
     code_train_data: &'a str,
     eval_suite: &'a str,
     profile: &'a str,
+    pipeline_until: &'a str,
     with_code_eval: bool,
+    build_conditioned_cache: bool,
+    from_conditioned_cache: bool,
     latent_steps: usize,
     world_steps: usize,
     high_world_steps: usize,
@@ -175,22 +190,57 @@ pub fn try_run_prepare_cache(args: &[String]) -> Result<bool> {
     };
 
     let profile_arg = rest.first().ok_or_else(|| {
-        anyhow::anyhow!("usage: prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload]")
+        anyhow::anyhow!(
+            "usage: prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]"
+        )
     })?;
     let profile = MemoryProfile::parse(profile_arg)?;
     let mut force = false;
     let mut auto_hf_upload = false;
-    for arg in &rest[1..] {
-        match arg.as_str() {
-            "--force" => force = true,
-            "--auto-hf-upload" | "-auto-hf-upload" => auto_hf_upload = true,
+    let mut hf_upload_dataset = None;
+    let mut idx = 1usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--force" => {
+                force = true;
+                idx += 1;
+            }
+            "--auto-hf-upload" | "-auto-hf-upload" => {
+                if auto_hf_upload {
+                    bail!("--auto-hf-upload may only be specified once");
+                }
+                auto_hf_upload = true;
+                idx += 1;
+            }
+            "--hf-dataset" | "-hf-dataset" => {
+                let value = rest.get(idx + 1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--hf-dataset requires a Hugging Face dataset id (org/dataset-name)"
+                    )
+                })?;
+                if value.starts_with('-') {
+                    bail!("--hf-dataset requires a Hugging Face dataset id (org/dataset-name)");
+                }
+                if hf_upload_dataset.is_some() {
+                    bail!("--hf-dataset may only be specified once");
+                }
+                hf_upload_dataset = Some(parse_hf_dataset_repo(value)?);
+                idx += 2;
+            }
             other => bail!(
-                "unsupported prepare cache argument '{other}' (accepted: --force, --auto-hf-upload)"
+                "unsupported prepare cache argument '{other}' (accepted: --force, --auto-hf-upload, --hf-dataset <org/dataset-name>)"
             ),
         }
     }
 
-    run_prepare_cache(profile, force, auto_hf_upload)?;
+    if auto_hf_upload && hf_upload_dataset.is_none() {
+        bail!("--auto-hf-upload requires --hf-dataset <org/dataset-name>");
+    }
+    if hf_upload_dataset.is_some() && !auto_hf_upload {
+        bail!("--hf-dataset requires --auto-hf-upload");
+    }
+
+    run_prepare_cache(profile, force, hf_upload_dataset)?;
     Ok(true)
 }
 
@@ -228,20 +278,51 @@ impl MemoryProfile {
     }
 }
 
+impl PipelineUntil {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "decoder" => Ok(Self::Decoder),
+            "decoder-cache" => Ok(Self::DecoderCache),
+            "full" => Ok(Self::Full),
+            other => bail!(
+                "unsupported --until value '{other}' (expected decoder, decoder-cache, or full)"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decoder => "decoder",
+            Self::DecoderCache => "decoder-cache",
+            Self::Full => "full",
+        }
+    }
+}
+
 impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--resume [latest|run]] [--with-code-eval]"
+                "usage: train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
+        let mut until = PipelineUntil::Full;
         let mut resume = false;
         let mut resume_selector = None;
         let mut with_code_eval = true;
+        let mut build_conditioned_cache = false;
+        let mut from_conditioned_cache = false;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
+                "--until" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--until requires decoder|decoder-cache|full"))?;
+                    until = PipelineUntil::parse(value)?;
+                    i += 2;
+                }
                 "--resume" => {
                     resume = true;
                     if args
@@ -259,27 +340,45 @@ impl PipelineConfig {
                     with_code_eval = true;
                     i += 1;
                 }
+                "--build-conditioned-cache" => {
+                    build_conditioned_cache = true;
+                    i += 1;
+                }
+                "--from-conditioned-cache" => {
+                    from_conditioned_cache = true;
+                    i += 1;
+                }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --resume, --with-code-eval)"
+                    "unsupported train argument '{other}' (accepted: --until, --resume, --with-code-eval, --build-conditioned-cache, --from-conditioned-cache)"
                 ),
             }
         }
         Ok(Self {
             profile,
+            until,
             resume,
             resume_selector,
             with_code_eval,
+            build_conditioned_cache,
+            from_conditioned_cache,
         })
     }
 }
 
-fn run_prepare_cache(profile: MemoryProfile, force: bool, auto_hf_upload: bool) -> Result<()> {
+fn run_prepare_cache(
+    profile: MemoryProfile,
+    force: bool,
+    hf_upload_dataset: Option<String>,
+) -> Result<()> {
     let defaults = profile.defaults()?;
     let cfg = PipelineConfig {
         profile,
+        until: PipelineUntil::Full,
         resume: false,
         resume_selector: None,
         with_code_eval: true,
+        build_conditioned_cache: false,
+        from_conditioned_cache: false,
     };
     set_pipeline_env(&cfg, &defaults);
     println!(
@@ -288,8 +387,8 @@ fn run_prepare_cache(profile: MemoryProfile, force: bool, auto_hf_upload: bool) 
     );
     prepare_data(&prepare_cache_paths(&defaults), &defaults, false, force)?;
     println!("Data/cache preparation complete.");
-    if auto_hf_upload {
-        archive_and_upload_prepare_cache(profile)?;
+    if let Some(repo) = hf_upload_dataset {
+        archive_and_upload_prepare_cache(profile, &repo)?;
     }
     Ok(())
 }
@@ -342,6 +441,29 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
     train_world(&paths, &cfg, &defaults)?;
     train_high_world(&paths, &cfg, &defaults)?;
     train_code_decoder(&paths, &cfg, &defaults)?;
+    if cfg.until == PipelineUntil::Decoder {
+        println!("Pipeline stopped after base decoder (--until decoder).");
+        return Ok(());
+    }
+    let should_build_conditioned_cache =
+        cfg.until == PipelineUntil::DecoderCache || cfg.build_conditioned_cache;
+    if cfg.from_conditioned_cache && !should_build_conditioned_cache {
+        println!(
+            "Skipping Go feedback data rebuild because --from-conditioned-cache requires the existing cache/data pair."
+        );
+    } else {
+        prepare_go_model_feedback_data(&paths, &cfg, &defaults)?;
+    }
+    if !cfg.from_conditioned_cache || should_build_conditioned_cache {
+        prepare_go_feedback_decoder_token_cache(&paths, &defaults)?;
+    }
+    if cfg.until == PipelineUntil::DecoderCache || cfg.build_conditioned_cache {
+        build_go_feedback_conditioned_cache(&paths, &cfg, &defaults)?;
+        if cfg.until == PipelineUntil::DecoderCache {
+            println!("Pipeline stopped after conditioned decoder cache (--until decoder-cache).");
+            return Ok(());
+        }
+    }
     train_go_feedback_decoder(&paths, &cfg, &defaults)?;
     let selected_decoder = select_decoder_checkpoint(&paths, &defaults)?;
     let mut paths = paths;
@@ -452,6 +574,7 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.05");
     set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
     set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "zero,shuffle");
+    set_env_default("TOFY_DECODER_CHECKPOINT_EVERY", "1000");
     set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
     set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");
     set_env_default("TOFY_CACHE_DIR", CACHE_DIR);
@@ -799,7 +922,6 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
             "--code-pairs".to_string(),
             GO_SEMANTIC_TASK_DATA.to_string(),
         ]);
-        extra_code_pairs.push(GO_SEMANTIC_TASK_DATA.to_string());
     }
     if nonempty_file(GO_REPAIR_DATA) {
         world_args.extend(["--code-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
@@ -857,18 +979,25 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
             GO_ALGORITHM_TASK_DATA.to_string(),
         ]);
     }
-    if nonempty_file(GO_SEMANTIC_TASK_DATA) {
-        go_feedback_mix_args.extend([
-            "--extra-pairs".to_string(),
-            GO_SEMANTIC_TASK_DATA.to_string(),
-        ]);
-    }
     if nonempty_file(GO_REPAIR_DATA) {
         go_feedback_mix_args.extend(["--extra-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
     }
+    if nonempty_file(GO_MODEL_FAILURE_REPAIR_DATA) {
+        go_feedback_mix_args.extend([
+            "--extra-pairs".to_string(),
+            GO_MODEL_FAILURE_REPAIR_DATA.to_string(),
+        ]);
+    }
+    if nonempty_file(GO_PASS_SELF_TRAIN_DATA) {
+        go_feedback_mix_args.extend([
+            "--extra-pairs".to_string(),
+            GO_PASS_SELF_TRAIN_DATA.to_string(),
+        ]);
+    }
     if nonempty_file(GO_ALGORITHM_TASK_DATA)
-        || nonempty_file(GO_SEMANTIC_TASK_DATA)
         || nonempty_file(GO_REPAIR_DATA)
+        || nonempty_file(GO_MODEL_FAILURE_REPAIR_DATA)
+        || nonempty_file(GO_PASS_SELF_TRAIN_DATA)
     {
         go_feedback_mix_args.extend(["--extra-repeat".to_string(), "32".to_string()]);
     }
@@ -1249,7 +1378,7 @@ fn train_world(
         "--encoder-output".to_string(),
         paths.world_encoder_model.to_string_lossy().to_string(),
         "--action-loss-weight".to_string(),
-        "0.0".to_string(),
+        "1.0".to_string(),
     ];
     args.push("--freeze-encoder".to_string());
     with_stage("world", || {
@@ -1361,6 +1490,80 @@ fn train_code_decoder(
     Ok(())
 }
 
+fn prepare_go_model_feedback_data(
+    paths: &PipelinePaths,
+    cfg: &PipelineConfig,
+    defaults: &ProfileDefaults,
+) -> Result<()> {
+    let default_rows = match cfg.profile {
+        MemoryProfile::Eight => 1024,
+        MemoryProfile::FortyEight => 2048,
+        MemoryProfile::Eighty => 4096,
+    };
+    let max_rows = env_usize_or("TOFY_GO_MODEL_FEEDBACK_ROWS", default_rows);
+    if max_rows == 0 {
+        println!("Skipping model-failure Go feedback mining; TOFY_GO_MODEL_FEEDBACK_ROWS=0.");
+        return Ok(());
+    }
+    if !command_available("go") {
+        println!("Skipping model-failure Go feedback mining; go not found.");
+        return Ok(());
+    }
+    println!("== Stage 5a/6: model-failure Go feedback mining ==");
+    let candidates = env_usize_or("TOFY_GO_MODEL_FEEDBACK_CANDIDATES", 1).max(1);
+    let max_new_tokens = env_usize_or("TOFY_GO_MODEL_FEEDBACK_MAX_TOKENS", 256).max(1);
+    let workers = env_usize_or("TOFY_GO_MODEL_FEEDBACK_WORKERS", 0);
+    let pass_min_compile_rate = std::env::var("TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE")
+        .unwrap_or_else(|_| "0.10".to_string());
+    let mut args = vec![
+        "jepa_ai".to_string(),
+        "--prepare-go-model-feedback-pairs".to_string(),
+        paths.world_encoder_model.to_string_lossy().to_string(),
+        matched_encoder_vocab(paths).to_string_lossy().to_string(),
+        paths.world_model.to_string_lossy().to_string(),
+        GO_TASK_DATA.to_string(),
+        GO_MODEL_FAILURE_REPAIR_DATA.to_string(),
+        max_new_tokens.to_string(),
+        defaults.dim.to_string(),
+        defaults.code_decoder_max_seq.to_string(),
+        defaults.layers.to_string(),
+        defaults.heads.to_string(),
+        defaults.bridge_dim.to_string(),
+        defaults.num_latent_tokens.to_string(),
+        "--high-world-model".to_string(),
+        paths.high_world_model.to_string_lossy().to_string(),
+        "--code-decoder".to_string(),
+        paths.code_decoder_base_model.to_string_lossy().to_string(),
+        "--code-decoder-vocab".to_string(),
+        paths.code_decoder_vocab.to_string_lossy().to_string(),
+        "--preference-output".to_string(),
+        GO_MODEL_PREFERENCE_DATA.to_string(),
+        "--pass-output".to_string(),
+        GO_PASS_SELF_TRAIN_DATA.to_string(),
+        "--candidates".to_string(),
+        candidates.to_string(),
+        "--max-rows".to_string(),
+        max_rows.to_string(),
+        "--go-timeout-sec".to_string(),
+        "6".to_string(),
+        "--pass-min-compile-rate".to_string(),
+        pass_min_compile_rate,
+    ];
+    if workers > 0 {
+        args.extend(["--workers".to_string(), workers.to_string()]);
+    }
+    if !cfg.resume {
+        args.push("--force".to_string());
+    }
+    with_stage("go_model_feedback", || {
+        tasks::eval::try_run_prepare_go_model_feedback_pairs(&args)
+    })?;
+
+    let (_, _, go_feedback_mix_args) = build_stage1_mix_args();
+    run_prepare_vec(go_feedback_mix_args)?;
+    Ok(())
+}
+
 fn train_go_feedback_decoder(
     paths: &PipelinePaths,
     cfg: &PipelineConfig,
@@ -1379,7 +1582,7 @@ fn train_go_feedback_decoder(
         );
         return Ok(());
     }
-    let args = decoder_args(
+    let mut args = decoder_args(
         paths,
         defaults,
         GO_FEEDBACK_TRAIN_DATA,
@@ -1391,10 +1594,64 @@ fn train_go_feedback_decoder(
         "5e-5",
         "0.20",
     );
+    if cfg.from_conditioned_cache || cfg.build_conditioned_cache {
+        args.push("--from-conditioned-cache".to_string());
+    }
     with_stage("decoder_code_go_feedback", || {
         tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
     })?;
     ensure_file(&paths.code_decoder_go_feedback_model)?;
+    Ok(())
+}
+
+fn prepare_go_feedback_decoder_token_cache(
+    paths: &PipelinePaths,
+    defaults: &ProfileDefaults,
+) -> Result<()> {
+    println!("== Stage 5a-cache/6: Go feedback decoder token cache ==");
+    run_cache(vec![
+        "--prepare-pipeline-cache".to_string(),
+        ENCODER_DATA.to_string(),
+        WORLD_DATA.to_string(),
+        GO_FEEDBACK_TRAIN_DATA.to_string(),
+        paths.encoder_cache_vocab.to_string_lossy().to_string(),
+        paths.code_decoder_cache_vocab.to_string_lossy().to_string(),
+        cache_dir().to_string_lossy().to_string(),
+        "--encoder-max-vocab".to_string(),
+        defaults.max_vocab.to_string(),
+        "--code-max-vocab".to_string(),
+        defaults.code_decoder_max_vocab.to_string(),
+        "--encoder-max-seq".to_string(),
+        (defaults.latent_max_seq * 4).to_string(),
+        "--world-max-seq".to_string(),
+        defaults.world_max_seq.to_string(),
+        "--code-max-seq".to_string(),
+        defaults.code_decoder_max_seq.to_string(),
+    ])
+}
+
+fn build_go_feedback_conditioned_cache(
+    paths: &PipelinePaths,
+    _cfg: &PipelineConfig,
+    defaults: &ProfileDefaults,
+) -> Result<()> {
+    println!("== Stage 5b-cache/6: Go feedback frozen conditioning cache ==");
+    let mut args = decoder_args(
+        paths,
+        defaults,
+        GO_FEEDBACK_TRAIN_DATA,
+        0,
+        defaults.go_feedback_batch,
+        defaults.go_feedback_grad_accum,
+        &paths.code_decoder_go_feedback_model,
+        Some(&paths.code_decoder_base_model),
+        "5e-5",
+        "0.20",
+    );
+    args.push("--build-conditioned-cache".to_string());
+    with_stage("decoder_code_go_feedback_cache", || {
+        tasks::world::try_run_train_decoder(&args)
+    })?;
     Ok(())
 }
 
@@ -1591,13 +1848,25 @@ fn run_cache(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn archive_and_upload_prepare_cache(profile: MemoryProfile) -> Result<()> {
-    ensure_cache_upload_tools()?;
+fn parse_hf_dataset_repo(value: &str) -> Result<String> {
+    let repo = value.trim();
+    if repo.is_empty() {
+        bail!("Hugging Face dataset id must not be empty");
+    }
+    if repo.contains(char::is_whitespace) {
+        bail!("Hugging Face dataset id must not contain whitespace: {repo:?}");
+    }
+    let Some((org, name)) = repo.split_once('/') else {
+        bail!("Hugging Face dataset id must be org/dataset-name, got {repo:?}");
+    };
+    if org.is_empty() || name.is_empty() {
+        bail!("Hugging Face dataset id must be org/dataset-name, got {repo:?}");
+    }
+    Ok(repo.to_string())
+}
 
-    let repo = std::env::var("TOFY_HF_CACHE_REPO")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_HF_CACHE_REPO.to_string());
+fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Result<()> {
+    ensure_cache_upload_tools()?;
     let artifact_dir = runs_dir().join("prepare_cache");
     fs::create_dir_all(&artifact_dir)?;
 
@@ -1678,7 +1947,7 @@ fn write_prepare_cache_info(
         .and_then(|name| name.to_str())
         .unwrap_or("<archive>");
     let content = format!(
-        "profile: {}\nrepo: {repo}\narchive: {archive_name}\ncreated_unix_secs: {}\ngit_sha: {}\ncommand: cargo run --release -- prepare cache {} --auto-hf-upload\ncontents:\n{inputs}\n",
+        "profile: {}\nrepo: {repo}\narchive: {archive_name}\ncreated_unix_secs: {}\ngit_sha: {}\ncommand: cargo run --release -- prepare cache {} --auto-hf-upload --hf-dataset {repo}\ncontents:\n{inputs}\n",
         profile.as_str(),
         unix_timestamp()?,
         short_git_sha(),
@@ -1756,6 +2025,13 @@ fn append_resume(mut args: Vec<String>, resume: bool) -> Vec<String> {
         args.push("--resume".to_string());
     }
     args
+}
+
+fn env_usize_or(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 fn stage_complete(
@@ -1866,12 +2142,23 @@ fn metrics_better(candidate: &SummaryMetrics, current: &SummaryMetrics) -> bool 
 fn write_launch(paths: &PipelinePaths, cfg: &PipelineConfig) -> Result<()> {
     let selector = cfg.resume_selector.as_deref().unwrap_or("");
     let command = format!(
-        "train {}{}",
+        "train {} --until {}{}{}{}",
         cfg.profile.as_str(),
+        cfg.until.as_str(),
         if selector.is_empty() {
             String::new()
         } else {
             format!(" --resume {selector}")
+        },
+        if cfg.build_conditioned_cache {
+            " --build-conditioned-cache"
+        } else {
+            ""
+        },
+        if cfg.from_conditioned_cache {
+            " --from-conditioned-cache"
+        } else {
+            ""
         }
     );
     let content = format!(
@@ -1911,7 +2198,10 @@ fn write_meta(
         code_train_data: CODE_TRAIN_DATA,
         eval_suite: EVAL_SUITE,
         profile: cfg.profile.as_str(),
+        pipeline_until: cfg.until.as_str(),
         with_code_eval: cfg.with_code_eval,
+        build_conditioned_cache: cfg.build_conditioned_cache,
+        from_conditioned_cache: cfg.from_conditioned_cache,
         latent_steps: defaults.latent_steps,
         world_steps: defaults.world_steps,
         high_world_steps: defaults.high_world_steps,

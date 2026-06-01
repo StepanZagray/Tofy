@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -9,6 +11,10 @@ use std::time::{Duration, Instant};
 
 use crate::model::decoders::{CandleCrossAttnDecoder, DecoderKind, LocalDecoderRuntime};
 use crate::tasks::orchestrator::Action;
+use crate::tasks::prepare::{
+    build_language_repair_prompt, default_go_repair_workers, escape_pair_field, go_version_string,
+    load_escaped_pairs, GoCompileFeedback,
+};
 use crate::tasks::world::AgentEngine;
 use crate::util;
 
@@ -152,6 +158,18 @@ pub fn try_run_decoder_only_eval(args: &[String]) -> Result<bool> {
     }
     let cfg = DecoderOnlyEvalConfig::from_args_after(&args[2..])?;
     run_decoder_only_eval(cfg)?;
+    Ok(true)
+}
+
+pub fn try_run_prepare_go_model_feedback_pairs(args: &[String]) -> Result<bool> {
+    if args.len() < 2
+        || (args[1] != "--prepare-go-model-feedback-pairs"
+            && args[1] != "prepare-go-model-feedback-pairs")
+    {
+        return Ok(false);
+    }
+    let cfg = GoModelFeedbackConfig::from_args_after(&args[2..])?;
+    run_prepare_go_model_feedback_pairs(cfg)?;
     Ok(true)
 }
 
@@ -340,6 +358,213 @@ struct DecoderOnlyEvalConfig {
     candidates: usize,
 }
 
+#[derive(Clone)]
+struct GoModelFeedbackConfig {
+    encoder_model_path: PathBuf,
+    encoder_vocab_path: PathBuf,
+    world_model_path: PathBuf,
+    high_world_model_path: Option<PathBuf>,
+    input_pairs_path: PathBuf,
+    repair_output_path: PathBuf,
+    preference_output_path: Option<PathBuf>,
+    pass_output_path: Option<PathBuf>,
+    max_new_tokens: usize,
+    dim: usize,
+    max_seq: usize,
+    num_layers: usize,
+    num_heads: usize,
+    bridge_dim: usize,
+    num_latent_tokens: usize,
+    code_decoder_path: Option<PathBuf>,
+    code_decoder_vocab_path: Option<PathBuf>,
+    go_bin: String,
+    go_timeout_secs: u64,
+    candidates: usize,
+    max_rows: usize,
+    workers: usize,
+    pass_min_compile_rate: f32,
+    force: bool,
+}
+
+impl GoModelFeedbackConfig {
+    fn from_args_after(args: &[String]) -> Result<Self> {
+        if args.len() < 5 {
+            bail!(
+                "usage: --prepare-go-model-feedback-pairs <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <input_pairs.tsv> <repair_output.tsv> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--preference-output <path>] [--pass-output <path>] [--candidates <int>] [--max-rows <int>] [--workers <int>] [--go <bin>] [--go-timeout-sec <int>] [--pass-min-compile-rate <float>] [--force]"
+            );
+        }
+        let mut filtered = Vec::new();
+        let mut high_world_model_path = None;
+        let mut code_decoder_path = None;
+        let mut code_decoder_vocab_path = None;
+        let mut preference_output_path = None;
+        let mut pass_output_path = None;
+        let mut go_bin = "go".to_string();
+        let mut go_timeout_secs = DEFAULT_GO_TIMEOUT_SECS;
+        let mut candidates = 1usize;
+        let mut max_rows = 0usize;
+        let mut workers = None;
+        let mut pass_min_compile_rate = 0.10f32;
+        let mut force = false;
+        let mut i = 0usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--high-world-model" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--high-world-model requires path"))?;
+                    high_world_model_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--code-decoder" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--code-decoder requires path"))?;
+                    code_decoder_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--code-decoder-vocab" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--code-decoder-vocab requires path"))?;
+                    code_decoder_vocab_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--preference-output" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--preference-output requires path"))?;
+                    preference_output_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--pass-output" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--pass-output requires path"))?;
+                    pass_output_path = Some(PathBuf::from(value));
+                    i += 2;
+                }
+                "--go" => {
+                    go_bin = args
+                        .get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--go requires binary path"))?;
+                    i += 2;
+                }
+                "--go-timeout-sec" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--go-timeout-sec requires integer"))?;
+                    go_timeout_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--go-timeout-sec must be integer"))?;
+                    i += 2;
+                }
+                "--candidates" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--candidates requires integer"))?;
+                    candidates = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--candidates must be integer"))?;
+                    i += 2;
+                }
+                "--max-rows" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--max-rows requires integer"))?;
+                    max_rows = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--max-rows must be integer"))?;
+                    i += 2;
+                }
+                "--workers" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--workers requires integer"))?;
+                    workers = Some(
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| anyhow::anyhow!("--workers must be integer"))?
+                            .max(1),
+                    );
+                    i += 2;
+                }
+                "--pass-min-compile-rate" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--pass-min-compile-rate requires float"))?;
+                    pass_min_compile_rate = value
+                        .parse::<f32>()
+                        .map_err(|_| anyhow::anyhow!("--pass-min-compile-rate must be float"))?
+                        .clamp(0.0, 1.0);
+                    i += 2;
+                }
+                "--force" => {
+                    force = true;
+                    i += 1;
+                }
+                _ => {
+                    filtered.push(args[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        Ok(Self {
+            encoder_model_path: PathBuf::from(&filtered[0]),
+            encoder_vocab_path: PathBuf::from(&filtered[1]),
+            world_model_path: PathBuf::from(&filtered[2]),
+            input_pairs_path: PathBuf::from(&filtered[3]),
+            repair_output_path: PathBuf::from(&filtered[4]),
+            max_new_tokens: filtered.get(5).and_then(|v| v.parse().ok()).unwrap_or(256),
+            dim: filtered.get(6).and_then(|v| v.parse().ok()).unwrap_or(768),
+            max_seq: filtered.get(7).and_then(|v| v.parse().ok()).unwrap_or(256),
+            num_layers: filtered.get(8).and_then(|v| v.parse().ok()).unwrap_or(9),
+            num_heads: filtered.get(9).and_then(|v| v.parse().ok()).unwrap_or(8),
+            bridge_dim: filtered.get(10).and_then(|v| v.parse().ok()).unwrap_or(256),
+            num_latent_tokens: filtered.get(11).and_then(|v| v.parse().ok()).unwrap_or(64),
+            high_world_model_path,
+            code_decoder_path,
+            code_decoder_vocab_path,
+            preference_output_path,
+            pass_output_path,
+            go_bin,
+            go_timeout_secs: go_timeout_secs.max(1),
+            candidates: candidates.max(1),
+            max_rows,
+            workers: workers.unwrap_or_else(default_go_repair_workers),
+            pass_min_compile_rate,
+            force,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct GoModelPreferenceRow {
+    task_index: usize,
+    candidate_index: usize,
+    prompt: String,
+    chosen: String,
+    rejected: String,
+    feedback: String,
+    compile_ok: bool,
+    chosen_source: String,
+    rejected_source: String,
+}
+
+struct GoModelAttempt {
+    task_index: usize,
+    candidate_index: usize,
+    task_prompt: String,
+    canonical_code: String,
+    code: String,
+}
+
+struct GoModelCheckedAttempt {
+    attempt: GoModelAttempt,
+    feedback: String,
+}
+
 impl DecoderOnlyEvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 3 {
@@ -417,6 +642,263 @@ impl DecoderOnlyEvalConfig {
             candidates: candidates.max(1),
         })
     }
+}
+
+fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()> {
+    set_eval_env_default("TOFY_DECODER_RLM", "0");
+    set_eval_env_default("TOFY_LATENT_REASONING", "0");
+    let default_eval_temp = if cfg.candidates > 1 { "0.35" } else { "0" };
+    set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
+
+    let optional_outputs_ready = cfg
+        .preference_output_path
+        .as_ref()
+        .map_or(true, |path| path.exists());
+    if !cfg.force && cfg.repair_output_path.exists() && optional_outputs_ready {
+        println!(
+            "Go model-feedback repair cache hit: {}",
+            cfg.repair_output_path.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(path) = cfg.code_decoder_path.as_ref() {
+        std::env::set_var("JEPA_USE_CANDLE_DECODER", "1");
+        std::env::set_var("JEPA_CANDLE_DECODER", path);
+        if let Some(vocab_path) = cfg.code_decoder_vocab_path.as_ref() {
+            std::env::set_var("JEPA_CANDLE_DECODER_VOCAB", vocab_path);
+        }
+    }
+
+    let pairs = load_escaped_pairs(&cfg.input_pairs_path)?;
+    if pairs.is_empty() {
+        bail!(
+            "no usable pairs found in {}",
+            cfg.input_pairs_path.display()
+        );
+    }
+    let engine = AgentEngine::load(
+        &cfg.encoder_model_path,
+        &cfg.encoder_vocab_path,
+        &cfg.world_model_path,
+        cfg.high_world_model_path.as_ref(),
+        cfg.dim,
+        cfg.max_seq,
+        cfg.num_layers,
+        cfg.num_heads,
+        cfg.bridge_dim,
+        cfg.num_latent_tokens,
+    )?;
+    let go_version = go_version_string(&cfg.go_bin)?;
+    let go_feedback = GoCompileFeedback::new(&cfg.go_bin, &go_version, cfg.go_timeout_secs as f64)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.workers)
+        .build()
+        .context("build Go model-feedback compiler pool")?;
+
+    let mut repair_writer = atomic_buf_writer(&cfg.repair_output_path)?;
+    let mut preference_writer = cfg
+        .preference_output_path
+        .as_ref()
+        .map(|path| atomic_buf_writer(path))
+        .transpose()?;
+    let mut pass_writer = cfg
+        .pass_output_path
+        .as_ref()
+        .map(|path| atomic_buf_writer(path))
+        .transpose()?;
+
+    println!("Go model-feedback pair generation");
+    println!("input_pairs: {}", cfg.input_pairs_path.display());
+    println!("repair_output: {}", cfg.repair_output_path.display());
+    if let Some(path) = cfg.preference_output_path.as_ref() {
+        println!("preference_output: {}", path.display());
+    }
+    if let Some(path) = cfg.pass_output_path.as_ref() {
+        println!(
+            "pass_output: {} (enabled if compile_rate >= {:.2})",
+            path.display(),
+            cfg.pass_min_compile_rate
+        );
+    }
+    println!(
+        "rows_limit={} candidates={} workers={} temp={}",
+        cfg.max_rows,
+        cfg.candidates,
+        cfg.workers,
+        std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string())
+    );
+
+    let mut seen_repair = HashSet::new();
+    let mut seen_pass = HashSet::new();
+    let mut processed_tasks = 0usize;
+    let mut generated_candidates = 0usize;
+    let mut compile_ok = 0usize;
+    let mut repair_rows = 0usize;
+    let mut pass_rows = 0usize;
+
+    for (task_index, (task_prompt, canonical_code)) in pairs.iter().enumerate() {
+        if cfg.max_rows > 0 && repair_rows >= cfg.max_rows {
+            break;
+        }
+        processed_tasks += 1;
+        let generation_prompt = build_go_model_feedback_generation_prompt(task_prompt);
+        let mut attempts = Vec::with_capacity(cfg.candidates);
+        for candidate_index in 0..cfg.candidates {
+            let response = engine.generate_for_action(
+                &generation_prompt,
+                Action::Code,
+                cfg.max_new_tokens,
+                false,
+            )?;
+            let code = extract_code_candidate_for_language(&response, "go");
+            attempts.push(GoModelAttempt {
+                task_index,
+                candidate_index,
+                task_prompt: task_prompt.clone(),
+                canonical_code: canonical_code.clone(),
+                code,
+            });
+        }
+        generated_candidates += attempts.len();
+        let checked = pool.install(|| {
+            attempts
+                .into_par_iter()
+                .map(|attempt| {
+                    let feedback = if attempt.code.trim().is_empty() {
+                        "empty model output".to_string()
+                    } else {
+                        go_feedback.compile(&attempt.code)?
+                    };
+                    Ok(GoModelCheckedAttempt { attempt, feedback })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        for checked_attempt in checked {
+            let attempt = checked_attempt.attempt;
+            let model_compile_ok = checked_attempt.feedback.is_empty();
+            compile_ok += usize::from(model_compile_ok);
+            if model_compile_ok {
+                if let Some(writer) = pass_writer.as_mut() {
+                    let digest = format!(
+                        "{:x}",
+                        md5::compute(format!("{}\t{}", attempt.task_prompt, attempt.code))
+                    );
+                    if seen_pass.insert(digest) {
+                        writeln!(
+                            writer,
+                            "{}\t{}",
+                            escape_pair_field(&attempt.task_prompt),
+                            escape_pair_field(&attempt.code)
+                        )?;
+                        pass_rows += 1;
+                    }
+                }
+                continue;
+            }
+
+            let repair_prompt = build_language_repair_prompt(
+                "Go",
+                "go",
+                &attempt.task_prompt,
+                &attempt.code,
+                &checked_attempt.feedback,
+            );
+            let digest = format!(
+                "{:x}",
+                md5::compute(format!("{repair_prompt}\t{}", attempt.canonical_code))
+            );
+            if seen_repair.insert(digest) {
+                writeln!(
+                    repair_writer,
+                    "{}\t{}",
+                    escape_pair_field(&repair_prompt),
+                    escape_pair_field(&attempt.canonical_code)
+                )?;
+                repair_rows += 1;
+            }
+            if let Some(writer) = preference_writer.as_mut() {
+                let row = GoModelPreferenceRow {
+                    task_index: attempt.task_index,
+                    candidate_index: attempt.candidate_index,
+                    prompt: attempt.task_prompt.clone(),
+                    chosen: attempt.canonical_code.clone(),
+                    rejected: attempt.code.clone(),
+                    feedback: checked_attempt.feedback,
+                    compile_ok: false,
+                    chosen_source: "canonical".to_string(),
+                    rejected_source: "model_failed_attempt".to_string(),
+                };
+                writeln!(writer, "{}", serde_json::to_string(&row)?)?;
+            }
+            if cfg.max_rows > 0 && repair_rows >= cfg.max_rows {
+                break;
+            }
+        }
+        if processed_tasks.is_multiple_of(100) {
+            println!(
+                "Go model-feedback progress: tasks={} candidates={} repair_rows={} pass_rows={} compile_rate={:.3}",
+                processed_tasks,
+                generated_candidates,
+                repair_rows,
+                pass_rows,
+                compile_ok as f32 / generated_candidates.max(1) as f32
+            );
+        }
+    }
+
+    finish_atomic_writer(repair_writer, &cfg.repair_output_path)?;
+    if let Some(writer) = preference_writer {
+        if let Some(path) = cfg.preference_output_path.as_ref() {
+            finish_atomic_writer(writer, path)?;
+        }
+    }
+    let compile_rate = compile_ok as f32 / generated_candidates.max(1) as f32;
+    if let Some(writer) = pass_writer {
+        if let Some(path) = cfg.pass_output_path.as_ref() {
+            if compile_rate >= cfg.pass_min_compile_rate {
+                finish_atomic_writer(writer, path)?;
+            } else {
+                drop(writer);
+                let _ = fs::remove_file(tmp_path_for(path));
+                let _ = fs::remove_file(path);
+                println!(
+                    "Skipped pass-only self-training rows: compile_rate {:.3} < threshold {:.3}",
+                    compile_rate, cfg.pass_min_compile_rate
+                );
+            }
+        }
+    }
+    println!(
+        "Wrote Go model-feedback rows: tasks={} candidates={} repair_rows={} pass_rows={} compile_rate={:.3}",
+        processed_tasks, generated_candidates, repair_rows, pass_rows, compile_rate
+    );
+    Ok(())
+}
+
+fn build_go_model_feedback_generation_prompt(task_prompt: &str) -> String {
+    format!(
+        "Return only Go code.\n{task_prompt}\n\nRules:\n- Keep the requested function name and signature.\n- Return only compilable Go code.\n- Do not add markdown fences or explanation.\n"
+    )
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", path.to_string_lossy()))
+}
+
+fn atomic_buf_writer(path: &Path) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(BufWriter::new(File::create(tmp_path_for(path))?))
+}
+
+fn finish_atomic_writer(mut writer: BufWriter<File>, path: &Path) -> Result<()> {
+    writer.flush()?;
+    drop(writer);
+    fs::rename(tmp_path_for(path), path)?;
+    Ok(())
 }
 
 fn run_code_eval(cfg: EvalConfig) -> Result<()> {
@@ -746,10 +1228,6 @@ fn evaluate_best_candidate(
 ) -> Result<CandidateEval> {
     let mut best = None;
     let max_new_tokens = task.max_new_tokens.min(cfg.max_new_tokens);
-    let repair_route_ok = matches!(
-        parse_expected_action(&task.expected_action),
-        Ok(Action::Code)
-    );
     for _ in 0..cfg.candidates.max(1) {
         let prompt = build_code_eval_prompt(task);
         let response = engine.generate(&prompt, max_new_tokens, cfg.ablate_conditioning)?;
@@ -783,7 +1261,7 @@ fn evaluate_best_candidate(
                 cfg.rust_timeout_secs,
                 cfg.go_timeout_secs,
                 task,
-                route_ok || repair_route_ok,
+                route_ok,
                 repaired_response,
                 repair_idx + 1,
             )?;

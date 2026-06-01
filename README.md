@@ -115,7 +115,7 @@ generalist:
 - base code data defaults to Go code pairs
 - `--prepare-go-function-tasks` derives synthetic instruction -> function pairs from the Go code corpus
 - `--prepare-code-poc-mix` oversamples instruction, semantic, repair, FIM, and EOS-terminated rows before code-decoder training
-- the second decoder stage trains on `data/code_poc_go_mix.txt`, built from Go code, Go instruction pairs, and Go compiler-feedback repair rows
+- the second decoder stage trains on `data/code_poc_go_mix.txt`, built from Go code, Go instruction pairs, cold compiler-feedback repair rows, model-failure repair rows, and pass-only self-training rows when available
 - the canonical eval suite is `eval/code_assistant_go_hard.jsonl`
 
 Default behavior:
@@ -126,13 +126,14 @@ Default behavior:
 - world/action classifier rows now carry explicit action labels and synthetic terminal `done` rows
 - text decoder data = UltraChat
 - code decoder data = Go-only code POC mix built from GitHub Go code, synthetic Go function tasks, and Go compiler-feedback repair rows when `go` is available
+- after the base code decoder trains, the pipeline can mine its failed Go attempts into `data/go_model_failure_repair_pairs.txt`, chosen/rejected preference records in `data/go_model_preference_pairs.jsonl`, and pass-only rows in `data/go_pass_self_train_pairs.txt`; tune with `TOFY_GO_MODEL_FEEDBACK_ROWS`, `TOFY_GO_MODEL_FEEDBACK_CANDIDATES`, and `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
 - Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
 - the pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
 - training now streams cached token batches from disk instead of retokenizing raw text in the hot loop
 - pipeline locations are configurable with `TOFY_RUNS_DIR`, `TOFY_CACHE_DIR`, `TOFY_VOCAB_DIR`, `TOFY_HUB_CACHE_DIR`, and `TOFY_SERVE_BIND`; `TOFY_DATA_DIR` also redirects default hub cache files to `$TOFY_DATA_DIR/hub`
 - cache preparation overlaps independent CPU jobs and encodes cache misses with Rayon; set `RAYON_NUM_THREADS=N` to cap CPU workers, `TOFY_PREPARE_CHUNK_LINES=N` to tune Stage 1 text chunks, `TOFY_TOKEN_CACHE_ENCODE_CHUNK_LINES=N` to tune token-cache build chunks, or `TOFY_VOCAB_SCAN_CHUNK_LINES=N` to tune vocab sampling chunks
-- `cargo run --release -- prepare cache <8gb|48gb|80gb>` runs Stage 1 only, so you can prepare source data, mixes, eval data, vocabs, and token caches locally before copying `data/`, `eval/`, and `local_models/vocabs/` to a pod; add `--auto-hf-upload` to archive those handoff directories and upload them to the Hugging Face cache dataset with the `hf` CLI
+- `cargo run --release -- prepare cache <8gb|48gb|80gb>` runs Stage 1 only, so you can prepare source data, mixes, eval data, vocabs, and token caches locally before copying `data/`, `eval/`, and `local_models/vocabs/` to a pod; add `--auto-hf-upload --hf-dataset <org/dataset-name>` to archive those handoff directories and upload them to your Hugging Face dataset with the `hf` CLI (see [docs/DATA_FORMATS.md](docs/DATA_FORMATS.md#prepared-cache-hf-upload))
 - raw and cached training streams prefetch ordered chunks by default; set `TOFY_CACHE_PREFETCH_BATCHES=0` to disable, `TOFY_CACHE_PREFETCH_BATCHES=N` to tune queue depth, `TOFY_CACHE_PREFETCH_CHUNK=N` to force chunk size, or `TOFY_TOKEN_CACHE_READER_MB=N` to tune the cache reader buffer
 - world/action classifier/decoder context encoding batches token segments on GPU; set `TOFY_CONTEXT_SEGMENT_BATCH=N` to tune the segment micro-batch size, default `64`
 - token caches and decoder/world batches keep the tail of overlong pair sides so late instructions, compiler feedback, and completion endings are retained
@@ -142,6 +143,7 @@ Default behavior:
   - world defaults to `32x8` (`256` effective) after a `32x1` warmup
   - high-world planning is trained by default from the selected profile (`12000` steps for `8gb`/`48gb`, `18000` for `80gb`) and loaded automatically from the run directory
   - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
+  - model-failure Go feedback mining defaults to `1024` rows on `8gb`, `2048` on `48gb`, and `4096` on `80gb`; set `TOFY_GO_MODEL_FEEDBACK_ROWS=0` to disable
   - Go compile/test eval runs by default for verifier-guided base vs Go-feedback decoder promotion
   - code eval defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline

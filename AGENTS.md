@@ -11,6 +11,7 @@
 - Keep changes minimal and targeted; avoid unrelated refactors.
 - Do not preserve backward compatibility unless the user explicitly asks for it.
 - Write as little code as possible while still solving the problem clearly.
+- Make sure program uses maximum hardware capabilities, for speed without affecting quality.
 
 ## Validation
 - After code edits, run lint/compile checks when possible.

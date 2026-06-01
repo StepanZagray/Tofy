@@ -517,7 +517,7 @@ fn write_artifact_manifest(
     write_json_atomic(&output_manifest_path(output_path), &manifest)
 }
 
-fn unescape_pair_field(text: &str) -> String {
+pub(crate) fn unescape_pair_field(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -551,7 +551,7 @@ fn unescape_pair_field(text: &str) -> String {
     out
 }
 
-fn escape_pair_field(text: &str) -> String {
+pub(crate) fn escape_pair_field(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -2067,7 +2067,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn default_go_repair_workers() -> usize {
+pub(crate) fn default_go_repair_workers() -> usize {
     thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or_else(|_| rayon::current_num_threads().max(1))
@@ -2117,7 +2117,7 @@ fn prepare_go_repair_rows_for_pair(
     Ok(GoRepairPairRows { pair_index, rows })
 }
 
-fn go_version_string(go_bin: &str) -> Result<String> {
+pub(crate) fn go_version_string(go_bin: &str) -> Result<String> {
     let out = Command::new(go_bin).arg("version").output()?;
     if out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -2128,7 +2128,7 @@ fn go_version_string(go_bin: &str) -> Result<String> {
     bail!("failed to query Go version from '{go_bin}'")
 }
 
-struct GoCompileFeedback {
+pub(crate) struct GoCompileFeedback {
     go_bin: String,
     timeout_sec: f64,
     cache_dir: PathBuf,
@@ -2137,7 +2137,7 @@ struct GoCompileFeedback {
 }
 
 impl GoCompileFeedback {
-    fn new(go_bin: &str, go_version: &str, timeout_sec: f64) -> Result<Self> {
+    pub(crate) fn new(go_bin: &str, go_version: &str, timeout_sec: f64) -> Result<Self> {
         let cache_root = std::env::var_os("TOFY_GO_REPAIR_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -2182,7 +2182,7 @@ impl GoCompileFeedback {
         Ok(())
     }
 
-    fn compile(&self, code: &str) -> Result<String> {
+    pub(crate) fn compile(&self, code: &str) -> Result<String> {
         go_compile_feedback(
             &self.go_bin,
             code,
@@ -2194,7 +2194,7 @@ impl GoCompileFeedback {
     }
 }
 
-fn load_escaped_pairs(path: &Path) -> Result<Vec<(String, String)>> {
+pub(crate) fn load_escaped_pairs(path: &Path) -> Result<Vec<(String, String)>> {
     let reader = BufReader::new(File::open(path)?);
     let mut rows = Vec::new();
     for raw in reader.lines() {
@@ -2351,7 +2351,7 @@ fn go_func_start_re() -> &'static Regex {
     })
 }
 
-fn build_language_repair_prompt(
+pub(crate) fn build_language_repair_prompt(
     language: &str,
     fence: &str,
     task_prompt: &str,
@@ -2760,6 +2760,7 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
         "instruction_repeat": instruction_repeat,
         "extra_repeat": extra_repeat,
         "fim_repeat": fim_repeat,
+        "code_targets_only": true,
         "target_stop_token": CODE_EOS_TOKEN,
         "max_rows": if max_rows > 0 { Some(max_rows) } else { None::<usize> },
         "seed": seed,
@@ -2890,7 +2891,7 @@ fn write_code_poc_rows_from_path<W: Write>(
         let rows = chunk
             .into_par_iter()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| code_poc_row_with_eos(&line).unwrap_or(line))
+            .filter_map(|line| code_poc_row_with_eos(&line))
             .collect::<Vec<_>>();
         for row in rows {
             if write_limited_row(out, &row, remaining)? {
@@ -2938,10 +2939,7 @@ fn write_code_poc_fim_rows_from_path<W: Write>(
         let rows = chunk
             .into_par_iter()
             .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| {
-                let row = code_poc_row_with_eos(&line).unwrap_or(line);
-                code_poc_fim_row(&row)
-            })
+            .filter_map(|line| code_poc_row_with_eos(&line).and_then(|row| code_poc_fim_row(&row)))
             .collect::<Vec<_>>();
         for row in rows {
             if write_limited_row(out, &row, remaining)? {
@@ -2957,12 +2955,28 @@ fn write_code_poc_fim_rows_from_path<W: Write>(
 fn code_poc_row_with_eos(row: &str) -> Option<String> {
     let (left, right) = row.split_once('\t')?;
     let state = unescape_pair_field(left);
-    let target = append_code_eos(&unescape_pair_field(right));
+    let target = code_poc_code_target(&unescape_pair_field(right))?;
+    let target = append_code_eos(&target);
     Some(format!(
         "{}\t{}",
         escape_pair_field(&state),
         escape_pair_field(&target)
     ))
+}
+
+fn code_poc_code_target(target: &str) -> Option<String> {
+    if let Some((_, body)) = split_explicit_action_prefix(target) {
+        return (explicit_world_mix_action(target) == Some("code"))
+            .then(|| body.trim_start().to_string());
+    }
+    Some(target.to_string())
+}
+
+fn split_explicit_action_prefix(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("<action:")?;
+    let (label, after_label) = rest.split_once('>')?;
+    Some((label.trim(), after_label))
 }
 
 fn append_code_eos(text: &str) -> String {
@@ -5103,6 +5117,35 @@ mod tests {
             unescape_pair_field(right).ends_with(CODE_EOS_TOKEN),
             "completion should end with code EOS"
         );
+    }
+
+    #[test]
+    fn code_poc_rows_drop_explicit_non_code_targets() {
+        let row = format!(
+            "{}\t{}",
+            escape_pair_field("track snippet"),
+            escape_pair_field("<action:text_reply> 42")
+        );
+
+        assert!(code_poc_row_with_eos(&row).is_none());
+    }
+
+    #[test]
+    fn code_poc_rows_strip_explicit_code_action() {
+        let row = format!(
+            "{}\t{}",
+            escape_pair_field("write add"),
+            escape_pair_field("<action:code> func Add(a int, b int) int { return a + b }")
+        );
+        let transformed = code_poc_row_with_eos(&row).expect("code row should transform");
+        let (_, right) = transformed
+            .split_once('\t')
+            .expect("pair should remain a pair");
+        let target = unescape_pair_field(right);
+
+        assert!(target.starts_with("func Add"));
+        assert!(!target.contains("<action:code>"));
+        assert!(target.ends_with(CODE_EOS_TOKEN));
     }
 
     #[test]

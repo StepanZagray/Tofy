@@ -5,28 +5,34 @@ running the current Tofy pipeline, resuming it, and pulling artifacts back.
 
 Current recommended pod target:
 
-- one high-VRAM NVIDIA GPU: L40S 48 GB minimum, A100/H100/RTX PRO 6000 preferred when available
+- one high-VRAM NVIDIA GPU: A100/H100/RTX PRO 6000 80 GB preferred; L40S 48 GB
+  minimum for the smaller profile
 - Ubuntu-like CUDA image with Rust build tools installed manually
 - regular pod volume mounted at `/workspace`
 - repo checkout at `/workspace/Tofy`
-- canonical training command: `./target/release/jepa_ai train 48gb` or `./target/release/jepa_ai train 80gb`
+- canonical training command: `./target/release/jepa_ai train 80gb` (or
+  `./target/release/jepa_ai train 48gb` on L40S/A40-class GPUs)
 
-The `48gb` profile is defined in `config/model_profiles.json`: `DIM=768`,
-`LAYERS=12`, `HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code
-decoder `dim=768`, decoder layers `12`, decoder FF `3072`, code decoder
-`max_seq=256`, and current long-run budgets of latent `16000`, world `60000`,
-high-world `12000`, code decoder `80000`, and Go feedback `20000`.
-Current 48 GB training batches are encoder `48x11` (`528` effective), world
-`128x4` (`512` effective) with the encoder frozen, code decoder `32x8`
-(`256` effective), and Go feedback `32x8` (`256` effective). Decoder and
-Go-feedback pipeline stages use conditioning-margin loss and prompt dropout so
-the decoder cannot solve training rows by ignoring the world state.
+The `80gb` profile is the default cloud shape in `config/model_profiles.json`:
+`DIM=1024`, `LAYERS=16`, `HEADS=16`, `BRIDGE_DIM=1024`,
+`NUM_LATENT_TOKENS=128`, code decoder `dim=1536`, decoder layers `16`, decoder
+FF `6144`, code decoder `max_seq=320`, and current long-run budgets of latent
+`24000`, world `90000`, high-world `18000`, code decoder `120000`, and Go
+feedback `30000`. Current 80 GB training batches are encoder `32x16` (`512`
+effective), world `96x6` (`576` effective) with the encoder frozen, code
+decoder `16x16` (`256` effective), and Go feedback `16x16` (`256` effective).
+Decoder microbatch stays small because larger microbatches mostly increase
+activation memory; use `--max-vram-probe --profile 80gb` before a long run.
 
-The `80gb` profile is intended for A100/H100/RTX PRO 6000-class pods. It uses a
-larger `DIM=1024` world stack and a decoder with `dim=1536`, `layers=16`,
-`heads=16`, and `ff=6144`. Decoder microbatch stays small at `8` with
-`grad_accum=32` because larger microbatches mostly increase activation memory;
-use `--max-vram-probe --profile 80gb` before a long run.
+The `48gb` profile is the L40S/A40 alternative: `DIM=768`, `LAYERS=12`,
+`HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code decoder `dim=768`,
+decoder layers `12`, decoder FF `3072`, code decoder `max_seq=256`, and budgets
+of latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, and
+Go feedback `20000`. Current 48 GB batches are encoder `48x11` (`528`
+effective), world `128x4` (`512` effective), code decoder `32x8` (`256`
+effective), and Go feedback `32x8` (`256` effective). Decoder and Go-feedback
+pipeline stages use conditioning-margin loss and prompt dropout so the decoder
+cannot solve training rows by ignoring the world state.
 
 Do not paste API keys or full RunPod API responses into public logs. Pod
 responses can include environment variables.
@@ -57,16 +63,16 @@ for this project because it lets RunPod place the job wherever a suitable GPU is
 available. Network volumes are useful for long-lived datasets, but they are tied
 to one datacenter and can reduce GPU availability.
 
-L40S 48 GB:
+A100 80 GB (default):
 
 ```bash
 cat > /tmp/runpod-tofy-train.json <<'EOF'
 {
-  "name": "tofy-train-48gb",
+  "name": "tofy-train-80gb",
   "cloudType": "SECURE",
   "computeType": "GPU",
   "templateId": "obgryfbuad",
-  "gpuTypeIds": ["NVIDIA L40S"],
+  "gpuTypeIds": ["NVIDIA A100-SXM4-80GB"],
   "gpuTypePriority": "availability",
   "gpuCount": 1,
   "dataCenterPriority": "availability",
@@ -86,9 +92,10 @@ curl -sS -X POST "https://rest.runpod.io/v1/pods" \
 
 Alternatives for the same command:
 
-- A100 80 GB: set `"gpuTypeIds": ["NVIDIA A100-SXM4-80GB"]`
 - H100 80 GB: set `"gpuTypeIds": ["NVIDIA H100 80GB HBM3"]`
+- A100 80 GB: set `"gpuTypeIds": ["NVIDIA A100 80GB PCIe"]`
 - RTX PRO 6000: set `"gpuTypeIds": ["NVIDIA RTX PRO 6000 Blackwell Server Edition"]`
+- L40S 48 GB: set `"gpuTypeIds": ["NVIDIA L40S"]` and use `train 48gb` instead of `train 80gb`
 
 If the response is an array, it is an API validation or availability error.
 Read the error text, retry later, or switch GPU type. Only add an
@@ -249,7 +256,7 @@ source "$HOME/.cargo/env"
 cargo build --release
 ```
 
-Run the current profile-aware probe before a long 48 GB launch:
+Run the current profile-aware probe before a long 80 GB launch:
 
 ```bash
 tmux new -s tofy-probe
@@ -261,8 +268,8 @@ Inside tmux:
 export RUST_BACKTRACE=1
 
 /workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai --max-vram-probe --profile 48gb --stage all --probe-dir /workspace/tofy-vram-probe-48gb \
-  2>&1 | tee /workspace/tofy-vram-probe-48gb.log
+  ./target/release/jepa_ai --max-vram-probe --profile 80gb --stage all --probe-dir /workspace/tofy-vram-probe-80gb \
+  2>&1 | tee /workspace/tofy-vram-probe-80gb.log
 ```
 
 Detach without stopping:
@@ -275,19 +282,22 @@ Monitor:
 
 ```bash
 tmux attach -t tofy-probe
-tail -f /workspace/tofy-vram-probe-48gb.log
+tail -f /workspace/tofy-vram-probe-80gb.log
 nvidia-smi
 ```
 
 Use the sustained probe when changing profile shapes or batch sizes:
 
 ```bash
-./target/release/jepa_ai --sustained-oom-probe --profile 48gb --stage all
+./target/release/jepa_ai --sustained-oom-probe --profile 80gb --stage all
 ```
+
+On L40S/A40 pods, repeat the same probe flow with `--profile 48gb` and log
+paths named `tofy-vram-probe-48gb`.
 
 ## 8. Full Training
 
-Start a full 48 GB run. This command is intended to run unattended from data
+Start a full 80 GB run. This command is intended to run unattended from data
 prep through latent, world, high-world, base code decoder, Go-feedback decoder,
 verifier-guided decoder selection, and the final hard Go eval.
 
@@ -306,12 +316,12 @@ Inside tmux:
 ```bash
 export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
-# Pipeline defaults set TOFY_CACHE_PREFETCH_BATCHES=8 for 48gb and 12 for 80gb; keep this enabled unless
+# Pipeline defaults set TOFY_CACHE_PREFETCH_BATCHES=12 for 80gb and 8 for 48gb; keep this enabled unless
 # debugging input-order or memory issues. It now covers both raw and cached streams.
 
 /workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 48gb \
-  2>&1 | tee /workspace/tofy-train-48gb.log
+  ./target/release/jepa_ai train 80gb \
+  2>&1 | tee /workspace/tofy-train-80gb.log
 ```
 
 Stage 1 bootstraps source data, materializes `data/encoder_mix.txt`, builds
@@ -323,17 +333,24 @@ builds `data/code_poc_go_mix.txt`, initializes the Go-feedback decoder from the
 base code decoder, and trains `runs/<run_id>/decoder_code_go_feedback/model.safetensors`
 without a separate manual command.
 
-You can run `cargo run --release -- prepare cache 48gb` locally first, then
+You can run `cargo run --release -- prepare cache 80gb` locally first, then
 copy `data/`, `eval/`, and `local_models/vocabs/` to the pod to skip most of
 the CPU-heavy Stage 1 work there. Use the same profile as the pod training run.
+To publish the handoff tree to your Hugging Face dataset instead of `scp`,
+use `prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset-name>` and restore with
+`hf download` plus `tar --zstd -xf` (see
+[DATA_FORMATS.md](DATA_FORMATS.md#prepared-cache-hf-upload)).
 
 Monitor:
 
 ```bash
 tmux attach -t tofy-train
-tail -f /workspace/tofy-train-48gb.log
+tail -f /workspace/tofy-train-80gb.log
 nvidia-smi
 ```
+
+On L40S/A40 pods, use `train 48gb`, `prepare cache 48gb`, and log paths named
+`tofy-train-48gb.log`.
 
 ## 9. Manual Go Eval
 
@@ -386,15 +403,17 @@ export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
 
 /workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 48gb --resume latest \
-  2>&1 | tee /workspace/tofy-train-48gb-resume.log
+  ./target/release/jepa_ai train 80gb --resume latest \
+  2>&1 | tee /workspace/tofy-train-80gb-resume.log
 ```
 
 Resume a specific run:
 
 ```bash
-./target/release/jepa_ai train 48gb --resume code_poc_<timestamp>
+./target/release/jepa_ai train 80gb --resume code_poc_<timestamp>
 ```
+
+On 48 GB pods, substitute `train 48gb` and `tofy-train-48gb-resume.log`.
 
 Resume requires matching architecture/profile arguments. Do not resume a run
 created with a different `config/model_profiles.json` shape.
@@ -411,6 +430,10 @@ rsync -az --info=progress2 \
 rsync -az --info=progress2 \
   root@<pod-host>:/workspace/Tofy/data/cache/ \
   /home/stepan/Coding/Personal/Tofy/data/cache/
+
+rsync -az --info=progress2 \
+  root@<pod-host>:/workspace/tofy-train-80gb*.log \
+  /home/stepan/Coding/Personal/Tofy/runs/
 
 rsync -az --info=progress2 \
   root@<pod-host>:/workspace/tofy-train-48gb*.log \

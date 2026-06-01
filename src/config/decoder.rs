@@ -12,7 +12,7 @@ const DEFAULT_DECODER_SIGNATURE_LOSS_WEIGHT: f64 = 0.15;
 const DEFAULT_DECODER_STRUCTURE_LOSS_WEIGHT: f64 = 0.05;
 const DEFAULT_DECODER_CONDITIONING_LOSS_WEIGHT: f64 = 0.20;
 const DEFAULT_DECODER_CONDITIONING_MARGIN: f64 = 0.10;
-const DEFAULT_CODE_DECODER_MTP_LOSS_WEIGHT: f64 = 0.05;
+const DEFAULT_CODE_DECODER_MTP_LOSS_WEIGHT: f64 = 0.0;
 const DEFAULT_CODE_DECODER_MTP_MAX_AHEAD: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -54,13 +54,15 @@ pub struct DecoderTrainConfig {
     pub decoder_layers: usize,
     pub decoder_heads: usize,
     pub decoder_ff_dim: usize,
+    pub build_conditioned_cache: bool,
+    pub from_conditioned_cache: bool,
 }
 
 impl DecoderTrainConfig {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--mtp-loss-weight <float>] [--mtp-max-ahead <int>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
+                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--mtp-loss-weight <float>] [--mtp-max-ahead <int>] [--init-decoder <path>] [--decoder-output <path>] [--build-conditioned-cache] [--from-conditioned-cache] [--resume]"
             );
         }
         let mut init_decoder_path = None;
@@ -81,6 +83,8 @@ impl DecoderTrainConfig {
         let mut conditioning_margin = None;
         let mut mtp_loss_weight = None;
         let mut mtp_max_ahead = None;
+        let mut build_conditioned_cache = false;
+        let mut from_conditioned_cache = false;
         let mut filtered = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -253,6 +257,16 @@ impl DecoderTrainConfig {
                 i += 1;
                 continue;
             }
+            if args[i] == "--build-conditioned-cache" {
+                build_conditioned_cache = true;
+                i += 1;
+                continue;
+            }
+            if args[i] == "--from-conditioned-cache" {
+                from_conditioned_cache = true;
+                i += 1;
+                continue;
+            }
             filtered.push(args[i].clone());
             i += 1;
         }
@@ -415,6 +429,8 @@ impl DecoderTrainConfig {
                         .and_then(|v| v.parse().ok())
                 })
                 .unwrap_or(2560),
+            build_conditioned_cache,
+            from_conditioned_cache,
         })
     }
 }

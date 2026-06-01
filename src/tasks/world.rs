@@ -2,13 +2,14 @@ use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::seq::SliceRandom;
-use serde::Deserialize;
+use rand::RngExt;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 use crate::cli::resolve_data_path;
@@ -20,9 +21,8 @@ use crate::data::{
     build_vocab_from_raw_world_file_with_mode, count_raw_world_rows, count_raw_world_rows_split,
     count_raw_world_rows_split_with_mode, encode_text_with_vocab_mode, encode_world_examples,
     encode_world_examples_with_mode, make_decoder_batch_from_slice_with_prompt_dropout,
-    make_world_batch_from_slice, CachedDecoderStream, CachedWorldStream, RawWorldExample,
-    RawWorldStream, TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
-    DEFAULT_STREAM_SHUFFLE_BUFFER,
+    CachedDecoderStream, CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode,
+    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::vocab_signature;
@@ -48,6 +48,10 @@ use crate::util;
 
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
+const CONDITIONED_DECODER_CACHE_VERSION: u32 = 1;
+const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V1\n";
+const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
+const GO_FEEDBACK_DATA_FILE: &str = "code_poc_go_mix.txt";
 
 type WorldConfig = WorldTrainConfig;
 
@@ -135,6 +139,687 @@ fn compatible_decoder_dual_cache_path(
     {
         return Ok(None);
     }
+    Ok(Some(cache_path))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CacheFileFingerprint {
+    path: String,
+    len: u64,
+    modified_unix_secs: u64,
+    content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ConditionedDecoderContextSignature {
+    max_seq: usize,
+    dim: usize,
+    bridge_dim: usize,
+    num_latent_tokens: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
+    rollout_steps: usize,
+    decoder_action_label: u32,
+    hybrid_context: bool,
+    hybrid_exact_tail: usize,
+    hybrid_block_size: usize,
+    hybrid_retrieval_slots: usize,
+    exact_old_tokens: usize,
+    train_dtype: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConditionedDecoderCacheManifest {
+    version: u32,
+    kind: String,
+    data_path: String,
+    cache_path: String,
+    source_token_cache: CacheFileFingerprint,
+    source_token_manifest: Option<CacheFileFingerprint>,
+    encoder_model: CacheFileFingerprint,
+    world_model: CacheFileFingerprint,
+    encoder_vocab_signature: String,
+    decoder_vocab_signature: String,
+    context: ConditionedDecoderContextSignature,
+    rows: usize,
+}
+
+#[derive(Clone)]
+struct ConditionedDecoderCacheRecord {
+    encoder_state_tokens: Vec<u32>,
+    encoder_next_tokens: Vec<u32>,
+    decoder_state_tokens: Vec<u32>,
+    decoder_next_tokens: Vec<u32>,
+    action_label: u32,
+    next_context_slots: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct ConditionedDecoderExample {
+    decoder: WorldExample,
+    next_context_slots: Vec<f32>,
+}
+
+struct ConditionedDecoderStream {
+    path: PathBuf,
+    reader: BufReader<File>,
+    shuffle_buffer_size: usize,
+    shuffle_buffer: Vec<ConditionedDecoderExample>,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    exclude_split_matches: bool,
+    row_index: usize,
+}
+
+impl ConditionedDecoderStream {
+    fn with_split(
+        path: &Path,
+        shuffle_buffer_size: usize,
+        split_modulus: Option<usize>,
+        split_remainder: usize,
+        exclude_split_matches: bool,
+    ) -> Result<Self> {
+        let mut stream = Self {
+            path: path.to_path_buf(),
+            reader: BufReader::new(File::open(path)?),
+            shuffle_buffer_size: shuffle_buffer_size.max(1),
+            shuffle_buffer: Vec::new(),
+            split_modulus,
+            split_remainder,
+            exclude_split_matches,
+            row_index: 0,
+        };
+        stream.read_magic()?;
+        Ok(stream)
+    }
+
+    fn read_magic(&mut self) -> Result<()> {
+        let mut magic = vec![0u8; CONDITIONED_DECODER_CACHE_MAGIC.len()];
+        self.reader.read_exact(&mut magic)?;
+        if magic != CONDITIONED_DECODER_CACHE_MAGIC {
+            bail!("invalid conditioned decoder cache magic in {:?}", self.path);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reader = BufReader::new(File::open(&self.path)?);
+        self.row_index = 0;
+        self.read_magic()
+    }
+
+    fn read_next_example(&mut self) -> Result<ConditionedDecoderExample> {
+        loop {
+            let Some(record) = read_conditioned_decoder_cache_record(&mut self.reader)? else {
+                self.reset()?;
+                continue;
+            };
+            let row_idx = self.row_index;
+            self.row_index += 1;
+            if let Some(modulus) = self.split_modulus {
+                let is_match = row_idx % modulus == self.split_remainder;
+                let keep = if self.exclude_split_matches {
+                    !is_match
+                } else {
+                    is_match
+                };
+                if !keep {
+                    continue;
+                }
+            }
+            if record.encoder_state_tokens.is_empty()
+                || record.encoder_next_tokens.is_empty()
+                || record.decoder_state_tokens.is_empty()
+                || record.decoder_next_tokens.is_empty()
+                || record.next_context_slots.is_empty()
+            {
+                continue;
+            }
+            return Ok(ConditionedDecoderExample {
+                decoder: WorldExample {
+                    state_tokens: record.decoder_state_tokens,
+                    next_tokens: record.decoder_next_tokens,
+                    action_label: record.action_label,
+                },
+                next_context_slots: record.next_context_slots,
+            });
+        }
+    }
+
+    fn refill_shuffle_buffer(&mut self) -> Result<()> {
+        while self.shuffle_buffer.len() < self.shuffle_buffer_size {
+            let example = self.read_next_example()?;
+            self.shuffle_buffer.push(example);
+        }
+        Ok(())
+    }
+
+    fn next_example(&mut self) -> Result<ConditionedDecoderExample> {
+        if self.shuffle_buffer_size <= 1 {
+            return self.read_next_example();
+        }
+        self.refill_shuffle_buffer()?;
+        let idx = rand::rng().random_range(0..self.shuffle_buffer.len());
+        Ok(self.shuffle_buffer.swap_remove(idx))
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Result<Vec<ConditionedDecoderExample>> {
+        let mut batch = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            batch.push(self.next_example()?);
+        }
+        Ok(batch)
+    }
+}
+
+struct DecoderMicroBatch {
+    encoder_batch: Vec<WorldExample>,
+    decoder_batch: Vec<WorldExample>,
+    oov_rate: f32,
+    next_context_slots: Option<Tensor>,
+}
+
+fn is_go_feedback_decoder_data(data_path: &Path) -> bool {
+    data_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == GO_FEEDBACK_DATA_FILE)
+}
+
+fn conditioned_decoder_cache_path() -> PathBuf {
+    std::env::var("TOFY_DECODER_CONDITIONED_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| cache_dir().join("code_decoder_go_conditioned.tokens.bin"))
+}
+
+fn conditioned_decoder_manifest_path(cache_path: &Path) -> PathBuf {
+    let file_name = cache_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("code_decoder_go_conditioned.tokens.bin");
+    cache_path.with_file_name(format!("{file_name}.manifest.json"))
+}
+
+fn cache_tmp_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+}
+
+fn cache_file_fingerprint(path: &Path, hash_contents: bool) -> Result<CacheFileFingerprint> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let modified_unix_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let content_hash = if hash_contents {
+        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            for byte in &buf[..read] {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        Some(format!("{hash:016x}"))
+    } else {
+        None
+    };
+    Ok(CacheFileFingerprint {
+        path: path.to_string_lossy().into_owned(),
+        len: metadata.len(),
+        modified_unix_secs,
+        content_hash,
+    })
+}
+
+fn conditioned_decoder_context_signature(
+    max_seq: usize,
+    dim: usize,
+    bridge_dim: usize,
+    num_latent_tokens: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
+    rollout_steps: usize,
+    decoder_action_label: u32,
+    train_dtype: DType,
+) -> ConditionedDecoderContextSignature {
+    let hybrid_retrieval_slots = env_usize("TOFY_CONTEXT_RETRIEVAL_SLOTS", 8);
+    let exact_old_tokens = std::env::var("TOFY_CONTEXT_EXACT_OLD_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| hybrid_retrieval_slots.saturating_mul(2).min(16));
+    ConditionedDecoderContextSignature {
+        max_seq,
+        dim,
+        bridge_dim,
+        num_latent_tokens,
+        context_segments,
+        recent_full_segments,
+        recursive_context_compressor,
+        rollout_steps,
+        decoder_action_label,
+        hybrid_context: env_bool("TOFY_CONTEXT_HYBRID_MEMORY", true),
+        hybrid_exact_tail: env_usize(
+            "TOFY_CONTEXT_HYBRID_EXACT_TAIL",
+            max_seq.saturating_mul(recent_full_segments.max(1)),
+        ),
+        hybrid_block_size: env_usize("TOFY_CONTEXT_HYBRID_BLOCK_SIZE", 16),
+        hybrid_retrieval_slots,
+        exact_old_tokens,
+        train_dtype: format!("{train_dtype:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conditioned_decoder_expected_manifest(
+    data_path: &Path,
+    cache_path: &Path,
+    source_cache_path: &Path,
+    encoder_model_path: &Path,
+    world_model_path: &Path,
+    encoder_vocab_sig: &str,
+    decoder_vocab_sig: &str,
+    context: ConditionedDecoderContextSignature,
+) -> Result<ConditionedDecoderCacheManifest> {
+    let source_manifest_path =
+        source_cache_path.with_file_name("code_decoder_dual_tokens.manifest.json");
+    let source_token_manifest = source_manifest_path
+        .exists()
+        .then(|| cache_file_fingerprint(&source_manifest_path, true))
+        .transpose()?;
+    Ok(ConditionedDecoderCacheManifest {
+        version: CONDITIONED_DECODER_CACHE_VERSION,
+        kind: "code_decoder_go_conditioned".to_string(),
+        data_path: data_path.to_string_lossy().into_owned(),
+        cache_path: cache_path.to_string_lossy().into_owned(),
+        source_token_cache: cache_file_fingerprint(source_cache_path, false)?,
+        source_token_manifest,
+        encoder_model: cache_file_fingerprint(encoder_model_path, true)?,
+        world_model: cache_file_fingerprint(world_model_path, true)?,
+        encoder_vocab_signature: encoder_vocab_sig.to_string(),
+        decoder_vocab_signature: decoder_vocab_sig.to_string(),
+        context,
+        rows: 0,
+    })
+}
+
+fn conditioned_decoder_manifest_matches(
+    actual: &ConditionedDecoderCacheManifest,
+    expected: &ConditionedDecoderCacheManifest,
+) -> bool {
+    actual.version == expected.version
+        && actual.kind == expected.kind
+        && actual.data_path == expected.data_path
+        && actual.cache_path == expected.cache_path
+        && actual.source_token_cache == expected.source_token_cache
+        && actual.source_token_manifest == expected.source_token_manifest
+        && actual.encoder_model == expected.encoder_model
+        && actual.world_model == expected.world_model
+        && actual.encoder_vocab_signature == expected.encoder_vocab_signature
+        && actual.decoder_vocab_signature == expected.decoder_vocab_signature
+        && actual.context == expected.context
+}
+
+fn read_cache_u32_le<R: Read>(reader: &mut R) -> Result<Option<u32>> {
+    let mut buf = [0u8; 4];
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = reader.read(&mut buf[read..])?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            bail!("truncated decoder cache record");
+        }
+        read += n;
+    }
+    Ok(Some(u32::from_le_bytes(buf)))
+}
+
+fn read_cache_ids<R: Read>(reader: &mut R) -> Result<Option<Vec<u32>>> {
+    let Some(len) = read_cache_u32_le(reader)? else {
+        return Ok(None);
+    };
+    let len = len as usize;
+    let byte_len = len
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("decoder cache id sequence too large")?;
+    let mut ids = vec![0u32; len];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ids.as_mut_ptr().cast::<u8>(), byte_len) };
+    reader
+        .read_exact(bytes)
+        .context("truncated decoder cache id sequence")?;
+    if cfg!(target_endian = "big") {
+        for id in &mut ids {
+            *id = u32::from_le(*id);
+        }
+    }
+    Ok(Some(ids))
+}
+
+fn read_cache_f32s<R: Read>(reader: &mut R) -> Result<Vec<f32>> {
+    let len = read_cache_u32_le(reader)?
+        .context("truncated conditioned decoder cache slot length")? as usize;
+    let byte_len = len
+        .checked_mul(std::mem::size_of::<f32>())
+        .context("conditioned decoder slot vector too large")?;
+    let mut values = vec![0f32; len];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), byte_len) };
+    reader
+        .read_exact(bytes)
+        .context("truncated conditioned decoder slot vector")?;
+    if cfg!(target_endian = "big") {
+        for value in &mut values {
+            *value = f32::from_le_bytes(value.to_ne_bytes());
+        }
+    }
+    Ok(values)
+}
+
+fn read_source_dual_cache_record<R: Read>(
+    reader: &mut R,
+) -> Result<Option<ConditionedDecoderCacheRecord>> {
+    let Some(encoder_state_tokens) = read_cache_ids(reader)? else {
+        return Ok(None);
+    };
+    let encoder_next_tokens =
+        read_cache_ids(reader)?.context("truncated dual token cache encoder next sequence")?;
+    let decoder_state_tokens =
+        read_cache_ids(reader)?.context("truncated dual token cache decoder state sequence")?;
+    let decoder_next_tokens =
+        read_cache_ids(reader)?.context("truncated dual token cache decoder next sequence")?;
+    let action_label = read_cache_u32_le(reader)?.context("truncated dual token cache action")?;
+    Ok(Some(ConditionedDecoderCacheRecord {
+        encoder_state_tokens,
+        encoder_next_tokens,
+        decoder_state_tokens,
+        decoder_next_tokens,
+        action_label,
+        next_context_slots: Vec::new(),
+    }))
+}
+
+fn read_conditioned_decoder_cache_record<R: Read>(
+    reader: &mut R,
+) -> Result<Option<ConditionedDecoderCacheRecord>> {
+    let Some(mut record) = read_source_dual_cache_record(reader)? else {
+        return Ok(None);
+    };
+    record.next_context_slots = read_cache_f32s(reader)?;
+    Ok(Some(record))
+}
+
+fn write_cache_ids<W: Write>(writer: &mut W, ids: &[u32]) -> Result<()> {
+    writer.write_all(&(ids.len() as u32).to_le_bytes())?;
+    for id in ids {
+        writer.write_all(&id.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_conditioned_decoder_cache_record<W: Write>(
+    writer: &mut W,
+    record: &ConditionedDecoderCacheRecord,
+) -> Result<()> {
+    write_cache_ids(writer, &record.encoder_state_tokens)?;
+    write_cache_ids(writer, &record.encoder_next_tokens)?;
+    write_cache_ids(writer, &record.decoder_state_tokens)?;
+    write_cache_ids(writer, &record.decoder_next_tokens)?;
+    writer.write_all(&record.action_label.to_le_bytes())?;
+    writer.write_all(&(record.next_context_slots.len() as u32).to_le_bytes())?;
+    for value in &record.next_context_slots {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn conditioned_slots_tensor(
+    batch: &[ConditionedDecoderExample],
+    num_latent_tokens: usize,
+    bridge_dim: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let slot_len = num_latent_tokens
+        .checked_mul(bridge_dim)
+        .context("conditioned decoder slot shape overflow")?;
+    let mut flat = Vec::with_capacity(batch.len() * slot_len);
+    for row in batch {
+        if row.next_context_slots.len() != slot_len {
+            bail!(
+                "conditioned decoder slot length mismatch: got {}, expected {}",
+                row.next_context_slots.len(),
+                slot_len
+            );
+        }
+        flat.extend_from_slice(&row.next_context_slots);
+    }
+    Tensor::from_vec(flat, (batch.len(), num_latent_tokens, bridge_dim), device)?
+        .to_dtype(dtype)
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_conditioned_slots_for_records(
+    records: &mut [ConditionedDecoderCacheRecord],
+    context_cache: &mut DecoderContextCache,
+    encoder: &OnlineEncoder,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    decoder_action_label: u32,
+    pad_id: u32,
+    max_seq: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
+    rollout_steps: usize,
+    device: &Device,
+) -> Result<()> {
+    let mut valid_positions = Vec::new();
+    let mut encoder_batch = Vec::new();
+    for (idx, record) in records.iter().enumerate() {
+        if record.encoder_state_tokens.is_empty()
+            || record.encoder_next_tokens.is_empty()
+            || record.decoder_state_tokens.is_empty()
+            || record.decoder_next_tokens.is_empty()
+        {
+            continue;
+        }
+        valid_positions.push(idx);
+        encoder_batch.push(WorldExample {
+            state_tokens: record.encoder_state_tokens.clone(),
+            next_tokens: record.encoder_next_tokens.clone(),
+            action_label: record.action_label,
+        });
+    }
+    if encoder_batch.is_empty() {
+        return Ok(());
+    }
+    let next_slots = decoder_next_context_slots(
+        context_cache,
+        encoder,
+        context_compressor,
+        transition,
+        &encoder_batch,
+        decoder_action_label,
+        pad_id,
+        max_seq,
+        context_segments,
+        recent_full_segments,
+        recursive_context_compressor,
+        rollout_steps,
+        device,
+    )?;
+    for (slot_idx, record_idx) in valid_positions.iter().copied().enumerate() {
+        let row_slots = next_slots.narrow(0, slot_idx, 1)?;
+        records[record_idx].next_context_slots = util::vec1_f32(&row_slots.flatten_all()?)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_prepare_conditioned_decoder_cache(
+    data_path: &Path,
+    source_cache_path: Option<&PathBuf>,
+    allow_build: bool,
+    require_existing: bool,
+    encoder_model_path: &Path,
+    world_model_path: &Path,
+    encoder_vocab_sig: &str,
+    decoder_vocab_sig: &str,
+    encoder: &OnlineEncoder,
+    context_compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
+    decoder_action_label: u32,
+    pad_id: u32,
+    max_seq: usize,
+    dim: usize,
+    bridge_dim: usize,
+    num_latent_tokens: usize,
+    context_segments: usize,
+    recent_full_segments: usize,
+    recursive_context_compressor: bool,
+    rollout_steps: usize,
+    train_dtype: DType,
+    device: &Device,
+) -> Result<Option<PathBuf>> {
+    let opportunistic_go_cache =
+        env_bool("TOFY_DECODER_PRECOMPUTE_SLOTS", true) && is_go_feedback_decoder_data(data_path);
+    if !allow_build && !require_existing && !opportunistic_go_cache {
+        return Ok(None);
+    }
+    let Some(source_cache_path) = source_cache_path else {
+        if allow_build || require_existing {
+            bail!(
+                "conditioned decoder cache requires a compatible decoder dual token cache for {:?}",
+                data_path
+            );
+        }
+        return Ok(None);
+    };
+    let cache_path = conditioned_decoder_cache_path();
+    let manifest_path = conditioned_decoder_manifest_path(&cache_path);
+    let context = conditioned_decoder_context_signature(
+        max_seq,
+        dim,
+        bridge_dim,
+        num_latent_tokens,
+        context_segments,
+        recent_full_segments,
+        recursive_context_compressor,
+        rollout_steps,
+        decoder_action_label,
+        train_dtype,
+    );
+    let expected_manifest = conditioned_decoder_expected_manifest(
+        data_path,
+        &cache_path,
+        source_cache_path,
+        encoder_model_path,
+        world_model_path,
+        encoder_vocab_sig,
+        decoder_vocab_sig,
+        context,
+    )?;
+    if cache_path.exists() && manifest_path.exists() {
+        if let Ok(text) = fs::read_to_string(&manifest_path) {
+            if let Ok(actual) = serde_json::from_str::<ConditionedDecoderCacheManifest>(&text) {
+                if conditioned_decoder_manifest_matches(&actual, &expected_manifest) {
+                    println!(
+                        "Token cache: using conditioned decoder slots {:?} (rows={})",
+                        cache_path, actual.rows
+                    );
+                    return Ok(Some(cache_path));
+                }
+            }
+        }
+    }
+    if require_existing {
+        bail!(
+            "conditioned decoder cache is missing or incompatible: {:?}",
+            cache_path
+        );
+    }
+    if !allow_build && !opportunistic_go_cache {
+        return Ok(None);
+    }
+
+    println!(
+        "Token cache: precomputing frozen decoder conditioning slots from {:?} to {:?}",
+        source_cache_path, cache_path
+    );
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = cache_tmp_path_for(&cache_path);
+    let mut source_reader = BufReader::new(File::open(source_cache_path)?);
+    let mut source_magic = vec![0u8; DUAL_TOKEN_CACHE_MAGIC.len()];
+    source_reader.read_exact(&mut source_magic)?;
+    if source_magic != DUAL_TOKEN_CACHE_MAGIC {
+        bail!("invalid dual token cache magic in {:?}", source_cache_path);
+    }
+    let mut writer = BufWriter::new(File::create(&tmp_path)?);
+    writer.write_all(CONDITIONED_DECODER_CACHE_MAGIC)?;
+    let chunk_size = env_usize("TOFY_DECODER_SLOT_PRECOMPUTE_BATCH", 256);
+    let mut context_cache = DecoderContextCache::from_env();
+    let mut rows = 0usize;
+    let mut next_progress = 10_000usize;
+    loop {
+        let mut records = Vec::with_capacity(chunk_size);
+        for _ in 0..chunk_size {
+            let Some(record) = read_source_dual_cache_record(&mut source_reader)? else {
+                break;
+            };
+            records.push(record);
+        }
+        if records.is_empty() {
+            break;
+        }
+        fill_conditioned_slots_for_records(
+            &mut records,
+            &mut context_cache,
+            encoder,
+            context_compressor,
+            transition,
+            decoder_action_label,
+            pad_id,
+            max_seq,
+            context_segments,
+            recent_full_segments,
+            recursive_context_compressor,
+            rollout_steps,
+            device,
+        )?;
+        for record in &records {
+            write_conditioned_decoder_cache_record(&mut writer, record)?;
+        }
+        rows += records.len();
+        if rows >= next_progress {
+            println!("Token cache: conditioned decoder slots progress rows={rows}");
+            next_progress += 10_000;
+        }
+    }
+    writer.flush()?;
+    fs::rename(&tmp_path, &cache_path)?;
+    let mut manifest = expected_manifest;
+    manifest.rows = rows;
+    let manifest_tmp = cache_tmp_path_for(&manifest_path);
+    fs::write(&manifest_tmp, serde_json::to_string_pretty(&manifest)?)?;
+    fs::rename(manifest_tmp, &manifest_path)?;
+    println!("Token cache: conditioned decoder slots saved rows={rows}");
     Ok(Some(cache_path))
 }
 
@@ -536,7 +1221,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         config.lambda
     );
     println!(
-        "World objective: LeWM next-embedding MSE + lambda * SIGReg | action auxiliary weight {:.2}",
+        "World objective: LeWM post-state MSE + lambda * SIGReg | action auxiliary weight {:.2}",
         config.action_loss_weight
     );
     println!(
@@ -2193,6 +2878,52 @@ fn default_decoder_vocab_path(decoder_path: &Path) -> PathBuf {
     decoder_path.with_extension("vocab.txt")
 }
 
+fn decoder_varmap_checkpoint_artifact(
+    varmap: &VarMap,
+    path: &Path,
+) -> Result<util::CheckpointArtifact> {
+    Ok(util::CheckpointArtifact::TensorMap {
+        path: path.to_path_buf(),
+        tensors: util::varmap_tensor_snapshot(varmap)?,
+    })
+}
+
+fn decoder_optimizer_checkpoint_artifact(
+    opt: &util::TrainOptimizer,
+    path: &Path,
+) -> Result<util::CheckpointArtifact> {
+    Ok(util::CheckpointArtifact::TensorMap {
+        path: path.to_path_buf(),
+        tensors: opt.state_tensors_snapshot()?,
+    })
+}
+
+fn decoder_resume_checkpoint_artifact(
+    state: &util::TrainingResumeState,
+    path: &Path,
+) -> Result<util::CheckpointArtifact> {
+    Ok(util::CheckpointArtifact::Json {
+        path: path.to_path_buf(),
+        text: serde_json::to_string_pretty(state)?,
+    })
+}
+
+fn save_decoder_checkpoint_job(
+    writer: Option<&util::AsyncCheckpointWriter>,
+    label: String,
+    artifacts: Vec<util::CheckpointArtifact>,
+) -> Result<bool> {
+    if artifacts.is_empty() {
+        return Ok(true);
+    }
+    if let Some(writer) = writer {
+        writer.try_submit(util::CheckpointJob { label, artifacts })
+    } else {
+        util::save_checkpoint_artifacts(artifacts)?;
+        Ok(true)
+    }
+}
+
 struct DecoderContextCache {
     capacity: usize,
     map: HashMap<Vec<u32>, Tensor>,
@@ -2284,7 +3015,7 @@ fn decoder_next_context_slots(
     context_compressor: &ContextCompressor,
     transition: &ActionStateTransition,
     encoder_batch: &[WorldExample],
-    _decoder_action_label: u32,
+    decoder_action_label: u32,
     pad_id: u32,
     max_seq: usize,
     context_segments: usize,
@@ -2312,10 +3043,7 @@ fn decoder_next_context_slots(
             recursive_context_compressor,
             device,
         )?;
-        let decoder_action_labels = encoder_batch
-            .iter()
-            .map(|row| row.action_label)
-            .collect::<Vec<_>>();
+        let decoder_action_labels = vec![decoder_action_label; encoder_batch.len()];
         let next_slots = transition_slots_for_labels(
             transition,
             &state_slots,
@@ -2330,7 +3058,7 @@ fn decoder_next_context_slots(
     let mut miss_token_refs = Vec::new();
 
     for (idx, row) in encoder_batch.iter().enumerate() {
-        let key = decoder_context_cache_key(row.action_label, &row.state_tokens);
+        let key = decoder_context_cache_key(decoder_action_label, &row.state_tokens);
         if let Some(slots) = cache.get(&key) {
             slots_by_row[idx] = Some(slots);
         } else {
@@ -2351,10 +3079,7 @@ fn decoder_next_context_slots(
             recursive_context_compressor,
             device,
         )?;
-        let decoder_action_labels = miss_positions
-            .iter()
-            .map(|&idx| encoder_batch[idx].action_label)
-            .collect::<Vec<_>>();
+        let decoder_action_labels = vec![decoder_action_label; miss_positions.len()];
         let next_slots = transition_slots_for_labels(
             transition,
             &state_slots,
@@ -2365,7 +3090,7 @@ fn decoder_next_context_slots(
             let row_slots = next_slots.narrow(0, miss_idx, 1)?.detach();
             cache.insert(
                 decoder_context_cache_key(
-                    encoder_batch[row_idx].action_label,
+                    decoder_action_label,
                     &encoder_batch[row_idx].state_tokens,
                 ),
                 row_slots.clone(),
@@ -2915,7 +3640,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     }
 
     let run_dir = util::create_run_dir("decoder")?;
-    let mut tb = SummaryWriter::new(&run_dir);
+    let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
     let conditioning_loss_weight = config.conditioning_loss_weight;
     let compute_conditioning_metrics =
@@ -3002,6 +3727,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         tb.add_scalar("memory/peak_used_mb", vram.peak_used_mb, 0);
     }
     tb.flush();
+    let async_checkpoints = env_bool("TOFY_DECODER_ASYNC_CHECKPOINTS", true);
+    let decoder_checkpoint_every = env_usize("TOFY_DECODER_CHECKPOINT_EVERY", config.log_every);
+    let mut checkpoint_writer = if async_checkpoints {
+        Some(util::AsyncCheckpointWriter::new())
+    } else {
+        None
+    };
+    println!(
+        "Decoder checkpointing: async={} checkpoint_every={} log_every={}",
+        async_checkpoints, decoder_checkpoint_every, config.log_every
+    );
 
     let mut best_loss = resume_state.best_aux_metric;
     let mut best_metric = resume_state.best_metric;
@@ -3016,6 +3752,68 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
     let mut decoder_context_cache = DecoderContextCache::from_env();
+    let training_needed = start_step < config.steps;
+    let build_only_conditioned_cache = config.build_conditioned_cache && config.steps == 0;
+    let should_prepare_conditioned_cache = training_needed || config.build_conditioned_cache;
+    let conditioned_decoder_cache_path = if should_prepare_conditioned_cache {
+        maybe_prepare_conditioned_decoder_cache(
+            &data_path,
+            decoder_cache_path.as_ref(),
+            config.build_conditioned_cache,
+            config.from_conditioned_cache && !config.build_conditioned_cache,
+            &config.encoder_model_path,
+            &config.world_model_path,
+            &encoder_vocab_sig,
+            &decoder_vocab_sig,
+            &encoder,
+            &context_compressor,
+            &transition,
+            decoder_action_label,
+            encoder_vocab.pad_id,
+            config.max_seq,
+            config.dim,
+            config.bridge_dim,
+            config.num_latent_tokens,
+            context_segments,
+            recent_full_segments,
+            recursive_context_compressor,
+            rollout_steps,
+            train_dtype,
+            &device,
+        )?
+    } else {
+        None
+    };
+    if build_only_conditioned_cache {
+        println!("Conditioned decoder cache build complete; skipping decoder training.");
+        tb.flush();
+        tb.finish()?;
+        let _ = vram_tracker.write_summary(&run_dir, "decoder");
+        return Ok(());
+    }
+    let mut conditioned_decoder_stream =
+        if let Some(cache_path) = conditioned_decoder_cache_path.as_ref() {
+            cached_decoder_stream = None;
+            println!("Token cache: using conditioned decoder training cache {cache_path:?}");
+            Some(ConditionedDecoderStream::with_split(
+                cache_path,
+                DEFAULT_STREAM_SHUFFLE_BUFFER,
+                Some(HELDOUT_SPLIT_MODULUS),
+                HELDOUT_SPLIT_REMAINDER,
+                true,
+            )?)
+        } else {
+            None
+        };
+    tb.add_scalar(
+        "config/conditioned_decoder_cache",
+        if conditioned_decoder_stream.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        0,
+    );
     tb.add_scalar(
         "config/decoder_context_cache_rows",
         decoder_context_cache.capacity as f32,
@@ -3063,9 +3861,27 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut prefill_encoder_batch = Vec::with_capacity(batch_size * grad_accum_steps);
 
         for _micro_step in 0..grad_accum_steps {
-            let (encoder_batch, decoder_batch, oov_rate) = if let Some(ref mut cached_stream) =
-                cached_decoder_stream
-            {
+            let micro_batch = if let Some(ref mut conditioned_stream) = conditioned_decoder_stream {
+                let conditioned_batch = conditioned_stream.next_batch(batch_size.max(1))?;
+                let decoder_batch = conditioned_batch
+                    .iter()
+                    .map(|row| row.decoder.clone())
+                    .collect::<Vec<_>>();
+                let next_context_slots = conditioned_slots_tensor(
+                    &conditioned_batch,
+                    config.num_latent_tokens,
+                    config.bridge_dim,
+                    train_dtype,
+                    &device,
+                )?;
+                let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
+                DecoderMicroBatch {
+                    encoder_batch: Vec::new(),
+                    decoder_batch,
+                    oov_rate,
+                    next_context_slots: Some(next_context_slots),
+                }
+            } else if let Some(ref mut cached_stream) = cached_decoder_stream {
                 let cached_batch = cached_stream.next_batch(batch_size.max(1))?;
                 let encoder_batch = cached_batch
                     .iter()
@@ -3076,7 +3892,12 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     .map(|row| row.decoder.clone())
                     .collect::<Vec<_>>();
                 let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
-                (encoder_batch, decoder_batch, oov_rate)
+                DecoderMicroBatch {
+                    encoder_batch,
+                    decoder_batch,
+                    oov_rate,
+                    next_context_slots: None,
+                }
             } else {
                 let raw_batch = raw_stream.next_batch(batch_size.max(1))?;
                 let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
@@ -3084,38 +3905,61 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
                 let oov_rate =
                     raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
-                (encoder_batch, decoder_batch, oov_rate)
+                DecoderMicroBatch {
+                    encoder_batch,
+                    decoder_batch,
+                    oov_rate,
+                    next_context_slots: None,
+                }
             };
-            prefill_encoder_batch.extend(encoder_batch.iter().cloned());
-            micro_batches.push((encoder_batch, decoder_batch, oov_rate));
+            if micro_batch.next_context_slots.is_none() {
+                prefill_encoder_batch.extend(micro_batch.encoder_batch.iter().cloned());
+            }
+            micro_batches.push(micro_batch);
         }
 
-        let next_context_slots = decoder_next_context_slots(
-            &mut decoder_context_cache,
-            &encoder,
-            &context_compressor,
-            &transition,
-            &prefill_encoder_batch,
-            decoder_action_label,
-            encoder_vocab.pad_id,
-            config.max_seq,
-            context_segments,
-            recent_full_segments,
-            recursive_context_compressor,
-            rollout_steps,
-            &device,
-        )?
-        .detach();
+        let next_context_slots = if prefill_encoder_batch.is_empty() {
+            None
+        } else {
+            Some(
+                decoder_next_context_slots(
+                    &mut decoder_context_cache,
+                    &encoder,
+                    &context_compressor,
+                    &transition,
+                    &prefill_encoder_batch,
+                    decoder_action_label,
+                    encoder_vocab.pad_id,
+                    config.max_seq,
+                    context_segments,
+                    recent_full_segments,
+                    recursive_context_compressor,
+                    rollout_steps,
+                    &device,
+                )?
+                .detach(),
+            )
+        };
 
         let mut row_offset = 0usize;
-        for (encoder_batch, decoder_batch, oov_rate) in micro_batches {
-            let micro_next_context_slots =
-                next_context_slots.narrow(0, row_offset, encoder_batch.len())?;
-            row_offset += encoder_batch.len();
-            let decoder_action_labels = decoder_batch
-                .iter()
-                .map(|row| row.action_label)
-                .collect::<Vec<_>>();
+        for micro_batch in micro_batches {
+            let DecoderMicroBatch {
+                encoder_batch,
+                decoder_batch,
+                oov_rate,
+                next_context_slots: cached_next_context_slots,
+            } = micro_batch;
+            let micro_next_context_slots = if let Some(slots) = cached_next_context_slots {
+                slots
+            } else {
+                let next_context_slots = next_context_slots
+                    .as_ref()
+                    .context("decoder context slots missing for tokenized micro-batch")?;
+                let slots = next_context_slots.narrow(0, row_offset, encoder_batch.len())?;
+                row_offset += encoder_batch.len();
+                slots
+            };
+            let decoder_action_labels = vec![decoder_action_label; decoder_batch.len()];
             let world_latent = decoder_conditioning_adapter
                 .forward_with_actions(&micro_next_context_slots, &decoder_action_labels)?;
 
@@ -3549,12 +4393,58 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 best_loss = best_loss.min(loss_val);
             }
             tb.flush();
-            if selection_metric < best_metric {
+            let metric_improved = selection_metric < best_metric;
+            let candidate_best_metric = if metric_improved {
+                selection_metric
+            } else {
+                best_metric
+            };
+            let checkpoint_due = step % decoder_checkpoint_every == 0;
+            let mut checkpoint_artifacts = Vec::new();
+            if metric_improved {
+                checkpoint_artifacts.push(decoder_varmap_checkpoint_artifact(
+                    &decoder_varmap,
+                    &decoder_path,
+                )?);
+            }
+            let checkpoint_resume_state = util::TrainingResumeState {
+                stage: resume_stage.clone(),
+                step,
+                best_metric: candidate_best_metric,
+                best_aux_metric: best_loss,
+                saved_checkpoint: saved_checkpoint || metric_improved,
+            };
+            if checkpoint_due {
+                checkpoint_artifacts.push(decoder_varmap_checkpoint_artifact(
+                    &decoder_varmap,
+                    &train_checkpoint_path,
+                )?);
+                checkpoint_artifacts.push(decoder_optimizer_checkpoint_artifact(
+                    &opt,
+                    &optimizer_checkpoint_path,
+                )?);
+                checkpoint_artifacts.push(decoder_resume_checkpoint_artifact(
+                    &checkpoint_resume_state,
+                    &resume_state_path,
+                )?);
+            }
+            let checkpoint_written_or_queued = save_decoder_checkpoint_job(
+                checkpoint_writer.as_ref(),
+                format!("decoder step {step}"),
+                checkpoint_artifacts,
+            )?;
+            if metric_improved && checkpoint_written_or_queued {
                 best_metric = selection_metric;
-                util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
                 saved_checkpoint = true;
+            }
+            if metric_improved {
+                let best_note = if async_checkpoints {
+                    "queued latest best"
+                } else {
+                    "saved best"
+                };
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [saved best]",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [{}]",
                     step,
                     config.steps,
                     loss_val,
@@ -3581,7 +4471,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     delimiter_balance_rate * 100.0,
                     function_skeleton_rate * 100.0,
                     selection_metric,
-                    memory_note
+                    memory_note,
+                    best_note
                 );
             } else {
                 println!(
@@ -3615,17 +4506,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     memory_note
                 );
             }
-            util::save_varmap_atomic(&decoder_varmap, &train_checkpoint_path)?;
-            opt.save_state(&optimizer_checkpoint_path)?;
-            resume_state = util::TrainingResumeState {
-                stage: resume_stage.clone(),
-                step,
-                best_metric,
-                best_aux_metric: best_loss,
-                saved_checkpoint,
-            };
-            util::save_resume_state(&resume_state_path, &resume_state)?;
         }
+    }
+
+    if let Some(writer) = checkpoint_writer.as_mut() {
+        writer.finish()?;
     }
 
     if !saved_checkpoint {
@@ -3646,6 +4531,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
+    tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "decoder");
     if saved_checkpoint {
         println!(
@@ -5690,38 +6576,26 @@ fn context_slots_from_world_pair_batch(
     if batch.is_empty() {
         bail!("world pair batch is empty");
     }
-    if context_segments > 1 || recursive_context_compressor {
-        let mut token_sequences = Vec::with_capacity(batch.len() * 2);
-        token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
-        token_sequences.extend(batch.iter().map(|row| row.next_tokens.as_slice()));
-        let slots = context_slots_from_token_sequences_with_detach(
-            encoder,
-            context_compressor,
-            &token_sequences,
-            pad_id,
-            max_seq,
-            context_segments,
-            recent_full_segments,
-            recursive_context_compressor,
-            detach_encoder,
-            device,
-        )?;
-        let batch_size = batch.len();
-        let state_slots = slots.narrow(0, 0, batch_size)?;
-        let next_slots = slots.narrow(0, batch_size, batch_size)?;
-        Ok((state_slots, next_slots))
-    } else {
-        let (state_ids, next_ids, mut token_lengths, next_lens, _) =
-            make_world_batch_from_slice(batch, max_seq, pad_id, device)?;
-        token_lengths.extend(next_lens);
-        let input_ids = Tensor::cat(&[&state_ids, &next_ids], 0)?;
-        let features = maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
-        let slots = planner_forward_encoder_masked(context_compressor, &features, &token_lengths)?;
-        let batch_size = batch.len();
-        let state_slots = slots.narrow(0, 0, batch_size)?;
-        let next_slots = slots.narrow(0, batch_size, batch_size)?;
-        Ok((state_slots, next_slots))
-    }
+    let post_state_sequences = world_post_state_token_sequences(batch);
+    let mut token_sequences = Vec::with_capacity(batch.len() * 2);
+    token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
+    token_sequences.extend(post_state_sequences.iter().map(Vec::as_slice));
+    let slots = context_slots_from_token_sequences_with_detach(
+        encoder,
+        context_compressor,
+        &token_sequences,
+        pad_id,
+        max_seq,
+        context_segments,
+        recent_full_segments,
+        recursive_context_compressor,
+        detach_encoder,
+        device,
+    )?;
+    let batch_size = batch.len();
+    let state_slots = slots.narrow(0, 0, batch_size)?;
+    let next_slots = slots.narrow(0, batch_size, batch_size)?;
+    Ok((state_slots, next_slots))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5740,14 +6614,8 @@ fn context_slots_from_world_post_state_batch(
     if batch.is_empty() {
         bail!("world post-state batch is empty");
     }
-    let mut owned_sequences = Vec::with_capacity(batch.len());
-    for row in batch {
-        let mut tokens = Vec::with_capacity(row.state_tokens.len() + row.next_tokens.len());
-        tokens.extend(row.state_tokens.iter().copied());
-        tokens.extend(row.next_tokens.iter().copied());
-        owned_sequences.push(tokens);
-    }
-    let refs = owned_sequences
+    let post_state_sequences = world_post_state_token_sequences(batch);
+    let refs = post_state_sequences
         .iter()
         .map(|tokens| tokens.as_slice())
         .collect::<Vec<_>>();
@@ -5780,9 +6648,10 @@ pub(crate) fn context_slots_from_world_pair_sequences(
     if batch.is_empty() {
         bail!("world pair batch is empty");
     }
+    let post_state_sequences = world_post_state_token_sequences(batch);
     let mut token_sequences = Vec::with_capacity(batch.len() * 2);
     token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
-    token_sequences.extend(batch.iter().map(|row| row.next_tokens.as_slice()));
+    token_sequences.extend(post_state_sequences.iter().map(Vec::as_slice));
     let slots = context_slots_from_token_sequences(
         encoder,
         context_compressor,
@@ -5800,11 +6669,23 @@ pub(crate) fn context_slots_from_world_pair_sequences(
     Ok((state_slots, next_slots))
 }
 
+fn world_post_state_token_sequences(batch: &[WorldExample]) -> Vec<Vec<u32>> {
+    batch
+        .iter()
+        .map(|row| {
+            let mut tokens = Vec::with_capacity(row.state_tokens.len() + row.next_tokens.len());
+            tokens.extend(row.state_tokens.iter().copied());
+            tokens.extend(row.next_tokens.iter().copied());
+            tokens
+        })
+        .collect()
+}
+
 fn world_post_state_loss_weight() -> f64 {
     std::env::var("TOFY_WORLD_POST_STATE_LOSS_WEIGHT")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.35)
+        .unwrap_or(0.0)
         .max(0.0)
 }
 

@@ -10,7 +10,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tensorboard_rs::summary_writer::SummaryWriter;
 
 /// Format parameter count: <1M → k, <1B → M, ≥1B → B.
 pub fn format_params(n: usize) -> String {
@@ -78,6 +82,27 @@ pub fn scalar_f32(tensor: &Tensor) -> Result<f32> {
         .to_dtype(DType::F32)?
         .to_scalar::<f32>()
         .map_err(Into::into)
+}
+
+pub fn varmap_tensor_snapshot(varmap: &VarMap) -> Result<HashMap<String, Tensor>> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to lock varmap for checkpoint snapshot"))?;
+    Ok(data
+        .iter()
+        .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+        .collect())
+}
+
+pub fn save_tensor_map_atomic(tensors: &HashMap<String, Tensor>, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    candle_core::safetensors::save(tensors, &tmp_path)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
 }
 
 pub fn vec1_f32(tensor: &Tensor) -> Result<Vec<f32>> {
@@ -216,9 +241,11 @@ impl ResumableAdamW {
 
     pub fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let tensors = self.state_tensors_snapshot()?;
+        save_tensor_map_atomic(&tensors, path)
+    }
+
+    pub fn state_tensors_snapshot(&self) -> Result<HashMap<String, Tensor>> {
         let device = self
             .vars
             .first()
@@ -243,10 +270,7 @@ impl ResumableAdamW {
                 state.second_moment.as_tensor().clone(),
             );
         }
-        let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-        candle_core::safetensors::save(&tensors, &tmp_path)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        Ok(tensors)
     }
 
     pub fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
@@ -414,9 +438,11 @@ impl ResumableHybridMuon {
 
     pub fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let tensors = self.state_tensors_snapshot()?;
+        save_tensor_map_atomic(&tensors, path)
+    }
+
+    pub fn state_tensors_snapshot(&self) -> Result<HashMap<String, Tensor>> {
         let device = self
             .vars
             .first()
@@ -458,10 +484,7 @@ impl ResumableHybridMuon {
                 }
             }
         }
-        let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-        candle_core::safetensors::save(&tensors, &tmp_path)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        Ok(tensors)
     }
 
     pub fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
@@ -639,6 +662,13 @@ impl TrainOptimizer {
         match self {
             Self::AdamW(opt) => opt.save_state(path),
             Self::HybridMuon(opt) => opt.save_state(path),
+        }
+    }
+
+    pub fn state_tensors_snapshot(&self) -> Result<HashMap<String, Tensor>> {
+        match self {
+            Self::AdamW(opt) => opt.state_tensors_snapshot(),
+            Self::HybridMuon(opt) => opt.state_tensors_snapshot(),
         }
     }
 }
@@ -852,6 +882,231 @@ pub fn save_resume_state(path: &Path, state: &TrainingResumeState) -> Result<()>
     }
     let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
     fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+pub struct AsyncSummaryWriter {
+    tx: Option<std::sync::mpsc::Sender<SummaryEvent>>,
+    handle: Option<JoinHandle<Result<()>>>,
+}
+
+enum SummaryEvent {
+    Scalar(String, f32, usize),
+    Flush,
+}
+
+impl AsyncSummaryWriter {
+    pub fn new(run_dir: &str) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<SummaryEvent>();
+        let run_dir = run_dir.to_string();
+        let handle = thread::Builder::new()
+            .name("tofy-tb-writer".to_string())
+            .spawn(move || -> Result<()> {
+                let mut writer = SummaryWriter::new(&run_dir);
+                while let Ok(event) = rx.recv() {
+                    match event {
+                        SummaryEvent::Scalar(tag, value, step) => {
+                            writer.add_scalar(&tag, value, step);
+                        }
+                        SummaryEvent::Flush => writer.flush(),
+                    }
+                }
+                writer.flush();
+                Ok(())
+            })
+            .expect("spawn tensorboard writer thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    pub fn add_scalar(&mut self, tag: &str, value: f32, step: usize) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(SummaryEvent::Scalar(tag.to_string(), value, step));
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(SummaryEvent::Flush);
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("tensorboard writer thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncSummaryWriter {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+pub struct AsyncCheckpointWriter {
+    shared: Arc<CheckpointQueue>,
+    handle: Option<JoinHandle<Result<usize>>>,
+    replaced: AtomicUsize,
+}
+
+struct CheckpointQueue {
+    state: Mutex<CheckpointQueueState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct CheckpointQueueState {
+    pending: Option<CheckpointJob>,
+    closed: bool,
+}
+
+pub struct CheckpointJob {
+    pub label: String,
+    pub artifacts: Vec<CheckpointArtifact>,
+}
+
+pub enum CheckpointArtifact {
+    TensorMap {
+        path: PathBuf,
+        tensors: HashMap<String, Tensor>,
+    },
+    Json {
+        path: PathBuf,
+        text: String,
+    },
+}
+
+impl AsyncCheckpointWriter {
+    pub fn new() -> Self {
+        let shared = Arc::new(CheckpointQueue {
+            state: Mutex::new(CheckpointQueueState::default()),
+            condvar: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("tofy-checkpoint-writer".to_string())
+            .spawn(move || -> Result<usize> {
+                let mut saved = 0usize;
+                while let Some(job) = worker_shared.recv()? {
+                    save_checkpoint_artifacts(job.artifacts)
+                        .with_context(|| format!("save async checkpoint {}", job.label))?;
+                    saved += 1;
+                }
+                Ok(saved)
+            })
+            .expect("spawn checkpoint writer thread");
+        Self {
+            shared,
+            handle: Some(handle),
+            replaced: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn try_submit(&self, job: CheckpointJob) -> Result<bool> {
+        let replaced = self.shared.replace_pending(job)?;
+        if replaced {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
+    pub fn finish(&mut self) -> Result<usize> {
+        self.shared.close()?;
+        let saved = if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("checkpoint writer thread panicked"))??
+        } else {
+            0
+        };
+        let replaced = self.replaced.load(Ordering::Relaxed);
+        if replaced > 0 {
+            eprintln!(
+                "Async checkpoint writer replaced {replaced} pending checkpoint job(s) with newer snapshots"
+            );
+        }
+        Ok(saved)
+    }
+}
+
+impl CheckpointQueue {
+    fn replace_pending(&self, job: CheckpointJob) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        if state.closed {
+            anyhow::bail!("checkpoint writer is closed");
+        }
+        let replaced = state.pending.replace(job).is_some();
+        self.condvar.notify_one();
+        Ok(replaced)
+    }
+
+    fn recv(&self) -> Result<Option<CheckpointJob>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        loop {
+            if let Some(job) = state.pending.take() {
+                return Ok(Some(job));
+            }
+            if state.closed {
+                return Ok(None);
+            }
+            state = self
+                .condvar
+                .wait(state)
+                .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        }
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        state.closed = true;
+        self.condvar.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for AsyncCheckpointWriter {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+pub fn save_checkpoint_artifacts(artifacts: Vec<CheckpointArtifact>) -> Result<()> {
+    for artifact in artifacts {
+        match artifact {
+            CheckpointArtifact::TensorMap { path, tensors } => {
+                save_tensor_map_atomic(&tensors, &path)?;
+            }
+            CheckpointArtifact::Json { path, text } => {
+                write_text_atomic(&path, &text)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    fs::write(&tmp_path, text)?;
     fs::rename(tmp_path, path)?;
     Ok(())
 }

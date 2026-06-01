@@ -565,6 +565,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             let all_view_features = encoder.forward_features(&all_view_ids)?;
             let [view_a_features, target_features, paired_view_targets] =
                 split_encoder_features(&all_view_features, batch_size)?;
+            let target_features = target_features.detached();
+            let paired_view_targets = paired_view_targets.detached();
             let context_hidden = view_a_features.token_states.clone();
             let target_hidden = target_features.token_states.clone();
             let (b, t, d) = context_hidden.dims3()?;

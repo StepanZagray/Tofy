@@ -36,12 +36,12 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {program} train <8gb|48gb|80gb> [--resume [latest|run_id|runs/path]] [--with-code-eval]"
+        "    {program} train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run_id|runs/path]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
     );
     eprintln!(
         "      Go eval selection runs by default; --with-code-eval is accepted for old scripts."
     );
-    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload]");
+    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );
@@ -60,7 +60,7 @@ pub fn print_usage(program: &str) {
         "    {program} --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] ..."
     );
     eprintln!(
-        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-algorithm-tasks|--prepare-go-semantics-tasks|--prepare-go-repair-tasks|--prepare-world-mix|--prepare-code-poc-mix ..."
+        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-algorithm-tasks|--prepare-go-semantics-tasks|--prepare-go-repair-tasks|--prepare-go-model-feedback-pairs|--prepare-world-mix|--prepare-code-poc-mix ..."
     );
     eprintln!(
         "    {program} --prepare-expert-pairs|--prepare-casual-conversation|--generate-code-eval-suite|--convert-jsonl-context-response-to-tsv ..."
@@ -78,7 +78,7 @@ pub fn print_usage(program: &str) {
         "    {program} --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>] [--resume]"
     );
     eprintln!(
-        "    {program} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--conditioning-loss-weight <float>] [--init-decoder <path>] [--decoder-output <path>] [--resume]"
+        "    {program} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--conditioning-loss-weight <float>] [--init-decoder <path>] [--decoder-output <path>] [--build-conditioned-cache] [--from-conditioned-cache] [--resume]"
     );
     eprintln!(
         "    {program} --eval-world <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots]"
