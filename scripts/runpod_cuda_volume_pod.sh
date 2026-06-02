@@ -13,7 +13,7 @@ Required environment:
   IMAGE_NAME           Docker image to use. Required unless TEMPLATE_ID is set.
 
 Optional environment:
-  CUDA_VERSION         Exact allowed CUDA version. Default: 13.0
+  CUDA_VERSION         Exact allowed CUDA version. Default: 13.0.
   CUDA_VERSIONS_JSON   JSON array of allowed CUDA versions. Overrides CUDA_VERSION.
   POD_NAME             Final pod name. Default: cuda-volume-pod
   TEMP_POD_NAME        Probe pod name. Default: ${POD_NAME}-probe
@@ -36,7 +36,7 @@ Example:
   GPU_TYPE_ID="NVIDIA RTX PRO 6000 Blackwell Server Edition" \
   CUDA_VERSION=13.0 \
   TEMPLATE_ID=obgryfbuad \
-  POD_NAME=tofy-cuda13 \
+  POD_NAME=tofy-volume-pod \
   ./scripts/runpod_cuda_volume_pod.sh
 EOF
 }
@@ -58,20 +58,51 @@ api() {
   local method="$1"
   local path="$2"
   local body_file="${3:-}"
+  local response_file http_status curl_status
 
+  response_file="$(mktemp "${TMPDIR_RUNPOD:-/tmp}/runpod-api-response.XXXXXX")"
+  set +e
   if [[ -n "$body_file" ]]; then
-    curl -fsS \
+    http_status="$(curl -sS \
       --request "$method" \
       --url "${RUNPOD_API_BASE}${path}" \
       --header "Authorization: Bearer ${RUNPOD_API_KEY}" \
       --header "Content-Type: application/json" \
-      --data-binary @"$body_file"
+      --data-binary @"$body_file" \
+      --output "$response_file" \
+      --write-out "%{http_code}")"
+    curl_status=$?
   else
-    curl -fsS \
+    http_status="$(curl -sS \
       --request "$method" \
       --url "${RUNPOD_API_BASE}${path}" \
-      --header "Authorization: Bearer ${RUNPOD_API_KEY}"
+      --header "Authorization: Bearer ${RUNPOD_API_KEY}" \
+      --output "$response_file" \
+      --write-out "%{http_code}")"
+    curl_status=$?
   fi
+  set -e
+
+  if (( curl_status != 0 )); then
+    echo "RunPod API ${method} ${path} failed: curl exit ${curl_status}" >&2
+    if [[ -s "$response_file" ]]; then
+      jq . "$response_file" >&2 || cat "$response_file" >&2
+    fi
+    rm -f "$response_file"
+    return 1
+  fi
+
+  if [[ "$http_status" != 2* ]]; then
+    echo "RunPod API ${method} ${path} failed: HTTP ${http_status}" >&2
+    if [[ -s "$response_file" ]]; then
+      jq . "$response_file" >&2 || cat "$response_file" >&2
+    fi
+    rm -f "$response_file"
+    return 1
+  fi
+
+  cat "$response_file"
+  rm -f "$response_file"
 }
 
 extract_pod_id() {
@@ -216,7 +247,6 @@ jq -n \
     gpuTypePriority: "availability",
     gpuCount: $gpuCount,
     dataCenterPriority: "availability",
-    allowedCudaVersions: $cudaVersions,
     containerDiskInGb: $containerDiskInGb,
     volumeInGb: $tempVolumeInGb,
     volumeMountPath: $mountPath,
@@ -224,6 +254,7 @@ jq -n \
     ports: $ports,
     env: $env
   }
+  + (if ($cudaVersions | length) > 0 then {allowedCudaVersions: $cudaVersions} else {} end)
   + (if $templateId != "" then {templateId: $templateId} else {imageName: $imageName} end)
   + (if ($dataCenterIds | length) > 0 then {dataCenterIds: $dataCenterIds} else {} end)
   + $extra

@@ -8,7 +8,7 @@ Current recommended pod target:
 - one high-VRAM NVIDIA GPU: A100/H100/RTX PRO 6000 80 GB preferred; L40S 48 GB
   minimum for the smaller profile
 - Ubuntu-like CUDA image with Rust build tools installed manually
-- regular pod volume or network volume mounted at `/workspace`
+- regular pod volume mounted at `/workspace`
 - repo checkout at `/workspace/Tofy`
 - canonical training command: `./target/release/jepa_ai train 80gb` (or
   `./target/release/jepa_ai train 48gb` on L40S/A40-class GPUs)
@@ -65,13 +65,21 @@ If the printed length is `0`, the key is not set.
 
 ## 2. Create A Pod
 
-There are two supported launch paths:
+Tofy training pods should be created with a CUDA 13.0 host/runtime filter. Lower
+CUDA hosts have caused runtime/build issues, so keep `allowedCudaVersions:
+["13.0"]` in raw RunPod API payloads and keep `CUDA_VERSION=13.0` when using the
+helper script.
+
+There are three supported launch paths:
 
 - **regular pod volume via curl:** best first choice when GPU availability
-  matters, because RunPod can place the job wherever a suitable GPU is available
-- **network volume via script:** best when you want the volume to survive pod
-  termination or reuse a large prepared workspace across pods; this is tied to
-  one datacenter and can reduce GPU availability
+  matters, because RunPod can place the job wherever a suitable CUDA 13.0 GPU is
+  available
+- **existing network volume via curl:** use when you already created a network
+  volume in the same datacenter as the target GPU
+- **new network volume via script:** use when you want the helper to create a
+  probe pod, create a network volume in that datacenter, then launch the final
+  pod attached to that volume
 
 ### Option A: Regular Pod Volume
 
@@ -88,6 +96,7 @@ cat > /tmp/runpod-tofy-train.json <<'EOF'
   "gpuTypePriority": "availability",
   "gpuCount": 1,
   "dataCenterPriority": "availability",
+  "allowedCudaVersions": ["13.0"],
   "containerDiskInGb": 80,
   "volumeInGb": 250,
   "volumeMountPath": "/workspace"
@@ -110,10 +119,9 @@ Alternatives for the same command:
 - L40S 48 GB: set `"gpuTypeIds": ["NVIDIA L40S"]` and use `train 48gb` instead of `train 80gb`
 
 If the response is an array, it is an API validation or availability error.
-Read the error text, retry later, or switch GPU type. Only add an
-`allowedCudaVersions` filter when you have a specific image/driver mismatch to
-avoid; CUDA availability changes often and over-filtering can make placement
-fail.
+Read the error text, retry later, or switch GPU type. Do not remove
+`allowedCudaVersions` for long Tofy training runs unless you are intentionally
+debugging a lower-CUDA machine.
 
 Save the pod ID:
 
@@ -125,28 +133,63 @@ echo "$RUNPOD_POD_ID"
 Get the exact SSH command from the RunPod Connect tab. The host suffix can
 differ between pods.
 
-### Option B: Network Volume Script
+### Option B: Existing Network Volume
+
+Use this when you already have a network volume in the target datacenter. The
+payload attaches the network volume and intentionally omits `volumeInGb`, so it
+does not create a regular pod volume.
+
+```bash
+cat > /tmp/runpod-tofy-train.json <<'EOF'
+{
+  "name": "tofy-train-80gb",
+  "cloudType": "SECURE",
+  "computeType": "GPU",
+  "templateId": "obgryfbuad",
+  "gpuTypeIds": ["NVIDIA A100 80GB PCIe"],
+  "gpuTypePriority": "availability",
+  "gpuCount": 1,
+  "dataCenterIds": ["CA-MTL-3"],
+  "allowedCudaVersions": ["13.0"],
+  "containerDiskInGb": 80,
+  "networkVolumeId": "7r75d9slhq",
+  "volumeMountPath": "/workspace"
+}
+EOF
+
+curl -sS -X POST "https://rest.runpod.io/v1/pods" \
+  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/runpod-tofy-train.json \
+  | tee /tmp/runpod-pod.json \
+  | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, networkVolume, volumeMountPath} end'
+```
+
+Set `dataCenterIds` and `networkVolumeId` to the datacenter and volume you are
+actually using. Network volumes are datacenter-bound; the pod and volume must be
+in the same datacenter.
+
+### Option C: New Network Volume Script
 
 Use the script when you want RunPod to create a short-lived probe pod, discover
-the datacenter where the requested GPU is available, create a network volume in
+the datacenter where a CUDA 13.0 GPU is available, create a network volume in
 that datacenter, delete the probe pod, and create the final training pod attached
 to that network volume.
-
-A100 80 GB network-volume pod:
 
 ```bash
 RUNPOD_API_KEY="${RUNPOD_API_KEY}" \
 GPU_TYPE_ID="NVIDIA A100-SXM4-80GB" \
+CUDA_VERSION=13.0 \
 TEMPLATE_ID="obgryfbuad" \
 POD_NAME="tofy-train-80gb" \
 NETWORK_VOLUME_GB=250 \
 VOLUME_MOUNT_PATH="/workspace" \
-CUDA_VERSION=13.0 \
 ./scripts/runpod_cuda_volume_pod.sh | tee /tmp/runpod-volume-pod.log
 ```
 
-Use the same GPU substitutions as Option A. If the API cannot place the probe
-pod, retry later, switch GPU type, or narrow `DATA_CENTER_IDS_JSON` only when
+The script defaults to `CUDA_VERSION=13.0`, but keep it explicit in copied
+commands. Use the same GPU substitutions as Option A. If the probe cannot be
+placed, retry later, switch GPU type, or narrow `DATA_CENTER_IDS_JSON` only when
 you intentionally want a specific datacenter.
 
 The script prints a summary containing `finalPodId`, `networkVolumeId`, and
