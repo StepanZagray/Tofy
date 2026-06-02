@@ -582,12 +582,24 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default(
         "TOFY_CACHE_PREFETCH_BATCHES",
         if cfg.profile == MemoryProfile::Eighty {
-            "12"
+            "24"
+        } else if cfg.profile == MemoryProfile::FortyEight {
+            "16"
         } else {
             "8"
         },
     );
-    set_env_default("TOFY_TOKEN_CACHE_READER_MB", "32");
+    set_env_default("TOFY_TOKEN_CACHE_READER_MB", "64");
+    set_env_default_owned(
+        "TOFY_CACHE_PREFETCH_CHUNK",
+        defaults
+            .world_batch
+            .max(defaults.latent_batch)
+            .max(defaults.code_decoder_batch)
+            .saturating_mul(2)
+            .max(1)
+            .to_string(),
+    );
     std::env::remove_var("TOFY_USE_TOKEN_CACHE");
     std::env::remove_var("TOFY_ENCODER_VOCAB");
     match cfg.profile {

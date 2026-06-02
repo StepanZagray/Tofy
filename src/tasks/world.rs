@@ -83,6 +83,8 @@ fn default_high_world_path(world_model_path: &Path) -> PathBuf {
 #[derive(Debug, Deserialize)]
 struct CacheManifestSource {
     path: String,
+    len: u64,
+    content_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +113,57 @@ fn cache_dir() -> PathBuf {
 fn load_cache_token_manifest(path: &Path) -> Result<CacheTokenManifest> {
     let text = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
+}
+
+fn source_fingerprint_matches(path: &Path, source: &CacheManifestSource) -> Result<bool> {
+    if source.path != path.to_string_lossy() {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if source.len != metadata.len() {
+        return Ok(false);
+    }
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        for byte in &buf[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(source.content_hash == format!("{hash:016x}"))
+}
+
+fn compatible_world_cache_path(
+    data_path: &Path,
+    max_seq: usize,
+    encoder_vocab_sig: &str,
+) -> Result<Option<PathBuf>> {
+    let cache_path = match token_cache_path("world") {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    let manifest_path = cache_dir().join("world_tokens.manifest.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest = load_cache_token_manifest(&manifest_path)
+        .with_context(|| format!("load world cache manifest from {:?}", manifest_path))?;
+    if manifest.kind != "world"
+        || manifest.tokenizer != TokenizationMode::Default.as_str()
+        || manifest.max_seq < max_seq
+        || manifest.vocab_signature != encoder_vocab_sig
+        || manifest.token_cache_path != cache_path.to_string_lossy()
+        || !source_fingerprint_matches(data_path, &manifest.source)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(cache_path))
 }
 
 fn compatible_decoder_dual_cache_path(
@@ -985,6 +1038,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     };
 
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
+    let encoder_vocab_sig = vocab_signature(&encoder_vocab);
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let row_count = count_raw_world_rows(&config.data_path)?;
     let val_row_count = count_raw_world_rows_split(
@@ -1012,10 +1066,12 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     } else {
         None
     };
-    let mut cached_world_stream = if let Some(cache_path) = token_cache_path("world") {
+    let world_cache_path =
+        compatible_world_cache_path(&config.data_path, config.max_seq, &encoder_vocab_sig)?;
+    let mut cached_world_stream = if let Some(cache_path) = world_cache_path.as_ref() {
         println!("Token cache: using world training cache {:?}", cache_path);
         Some(CachedWorldStream::with_split(
-            &cache_path,
+            cache_path,
             DEFAULT_STREAM_SHUFFLE_BUFFER,
             Some(HELDOUT_SPLIT_MODULUS),
             HELDOUT_SPLIT_REMAINDER,
@@ -1026,9 +1082,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         None
     };
     let mut cached_val_stream = if val_row_count > 0 {
-        if let Some(cache_path) = token_cache_path("world") {
+        if let Some(cache_path) = world_cache_path.as_ref() {
             Some(CachedWorldStream::with_split(
-                &cache_path,
+                cache_path,
                 DEFAULT_STREAM_SHUFFLE_BUFFER,
                 Some(HELDOUT_SPLIT_MODULUS),
                 HELDOUT_SPLIT_REMAINDER,
@@ -1987,6 +2043,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     };
 
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
+    let encoder_vocab_sig = vocab_signature(&encoder_vocab);
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let row_count = count_raw_world_rows(&config.data_path)?;
     let val_row_count = count_raw_world_rows_split(
@@ -1996,10 +2053,12 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     )
     .unwrap_or(0);
     let train_row_count = row_count.saturating_sub(val_row_count);
-    let mut cached_macro_stream = if let Some(cache_path) = token_cache_path("world") {
+    let world_cache_path =
+        compatible_world_cache_path(&config.data_path, config.max_seq, &encoder_vocab_sig)?;
+    let mut cached_macro_stream = if let Some(cache_path) = world_cache_path.as_ref() {
         println!("Token cache: using high-world cache {:?}", cache_path);
         Some(CachedWorldStream::with_split(
-            &cache_path,
+            cache_path,
             1,
             Some(HELDOUT_SPLIT_MODULUS),
             HELDOUT_SPLIT_REMAINDER,
@@ -2395,6 +2454,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     };
 
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
+    let encoder_vocab_sig = vocab_signature(&encoder_vocab);
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let row_count = count_raw_world_rows(&config.data_path)?;
     let val_row_count = count_raw_world_rows_split(
@@ -2422,13 +2482,15 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     } else {
         None
     };
-    let mut cached_train_stream = if let Some(cache_path) = token_cache_path("world") {
+    let world_cache_path =
+        compatible_world_cache_path(&config.data_path, config.max_seq, &encoder_vocab_sig)?;
+    let mut cached_train_stream = if let Some(cache_path) = world_cache_path.as_ref() {
         println!(
             "Token cache: using action_classifier world cache {:?}",
             cache_path
         );
         Some(CachedWorldStream::with_split(
-            &cache_path,
+            cache_path,
             DEFAULT_STREAM_SHUFFLE_BUFFER,
             Some(HELDOUT_SPLIT_MODULUS),
             HELDOUT_SPLIT_REMAINDER,
@@ -2441,9 +2503,9 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         None
     };
     let mut cached_val_stream = if val_row_count > 0 {
-        if let Some(cache_path) = token_cache_path("world") {
+        if let Some(cache_path) = world_cache_path.as_ref() {
             Some(CachedWorldStream::with_split(
-                &cache_path,
+                cache_path,
                 DEFAULT_STREAM_SHUFFLE_BUFFER,
                 Some(HELDOUT_SPLIT_MODULUS),
                 HELDOUT_SPLIT_REMAINDER,
@@ -6807,14 +6869,14 @@ fn continuation_edge_score_with_combined(
     if from_next_tokens.is_empty() || combined.is_empty() || to.state_tokens.is_empty() {
         return 0;
     }
-    if to.state_tokens.starts_with(&combined) {
+    if to.state_tokens.starts_with(combined) {
         return combined.len();
     }
     if combined.ends_with(&to.state_tokens) {
         return to.state_tokens.len();
     }
     let next_overlap = continuation_overlap(from_next_tokens, &to.state_tokens);
-    let combined_overlap = continuation_overlap(&combined, &to.state_tokens);
+    let combined_overlap = continuation_overlap(combined, &to.state_tokens);
     next_overlap.max(combined_overlap)
 }
 

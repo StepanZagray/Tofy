@@ -2227,24 +2227,39 @@ pub fn make_augmented_jepa_batch(
     cfg: &CurriculumDenoisingConfig,
     device: &Device,
 ) -> Result<AugmentedJepaBatch> {
-    let mut rng = rng();
     let batch_size = token_batches.len();
+    let rows = token_batches
+        .par_iter()
+        .enumerate()
+        .map(|(b, tokens)| {
+            let mut rng = rng();
+            let (view_a_ids, target_ids, selected_positions, code_like) =
+                build_masked_view(tokens, vocab, cfg, &mut rng);
+            let (view_b_ids, _, _, code_like_b) = build_masked_view(tokens, vocab, cfg, &mut rng);
+            let target_linear = selected_positions
+                .into_iter()
+                .map(|p| (b * cfg.max_seq + p) as u32)
+                .collect::<Vec<_>>();
+            (
+                view_a_ids,
+                view_b_ids,
+                target_ids,
+                target_linear,
+                code_like || code_like_b,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_linear = Vec::new();
     let mut code_like_count = 0usize;
-
-    for (b, tokens) in token_batches.iter().enumerate() {
-        let (view_a_ids, target_ids, selected_positions, code_like) =
-            build_masked_view(tokens, vocab, cfg, &mut rng);
-        let (view_b_ids, _, _, code_like_b) = build_masked_view(tokens, vocab, cfg, &mut rng);
-        if code_like || code_like_b {
+    for (view_a_ids, view_b_ids, target_ids, row_target_linear, code_like) in rows {
+        if code_like {
             code_like_count += 1;
         }
-        for &p in &selected_positions {
-            target_linear.push((b * cfg.max_seq + p) as u32);
-        }
+        target_linear.extend(row_target_linear);
         view_a_buf.extend(view_a_ids);
         view_b_buf.extend(view_b_ids);
         target_buf.extend(target_ids);
@@ -2272,25 +2287,40 @@ pub fn make_augmented_jepa_batch_from_pairs(
     cfg: &CurriculumDenoisingConfig,
     device: &Device,
 ) -> Result<AugmentedJepaBatch> {
-    let mut rng = rng();
     let batch_size = pairs.len();
+    let rows = pairs
+        .par_iter()
+        .enumerate()
+        .map(|(b, pair)| {
+            let mut rng = rng();
+            let (view_a_ids, target_ids, selected_positions, code_like) =
+                build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
+            let (view_b_ids, _, _, code_like_b) =
+                build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
+            let target_linear = selected_positions
+                .into_iter()
+                .map(|p| (b * cfg.max_seq + p) as u32)
+                .collect::<Vec<_>>();
+            (
+                view_a_ids,
+                view_b_ids,
+                target_ids,
+                target_linear,
+                code_like || code_like_b,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_linear = Vec::new();
     let mut code_like_count = 0usize;
-
-    for (b, pair) in pairs.iter().enumerate() {
-        let (view_a_ids, target_ids, selected_positions, code_like) =
-            build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
-        let (view_b_ids, _, _, code_like_b) =
-            build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
-        if code_like || code_like_b {
+    for (view_a_ids, view_b_ids, target_ids, row_target_linear, code_like) in rows {
+        if code_like {
             code_like_count += 1;
         }
-        for &p in &selected_positions {
-            target_linear.push((b * cfg.max_seq + p) as u32);
-        }
+        target_linear.extend(row_target_linear);
         view_a_buf.extend(view_a_ids);
         view_b_buf.extend(view_b_ids);
         target_buf.extend(target_ids);
@@ -2336,78 +2366,87 @@ pub fn make_jepa_batch_from_pairs(
     max_masked_ratio: f64,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let mut rng = rng();
     let batch_size = pairs.len();
-    let mut context_buf = Vec::with_capacity(batch_size * max_seq);
-    let mut target_buf = Vec::with_capacity(batch_size * max_seq);
-    let mut target_linear = Vec::new();
-
     let span_count_cap = max_spans_per_sample.max(1);
     let span_len_cap = max_span_len.max(1);
     let ratio = max_masked_ratio.clamp(0.01, 1.0);
+    let rows = pairs
+        .par_iter()
+        .enumerate()
+        .map(|(b, pair)| {
+            let mut rng = rng();
+            let mut seq = pair.tokens.clone();
+            if seq.len() > max_seq {
+                let start = seq.len() - max_seq;
+                seq.drain(..start);
+            }
+            pad_or_truncate(&mut seq, max_seq, pad_id);
+            let target_seq = seq.clone();
+            let mut context_seq = seq;
 
-    for (b, pair) in pairs.iter().enumerate() {
-        let mut seq = pair.tokens.clone();
-        if seq.len() > max_seq {
-            let start = seq.len() - max_seq;
-            seq.drain(..start);
-        }
-        pad_or_truncate(&mut seq, max_seq, pad_id);
-        let target_seq = seq.clone();
-        let mut context_seq = seq;
+            let valid_positions: Vec<usize> = (0..max_seq)
+                .filter(|&i| target_seq[i] != pad_id && target_seq[i] != mask_id)
+                .collect();
+            let mut selected: HashSet<usize> = HashSet::new();
 
-        let valid_positions: Vec<usize> = (0..max_seq)
-            .filter(|&i| target_seq[i] != pad_id && target_seq[i] != mask_id)
-            .collect();
-        let mut selected: HashSet<usize> = HashSet::new();
+            if !valid_positions.is_empty() {
+                let max_masked = (valid_positions.len() as f64 * ratio).ceil() as usize;
+                let max_masked = max_masked.max(1).min(valid_positions.len());
 
-        if !valid_positions.is_empty() {
-            let max_masked = (valid_positions.len() as f64 * ratio).ceil() as usize;
-            let max_masked = max_masked.max(1).min(valid_positions.len());
-
-            let span_count = rng.random_range(1..=span_count_cap);
-            for _ in 0..span_count {
-                if selected.len() >= max_masked {
-                    break;
-                }
-                let Some(&start) = valid_positions.choose(&mut rng) else {
-                    break;
-                };
-                let span_len = rng.random_range(1..=span_len_cap);
-                for (p, token) in target_seq
-                    .iter()
-                    .enumerate()
-                    .take((start + span_len).min(max_seq))
-                    .skip(start)
-                {
+                let span_count = rng.random_range(1..=span_count_cap);
+                for _ in 0..span_count {
                     if selected.len() >= max_masked {
                         break;
                     }
-                    if *token != pad_id && *token != mask_id {
-                        selected.insert(p);
-                    } else {
+                    let Some(&start) = valid_positions.choose(&mut rng) else {
                         break;
+                    };
+                    let span_len = rng.random_range(1..=span_len_cap);
+                    for (p, token) in target_seq
+                        .iter()
+                        .enumerate()
+                        .take((start + span_len).min(max_seq))
+                        .skip(start)
+                    {
+                        if selected.len() >= max_masked {
+                            break;
+                        }
+                        if *token != pad_id && *token != mask_id {
+                            selected.insert(p);
+                        } else {
+                            break;
+                        }
                     }
                 }
-            }
-            if selected.is_empty() {
-                if let Some(&fallback) = valid_positions.choose(&mut rng) {
-                    selected.insert(fallback);
+                if selected.is_empty() {
+                    if let Some(&fallback) = valid_positions.choose(&mut rng) {
+                        selected.insert(fallback);
+                    }
                 }
+            } else {
+                selected.insert(0);
             }
-        } else {
-            selected.insert(0);
-        }
 
-        let mut selected_positions: Vec<usize> = selected.into_iter().collect();
-        selected_positions.sort_unstable();
-        for &p in &selected_positions {
-            context_seq[p] = mask_id;
-            target_linear.push((b * max_seq + p) as u32);
-        }
+            let mut selected_positions: Vec<usize> = selected.into_iter().collect();
+            selected_positions.sort_unstable();
+            let target_linear = selected_positions
+                .iter()
+                .map(|&p| {
+                    context_seq[p] = mask_id;
+                    (b * max_seq + p) as u32
+                })
+                .collect::<Vec<_>>();
+            (context_seq, target_seq, target_linear)
+        })
+        .collect::<Vec<_>>();
 
+    let mut context_buf = Vec::with_capacity(batch_size * max_seq);
+    let mut target_buf = Vec::with_capacity(batch_size * max_seq);
+    let mut target_linear = Vec::new();
+    for (context_seq, target_seq, row_target_linear) in rows {
         context_buf.extend(context_seq);
         target_buf.extend(target_seq);
+        target_linear.extend(row_target_linear);
     }
 
     let context_ids = Tensor::from_vec(context_buf, (batch_size, max_seq), device)?;
@@ -2484,7 +2523,7 @@ pub fn encode_world_examples_with_mode(
     vocab: &Vocab,
     mode: TokenizationMode,
 ) -> Vec<WorldExample> {
-    rows.iter()
+    rows.par_iter()
         .map(|row| WorldExample {
             state_tokens: encode_text_with_vocab_mode(&row.state_text, vocab, mode),
             next_tokens: encode_text_with_vocab_mode(&row.next_text, vocab, mode),
@@ -2937,46 +2976,58 @@ pub fn make_decoder_batch_from_slice_with_prompt_dropout(
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let batch_size = rows.len();
     let decoder_len = 2 * max_seq;
+    let prompt_dropout = prompt_dropout.clamp(0.0, 1.0);
+    let row_buffers = rows
+        .par_iter()
+        .map(|row| {
+            let mut rng = rng();
+            let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
+            let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
+            let sl = state_len.min(max_seq);
+            let nl = next_len.min(max_seq);
+
+            let mut input = Vec::with_capacity(decoder_len);
+            input.extend(state_seq.iter().take(sl).map(|token| {
+                if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
+                    drop_id
+                } else {
+                    *token
+                }
+            }));
+            input.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
+            let input_len = sl + nl.saturating_sub(1);
+            input.extend(std::iter::repeat_n(
+                pad_id,
+                decoder_len.saturating_sub(input_len),
+            ));
+
+            let mut target = Vec::with_capacity(decoder_len);
+            target.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
+            target.extend(next_seq.iter().take(nl).copied());
+            let target_len = sl.saturating_sub(1) + nl;
+            target.extend(std::iter::repeat_n(
+                pad_id,
+                decoder_len.saturating_sub(target_len),
+            ));
+
+            let mut mask = Vec::with_capacity(decoder_len);
+            mask.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
+            mask.extend(std::iter::repeat_n(1.0f32, nl));
+            mask.extend(std::iter::repeat_n(
+                0.0f32,
+                decoder_len.saturating_sub(target_len),
+            ));
+            (input, target, mask)
+        })
+        .collect::<Vec<_>>();
+
     let mut input_buf = Vec::with_capacity(batch_size * decoder_len);
     let mut target_buf = Vec::with_capacity(batch_size * decoder_len);
     let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
-    let prompt_dropout = prompt_dropout.clamp(0.0, 1.0);
-    let mut rng = rng();
-
-    for row in rows {
-        let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
-        let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
-        let sl = state_len.min(max_seq);
-        let nl = next_len.min(max_seq);
-
-        input_buf.extend(state_seq.iter().take(sl).map(|token| {
-            if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
-                drop_id
-            } else {
-                *token
-            }
-        }));
-        input_buf.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
-        let input_len = sl + nl.saturating_sub(1);
-        input_buf.extend(std::iter::repeat_n(
-            pad_id,
-            decoder_len.saturating_sub(input_len),
-        ));
-
-        target_buf.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
-        target_buf.extend(next_seq.iter().take(nl).copied());
-        let target_len = sl.saturating_sub(1) + nl;
-        target_buf.extend(std::iter::repeat_n(
-            pad_id,
-            decoder_len.saturating_sub(target_len),
-        ));
-
-        mask_buf.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
-        mask_buf.extend(std::iter::repeat_n(1.0f32, nl));
-        mask_buf.extend(std::iter::repeat_n(
-            0.0f32,
-            decoder_len.saturating_sub(target_len),
-        ));
+    for (input, target, mask) in row_buffers {
+        input_buf.extend(input);
+        target_buf.extend(target);
+        mask_buf.extend(mask);
     }
 
     let input_ids = Tensor::from_vec(input_buf, (batch_size, decoder_len), device)?;
@@ -2993,20 +3044,26 @@ pub fn make_world_batch_from_slice(
     device: &Device,
 ) -> Result<(Tensor, Tensor, Vec<usize>, Vec<usize>, Vec<u32>)> {
     let batch_size = rows.len();
+    let row_buffers = rows
+        .par_iter()
+        .map(|row| {
+            let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
+            let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
+            (state_seq, next_seq, state_len, next_len, row.action_label)
+        })
+        .collect::<Vec<_>>();
+
     let mut state_buf = Vec::with_capacity(batch_size * max_seq);
     let mut next_buf = Vec::with_capacity(batch_size * max_seq);
     let mut state_lens = Vec::with_capacity(batch_size);
     let mut next_lens = Vec::with_capacity(batch_size);
     let mut action_labels = Vec::with_capacity(batch_size);
-
-    for row in rows {
-        let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
-        let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
+    for (state_seq, next_seq, state_len, next_len, action_label) in row_buffers {
         state_buf.extend(state_seq);
         next_buf.extend(next_seq);
         state_lens.push(state_len);
         next_lens.push(next_len);
-        action_labels.push(row.action_label);
+        action_labels.push(action_label);
     }
 
     let state_ids = Tensor::from_vec(state_buf, (batch_size, max_seq), device)?;

@@ -81,15 +81,15 @@
     "decoder_layers": 16,
     "decoder_heads": 16,
     "decoder_ff_dim": 6144,
-    "latent_batch": 32,
+    "latent_batch": 28,
     "latent_warmup_batch": 24,
-    "world_batch": 96,
+    "world_batch": 64,
     "world_warmup_batch": 64,
-    "code_decoder_batch": 16,
-    "go_feedback_batch": 16,
-    "latent_grad_accum": 16,
-    "world_grad_accum": 6,
-    "code_decoder_grad_accum": 16,
-    "go_feedback_grad_accum": 16
+    "code_decoder_batch": 8,
+    "go_feedback_batch": 8,
+    "latent_grad_accum": 18,
+    "world_grad_accum": 8,
+    "code_decoder_grad_accum": 32,
+    "go_feedback_grad_accum": 32
   }
 }
