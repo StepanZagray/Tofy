@@ -1,107 +1,76 @@
 # Training Pod Runbook
 
-This document is the copy-paste checklist for launching a cloud training pod,
-running the current Tofy pipeline, resuming it, and pulling artifacts back.
+This is the low-back-and-forth path for launching a RunPod training pod,
+restoring the prepared cache, probing VRAM, running the full pipeline, and
+recovering artifacts.
 
-Current recommended pod target:
+Tofy training pods should use CUDA 13.0. Keep `allowedCudaVersions: ["13.0"]`
+in raw RunPod payloads and keep `CUDA_VERSION=13.0` when using the helper
+script. Lower CUDA hosts have caused build/runtime failures.
 
-- one high-VRAM NVIDIA GPU: A100/H100/RTX PRO 6000 80 GB preferred; L40S 48 GB
-  minimum for the smaller profile
-- Ubuntu-like CUDA image with Rust build tools installed manually
-- regular pod volume mounted at `/workspace`
-- repo checkout at `/workspace/Tofy`
-- canonical training command: `./target/release/jepa_ai train 80gb` (or
-  `./target/release/jepa_ai train 48gb` on L40S/A40-class GPUs)
+The normal 80 GB target is A100/H100/RTX PRO 6000-class hardware with
+`./target/release/jepa_ai train 80gb`. Use `train 48gb` only for L40S/A40-class
+pods.
 
-The `80gb` profile is the default cloud shape in `config/model_profiles.json`:
-`DIM=1024`, `LAYERS=16`, `HEADS=16`, `BRIDGE_DIM=1024`,
-`NUM_LATENT_TOKENS=128`, code decoder `dim=1536`, decoder layers `16`, decoder
-FF `6144`, code decoder `max_seq=320`, and current long-run budgets of latent
-`24000`, world `90000`, high-world `18000`, code decoder `120000`, and Go
-feedback `30000`. Current 80 GB training batches are encoder `32x16` (`512`
-effective), world `96x6` (`576` effective) with the encoder frozen, code
-decoder `16x16` (`256` effective), and Go feedback `16x16` (`256` effective).
-Decoder microbatch stays small because larger microbatches mostly increase
-activation memory; use `--max-vram-probe --profile 80gb` before a long run.
+Do not use `--build-conditioned-cache`, `--until decoder-cache`, or
+`--from-conditioned-cache` for a normal full run. The default `train 80gb` path
+streams world conditioning and avoids the hundreds-of-GiB conditioned-slot
+cache.
 
-The `48gb` profile is the L40S/A40 alternative: `DIM=768`, `LAYERS=12`,
-`HEADS=16`, `BRIDGE_DIM=768`, `NUM_LATENT_TOKENS=96`, code decoder `dim=768`,
-decoder layers `12`, decoder FF `3072`, code decoder `max_seq=256`, and budgets
-of latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, and
-Go feedback `20000`. Current 48 GB batches are encoder `48x11` (`528`
-effective), world `128x4` (`512` effective), code decoder `32x8` (`256`
-effective), and Go feedback `32x8` (`256` effective). Decoder and Go-feedback
-pipeline stages use matched world conditioning plus prompt dropout by default;
-extra zero/shuffle/hard negative-conditioning forwards are opt-in.
+## 1. Local Setup
 
-The full training command below does not build the conditioned-slot cache.
-Keep it that way on 200-250 GB RunPod volumes: an 80 GB profile conditioned-slot
-cache for a full decoder mix can require roughly 450-500 GiB, before temporary
-files and checkpoints. Only use `--build-conditioned-cache` or
-`--until decoder-cache` when you have storage sized for that cache, and only use
-`--from-conditioned-cache` when that cache already exists.
-
-Do not paste API keys or full RunPod API responses into public logs. Pod
-responses can include environment variables.
-
-## 1. Local Prerequisites
-
-Install helpers on your local machine:
+Paste this locally once:
 
 ```bash
 sudo pacman -S --needed curl jq openssh rsync
-```
 
-Load the RunPod API key into the current shell only:
-
-```bash
 read -rsp "RunPod API key: " RUNPOD_API_KEY
 export RUNPOD_API_KEY
 echo
-echo "key length: ${#RUNPOD_API_KEY}"
+echo "RUNPOD_API_KEY length: ${#RUNPOD_API_KEY}"
 ```
 
-If the printed length is `0`, the key is not set.
+If the key length is `0`, stop and set the key again. Do not paste API keys or
+full RunPod responses into public logs.
 
-## 2. Create A Pod
+## 2. Create Pod
 
-Tofy training pods should be created with a CUDA 13.0 host/runtime filter. Lower
-CUDA hosts have caused runtime/build issues, so keep `allowedCudaVersions:
-["13.0"]` in raw RunPod API payloads and keep `CUDA_VERSION=13.0` when using the
-helper script.
-
-There are three supported launch paths:
-
-- **regular pod volume via curl:** best first choice when GPU availability
-  matters, because RunPod can place the job wherever a suitable CUDA 13.0 GPU is
-  available
-- **existing network volume via curl:** use when you already created a network
-  volume in the same datacenter as the target GPU
-- **new network volume via script:** use when you want the helper to create a
-  probe pod, create a network volume in that datacenter, then launch the final
-  pod attached to that volume
+Pick exactly one option.
 
 ### Option A: Regular Pod Volume
 
-A100 80 GB regular-volume pod:
+Best when GPU availability matters. This creates a regular pod volume mounted
+at `/workspace`.
 
 ```bash
-cat > /tmp/runpod-tofy-train.json <<'EOF'
-{
-  "name": "tofy-train-80gb",
-  "cloudType": "SECURE",
-  "computeType": "GPU",
-  "templateId": "obgryfbuad",
-  "gpuTypeIds": ["NVIDIA A100-SXM4-80GB"],
-  "gpuTypePriority": "availability",
-  "gpuCount": 1,
-  "dataCenterPriority": "availability",
-  "allowedCudaVersions": ["13.0"],
-  "containerDiskInGb": 80,
-  "volumeInGb": 250,
-  "volumeMountPath": "/workspace"
-}
-EOF
+export RUNPOD_POD_NAME="tofy-train-80gb"
+export RUNPOD_GPU_TYPE="NVIDIA A100-SXM4-80GB"
+export RUNPOD_TEMPLATE_ID="obgryfbuad"
+export RUNPOD_CONTAINER_DISK_GB=80
+export RUNPOD_VOLUME_GB=200
+export RUNPOD_MOUNT_PATH="/workspace"
+
+jq -n \
+  --arg name "$RUNPOD_POD_NAME" \
+  --arg templateId "$RUNPOD_TEMPLATE_ID" \
+  --arg gpuType "$RUNPOD_GPU_TYPE" \
+  --arg mountPath "$RUNPOD_MOUNT_PATH" \
+  --argjson containerDisk "$RUNPOD_CONTAINER_DISK_GB" \
+  --argjson volumeGb "$RUNPOD_VOLUME_GB" \
+  '{
+    name: $name,
+    cloudType: "SECURE",
+    computeType: "GPU",
+    templateId: $templateId,
+    gpuTypeIds: [$gpuType],
+    gpuTypePriority: "availability",
+    gpuCount: 1,
+    dataCenterPriority: "availability",
+    allowedCudaVersions: ["13.0"],
+    containerDiskInGb: $containerDisk,
+    volumeInGb: $volumeGb,
+    volumeMountPath: $mountPath
+  }' > /tmp/runpod-tofy-train.json
 
 curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
@@ -109,53 +78,55 @@ curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   --data-binary @/tmp/runpod-tofy-train.json \
   | tee /tmp/runpod-pod.json \
   | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, volumeInGb, volumeMountPath} end'
+
+export RUNPOD_POD_ID="$(jq -r '.id // empty' /tmp/runpod-pod.json)"
+echo "RUNPOD_POD_ID=${RUNPOD_POD_ID}"
 ```
 
-Alternatives for the same command:
+GPU substitutions:
 
-- H100 80 GB: set `"gpuTypeIds": ["NVIDIA H100 80GB HBM3"]`
-- A100 80 GB: set `"gpuTypeIds": ["NVIDIA A100 80GB PCIe"]`
-- RTX PRO 6000: set `"gpuTypeIds": ["NVIDIA RTX PRO 6000 Blackwell Server Edition"]`
-- L40S 48 GB: set `"gpuTypeIds": ["NVIDIA L40S"]` and use `train 48gb` instead of `train 80gb`
-
-If the response is an array, it is an API validation or availability error.
-Read the error text, retry later, or switch GPU type. Do not remove
-`allowedCudaVersions` for long Tofy training runs unless you are intentionally
-debugging a lower-CUDA machine.
-
-Save the pod ID:
-
-```bash
-export RUNPOD_POD_ID="$(jq -r '.id' /tmp/runpod-pod.json)"
-echo "$RUNPOD_POD_ID"
-```
-
-Get the exact SSH command from the RunPod Connect tab. The host suffix can
-differ between pods.
+- H100 80 GB: `export RUNPOD_GPU_TYPE="NVIDIA H100 80GB HBM3"`
+- A100 PCIe: `export RUNPOD_GPU_TYPE="NVIDIA A100 80GB PCIe"`
+- RTX PRO 6000: `export RUNPOD_GPU_TYPE="NVIDIA RTX PRO 6000 Blackwell Server Edition"`
+- L40S: `export RUNPOD_GPU_TYPE="NVIDIA L40S"` and train with `48gb`
 
 ### Option B: Existing Network Volume
 
-Use this when you already have a network volume in the target datacenter. The
-payload attaches the network volume and intentionally omits `volumeInGb`, so it
-does not create a regular pod volume.
+Use this when you already created a network volume. Pod and network volume must
+be in the same datacenter. This intentionally omits `volumeInGb`, so it does not
+create a regular pod volume.
 
 ```bash
-cat > /tmp/runpod-tofy-train.json <<'EOF'
-{
-  "name": "tofy-train-80gb",
-  "cloudType": "SECURE",
-  "computeType": "GPU",
-  "templateId": "obgryfbuad",
-  "gpuTypeIds": ["NVIDIA A100 80GB PCIe"],
-  "gpuTypePriority": "availability",
-  "gpuCount": 1,
-  "dataCenterIds": ["CA-MTL-3"],
-  "allowedCudaVersions": ["13.0"],
-  "containerDiskInGb": 80,
-  "networkVolumeId": "7r75d9slhq",
-  "volumeMountPath": "/workspace"
-}
-EOF
+export RUNPOD_POD_NAME="tofy-train-80gb"
+export RUNPOD_GPU_TYPE="NVIDIA A100 80GB PCIe"
+export RUNPOD_TEMPLATE_ID="obgryfbuad"
+export RUNPOD_DATA_CENTER_ID="CA-MTL-3"
+export RUNPOD_NETWORK_VOLUME_ID="7r75d9slhq"
+export RUNPOD_CONTAINER_DISK_GB=80
+export RUNPOD_MOUNT_PATH="/workspace"
+
+jq -n \
+  --arg name "$RUNPOD_POD_NAME" \
+  --arg templateId "$RUNPOD_TEMPLATE_ID" \
+  --arg gpuType "$RUNPOD_GPU_TYPE" \
+  --arg dataCenter "$RUNPOD_DATA_CENTER_ID" \
+  --arg networkVolumeId "$RUNPOD_NETWORK_VOLUME_ID" \
+  --arg mountPath "$RUNPOD_MOUNT_PATH" \
+  --argjson containerDisk "$RUNPOD_CONTAINER_DISK_GB" \
+  '{
+    name: $name,
+    cloudType: "SECURE",
+    computeType: "GPU",
+    templateId: $templateId,
+    gpuTypeIds: [$gpuType],
+    gpuTypePriority: "availability",
+    gpuCount: 1,
+    dataCenterIds: [$dataCenter],
+    allowedCudaVersions: ["13.0"],
+    containerDiskInGb: $containerDisk,
+    networkVolumeId: $networkVolumeId,
+    volumeMountPath: $mountPath
+  }' > /tmp/runpod-tofy-train.json
 
 curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
@@ -163,18 +134,15 @@ curl -sS -X POST "https://rest.runpod.io/v1/pods" \
   --data-binary @/tmp/runpod-tofy-train.json \
   | tee /tmp/runpod-pod.json \
   | jq 'if type=="array" then . else {id, name, desiredStatus, imageName, costPerHr, machine, networkVolume, volumeMountPath} end'
-```
 
-Set `dataCenterIds` and `networkVolumeId` to the datacenter and volume you are
-actually using. Network volumes are datacenter-bound; the pod and volume must be
-in the same datacenter.
+export RUNPOD_POD_ID="$(jq -r '.id // empty' /tmp/runpod-pod.json)"
+echo "RUNPOD_POD_ID=${RUNPOD_POD_ID}"
+```
 
 ### Option C: New Network Volume Script
 
-Use the script when you want RunPod to create a short-lived probe pod, discover
-the datacenter where a CUDA 13.0 GPU is available, create a network volume in
-that datacenter, delete the probe pod, and create the final training pod attached
-to that network volume.
+Use this when you want the helper to create a probe pod, create a network volume
+in the discovered datacenter, then launch the final pod attached to that volume.
 
 ```bash
 RUNPOD_API_KEY="${RUNPOD_API_KEY}" \
@@ -185,131 +153,64 @@ POD_NAME="tofy-train-80gb" \
 NETWORK_VOLUME_GB=250 \
 VOLUME_MOUNT_PATH="/workspace" \
 ./scripts/runpod_cuda_volume_pod.sh | tee /tmp/runpod-volume-pod.log
+
+export RUNPOD_POD_ID="$(awk -F'"' '/finalPodId/ {print $4}' /tmp/runpod-volume-pod.log | tail -n1)"
+echo "RUNPOD_POD_ID=${RUNPOD_POD_ID}"
 ```
 
-The script defaults to `CUDA_VERSION=13.0`, but keep it explicit in copied
-commands. Use the same GPU substitutions as Option A. If the probe cannot be
-placed, retry later, switch GPU type, or narrow `DATA_CENTER_IDS_JSON` only when
-you intentionally want a specific datacenter.
+If the API returns `There are no instances currently available`, retry later or
+switch GPU type. Keep the CUDA 13.0 filter unless you are intentionally
+debugging a lower-CUDA machine.
 
-The script prints a summary containing `finalPodId`, `networkVolumeId`, and
-`dataCenterId`. Save the final pod ID for the stop wrapper:
+## 3. SSH
+
+Get the exact SSH command from the RunPod Connect tab. The host suffix can vary.
+You will paste the next sections inside that SSH shell.
 
 ```bash
-export RUNPOD_POD_ID="<finalPodId from script summary>"
-echo "$RUNPOD_POD_ID"
+ssh <runpod-user>@ssh.runpod.io -i ~/.ssh/id_ed25519
 ```
 
-Network volumes survive pod termination. Delete the network volume manually from
-RunPod only after you have recovered or intentionally discarded its contents.
+## 4. Pod Bootstrap
 
-## 3. Pod Bootstrap
-
-SSH into the pod, then install tools:
+Paste this inside the pod. It installs system tools, Rust, Go, HF CLI, saves
+auto-stop credentials locally, writes the auto-stop wrapper, checks CUDA, and
+prepares SSH for GitHub.
 
 ```bash
+set -euo pipefail
+
 apt-get update
 apt-get install -y \
   git curl ca-certificates build-essential pkg-config libssl-dev \
-  openssh-client tmux htop nvtop pciutils jq rsync
+  openssh-client tmux htop nvtop pciutils jq rsync zstd \
+  python3-pip golang-go
 
-curl https://sh.rustup.rs -sSf | sh -s -- -y
+if ! command -v cargo >/dev/null 2>&1; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y
+fi
 source "$HOME/.cargo/env"
 
-nvidia-smi
-nvcc --version || true
-```
-
-Install Go for autonomous Go-feedback repair data generation and hard eval:
-
-```bash
-apt-get install -y golang-go
-go version
-```
-
-## 4. GitHub Deploy Key
-
-Create a deploy key on the pod and add the public key to the repo in GitHub:
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-
-ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
-
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/runpod_tofy
-    IdentitiesOnly yes
-EOF
-
-chmod 600 ~/.ssh/runpod_tofy
-chmod 644 ~/.ssh/runpod_tofy.pub
-chmod 600 ~/.ssh/config
-ssh-keyscan github.com >> ~/.ssh/known_hosts
-chmod 644 ~/.ssh/known_hosts
-
-cat ~/.ssh/runpod_tofy.pub
-```
-
-Add the printed key to:
-
-```text
-GitHub repo -> Settings -> Deploy keys -> Add deploy key
-```
-
-Keep write access disabled unless you explicitly need to push from the pod.
-
-Verify:
-
-```bash
-ssh -T git@github.com
-```
-
-Expected:
-
-```text
-Hi StepanZagray/Tofy! You've successfully authenticated, but GitHub does not provide shell access.
-```
-
-Keep private keys under `/root/.ssh`, not `/workspace/.ssh`; some RunPod volume
-mounts report permissive permissions that OpenSSH rejects.
-
-## 5. Clone Or Update
-
-```bash
-cd /workspace
-
-if [ ! -d Tofy/.git ]; then
-  git clone git@github.com:StepanZagray/Tofy.git Tofy
+if ! command -v hf >/dev/null 2>&1; then
+  python3 -m pip install -U "huggingface_hub[cli]" --break-system-packages
 fi
 
-cd /workspace/Tofy
-git fetch origin
-git pull --ff-only
-```
+read -rsp "RunPod API key for auto-stop: " RUNPOD_API_KEY
+echo
+read -rp "RunPod pod id for auto-stop: " RUNPOD_POD_ID
+cat > /workspace/tofy-runpod.env <<EOF
+export RUNPOD_API_KEY='${RUNPOD_API_KEY}'
+export RUNPOD_POD_ID='${RUNPOD_POD_ID}'
+EOF
+chmod 600 /workspace/tofy-runpod.env
 
-If you are testing unpushed local changes, use `rsync` from your workstation
-instead of `git pull`:
-
-```bash
-rsync -az --delete \
-  --exclude target --exclude runs --exclude .git \
-  /home/stepan/Coding/Personal/Tofy/ \
-  root@<pod-host>:/workspace/Tofy/
-```
-
-## 6. Auto-Stop Wrapper
-
-The wrapper stops the pod after the wrapped command exits. It prints only the
-API key length, not the key.
-
-```bash
 cat > /workspace/run-tofy-and-stop.sh <<'EOF'
 #!/usr/bin/env bash
 set -o pipefail
+
+if [ -f /workspace/tofy-runpod.env ]; then
+  . /workspace/tofy-runpod.env
+fi
 
 stop_pod() {
   echo "Stopping RunPod pod..."
@@ -329,46 +230,112 @@ stop_pod() {
 trap stop_pod EXIT
 "$@"
 EOF
-
 chmod +x /workspace/run-tofy-and-stop.sh
+
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+if [ ! -f ~/.ssh/runpod_tofy ]; then
+  ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
+fi
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/runpod_tofy
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/runpod_tofy ~/.ssh/config
+chmod 644 ~/.ssh/runpod_tofy.pub
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+chmod 644 ~/.ssh/known_hosts
+
+nvidia-smi
+nvcc --version || true
+go version
+hf --help >/dev/null
+
+echo
+echo "Add this deploy key to GitHub repo -> Settings -> Deploy keys:"
+cat ~/.ssh/runpod_tofy.pub
 ```
 
-Inside the pod, export the same `RUNPOD_API_KEY` and `RUNPOD_POD_ID` before
-using the wrapper.
+Add the printed public key to GitHub. Keep write access disabled unless you need
+to push from the pod.
 
-## 7. Build And Probe
+## 5. Repo And Cache
 
-Build the release binary:
+After adding the deploy key, paste this inside the pod. It clones or updates the
+repo, downloads the prepared cache, extracts it into `/workspace/Tofy`, verifies
+the expected files, and builds release.
+
+```bash
+set -euo pipefail
+source "$HOME/.cargo/env"
+
+cd /workspace
+if [ ! -d Tofy/.git ]; then
+  git clone git@github.com:StepanZagray/Tofy.git Tofy
+fi
+
+cd /workspace/Tofy
+git fetch origin
+git pull --ff-only
+
+hf download Grayza/80gb-profile-go-cache \
+  tofy-cache-80gb-a8e7916-1780391272.tar.zst \
+  --repo-type dataset \
+  --local-dir /workspace
+
+tar --zstd --no-same-owner --no-same-permissions \
+  -xf /workspace/tofy-cache-80gb-a8e7916-1780391272.tar.zst \
+  -C /workspace/Tofy
+
+echo "Prepared cache:"
+du -sh data/cache eval local_models 2>/dev/null || true
+ls -lh data/cache eval local_models/vocabs 2>/dev/null || true
+
+cargo build --release
+```
+
+If `local_models/vocabs` is missing after extraction, do not start the long run;
+rebuild or copy the prepared cache with vocabs included.
+
+For unpushed local changes, run this from your workstation instead of `git pull`
+on the pod:
+
+```bash
+rsync -az --delete \
+  --exclude target --exclude runs --exclude .git \
+  /home/stepan/Coding/Personal/Tofy/ \
+  root@<pod-host>:/workspace/Tofy/
+```
+
+## 6. Probe Or Train
+
+Probe first on a fresh GPU shape. Paste once; it creates a probe script, starts
+tmux, and attaches to the session:
 
 ```bash
 cd /workspace/Tofy
 source "$HOME/.cargo/env"
-cargo build --release
-```
 
-Run the current profile-aware probe before a long 80 GB launch:
-
-```bash
-tmux new -s tofy-probe
-```
-
-Inside tmux:
-
-```bash
+cat > /workspace/tofy-probe.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace/Tofy
+source "$HOME/.cargo/env"
 export RUST_BACKTRACE=1
 
 /workspace/run-tofy-and-stop.sh \
   ./target/release/jepa_ai --max-vram-probe --profile 80gb --stage all --probe-dir /workspace/tofy-vram-probe-80gb \
   2>&1 | tee /workspace/tofy-vram-probe-80gb.log
+EOF
+chmod +x /workspace/tofy-probe.sh
+
+tmux new -s tofy-probe /workspace/tofy-probe.sh
 ```
 
-Detach without stopping:
-
-```text
-Ctrl+b, then d
-```
-
-Monitor:
+Detach with `Ctrl+b`, then `d`. Reattach or monitor with:
 
 ```bash
 tmux attach -t tofy-probe
@@ -376,20 +343,8 @@ tail -f /workspace/tofy-vram-probe-80gb.log
 nvidia-smi
 ```
 
-Use the sustained probe when changing profile shapes or batch sizes:
-
-```bash
-./target/release/jepa_ai --sustained-oom-probe --profile 80gb --stage all
-```
-
-On L40S/A40 pods, repeat the same probe flow with `--profile 48gb` and log
-paths named `tofy-vram-probe-48gb`.
-
-## 8. Full Training
-
-Start a full 80 GB run. This command is intended to run unattended from data
-prep through latent, world, high-world, base code decoder, Go-feedback decoder,
-verifier-guided decoder selection, and the final hard Go eval.
+Start the full 80 GB run. Paste once; it updates the repo, builds, creates a
+train script, starts tmux, and attaches:
 
 ```bash
 cd /workspace/Tofy
@@ -398,63 +353,63 @@ git fetch origin
 git pull --ff-only
 cargo build --release
 
-tmux new -s tofy-train
-```
-
-Inside tmux:
-
-```bash
+cat > /workspace/tofy-train.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace/Tofy
+source "$HOME/.cargo/env"
 export RUST_BACKTRACE=1
 export TOFY_TRAIN_DTYPE=bf16
-# Pipeline defaults set TOFY_CACHE_PREFETCH_BATCHES=12 for 80gb and 8 for 48gb; keep this enabled unless
-# debugging input-order or memory issues. It now covers both raw and cached streams.
 
 /workspace/run-tofy-and-stop.sh \
   ./target/release/jepa_ai train 80gb \
   2>&1 | tee /workspace/tofy-train-80gb.log
+EOF
+chmod +x /workspace/tofy-train.sh
+
+tmux new -s tofy-train /workspace/tofy-train.sh
 ```
 
-Do not add `--build-conditioned-cache`, `--until decoder-cache`, or
-`--from-conditioned-cache` for a normal full RunPod training run. The default
-`train 80gb` path streams world conditioning during decoder training and avoids
-the hundreds-of-GiB conditioned-slot cache.
+For 48 GB pods, use `--profile 48gb`, `train 48gb`, and log names ending in
+`48gb`.
 
-Stage 1 bootstraps source data, materializes `data/encoder_mix.txt`, builds
-vocabs, and writes token caches before model training starts. Reruns reuse
-compatible manifests and token caches. Hub-backed files are written atomically,
-so an interrupted pod should leave temporary files rather than corrupting
-canonical datasets. The same pipeline also prepares Go instruction/repair data,
-builds `data/code_poc_go_mix.txt`, initializes the Go-feedback decoder from the
-base code decoder, and trains `runs/<run_id>/decoder_code_go_feedback/model.safetensors`
-without a separate manual command.
+## 7. Resume
 
-You can run `cargo run --release -- prepare cache 80gb` locally first, then
-copy `data/`, `eval/`, and `local_models/vocabs/` to the pod to skip most of
-the CPU-heavy Stage 1 work there. Use the same profile as the pod training run.
-To publish the handoff tree to your Hugging Face dataset instead of `scp`,
-use `prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset-name>` and restore with
-`hf download` plus `tar --zstd -xf` (see
-[DATA_FORMATS.md](DATA_FORMATS.md#prepared-cache-hf-upload)).
-
-Monitor:
+Paste once inside the pod:
 
 ```bash
-tmux attach -t tofy-train
-tail -f /workspace/tofy-train-80gb.log
-nvidia-smi
+cd /workspace/Tofy
+source "$HOME/.cargo/env"
+
+cat > /workspace/tofy-resume.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace/Tofy
+source "$HOME/.cargo/env"
+export RUST_BACKTRACE=1
+export TOFY_TRAIN_DTYPE=bf16
+
+/workspace/run-tofy-and-stop.sh \
+  ./target/release/jepa_ai train 80gb --resume latest \
+  2>&1 | tee /workspace/tofy-train-80gb-resume.log
+EOF
+chmod +x /workspace/tofy-resume.sh
+
+tmux new -s tofy-resume /workspace/tofy-resume.sh
 ```
 
-On L40S/A40 pods, use `train 48gb`, `prepare cache 48gb`, and log paths named
-`tofy-train-48gb.log`.
+Resume a specific run with:
 
-## 9. Manual Go Eval
+```bash
+./target/release/jepa_ai train 80gb --resume code_poc_<timestamp>
+```
 
-The full training pipeline already runs this Go eval and uses it for decoder
-promotion. Use the manual command only when you want to rescore a specific
-checkpoint. `--generate-go-code-eval-suite` writes `language: "go"` tasks, and
-`--eval-code-assistant` runs those tasks through a temporary `go test` harness.
-The command below uses the newest `runs/code_poc_*` directory; set `RUN_ID`
-manually if you want to evaluate a specific run.
+Resume only with the same architecture/profile that created the run.
+
+## 8. Manual Go Eval
+
+The full pipeline already runs Go eval and uses it for decoder promotion. Use
+this only to rescore a checkpoint:
 
 ```bash
 cd /workspace/Tofy
@@ -479,89 +434,41 @@ source scripts/tofy_pi_runtime_env.sh runs/${RUN_ID} 80gb
   2>&1 | tee /workspace/tofy-go-eval-${RUN_ID}.log
 ```
 
-The sourced runtime env matches the Pi/serve path: Candle code decoder enabled,
-high-world model selected, profile context settings restored, and
-`TOFY_DECODER_RLM=1`, `TOFY_LATENT_REASONING=1`, `JEPA_DECODER_TEMP=0.35` unless
-you override them. Omit `--pi-agent-env` only when you explicitly want the
-direct deterministic decoder-training eval mode.
+## 9. Artifact Recovery
 
-## 10. Resume
-
-Resume the newest run:
+Run from your workstation before terminating the pod:
 
 ```bash
-cd /workspace/Tofy
-source "$HOME/.cargo/env"
+export TOFY_POD_HOST="<pod-host-from-runpod-connect>"
 
-tmux new -s tofy-resume
-```
-
-Inside tmux:
-
-```bash
-export RUST_BACKTRACE=1
-export TOFY_TRAIN_DTYPE=bf16
-
-/workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 80gb --resume latest \
-  2>&1 | tee /workspace/tofy-train-80gb-resume.log
-```
-
-Resume a specific run:
-
-```bash
-./target/release/jepa_ai train 80gb --resume code_poc_<timestamp>
-```
-
-On 48 GB pods, substitute `train 48gb` and `tofy-train-48gb-resume.log`.
-
-Resume requires matching architecture/profile arguments. Do not resume a run
-created with a different `config/model_profiles.json` shape.
-
-## 11. Artifact Recovery
-
-Before terminating a pod, copy the run artifacts back:
-
-```bash
 rsync -az --info=progress2 \
-  root@<pod-host>:/workspace/Tofy/runs/ \
+  root@${TOFY_POD_HOST}:/workspace/Tofy/runs/ \
   /home/stepan/Coding/Personal/Tofy/runs/
 
 rsync -az --info=progress2 \
-  root@<pod-host>:/workspace/Tofy/data/cache/ \
+  root@${TOFY_POD_HOST}:/workspace/Tofy/data/cache/ \
   /home/stepan/Coding/Personal/Tofy/data/cache/
 
 rsync -az --info=progress2 \
-  root@<pod-host>:/workspace/tofy-train-80gb*.log \
-  /home/stepan/Coding/Personal/Tofy/runs/
+  root@${TOFY_POD_HOST}:/workspace/tofy-train-80gb*.log \
+  /home/stepan/Coding/Personal/Tofy/runs/ || true
 
 rsync -az --info=progress2 \
-  root@<pod-host>:/workspace/tofy-train-48gb*.log \
-  /home/stepan/Coding/Personal/Tofy/runs/
-
-rsync -az --info=progress2 \
-  root@<pod-host>:/workspace/tofy-go-eval-*.log \
-  /home/stepan/Coding/Personal/Tofy/runs/
+  root@${TOFY_POD_HOST}:/workspace/tofy-go-eval-*.log \
+  /home/stepan/Coding/Personal/Tofy/runs/ || true
 ```
 
-At minimum, preserve the run directory:
-
-```text
-runs/code_poc_<timestamp>/
-```
-
-It contains model checkpoints, optimizer sidecars, TensorBoard event files,
-metadata, vocab files, and pipeline metadata. Standalone post-training eval logs
-are written to `/workspace/tofy-go-eval-*.log` by the command above; recover
-those logs separately if you need the verifier output.
+At minimum, preserve `runs/code_poc_<timestamp>/`. It contains checkpoints,
+optimizer sidecars, TensorBoard event files, metadata, vocab files, and pipeline
+metadata.
 
 After a completed run reports a better metric, update `docs/RESULTS.md` with
 the exact command and metric. Do not update it for failed probes or unchanged
 metrics.
 
-## 12. Stop Or Terminate
+## 10. Stop Or Terminate
 
-Stop keeps the regular pod volume attached to the same pod:
+Stop keeps a regular pod volume attached to the same pod:
 
 ```bash
 curl -fsS --request POST \
@@ -570,11 +477,6 @@ curl -fsS --request POST \
   -w "HTTP %{http_code}\n"
 ```
 
-Terminate deletes the regular pod volume. Only terminate after artifact
-recovery is complete.
-
-Storage behavior:
-
-- regular pod volume: persists across stop/start of the same pod, deleted on terminate
-- network volume: survives pod termination but is tied to one datacenter
-- container disk: useful for build dependencies, not for run artifacts
+Terminate deletes a regular pod volume. Network volumes survive pod termination
+but are tied to one datacenter. Delete a network volume manually only after you
+have recovered or intentionally discarded its contents.
