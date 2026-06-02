@@ -28,6 +28,14 @@ Optional environment:
   PORTS_JSON           JSON array, for example '["22/tcp","8888/http"]'. Default: []
   ENV_JSON             JSON object passed to the pod. Default: {}
   DATA_CENTER_IDS_JSON Optional JSON array limiting probe datacenters.
+  NETWORK_VOLUME_DATA_CENTER_IDS_JSON
+                       JSON array of datacenters known to support network
+                       volumes. Default: RunPod-supported list current at repo
+                       update time.
+  POD_DATA_CENTER_IDS_JSON
+                       JSON array of datacenters accepted by Pod create.
+                       Default: RunPod REST schema list current at repo update
+                       time.
   EXTRA_POD_JSON       Optional JSON object merged into probe and final payloads.
   RUNPOD_API_BASE      API base URL. Default: https://rest.runpod.io/v1
 
@@ -124,6 +132,15 @@ extract_datacenter_id() {
   ' "$1"
 }
 
+network_volume_datacenters_from_error() {
+  local path="$1"
+  jq -r '
+    (.error // "")
+    | capture("Available data centers: (?<dcs>.*)\\.")?.dcs // empty
+    | split(", ")
+  ' "$path"
+}
+
 summarize_pod() {
   jq '{
     id,
@@ -151,6 +168,57 @@ delete_temp_pod() {
     api DELETE "/pods/${TEMP_POD_ID}" >/dev/null || true
     TEMP_POD_DELETED=1
   fi
+}
+
+create_probe_pod() {
+  local datacenter_ids_json="$1"
+  local candidate payload response
+
+  TEMP_POD_ID=""
+  TEMP_POD_DELETED=0
+  DATA_CENTER_ID=""
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    echo "Trying probe Pod in ${candidate} for GPU '${GPU_TYPE_ID}' and CUDA versions ${CUDA_VERSIONS_JSON}..."
+    jq \
+      --arg dc "$candidate" \
+      '.dataCenterIds = [$dc] | .dataCenterPriority = "custom"' \
+      "$TEMP_PAYLOAD" > "${TEMP_PAYLOAD}.candidate"
+    payload="${TEMP_PAYLOAD}.candidate"
+    response="${TEMP_RESPONSE}.${candidate}"
+    if api POST "/pods" "$payload" > "$response"; then
+      cp "$response" "$TEMP_RESPONSE"
+      TEMP_POD_ID="$(extract_pod_id "$TEMP_RESPONSE")"
+      if [[ -z "$TEMP_POD_ID" ]]; then
+        echo "RunPod did not return a probe Pod id for ${candidate}. Response:" >&2
+        jq . "$TEMP_RESPONSE" >&2 || cat "$TEMP_RESPONSE" >&2
+        continue
+      fi
+      DATA_CENTER_ID="$(extract_datacenter_id "$TEMP_RESPONSE")"
+      if [[ -z "$DATA_CENTER_ID" ]]; then
+        echo "Waiting for probe Pod datacenter..."
+        for _ in $(seq 1 30); do
+          sleep 2
+          if api GET "/pods/${TEMP_POD_ID}" > "$TEMP_GET_RESPONSE"; then
+            DATA_CENTER_ID="$(extract_datacenter_id "$TEMP_GET_RESPONSE")"
+          fi
+          [[ -n "$DATA_CENTER_ID" ]] && break
+        done
+      fi
+      if [[ -z "$DATA_CENTER_ID" ]]; then
+        echo "Could not determine probe Pod datacenter for ${candidate}; deleting probe and trying next datacenter"
+        delete_temp_pod
+        continue
+      fi
+      echo "Probe Pod created: ${TEMP_POD_ID}"
+      echo "Probe Pod datacenter: ${DATA_CENTER_ID}"
+      return 0
+    fi
+    echo "No probe Pod in ${candidate}; trying next datacenter."
+  done < <(jq -r '.[]' <<<"$datacenter_ids_json")
+
+  return 1
 }
 
 cleanup() {
@@ -191,6 +259,8 @@ INTERRUPTIBLE="${INTERRUPTIBLE:-false}"
 PORTS_JSON="${PORTS_JSON:-[]}"
 ENV_JSON="${ENV_JSON:-{}}"
 DATA_CENTER_IDS_JSON="${DATA_CENTER_IDS_JSON:-[]}"
+NETWORK_VOLUME_DATA_CENTER_IDS_JSON="${NETWORK_VOLUME_DATA_CENTER_IDS_JSON:-[\"AP-JP-1\",\"CA-MTL-3\",\"CA-MTL-4\",\"EU-CZ-1\",\"EU-FR-1\",\"EU-NL-1\",\"EU-RO-1\",\"EUR-IS-1\",\"EUR-IS-3\",\"EUR-NO-1\",\"EUR-NO-2\",\"US-CA-2\",\"US-IL-1\",\"US-KS-2\",\"US-MO-1\",\"US-MO-2\",\"US-NC-1\",\"US-NC-2\",\"US-NE-1\",\"US-TX-3\",\"US-WA-1\"]}"
+POD_DATA_CENTER_IDS_JSON="${POD_DATA_CENTER_IDS_JSON:-[\"EU-RO-1\",\"CA-MTL-1\",\"EU-SE-1\",\"US-IL-1\",\"EUR-IS-1\",\"EU-CZ-1\",\"US-TX-3\",\"EUR-IS-2\",\"US-KS-2\",\"US-GA-2\",\"US-WA-1\",\"US-TX-1\",\"CA-MTL-3\",\"EU-NL-1\",\"US-TX-4\",\"US-CA-2\",\"US-NC-1\",\"OC-AU-1\",\"US-DE-1\",\"EUR-IS-3\",\"CA-MTL-2\",\"AP-JP-1\",\"EUR-NO-1\",\"EU-FR-1\",\"US-KS-3\",\"US-GA-1\",\"AP-IN-1\",\"US-MD-1\"]}"
 EXTRA_POD_JSON="${EXTRA_POD_JSON:-{}}"
 
 [[ "$INTERRUPTIBLE" == "true" || "$INTERRUPTIBLE" == "false" ]] || die "INTERRUPTIBLE must be true or false"
@@ -207,6 +277,8 @@ printf '%s' "$CUDA_VERSIONS_JSON" | json_type '. as $v | if ($v | type) == "arra
 printf '%s' "$PORTS_JSON" | json_type '. as $v | if ($v | type) == "array" then $v else error("not array") end' || die "PORTS_JSON must be a JSON array"
 printf '%s' "$ENV_JSON" | json_type '. as $v | if ($v | type) == "object" then $v else error("not object") end' || die "ENV_JSON must be a JSON object"
 printf '%s' "$DATA_CENTER_IDS_JSON" | json_type '. as $v | if ($v | type) == "array" then $v else error("not array") end' || die "DATA_CENTER_IDS_JSON must be a JSON array"
+printf '%s' "$NETWORK_VOLUME_DATA_CENTER_IDS_JSON" | json_type '. as $v | if ($v | type) == "array" then $v else error("not array") end' || die "NETWORK_VOLUME_DATA_CENTER_IDS_JSON must be a JSON array"
+printf '%s' "$POD_DATA_CENTER_IDS_JSON" | json_type '. as $v | if ($v | type) == "array" then $v else error("not array") end' || die "POD_DATA_CENTER_IDS_JSON must be a JSON array"
 printf '%s' "$EXTRA_POD_JSON" | json_type '. as $v | if ($v | type) == "object" then $v else error("not object") end' || die "EXTRA_POD_JSON must be a JSON object"
 
 TMPDIR_RUNPOD="$(mktemp -d)"
@@ -221,6 +293,24 @@ VOLUME_PAYLOAD="${TMPDIR_RUNPOD}/network-volume.json"
 VOLUME_RESPONSE="${TMPDIR_RUNPOD}/network-volume-response.json"
 FINAL_PAYLOAD="${TMPDIR_RUNPOD}/final-pod.json"
 FINAL_RESPONSE="${TMPDIR_RUNPOD}/final-pod-response.json"
+
+REQUESTED_DATA_CENTER_IDS_JSON="$DATA_CENTER_IDS_JSON"
+if [[ "$REQUESTED_DATA_CENTER_IDS_JSON" == "[]" ]]; then
+  REQUESTED_DATA_CENTER_IDS_JSON="$NETWORK_VOLUME_DATA_CENTER_IDS_JSON"
+fi
+
+DATA_CENTER_IDS_JSON="$(
+  jq -nc \
+    --argjson requested "$REQUESTED_DATA_CENTER_IDS_JSON" \
+    --argjson volume "$NETWORK_VOLUME_DATA_CENTER_IDS_JSON" \
+    --argjson pod "$POD_DATA_CENTER_IDS_JSON" \
+    '$requested | map(select(. as $dc | ($volume | index($dc)) and ($pod | index($dc))))'
+)"
+if [[ "$DATA_CENTER_IDS_JSON" == "[]" ]]; then
+  die "no datacenters remain after intersecting requested, network-volume-capable, and pod-create datacenter lists"
+fi
+
+echo "Probe Pod datacenter allowlist for network volumes: ${DATA_CENTER_IDS_JSON}"
 
 jq -n \
   --arg name "$TEMP_POD_NAME" \
@@ -260,41 +350,7 @@ jq -n \
   + $extra
   ' > "$TEMP_PAYLOAD"
 
-echo "Creating probe Pod for GPU '${GPU_TYPE_ID}' and CUDA versions ${CUDA_VERSIONS_JSON}..."
-api POST "/pods" "$TEMP_PAYLOAD" > "$TEMP_RESPONSE" || die "probe Pod creation request failed"
-
-TEMP_POD_ID="$(extract_pod_id "$TEMP_RESPONSE")"
-if [[ -z "$TEMP_POD_ID" ]]; then
-  echo "RunPod did not return a probe Pod id. Response:" >&2
-  jq . "$TEMP_RESPONSE" >&2 || cat "$TEMP_RESPONSE" >&2
-  exit 1
-fi
-
-echo "Probe Pod created: ${TEMP_POD_ID}"
-DATA_CENTER_ID="$(extract_datacenter_id "$TEMP_RESPONSE")"
-
-if [[ -z "$DATA_CENTER_ID" ]]; then
-  echo "Waiting for probe Pod datacenter..."
-  for _ in $(seq 1 30); do
-    sleep 2
-    if api GET "/pods/${TEMP_POD_ID}" > "$TEMP_GET_RESPONSE"; then
-      DATA_CENTER_ID="$(extract_datacenter_id "$TEMP_GET_RESPONSE")"
-    fi
-    [[ -n "$DATA_CENTER_ID" ]] && break
-  done
-fi
-
-if [[ -z "$DATA_CENTER_ID" ]]; then
-  echo "Could not determine probe Pod datacenter. Last response:" >&2
-  if [[ -s "$TEMP_GET_RESPONSE" ]]; then
-    jq . "$TEMP_GET_RESPONSE" >&2 || cat "$TEMP_GET_RESPONSE" >&2
-  else
-    jq . "$TEMP_RESPONSE" >&2 || cat "$TEMP_RESPONSE" >&2
-  fi
-  exit 1
-fi
-
-echo "Probe Pod datacenter: ${DATA_CENTER_ID}"
+create_probe_pod "$DATA_CENTER_IDS_JSON" || die "probe Pod creation failed in every network-volume-capable datacenter"
 delete_temp_pod
 
 jq -n \
@@ -304,7 +360,37 @@ jq -n \
   '{dataCenterId: $dataCenterId, name: $name, size: $size}' > "$VOLUME_PAYLOAD"
 
 echo "Creating ${NETWORK_VOLUME_GB} GB network volume '${NETWORK_VOLUME_NAME}' in ${DATA_CENTER_ID}..."
-api POST "/networkvolumes" "$VOLUME_PAYLOAD" > "$VOLUME_RESPONSE" || die "network volume creation request failed"
+if ! api POST "/networkvolumes" "$VOLUME_PAYLOAD" > "$VOLUME_RESPONSE"; then
+  UPDATED_DATA_CENTERS="$(network_volume_datacenters_from_error "$VOLUME_RESPONSE")"
+  if [[ -z "$UPDATED_DATA_CENTERS" || "$UPDATED_DATA_CENTERS" == "[]" ]]; then
+    die "network volume creation request failed"
+  fi
+  echo "RunPod rejected ${DATA_CENTER_ID} for network volumes."
+  echo "Retrying probe with RunPod-reported network-volume datacenters: ${UPDATED_DATA_CENTERS}"
+  DATA_CENTER_IDS_JSON="$(
+    jq -nc \
+      --argjson updated "$UPDATED_DATA_CENTERS" \
+      --argjson pod "$POD_DATA_CENTER_IDS_JSON" \
+      '$updated | map(select(. as $dc | $pod | index($dc)))'
+  )"
+  if [[ "$DATA_CENTER_IDS_JSON" == "[]" ]]; then
+    die "RunPod-reported network-volume datacenters do not overlap with Pod create datacenters"
+  fi
+  delete_temp_pod
+  TEMP_POD_ID=""
+  TEMP_POD_DELETED=0
+
+  create_probe_pod "$DATA_CENTER_IDS_JSON" || die "replacement probe Pod creation failed in every RunPod-reported network-volume datacenter"
+  delete_temp_pod
+
+  jq -n \
+    --arg dataCenterId "$DATA_CENTER_ID" \
+    --arg name "$NETWORK_VOLUME_NAME" \
+    --argjson size "$NETWORK_VOLUME_GB" \
+    '{dataCenterId: $dataCenterId, name: $name, size: $size}' > "$VOLUME_PAYLOAD"
+  echo "Creating ${NETWORK_VOLUME_GB} GB network volume '${NETWORK_VOLUME_NAME}' in ${DATA_CENTER_ID}..."
+  api POST "/networkvolumes" "$VOLUME_PAYLOAD" > "$VOLUME_RESPONSE" || die "network volume creation request failed after retry"
+fi
 
 NETWORK_VOLUME_ID="$(extract_volume_id "$VOLUME_RESPONSE")"
 if [[ -z "$NETWORK_VOLUME_ID" ]]; then

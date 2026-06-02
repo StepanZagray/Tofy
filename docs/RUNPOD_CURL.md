@@ -1,8 +1,7 @@
 # Training Pod Runbook
 
-This is the low-back-and-forth path for launching a RunPod training pod,
-restoring the prepared cache, probing VRAM, running the full pipeline, and
-recovering artifacts.
+This is the low-back-and-forth RunPod path. Pod-side commands live in
+`scripts/`, so the console flow is mostly “sync repo, run script.”
 
 Tofy training pods should use CUDA 13.0. Keep `allowedCudaVersions: ["13.0"]`
 in raw RunPod payloads and keep `CUDA_VERSION=13.0` when using the helper
@@ -19,7 +18,7 @@ cache.
 
 ## 1. Local Setup
 
-Paste this locally once:
+Run locally:
 
 ```bash
 sudo pacman -S --needed curl jq openssh rsync
@@ -141,8 +140,9 @@ echo "RUNPOD_POD_ID=${RUNPOD_POD_ID}"
 
 ### Option C: New Network Volume Script
 
-Use this when you want the helper to create a probe pod, create a network volume
-in the discovered datacenter, then launch the final pod attached to that volume.
+Use this when you want the helper to probe network-volume-capable datacenters
+one at a time, create a network volume in the first datacenter that can place
+the GPU, and launch the final pod attached to that volume.
 
 ```bash
 RUNPOD_API_KEY="${RUNPOD_API_KEY}" \
@@ -162,177 +162,91 @@ If the API returns `There are no instances currently available`, retry later or
 switch GPU type. Keep the CUDA 13.0 filter unless you are intentionally
 debugging a lower-CUDA machine.
 
-## 3. SSH
+## 3. Sync Repo To Pod
 
-Get the exact SSH command from the RunPod Connect tab. The host suffix can vary.
-You will paste the next sections inside that SSH shell.
+Get the exact SSH command from the RunPod Connect tab, then set these locally.
+For a command like `ssh 2pb...@ssh.runpod.io -i ~/.ssh/id_ed25519`, use:
 
 ```bash
-ssh <runpod-user>@ssh.runpod.io -i ~/.ssh/id_ed25519
+export TOFY_POD_SSH="2pb...@ssh.runpod.io"
+export TOFY_POD_KEY="$HOME/.ssh/id_ed25519"
 ```
 
-## 4. Pod Bootstrap
-
-Paste this inside the pod. It installs system tools, Rust, Go, HF CLI, saves
-auto-stop credentials locally, writes the auto-stop wrapper, checks CUDA, and
-prepares SSH for GitHub.
+Push the current repo checkout to the pod:
 
 ```bash
-set -euo pipefail
+rsync -az --delete \
+  -e "ssh -i ${TOFY_POD_KEY}" \
+  --exclude target --exclude runs --exclude .git \
+  /home/stepan/Coding/Personal/Tofy/ \
+  "${TOFY_POD_SSH}:/workspace/Tofy/"
 
-apt-get update
-apt-get install -y \
-  git curl ca-certificates build-essential pkg-config libssl-dev \
-  openssh-client tmux htop nvtop pciutils jq rsync zstd \
-  python3-pip golang-go
-
-if ! command -v cargo >/dev/null 2>&1; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y
-fi
-source "$HOME/.cargo/env"
-
-if ! command -v hf >/dev/null 2>&1; then
-  python3 -m pip install -U "huggingface_hub[cli]" --break-system-packages
-fi
-
-read -rsp "RunPod API key for auto-stop: " RUNPOD_API_KEY
-echo
-read -rp "RunPod pod id for auto-stop: " RUNPOD_POD_ID
-cat > /workspace/tofy-runpod.env <<EOF
-export RUNPOD_API_KEY='${RUNPOD_API_KEY}'
-export RUNPOD_POD_ID='${RUNPOD_POD_ID}'
-EOF
-chmod 600 /workspace/tofy-runpod.env
-
-cat > /workspace/run-tofy-and-stop.sh <<'EOF'
-#!/usr/bin/env bash
-set -o pipefail
-
-if [ -f /workspace/tofy-runpod.env ]; then
-  . /workspace/tofy-runpod.env
-fi
-
-stop_pod() {
-  echo "Stopping RunPod pod..."
-  echo "RUNPOD_POD_ID=${RUNPOD_POD_ID:-}"
-  echo "RUNPOD_API_KEY length=${#RUNPOD_API_KEY}"
-  if [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${RUNPOD_API_KEY:-}" ]; then
-    curl -fsS --request POST \
-      --url "https://rest.runpod.io/v1/pods/${RUNPOD_POD_ID}/stop" \
-      --header "Authorization: Bearer ${RUNPOD_API_KEY}" \
-      -o /workspace/runpod-stop-response.json \
-      -w "HTTP %{http_code}\n" || true
-  else
-    echo "RUNPOD_POD_ID or RUNPOD_API_KEY missing; cannot auto-stop pod"
-  fi
-}
-
-trap stop_pod EXIT
-"$@"
-EOF
-chmod +x /workspace/run-tofy-and-stop.sh
-
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-if [ ! -f ~/.ssh/runpod_tofy ]; then
-  ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
-fi
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/runpod_tofy
-    IdentitiesOnly yes
-EOF
-chmod 600 ~/.ssh/runpod_tofy ~/.ssh/config
-chmod 644 ~/.ssh/runpod_tofy.pub
-ssh-keyscan github.com >> ~/.ssh/known_hosts
-chmod 644 ~/.ssh/known_hosts
-
-nvidia-smi
-nvcc --version || true
-go version
-hf --help >/dev/null
-
-echo
-echo "Add this deploy key to GitHub repo -> Settings -> Deploy keys:"
-cat ~/.ssh/runpod_tofy.pub
+ssh -tt -i "${TOFY_POD_KEY}" "${TOFY_POD_SSH}"
 ```
 
-Add the printed public key to GitHub. Keep write access disabled unless you need
-to push from the pod.
+Use `ssh -tt` for interactive pod access. Some RunPod endpoints reject
+one-shot, non-PTY commands such as `ssh ... 'ps aux'` with
+`Error: Your SSH client doesn't support PTY`; connect with `ssh -tt` first and
+then run status commands inside the shell.
 
-## 5. Repo And Cache
+If you prefer `git pull` on the pod, clone the repo however you normally do and
+add the deploy key printed by `scripts/runpod_pod_setup.sh`.
 
-After adding the deploy key, paste this inside the pod. It clones or updates the
-repo, downloads the prepared cache, extracts it into `/workspace/Tofy`, verifies
-the expected files, and builds release.
+## 4. Pod Setup
+
+Run inside the pod from the synced repo. This installs system tools, Rust, Go,
+HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves auto-stop credentials,
+checks CUDA, and prints a GitHub deploy key.
 
 ```bash
-set -euo pipefail
-source "$HOME/.cargo/env"
-
-cd /workspace
-if [ ! -d Tofy/.git ]; then
-  git clone git@github.com:StepanZagray/Tofy.git Tofy
-fi
-
 cd /workspace/Tofy
-git fetch origin
-git pull --ff-only
+RUNPOD_POD_ID="<pod-id-from-create-step>" scripts/runpod_pod_setup.sh
+```
 
-hf download Grayza/80gb-profile-go-cache \
-  tofy-cache-80gb-a8e7916-1780391272.tar.zst \
-  --repo-type dataset \
-  --local-dir /workspace
+If you already exported `RUNPOD_API_KEY` and `RUNPOD_POD_ID` inside the pod, the
+script will not prompt for them.
 
-tar --zstd --no-same-owner --no-same-permissions \
-  -xf /workspace/tofy-cache-80gb-a8e7916-1780391272.tar.zst \
-  -C /workspace/Tofy
+## 5. Restore Cache And Build
 
-echo "Prepared cache:"
-du -sh data/cache eval local_models 2>/dev/null || true
-ls -lh data/cache eval local_models/vocabs 2>/dev/null || true
+Run inside the pod:
 
-cargo build --release
+```bash
+cd /workspace/Tofy
+SKIP_GIT_PULL=1 scripts/runpod_restore_cache_build.sh
+```
+
+The restore script uses `pzstd -d -p $(nproc)` when available and falls back to
+`tar --zstd`. This can speed up archives created with the repo's current
+`pzstd` default, but extraction can still be limited by RunPod volume write
+throughput.
+
+Defaults:
+
+- dataset: `Grayza/80gb-profile-go-cache`
+- archive: `tofy-cache-80gb-a8e7916-1780391272.tar.zst`
+- extraction target: `/workspace/Tofy`
+
+Override if needed:
+
+```bash
+TOFY_CACHE_HF_DATASET="Grayza/80gb-profile-go-cache" \
+TOFY_CACHE_ARCHIVE="tofy-cache-80gb-a8e7916-1780391272.tar.zst" \
+SKIP_GIT_PULL=1 \
+scripts/runpod_restore_cache_build.sh
 ```
 
 If `local_models/vocabs` is missing after extraction, do not start the long run;
 rebuild or copy the prepared cache with vocabs included.
 
-For unpushed local changes, run this from your workstation instead of `git pull`
-on the pod:
-
-```bash
-rsync -az --delete \
-  --exclude target --exclude runs --exclude .git \
-  /home/stepan/Coding/Personal/Tofy/ \
-  root@<pod-host>:/workspace/Tofy/
-```
-
 ## 6. Probe Or Train
 
-Probe first on a fresh GPU shape. Paste once; it creates a probe script, starts
-tmux, and attaches to the session:
+Probe first on a fresh GPU shape. The probe intentionally does not use the
+auto-stop wrapper, so the pod stays running for the training launch if the probe
+passes.
 
 ```bash
 cd /workspace/Tofy
-source "$HOME/.cargo/env"
-
-cat > /workspace/tofy-probe.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /workspace/Tofy
-source "$HOME/.cargo/env"
-export RUST_BACKTRACE=1
-
-/workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai --max-vram-probe --profile 80gb --stage all --probe-dir /workspace/tofy-vram-probe-80gb \
-  2>&1 | tee /workspace/tofy-vram-probe-80gb.log
-EOF
-chmod +x /workspace/tofy-probe.sh
-
-tmux new -s tofy-probe /workspace/tofy-probe.sh
+PROFILE=80gb scripts/runpod_probe.sh
 ```
 
 Detach with `Ctrl+b`, then `d`. Reattach or monitor with:
@@ -343,65 +257,29 @@ tail -f /workspace/tofy-vram-probe-80gb.log
 nvidia-smi
 ```
 
-Start the full 80 GB run. Paste once; it updates the repo, builds, creates a
-train script, starts tmux, and attaches:
+Start the full 80 GB run. This uses the auto-stop wrapper by default.
 
 ```bash
 cd /workspace/Tofy
-source "$HOME/.cargo/env"
-git fetch origin
-git pull --ff-only
-cargo build --release
-
-cat > /workspace/tofy-train.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /workspace/Tofy
-source "$HOME/.cargo/env"
-export RUST_BACKTRACE=1
-export TOFY_TRAIN_DTYPE=bf16
-
-/workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 80gb \
-  2>&1 | tee /workspace/tofy-train-80gb.log
-EOF
-chmod +x /workspace/tofy-train.sh
-
-tmux new -s tofy-train /workspace/tofy-train.sh
+SKIP_GIT_PULL=1 PROFILE=80gb scripts/runpod_train.sh train
 ```
 
-For 48 GB pods, use `--profile 48gb`, `train 48gb`, and log names ending in
-`48gb`.
+For 48 GB pods, use `PROFILE=48gb`.
 
 ## 7. Resume
 
-Paste once inside the pod:
+Resume latest:
 
 ```bash
 cd /workspace/Tofy
-source "$HOME/.cargo/env"
-
-cat > /workspace/tofy-resume.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cd /workspace/Tofy
-source "$HOME/.cargo/env"
-export RUST_BACKTRACE=1
-export TOFY_TRAIN_DTYPE=bf16
-
-/workspace/run-tofy-and-stop.sh \
-  ./target/release/jepa_ai train 80gb --resume latest \
-  2>&1 | tee /workspace/tofy-train-80gb-resume.log
-EOF
-chmod +x /workspace/tofy-resume.sh
-
-tmux new -s tofy-resume /workspace/tofy-resume.sh
+SKIP_GIT_PULL=1 PROFILE=80gb scripts/runpod_train.sh resume
 ```
 
-Resume a specific run with:
+Resume a specific run:
 
 ```bash
-./target/release/jepa_ai train 80gb --resume code_poc_<timestamp>
+cd /workspace/Tofy
+SKIP_GIT_PULL=1 PROFILE=80gb RESUME_TARGET=code_poc_<timestamp> scripts/runpod_train.sh resume
 ```
 
 Resume only with the same architecture/profile that created the run.
@@ -413,48 +291,38 @@ this only to rescore a checkpoint:
 
 ```bash
 cd /workspace/Tofy
-source "$HOME/.cargo/env"
-RUN_ID=$(ls -td runs/code_poc_* | head -n1 | xargs -r basename)
-test -n "${RUN_ID}"
-source scripts/tofy_pi_runtime_env.sh runs/${RUN_ID} 80gb
+PROFILE=80gb scripts/runpod_go_eval.sh
+```
 
-./target/release/jepa_ai --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
+Evaluate a specific run:
 
-./target/release/jepa_ai --eval-code-assistant \
-  "$TOFY_WORLD_ENCODER_MODEL" \
-  "$TOFY_ENCODER_VOCAB" \
-  "$TOFY_WORLD_MODEL" \
-  eval/code_assistant_go_hard.jsonl \
-  384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" \
-  --high-world-model "$TOFY_HIGH_WORLD_MODEL" \
-  --code-decoder "$JEPA_CANDLE_DECODER" \
-  --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" \
-  --pi-agent-env \
-  --go-timeout-sec 6 \
-  2>&1 | tee /workspace/tofy-go-eval-${RUN_ID}.log
+```bash
+cd /workspace/Tofy
+PROFILE=80gb RUN_ID=code_poc_<timestamp> scripts/runpod_go_eval.sh
 ```
 
 ## 9. Artifact Recovery
 
-Run from your workstation before terminating the pod:
+Run locally before terminating the pod:
 
 ```bash
-export TOFY_POD_HOST="<pod-host-from-runpod-connect>"
+export TOFY_POD_SSH="2pb...@ssh.runpod.io"
+export TOFY_POD_KEY="$HOME/.ssh/id_ed25519"
 
-rsync -az --info=progress2 \
-  root@${TOFY_POD_HOST}:/workspace/Tofy/runs/ \
+rsync -az --info=progress2 -e "ssh -i ${TOFY_POD_KEY}" \
+  "${TOFY_POD_SSH}:/workspace/Tofy/runs/" \
   /home/stepan/Coding/Personal/Tofy/runs/
 
-rsync -az --info=progress2 \
-  root@${TOFY_POD_HOST}:/workspace/Tofy/data/cache/ \
+rsync -az --info=progress2 -e "ssh -i ${TOFY_POD_KEY}" \
+  "${TOFY_POD_SSH}:/workspace/Tofy/data/cache/" \
   /home/stepan/Coding/Personal/Tofy/data/cache/
 
-rsync -az --info=progress2 \
-  root@${TOFY_POD_HOST}:/workspace/tofy-train-80gb*.log \
+rsync -az --info=progress2 -e "ssh -i ${TOFY_POD_KEY}" \
+  "${TOFY_POD_SSH}:/workspace/tofy-train-80gb*.log" \
   /home/stepan/Coding/Personal/Tofy/runs/ || true
 
-rsync -az --info=progress2 \
-  root@${TOFY_POD_HOST}:/workspace/tofy-go-eval-*.log \
+rsync -az --info=progress2 -e "ssh -i ${TOFY_POD_KEY}" \
+  "${TOFY_POD_SSH}:/workspace/tofy-go-eval-*.log" \
   /home/stepan/Coding/Personal/Tofy/runs/ || true
 ```
 

@@ -40,8 +40,11 @@ Requirements:
   `--hf-dataset <org/dataset-name>` (for example `--hf-dataset my-org/tofy-cache`).
   The command errors if either flag is missing its partner. There is no built-in
   default dataset.
-- `tar`, `zstd`, and `hf` must be on `PATH`; run `hf auth login` with write
-  access to the target dataset before uploading.
+- `tar`, `hf`, and either `pzstd` or `zstd` must be on `PATH`; run
+  `hf auth login` with write access to the target dataset before uploading.
+  Cache archives prefer `pzstd -p <available-cpus> -1` when available so future
+  `.tar.zst` restores can parallelize the zstd decode step. Set
+  `TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM` to override the compressor.
 
 The command archives:
 
@@ -57,9 +60,13 @@ Restore on another machine (same profile as the archive):
 
 ```bash
 hf download --repo-type dataset <org/dataset-name> tofy-cache-80gb-<sha>-<timestamp>.tar.zst
-tar --zstd -xf tofy-cache-80gb-<sha>-<timestamp>.tar.zst
+tar -I "pzstd -d -p $(nproc)" -xf tofy-cache-80gb-<sha>-<timestamp>.tar.zst
 cargo run --release -- train 80gb
 ```
+
+If `pzstd` is not installed, use `tar --zstd -xf ...`. Low CPU usage during
+restore usually means the bottleneck is volume write throughput rather than
+zstd decoding.
 
 Use the same memory profile (`8gb`, `48gb`, or `80gb`) when training as when the
 cache was built.

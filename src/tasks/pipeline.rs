@@ -1883,7 +1883,10 @@ fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Resul
 
     println!("Archiving prepared cache to {}", archive_path.display());
     let mut tar = Command::new("tar");
-    tar.arg("--zstd").arg("-cf").arg(&archive_path);
+    tar.arg("-I")
+        .arg(cache_archive_compress_program())
+        .arg("-cf")
+        .arg(&archive_path);
     for input in &archive_inputs {
         tar.arg(input);
     }
@@ -1902,14 +1905,41 @@ fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Resul
 }
 
 fn ensure_cache_upload_tools() -> Result<()> {
-    for tool in ["tar", "zstd", "hf"] {
+    for tool in ["tar", "hf"] {
         if !command_available(tool) {
             bail!(
                 "--auto-hf-upload requires `{tool}` on PATH; install it and authenticate with `hf auth login` if needed"
             );
         }
     }
+    let compress_program = cache_archive_compress_program();
+    let compress_tool = compress_program.split_whitespace().next().unwrap_or("zstd");
+    if !command_available(compress_tool) {
+        bail!(
+            "--auto-hf-upload requires cache archive compressor `{compress_tool}` on PATH; set TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM or install pzstd/zstd"
+        );
+    }
     Ok(())
+}
+
+fn cache_archive_compress_program() -> String {
+    if let Ok(program) = std::env::var("TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM") {
+        let trimmed = program.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if command_available("pzstd") {
+        format!("pzstd -p {} -1", default_parallel_threads())
+    } else {
+        "zstd -T0 -1".to_string()
+    }
+}
+
+fn default_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
 }
 
 fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
