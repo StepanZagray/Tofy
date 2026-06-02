@@ -155,7 +155,7 @@ Teacher forcing is built as:
 - `input = state + shifted(next)`
 - `target = shifted(state) + next`
 
-The decoder objective can include a conditioning-margin term. It compares the matched context/state latent against configurable negative conditioning (`TOFY_DECODER_CONDITIONING_NEGATIVES`, default `zero,shuffle`) and logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain` when ablation metrics are enabled. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
+The decoder objective uses matched world conditioning by default. Set `TOFY_DECODER_NEGATIVE_FORWARDS=1` or pass `--conditioning-negative-forwards` to add the conditioning-margin term, which compares the matched context/state latent against configurable negative conditioning (`TOFY_DECODER_CONDITIONING_NEGATIVES`, default `zero,shuffle`). With `TOFY_DECODER_ABLATION_METRICS=1`, it also logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain`. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
 
 So the decoder training sequence length is effectively **`2 * max_seq`**, even though `max_seq` is still the configuration knob for each side individually.
 

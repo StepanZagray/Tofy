@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "kind": "world_mix",
+  "output_path": "data/world_mix_pairs.txt",
+  "params": {
+    "code_ratio": 0.45,
+    "done_ratio": 0.18,
+    "max_rows": 0,
+    "seed": 0
+  },
+  "inputs": [
+    {
+      "path": "data/ultrachat_pairs.txt",
+      "len": 5105595121,
+      "modified_unix_nanos": 1771150239302610323,
+      "content_hash": "0a34fcf8b57d8b2636662c3f77793fa65b80de4aadf48ea442b7634a4b71288d"
+    },
+    {
+      "path": "data/go_code_pairs.txt",
+      "len": 333687565,
+      "modified_unix_nanos": 1780262003430759915,
+      "content_hash": "df85bf2bd0f7db401c01cb9690780a1c71ca08091aaad3855f16b16ae09897b6"
+    },
+    {
+      "path": "data/go_instruction_pairs.txt",
+      "len": 457985055,
+      "modified_unix_nanos": 1780262004989674300,
+      "content_hash": "81eae4d94d9eec02b7bcb75d85a2d6cc231c4c81364926c8656957d6691498fc"
+    },
+    {
+      "path": "data/go_algorithm_pairs.txt",
+      "len": 69590,
+      "modified_unix_nanos": 1780262005283737092,
+      "content_hash": "7aaa024139feb97e1a0fd702a0d885dfbca62e0128d7d3a6757488450b5790e5"
+    },
+    {
+      "path": "data/go_semantic_pairs.txt",
+      "len": 8252,
+      "modified_unix_nanos": 1780262005283854789,
+      "content_hash": "706fe6ebb5b598b74e8e91c3819a0d4a0e985eaa505c6921e140b76155fcb112"
+    },
+    {
+      "path": "data/go_repair_pairs.txt",
+      "len": 143329346,
+      "modified_unix_nanos": 1780262221412712268,
+      "content_hash": "c83f43f27afd0134d1a3091305bd88c8e207e89ffa0f4bdcf2b49f2b874824e5"
+    }
+  ],
+  "rows": 2312223
+}

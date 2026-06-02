@@ -97,6 +97,7 @@ struct EvalConfig {
     go_timeout_secs: u64,
     candidates: usize,
     repair_attempts: usize,
+    pi_agent_env: bool,
     conditioning_pareto: bool,
     condition_budgets: Vec<usize>,
     cross_schedules: Vec<String>,
@@ -183,7 +184,7 @@ impl EvalConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>] [--conditioning-pareto] [--condition-budgets <csv>] [--cross-schedules <csv>]"
+                "usage: --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--ablate-conditioning] [--rustc <bin>] [--rust-timeout-sec <int>] [--candidates <int>] [--repair-attempts <int>] [--pi-agent-env] [--conditioning-pareto] [--condition-budgets <csv>] [--cross-schedules <csv>]"
             );
         }
         let mut filtered = Vec::new();
@@ -197,6 +198,7 @@ impl EvalConfig {
         let mut go_timeout_secs = DEFAULT_GO_TIMEOUT_SECS;
         let mut candidates = 1usize;
         let mut repair_attempts = 2usize;
+        let mut pi_agent_env = false;
         let mut conditioning_pareto = false;
         let mut condition_budgets = vec![0, 4, 8, 16, 32, 64];
         let mut cross_schedules = vec![
@@ -210,6 +212,10 @@ impl EvalConfig {
             match args[i].as_str() {
                 "--conditioning-pareto" => {
                     conditioning_pareto = true;
+                    i += 1;
+                }
+                "--pi-agent-env" => {
+                    pi_agent_env = true;
                     i += 1;
                 }
                 "--ablate-conditioning" => {
@@ -336,6 +342,7 @@ impl EvalConfig {
             go_timeout_secs: go_timeout_secs.max(1),
             candidates: candidates.max(1),
             repair_attempts,
+            pi_agent_env,
             conditioning_pareto,
             condition_budgets,
             cross_schedules,
@@ -653,7 +660,7 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
     let optional_outputs_ready = cfg
         .preference_output_path
         .as_ref()
-        .map_or(true, |path| path.exists());
+        .is_none_or(|path| path.exists());
     if !cfg.force && cfg.repair_output_path.exists() && optional_outputs_ready {
         println!(
             "Go model-feedback repair cache hit: {}",
@@ -902,9 +909,18 @@ fn finish_atomic_writer(mut writer: BufWriter<File>, path: &Path) -> Result<()> 
 }
 
 fn run_code_eval(cfg: EvalConfig) -> Result<()> {
-    set_eval_env_default("TOFY_DECODER_RLM", "0");
-    set_eval_env_default("TOFY_LATENT_REASONING", "0");
-    let default_eval_temp = if cfg.candidates > 1 { "0.35" } else { "0" };
+    if cfg.pi_agent_env {
+        set_eval_env_default("TOFY_DECODER_RLM", "1");
+        set_eval_env_default("TOFY_LATENT_REASONING", "1");
+    } else {
+        set_eval_env_default("TOFY_DECODER_RLM", "0");
+        set_eval_env_default("TOFY_LATENT_REASONING", "0");
+    }
+    let default_eval_temp = if cfg.pi_agent_env || cfg.candidates > 1 {
+        "0.35"
+    } else {
+        "0"
+    };
     set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
 
     if let Some(path) = cfg.code_decoder_path.as_ref() {
@@ -947,10 +963,15 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         None => println!("high_world: unavailable; train the integrated high-world stage"),
     }
     println!(
-        "search: candidates={} repair_attempts={} temp={}",
+        "search: candidates={} repair_attempts={} temp={} runtime_env={}",
         cfg.candidates,
         cfg.repair_attempts,
-        std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string())
+        std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string()),
+        if cfg.pi_agent_env {
+            "pi-agent"
+        } else {
+            "direct"
+        }
     );
 
     let pareto_points = if cfg.conditioning_pareto {

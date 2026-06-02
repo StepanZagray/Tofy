@@ -42,6 +42,7 @@ pub struct DecoderTrainConfig {
     pub signature_loss_weight: f64,
     pub structure_loss_weight: f64,
     pub conditioning_loss_weight: f64,
+    pub conditioning_negative_forwards: bool,
     pub conditioning_margin: f64,
     pub mtp_loss_weight: f64,
     pub mtp_max_ahead: usize,
@@ -62,7 +63,7 @@ impl DecoderTrainConfig {
     pub fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--mtp-loss-weight <float>] [--mtp-max-ahead <int>] [--init-decoder <path>] [--decoder-output <path>] [--build-conditioned-cache] [--from-conditioned-cache] [--resume]"
+                "usage: --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--grad-accum <int>] [--conditioning-loss-weight <float>] [--conditioning-margin <float>] [--conditioning-negative-forwards] [--mtp-loss-weight <float>] [--mtp-max-ahead <int>] [--init-decoder <path>] [--decoder-output <path>] [--build-conditioned-cache] [--from-conditioned-cache] [--resume]"
             );
         }
         let mut init_decoder_path = None;
@@ -81,6 +82,7 @@ impl DecoderTrainConfig {
         let mut decoder_ff_dim = None;
         let mut conditioning_loss_weight = None;
         let mut conditioning_margin = None;
+        let mut conditioning_negative_forwards = false;
         let mut mtp_loss_weight = None;
         let mut mtp_max_ahead = None;
         let mut build_conditioned_cache = false;
@@ -228,6 +230,11 @@ impl DecoderTrainConfig {
                 i += 2;
                 continue;
             }
+            if args[i] == "--conditioning-negative-forwards" {
+                conditioning_negative_forwards = true;
+                i += 1;
+                continue;
+            }
             if args[i] == "--mtp-loss-weight" {
                 let value = args
                     .get(i + 1)
@@ -355,6 +362,10 @@ impl DecoderTrainConfig {
                 })
                 .unwrap_or(DEFAULT_DECODER_CONDITIONING_LOSS_WEIGHT)
                 .max(0.0),
+            conditioning_negative_forwards: conditioning_negative_forwards
+                || std::env::var("TOFY_DECODER_NEGATIVE_FORWARDS")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             conditioning_margin: conditioning_margin
                 .or_else(|| {
                     std::env::var("TOFY_DECODER_CONDITIONING_MARGIN")

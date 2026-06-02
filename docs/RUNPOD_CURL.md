@@ -8,7 +8,7 @@ Current recommended pod target:
 - one high-VRAM NVIDIA GPU: A100/H100/RTX PRO 6000 80 GB preferred; L40S 48 GB
   minimum for the smaller profile
 - Ubuntu-like CUDA image with Rust build tools installed manually
-- regular pod volume mounted at `/workspace`
+- regular pod volume or network volume mounted at `/workspace`
 - repo checkout at `/workspace/Tofy`
 - canonical training command: `./target/release/jepa_ai train 80gb` (or
   `./target/release/jepa_ai train 48gb` on L40S/A40-class GPUs)
@@ -31,8 +31,15 @@ of latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, and
 Go feedback `20000`. Current 48 GB batches are encoder `48x11` (`528`
 effective), world `128x4` (`512` effective), code decoder `32x8` (`256`
 effective), and Go feedback `32x8` (`256` effective). Decoder and Go-feedback
-pipeline stages use conditioning-margin loss and prompt dropout so the decoder
-cannot solve training rows by ignoring the world state.
+pipeline stages use matched world conditioning plus prompt dropout by default;
+extra zero/shuffle/hard negative-conditioning forwards are opt-in.
+
+The full training command below does not build the conditioned-slot cache.
+Keep it that way on 200-250 GB RunPod volumes: an 80 GB profile conditioned-slot
+cache for a full decoder mix can require roughly 450-500 GiB, before temporary
+files and checkpoints. Only use `--build-conditioned-cache` or
+`--until decoder-cache` when you have storage sized for that cache, and only use
+`--from-conditioned-cache` when that cache already exists.
 
 Do not paste API keys or full RunPod API responses into public logs. Pod
 responses can include environment variables.
@@ -58,12 +65,17 @@ If the printed length is `0`, the key is not set.
 
 ## 2. Create A Pod
 
-Use availability-based placement first. Regular pod volume storage is preferred
-for this project because it lets RunPod place the job wherever a suitable GPU is
-available. Network volumes are useful for long-lived datasets, but they are tied
-to one datacenter and can reduce GPU availability.
+There are two supported launch paths:
 
-A100 80 GB (default):
+- **regular pod volume via curl:** best first choice when GPU availability
+  matters, because RunPod can place the job wherever a suitable GPU is available
+- **network volume via script:** best when you want the volume to survive pod
+  termination or reuse a large prepared workspace across pods; this is tied to
+  one datacenter and can reduce GPU availability
+
+### Option A: Regular Pod Volume
+
+A100 80 GB regular-volume pod:
 
 ```bash
 cat > /tmp/runpod-tofy-train.json <<'EOF'
@@ -112,6 +124,41 @@ echo "$RUNPOD_POD_ID"
 
 Get the exact SSH command from the RunPod Connect tab. The host suffix can
 differ between pods.
+
+### Option B: Network Volume Script
+
+Use the script when you want RunPod to create a short-lived probe pod, discover
+the datacenter where the requested GPU is available, create a network volume in
+that datacenter, delete the probe pod, and create the final training pod attached
+to that network volume.
+
+A100 80 GB network-volume pod:
+
+```bash
+RUNPOD_API_KEY="${RUNPOD_API_KEY}" \
+GPU_TYPE_ID="NVIDIA A100-SXM4-80GB" \
+TEMPLATE_ID="obgryfbuad" \
+POD_NAME="tofy-train-80gb" \
+NETWORK_VOLUME_GB=250 \
+VOLUME_MOUNT_PATH="/workspace" \
+CUDA_VERSION=13.0 \
+./scripts/runpod_cuda_volume_pod.sh | tee /tmp/runpod-volume-pod.log
+```
+
+Use the same GPU substitutions as Option A. If the API cannot place the probe
+pod, retry later, switch GPU type, or narrow `DATA_CENTER_IDS_JSON` only when
+you intentionally want a specific datacenter.
+
+The script prints a summary containing `finalPodId`, `networkVolumeId`, and
+`dataCenterId`. Save the final pod ID for the stop wrapper:
+
+```bash
+export RUNPOD_POD_ID="<finalPodId from script summary>"
+echo "$RUNPOD_POD_ID"
+```
+
+Network volumes survive pod termination. Delete the network volume manually from
+RunPod only after you have recovered or intentionally discarded its contents.
 
 ## 3. Pod Bootstrap
 
@@ -324,6 +371,11 @@ export TOFY_TRAIN_DTYPE=bf16
   2>&1 | tee /workspace/tofy-train-80gb.log
 ```
 
+Do not add `--build-conditioned-cache`, `--until decoder-cache`, or
+`--from-conditioned-cache` for a normal full RunPod training run. The default
+`train 80gb` path streams world conditioning during decoder training and avoids
+the hundreds-of-GiB conditioned-slot cache.
+
 Stage 1 bootstraps source data, materializes `data/encoder_mix.txt`, builds
 vocabs, and writes token caches before model training starts. Reruns reuse
 compatible manifests and token caches. Hub-backed files are written atomically,
@@ -366,24 +418,29 @@ cd /workspace/Tofy
 source "$HOME/.cargo/env"
 RUN_ID=$(ls -td runs/code_poc_* | head -n1 | xargs -r basename)
 test -n "${RUN_ID}"
+source scripts/tofy_pi_runtime_env.sh runs/${RUN_ID} 80gb
 
 ./target/release/jepa_ai --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
 
 ./target/release/jepa_ai --eval-code-assistant \
-  runs/${RUN_ID}/world/model.encoder.safetensors \
-  runs/${RUN_ID}/latent/model.vocab.txt \
-  runs/${RUN_ID}/world/model.safetensors \
+  "$TOFY_WORLD_ENCODER_MODEL" \
+  "$TOFY_ENCODER_VOCAB" \
+  "$TOFY_WORLD_MODEL" \
   eval/code_assistant_go_hard.jsonl \
-  384 768 256 12 16 768 96 \
-  --high-world-model runs/${RUN_ID}/high_world/model.safetensors \
-  --code-decoder runs/${RUN_ID}/decoder_code_go_feedback/model.safetensors \
+  384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" \
+  --high-world-model "$TOFY_HIGH_WORLD_MODEL" \
+  --code-decoder "$JEPA_CANDLE_DECODER" \
+  --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" \
+  --pi-agent-env \
   --go-timeout-sec 6 \
   2>&1 | tee /workspace/tofy-go-eval-${RUN_ID}.log
 ```
 
-Assistant eval defaults to deterministic direct decoding unless you explicitly
-export different values: `JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, and
-`TOFY_LATENT_REASONING=0`.
+The sourced runtime env matches the Pi/serve path: Candle code decoder enabled,
+high-world model selected, profile context settings restored, and
+`TOFY_DECODER_RLM=1`, `TOFY_LATENT_REASONING=1`, `JEPA_DECODER_TEMP=0.35` unless
+you override them. Omit `--pi-agent-env` only when you explicitly want the
+direct deterministic decoder-training eval mode.
 
 ## 10. Resume
 

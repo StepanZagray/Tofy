@@ -144,7 +144,7 @@ World/context compressor knobs:
 - `TOFY_LATENT_REASONING_PATIENCE=<int>` stops latent refinement after this many non-improving steps beyond the minimum, default `2`
 - `TOFY_LATENT_REASONING_ALPHA=<float>` blends each recurrent proposal with the selected next-action latent anchor, default `0.35`
 - `TOFY_LATENT_REASONING_GOAL_WEIGHT`, `TOFY_LATENT_REASONING_ROUTE_WEIGHT`, and `TOFY_LATENT_REASONING_STABILITY_WEIGHT` tune the latent selection score
-- `--eval-code-assistant` defaults to `TOFY_LATENT_REASONING=0`, `TOFY_DECODER_RLM=0`, and `JEPA_DECODER_TEMP=0` unless you set those variables yourself, so eval matches direct decoder training before testing extra inference-time wrappers
+- direct `--eval-code-assistant` defaults to `TOFY_LATENT_REASONING=0`, `TOFY_DECODER_RLM=0`, and `JEPA_DECODER_TEMP=0` unless you set those variables yourself, so it can match decoder training; the canonical pipeline and Pi-style manual eval use `--pi-agent-env` after sourcing `scripts/tofy_pi_runtime_env.sh` to match the Pi/serve runtime
 - the integrated high-world training stage is fixed by profile: `12000` for `8gb`/`48gb` and `18000` for `80gb`
 - `HWM_MACRO_MIN_LEN=<int>` and `HWM_MACRO_MAX_LEN=<int>` set the primitive-action span encoded into each macro-action, defaults `2..4`
 - serve/eval auto-load `runs/.../high_world/model.safetensors` next to the world checkpoint; `TOFY_HIGH_WORLD_MODEL=<path>` or `--high-world-model <path>` overrides that path
@@ -152,11 +152,15 @@ World/context compressor knobs:
 
 Decoder training knobs:
 
-- `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` mixes a conditioning-margin loss into decoder training, default `0.20` for direct `--train-decoder` runs and the canonical pipeline decoder stages
+- Decoder training uses only matched world conditioning by default.
+- `TOFY_DECODER_NEGATIVE_FORWARDS=1` or `--conditioning-negative-forwards` enables extra negative-conditioning decoder forwards for the conditioning-margin loss and optional ablation metrics.
+- `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` sets the conditioning-margin weight used only when negative forwards are enabled, default `0.20`
 - `TOFY_DECODER_CONDITIONING_MARGIN=<float>` sets the conditioning-loss margin, default `0.10`
-- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all` controls which negative-conditioning forwards are used for the training margin; pipeline default `zero,shuffle` to avoid the full three-negative cost on every microbatch
+- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all|none` controls which negative-conditioning forwards are used for the training margin after `TOFY_DECODER_NEGATIVE_FORWARDS=1`; pipeline default `zero,shuffle`
+- `TOFY_DECODER_ABLATION_METRICS=1` logs zero/shuffle/hard negative-conditioning losses when negative forwards are enabled.
 - `TOFY_DECODER_PROMPT_DROPOUT=<float>` randomly masks prompt tokens during decoder training so the decoder must use world conditioning; pipeline default `0.12`
 - `TOFY_DECODER_CONTEXT_CACHE_ROWS=<int>` bounds the in-memory cache of frozen world/context slots during decoder training, default `1024`; set `0` to disable
+- The conditioned-slot cache is never built by default. Build it only with `--build-conditioned-cache` or pipeline `--until decoder-cache`, and consume it only with `--from-conditioned-cache`; the 80 GB full mix can require hundreds of GiB.
 - decoder conditioning/cache keys include the row action label, so mixed action batches do not reuse a latent generated for a different action
 - Decoder training batches all gradient-accumulation rows into one frozen encoder/world prefill before slicing latents back into decoder microbatches; the logged `config/decoder_prefill_batch_rows` is `batch * grad_accum`
 - `TOFY_DECODER_SYNTAX_LOSS_WEIGHT=<float>` mixes syntax-weighted CE into decoder training
@@ -601,24 +605,21 @@ cargo run --release -- --train-decoder \
   --decoder-output runs/${RUN_ID}/decoder_code_go/model.safetensors \
   --decoder-max-vocab 32000 \
   --grad-accum 1 \
-  --conditioning-loss-weight 0.20 \
   --init-decoder runs/${RUN_ID}/decoder_code/model.safetensors
 ```
 
 Serve that decoder for Pi:
 
 ```bash
-export JEPA_USE_CANDLE_DECODER=1
-export JEPA_CANDLE_DECODER=$PWD/runs/${RUN_ID}/decoder_code_go/model.safetensors
-export JEPA_CANDLE_DECODER_VOCAB=$PWD/runs/${RUN_ID}/decoder_code_go/model.vocab.txt
+source scripts/tofy_pi_runtime_env.sh runs/${RUN_ID} 80gb
 
 cargo run --release -- --serve \
-  runs/${RUN_ID}/world/model.encoder.safetensors \
-  runs/${RUN_ID}/latent/model.vocab.txt \
-  runs/${RUN_ID}/world/model.safetensors \
+  "$TOFY_WORLD_ENCODER_MODEL" \
+  "$TOFY_ENCODER_VOCAB" \
+  "$TOFY_WORLD_MODEL" \
   127.0.0.1:8080 \
-  1024 256 12 16 1024 96 \
-  --high-world-model runs/${RUN_ID}/high_world/model.safetensors
+  "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" \
+  --high-world-model "$TOFY_HIGH_WORLD_MODEL"
 ```
 
 Configure Pi to call the local OpenAI-compatible server:
@@ -717,7 +718,8 @@ cargo run --release -- --generate-go-code-eval-suite --output eval/code_assistan
 Run the end-to-end eval:
 
 ```bash
-cargo run --release -- --eval-code-assistant local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors eval/code_assistant_go_hard.jsonl 384 768 256 9 8 256 64 --code-decoder local_models/code_decoder_68.50M.safetensors --go-timeout-sec 6
+source scripts/tofy_pi_runtime_env.sh latest 80gb
+cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --pi-agent-env --go-timeout-sec 6
 ```
 
 The eval writes:
@@ -730,7 +732,8 @@ The main KPI is `suite_pass_rate`. Support metrics are `route_code_acc`, `compil
 Run the conditioning-efficiency Pareto sweep:
 
 ```bash
-cargo run --release -- --eval-code-assistant local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors eval/code_assistant_go_hard.jsonl 384 768 256 9 8 256 64 --code-decoder local_models/code_decoder_68.50M.safetensors --go-timeout-sec 6 --conditioning-pareto --condition-budgets 0,4,8,16,32,64 --cross-schedules last-only,every-3rd,every-2nd,all
+source scripts/tofy_pi_runtime_env.sh latest 80gb
+cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --pi-agent-env --go-timeout-sec 6 --conditioning-pareto --condition-budgets 0,4,8,16,32,64 --cross-schedules last-only,every-3rd,every-2nd,all
 ```
 
 The Pareto sweep writes per-budget/per-schedule `results_*.jsonl` and `summary_*.txt` files plus `runs/code_eval/<timestamp>/conditioning_pareto.csv`. Use `suite_pass_rate`, `compile_rate`, `test_pass_rate`, and required-signature/constraint pass rates as the quality side of the efficiency tradeoff.

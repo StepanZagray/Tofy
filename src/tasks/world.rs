@@ -9,8 +9,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
-use tensorboard_rs::summary_writer::SummaryWriter;
 
 use crate::cli::resolve_data_path;
 use crate::config::{
@@ -42,7 +42,8 @@ use crate::tasks::world_support::{
     hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
     masked_weighted_cross_entropy, multi_token_prediction_loss, raw_examples_oov_rate,
     shuffled_conditioning_latent, signature_weight_mask, slot_delta_slots, structure_weight_mask,
-    syntax_weight_mask, world_selection_score, DecoderBatchMetrics, WorldBatchMetrics,
+    syntax_weight_mask, world_selection_score, ActionMetrics, DecoderBatchMetrics,
+    WorldBatchMetrics,
 };
 use crate::util;
 
@@ -51,7 +52,6 @@ const HELDOUT_SPLIT_REMAINDER: usize = 0;
 const CONDITIONED_DECODER_CACHE_VERSION: u32 = 1;
 const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V1\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
-const GO_FEEDBACK_DATA_FILE: &str = "code_poc_go_mix.txt";
 
 type WorldConfig = WorldTrainConfig;
 
@@ -320,13 +320,6 @@ struct DecoderMicroBatch {
     next_context_slots: Option<Tensor>,
 }
 
-fn is_go_feedback_decoder_data(data_path: &Path) -> bool {
-    data_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == GO_FEEDBACK_DATA_FILE)
-}
-
 fn conditioned_decoder_cache_path() -> PathBuf {
     std::env::var("TOFY_DECODER_CONDITIONED_CACHE")
         .map(PathBuf::from)
@@ -383,6 +376,7 @@ fn cache_file_fingerprint(path: &Path, hash_contents: bool) -> Result<CacheFileF
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conditioned_decoder_context_signature(
     max_seq: usize,
     dim: usize,
@@ -696,9 +690,7 @@ fn maybe_prepare_conditioned_decoder_cache(
     train_dtype: DType,
     device: &Device,
 ) -> Result<Option<PathBuf>> {
-    let opportunistic_go_cache =
-        env_bool("TOFY_DECODER_PRECOMPUTE_SLOTS", true) && is_go_feedback_decoder_data(data_path);
-    if !allow_build && !require_existing && !opportunistic_go_cache {
+    if !allow_build && !require_existing {
         return Ok(None);
     }
     let Some(source_cache_path) = source_cache_path else {
@@ -753,7 +745,7 @@ fn maybe_prepare_conditioned_decoder_cache(
             cache_path
         );
     }
-    if !allow_build && !opportunistic_go_cache {
+    if !allow_build {
         return Ok(None);
     }
 
@@ -1247,8 +1239,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     };
 
     let run_dir = util::create_run_dir("world")?;
-    let mut tb = SummaryWriter::new(&run_dir);
+    let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
+    let async_checkpoints = env_bool("TOFY_WORLD_ASYNC_CHECKPOINTS", true);
+    let mut checkpoint_writer = if async_checkpoints {
+        Some(util::AsyncCheckpointWriter::new())
+    } else {
+        None
+    };
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
         run_dir
@@ -1312,6 +1310,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         tb.add_scalar("memory/total_mb", vram.total_mb, 0);
         tb.add_scalar("memory/peak_used_mb", vram.peak_used_mb, 0);
     }
+    println!(
+        "World sidecar checkpointing: async={} log_every={}",
+        async_checkpoints, config.log_every
+    );
     tb.flush();
 
     const TARGET_CODE_RATE: f32 = 0.35;
@@ -1323,17 +1325,16 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
+    let post_state_loss_weight = world_post_state_loss_weight();
+    let rollout_loss_weight = world_rollout_loss_weight();
+    let rollout_steps = world_rollout_steps();
     tb.add_scalar(
         "config/post_state_loss_weight",
-        world_post_state_loss_weight() as f32,
+        post_state_loss_weight as f32,
         0,
     );
-    tb.add_scalar(
-        "config/rollout_loss_weight",
-        world_rollout_loss_weight() as f32,
-        0,
-    );
-    tb.add_scalar("config/rollout_steps", world_rollout_steps() as f32, 0);
+    tb.add_scalar("config/rollout_loss_weight", rollout_loss_weight as f32, 0);
+    tb.add_scalar("config/rollout_steps", rollout_steps as f32, 0);
     if start_step >= config.steps {
         println!(
             "World resume checkpoint already reached step {}/{}; skipping training.",
@@ -1404,26 +1405,19 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let pred_next_slots = transition.forward(&state_slots, &action_labels)?;
 
             let transition_loss = prediction_loss(&pred_next_slots, &next_slots)?;
-            let post_state_loss = if world_post_state_loss_weight() > 0.0 {
-                let post_state_slots = context_slots_from_world_post_state_batch(
-                    &encoder,
-                    &context_compressor,
-                    &batch,
-                    encoder_vocab.pad_id,
-                    config.max_seq,
-                    context_segments,
-                    recent_full_segments,
-                    recursive_context_compressor,
-                    !config.train_encoder,
-                    &device,
-                )?;
-                prediction_loss(&pred_next_slots, &post_state_slots)?
+            let post_state_loss = if post_state_loss_weight > 0.0 {
+                transition_loss.clone()
             } else {
                 transition_loss.affine(0.0, 0.0)?
             };
-            let rollout_loss =
-                rollout_loss_from_batch(&transition, &state_slots, &batch, world_rollout_steps())?
-                    .unwrap_or(transition_loss.affine(0.0, 0.0)?);
+            let rollout_loss = rollout_loss_from_batch(
+                &transition,
+                &state_slots,
+                &batch,
+                rollout_steps,
+                rollout_loss_weight,
+            )?
+            .unwrap_or(transition_loss.affine(0.0, 0.0)?);
             let state_sigreg = sigreg_epps_pulley(
                 &flatten_latent_slots(&state_slots)?,
                 sigreg_slices,
@@ -1446,20 +1440,27 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
             let action_logits = action_classifier_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
-            let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
-            let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
-            let inverse_logits_true = inverse_action_classifier.forward(&true_delta_slots)?;
-            let inverse_logits_pred = inverse_action_classifier.forward(&pred_delta_slots)?;
-            let inverse_true_loss =
-                action_cross_entropy(&inverse_logits_true, &action_labels, &device)?;
-            let inverse_pred_loss =
-                action_cross_entropy(&inverse_logits_pred, &action_labels, &device)?;
-            let inverse_loss = inverse_true_loss
-                .broadcast_add(&inverse_pred_loss)?
-                .affine(0.5, 0.0)?;
+            let (inverse_loss, inverse_logits) = if inverse_loss_weight > 0.0 {
+                let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+                let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
+                let inverse_logits_true = inverse_action_classifier.forward(&true_delta_slots)?;
+                let inverse_logits_pred = inverse_action_classifier.forward(&pred_delta_slots)?;
+                let inverse_true_loss =
+                    action_cross_entropy(&inverse_logits_true, &action_labels, &device)?;
+                let inverse_pred_loss =
+                    action_cross_entropy(&inverse_logits_pred, &action_labels, &device)?;
+                (
+                    inverse_true_loss
+                        .broadcast_add(&inverse_pred_loss)?
+                        .affine(0.5, 0.0)?,
+                    Some(inverse_logits_pred),
+                )
+            } else {
+                (transition_loss.affine(0.0, 0.0)?, None)
+            };
             let loss = transition_loss
-                .broadcast_add(&post_state_loss.affine(world_post_state_loss_weight(), 0.0)?)?
-                .broadcast_add(&rollout_loss.affine(world_rollout_loss_weight(), 0.0)?)?
+                .broadcast_add(&post_state_loss.affine(post_state_loss_weight, 0.0)?)?
+                .broadcast_add(&rollout_loss.affine(rollout_loss_weight, 0.0)?)?
                 .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?
                 .broadcast_add(&action_loss.affine(config.action_loss_weight, 0.0)?)?
                 .broadcast_add(&inverse_loss.affine(inverse_loss_weight, 0.0)?)?;
@@ -1479,7 +1480,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             last_rollout_loss = Some(rollout_loss);
             last_loss = Some(loss);
             last_action_logits = Some(action_logits);
-            last_inverse_logits = Some(inverse_logits_pred);
+            last_inverse_logits = inverse_logits;
             last_action_labels = action_labels;
             last_pred_next_slots = Some(pred_next_slots);
             last_next_slots = Some(next_slots);
@@ -1504,8 +1505,6 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let loss = last_loss.context("world grad accumulation produced no total loss")?;
             let action_logits =
                 last_action_logits.context("world grad accumulation produced no action logits")?;
-            let inverse_logits = last_inverse_logits
-                .context("world grad accumulation produced no inverse action logits")?;
             let pred_next_slots = last_pred_next_slots
                 .context("world grad accumulation produced no predicted slots")?;
             let next_slots =
@@ -1520,7 +1519,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let post_state_val = util::scalar_f32(&post_state_loss)?;
             let rollout_val = util::scalar_f32(&rollout_loss)?;
             let action_metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
-            let inverse_metrics = compute_action_metrics(&inverse_logits, &last_action_labels)?;
+            let inverse_metrics = if let Some(inverse_logits) = last_inverse_logits {
+                compute_action_metrics(&inverse_logits, &last_action_labels)?
+            } else {
+                ActionMetrics::default()
+            };
             let pred_slots_flat = flatten_latent_slots(&pred_next_slots)?;
             let next_slots_flat = flatten_latent_slots(&next_slots)?;
             let trans_cos =
@@ -1813,20 +1816,41 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     memory_note
                 );
             }
-            util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
-            if config.train_encoder {
-                util::save_varmap_atomic(&encoder_varmap, &encoder_train_checkpoint_path)?;
-            }
-            opt.save_state(&optimizer_checkpoint_path)?;
-            resume_state = util::TrainingResumeState {
+            let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
                 best_metric,
                 best_aux_metric: best_loss,
                 saved_checkpoint,
             };
-            util::save_resume_state(&resume_state_path, &resume_state)?;
+            let mut checkpoint_artifacts = vec![util::varmap_checkpoint_artifact(
+                &world_varmap,
+                &train_checkpoint_path,
+            )?];
+            if config.train_encoder {
+                checkpoint_artifacts.push(util::varmap_checkpoint_artifact(
+                    &encoder_varmap,
+                    &encoder_train_checkpoint_path,
+                )?);
+            }
+            checkpoint_artifacts.push(util::optimizer_checkpoint_artifact(
+                &opt,
+                &optimizer_checkpoint_path,
+            )?);
+            checkpoint_artifacts.push(util::resume_checkpoint_artifact(
+                &checkpoint_resume_state,
+                &resume_state_path,
+            )?);
+            util::save_checkpoint_job(
+                checkpoint_writer.as_ref(),
+                format!("world step {step}"),
+                checkpoint_artifacts,
+            )?;
         }
+    }
+
+    if let Some(writer) = checkpoint_writer.as_mut() {
+        writer.finish()?;
     }
 
     if !saved_checkpoint {
@@ -1853,6 +1877,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
+    tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "world");
     if saved_checkpoint {
         println!(
@@ -2108,8 +2133,14 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     }
 
     let run_dir = util::create_run_dir("high_world")?;
-    let mut tb = SummaryWriter::new(&run_dir);
+    let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
+    let async_checkpoints = env_bool("TOFY_HIGH_WORLD_ASYNC_CHECKPOINTS", true);
+    let mut checkpoint_writer = if async_checkpoints {
+        Some(util::AsyncCheckpointWriter::new())
+    } else {
+        None
+    };
     println!(
         "Training high-level latent world model: rows={} val={} batch={} macro_len={}..{} slots={} dim={} dtype={:?}",
         train_row_count,
@@ -2126,6 +2157,10 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
         run_dir
+    );
+    println!(
+        "High-world sidecar checkpointing: async={} log_every={}",
+        async_checkpoints, config.log_every
     );
     tb.add_scalar("run/alive", 1.0, 0);
     tb.add_scalar("config/macro_min_len", config.macro_min_len as f32, 0);
@@ -2300,17 +2335,27 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
                     selection_metric
                 );
             }
-            util::save_varmap_atomic(&high_varmap, &train_checkpoint_path)?;
-            opt.save_state(&optimizer_checkpoint_path)?;
-            resume_state = util::TrainingResumeState {
+            let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
                 best_metric,
                 best_aux_metric: best_metric,
                 saved_checkpoint,
             };
-            util::save_resume_state(&resume_state_path, &resume_state)?;
+            util::save_checkpoint_job(
+                checkpoint_writer.as_ref(),
+                format!("high-world step {step}"),
+                vec![
+                    util::varmap_checkpoint_artifact(&high_varmap, &train_checkpoint_path)?,
+                    util::optimizer_checkpoint_artifact(&opt, &optimizer_checkpoint_path)?,
+                    util::resume_checkpoint_artifact(&checkpoint_resume_state, &resume_state_path)?,
+                ],
+            )?;
         }
+    }
+
+    if let Some(writer) = checkpoint_writer.as_mut() {
+        writer.finish()?;
     }
 
     if !saved_checkpoint {
@@ -2328,6 +2373,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
+    tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "high_world");
     println!(
         "High-level world model saved to {:?} (selection {:.4})",
@@ -2514,11 +2560,21 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     );
 
     let run_dir = util::create_run_dir("action_classifier")?;
-    let mut tb = SummaryWriter::new(&run_dir);
+    let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
+    let async_checkpoints = env_bool("TOFY_ORCHESTRATOR_ASYNC_CHECKPOINTS", true);
+    let mut checkpoint_writer = if async_checkpoints {
+        Some(util::AsyncCheckpointWriter::new())
+    } else {
+        None
+    };
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
         run_dir
+    );
+    println!(
+        "Action classifier sidecar checkpointing: async={} log_every={}",
+        async_checkpoints, config.log_every
     );
     tb.add_scalar("run/alive", 1.0, 0);
     let start_step = if config.resume {
@@ -2792,17 +2848,27 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                     memory_note
                 );
             }
-            util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
-            opt.save_state(&optimizer_checkpoint_path)?;
-            resume_state = util::TrainingResumeState {
+            let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
                 best_metric: best_score,
                 best_aux_metric: best_score,
                 saved_checkpoint,
             };
-            util::save_resume_state(&resume_state_path, &resume_state)?;
+            util::save_checkpoint_job(
+                checkpoint_writer.as_ref(),
+                format!("action-classifier step {step}"),
+                vec![
+                    util::varmap_checkpoint_artifact(&world_varmap, &train_checkpoint_path)?,
+                    util::optimizer_checkpoint_artifact(&opt, &optimizer_checkpoint_path)?,
+                    util::resume_checkpoint_artifact(&checkpoint_resume_state, &resume_state_path)?,
+                ],
+            )?;
         }
+    }
+
+    if let Some(writer) = checkpoint_writer.as_mut() {
+        writer.finish()?;
     }
 
     if !saved_checkpoint {
@@ -2819,6 +2885,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
+    tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "action_classifier");
     println!(
         "Best context compressor/action_classifier checkpoint saved to {:?} (selection {:.4})",
@@ -3601,6 +3668,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.num_latent_tokens,
         decoder_arch,
     );
+    let requested_conditioning_loss_weight = config.conditioning_loss_weight;
+    let conditioning_loss_weight = if config.conditioning_negative_forwards {
+        requested_conditioning_loss_weight
+    } else {
+        0.0
+    };
+    let compute_conditioning_metrics =
+        config.conditioning_negative_forwards && env_bool("TOFY_DECODER_ABLATION_METRICS", false);
+    let conditioning_margin = config.conditioning_margin;
+    let conditioning_negatives = if config.conditioning_negative_forwards {
+        DecoderConditioningNegatives::from_env()
+    } else {
+        DecoderConditioningNegatives::none()
+    };
 
     println!(
         "Training ({} decoder with cross-attention to world latent)",
@@ -3630,6 +3711,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         decoder_arch.ff_dim,
         util::format_params(decoder_params)
     );
+    println!(
+        "Decoder negative conditioning forwards: {} (weight={} negatives={})",
+        if config.conditioning_negative_forwards {
+            "on"
+        } else {
+            "off"
+        },
+        conditioning_loss_weight,
+        conditioning_negatives.count()
+    );
     println!("Save path: {:?}", decoder_path);
     println!("Decoder vocab path: {:?}", decoder_vocab_path);
     if let Some(parent) = decoder_path.parent() {
@@ -3642,11 +3733,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let run_dir = util::create_run_dir("decoder")?;
     let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
-    let conditioning_loss_weight = config.conditioning_loss_weight;
-    let compute_conditioning_metrics =
-        conditioning_loss_weight > 0.0 || env_bool("TOFY_DECODER_ABLATION_METRICS", false);
-    let conditioning_margin = config.conditioning_margin;
-    let conditioning_negatives = DecoderConditioningNegatives::from_env();
     let prompt_dropout = std::env::var("TOFY_DECODER_PROMPT_DROPOUT")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -3685,6 +3771,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     tb.add_scalar(
         "config/conditioning_loss_weight",
         conditioning_loss_weight as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/requested_conditioning_loss_weight",
+        requested_conditioning_loss_weight as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/conditioning_negative_forwards",
+        if config.conditioning_negative_forwards {
+            1.0
+        } else {
+            0.0
+        },
         0,
     );
     tb.add_scalar("config/prompt_dropout", prompt_dropout as f32, 0);
@@ -3752,9 +3852,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
     let mut decoder_context_cache = DecoderContextCache::from_env();
-    let training_needed = start_step < config.steps;
     let build_only_conditioned_cache = config.build_conditioned_cache && config.steps == 0;
-    let should_prepare_conditioned_cache = training_needed || config.build_conditioned_cache;
+    let should_prepare_conditioned_cache =
+        config.build_conditioned_cache || config.from_conditioned_cache;
     let conditioned_decoder_cache_path = if should_prepare_conditioned_cache {
         maybe_prepare_conditioned_decoder_cache(
             &data_path,
@@ -3859,8 +3959,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         }
         let mut micro_batches = Vec::with_capacity(grad_accum_steps);
         let mut prefill_encoder_batch = Vec::with_capacity(batch_size * grad_accum_steps);
+        let logging_step = step % config.log_every == 0;
 
-        for _micro_step in 0..grad_accum_steps {
+        for micro_step in 0..grad_accum_steps {
+            let capture_micro_metrics = logging_step && micro_step + 1 == grad_accum_steps;
             let micro_batch = if let Some(ref mut conditioned_stream) = conditioned_decoder_stream {
                 let conditioned_batch = conditioned_stream.next_batch(batch_size.max(1))?;
                 let decoder_batch = conditioned_batch
@@ -3874,7 +3976,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     train_dtype,
                     &device,
                 )?;
-                let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
+                let oov_rate = if capture_micro_metrics {
+                    encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id)
+                } else {
+                    0.0
+                };
                 DecoderMicroBatch {
                     encoder_batch: Vec::new(),
                     decoder_batch,
@@ -3891,7 +3997,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     .iter()
                     .map(|row| row.decoder.clone())
                     .collect::<Vec<_>>();
-                let oov_rate = encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id);
+                let oov_rate = if capture_micro_metrics {
+                    encoded_examples_oov_rate(&decoder_batch, decoder_vocab.unk_id)
+                } else {
+                    0.0
+                };
                 DecoderMicroBatch {
                     encoder_batch,
                     decoder_batch,
@@ -3903,8 +4013,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
                 let decoder_batch =
                     encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
-                let oov_rate =
-                    raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode);
+                let oov_rate = if capture_micro_metrics {
+                    raw_examples_oov_rate(&raw_batch, &decoder_vocab, decoder_token_mode)
+                } else {
+                    0.0
+                };
                 DecoderMicroBatch {
                     encoder_batch,
                     decoder_batch,
@@ -3942,7 +4055,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         };
 
         let mut row_offset = 0usize;
-        for micro_batch in micro_batches {
+        let micro_batch_count = micro_batches.len();
+        for (micro_idx, micro_batch) in micro_batches.into_iter().enumerate() {
+            let capture_micro_metrics = logging_step && micro_idx + 1 == micro_batch_count;
             let DecoderMicroBatch {
                 encoder_batch,
                 decoder_batch,
@@ -3985,7 +4100,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             };
             if config.mtp_loss_weight > 0.0 {
                 loss = loss.broadcast_add(&mtp_loss.affine(config.mtp_loss_weight, 0.0)?)?;
-                last_mtp_loss_val = util::scalar_f32(&mtp_loss)?;
+                if capture_micro_metrics {
+                    last_mtp_loss_val = util::scalar_f32(&mtp_loss)?;
+                }
             } else {
                 last_mtp_loss_val = 0.0;
             }
@@ -4063,7 +4180,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 token_loss.affine(0.0, 0.0)?
             };
             if conditioning_loss_weight > 0.0 {
-                last_conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
+                if capture_micro_metrics {
+                    last_conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
+                }
                 loss =
                     loss.broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
             } else {
@@ -4296,7 +4415,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
-                        config.conditioning_loss_weight,
+                        compute_conditioning_metrics,
                         config.max_seq,
                         &device,
                     )?
@@ -4316,7 +4435,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         &decoder,
                         config.decoder_kind,
                         decoder_action_label,
-                        config.conditioning_loss_weight,
+                        compute_conditioning_metrics,
                         config.max_seq,
                         &device,
                     )?
@@ -4792,13 +4911,13 @@ pub struct AgentEngine {
     /// JEPA-style action_classifier: predicts next action from transition latent. None if checkpoint has no head.
     action_classifier_head: Option<NextActionClassifier>,
     max_seq: usize,
-    bridge_dim: usize,
-    num_latent_tokens: usize,
     context_segments: usize,
     recent_full_segments: usize,
     recursive_context_compressor: bool,
     world_rollout_steps: usize,
     high_macro_max_len: usize,
+    code_decoder: Option<Arc<CandleCrossAttnDecoder>>,
+    text_decoder: Option<Arc<CandleCrossAttnDecoder>>,
 }
 
 /// Returns true if the safetensors file contains any tensor whose name starts with `prefix`.
@@ -5230,6 +5349,21 @@ impl AgentEngine {
             } else {
                 (None, None, None)
             };
+        let explicit_code_decoder = std::env::var("JEPA_USE_CANDLE_DECODER")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let code_decoder =
+            match CandleCrossAttnDecoder::try_new_from_env_code(bridge_dim, num_latent_tokens) {
+                Ok(decoder) => Some(Arc::new(decoder)),
+                Err(err) if explicit_code_decoder => {
+                    anyhow::bail!("explicit Candle code decoder failed to load: {err:#}")
+                }
+                Err(_) => None,
+            };
+        let text_decoder =
+            CandleCrossAttnDecoder::try_new_from_env_text(bridge_dim, num_latent_tokens)
+                .ok()
+                .map(Arc::new);
         Ok(Self {
             device,
             _encoder_varmap: encoder_varmap,
@@ -5244,8 +5378,6 @@ impl AgentEngine {
             macro_transition,
             action_classifier_head,
             max_seq,
-            bridge_dim,
-            num_latent_tokens,
             context_segments: std::env::var("TOFY_ENCODER_CONTEXT_SEGMENTS")
                 .ok()
                 .or_else(|| std::env::var("TOFY_WORLD_CONTEXT_SEGMENTS").ok())
@@ -5265,6 +5397,8 @@ impl AgentEngine {
                 .unwrap_or(1usize)
                 .max(1),
             high_macro_max_len,
+            code_decoder,
+            text_decoder,
         })
     }
 
@@ -5683,26 +5817,10 @@ impl AgentEngine {
             .pool(next_context_slots)?
             .squeeze(0)?;
         let pooled_planner = util::vec1_f32(&pooled_planner)?;
-        let explicit_code_decoder = std::env::var("JEPA_USE_CANDLE_DECODER")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let code_decoder = match CandleCrossAttnDecoder::try_new_from_env_code(
-            self.bridge_dim,
-            self.num_latent_tokens,
-        ) {
-            Ok(decoder) => Some(decoder),
-            Err(err) if explicit_code_decoder => {
-                anyhow::bail!("explicit Candle code decoder failed to load: {err:#}")
-            }
-            Err(_) => None,
-        };
-        let text_decoder =
-            CandleCrossAttnDecoder::try_new_from_env_text(self.bridge_dim, self.num_latent_tokens)
-                .ok();
         let (decoder, mut cond_vec): (Box<dyn LocalDecoderRuntime>, Vec<f32>) =
             if action == crate::tasks::orchestrator::Action::Code {
-                if let Some(d) = code_decoder {
-                    (Box::new(d), planner_vec.clone())
+                if let Some(d) = self.code_decoder.as_ref() {
+                    (Box::new(Arc::clone(d)), planner_vec.clone())
                 } else {
                     (
                         match LlamaCppDecoder::try_new() {
@@ -5713,8 +5831,8 @@ impl AgentEngine {
                     )
                 }
             } else {
-                if let Some(d) = text_decoder {
-                    (Box::new(d), planner_vec.clone())
+                if let Some(d) = self.text_decoder.as_ref() {
+                    (Box::new(Arc::clone(d)), planner_vec.clone())
                 } else {
                     (
                         match LlamaCppDecoder::try_new() {
@@ -6599,41 +6717,6 @@ fn context_slots_from_world_pair_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn context_slots_from_world_post_state_batch(
-    encoder: &OnlineEncoder,
-    context_compressor: &ContextCompressor,
-    batch: &[WorldExample],
-    pad_id: u32,
-    max_seq: usize,
-    context_segments: usize,
-    recent_full_segments: usize,
-    recursive_context_compressor: bool,
-    detach_encoder: bool,
-    device: &Device,
-) -> Result<Tensor> {
-    if batch.is_empty() {
-        bail!("world post-state batch is empty");
-    }
-    let post_state_sequences = world_post_state_token_sequences(batch);
-    let refs = post_state_sequences
-        .iter()
-        .map(|tokens| tokens.as_slice())
-        .collect::<Vec<_>>();
-    context_slots_from_token_sequences_with_detach(
-        encoder,
-        context_compressor,
-        &refs,
-        pad_id,
-        max_seq,
-        context_segments,
-        recent_full_segments,
-        recursive_context_compressor,
-        detach_encoder,
-        device,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn context_slots_from_world_pair_sequences(
     encoder: &OnlineEncoder,
     context_compressor: &ContextCompressor,
@@ -6716,35 +6799,63 @@ fn continuation_overlap(left: &[u32], right: &[u32]) -> usize {
     0
 }
 
-fn continuation_edge_score(from: &WorldExample, to: &WorldExample) -> usize {
-    if from.state_tokens.is_empty() || from.next_tokens.is_empty() || to.state_tokens.is_empty() {
+fn continuation_edge_score_with_combined(
+    from_next_tokens: &[u32],
+    combined: &[u32],
+    to: &WorldExample,
+) -> usize {
+    if from_next_tokens.is_empty() || combined.is_empty() || to.state_tokens.is_empty() {
         return 0;
     }
-    let mut combined = Vec::with_capacity(from.state_tokens.len() + from.next_tokens.len());
-    combined.extend(from.state_tokens.iter().copied());
-    combined.extend(from.next_tokens.iter().copied());
     if to.state_tokens.starts_with(&combined) {
         return combined.len();
     }
     if combined.ends_with(&to.state_tokens) {
         return to.state_tokens.len();
     }
-    let next_overlap = continuation_overlap(&from.next_tokens, &to.state_tokens);
+    let next_overlap = continuation_overlap(from_next_tokens, &to.state_tokens);
     let combined_overlap = continuation_overlap(&combined, &to.state_tokens);
     next_overlap.max(combined_overlap)
 }
 
 fn continuation_edges(batch: &[WorldExample]) -> Vec<Option<usize>> {
     let min_overlap = env_usize("TOFY_WORLD_ROLLOUT_MIN_OVERLAP", 24);
+    let mut by_first_token: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, row) in batch.iter().enumerate() {
+        if let Some(&first) = row.state_tokens.first() {
+            by_first_token.entry(first).or_default().push(idx);
+        }
+    }
+
     let mut edges = vec![None; batch.len()];
     for (from_idx, from) in batch.iter().enumerate() {
+        if from.state_tokens.is_empty() || from.next_tokens.is_empty() {
+            continue;
+        }
         let mut best = None;
         let mut best_score = min_overlap.saturating_sub(1);
-        for (to_idx, to) in batch.iter().enumerate() {
+        let mut combined = Vec::with_capacity(from.state_tokens.len() + from.next_tokens.len());
+        combined.extend(from.state_tokens.iter().copied());
+        combined.extend(from.next_tokens.iter().copied());
+
+        let mut candidate_tokens = combined.clone();
+        candidate_tokens.sort_unstable();
+        candidate_tokens.dedup();
+        let mut candidate_indices = Vec::new();
+        for token in candidate_tokens {
+            if let Some(indices) = by_first_token.get(&token) {
+                candidate_indices.extend(indices.iter().copied());
+            }
+        }
+        candidate_indices.sort_unstable();
+        candidate_indices.dedup();
+
+        for to_idx in candidate_indices {
             if from_idx == to_idx {
                 continue;
             }
-            let score = continuation_edge_score(from, to);
+            let score =
+                continuation_edge_score_with_combined(&from.next_tokens, &combined, &batch[to_idx]);
             if score > best_score {
                 best = Some(to_idx);
                 best_score = score;
@@ -6772,8 +6883,9 @@ fn rollout_loss_from_batch(
     state_slots: &Tensor,
     batch: &[WorldExample],
     rollout_steps: usize,
+    rollout_loss_weight: f64,
 ) -> Result<Option<Tensor>> {
-    if batch.len() < 2 || world_rollout_loss_weight() == 0.0 {
+    if batch.len() < 2 || rollout_loss_weight == 0.0 {
         return Ok(None);
     }
     let edges = continuation_edges(batch);
@@ -6862,14 +6974,19 @@ struct DecoderConditioningNegatives {
 }
 
 impl DecoderConditioningNegatives {
-    fn from_env() -> Self {
-        let value = std::env::var("TOFY_DECODER_CONDITIONING_NEGATIVES")
-            .unwrap_or_else(|_| "zero,shuffle".to_string());
-        let mut out = Self {
+    fn none() -> Self {
+        Self {
             zero: false,
             shuffle: false,
             hard: false,
-        };
+        }
+    }
+
+    fn from_env() -> Self {
+        let value = std::env::var("TOFY_DECODER_CONDITIONING_NEGATIVES")
+            .unwrap_or_else(|_| "zero,shuffle".to_string());
+        let mut out = Self::none();
+        let mut allow_empty = false;
         for part in value.split(',') {
             match part.trim().to_ascii_lowercase().as_str() {
                 "all" => {
@@ -6877,7 +6994,8 @@ impl DecoderConditioningNegatives {
                     out.shuffle = true;
                     out.hard = true;
                 }
-                "zero" | "ablated" | "none" => out.zero = true,
+                "zero" | "ablated" => out.zero = true,
+                "none" => allow_empty = true,
                 "shuffle" | "shuffled" => out.shuffle = true,
                 "hard" | "hard_mismatch" | "mismatch" => out.hard = true,
                 "" => {}
@@ -6886,7 +7004,7 @@ impl DecoderConditioningNegatives {
                 }
             }
         }
-        if out.count() == 0 {
+        if out.count() == 0 && !allow_empty {
             out.zero = true;
         }
         out

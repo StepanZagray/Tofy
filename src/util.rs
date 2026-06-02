@@ -984,6 +984,49 @@ pub enum CheckpointArtifact {
     },
 }
 
+pub fn varmap_checkpoint_artifact(varmap: &VarMap, path: &Path) -> Result<CheckpointArtifact> {
+    Ok(CheckpointArtifact::TensorMap {
+        path: path.to_path_buf(),
+        tensors: varmap_tensor_snapshot(varmap)?,
+    })
+}
+
+pub fn optimizer_checkpoint_artifact(
+    opt: &TrainOptimizer,
+    path: &Path,
+) -> Result<CheckpointArtifact> {
+    Ok(CheckpointArtifact::TensorMap {
+        path: path.to_path_buf(),
+        tensors: opt.state_tensors_snapshot()?,
+    })
+}
+
+pub fn resume_checkpoint_artifact(
+    state: &TrainingResumeState,
+    path: &Path,
+) -> Result<CheckpointArtifact> {
+    Ok(CheckpointArtifact::Json {
+        path: path.to_path_buf(),
+        text: serde_json::to_string_pretty(state)?,
+    })
+}
+
+pub fn save_checkpoint_job(
+    writer: Option<&AsyncCheckpointWriter>,
+    label: String,
+    artifacts: Vec<CheckpointArtifact>,
+) -> Result<bool> {
+    if artifacts.is_empty() {
+        return Ok(true);
+    }
+    if let Some(writer) = writer {
+        writer.try_submit(CheckpointJob { label, artifacts })
+    } else {
+        save_checkpoint_artifacts(artifacts)?;
+        Ok(true)
+    }
+}
+
 impl AsyncCheckpointWriter {
     pub fn new() -> Self {
         let shared = Arc::new(CheckpointQueue {
@@ -1034,6 +1077,12 @@ impl AsyncCheckpointWriter {
             );
         }
         Ok(saved)
+    }
+}
+
+impl Default for AsyncCheckpointWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

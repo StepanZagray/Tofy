@@ -145,7 +145,7 @@ Default behavior:
   - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
   - model-failure Go feedback mining defaults to `1024` rows on `8gb`, `2048` on `48gb`, and `4096` on `80gb`; set `TOFY_GO_MODEL_FEEDBACK_ROWS=0` to disable
   - Go compile/test eval runs by default for verifier-guided base vs Go-feedback decoder promotion
-  - code eval defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set
+  - direct `--eval-code-assistant` defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set; the canonical pipeline and Pi-style manual eval pass `--pi-agent-env` after loading `scripts/tofy_pi_runtime_env.sh`
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline
 - the 48 GB A40 profile is available through `cargo run --release -- train 48gb`:
   - uses shared `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`, `HEADS=16`
@@ -220,7 +220,8 @@ Run the code-assistant eval suite:
 
 ```bash
 cargo run --release -- --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
-cargo run --release -- --eval-code-assistant local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt local_models/model_world_<size>.safetensors eval/code_assistant_go_hard.jsonl 384 768 256 9 8 256 64 --code-decoder local_models/code_decoder_90M.safetensors --go-timeout-sec 6
+source scripts/tofy_pi_runtime_env.sh latest 80gb
+cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --pi-agent-env --go-timeout-sec 6
 ```
 
 Main KPI from this eval:

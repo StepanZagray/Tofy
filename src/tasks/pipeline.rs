@@ -567,7 +567,8 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
-    set_env_default("TOFY_DECODER_ABLATION_METRICS", "1");
+    set_env_default("TOFY_DECODER_NEGATIVE_FORWARDS", "0");
+    set_env_default("TOFY_DECODER_ABLATION_METRICS", "0");
     set_env_default("TOFY_DECODER_PROMPT_DROPOUT", "0.12");
     set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.05");
     set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.15");
@@ -1800,6 +1801,7 @@ fn run_code_eval(
         "8".to_string(),
         "--repair-attempts".to_string(),
         "4".to_string(),
+        "--pi-agent-env".to_string(),
         "--go-timeout-sec".to_string(),
         "10".to_string(),
     ];
@@ -1877,7 +1879,7 @@ fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Resul
     let info_path = artifact_dir.join(format!("{base_name}.info.txt"));
 
     let archive_inputs = prepare_cache_archive_inputs()?;
-    write_prepare_cache_info(&info_path, profile, &repo, &archive_path, &archive_inputs)?;
+    write_prepare_cache_info(&info_path, profile, repo, &archive_path, &archive_inputs)?;
 
     println!("Archiving prepared cache to {}", archive_path.display());
     let mut tar = Command::new("tar");
@@ -1887,8 +1889,8 @@ fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Resul
     }
     run_external_command(&mut tar, "archive prepared cache")?;
 
-    upload_hf_file(&repo, &info_path)?;
-    upload_hf_file(&repo, &archive_path)?;
+    upload_hf_file(repo, &info_path)?;
+    upload_hf_file(repo, &archive_path)?;
     println!(
         "Uploaded prepared cache archive to Hugging Face dataset {repo}: {}",
         archive_path

@@ -103,4 +103,4 @@ and Go repair rows, then trains
 `runs/.../decoder_code_go_feedback/model.safetensors` initialized from the base
 code decoder.
 
-The full assistant eval uses the same plain repair prompt shape and defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set before the eval command.
+The assistant eval uses the same plain repair prompt shape. Direct manual eval defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set before the eval command; the canonical pipeline and Pi-style eval pass `--pi-agent-env` after loading `scripts/tofy_pi_runtime_env.sh`.

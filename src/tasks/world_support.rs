@@ -17,7 +17,7 @@ use crate::tasks::world::{
 };
 use crate::util;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ActionMetrics {
     pub(crate) accuracy: f32,
     pub(crate) balanced_accuracy: f32,
@@ -877,15 +877,22 @@ pub(crate) fn evaluate_world_encoded_batch(
         .affine(1.0 / 3.0, 0.0)?;
     let action_logits = action_classifier_head.forward(&state_slots)?;
     let action_loss = action_cross_entropy(&action_logits, &action_labels, device)?;
-    let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
-    let pred_delta_slots = slot_delta_slots(&pred_slots, &state_slots)?;
-    let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
-    let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;
-    let inverse_true_loss = action_cross_entropy(&inverse_logits_true, &action_labels, device)?;
-    let inverse_pred_loss = action_cross_entropy(&inverse_logits_pred, &action_labels, device)?;
-    let inverse_loss = inverse_true_loss
-        .broadcast_add(&inverse_pred_loss)?
-        .affine(0.5, 0.0)?;
+    let (inverse_loss, inverse_action_metrics) = if inverse_loss_weight > 0.0 {
+        let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+        let pred_delta_slots = slot_delta_slots(&pred_slots, &state_slots)?;
+        let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
+        let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;
+        let inverse_true_loss = action_cross_entropy(&inverse_logits_true, &action_labels, device)?;
+        let inverse_pred_loss = action_cross_entropy(&inverse_logits_pred, &action_labels, device)?;
+        (
+            inverse_true_loss
+                .broadcast_add(&inverse_pred_loss)?
+                .affine(0.5, 0.0)?,
+            compute_action_metrics(&inverse_logits_pred, &action_labels)?,
+        )
+    } else {
+        (pred_loss.affine(0.0, 0.0)?, ActionMetrics::default())
+    };
     let total_loss = pred_loss
         .broadcast_add(&sigreg_loss.affine(lambda, 0.0)?)?
         .broadcast_add(&action_loss.affine(action_loss_weight, 0.0)?)?
@@ -897,7 +904,7 @@ pub(crate) fn evaluate_world_encoded_batch(
         action_loss: util::scalar_f32(&action_loss)?,
         inverse_loss: util::scalar_f32(&inverse_loss)?,
         action_metrics: compute_action_metrics(&action_logits, &action_labels)?,
-        inverse_action_metrics: compute_action_metrics(&inverse_logits_pred, &action_labels)?,
+        inverse_action_metrics,
         transition_cosine: util::scalar_f32(&mean_cosine_similarity(&pred_slots, &next_slots)?)?,
     })
 }
@@ -914,7 +921,7 @@ pub(crate) fn evaluate_decoder_batch(
     decoder: &CodeDecoder,
     decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
-    conditioning_loss_weight: f64,
+    compute_conditioning_metrics: bool,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -941,7 +948,7 @@ pub(crate) fn evaluate_decoder_batch(
         decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
-        conditioning_loss_weight,
+        compute_conditioning_metrics,
         max_seq,
         device,
     )
@@ -959,7 +966,7 @@ pub(crate) fn evaluate_decoder_cached_batch(
     decoder: &CodeDecoder,
     _decoder_kind: crate::model::DecoderKind,
     decoder_action_label: u32,
-    conditioning_loss_weight: f64,
+    compute_conditioning_metrics: bool,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -984,7 +991,7 @@ pub(crate) fn evaluate_decoder_cached_batch(
         decoder_conditioning_adapter,
         decoder,
         decoder_action_label,
-        conditioning_loss_weight,
+        compute_conditioning_metrics,
         max_seq,
         device,
     )
@@ -1003,7 +1010,7 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     decoder_conditioning_adapter: &DecoderConditioningAdapter,
     decoder: &CodeDecoder,
     decoder_action_label: u32,
-    conditioning_loss_weight: f64,
+    compute_conditioning_metrics: bool,
     max_seq: usize,
     device: &Device,
 ) -> Result<DecoderBatchMetrics> {
@@ -1011,8 +1018,6 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let rollout_steps = env_usize("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", 1);
-    let compute_conditioning_metrics =
-        conditioning_loss_weight > 0.0 || env_bool("TOFY_DECODER_ABLATION_METRICS", false);
     let state_tokens = encoder_batch
         .iter()
         .map(|row| row.state_tokens.as_slice())
@@ -1037,7 +1042,6 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let adapter_action_labels = vec![decoder_action_label; decoder_batch.len()];
     let world_latent = decoder_conditioning_adapter
         .forward_with_actions(&next_context_slots.detach(), &adapter_action_labels)?;
-    let zero_world_latent = world_latent.affine(0.0, 0.0)?;
     let (dec_input, dec_target, loss_mask) =
         make_decoder_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
     let logits = decoder.forward(&dec_input, &world_latent)?;
@@ -1053,6 +1057,7 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let structure_loss = masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
     let loss_val = util::scalar_f32(&loss)?;
     let ablated_loss_val = if compute_conditioning_metrics {
+        let zero_world_latent = world_latent.affine(0.0, 0.0)?;
         let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
         let ablated_loss = masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
         util::scalar_f32(&ablated_loss)?

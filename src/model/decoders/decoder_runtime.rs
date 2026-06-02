@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 pub trait LocalDecoderRuntime {
     #[allow(dead_code)]
@@ -30,6 +31,33 @@ pub trait LocalDecoderRuntime {
             on_chunk(&full);
         }
         Ok(())
+    }
+}
+
+impl<T: LocalDecoderRuntime + ?Sized> LocalDecoderRuntime for Arc<T> {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+
+    fn generate(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+    ) -> Result<String> {
+        (**self).generate(prompt, action, conditioning, max_new_tokens)
+    }
+
+    fn generate_stream(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        (**self).generate_stream(prompt, action, conditioning, max_new_tokens, on_chunk)
     }
 }
 

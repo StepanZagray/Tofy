@@ -3,7 +3,6 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use std::fs;
 use std::path::PathBuf;
-use tensorboard_rs::summary_writer::SummaryWriter;
 
 use crate::cli::resolve_data_path;
 use crate::config::{LatentEvalConfig, LatentTrainConfig};
@@ -27,6 +26,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
         .max(1)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
 }
 
 fn latent_grad_accum_for_step(step: usize, config: &LatentTrainConfig) -> usize {
@@ -446,8 +452,14 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     };
 
     let run_dir = util::create_run_dir("latent")?;
-    let mut tb = SummaryWriter::new(&run_dir);
+    let mut tb = util::AsyncSummaryWriter::new(&run_dir);
     let mut vram_tracker = util::VramTracker::default();
+    let async_checkpoints = env_bool("TOFY_LATENT_ASYNC_CHECKPOINTS", true);
+    let mut checkpoint_writer = if async_checkpoints {
+        Some(util::AsyncCheckpointWriter::new())
+    } else {
+        None
+    };
     println!("LeJEPA: online masked-view prediction + SIGReg");
     println!(
         "TensorBoard run dir: {} (view with: tensorboard --logdir runs)",
@@ -456,6 +468,10 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     println!(
         "Streaming shuffle buffer: {}",
         DEFAULT_STREAM_SHUFFLE_BUFFER
+    );
+    println!(
+        "Latent sidecar checkpointing: async={} log_every={}",
+        async_checkpoints, config.log_every
     );
     tb.add_scalar("run/alive", 1.0, 0);
     tb.add_scalar("resume/start_step", start_step as f32, 0);
@@ -730,17 +746,27 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     memory_note,
                 );
             }
-            util::save_varmap_atomic(&varmap, &train_checkpoint_path)?;
-            opt.save_state(&optimizer_checkpoint_path)?;
-            resume_state = util::TrainingResumeState {
+            let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
                 best_metric: best_pred,
                 best_aux_metric: best_pred,
                 saved_checkpoint,
             };
-            util::save_resume_state(&resume_state_path, &resume_state)?;
+            util::save_checkpoint_job(
+                checkpoint_writer.as_ref(),
+                format!("latent step {step}"),
+                vec![
+                    util::varmap_checkpoint_artifact(&varmap, &train_checkpoint_path)?,
+                    util::optimizer_checkpoint_artifact(&opt, &optimizer_checkpoint_path)?,
+                    util::resume_checkpoint_artifact(&checkpoint_resume_state, &resume_state_path)?,
+                ],
+            )?;
         }
+    }
+
+    if let Some(writer) = checkpoint_writer.as_mut() {
+        writer.finish()?;
     }
 
     if !saved_checkpoint {
@@ -761,6 +787,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     };
     util::save_resume_state(&resume_state_path, &resume_state)?;
     tb.flush();
+    tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "latent");
     if saved_checkpoint {
         println!(

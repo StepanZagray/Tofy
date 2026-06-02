@@ -66,7 +66,7 @@ Decoder checkpoints written after this change include `conditioner=action_aware_
 
 ## Latent test-time reasoning
 
-Before the Candle or GGUF decoder receives conditioning, Tofy can refine the planned context slots in latent space. This follows the recurrent-depth test-time compute direction: spend compute on latent state updates, then decode once. Code eval disables this by default unless `TOFY_LATENT_REASONING` is already set, so eval remains comparable to direct decoder training.
+Before the Candle or GGUF decoder receives conditioning, Tofy can refine the planned context slots in latent space. This follows the recurrent-depth test-time compute direction: spend compute on latent state updates, then decode once. Code eval disables this by default unless `TOFY_LATENT_REASONING` is already set, so eval remains comparable to direct decoder training. Pass `--pi-agent-env` to `--eval-code-assistant` to use the same default as serve/Pi.
 
 Useful controls:
 
@@ -79,7 +79,7 @@ Useful controls:
 
 ## Recursive decoder
 
-Decoder backends can be wrapped with the generic recursive decoder scaffold (`TOFY_DECODER_RLM=1`, default). The wrapper keeps the full request as external environment state, splits long prompts into semantic work units, executes a small RLM command program, invokes `SUB_RLM` recursively on bounded snippets, and joins stored sub-call outputs as the final response. Short code prompts no longer recurse just because the action is `code`; they recurse only when they meet `TOFY_DECODER_RLM_MIN_CHARS`. Code eval also defaults `TOFY_DECODER_RLM=0` unless explicitly overridden.
+Decoder backends can be wrapped with the generic recursive decoder scaffold (`TOFY_DECODER_RLM=1`, default). The wrapper keeps the full request as external environment state, splits long prompts into semantic work units, executes a small RLM command program, invokes `SUB_RLM` recursively on bounded snippets, and joins stored sub-call outputs as the final response. Short code prompts no longer recurse just because the action is `code`; they recurse only when they meet `TOFY_DECODER_RLM_MIN_CHARS`. Code eval also defaults `TOFY_DECODER_RLM=0` unless explicitly overridden or run with `--pi-agent-env`.
 
 Useful controls:
 
