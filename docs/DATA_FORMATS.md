@@ -27,7 +27,7 @@ Formats and paths for JEPA, world model, and decoder training. See [RUNBOOK.md](
 
 ## Prepared cache HF upload
 
-After Stage 1 completes locally or on a pod, you can publish the handoff tree to
+Prepare the full cache on your local machine, then publish the handoff tree to
 a Hugging Face **dataset** you control:
 
 ```bash
@@ -49,6 +49,7 @@ Requirements:
 The command archives:
 
 - `data/` (including `data/cache/` token caches and manifests)
+- `data/cache/go_feedback/` for the Go-feedback decoder cache
 - `eval/`
 - `local_models/vocabs/`
 
@@ -70,6 +71,10 @@ zstd decoding.
 
 Use the same memory profile (`8gb`, `48gb`, or `80gb`) when training as when the
 cache was built.
+
+On RunPod, train with `TOFY_REQUIRE_PREPARED_CACHE=1` so missing or mismatched
+cache files fail fast instead of being rebuilt on the network volume. The
+RunPod training script enables this by default.
 
 ## Technical / wiki-like / expert world model data
 

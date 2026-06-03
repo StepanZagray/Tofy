@@ -38,9 +38,27 @@ echo "Prepared cache:"
 du -sh data/cache eval local_models 2>/dev/null || true
 ls -lh data/cache eval local_models/vocabs 2>/dev/null || true
 
-if [[ ! -d local_models/vocabs ]]; then
-  echo "error: local_models/vocabs is missing after cache extraction" >&2
-  exit 1
-fi
+required_paths=(
+  "local_models/vocabs"
+  "data/cache/encoder.tokens.bin"
+  "data/cache/encoder_tokens.manifest.json"
+  "data/cache/world.tokens.bin"
+  "data/cache/world_tokens.manifest.json"
+  "data/cache/code_decoder.tokens.bin"
+  "data/cache/code_decoder_tokens.manifest.json"
+  "data/cache/code_decoder_dual.tokens.bin"
+  "data/cache/code_decoder_dual_tokens.manifest.json"
+  "data/cache/go_feedback/code_decoder.tokens.bin"
+  "data/cache/go_feedback/code_decoder_tokens.manifest.json"
+  "data/cache/go_feedback/code_decoder_dual.tokens.bin"
+  "data/cache/go_feedback/code_decoder_dual_tokens.manifest.json"
+)
+for path in "${required_paths[@]}"; do
+  if [[ ! -e "$path" ]]; then
+    echo "error: prepared cache archive is missing required path: $path" >&2
+    echo "Rebuild and upload locally with: cargo run --release -- prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset>" >&2
+    exit 1
+  fi
+done
 
 cargo build --release

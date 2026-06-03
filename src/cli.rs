@@ -41,7 +41,7 @@ pub fn print_usage(program: &str) {
     eprintln!(
         "      Go eval selection runs by default; --with-code-eval is accepted for old scripts."
     );
-    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]");
+    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]  # build full local pod cache");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );

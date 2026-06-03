@@ -83,6 +83,7 @@ struct PrepareCacheConfig {
     world_max_seq: usize,
     code_max_seq: usize,
     force: bool,
+    require_hit: bool,
 }
 
 struct VocabCacheSpec<'a> {
@@ -94,6 +95,7 @@ struct VocabCacheSpec<'a> {
     vocab_path: &'a Path,
     manifest_path: &'a Path,
     force: bool,
+    require_hit: bool,
 }
 
 struct TokenCacheRawCaps {
@@ -109,6 +111,7 @@ struct TokenCacheSpec<'a> {
     token_cache_path: &'a Path,
     manifest_path: &'a Path,
     force: bool,
+    require_hit: bool,
 }
 
 pub fn try_run_prepare_pipeline_cache(args: &[String]) -> Result<bool> {
@@ -126,7 +129,7 @@ impl PrepareCacheConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         if args.len() < 3 {
             bail!(
-                "usage: --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] [--encoder-max-vocab N] [--code-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--code-max-seq N] [--force]"
+                "usage: --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] [--encoder-max-vocab N] [--code-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--code-max-seq N] [--force] [--require-hit]"
             );
         }
         let mut encoder_max_vocab = 8_000usize;
@@ -135,6 +138,7 @@ impl PrepareCacheConfig {
         let mut world_max_seq = 256usize;
         let mut code_max_seq = 192usize;
         let mut force = false;
+        let mut require_hit = false;
         let mut positional = Vec::new();
         let mut i = 0usize;
         while i < args.len() {
@@ -163,12 +167,19 @@ impl PrepareCacheConfig {
                     force = true;
                     i += 1;
                 }
+                "--require-hit" => {
+                    require_hit = true;
+                    i += 1;
+                }
                 value if value.starts_with("--") => bail!("unknown cache flag: {value}"),
                 value => {
                     positional.push(value.to_string());
                     i += 1;
                 }
             }
+        }
+        if force && require_hit {
+            bail!("--force cannot be combined with --require-hit");
         }
         let encoder_data = PathBuf::from(&positional[0]);
         let world_data = PathBuf::from(&positional[1]);
@@ -198,6 +209,7 @@ impl PrepareCacheConfig {
             world_max_seq,
             code_max_seq,
             force,
+            require_hit,
         })
     }
 }
@@ -250,6 +262,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                 vocab_path: &config.encoder_vocab_path,
                 manifest_path: &encoder_vocab_manifest,
                 force: config.force,
+                require_hit: config.require_hit,
             })
         });
         let code = scope.spawn(|| {
@@ -262,6 +275,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                 vocab_path: &config.code_vocab_path,
                 manifest_path: &code_vocab_manifest,
                 force: config.force,
+                require_hit: config.require_hit,
             })
         });
         Ok((
@@ -292,6 +306,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     token_cache_path: &encoder_tokens,
                     manifest_path: &encoder_tokens_manifest,
                     force: config.force,
+                    require_hit: config.require_hit,
                 },
                 &encoder_vocab,
             )
@@ -307,6 +322,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     token_cache_path: &world_tokens,
                     manifest_path: &world_tokens_manifest,
                     force: config.force,
+                    require_hit: config.require_hit,
                 },
                 &encoder_vocab,
             )
@@ -322,6 +338,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     token_cache_path: &code_tokens,
                     manifest_path: &code_tokens_manifest,
                     force: config.force,
+                    require_hit: config.require_hit,
                 },
                 &code_vocab,
             )
@@ -337,6 +354,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     token_cache_path: &dual_tokens,
                     manifest_path: &dual_tokens_manifest,
                     force: config.force,
+                    require_hit: config.require_hit,
                 },
                 &encoder_vocab,
                 &code_vocab,
@@ -378,6 +396,13 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
                 }
             }
         }
+    }
+
+    if spec.require_hit {
+        bail!(
+            "{} vocab cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            spec.kind
+        );
     }
 
     println!(
@@ -432,6 +457,13 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             spec.token_cache_path.display()
         );
         return Ok(());
+    }
+
+    if spec.require_hit {
+        bail!(
+            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            spec.kind
+        );
     }
 
     println!(
@@ -519,6 +551,13 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             spec.token_cache_path.display()
         );
         return Ok(());
+    }
+
+    if spec.require_hit {
+        bail!(
+            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            spec.kind
+        );
     }
 
     println!(
@@ -615,6 +654,13 @@ fn ensure_dual_world_token_cache(
             spec.token_cache_path.display()
         );
         return Ok(());
+    }
+
+    if spec.require_hit {
+        bail!(
+            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            spec.kind
+        );
     }
 
     println!(

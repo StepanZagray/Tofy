@@ -32,6 +32,19 @@ echo "RUNPOD_API_KEY length: ${#RUNPOD_API_KEY}"
 If the key length is `0`, stop and set the key again. Do not paste API keys or
 full RunPod responses into public logs.
 
+Build and upload the complete cache locally before starting the pod. This is
+the only place the large token caches should be generated:
+
+```bash
+cargo run --release -- prepare cache 80gb \
+  --auto-hf-upload \
+  --hf-dataset Grayza/80gb-profile-go-cache
+```
+
+Use the archive name printed at the end in Step 5. The archive includes the
+base decoder cache and the separate Go-feedback decoder cache under
+`data/cache/go_feedback/`.
+
 ## 2. Create Pod
 
 Pick exactly one option.
@@ -238,6 +251,10 @@ scripts/runpod_restore_cache_build.sh
 If `local_models/vocabs` is missing after extraction, do not start the long run;
 rebuild or copy the prepared cache with vocabs included.
 
+The restore script also checks for the base and Go-feedback token cache
+manifests. If it reports a missing `data/cache/go_feedback/...` path, rebuild
+and upload the cache locally with the command from Step 1 before training.
+
 ## 6. Probe Or Train
 
 Probe first on a fresh GPU shape. The probe intentionally does not use the
@@ -263,6 +280,13 @@ Start the full 80 GB run. This uses the auto-stop wrapper by default.
 cd /workspace/Tofy
 SKIP_GIT_PULL=1 PROFILE=80gb scripts/runpod_train.sh train
 ```
+
+`scripts/runpod_train.sh` defaults to `TOFY_REQUIRE_PREPARED_CACHE=1`, so a
+missing cache exits immediately instead of writing large token caches to the
+RunPod volume. It also defaults `TOFY_GO_MODEL_FEEDBACK_ROWS=0`, because
+model-failure feedback mining depends on the just-trained decoder and would
+force pod-side data/cache regeneration. Override those variables only when you
+intentionally want the pod to generate new feedback/cache files.
 
 For 48 GB pods, use `PROFILE=48gb`.
 

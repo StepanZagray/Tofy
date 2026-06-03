@@ -382,10 +382,11 @@ fn run_prepare_cache(
     };
     set_pipeline_env(&cfg, &defaults);
     println!(
-        "Preparing local data/cache for {} profile; no model training will run.",
+        "Preparing full local data/cache handoff for {} profile; no model training will run.",
         profile.as_str()
     );
     prepare_data(&prepare_cache_paths(&defaults), &defaults, false, force)?;
+    prepare_go_feedback_decoder_token_cache(&prepare_cache_paths(&defaults), &defaults)?;
     println!("Data/cache preparation complete.");
     if let Some(repo) = hf_upload_dataset {
         archive_and_upload_prepare_cache(profile, &repo)?;
@@ -850,7 +851,11 @@ fn prepare_data(
     if force_cache {
         cache_args.push("--force".to_string());
     }
+    add_require_prepared_cache_arg(&mut cache_args);
     run_cache(cache_args)?;
+    if prepared_cache_required() {
+        prepare_go_feedback_decoder_token_cache(paths, defaults)?;
+    }
     if paths.code_decoder_cache_vocab.exists() && !paths.code_decoder_vocab.exists() {
         if let Some(parent) = paths.code_decoder_vocab.parent() {
             fs::create_dir_all(parent)?;
@@ -1610,8 +1615,10 @@ fn train_go_feedback_decoder(
     if cfg.from_conditioned_cache || cfg.build_conditioned_cache {
         args.push("--from-conditioned-cache".to_string());
     }
-    with_stage("decoder_code_go_feedback", || {
-        tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
+    with_go_feedback_cache_dir(|| {
+        with_stage("decoder_code_go_feedback", || {
+            tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
+        })
     })?;
     ensure_file(&paths.code_decoder_go_feedback_model)?;
     Ok(())
@@ -1622,14 +1629,14 @@ fn prepare_go_feedback_decoder_token_cache(
     defaults: &ProfileDefaults,
 ) -> Result<()> {
     println!("== Stage 5a-cache/6: Go feedback decoder token cache ==");
-    run_cache(vec![
+    let mut args = vec![
         "--prepare-pipeline-cache".to_string(),
         ENCODER_DATA.to_string(),
         WORLD_DATA.to_string(),
         GO_FEEDBACK_TRAIN_DATA.to_string(),
         paths.encoder_cache_vocab.to_string_lossy().to_string(),
         paths.code_decoder_cache_vocab.to_string_lossy().to_string(),
-        cache_dir().to_string_lossy().to_string(),
+        go_feedback_cache_dir().to_string_lossy().to_string(),
         "--encoder-max-vocab".to_string(),
         defaults.max_vocab.to_string(),
         "--code-max-vocab".to_string(),
@@ -1640,7 +1647,9 @@ fn prepare_go_feedback_decoder_token_cache(
         defaults.world_max_seq.to_string(),
         "--code-max-seq".to_string(),
         defaults.code_decoder_max_seq.to_string(),
-    ])
+    ];
+    add_require_prepared_cache_arg(&mut args);
+    run_cache(args)
 }
 
 fn build_go_feedback_conditioned_cache(
@@ -1662,8 +1671,10 @@ fn build_go_feedback_conditioned_cache(
         "0.20",
     );
     args.push("--build-conditioned-cache".to_string());
-    with_stage("decoder_code_go_feedback_cache", || {
-        tasks::world::try_run_train_decoder(&args)
+    with_go_feedback_cache_dir(|| {
+        with_stage("decoder_code_go_feedback_cache", || {
+            tasks::world::try_run_train_decoder(&args)
+        })
     })?;
     Ok(())
 }
@@ -2393,6 +2404,41 @@ fn cache_dir() -> PathBuf {
     std::env::var("TOFY_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(CACHE_DIR))
+}
+
+fn go_feedback_cache_dir() -> PathBuf {
+    cache_dir().join("go_feedback")
+}
+
+fn prepared_cache_required() -> bool {
+    std::env::var("TOFY_REQUIRE_PREPARED_CACHE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "1" || value == "true" || value == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn add_require_prepared_cache_arg(args: &mut Vec<String>) {
+    if prepared_cache_required() {
+        args.push("--require-hit".to_string());
+    }
+}
+
+fn with_go_feedback_cache_dir<F>(f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let key = "TOFY_CACHE_DIR";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, go_feedback_cache_dir());
+    let result = f();
+    if let Some(previous) = previous {
+        std::env::set_var(key, previous);
+    } else {
+        std::env::remove_var(key);
+    }
+    result
 }
 
 fn vocab_dir() -> PathBuf {

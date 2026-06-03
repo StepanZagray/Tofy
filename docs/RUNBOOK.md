@@ -65,14 +65,15 @@ cargo run --release -- train 80gb
 ```
 
 To do the data-heavy part on a local machine before launching a pod, run the
-same Stage 1 preparation without training:
+full cache handoff preparation without training:
 
 ```bash
 cargo run --release -- prepare cache 80gb
 ```
 
 Use the same profile that you plan to train on. This prepares source data,
-prepared mixes, the Go eval suite, profile-sized vocabs, and token caches.
+prepared mixes, the Go eval suite, profile-sized vocabs, the base token caches,
+and the separate Go-feedback decoder token cache under `data/cache/go_feedback/`.
 
 To archive and upload the handoff directories to your own Hugging Face dataset:
 
@@ -88,8 +89,9 @@ steps and archive contents.
 
 Stage 1 prepares the text datasets, materializes `data/encoder_mix.txt`, builds
 profile-specific vocabs, and writes binary token caches before Stage 2 starts.
-Later stages stream those token caches instead of retokenizing raw text in the
-training loop.
+RunPod training should use `TOFY_REQUIRE_PREPARED_CACHE=1` so later stages fail
+fast on a missing restored cache instead of rebuilding large cache files on the
+pod volume.
 
 The 8 GB profile uses:
 
