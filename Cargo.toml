@@ -30,6 +30,3 @@ sha2 = "0.10.9"
 md5 = "0.8.0"
 # TensorBoard logging (local: writes to runs/, view with tensorboard --logdir runs/)
 tensorboard-rs = "0.5.9"
-
-[patch.crates-io]
-candle-kernels = { path = "vendor/candle-kernels-0.10.2" }
