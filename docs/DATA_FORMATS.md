@@ -36,38 +36,44 @@ cargo run --release -- prepare cache 80gb --auto-hf-upload --hf-dataset <org/dat
 
 Requirements:
 
-- `--auto-hf-upload` enables the archive/upload step and must be paired with
+- `--auto-hf-upload` enables the tree upload step and must be paired with
   `--hf-dataset <org/dataset-name>` (for example `--hf-dataset my-org/tofy-cache`).
   The command errors if either flag is missing its partner. There is no built-in
   default dataset.
-- `tar`, `hf`, and either `pzstd` or `zstd` must be on `PATH`; run
-  `hf auth login` with write access to the target dataset before uploading.
-  Cache archives prefer `pzstd -p <available-cpus> -1` when available so future
-  `.tar.zst` restores can parallelize the zstd decode step. Set
-  `TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM` to override the compressor.
+- `hf` must be on `PATH`; run `hf auth login` with write access to the target
+  dataset before uploading.
+- `pzstd` or `zstd` must be on `PATH`. Files at least 8 MiB are compressed as
+  individual `*.zst` objects with zstd level 1 before upload. Small manifests,
+  eval files, and vocab files stay plain.
+- Files are uploaded individually with retries, so a transient LFS multipart
+  timeout on a large compressed object only retries that file. Tune with
+  `TOFY_HF_UPLOAD_RETRIES` and `TOFY_HF_UPLOAD_RETRY_SLEEP_SECS`.
+- Before upload, the command scans the existing HF dataset tree. Unchanged
+  files are skipped, missing or changed files are uploaded, and stale files
+  under managed paths (`data/`, `eval/`, `local_models/vocabs/`) are deleted.
 
-The command archives:
+The command uploads these paths to the dataset root:
 
 - `data/` (including `data/cache/` token caches and manifests)
 - `data/cache/go_feedback/` for the Go-feedback decoder cache
 - `eval/`
 - `local_models/vocabs/`
 
-Archives land in `runs/prepare_cache/` as
-`tofy-cache-<profile>-<git-sha>-<timestamp>.tar.zst` with a matching
-`.info.txt` sidecar, then both files are uploaded to the dataset you named.
+An `.info.txt` sidecar is written under `runs/prepare_cache/` and uploaded to
+the dataset. There is no tarball.
 
-Restore on another machine (same profile as the archive):
+Restore on another machine using the same profile:
 
 ```bash
-hf download --repo-type dataset <org/dataset-name> tofy-cache-80gb-<sha>-<timestamp>.tar.zst
-tar -I "pzstd -d -p $(nproc)" -xf tofy-cache-80gb-<sha>-<timestamp>.tar.zst
+hf download --repo-type dataset <org/dataset-name> \
+  --include "data/**" \
+  --include "eval/**" \
+  --include "local_models/vocabs/**" \
+  --local-dir .
+find data eval local_models/vocabs -type f -name '*.zst' -print0 \
+  | while IFS= read -r -d '' path; do zstd -d -T0 -f "$path" -o "${path%.zst}" && rm -f "$path"; done
 cargo run --release -- train 80gb
 ```
-
-If `pzstd` is not installed, use `tar --zstd -xf ...`. Low CPU usage during
-restore usually means the bottleneck is volume write throughput rather than
-zstd decoding.
 
 Use the same memory profile (`8gb`, `48gb`, or `80gb`) when training as when the
 cache was built.

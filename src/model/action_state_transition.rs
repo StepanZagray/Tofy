@@ -29,8 +29,8 @@ impl ActionConditionedBlock {
     }
 
     fn modulate(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-        let scale = scale.affine(0.01, 1.0)?;
-        let shift = shift.affine(0.01, 0.0)?;
+        let scale = scale.tanh()?.affine(0.25, 1.0)?;
+        let shift = shift.tanh()?.affine(0.25, 0.0)?;
         Ok(x.broadcast_mul(&scale)?.broadcast_add(&shift)?)
     }
 
@@ -54,13 +54,16 @@ pub struct ActionStateTransition {
     action_embed: nn::Embedding,
     blocks: Vec<ActionConditionedBlock>,
     delta_ln: nn::LayerNorm,
+    delta_proj: nn::Linear,
+    delta_gate: nn::Linear,
+    dim: usize,
 }
 
 impl ActionStateTransition {
     pub fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
         let action_embed = nn::embedding(NUM_ACTIONS, dim, vb.pp("action_embed"))?;
         let num_blocks = 6;
-        let num_heads = 16;
+        let num_heads = transition_heads(dim);
         let ff_dim = (dim * 4).max(320);
         let mut blocks = Vec::with_capacity(num_blocks);
         for i in 0..num_blocks {
@@ -72,28 +75,55 @@ impl ActionStateTransition {
             )?);
         }
         let delta_ln = nn::layer_norm(dim, 1e-5, vb.pp("delta_ln"))?;
+        let delta_proj = nn::linear(dim, dim, vb.pp("delta_proj"))?;
+        let delta_gate = nn::linear(dim, dim, vb.pp("delta_gate"))?;
         Ok(Self {
             action_embed,
             blocks,
             delta_ln,
+            delta_proj,
+            delta_gate,
+            dim,
         })
     }
 
-    pub fn forward_delta(&self, state_slots: &Tensor, action_labels: &[u32]) -> Result<Tensor> {
+    fn action_vec(&self, state_slots: &Tensor, action_labels: &[u32]) -> Result<Tensor> {
         let (batch, _, _) = state_slots.dims3()?;
-        let mut action_ids = action_labels.to_vec();
+        let mut action_ids = if action_labels.len() == 1 && batch > 1 {
+            vec![action_labels[0]; batch]
+        } else {
+            action_labels.to_vec()
+        };
         if action_ids.len() < batch {
             action_ids.resize(batch, 0);
         } else {
             action_ids.truncate(batch);
         }
+        for action_id in &mut action_ids {
+            *action_id = (*action_id).min((NUM_ACTIONS - 1) as u32);
+        }
         let action_ids = Tensor::from_vec(action_ids, (batch,), state_slots.device())?;
-        let action_vec = self.action_embed.forward(&action_ids)?;
-        let mut hidden = state_slots.clone();
+        self.action_embed.forward(&action_ids).map_err(Into::into)
+    }
+
+    pub fn forward_delta(&self, state_slots: &Tensor, action_labels: &[u32]) -> Result<Tensor> {
+        let (batch, slots, _) = state_slots.dims3()?;
+        let action_vec = self.action_vec(state_slots, action_labels)?;
+        let action_bias = action_vec
+            .unsqueeze(1)?
+            .broadcast_as((batch, slots, self.dim))?;
+        let mut hidden = state_slots.broadcast_add(&action_bias)?;
         for block in &self.blocks {
             hidden = block.forward(&hidden, &action_vec)?;
         }
-        self.delta_ln.forward(&hidden).map_err(Into::into)
+        let delta = self
+            .delta_proj
+            .forward(&self.delta_ln.forward(&hidden)?)?
+            .tanh()?;
+        let gate = nn::ops::sigmoid(&self.delta_gate.forward(&action_vec)?)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, slots, self.dim))?;
+        delta.broadcast_mul(&gate).map_err(Into::into)
     }
 
     pub fn forward(&self, state_slots: &Tensor, action_labels: &[u32]) -> Result<Tensor> {
@@ -103,5 +133,39 @@ impl ActionStateTransition {
 
     pub fn forward_one(&self, state_slots: &Tensor, action_label: u32) -> Result<Tensor> {
         self.forward(state_slots, &[action_label])
+    }
+}
+
+fn transition_heads(dim: usize) -> usize {
+    [16, 8, 4, 2]
+        .into_iter()
+        .find(|heads| dim.is_multiple_of(*heads))
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    #[test]
+    fn forward_one_applies_same_action_to_entire_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let transition = ActionStateTransition::new(vb, 16)?;
+        let state = Tensor::zeros((2, 3, 16), DType::F32, &device)?;
+        let single = transition.forward_one(&state, 1)?;
+        let batched = transition.forward(&state, &[1, 1])?;
+        let single = single.flatten_all()?.to_vec1::<f32>()?;
+        let batched = batched.flatten_all()?.to_vec1::<f32>()?;
+        let diff = single
+            .iter()
+            .zip(batched.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>();
+        assert!(diff < 1e-5, "forward_one diff {diff}");
+        Ok(())
     }
 }

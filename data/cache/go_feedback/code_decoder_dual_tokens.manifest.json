@@ -1,0 +1,36 @@
+{
+  "version": 5,
+  "kind": "code_decoder_dual",
+  "source": {
+    "path": "data/code_poc_go_mix.txt",
+    "len": 17965862967,
+    "modified_unix_secs": 1780309563,
+    "content_hash": "e2de83a1fb6829e4"
+  },
+  "tokenizer": "code-aware",
+  "tokenizer_spec": {
+    "version": 8,
+    "mode": "code-aware",
+    "normalization": "identity_utf8",
+    "pretokenizer": "code_lexical_v1",
+    "code_control_tokens": [
+      "<fim_prefix>",
+      "<fim_suffix>",
+      "<fim_middle>",
+      "<eos_code>"
+    ],
+    "byte_fallback": true,
+    "reserved_byte_tokens": true,
+    "subword_identifier_fallback": false,
+    "byte_token_format": "<byte:XX>",
+    "byte_native": true,
+    "adaptive_boundaries": true,
+    "boundaryless_bpe": false
+  },
+  "tokenizer_spec_signature": "1cb3263e20babbe7",
+  "max_seq": 320,
+  "vocab_path": "",
+  "vocab_signature": "820794f439b00df6+652806c8bbcf223c",
+  "token_cache_path": "data/cache/go_feedback/code_decoder_dual.tokens.bin",
+  "rows": 13792646
+}

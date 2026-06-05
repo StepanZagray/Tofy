@@ -40,7 +40,12 @@ impl MultiQueryPool {
         })
     }
 
+    #[allow(dead_code)]
     pub fn forward(&self, memory: &Tensor) -> Result<Tensor> {
+        self.forward_masked(memory, None)
+    }
+
+    pub fn forward_masked(&self, memory: &Tensor, memory_mask: Option<&Tensor>) -> Result<Tensor> {
         let (batch, _, _) = memory.dims3()?;
         let query_ids: Vec<u32> = (0..self.num_queries as u32).collect();
         let query_ids = Tensor::from_vec(query_ids, (1, self.num_queries), memory.device())?;
@@ -50,7 +55,9 @@ impl MultiQueryPool {
             self.dim,
         ))?;
         let normed = self.ln1.forward(&queries)?;
-        let attended = self.cross_attn.forward(&normed, memory)?;
+        let attended = self
+            .cross_attn
+            .forward_masked(&normed, memory, memory_mask)?;
         let pooled = (queries + attended)?;
         let normed = self.ln2.forward(&pooled)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;

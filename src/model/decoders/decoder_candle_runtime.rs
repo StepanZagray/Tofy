@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    CodeDecoder, DecoderArchitecture, DecoderConditioningAdapter, DecoderKind, LocalDecoderRuntime,
+    CodeDecoder, DecoderArchitecture, DecoderAttentionConfig, DecoderConditioningAdapter,
+    DecoderCrossAttentionSchedule, DecoderKind, LocalDecoderRuntime,
 };
 use crate::data::{
     encode_text_with_vocab_mode, TokenizationMode, CODE_CONTROL_TOKENS, CODE_EOS_TOKEN,
@@ -48,6 +49,7 @@ impl CandleCrossAttnDecoder {
         checkpoint_path.with_extension("meta.txt")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_metadata(
         checkpoint_path: &Path,
         vocab: &Vocab,
@@ -55,9 +57,11 @@ impl CandleCrossAttnDecoder {
         planner_dim: usize,
         context_slots: usize,
         architecture: DecoderArchitecture,
+        attention: DecoderAttentionConfig,
+        adapter_compress_rate: usize,
     ) -> Result<()> {
         let metadata = format!(
-            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v1\ndecoder_arch=rope_rmsnorm_swiglu_tied_v2\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\n",
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v2\ndecoder_arch=rope_rmsnorm_swiglu_tied_v3\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\ndecoder_adapter_compress_rate={}\ndecoder_local_window={}\ndecoder_anchor_period={}\ndecoder_csa_compress_rate={}\ndecoder_hca_compress_rate={}\ndecoder_csa_topk={}\ndecoder_cross_attention_schedule={}\ndecoder_latent_prefix={}\n",
             kind.as_str(),
             vocab_signature(vocab),
             vocab.id_to_token.len(),
@@ -66,23 +70,31 @@ impl CandleCrossAttnDecoder {
             architecture.dim,
             architecture.num_layers,
             architecture.num_heads,
-            architecture.ff_dim
+            architecture.ff_dim,
+            adapter_compress_rate,
+            attention.local_window,
+            attention.anchor_period,
+            attention.csa_compress_rate,
+            attention.hca_compress_rate,
+            attention.csa_topk,
+            attention.cross_attention_schedule.as_str(),
+            if attention.latent_prefix { "true" } else { "false" }
         );
         fs::write(Self::metadata_path(checkpoint_path), metadata)?;
         Ok(())
     }
 
-    fn load_metadata_architecture(
+    fn load_metadata_config(
         checkpoint_path: &Path,
         vocab: &Vocab,
         kind: DecoderKind,
         planner_dim: usize,
         context_slots: usize,
-    ) -> Result<DecoderArchitecture> {
+    ) -> Result<(DecoderArchitecture, DecoderAttentionConfig, usize)> {
         let metadata_path = Self::metadata_path(checkpoint_path);
         if !metadata_path.exists() {
             anyhow::bail!(
-                "decoder metadata not found for {:?}; runtime requires checkpoint metadata with decoder_dim/layers/heads/ff_dim",
+                "decoder metadata not found for {:?}; runtime requires checkpoint metadata with decoder architecture and attention config",
                 checkpoint_path
             );
         }
@@ -135,6 +147,23 @@ impl CandleCrossAttnDecoder {
                 );
             }
         }
+        let require_metadata_value = |key: &str, expected: &str| -> Result<()> {
+            let value = parsed.get(key).ok_or_else(|| {
+                anyhow::anyhow!("decoder metadata {:?} is missing {}", metadata_path, key)
+            })?;
+            if value != expected {
+                anyhow::bail!(
+                    "decoder metadata {:?} has {}={}, expected {}",
+                    metadata_path,
+                    key,
+                    value,
+                    expected
+                );
+            }
+            Ok(())
+        };
+        require_metadata_value("conditioner", "action_aware_local_plan_v2")?;
+        require_metadata_value("decoder_arch", "rope_rmsnorm_swiglu_tied_v3")?;
         let parse_required = |key: &str| -> Result<usize> {
             parsed
                 .get(key)
@@ -144,12 +173,60 @@ impl CandleCrossAttnDecoder {
                 .parse()
                 .with_context(|| format!("parse {} from {:?}", key, metadata_path))
         };
-        DecoderArchitecture::new(
+        let parse_required_bool = |key: &str| -> Result<bool> {
+            let value = parsed
+                .get(key)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("decoder metadata {:?} is missing {}", metadata_path, key)
+                })?
+                .trim()
+                .to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "yes" => Ok(true),
+                "0" | "false" | "no" => Ok(false),
+                _ => anyhow::bail!("parse {} from {:?}: {}", key, metadata_path, value),
+            }
+        };
+        let architecture = DecoderArchitecture::new(
             parse_required("decoder_dim")?,
             parse_required("decoder_layers")?,
             parse_required("decoder_heads")?,
             parse_required("decoder_ff_dim")?,
-        )
+        )?;
+        let schedule = parsed
+            .get("decoder_cross_attention_schedule")
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decoder metadata {:?} is missing decoder_cross_attention_schedule",
+                    metadata_path
+                )
+            })
+            .and_then(|value| {
+                DecoderCrossAttentionSchedule::from_flag(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "parse decoder_cross_attention_schedule from {:?}: {}",
+                        metadata_path,
+                        value
+                    )
+                })
+            })?;
+        let attention = DecoderAttentionConfig::new(
+            parse_required("decoder_local_window")?,
+            parse_required("decoder_anchor_period")?,
+            parse_required("decoder_csa_compress_rate")?,
+            parse_required("decoder_hca_compress_rate")?,
+            parse_required("decoder_csa_topk")?,
+            schedule,
+            parse_required_bool("decoder_latent_prefix")?,
+        )?;
+        let adapter_compress_rate = parse_required("decoder_adapter_compress_rate")?;
+        if adapter_compress_rate == 0 {
+            anyhow::bail!(
+                "decoder metadata {:?} has zero decoder_adapter_compress_rate",
+                metadata_path
+            );
+        }
+        Ok((architecture, attention, adapter_compress_rate))
     }
 
     fn infer_vocab_path(checkpoint_path: &Path) -> Result<PathBuf> {
@@ -190,13 +267,8 @@ impl CandleCrossAttnDecoder {
         let mut varmap = VarMap::new();
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
-        let architecture = Self::load_metadata_architecture(
-            &checkpoint_path,
-            &vocab,
-            kind,
-            planner_dim,
-            context_slots,
-        )?;
+        let (architecture, attention, adapter_compress_rate) =
+            Self::load_metadata_config(&checkpoint_path, &vocab, kind, planner_dim, context_slots)?;
         let vocab_size = vocab.id_to_token.len();
         let default_repeat_penalty = if kind == DecoderKind::CodeSpecialist {
             1.12
@@ -218,14 +290,15 @@ impl CandleCrossAttnDecoder {
         } else {
             1.0
         };
-        let adapter = DecoderConditioningAdapter::new(
+        let adapter = DecoderConditioningAdapter::new_with_compress_rate(
             VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device)
                 .pp("decoder_conditioning_adapter"),
             planner_dim,
             world_dim,
             DecoderConditioningAdapter::output_slots_for(kind, context_slots),
+            adapter_compress_rate,
         )?;
-        let decoder = CodeDecoder::new(
+        let decoder = CodeDecoder::new_with_attention_config(
             VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device).pp("decoder"),
             vocab_size,
             architecture.dim,
@@ -234,6 +307,7 @@ impl CandleCrossAttnDecoder {
             architecture.num_heads,
             architecture.ff_dim,
             kind,
+            attention,
         )?;
         varmap
             .load(&checkpoint_path)

@@ -4,6 +4,8 @@ use candle_nn::{self as nn, VarBuilder};
 
 use crate::util;
 
+const ATTENTION_MASK_VALUE: f32 = -1.0e4;
+
 #[derive(Clone)]
 pub struct AttentionKvCache {
     pub k: Tensor,
@@ -209,7 +211,7 @@ fn topk_bias_from_scores(
         .to_dtype(DType::F32)?
         .flatten_all()?
         .to_vec1::<f32>()?;
-    let mut bias = vec![-1e9f32; batch * heads * queries * keys];
+    let mut bias = vec![ATTENTION_MASK_VALUE; batch * heads * queries * keys];
     for b_idx in 0..batch {
         for h_idx in 0..heads {
             for q_idx in 0..queries {
@@ -296,12 +298,41 @@ impl MultiHeadAttention {
 
     /// Sliding-window bidirectional attention for encoder layers.
     pub fn forward_local(&self, x: &Tensor, window: usize) -> Result<Tensor> {
-        self.forward_local_windowed(x, window.max(1), false)
+        self.forward_local_windowed(x, window.max(1), false, None, 0)
+    }
+
+    pub fn forward_local_masked(
+        &self,
+        x: &Tensor,
+        window: usize,
+        key_padding_mask: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_local_windowed(x, window.max(1), false, Some(key_padding_mask), 0)
     }
 
     /// Sliding-window causal attention for sparse decoder layers.
     pub fn forward_causal_local(&self, x: &Tensor, window: usize) -> Result<Tensor> {
-        self.forward_local_windowed(x, window.max(1), true)
+        self.forward_local_windowed(x, window.max(1), true, None, 0)
+    }
+
+    pub fn forward_causal_local_with_prefix(
+        &self,
+        x: &Tensor,
+        window: usize,
+        prefix_len: usize,
+    ) -> Result<Tensor> {
+        self.forward_local_windowed(x, window.max(1), true, None, prefix_len)
+    }
+
+    pub fn forward_self_masked(&self, x: &Tensor, key_padding_mask: &Tensor) -> Result<Tensor> {
+        let x = x.contiguous()?;
+        let (b, t, _) = x.dims3()?;
+        let (q, k, v) = self.project_self_qkv(&x)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        util::ensure_same_dtype(&q, &k, "self masked attention q/k")?;
+        let scores = (q.matmul(&k_t)? / self.scale)?;
+        let bias = key_padding_bias(key_padding_mask, b, self.num_heads, t, t, scores.dtype())?;
+        self.attention_scores_to_output(scores.broadcast_add(&bias)?, &v, b, t)
     }
 
     /// DeepSeek-V4-inspired compressed sparse causal attention.
@@ -315,12 +346,14 @@ impl MultiHeadAttention {
         local_window: usize,
         compress_rate: usize,
         index_topk: usize,
+        prefix_len: usize,
     ) -> Result<Tensor> {
         self.forward_causal_compressed_sparse_windowed(
             x,
             local_window,
             compress_rate.max(1),
             index_topk.max(1),
+            prefix_len,
         )
     }
 
@@ -333,8 +366,14 @@ impl MultiHeadAttention {
         x: &Tensor,
         local_window: usize,
         compress_rate: usize,
+        prefix_len: usize,
     ) -> Result<Tensor> {
-        self.forward_causal_heavily_compressed_windowed(x, local_window, compress_rate.max(1))
+        self.forward_causal_heavily_compressed_windowed(
+            x,
+            local_window,
+            compress_rate.max(1),
+            prefix_len,
+        )
     }
 
     #[allow(dead_code)]
@@ -602,11 +641,10 @@ impl MultiHeadAttention {
             .matmul(&k_t)?
             .reshape((b, self.num_heads, t_q, t_kv))?
             .affine(1.0 / self.scale, 0.0)?;
-        let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?.reshape((
-            b * self.num_heads,
-            t_q,
-            t_kv,
-        ))?;
+        let bias = cache_causal_bias(&full_kv, position_offset, t_q, x.device())?
+            .to_dtype(scores.dtype())?;
+        let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?
+            .reshape((b * self.num_heads, t_q, t_kv))?;
         let attn_output =
             attn_weights
                 .matmul(&v)?
@@ -641,9 +679,10 @@ impl MultiHeadAttention {
 
         let mut k_parts = vec![full_kv.k.clone()];
         let mut v_parts = vec![full_kv.v.clone()];
-        let mut bias_parts = vec![Tensor::zeros(
-            (b, self.num_heads, t_q, full_kv.k.dim(2)?),
-            q.dtype(),
+        let mut bias_parts = vec![cache_causal_bias(
+            &full_kv,
+            position_offset,
+            t_q,
             x.device(),
         )?];
         if let (Some(comp_k), Some(comp_v)) = (&full_kv.compressed_k, &full_kv.compressed_v) {
@@ -655,13 +694,20 @@ impl MultiHeadAttention {
             } else {
                 Tensor::zeros(
                     (b, self.num_heads, t_q, comp_k.dim(2)?),
-                    q.dtype(),
+                    DType::F32,
                     x.device(),
                 )?
             };
             k_parts.push(comp_k.clone());
             v_parts.push(comp_v.clone());
-            bias_parts.push(comp_bias);
+            let causal_comp_bias = compressed_cache_block_bias(
+                position_offset,
+                t_q,
+                &full_kv.compressed_block_ends,
+                x.device(),
+            )?
+            .broadcast_as((b, self.num_heads, t_q, comp_k.dim(2)?))?;
+            bias_parts.push(causal_comp_bias.broadcast_add(&comp_bias)?);
         }
 
         let k_all = Tensor::cat(&k_parts, 2)?;
@@ -684,7 +730,14 @@ impl MultiHeadAttention {
         Ok((out, full_kv))
     }
 
-    fn forward_local_windowed(&self, x: &Tensor, window: usize, causal: bool) -> Result<Tensor> {
+    fn forward_local_windowed(
+        &self,
+        x: &Tensor,
+        window: usize,
+        causal: bool,
+        key_padding_mask: Option<&Tensor>,
+        prefix_len: usize,
+    ) -> Result<Tensor> {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
         let (q, k, v) = self.project_self_qkv(&x)?;
@@ -700,17 +753,67 @@ impl MultiHeadAttention {
             } else {
                 (q_start + q_len + radius).min(t)
             };
-            let kv_len = kv_end.saturating_sub(kv_start).max(1);
+            let exact_prefix_len = prefix_len.min(t);
+            let include_prefix = causal && exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let local_kv_start = if include_prefix {
+                kv_start.max(exact_prefix_len)
+            } else {
+                kv_start
+            };
+            let local_kv_len = kv_end.saturating_sub(local_kv_start).max(1);
 
             let q_chunk = q.narrow(2, q_start, q_len)?.contiguous()?;
-            let k_chunk = k.narrow(2, kv_start, kv_len)?;
-            let v_chunk = v.narrow(2, kv_start, kv_len)?;
+            let local_k = k.narrow(2, local_kv_start, local_kv_len)?;
+            let local_v = v.narrow(2, local_kv_start, local_kv_len)?;
+            let mut k_parts = Vec::new();
+            let mut v_parts = Vec::new();
+            let mut bias_parts = Vec::new();
+            if include_prefix {
+                k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
+                v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
+                let mut prefix_bias =
+                    Tensor::zeros((1, 1, q_len, exact_prefix_len), DType::F32, x.device())?;
+                if let Some(mask) = key_padding_mask {
+                    prefix_bias = prefix_bias.broadcast_add(&key_padding_bias(
+                        &mask.narrow(1, 0, exact_prefix_len)?,
+                        b,
+                        self.num_heads,
+                        q_len,
+                        exact_prefix_len,
+                        DType::F32,
+                    )?)?;
+                }
+                bias_parts.push(prefix_bias);
+            }
+            k_parts.push(local_k);
+            v_parts.push(local_v);
+            let mut local_bias = local_chunk_bias(
+                q_start,
+                q_len,
+                local_kv_start,
+                local_kv_len,
+                window,
+                causal,
+                x.device(),
+            )?;
+            if let Some(mask) = key_padding_mask {
+                local_bias = local_bias.broadcast_add(&key_padding_bias(
+                    &mask.narrow(1, local_kv_start, local_kv_len)?,
+                    b,
+                    self.num_heads,
+                    q_len,
+                    local_kv_len,
+                    DType::F32,
+                )?)?;
+            }
+            bias_parts.push(local_bias);
+            let k_chunk = Tensor::cat(&k_parts, 2)?;
+            let v_chunk = Tensor::cat(&v_parts, 2)?;
+            let bias = Tensor::cat(&bias_parts, 3)?;
             util::ensure_same_dtype(&q_chunk, &k_chunk, "local attention q/k")?;
             let scores = (q_chunk
                 .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
                 / self.scale)?;
-            let bias =
-                local_chunk_bias(q_start, q_len, kv_start, kv_len, window, causal, x.device())?;
             let bias = bias.to_dtype(scores.dtype())?;
             let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
             outputs.push(attn_weights.contiguous()?.matmul(&v_chunk.contiguous()?)?);
@@ -733,22 +836,30 @@ impl MultiHeadAttention {
         local_window: usize,
         compress_rate: usize,
         index_topk: usize,
+        prefix_len: usize,
     ) -> Result<Tensor> {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
         let (q, k, v) = self.project_self_qkv(&x)?;
         if t <= local_window.max(1) {
-            return self.forward_local_windowed(&x, local_window.max(1), true);
+            return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
         let query_block = ((local_window.max(1) * 2).max(32)).min(t.max(1));
         let local_radius = local_window.saturating_sub(1);
+        let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
 
         for q_start in (0..t).step_by(query_block) {
             let q_len = (t - q_start).min(query_block);
-            let local_start = q_start.saturating_sub(local_radius);
+            let local_start_raw = q_start.saturating_sub(local_radius);
             let local_end = q_start + q_len;
+            let include_prefix = exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let local_start = if include_prefix {
+                local_start_raw.max(exact_prefix_len)
+            } else {
+                local_start_raw
+            };
             let local_len = local_end.saturating_sub(local_start).max(1);
 
             let q_chunk = q.narrow(2, q_start, q_len)?;
@@ -765,11 +876,29 @@ impl MultiHeadAttention {
             )?
             .broadcast_as((b, self.num_heads, q_len, local_len))?;
 
-            let mut k_parts = vec![local_k];
-            let mut v_parts = vec![local_v];
-            let mut bias_parts = vec![local_bias];
+            let mut k_parts = Vec::new();
+            let mut v_parts = Vec::new();
+            let mut bias_parts = Vec::new();
+            if include_prefix {
+                k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
+                v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
+                bias_parts.push(Tensor::zeros(
+                    (b, self.num_heads, q_len, exact_prefix_len),
+                    DType::F32,
+                    x.device(),
+                )?);
+            }
+            k_parts.push(local_k);
+            v_parts.push(local_v);
+            bias_parts.push(local_bias);
 
-            let compressed = compressed_causal_blocks(&k, &v, q_start + q_len, compress_rate)?;
+            let compressed = compressed_causal_blocks_from(
+                &k,
+                &v,
+                exact_prefix_len,
+                q_start + q_len,
+                compress_rate,
+            )?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
                 let index_scores =
                     q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
@@ -808,22 +937,30 @@ impl MultiHeadAttention {
         x: &Tensor,
         local_window: usize,
         compress_rate: usize,
+        prefix_len: usize,
     ) -> Result<Tensor> {
         let x = x.contiguous()?;
         let (b, t, _) = x.dims3()?;
         let (q, k, v) = self.project_self_qkv(&x)?;
         if t <= local_window.max(1) {
-            return self.forward_local_windowed(&x, local_window.max(1), true);
+            return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
         let query_block = ((local_window.max(1) * 2).max(32)).min(t.max(1));
         let local_radius = local_window.saturating_sub(1);
+        let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
 
         for q_start in (0..t).step_by(query_block) {
             let q_len = (t - q_start).min(query_block);
-            let local_start = q_start.saturating_sub(local_radius);
+            let local_start_raw = q_start.saturating_sub(local_radius);
             let local_end = q_start + q_len;
+            let include_prefix = exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let local_start = if include_prefix {
+                local_start_raw.max(exact_prefix_len)
+            } else {
+                local_start_raw
+            };
             let local_len = local_end.saturating_sub(local_start).max(1);
 
             let q_chunk = q.narrow(2, q_start, q_len)?;
@@ -839,10 +976,28 @@ impl MultiHeadAttention {
                 x.device(),
             )?;
 
-            let mut k_parts = vec![local_k];
-            let mut v_parts = vec![local_v];
-            let mut bias_parts = vec![local_bias];
-            let compressed = compressed_causal_blocks(&k, &v, q_start + q_len, compress_rate)?;
+            let mut k_parts = Vec::new();
+            let mut v_parts = Vec::new();
+            let mut bias_parts = Vec::new();
+            if include_prefix {
+                k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
+                v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
+                bias_parts.push(Tensor::zeros(
+                    (1, 1, q_len, exact_prefix_len),
+                    DType::F32,
+                    x.device(),
+                )?);
+            }
+            k_parts.push(local_k);
+            v_parts.push(local_v);
+            bias_parts.push(local_bias);
+            let compressed = compressed_causal_blocks_from(
+                &k,
+                &v,
+                exact_prefix_len,
+                q_start + q_len,
+                compress_rate,
+            )?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
@@ -993,6 +1148,17 @@ impl TransformerBlock {
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
+
+    pub fn forward_masked(&self, x: &Tensor, key_padding_mask: &Tensor) -> Result<Tensor> {
+        let normed = self.ln1.forward(x)?;
+        let attn_out = self.attn.forward_self_masked(&normed, key_padding_mask)?;
+        let x = (x + attn_out)?;
+
+        let normed = self.ln2.forward(&x)?;
+        let ff_out = self.ff1.forward(&normed)?.gelu()?;
+        let ff_out = self.ff2.forward(&ff_out)?;
+        Ok((x + ff_out)?)
+    }
 }
 
 pub struct LocalTransformerBlock {
@@ -1029,6 +1195,24 @@ impl LocalTransformerBlock {
     pub fn forward_with_window(&self, x: &Tensor, window: usize) -> Result<Tensor> {
         let normed = self.ln1.forward(x)?;
         let attn_out = self.attn.forward_local(&normed, window.max(1))?;
+        let x = (x + attn_out)?;
+
+        let normed = self.ln2.forward(&x)?;
+        let ff_out = self.ff1.forward(&normed)?.gelu()?;
+        let ff_out = self.ff2.forward(&ff_out)?;
+        Ok((x + ff_out)?)
+    }
+
+    pub fn forward_with_window_masked(
+        &self,
+        x: &Tensor,
+        window: usize,
+        key_padding_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let normed = self.ln1.forward(x)?;
+        let attn_out = self
+            .attn
+            .forward_local_masked(&normed, window.max(1), key_padding_mask)?;
         let x = (x + attn_out)?;
 
         let normed = self.ln2.forward(&x)?;
@@ -1088,7 +1272,7 @@ impl CrossAttention {
         let (b, h, t_q, t_kv) = scores.dims4()?;
         let bias = mask
             .contiguous()?
-            .affine(1e9, -1e9)?
+            .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?
             .unsqueeze(1)?
             .unsqueeze(1)?
             .broadcast_as((b, h, t_q, t_kv))?;
@@ -1211,13 +1395,13 @@ impl CrossAttention {
     }
 }
 
-/// Causal mask for decoder self-attention: [1, 1, seq_len, seq_len], (i,j) = 0 if j <= i else -1e9
+/// Causal mask for decoder self-attention: [1, 1, seq_len, seq_len], (i,j) = 0 if j <= i else a large negative bias.
 #[allow(dead_code)]
 fn causal_mask(seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {
     let mut v = vec![0f32; seq_len * seq_len];
     for i in 0..seq_len {
         for j in (i + 1)..seq_len {
-            v[i * seq_len + j] = -1e9;
+            v[i * seq_len + j] = ATTENTION_MASK_VALUE;
         }
     }
     Tensor::from_vec(v, (1, 1, seq_len, seq_len), device).map_err(|e| anyhow::anyhow!("{:?}", e))
@@ -1245,29 +1429,94 @@ fn local_chunk_bias(
         for kj in 0..kv_len {
             let k_abs = kv_start + kj;
             if k_abs < left || k_abs >= right {
-                v[qi * kv_len + kj] = -1e9;
+                v[qi * kv_len + kj] = ATTENTION_MASK_VALUE;
             }
         }
     }
     Tensor::from_vec(v, (1, 1, q_len, kv_len), device).map_err(|e| anyhow::anyhow!("{:?}", e))
 }
 
-fn compressed_causal_blocks(
+fn key_padding_bias(
+    mask: &Tensor,
+    batch: usize,
+    heads: usize,
+    queries: usize,
+    keys: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    mask.contiguous()?
+        .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?
+        .unsqueeze(1)?
+        .unsqueeze(1)?
+        .broadcast_as((batch, heads, queries, keys))?
+        .to_dtype(dtype)
+        .map_err(Into::into)
+}
+
+fn cache_causal_bias(
+    cache: &AttentionKvCache,
+    query_start: usize,
+    query_len: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let (batch, heads, key_len, _) = cache.k.dims4()?;
+    let prefix_len = cache.prefix_len.min(key_len);
+    let dynamic_len = key_len.saturating_sub(prefix_len);
+    let dynamic_start = cache.token_count.saturating_sub(dynamic_len);
+    let mut v = vec![0f32; query_len * key_len];
+    for qi in 0..query_len {
+        let q_abs = query_start + qi;
+        for kj in prefix_len..key_len {
+            let k_abs = dynamic_start + (kj - prefix_len);
+            if k_abs > q_abs {
+                v[qi * key_len + kj] = ATTENTION_MASK_VALUE;
+            }
+        }
+    }
+    Tensor::from_vec(v, (1, 1, query_len, key_len), device)?
+        .broadcast_as((batch, heads, query_len, key_len))
+        .map_err(Into::into)
+}
+
+fn compressed_cache_block_bias(
+    query_start: usize,
+    query_len: usize,
+    block_ends: &[usize],
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    if block_ends.is_empty() {
+        return Tensor::zeros((1, 1, query_len, 0), DType::F32, device).map_err(Into::into);
+    }
+    let mut v = vec![0f32; query_len * block_ends.len()];
+    for qi in 0..query_len {
+        let visible_until = query_start + qi + 1;
+        for (bi, &block_end) in block_ends.iter().enumerate() {
+            if block_end > visible_until {
+                v[qi * block_ends.len() + bi] = ATTENTION_MASK_VALUE;
+            }
+        }
+    }
+    Tensor::from_vec(v, (1, 1, query_len, block_ends.len()), device).map_err(Into::into)
+}
+
+fn compressed_causal_blocks_from(
     k: &Tensor,
     v: &Tensor,
+    start_at: usize,
     upto: usize,
     compress_rate: usize,
 ) -> Result<Option<(Tensor, Tensor, Vec<usize>)>> {
     let (_, _, t, _) = k.dims4()?;
+    let start_at = start_at.min(t);
     let upto = upto.min(t);
-    if upto == 0 || compress_rate <= 1 {
+    if start_at >= upto || compress_rate <= 1 {
         return Ok(None);
     }
 
     let mut k_blocks = Vec::new();
     let mut v_blocks = Vec::new();
     let mut block_ends = Vec::new();
-    let mut start = 0usize;
+    let mut start = start_at;
     while start < upto {
         let len = (upto - start).min(compress_rate);
         let scale = 1.0 / len.max(1) as f64;
@@ -1310,7 +1559,7 @@ fn compressed_block_bias(
         let visible_until = q_start + qi + 1;
         for (bi, &block_end) in block_ends.iter().enumerate() {
             if block_end > visible_until {
-                v[qi * block_ends.len() + bi] = -1e9;
+                v[qi * block_ends.len() + bi] = ATTENTION_MASK_VALUE;
             }
         }
     }
@@ -1345,4 +1594,62 @@ pub fn positional_encoding_from(
     }
 
     Tensor::from_vec(pe, (1, seq_len, dim), device).map_err(|e| anyhow::anyhow!("{:?}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    #[test]
+    fn cache_causal_bias_keeps_prefix_visible_and_masks_future_chunk_keys() -> Result<()> {
+        let device = Device::Cpu;
+        let k = Tensor::zeros((1, 1, 4, 1), DType::F32, &device)?;
+        let v = Tensor::zeros((1, 1, 4, 1), DType::F32, &device)?;
+        let cache = AttentionKvCache {
+            k,
+            v,
+            compressed_k: None,
+            compressed_v: None,
+            compressed_block_ends: Vec::new(),
+            token_count: 6,
+            prefix_len: 2,
+        };
+
+        let bias = cache_causal_bias(&cache, 4, 2, &device)?
+            .reshape((2, 4))?
+            .to_vec2::<f32>()?;
+
+        assert_eq!(bias[0], vec![0.0, 0.0, 0.0, ATTENTION_MASK_VALUE]);
+        assert_eq!(bias[1], vec![0.0, 0.0, 0.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_cache_block_bias_masks_blocks_ending_after_query() -> Result<()> {
+        let device = Device::Cpu;
+        let bias = compressed_cache_block_bias(4, 2, &[3, 5, 6], &device)?
+            .reshape((2, 3))?
+            .to_vec2::<f32>()?;
+
+        assert_eq!(bias[0], vec![0.0, 0.0, ATTENTION_MASK_VALUE]);
+        assert_eq!(bias[1], vec![0.0, 0.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_causal_blocks_from_keeps_prefix_out_of_blocks() -> Result<()> {
+        let device = Device::Cpu;
+        let values = (0..6).map(|value| value as f32).collect::<Vec<_>>();
+        let k = Tensor::from_vec(values.clone(), (1, 1, 6, 1), &device)?;
+        let v = Tensor::from_vec(values, (1, 1, 6, 1), &device)?;
+
+        let (compressed_k, _, block_ends) =
+            compressed_causal_blocks_from(&k, &v, 2, 6, 2)?.expect("compressed blocks");
+
+        assert_eq!(block_ends, vec![4, 6]);
+        let compressed = compressed_k.reshape((2, 1))?.to_vec2::<f32>()?;
+        assert_eq!(compressed, vec![vec![2.5], vec![4.5]]);
+        Ok(())
+    }
 }

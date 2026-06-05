@@ -855,7 +855,8 @@ pub(crate) fn evaluate_world_encoded_batch(
         device,
     )?;
     let pred_slots = transition.forward(&state_slots, &action_labels)?;
-    let pred_loss = prediction_loss(&pred_slots, &next_slots)?;
+    let fixed_next_slots = next_slots.detach();
+    let pred_loss = prediction_loss(&pred_slots, &fixed_next_slots)?;
     let state_sigreg = crate::model::sigreg_epps_pulley(
         &flatten_latent_slots(&state_slots)?,
         sigreg_slices,
@@ -878,7 +879,7 @@ pub(crate) fn evaluate_world_encoded_batch(
     let action_logits = action_classifier_head.forward(&state_slots)?;
     let action_loss = action_cross_entropy(&action_logits, &action_labels, device)?;
     let (inverse_loss, inverse_action_metrics) = if inverse_loss_weight > 0.0 {
-        let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+        let true_delta_slots = slot_delta_slots(&fixed_next_slots, &state_slots.detach())?;
         let pred_delta_slots = slot_delta_slots(&pred_slots, &state_slots)?;
         let inverse_logits_true = inverse_action_head.forward(&true_delta_slots)?;
         let inverse_logits_pred = inverse_action_head.forward(&pred_delta_slots)?;

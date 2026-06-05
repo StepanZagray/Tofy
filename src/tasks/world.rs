@@ -986,6 +986,12 @@ pub fn try_run_train_decoder(args: &[String]) -> Result<bool> {
     ];
     args_for_cfg.extend(args.iter().skip(6).cloned());
     let cfg = DecoderTrainConfig::from_args_after(&args_for_cfg)?;
+    if cfg.mtp_loss_weight > 0.0 {
+        anyhow::bail!(
+            "--mtp-loss-weight is unsupported: this decoder has no dedicated future-token heads, \
+             so reusing next-token logits for MTP trains conflicting targets"
+        );
+    }
     run_decoder_training(cfg)?;
     Ok(true)
 }
@@ -1150,10 +1156,15 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let inverse_action_classifier =
         NextActionClassifier::new(world_vb.pp("inverse_action_classifier"), config.bridge_dim)?;
 
-    let transition_params = 3
-        * (config.bridge_dim * config.bridge_dim * 4
-            + config.bridge_dim * config.bridge_dim * 2
-            + 4 * config.bridge_dim);
+    const ORCH_N: usize = crate::model::action_classifier_head::NUM_ACTIONS;
+    let transition_ff = (config.bridge_dim * 4).max(320);
+    let transition_params = ORCH_N * config.bridge_dim
+        + 6 * (8 * config.bridge_dim * config.bridge_dim
+            + 2 * config.bridge_dim * transition_ff
+            + transition_ff
+            + 13 * config.bridge_dim)
+        + 2 * config.bridge_dim
+        + 2 * (config.bridge_dim * config.bridge_dim + config.bridge_dim);
     let learned_memory_params =
         2 * config.dim + 2 * (config.dim + 1) + 2 * (config.dim * config.dim + config.dim);
     let planner_params = config.num_latent_tokens * config.dim
@@ -1162,7 +1173,6 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         + config.bridge_dim
         + learned_memory_params;
     let action_classifier_hidden = (config.bridge_dim * 2).max(256);
-    const ORCH_N: usize = crate::model::action_classifier_head::NUM_ACTIONS;
     let action_classifier_params = config.bridge_dim * action_classifier_hidden
         + action_classifier_hidden
         + action_classifier_hidden * ORCH_N
@@ -1459,8 +1469,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 &device,
             )?;
             let pred_next_slots = transition.forward(&state_slots, &action_labels)?;
+            let fixed_next_slots = next_slots.detach();
 
-            let transition_loss = prediction_loss(&pred_next_slots, &next_slots)?;
+            let transition_loss = prediction_loss(&pred_next_slots, &fixed_next_slots)?;
             let post_state_loss = if post_state_loss_weight > 0.0 {
                 transition_loss.clone()
             } else {
@@ -1497,7 +1508,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let action_logits = action_classifier_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
             let (inverse_loss, inverse_logits) = if inverse_loss_weight > 0.0 {
-                let true_delta_slots = slot_delta_slots(&next_slots, &state_slots)?;
+                let true_delta_slots = slot_delta_slots(&fixed_next_slots, &state_slots.detach())?;
                 let pred_delta_slots = slot_delta_slots(&pred_next_slots, &state_slots)?;
                 let inverse_logits_true = inverse_action_classifier.forward(&true_delta_slots)?;
                 let inverse_logits_pred = inverse_action_classifier.forward(&pred_delta_slots)?;
@@ -2139,8 +2150,33 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
         config.bridge_dim,
     )?;
 
-    let total_params = config.bridge_dim * config.bridge_dim * 8
-        + config.bridge_dim * config.macro_max_len
+    let macro_encoder_ff = (config.bridge_dim * 4).max(256);
+    let macro_encoder_hidden = (config.bridge_dim * 2).max(256);
+    let macro_encoder_params = crate::model::action_classifier_head::NUM_ACTIONS
+        * config.bridge_dim
+        + config.macro_max_len * config.bridge_dim
+        + (config.macro_max_len + 1) * config.bridge_dim
+        + 2 * (4 * config.bridge_dim * config.bridge_dim
+            + 2 * config.bridge_dim * macro_encoder_ff
+            + macro_encoder_ff
+            + 9 * config.bridge_dim)
+        + 2 * 2 * config.bridge_dim
+        + config.bridge_dim
+        + 1
+        + 2 * config.bridge_dim * macro_encoder_hidden
+        + macro_encoder_hidden
+        + config.bridge_dim;
+    let macro_transition_ff = (config.bridge_dim * 5).max(320);
+    let macro_transition_params = config.bridge_dim * config.bridge_dim
+        + config.bridge_dim
+        + 3 * (4 * config.bridge_dim * config.bridge_dim
+            + 2 * config.bridge_dim * macro_transition_ff
+            + macro_transition_ff
+            + 9 * config.bridge_dim)
+        + 2 * config.bridge_dim
+        + 2 * (config.bridge_dim * config.bridge_dim + config.bridge_dim);
+    let total_params = macro_encoder_params
+        + macro_transition_params
         + config.num_latent_tokens * config.bridge_dim;
     let _ = fs::create_dir_all("local_models");
     let model_path = config.output_path.clone().unwrap_or_else(|| {
@@ -2302,7 +2338,8 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             let macro_action =
                 macro_encoder.forward_from_slices(&batch.action_sequences, &device)?;
             let pred_slots = macro_transition.forward(&state_slots, &macro_action)?;
-            let transition_loss = prediction_loss(&pred_slots, &target_slots)?;
+            let fixed_target_slots = target_slots.detach();
+            let transition_loss = prediction_loss(&pred_slots, &fixed_target_slots)?;
             let target_sigreg = sigreg_epps_pulley(
                 &flatten_latent_slots(&target_slots)?,
                 sigreg_slices,
@@ -3471,6 +3508,12 @@ fn collect_action_training_batch_cached(
 }
 
 fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
+    if config.mtp_loss_weight > 0.0 {
+        anyhow::bail!(
+            "--mtp-loss-weight is unsupported: this decoder has no dedicated future-token heads, \
+             so reusing next-token logits for MTP trains conflicting targets"
+        );
+    }
     let device = match Device::new_cuda(0) {
         Ok(d) => {
             tracing::info!("using device: CUDA(0)");
@@ -3586,6 +3629,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.bridge_dim,
         DecoderConditioningAdapter::output_slots_for(config.decoder_kind, config.num_latent_tokens),
     )?;
+    let decoder_adapter_compress_rate = decoder_conditioning_adapter.compress_rate();
     let decoder_path = config.decoder_output_path.clone().unwrap_or_else(|| {
         config
             .world_model_path
@@ -3681,6 +3725,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         decoder_arch.ff_dim,
         config.decoder_kind,
     )?;
+    let decoder_attention = decoder.attention_config();
     util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
@@ -3772,6 +3817,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         decoder_arch.num_heads,
         decoder_arch.ff_dim,
         util::format_params(decoder_params)
+    );
+    println!(
+        "Decoder attention: local_window={} anchor_period={} csa_rate={} hca_rate={} csa_topk={} cross_schedule={} latent_prefix={} adapter_compress_rate={}",
+        decoder_attention.local_window,
+        decoder_attention.anchor_period,
+        decoder_attention.csa_compress_rate,
+        decoder_attention.hca_compress_rate,
+        decoder_attention.csa_topk,
+        decoder_attention.cross_attention_schedule.as_str(),
+        decoder_attention.latent_prefix,
+        decoder_adapter_compress_rate
     );
     println!(
         "Decoder negative conditioning forwards: {} (weight={} negatives={})",
@@ -4732,6 +4788,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         config.bridge_dim,
         config.num_latent_tokens,
         decoder_arch,
+        decoder_attention,
+        decoder_adapter_compress_rate,
     )?;
     println!("Decoder vocab saved to {:?}", decoder_vocab_path);
     if config.decoder_kind == DecoderKind::TextGeneralist {

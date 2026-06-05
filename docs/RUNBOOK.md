@@ -75,17 +75,18 @@ Use the same profile that you plan to train on. This prepares source data,
 prepared mixes, the Go eval suite, profile-sized vocabs, the base token caches,
 and the separate Go-feedback decoder token cache under `data/cache/go_feedback/`.
 
-To archive and upload the handoff directories to your own Hugging Face dataset:
+To upload the handoff directories to your own Hugging Face dataset:
 
 ```bash
 cargo run --release -- prepare cache 80gb --auto-hf-upload --hf-dataset <org/dataset-name>
 ```
 
-This writes `tofy-cache-<profile>-<sha>-<timestamp>.tar.zst` plus a sidecar
-`.info.txt` under `runs/prepare_cache/`, then uploads both files with the `hf`
-CLI. You must pass the dataset id on the command line; there is no default repo.
-See [DATA_FORMATS.md](DATA_FORMATS.md#prepared-cache-hf-upload) for restore
-steps and archive contents.
+This uploads `data/`, `eval/`, and `local_models/vocabs/` with the `hf` CLI and
+writes a sidecar `.info.txt` under `runs/prepare_cache/`. Large files are
+compressed individually with zstd level 1 before upload. There is no tarball.
+You must pass the dataset id on the command line; there is no default repo. See
+[DATA_FORMATS.md](DATA_FORMATS.md#prepared-cache-hf-upload) for restore steps
+and uploaded contents.
 
 Stage 1 prepares the text datasets, materializes `data/encoder_mix.txt`, builds
 profile-specific vocabs, and writes binary token caches before Stage 2 starts.

@@ -1,0 +1,31 @@
+{
+  "version": 5,
+  "kind": "encoder",
+  "source": {
+    "path": "data/encoder_mix.txt",
+    "len": 6056333473,
+    "modified_unix_secs": 1780262029,
+    "content_hash": "a6d06ac9fcc5a80c"
+  },
+  "tokenizer": "default",
+  "tokenizer_spec": {
+    "version": 8,
+    "mode": "default",
+    "normalization": "identity_utf8",
+    "pretokenizer": "none",
+    "code_control_tokens": [],
+    "byte_fallback": true,
+    "reserved_byte_tokens": true,
+    "subword_identifier_fallback": false,
+    "byte_token_format": "<byte:XX>",
+    "byte_native": true,
+    "adaptive_boundaries": false,
+    "boundaryless_bpe": true
+  },
+  "tokenizer_spec_signature": "2a5841a9843c5048",
+  "max_seq": 1536,
+  "vocab_path": "",
+  "vocab_signature": "820794f439b00df6",
+  "token_cache_path": "data/cache/go_feedback/encoder.tokens.bin",
+  "rows": 30194364
+}

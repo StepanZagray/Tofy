@@ -62,45 +62,149 @@ impl DecoderKind {
             Self::CodeSpecialist => 1,
         }
     }
+}
 
-    fn local_window(self) -> usize {
-        decoder_env_usize(
-            "TOFY_DECODER_LOCAL_WINDOW",
-            match self {
-                Self::TextGeneralist => 96,
-                Self::CodeSpecialist => 192,
-            },
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecoderCrossAttentionSchedule {
+    All,
+    LastOnly,
+    Every2nd,
+    Every3rd,
+}
+
+impl DecoderCrossAttentionSchedule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::LastOnly => "last-only",
+            Self::Every2nd => "every-2nd",
+            Self::Every3rd => "every-3rd",
+        }
     }
 
-    fn anchor_period(self) -> usize {
-        decoder_env_usize(
-            "TOFY_DECODER_ANCHOR_PERIOD",
-            match self {
-                Self::TextGeneralist => 4,
-                Self::CodeSpecialist => 3,
-            },
-        )
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        match flag.trim().to_ascii_lowercase().as_str() {
+            "" | "all" => Some(Self::All),
+            "last" | "last-only" | "last_only" => Some(Self::LastOnly),
+            "every-2nd" | "every_2nd" | "half" => Some(Self::Every2nd),
+            "every-3rd" | "every_3rd" | "third" => Some(Self::Every3rd),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecoderAttentionConfig {
+    pub local_window: usize,
+    pub anchor_period: usize,
+    pub csa_compress_rate: usize,
+    pub hca_compress_rate: usize,
+    pub csa_topk: usize,
+    pub cross_attention_schedule: DecoderCrossAttentionSchedule,
+    pub latent_prefix: bool,
+}
+
+impl DecoderAttentionConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        local_window: usize,
+        anchor_period: usize,
+        csa_compress_rate: usize,
+        hca_compress_rate: usize,
+        csa_topk: usize,
+        cross_attention_schedule: DecoderCrossAttentionSchedule,
+        latent_prefix: bool,
+    ) -> Result<Self> {
+        if local_window == 0 {
+            anyhow::bail!("decoder local_window must be non-zero");
+        }
+        if anchor_period == 0 {
+            anyhow::bail!("decoder anchor_period must be non-zero");
+        }
+        if csa_compress_rate == 0 {
+            anyhow::bail!("decoder csa_compress_rate must be non-zero");
+        }
+        if hca_compress_rate == 0 {
+            anyhow::bail!("decoder hca_compress_rate must be non-zero");
+        }
+        if csa_topk == 0 {
+            anyhow::bail!("decoder csa_topk must be non-zero");
+        }
+        Ok(Self {
+            local_window,
+            anchor_period,
+            csa_compress_rate,
+            hca_compress_rate,
+            csa_topk,
+            cross_attention_schedule,
+            latent_prefix,
+        })
     }
 
-    fn csa_compress_rate(self) -> usize {
-        decoder_env_usize(
+    pub fn from_env(kind: DecoderKind) -> Self {
+        let csa_compress_rate = decoder_env_usize(
             "TOFY_DECODER_CSA_COMPRESS_RATE",
-            match self {
-                Self::TextGeneralist => 4,
-                Self::CodeSpecialist => 4,
+            match kind {
+                DecoderKind::TextGeneralist => 4,
+                DecoderKind::CodeSpecialist => 4,
             },
-        )
+        );
+        Self {
+            local_window: decoder_env_usize(
+                "TOFY_DECODER_LOCAL_WINDOW",
+                match kind {
+                    DecoderKind::TextGeneralist => 96,
+                    DecoderKind::CodeSpecialist => 192,
+                },
+            ),
+            anchor_period: decoder_env_usize(
+                "TOFY_DECODER_ANCHOR_PERIOD",
+                match kind {
+                    DecoderKind::TextGeneralist => 4,
+                    DecoderKind::CodeSpecialist => 3,
+                },
+            ),
+            csa_compress_rate,
+            hca_compress_rate: decoder_env_usize(
+                "TOFY_DECODER_HCA_COMPRESS_RATE",
+                match kind {
+                    DecoderKind::TextGeneralist => 64,
+                    DecoderKind::CodeSpecialist => 128,
+                },
+            ),
+            csa_topk: decoder_env_usize("TOFY_DECODER_CSA_TOPK", csa_compress_rate.max(1) * 2),
+            cross_attention_schedule: std::env::var("TOFY_DECODER_CROSS_ATTN_SCHEDULE")
+                .ok()
+                .and_then(|flag| DecoderCrossAttentionSchedule::from_flag(&flag))
+                .unwrap_or(DecoderCrossAttentionSchedule::All),
+            latent_prefix: std::env::var("TOFY_DECODER_LATENT_PREFIX")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+        }
     }
 
-    fn hca_compress_rate(self) -> usize {
-        decoder_env_usize(
-            "TOFY_DECODER_HCA_COMPRESS_RATE",
-            match self {
-                Self::TextGeneralist => 64,
-                Self::CodeSpecialist => 128,
-            },
-        )
+    fn self_attention_kind(self, layer_idx: usize, num_layers: usize) -> DecoderSelfAttentionKind {
+        if layer_idx == 0 {
+            return DecoderSelfAttentionKind::Sliding;
+        }
+        if layer_idx + 1 == num_layers || layer_idx.is_multiple_of(self.anchor_period) {
+            DecoderSelfAttentionKind::CompressedSparse
+        } else {
+            DecoderSelfAttentionKind::HeavilyCompressed
+        }
+    }
+
+    fn cross_attention_enabled(self, layer_idx: usize, num_layers: usize) -> bool {
+        match self.cross_attention_schedule {
+            DecoderCrossAttentionSchedule::All => true,
+            DecoderCrossAttentionSchedule::LastOnly => layer_idx + 1 == num_layers,
+            DecoderCrossAttentionSchedule::Every2nd => {
+                layer_idx + 1 == num_layers || layer_idx.is_multiple_of(2)
+            }
+            DecoderCrossAttentionSchedule::Every3rd => {
+                layer_idx + 1 == num_layers || layer_idx.is_multiple_of(3)
+            }
+        }
     }
 }
 
@@ -117,45 +221,6 @@ enum DecoderSelfAttentionKind {
     Sliding,
     CompressedSparse,
     HeavilyCompressed,
-}
-
-fn decoder_self_attention_kind(
-    kind: DecoderKind,
-    layer_idx: usize,
-    num_layers: usize,
-) -> DecoderSelfAttentionKind {
-    if layer_idx == 0 {
-        return DecoderSelfAttentionKind::Sliding;
-    }
-    if layer_idx + 1 == num_layers || layer_idx.is_multiple_of(kind.anchor_period()) {
-        DecoderSelfAttentionKind::CompressedSparse
-    } else {
-        DecoderSelfAttentionKind::HeavilyCompressed
-    }
-}
-
-fn decoder_cross_attention_enabled(layer_idx: usize, num_layers: usize) -> bool {
-    match std::env::var("TOFY_DECODER_CROSS_ATTN_SCHEDULE")
-        .unwrap_or_else(|_| "all".to_string())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "last" | "last-only" | "last_only" => layer_idx + 1 == num_layers,
-        "every-3rd" | "every_3rd" | "third" => {
-            layer_idx + 1 == num_layers || layer_idx.is_multiple_of(3)
-        }
-        "every-2nd" | "every_2nd" | "half" => {
-            layer_idx + 1 == num_layers || layer_idx.is_multiple_of(2)
-        }
-        _ => true,
-    }
-}
-
-fn decoder_latent_prefix_enabled() -> bool {
-    std::env::var("TOFY_DECODER_LATENT_PREFIX")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
 }
 
 /// One decoder layer: causal self-attention + cross-attention to world latent + FFN.
@@ -225,27 +290,34 @@ impl CodeDecoderBlock {
         world_latent: &Tensor,
         domain_state: &Tensor,
         attention_kind: DecoderSelfAttentionKind,
-        local_window: usize,
-        csa_compress_rate: usize,
-        hca_compress_rate: usize,
+        attention: DecoderAttentionConfig,
         use_cross_attention: bool,
+        prefix_len: usize,
     ) -> Result<Tensor> {
         let normed = self.ln1.forward(x)?;
         let self_out = match attention_kind {
-            DecoderSelfAttentionKind::Sliding => {
-                self.self_attn.forward_causal_local(&normed, local_window)?
-            }
+            DecoderSelfAttentionKind::Sliding => self.self_attn.forward_causal_local_with_prefix(
+                &normed,
+                attention.local_window,
+                prefix_len,
+            )?,
             DecoderSelfAttentionKind::CompressedSparse => {
                 self.self_attn.forward_causal_compressed_sparse(
                     &normed,
-                    local_window,
-                    csa_compress_rate,
-                    self.kind_index_topk(csa_compress_rate),
+                    attention.local_window,
+                    attention.csa_compress_rate,
+                    attention.csa_topk,
+                    prefix_len,
                 )?
             }
-            DecoderSelfAttentionKind::HeavilyCompressed => self
-                .self_attn
-                .forward_causal_heavily_compressed(&normed, local_window, hca_compress_rate)?,
+            DecoderSelfAttentionKind::HeavilyCompressed => {
+                self.self_attn.forward_causal_heavily_compressed(
+                    &normed,
+                    attention.local_window,
+                    attention.hca_compress_rate,
+                    prefix_len,
+                )?
+            }
         };
         let x = (x + self_out)?;
 
@@ -254,9 +326,8 @@ impl CodeDecoderBlock {
             let cross_gate_in = normed.broadcast_add(domain_state)?;
             let cross_gate = self
                 .cross_gate
-                .forward(&cross_gate_in)?
-                .relu()?
-                .clamp(0.0, 1.0)?;
+                .forward(&cross_gate_in)
+                .and_then(|gate| nn::ops::sigmoid(&gate))?;
             let cross_out = self
                 .cross_attn
                 .forward(&normed, world_latent)?
@@ -289,39 +360,55 @@ impl CodeDecoderBlock {
         cross_kv_cache: &AttentionKvCache,
         domain_state: &Tensor,
         attention_kind: DecoderSelfAttentionKind,
-        local_window: usize,
-        csa_compress_rate: usize,
-        hca_compress_rate: usize,
+        attention: DecoderAttentionConfig,
         use_cross_attention: bool,
         prefix_len: usize,
     ) -> Result<(Tensor, AttentionKvCache)> {
         let normed = self.ln1.forward(x)?;
         let self_out = match attention_kind {
-            DecoderSelfAttentionKind::Sliding => {
-                self.self_attn.forward_causal_local(&normed, local_window)?
-            }
+            DecoderSelfAttentionKind::Sliding => self.self_attn.forward_causal_local_with_prefix(
+                &normed,
+                attention.local_window,
+                prefix_len,
+            )?,
             DecoderSelfAttentionKind::CompressedSparse => {
                 self.self_attn.forward_causal_compressed_sparse(
                     &normed,
-                    local_window,
-                    csa_compress_rate,
-                    self.kind_index_topk(csa_compress_rate),
+                    attention.local_window,
+                    attention.csa_compress_rate,
+                    attention.csa_topk,
+                    prefix_len,
                 )?
             }
-            DecoderSelfAttentionKind::HeavilyCompressed => self
-                .self_attn
-                .forward_causal_heavily_compressed(&normed, local_window, hca_compress_rate)?,
+            DecoderSelfAttentionKind::HeavilyCompressed => {
+                self.self_attn.forward_causal_heavily_compressed(
+                    &normed,
+                    attention.local_window,
+                    attention.hca_compress_rate,
+                    prefix_len,
+                )?
+            }
         };
         let self_kv_cache = match attention_kind {
             DecoderSelfAttentionKind::Sliding => self
                 .self_attn
                 .project_self_kv_with_prefix(&normed, prefix_len)?,
-            DecoderSelfAttentionKind::CompressedSparse => self
-                .self_attn
-                .project_self_kv_compressed(&normed, local_window, csa_compress_rate, prefix_len)?,
-            DecoderSelfAttentionKind::HeavilyCompressed => self
-                .self_attn
-                .project_self_kv_compressed(&normed, local_window, hca_compress_rate, prefix_len)?,
+            DecoderSelfAttentionKind::CompressedSparse => {
+                self.self_attn.project_self_kv_compressed(
+                    &normed,
+                    attention.local_window,
+                    attention.csa_compress_rate,
+                    prefix_len,
+                )?
+            }
+            DecoderSelfAttentionKind::HeavilyCompressed => {
+                self.self_attn.project_self_kv_compressed(
+                    &normed,
+                    attention.local_window,
+                    attention.hca_compress_rate,
+                    prefix_len,
+                )?
+            }
         };
         let x = (x + self_out)?;
 
@@ -330,9 +417,8 @@ impl CodeDecoderBlock {
             let cross_gate_in = normed.broadcast_add(domain_state)?;
             let cross_gate = self
                 .cross_gate
-                .forward(&cross_gate_in)?
-                .relu()?
-                .clamp(0.0, 1.0)?;
+                .forward(&cross_gate_in)
+                .and_then(|gate| nn::ops::sigmoid(&gate))?;
             let cross_out = self
                 .cross_attn
                 .forward_precomputed(&normed, cross_kv_cache, None)?
@@ -361,36 +447,35 @@ impl CodeDecoderBlock {
         cross_kv_cache: &AttentionKvCache,
         domain_state: &Tensor,
         attention_kind: DecoderSelfAttentionKind,
-        local_window: usize,
-        csa_compress_rate: usize,
-        hca_compress_rate: usize,
+        attention: DecoderAttentionConfig,
         use_cross_attention: bool,
         self_kv_cache: Option<&AttentionKvCache>,
     ) -> Result<(Tensor, AttentionKvCache)> {
         let normed = self.ln1.forward(x)?;
-        let (self_out, next_self_kv_cache) =
-            match attention_kind {
-                DecoderSelfAttentionKind::Sliding => self
-                    .self_attn
-                    .forward_causal_local_incremental(&normed, self_kv_cache, local_window)?,
-                DecoderSelfAttentionKind::CompressedSparse => self
-                    .self_attn
-                    .forward_causal_compressed_sparse_incremental(
-                        &normed,
-                        self_kv_cache,
-                        local_window,
-                        csa_compress_rate,
-                        self.kind_index_topk(csa_compress_rate),
-                    )?,
-                DecoderSelfAttentionKind::HeavilyCompressed => self
-                    .self_attn
-                    .forward_causal_heavily_compressed_incremental(
-                        &normed,
-                        self_kv_cache,
-                        local_window,
-                        hca_compress_rate,
-                    )?,
-            };
+        let (self_out, next_self_kv_cache) = match attention_kind {
+            DecoderSelfAttentionKind::Sliding => self.self_attn.forward_causal_local_incremental(
+                &normed,
+                self_kv_cache,
+                attention.local_window,
+            )?,
+            DecoderSelfAttentionKind::CompressedSparse => self
+                .self_attn
+                .forward_causal_compressed_sparse_incremental(
+                    &normed,
+                    self_kv_cache,
+                    attention.local_window,
+                    attention.csa_compress_rate,
+                    attention.csa_topk,
+                )?,
+            DecoderSelfAttentionKind::HeavilyCompressed => self
+                .self_attn
+                .forward_causal_heavily_compressed_incremental(
+                    &normed,
+                    self_kv_cache,
+                    attention.local_window,
+                    attention.hca_compress_rate,
+                )?,
+        };
         let x = (x + self_out)?;
 
         let x = if use_cross_attention {
@@ -398,9 +483,8 @@ impl CodeDecoderBlock {
             let cross_gate_in = normed.broadcast_add(domain_state)?;
             let cross_gate = self
                 .cross_gate
-                .forward(&cross_gate_in)?
-                .relu()?
-                .clamp(0.0, 1.0)?;
+                .forward(&cross_gate_in)
+                .and_then(|gate| nn::ops::sigmoid(&gate))?;
             let cross_out = self
                 .cross_attn
                 .forward_precomputed(&normed, cross_kv_cache, None)?
@@ -421,14 +505,6 @@ impl CodeDecoderBlock {
         let ff_out = ff_out.broadcast_add(&adapter.affine(0.5, 0.0)?)?;
         Ok(((x + ff_out)?, next_self_kv_cache))
     }
-
-    fn kind_index_topk(&self, fallback: usize) -> usize {
-        std::env::var("TOFY_DECODER_CSA_TOPK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(fallback.max(1) * 2)
-            .max(1)
-    }
 }
 
 /// Decoder-only transformer conditioned on world latent via cross-attention.
@@ -443,6 +519,7 @@ pub struct CodeDecoder {
     dim: usize,
     vocab_size: usize,
     kind: DecoderKind,
+    attention: DecoderAttentionConfig,
 }
 
 impl CodeDecoder {
@@ -456,6 +533,31 @@ impl CodeDecoder {
         num_heads: usize,
         ff_dim: usize,
         kind: DecoderKind,
+    ) -> Result<Self> {
+        Self::new_with_attention_config(
+            vb,
+            vocab_size,
+            dim,
+            world_dim,
+            num_layers,
+            num_heads,
+            ff_dim,
+            kind,
+            DecoderAttentionConfig::from_env(kind),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_attention_config(
+        vb: VarBuilder<'_>,
+        vocab_size: usize,
+        dim: usize,
+        world_dim: usize,
+        num_layers: usize,
+        num_heads: usize,
+        ff_dim: usize,
+        kind: DecoderKind,
+        attention: DecoderAttentionConfig,
     ) -> Result<Self> {
         let embed = nn::embedding(vocab_size, dim, vb.pp("embed"))?;
         let kind_embed = nn::embedding(2, dim, vb.pp("kind_embed"))?;
@@ -481,7 +583,12 @@ impl CodeDecoder {
             dim,
             vocab_size,
             kind,
+            attention,
         })
+    }
+
+    pub fn attention_config(&self) -> DecoderAttentionConfig {
+        self.attention
     }
 
     /// input_ids: [B, T], world_latent: [B, T_world, world_dim]
@@ -508,17 +615,18 @@ impl CodeDecoder {
         let domain_state = self.domain_state(device, b, total_len)?;
         let structure_state = self.structure_state(world_latent, b, total_len)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let attention_kind =
-                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
+            let attention_kind = self
+                .attention
+                .self_attention_kind(layer_idx, self.blocks.len());
             h = block.forward(
                 &h,
                 world_latent,
                 &domain_state.broadcast_add(&structure_state)?,
                 attention_kind,
-                self.kind.local_window(),
-                self.kind.csa_compress_rate(),
-                self.kind.hca_compress_rate(),
-                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
+                self.attention,
+                self.attention
+                    .cross_attention_enabled(layer_idx, self.blocks.len()),
+                prefix_len,
             )?;
         }
         h = self.ln_final.forward(&h)?;
@@ -527,7 +635,7 @@ impl CodeDecoder {
     }
 
     fn latent_prefix(&self, world_latent: &Tensor) -> Result<Tensor> {
-        if !decoder_latent_prefix_enabled() {
+        if !self.attention.latent_prefix {
             let (batch, _, _) = world_latent.dims3()?;
             return Tensor::zeros(
                 (batch, 0, self.dim),
@@ -595,17 +703,17 @@ impl CodeDecoder {
         h = h.broadcast_add(&state.domain_state)?;
         h = h.broadcast_add(&state.structure_state)?;
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let attention_kind =
-                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
+            let attention_kind = self
+                .attention
+                .self_attention_kind(layer_idx, self.blocks.len());
             let (next_h, next_cache) = block.forward_incremental(
                 &h,
                 &state.cross_kv_caches[layer_idx],
                 &state.domain_state.broadcast_add(&state.structure_state)?,
                 attention_kind,
-                self.kind.local_window(),
-                self.kind.csa_compress_rate(),
-                self.kind.hca_compress_rate(),
-                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
+                self.attention,
+                self.attention
+                    .cross_attention_enabled(layer_idx, self.blocks.len()),
                 state.self_kv_caches[layer_idx].as_ref(),
             )?;
             h = next_h;
@@ -655,17 +763,17 @@ impl CodeDecoder {
         let mut self_kv_caches = Vec::with_capacity(self.blocks.len());
 
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let attention_kind =
-                decoder_self_attention_kind(self.kind, layer_idx, self.blocks.len());
+            let attention_kind = self
+                .attention
+                .self_attention_kind(layer_idx, self.blocks.len());
             let (next_h, self_kv_cache) = block.forward_prefill(
                 &h,
                 &cross_kv_caches[layer_idx],
                 &domain_state_full.broadcast_add(&structure_state_full)?,
                 attention_kind,
-                self.kind.local_window(),
-                self.kind.csa_compress_rate(),
-                self.kind.hca_compress_rate(),
-                decoder_cross_attention_enabled(layer_idx, self.blocks.len()),
+                self.attention,
+                self.attention
+                    .cross_attention_enabled(layer_idx, self.blocks.len()),
                 prefix_len,
             )?;
             h = next_h;

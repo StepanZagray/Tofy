@@ -1,7 +1,7 @@
 # Training Pod Runbook
 
 This is the low-back-and-forth RunPod path. Pod-side commands live in
-`scripts/`, so the console flow is mostly “sync repo, run script.”
+`scripts/`, so the console flow is mostly “git pull, run script.”
 
 Tofy training pods should use CUDA 13.0. Keep `allowedCudaVersions: ["13.0"]`
 in raw RunPod payloads and keep `CUDA_VERSION=13.0` when using the helper
@@ -41,9 +41,12 @@ cargo run --release -- prepare cache 80gb \
   --hf-dataset Grayza/80gb-profile-go-cache
 ```
 
-Use the archive name printed at the end in Step 5. The archive includes the
-base decoder cache and the separate Go-feedback decoder cache under
-`data/cache/go_feedback/`.
+This uploads `data/`, `eval/`, and `local_models/vocabs/` to the dataset root.
+Large files are stored as individual `*.zst` objects; small manifests and vocab
+files stay plain. There is no `.tar.zst` archive name to pass to the pod.
+
+Create a Hugging Face token with read access to the cache dataset. This is
+separate from the GitHub deploy key; GitHub keys only allow `git pull`.
 
 ## 2. Create Pod
 
@@ -175,7 +178,7 @@ If the API returns `There are no instances currently available`, retry later or
 switch GPU type. Keep the CUDA 13.0 filter unless you are intentionally
 debugging a lower-CUDA machine.
 
-## 3. Sync Repo To Pod
+## 3. Clone Repo To Pod
 
 Get the exact SSH command from the RunPod Connect tab, then set these locally.
 For a command like `ssh 2pb...@ssh.runpod.io -i ~/.ssh/id_ed25519`, use:
@@ -185,16 +188,44 @@ export TOFY_POD_SSH="2pb...@ssh.runpod.io"
 export TOFY_POD_KEY="$HOME/.ssh/id_ed25519"
 ```
 
-Push the current repo checkout to the pod:
+Commit and push your local changes before using the pod. The pod should pull
+from Git, not receive local working-tree edits.
+
+Connect to the pod:
 
 ```bash
-rsync -az --delete \
-  -e "ssh -i ${TOFY_POD_KEY}" \
-  --exclude target --exclude runs --exclude .git \
-  /home/stepan/Coding/Personal/Tofy/ \
-  "${TOFY_POD_SSH}:/workspace/Tofy/"
-
 ssh -tt -i "${TOFY_POD_KEY}" "${TOFY_POD_SSH}"
+```
+
+Inside the pod, create a GitHub SSH key if the pod does not already have one:
+
+```bash
+apt-get update
+apt-get install -y git openssh-client ca-certificates
+
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+test -f ~/.ssh/runpod_tofy || ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/runpod_tofy
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/runpod_tofy ~/.ssh/config
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+cat ~/.ssh/runpod_tofy.pub
+```
+
+Add the printed public key to GitHub repo -> Settings -> Deploy keys. Then
+clone or update the repo:
+
+```bash
+cd /workspace
+git clone git@github.com:StepanZagray/Tofy.git Tofy || true
+cd /workspace/Tofy
+git pull --ff-only
 ```
 
 Use `ssh -tt` for interactive pod access. Some RunPod endpoints reject
@@ -202,14 +233,12 @@ one-shot, non-PTY commands such as `ssh ... 'ps aux'` with
 `Error: Your SSH client doesn't support PTY`; connect with `ssh -tt` first and
 then run status commands inside the shell.
 
-If you prefer `git pull` on the pod, clone the repo however you normally do and
-add the deploy key printed by `scripts/runpod_pod_setup.sh`.
-
 ## 4. Pod Setup
 
-Run inside the pod from the synced repo. This installs system tools, Rust, Go,
+Run inside the pod from the cloned repo. This installs system tools, Rust, Go,
 HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves auto-stop credentials,
-checks CUDA, and prints a GitHub deploy key.
+saves the HF token for cache download, checks CUDA, and prints a GitHub deploy
+key.
 
 ```bash
 cd /workspace/Tofy
@@ -217,7 +246,22 @@ RUNPOD_POD_ID="<pod-id-from-create-step>" scripts/runpod_pod_setup.sh
 ```
 
 If you already exported `RUNPOD_API_KEY` and `RUNPOD_POD_ID` inside the pod, the
-script will not prompt for them.
+script will not prompt for them. The setup script also prints the pod deploy key
+again if you skipped the key setup in Step 3.
+
+When prompted for `Hugging Face token for cache download`, paste the HF token
+with access to `Grayza/80gb-profile-go-cache`. To set it non-interactively:
+
+```bash
+cd /workspace/Tofy
+export HF_TOKEN="<hf-read-token>"
+scripts/runpod_pod_setup.sh
+hf auth whoami
+```
+
+`export` matters: `HF_TOKEN=...` without `export` is only a shell variable and
+child processes such as `scripts/runpod_restore_cache_build.sh` and `hf
+download` will not see it.
 
 ## 5. Restore Cache And Build
 
@@ -225,31 +269,27 @@ Run inside the pod:
 
 ```bash
 cd /workspace/Tofy
-SKIP_GIT_PULL=1 scripts/runpod_restore_cache_build.sh
+scripts/runpod_restore_cache_build.sh
 ```
 
-The restore script uses `pzstd -d -p $(nproc)` when available and falls back to
-`tar --zstd`. This can speed up archives created with the repo's current
-`pzstd` default, but extraction can still be limited by RunPod volume write
-throughput.
+The restore script downloads the prepared cache tree directly into
+`/workspace/Tofy`, decompresses downloaded `*.zst` files in place, and removes
+the compressed copies. It does not download or extract a tarball.
 
-Defaults:
+Defaults and required inputs:
 
 - dataset: `Grayza/80gb-profile-go-cache`
-- archive: `tofy-cache-80gb-a8e7916-1780391272.tar.zst`
-- extraction target: `/workspace/Tofy`
+- restore target: `/workspace/Tofy`
 
 Override if needed:
 
 ```bash
 TOFY_CACHE_HF_DATASET="Grayza/80gb-profile-go-cache" \
-TOFY_CACHE_ARCHIVE="tofy-cache-80gb-a8e7916-1780391272.tar.zst" \
-SKIP_GIT_PULL=1 \
 scripts/runpod_restore_cache_build.sh
 ```
 
-If `local_models/vocabs` is missing after extraction, do not start the long run;
-rebuild or copy the prepared cache with vocabs included.
+If `local_models/vocabs` is missing after restore, do not start the long run;
+rebuild and upload the prepared cache locally.
 
 The restore script also checks for the base and Go-feedback token cache
 manifests. If it reports a missing `data/cache/go_feedback/...` path, rebuild
@@ -278,7 +318,7 @@ Start the full 80 GB run. This uses the auto-stop wrapper by default.
 
 ```bash
 cd /workspace/Tofy
-SKIP_GIT_PULL=1 PROFILE=80gb scripts/runpod_train.sh train
+PROFILE=80gb scripts/runpod_train.sh train
 ```
 
 `scripts/runpod_train.sh` defaults to `TOFY_REQUIRE_PREPARED_CACHE=1`, so a
@@ -296,14 +336,14 @@ Resume latest:
 
 ```bash
 cd /workspace/Tofy
-SKIP_GIT_PULL=1 PROFILE=80gb scripts/runpod_train.sh resume
+PROFILE=80gb scripts/runpod_train.sh resume
 ```
 
 Resume a specific run:
 
 ```bash
 cd /workspace/Tofy
-SKIP_GIT_PULL=1 PROFILE=80gb RESUME_TARGET=code_poc_<timestamp> scripts/runpod_train.sh resume
+PROFILE=80gb RESUME_TARGET=code_poc_<timestamp> scripts/runpod_train.sh resume
 ```
 
 Resume only with the same architecture/profile that created the run.

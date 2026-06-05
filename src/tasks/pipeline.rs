@@ -1,12 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::{data, tasks, util};
 
@@ -27,6 +30,7 @@ const GO_FEEDBACK_TRAIN_DATA: &str = "data/code_poc_go_mix.txt";
 const CODE_TRAIN_DATA: &str = "data/code_poc_mix.txt";
 const CACHE_DIR: &str = "data/cache";
 const MODEL_PROFILES_PATH: &str = "config/model_profiles.json";
+const PREPARED_CACHE_COMPRESS_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemoryProfile {
@@ -116,6 +120,20 @@ struct PipelinePaths {
     code_decoder_vocab: PathBuf,
     encoder_cache_vocab: PathBuf,
     code_decoder_cache_vocab: PathBuf,
+}
+
+#[derive(Debug)]
+struct PreparedCacheUploadFile {
+    local_path: PathBuf,
+    remote_path: PathBuf,
+    size: u64,
+    sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct RemoteRepoFile {
+    size: u64,
+    oid: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -389,7 +407,7 @@ fn run_prepare_cache(
     prepare_go_feedback_decoder_token_cache(&prepare_cache_paths(&defaults), &defaults)?;
     println!("Data/cache preparation complete.");
     if let Some(repo) = hf_upload_dataset {
-        archive_and_upload_prepare_cache(profile, &repo)?;
+        upload_prepare_cache_tree(profile, &repo)?;
     }
     Ok(())
 }
@@ -1890,7 +1908,7 @@ fn parse_hf_dataset_repo(value: &str) -> Result<String> {
     Ok(repo.to_string())
 }
 
-fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Result<()> {
+fn upload_prepare_cache_tree(profile: MemoryProfile, repo: &str) -> Result<()> {
     ensure_cache_upload_tools()?;
     let artifact_dir = runs_dir().join("prepare_cache");
     fs::create_dir_all(&artifact_dir)?;
@@ -1898,74 +1916,65 @@ fn archive_and_upload_prepare_cache(profile: MemoryProfile, repo: &str) -> Resul
     let git_sha = short_git_sha();
     let timestamp = unix_timestamp()?;
     let base_name = format!("tofy-cache-{}-{}-{}", profile.as_str(), git_sha, timestamp);
-    let archive_path = artifact_dir.join(format!("{base_name}.tar.zst"));
     let info_path = artifact_dir.join(format!("{base_name}.info.txt"));
 
-    let archive_inputs = prepare_cache_archive_inputs()?;
-    write_prepare_cache_info(&info_path, profile, repo, &archive_path, &archive_inputs)?;
+    let upload_roots = prepare_cache_upload_roots()?;
+    write_prepare_cache_info(&info_path, profile, repo, &base_name, &upload_roots)?;
 
-    println!("Archiving prepared cache to {}", archive_path.display());
-    let mut tar = Command::new("tar");
-    tar.arg("-I")
-        .arg(cache_archive_compress_program())
-        .arg("-cf")
-        .arg(&archive_path);
-    for input in &archive_inputs {
-        tar.arg(input);
+    let staging_dir = artifact_dir.join(format!("{base_name}-upload"));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).with_context(|| {
+            format!("remove stale upload staging dir {}", staging_dir.display())
+        })?;
     }
-    run_external_command(&mut tar, "archive prepared cache")?;
+    fs::create_dir_all(&staging_dir)?;
 
-    upload_hf_file(repo, &info_path)?;
-    upload_hf_file(repo, &archive_path)?;
+    let upload_files = prepare_cache_upload_files(&upload_roots, &staging_dir)?;
+    let remote_files = list_hf_dataset_files(repo)?;
+
+    let mut skipped = 0usize;
     println!(
-        "Uploaded prepared cache archive to Hugging Face dataset {repo}: {}",
-        archive_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("<archive>")
+        "Uploading compressed prepared cache tree to Hugging Face dataset {repo}: {} files",
+        upload_files.len()
+    );
+    for file in &upload_files {
+        if remote_file_matches(file, &remote_files) {
+            skipped += 1;
+            println!(
+                "Skipping unchanged Hugging Face file: {}",
+                file.remote_path.display()
+            );
+            continue;
+        }
+        upload_hf_file(repo, &file.local_path, &file.remote_path)?;
+    }
+    upload_hf_file(
+        repo,
+        &info_path,
+        &PathBuf::from(format!("runs/prepare_cache/{base_name}.info.txt")),
+    )?;
+    delete_stale_hf_cache_files(repo, &upload_files, &remote_files)?;
+    fs::remove_dir_all(&staging_dir)
+        .with_context(|| format!("remove upload staging dir {}", staging_dir.display()))?;
+    println!(
+        "Uploaded compressed prepared cache tree to Hugging Face dataset {repo}: {base_name} (skipped {skipped} unchanged files)"
     );
     Ok(())
 }
 
 fn ensure_cache_upload_tools() -> Result<()> {
-    for tool in ["tar", "hf"] {
-        if !command_available(tool) {
-            bail!(
-                "--auto-hf-upload requires `{tool}` on PATH; install it and authenticate with `hf auth login` if needed"
-            );
-        }
-    }
-    let compress_program = cache_archive_compress_program();
-    let compress_tool = compress_program.split_whitespace().next().unwrap_or("zstd");
-    if !command_available(compress_tool) {
+    if !command_available("hf") {
         bail!(
-            "--auto-hf-upload requires cache archive compressor `{compress_tool}` on PATH; set TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM or install pzstd/zstd"
+            "--auto-hf-upload requires `hf` on PATH; install it and authenticate with `hf auth login` if needed"
         );
+    }
+    if !command_available("pzstd") && !command_available("zstd") {
+        bail!("--auto-hf-upload requires `pzstd` or `zstd` on PATH for prepared cache compression");
     }
     Ok(())
 }
 
-fn cache_archive_compress_program() -> String {
-    if let Ok(program) = std::env::var("TOFY_CACHE_ARCHIVE_COMPRESS_PROGRAM") {
-        let trimmed = program.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if command_available("pzstd") {
-        format!("pzstd -p {} -1", default_parallel_threads())
-    } else {
-        "zstd -T0 -1".to_string()
-    }
-}
-
-fn default_parallel_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(1)
-}
-
-fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
+fn prepare_cache_upload_roots() -> Result<Vec<PathBuf>> {
     let mut inputs = vec![PathBuf::from("data"), PathBuf::from("eval"), vocab_dir()];
     let configured_cache_dir = cache_dir();
     if configured_cache_dir.as_path() != Path::new(CACHE_DIR)
@@ -1977,7 +1986,7 @@ fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
     for input in &inputs {
         if !input.exists() {
             bail!(
-                "cannot archive prepared cache because {} does not exist",
+                "cannot upload prepared cache because {} does not exist",
                 input.display()
             );
         }
@@ -1985,25 +1994,253 @@ fn prepare_cache_archive_inputs() -> Result<Vec<PathBuf>> {
     Ok(inputs)
 }
 
+fn prepare_cache_upload_files(
+    roots: &[PathBuf],
+    staging_dir: &Path,
+) -> Result<Vec<PreparedCacheUploadFile>> {
+    let mut files = Vec::new();
+    for root in roots {
+        collect_prepare_cache_upload_files(root, staging_dir, &mut files)?;
+    }
+    files.sort_by(|left, right| {
+        left.size
+            .cmp(&right.size)
+            .then_with(|| left.remote_path.cmp(&right.remote_path))
+    });
+    Ok(files)
+}
+
+fn collect_prepare_cache_upload_files(
+    path: &Path,
+    staging_dir: &Path,
+    files: &mut Vec<PreparedCacheUploadFile>,
+) -> Result<()> {
+    if path.is_file() {
+        if should_upload_prepare_cache_file(path) {
+            let source_size = fs::metadata(path)
+                .with_context(|| format!("stat prepared cache upload file {}", path.display()))?
+                .len();
+            let (local_path, remote_path) =
+                if should_compress_prepare_cache_upload_file(source_size) {
+                    let remote_path = PathBuf::from(format!("{}.zst", path.display()));
+                    let local_path = staging_dir.join(&remote_path);
+                    compress_prepare_cache_file(path, &local_path)?;
+                    (local_path, remote_path)
+                } else {
+                    (path.to_path_buf(), path.to_path_buf())
+                };
+            let size = fs::metadata(&local_path)
+                .with_context(|| {
+                    format!("stat prepared cache upload file {}", local_path.display())
+                })?
+                .len();
+            let sha256 = should_hash_prepare_cache_upload_file(&local_path, size)
+                .then(|| sha256_file(&local_path))
+                .transpose()?;
+            files.push(PreparedCacheUploadFile {
+                local_path,
+                remote_path,
+                size,
+                sha256,
+            });
+        }
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("read prepared cache upload directory {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read prepared cache upload directory {}", path.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        collect_prepare_cache_upload_files(&entry.path(), staging_dir, files)?;
+    }
+    Ok(())
+}
+
+fn should_upload_prepare_cache_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !(name.ends_with(".lock")
+        || name.ends_with(".incomplete")
+        || name.contains(".tmp.")
+        || name.starts_with('.'))
+}
+
+fn should_hash_prepare_cache_upload_file(path: &Path, size: u64) -> bool {
+    size >= 8 * 1024 * 1024 || path.extension().and_then(|ext| ext.to_str()) == Some("bin")
+}
+
+fn should_compress_prepare_cache_upload_file(size: u64) -> bool {
+    size >= PREPARED_CACHE_COMPRESS_THRESHOLD_BYTES
+}
+
+fn compress_prepare_cache_file(input: &Path, output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    println!(
+        "Compressing prepared cache file {} -> {}",
+        input.display(),
+        output.display()
+    );
+    let mut command = if command_available("pzstd") {
+        let mut command = Command::new("pzstd");
+        command
+            .arg("-p")
+            .arg(default_parallel_threads().to_string())
+            .arg("-1")
+            .arg("-f")
+            .arg(input)
+            .arg("-o")
+            .arg(output);
+        command
+    } else {
+        let mut command = Command::new("zstd");
+        command
+            .arg("-T0")
+            .arg("-1")
+            .arg("-f")
+            .arg(input)
+            .arg("-o")
+            .arg(output);
+        command
+    };
+    run_external_command(&mut command, "compress prepared cache file")
+}
+
+fn default_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open {} for sha256", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("hash {} with sha256", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn managed_prepare_cache_remote_path(path: &str) -> bool {
+    path == "eval"
+        || path.starts_with("eval/")
+        || path == "data"
+        || path.starts_with("data/")
+        || path == "local_models/vocabs"
+        || path.starts_with("local_models/vocabs/")
+}
+
+fn remote_file_matches(
+    local: &PreparedCacheUploadFile,
+    remote_files: &HashMap<String, RemoteRepoFile>,
+) -> bool {
+    let remote_path = local.remote_path.to_string_lossy();
+    let Some(remote) = remote_files.get(remote_path.as_ref()) else {
+        return false;
+    };
+    if remote.size != local.size {
+        return false;
+    }
+    match (&local.sha256, &remote.oid) {
+        (Some(local_hash), Some(remote_oid)) if remote_oid.len() == 64 => local_hash == remote_oid,
+        (Some(_), Some(_)) => false,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn list_hf_dataset_files(repo: &str) -> Result<HashMap<String, RemoteRepoFile>> {
+    let endpoint =
+        format!("https://huggingface.co/api/datasets/{repo}/tree/main?recursive=true&expand=true");
+    let mut curl = Command::new("curl");
+    curl.args(["-fsSL", &endpoint]);
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        if !token.trim().is_empty() {
+            curl.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    let output = curl
+        .output()
+        .with_context(|| format!("list Hugging Face dataset files for {repo}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "list Hugging Face dataset files for {repo} failed with status {}\nstderr:\n{}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse Hugging Face dataset file tree for {repo}"))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| anyhow!("Hugging Face dataset tree response was not an array"))?;
+    let mut files = HashMap::new();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("file") {
+            continue;
+        }
+        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let oid = entry.get("oid").and_then(Value::as_str).map(str::to_string);
+        files.insert(path.to_string(), RemoteRepoFile { size, oid });
+    }
+    println!(
+        "Scanned Hugging Face dataset {repo}: {} remote files",
+        files.len()
+    );
+    Ok(files)
+}
+
+fn delete_stale_hf_cache_files(
+    repo: &str,
+    upload_files: &[PreparedCacheUploadFile],
+    remote_files: &HashMap<String, RemoteRepoFile>,
+) -> Result<()> {
+    let local_paths = upload_files
+        .iter()
+        .map(|file| file.remote_path.to_string_lossy().to_string())
+        .collect::<HashSet<_>>();
+    let mut stale_paths = remote_files
+        .keys()
+        .filter(|path| managed_prepare_cache_remote_path(path) && !local_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    stale_paths.sort();
+    if stale_paths.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "Deleting {} stale Hugging Face cache files from {repo}",
+        stale_paths.len()
+    );
+    for path in stale_paths {
+        delete_hf_file(repo, &path)?;
+    }
+    Ok(())
+}
+
 fn write_prepare_cache_info(
     path: &Path,
     profile: MemoryProfile,
     repo: &str,
-    archive_path: &Path,
-    archive_inputs: &[PathBuf],
+    tree_name: &str,
+    upload_inputs: &[PathBuf],
 ) -> Result<()> {
-    let inputs = archive_inputs
+    let inputs = upload_inputs
         .iter()
         .map(|path| format!("- {}", path.display()))
         .collect::<Vec<_>>()
         .join("\n");
-    let archive_name = archive_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("<archive>");
     let content = format!(
-        "profile: {}\nrepo: {repo}\narchive: {archive_name}\ncreated_unix_secs: {}\ngit_sha: {}\ncommand: cargo run --release -- prepare cache {} --auto-hf-upload --hf-dataset {repo}\ncontents:\n{inputs}\n",
+        "profile: {}\nrepo: {repo}\nupload_mode: compressed-tree\ntree: {tree_name}\ncompression: zstd level 1 for files >= {} bytes\ncreated_unix_secs: {}\ngit_sha: {}\ncommand: cargo run --release -- prepare cache {} --auto-hf-upload --hf-dataset {repo}\ncontents:\n{inputs}\n",
         profile.as_str(),
+        PREPARED_CACHE_COMPRESS_THRESHOLD_BYTES,
         unix_timestamp()?,
         short_git_sha(),
         profile.as_str()
@@ -2011,21 +2248,77 @@ fn write_prepare_cache_info(
     write_text_atomic(path, &content)
 }
 
-fn upload_hf_file(repo: &str, path: &Path) -> Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid upload path: {}", path.display()))?;
+fn upload_hf_file(repo: &str, local_path: &Path, remote_path: &Path) -> Result<()> {
     println!(
-        "Uploading {} to Hugging Face dataset {repo}",
-        path.display()
+        "Uploading {} to Hugging Face dataset {repo}: {}",
+        local_path.display(),
+        remote_path.display()
     );
-    let mut hf = Command::new("hf");
-    hf.args(["upload", "--repo-type", "dataset", repo])
-        .arg(path)
-        .arg(file_name);
-    run_external_command(&mut hf, "upload prepared cache to Hugging Face")?;
+    run_hf_upload_with_retries(repo, local_path, remote_path)?;
     Ok(())
+}
+
+fn delete_hf_file(repo: &str, remote_path: &str) -> Result<()> {
+    println!("Deleting stale Hugging Face file from {repo}: {remote_path}");
+    let attempts = env_usize_or("TOFY_HF_UPLOAD_RETRIES", 5).max(1);
+    let retry_sleep_secs = env_usize_or("TOFY_HF_UPLOAD_RETRY_SLEEP_SECS", 30);
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        let mut hf = Command::new("hf");
+        hf.args([
+            "repo-files",
+            "delete",
+            "--repo-type",
+            "dataset",
+            repo,
+            remote_path,
+        ]);
+        match run_external_command(
+            &mut hf,
+            "delete stale prepared cache file from Hugging Face",
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < attempts {
+                    eprintln!(
+                        "Hugging Face delete failed for {remote_path} (attempt {attempt}/{attempts}); retrying in {retry_sleep_secs}s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(retry_sleep_secs as u64));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("delete retry loop must record an error"))
+}
+
+fn run_hf_upload_with_retries(repo: &str, local_path: &Path, remote_path: &Path) -> Result<()> {
+    let attempts = env_usize_or("TOFY_HF_UPLOAD_RETRIES", 5).max(1);
+    let retry_sleep_secs = env_usize_or("TOFY_HF_UPLOAD_RETRY_SLEEP_SECS", 30);
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        let mut hf = Command::new("hf");
+        if std::env::var_os("HF_HUB_DISABLE_XET").is_none() {
+            hf.env("HF_HUB_DISABLE_XET", "1");
+        }
+        hf.args(["upload", "--repo-type", "dataset", repo])
+            .arg(local_path)
+            .arg(remote_path);
+        match run_external_command(&mut hf, "upload prepared cache file to Hugging Face") {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < attempts {
+                    eprintln!(
+                        "Hugging Face upload failed for {} (attempt {attempt}/{attempts}); retrying in {retry_sleep_secs}s",
+                        local_path.display()
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(retry_sleep_secs as u64));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("upload retry loop must record an error"))
 }
 
 fn short_git_sha() -> String {

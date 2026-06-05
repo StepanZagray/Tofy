@@ -21,6 +21,7 @@ pub struct DecoderConditioningAdapter {
     proj: nn::Linear,
     num_output_slots: usize,
     planner_dim: usize,
+    compress_rate: usize,
 }
 
 impl DecoderConditioningAdapter {
@@ -30,6 +31,24 @@ impl DecoderConditioningAdapter {
         model_dim: usize,
         num_output_slots: usize,
     ) -> Result<Self> {
+        let compress_rate = std::env::var("TOFY_DECODER_ADAPTER_COMPRESS_RATE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        Self::new_with_compress_rate(vb, planner_dim, model_dim, num_output_slots, compress_rate)
+    }
+
+    pub fn new_with_compress_rate(
+        vb: VarBuilder<'_>,
+        planner_dim: usize,
+        model_dim: usize,
+        num_output_slots: usize,
+        compress_rate: usize,
+    ) -> Result<Self> {
+        if compress_rate == 0 {
+            anyhow::bail!("decoder adapter compress_rate must be non-zero");
+        }
         let query_embed = nn::embedding(num_output_slots, planner_dim, vb.pp("query_embed"))?;
         let action_embed = nn::embedding(
             crate::model::action_classifier_head::NUM_ACTIONS,
@@ -58,6 +77,7 @@ impl DecoderConditioningAdapter {
             proj,
             num_output_slots,
             planner_dim,
+            compress_rate,
         })
     }
 
@@ -66,6 +86,10 @@ impl DecoderConditioningAdapter {
             DecoderKind::TextGeneralist => context_slots.clamp(4, 8),
             DecoderKind::CodeSpecialist => context_slots.clamp(16, 64),
         }
+    }
+
+    pub fn compress_rate(&self) -> usize {
+        self.compress_rate
     }
 
     /// Input: context slots [B, S, planner_dim]. Output: decoder conditioning slots [B, A, model_dim].
@@ -95,18 +119,21 @@ impl DecoderConditioningAdapter {
                 batch
             );
         }
-        let memory = compressed_context_compressor(context_slots, self.num_output_slots)?;
+        let memory = compressed_context_compressor(
+            context_slots,
+            self.num_output_slots,
+            self.compress_rate,
+        )?;
         let action_ids = Tensor::from_vec(action_ids.to_vec(), (batch,), context_slots.device())?;
         let action_state = self.action_embed.forward(&action_ids)?;
         let action_memory = memory.broadcast_add(&action_state.unsqueeze(1)?)?;
         let salience = ops::softmax(&self.index_proj.forward(&action_memory)?, D::Minus2)?;
-        let memory = action_memory.broadcast_mul(&salience)?;
-        let global_memory = memory.sum(1)?;
+        let salience_memory = action_memory.broadcast_mul(&salience)?;
+        let global_memory = salience_memory.sum(1)?;
         let memory_gate = self
             .gate_proj
-            .forward(&global_memory)?
-            .relu()?
-            .clamp(0.0, 1.0)?
+            .forward(&global_memory)
+            .and_then(|gate| ops::sigmoid(&gate))?
             .unsqueeze(1)?;
 
         let query_ids: Vec<u32> = (0..self.num_output_slots as u32).collect();
@@ -126,7 +153,7 @@ impl DecoderConditioningAdapter {
         let normed = self.ln1.forward(&gated_queries)?;
         let attended = self
             .cross_attn
-            .forward(&normed, &memory)?
+            .forward(&normed, &action_memory)?
             .broadcast_mul(&memory_gate)?;
         let slots = (action_queries + attended)?;
 
@@ -138,7 +165,11 @@ impl DecoderConditioningAdapter {
     }
 }
 
-fn compressed_context_compressor(context_slots: &Tensor, output_slots: usize) -> Result<Tensor> {
+fn compressed_context_compressor(
+    context_slots: &Tensor,
+    output_slots: usize,
+    compress_rate: usize,
+) -> Result<Tensor> {
     let (_, slots, _) = context_slots.dims3()?;
     let recent = output_slots.clamp(1, slots.max(1)).min(slots);
     let recent_start = slots.saturating_sub(recent);
@@ -147,11 +178,7 @@ fn compressed_context_compressor(context_slots: &Tensor, output_slots: usize) ->
         return Ok(recent_memory);
     }
 
-    let compress_rate = std::env::var("TOFY_DECODER_ADAPTER_COMPRESS_RATE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4)
-        .max(1);
+    let compress_rate = compress_rate.max(1);
     let mut compressed = Vec::new();
     let mut start = 0usize;
     while start < recent_start {

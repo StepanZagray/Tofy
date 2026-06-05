@@ -5,6 +5,8 @@ use candle_nn::{self as nn, Module, VarBuilder};
 use super::attention::CrossAttention;
 use super::encoders::EncoderFeatures;
 
+const ATTENTION_MASK_VALUE: f32 = -1.0e4;
+
 /// Context compressor: resamples encoder hidden states into a fixed set of private task-state slots.
 /// These slots are used by the action classifier/router and action-state transition, not directly by the decoders.
 pub struct ContextCompressor {
@@ -161,7 +163,7 @@ impl ContextCompressor {
             let scores = queries.matmul(&blocks.transpose(D::Minus2, D::Minus1)?)?;
             let scores = (scores / (self.in_dim as f64).sqrt())?;
             let bias = block_mask
-                .affine(1e9, -1e9)?
+                .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?
                 .unsqueeze(1)?
                 .to_dtype(scores.dtype())?;
             let weights = nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
@@ -210,21 +212,22 @@ impl ContextCompressor {
                 .broadcast_div(&denom)?;
             let normed = self.memory_ln.forward(&block)?;
             let score = self.memory_score.forward(&normed)?.squeeze(2)?;
-            let score_bias = block_mask.affine(1e9, -1e9)?.to_dtype(score.dtype())?;
+            let score_bias = block_mask
+                .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?
+                .to_dtype(score.dtype())?;
             let attn = nn::ops::softmax(&score.broadcast_add(&score_bias)?, 1)?;
             let value = self.memory_value.forward(&normed)?;
             let learned = value.broadcast_mul(&attn.unsqueeze(2)?)?.sum(1)?;
             let gate = self
                 .memory_gate
-                .forward(&summary)?
-                .relu()?
-                .clamp(0.0, 1.0)?;
+                .forward(&summary)
+                .and_then(|gate| nn::ops::sigmoid(&gate))?;
             let gated = learned
                 .broadcast_mul(&gate)?
                 .broadcast_add(&summary.broadcast_mul(&gate.affine(-1.0, 1.0)?)?)?;
-            block_tensors.push(gated.unsqueeze(1)?);
 
             let valid = block_mask.sum(1)?.clamp(0.0, 1.0)?.unsqueeze(1)?;
+            block_tensors.push(gated.broadcast_mul(&valid)?.unsqueeze(1)?);
             block_mask_tensors.push(valid);
             start += len;
         }

@@ -6,7 +6,10 @@ pub mod tool_calling_decoder;
 
 pub use decoder_candle_runtime::CandleCrossAttnDecoder;
 pub use decoder_conditioning_adapter::DecoderConditioningAdapter;
-pub use decoder_cross::{CodeDecoder, DecoderArchitecture, DecoderKind};
+pub use decoder_cross::{
+    CodeDecoder, DecoderArchitecture, DecoderAttentionConfig, DecoderCrossAttentionSchedule,
+    DecoderKind,
+};
 pub use decoder_runtime::{
     LlamaCppDecoder, LocalDecoderRuntime, RlmDecoderRuntime, StubLocalDecoder,
 };
