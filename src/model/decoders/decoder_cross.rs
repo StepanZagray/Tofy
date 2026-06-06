@@ -729,16 +729,13 @@ impl CodeDecoder {
         prompt_ids: &[u32],
         world_latent: &Tensor,
     ) -> Result<DecoderGenerationState> {
-        if prompt_ids.is_empty() {
-            return Ok(DecoderGenerationState {
-                token_ids: Vec::new(),
-                self_kv_caches: vec![None; self.blocks.len()],
-                cross_kv_caches: self.precompute_cross_kv_caches(world_latent)?,
-                domain_state: self.domain_state(device, 1, 1)?,
-                structure_state: self.structure_state(world_latent, 1, 1)?,
-                last_logits: None,
-            });
-        }
+        let seeded_prompt;
+        let prompt_ids = if prompt_ids.is_empty() {
+            seeded_prompt = [0u32];
+            seeded_prompt.as_slice()
+        } else {
+            prompt_ids
+        };
         let prompt_len = prompt_ids.len();
         let prefix = self.latent_prefix(world_latent)?;
         let prefix_len = prefix.dim(1)?;
@@ -874,9 +871,6 @@ impl CodeDecoder {
         temperature: f32,
         stop_at: Option<u32>,
     ) -> Result<Vec<u32>> {
-        if prompt_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut state = self.begin_generation(device, prompt_ids, world_latent)?;
         let mut generated = Vec::new();
 
@@ -901,10 +895,83 @@ impl CodeDecoder {
         world_latent: &Tensor,
         temperature: f32,
     ) -> Result<u32> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
         let state = self.begin_generation(device, ids, world_latent)?;
         self.sample_from_last_logits(&state, temperature)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    fn deterministic_world_latent(
+        batch: usize,
+        slots: usize,
+        dim: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let values = (0..batch * slots * dim)
+            .map(|idx| ((idx % 31) as f32 - 15.0) / 17.0)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (batch, slots, dim), device).map_err(Into::into)
+    }
+
+    fn assert_close(a: &Tensor, b: &Tensor, tol: f32, label: &str) -> Result<()> {
+        let max_diff = a.broadcast_sub(b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_diff < tol, "{label} mismatch: {max_diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn cached_generation_logits_match_full_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let attention =
+            DecoderAttentionConfig::new(3, 2, 2, 2, 4, DecoderCrossAttentionSchedule::All, true)?;
+        let decoder = CodeDecoder::new_with_attention_config(
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            32,
+            8,
+            6,
+            3,
+            2,
+            16,
+            DecoderKind::CodeSpecialist,
+            attention,
+        )?;
+        let world_latent = deterministic_world_latent(1, 5, 6, &device)?;
+        let prompt_ids = vec![3u32, 4, 5, 6, 7, 8, 9, 10];
+        let prompt = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device)?;
+
+        let full_prompt_logits =
+            decoder
+                .forward(&prompt, &world_latent)?
+                .narrow(1, prompt_ids.len() - 1, 1)?;
+        let mut state = decoder.begin_generation(&device, &prompt_ids, &world_latent)?;
+        let cached_prompt_logits = state
+            .last_logits
+            .as_ref()
+            .context("missing prompt logits")?;
+        assert_close(
+            &full_prompt_logits,
+            cached_prompt_logits,
+            1e-4,
+            "prefill logits",
+        )?;
+
+        let next_id = 11u32;
+        decoder.step_generation(&device, &mut state, next_id)?;
+        let mut stepped_ids = prompt_ids;
+        stepped_ids.push(next_id);
+        let stepped = Tensor::from_vec(stepped_ids.clone(), (1, stepped_ids.len()), &device)?;
+        let full_step_logits =
+            decoder
+                .forward(&stepped, &world_latent)?
+                .narrow(1, stepped_ids.len() - 1, 1)?;
+        let cached_step_logits = state.last_logits.as_ref().context("missing step logits")?;
+        assert_close(&full_step_logits, cached_step_logits, 1e-4, "step logits")?;
+        Ok(())
     }
 }

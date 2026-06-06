@@ -1,16 +1,18 @@
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
+use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use crate::cli::resolve_data_path;
 use crate::config::{LatentEvalConfig, LatentTrainConfig};
 use crate::data::{
     build_vocab_from_pair_file, count_pairs_with_vocab, make_augmented_jepa_batch,
     make_augmented_jepa_batch_from_pairs, make_jepa_batch_from_pairs, prepare_ultrachat_pairs,
-    CachedPairStream, CurriculumDenoisingConfig, PairStream, DEFAULT_MIN_TOKENS_PER_LINE,
-    DEFAULT_STREAM_SHUFFLE_BUFFER,
+    tokenizer_spec_signature, CachedPairStream, CurriculumDenoisingConfig, PairStream,
+    TokenizationMode, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::{vocab_signature, Pair};
@@ -91,6 +93,30 @@ fn split_encoder_features(
     ])
 }
 
+const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
+
+#[derive(Debug, Deserialize)]
+struct CacheManifestSource {
+    path: String,
+    len: u64,
+    content_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheTokenManifest {
+    #[serde(default)]
+    version: u32,
+    kind: String,
+    source: CacheManifestSource,
+    tokenizer: String,
+    #[serde(default)]
+    tokenizer_spec_signature: String,
+    max_seq: usize,
+    action_filter: Option<u32>,
+    vocab_signature: String,
+    token_cache_path: String,
+}
+
 fn token_cache_path(kind: &str) -> Option<PathBuf> {
     let enabled = std::env::var("TOFY_USE_TOKEN_CACHE")
         .ok()
@@ -103,21 +129,61 @@ fn token_cache_path(kind: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn token_cache_manifest(kind: &str) -> Option<serde_json::Value> {
+fn token_cache_manifest(kind: &str) -> Option<CacheTokenManifest> {
     let cache_dir = std::env::var("TOFY_CACHE_DIR").unwrap_or_else(|_| "data/cache".to_string());
     let path = PathBuf::from(cache_dir).join(format!("{kind}_tokens.manifest.json"));
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn latent_token_cache_path(vocab_signature_value: &str, source_budget: usize) -> Option<PathBuf> {
-    let manifest = token_cache_manifest("encoder")?;
-    let max_seq = manifest.get("max_seq")?.as_u64()? as usize;
-    let signature = manifest.get("vocab_signature")?.as_str()?;
-    if max_seq < source_budget || signature != vocab_signature_value {
-        return None;
+fn source_fingerprint_matches(path: &Path, source: &CacheManifestSource) -> Result<bool> {
+    if source.path != path.to_string_lossy() {
+        return Ok(false);
     }
-    token_cache_path("encoder")
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if source.len != metadata.len() {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        for byte in &buf[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(source.content_hash == format!("{hash:016x}"))
+}
+
+fn latent_token_cache_path(
+    data_path: &Path,
+    vocab_signature_value: &str,
+    source_budget: usize,
+) -> Result<Option<PathBuf>> {
+    let Some(cache_path) = token_cache_path("encoder") else {
+        return Ok(None);
+    };
+    let Some(manifest) = token_cache_manifest("encoder") else {
+        return Ok(None);
+    };
+    if manifest.version != TOKEN_CACHE_MANIFEST_VERSION
+        || manifest.kind != "encoder"
+        || manifest.tokenizer != TokenizationMode::Default.as_str()
+        || manifest.tokenizer_spec_signature != tokenizer_spec_signature(TokenizationMode::Default)
+        || manifest.max_seq < source_budget
+        || manifest.action_filter.is_some()
+        || manifest.vocab_signature != vocab_signature_value
+        || manifest.token_cache_path != cache_path.to_string_lossy().as_ref()
+        || !source_fingerprint_matches(data_path, &manifest.source)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(cache_path))
 }
 
 fn latent_curriculum(
@@ -319,9 +385,11 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         min_tokens.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE),
     )?;
     let latent_source_budget = config.max_seq.max(1) * config.latent_context_segments.max(1);
-    let mut cached_pair_stream = if let Some(cache_path) =
-        latent_token_cache_path(&vocab_signature(&vocab), latent_source_budget)
-    {
+    let mut cached_pair_stream = if let Some(cache_path) = latent_token_cache_path(
+        &config.data_path,
+        &vocab_signature(&vocab),
+        latent_source_budget,
+    )? {
         println!("Token cache: using latent encoder cache {:?}", cache_path);
         Some(CachedPairStream::new(&cache_path)?)
     } else {

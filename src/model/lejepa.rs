@@ -7,7 +7,21 @@ pub fn prediction_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
 }
 
 pub fn mean_cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dot = a.broadcast_mul(b)?.sum(1)?;
+    let a_dims = a.dims();
+    let b_dims = b.dims();
+    if a_dims != b_dims {
+        anyhow::bail!("cosine tensors must have identical dims: {a_dims:?} vs {b_dims:?}");
+    }
+    let Some(&dim) = a_dims.last() else {
+        anyhow::bail!("cosine tensors must have at least one dimension");
+    };
+    let rows = a_dims[..a_dims.len().saturating_sub(1)]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let a = a.reshape((rows, dim))?;
+    let b = b.reshape((rows, dim))?;
+    let dot = a.broadcast_mul(&b)?.sum(1)?;
     let a_norm = a.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
     let b_norm = b.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
     dot.broadcast_div(&a_norm.broadcast_mul(&b_norm)?)?
@@ -71,4 +85,30 @@ pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> R
     let stacked = Tensor::cat(&per_t, 0)?;
     let _ = num_samples;
     stacked.mean_all().map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn mean_cosine_similarity_uses_last_dimension_for_slot_tensors() -> Result<()> {
+        let device = Device::Cpu;
+        let a = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            (2, 2, 2),
+            &device,
+        )?;
+        let b = Tensor::from_vec(
+            vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, -1.0],
+            (2, 2, 2),
+            &device,
+        )?;
+
+        let value = mean_cosine_similarity(&a, &b)?.to_vec0::<f32>()?;
+
+        assert!((value - 0.25).abs() < 1e-6, "cosine was {value}");
+        Ok(())
+    }
 }

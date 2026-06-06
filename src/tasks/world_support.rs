@@ -78,6 +78,33 @@ pub(crate) struct DecoderBatchMetrics {
     pub(crate) function_name_exact_rate: f32,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DecoderConditioningGains {
+    pub(crate) conditioning_gain: f32,
+    pub(crate) zero_gain: f32,
+    pub(crate) shuffle_gain: f32,
+    pub(crate) hard_negative_gain: f32,
+}
+
+pub(crate) fn decoder_conditioning_gains(
+    raw_loss: f32,
+    ablated_loss: f32,
+    shuffled_loss: f32,
+    hard_mismatch_loss: f32,
+    compute_conditioning_metrics: bool,
+) -> DecoderConditioningGains {
+    if !compute_conditioning_metrics {
+        return DecoderConditioningGains::default();
+    }
+    let conditioning_gain = ablated_loss - raw_loss;
+    DecoderConditioningGains {
+        conditioning_gain,
+        zero_gain: conditioning_gain,
+        shuffle_gain: shuffled_loss - raw_loss,
+        hard_negative_gain: ablated_loss.min(shuffled_loss).min(hard_mismatch_loss) - raw_loss,
+    }
+}
+
 pub(crate) fn shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
     shifted_conditioning_latent(world_latent, 1)
 }
@@ -1089,22 +1116,26 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let total_tokens = (decoder_batch.len().max(1) * max_seq * 2) as f32;
     let prediction_metrics =
         decoder_prediction_metrics(&logits, &dec_target, &loss_mask, decoder_vocab)?;
+    let gains = decoder_conditioning_gains(
+        raw_loss_val,
+        ablated_loss_val,
+        shuffled_loss_val,
+        hard_mismatch_loss_val,
+        compute_conditioning_metrics,
+    );
     Ok(DecoderBatchMetrics {
         loss: loss_val,
         raw_loss: raw_loss_val,
         ablated_loss: ablated_loss_val,
-        conditioning_gain: ablated_loss_val - loss_val,
-        zero_gain: ablated_loss_val - loss_val,
+        conditioning_gain: gains.conditioning_gain,
+        zero_gain: gains.zero_gain,
         shuffled_loss: shuffled_loss_val,
-        shuffle_gain: shuffled_loss_val - loss_val,
-        hard_negative_gain: ablated_loss_val
-            .min(shuffled_loss_val)
-            .min(hard_mismatch_loss_val)
-            - loss_val,
+        shuffle_gain: gains.shuffle_gain,
+        hard_negative_gain: gains.hard_negative_gain,
         syntax_loss: syntax_loss_val,
         signature_loss: signature_loss_val,
         structure_loss: structure_loss_val,
-        perplexity: loss_val.exp(),
+        perplexity: raw_loss_val.exp(),
         active_tokens,
         active_frac: active_tokens / total_tokens.max(1.0),
         world_rms: util::scalar_f32(&tensor_rms(&world_latent)?)?,
@@ -1150,6 +1181,64 @@ pub(crate) fn masked_cross_entropy(
     masked_weighted_cross_entropy(logits, target, mask)
 }
 
+pub(crate) fn forbidden_output_probability_loss(
+    logits: &Tensor,
+    mask: &Tensor,
+    vocab: &Vocab,
+) -> Result<Tensor> {
+    let (b, t, v) = logits.dims3()?;
+    let forbidden_ids = vocab
+        .id_to_token
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, token)| forbidden_decoder_token(token).then_some(idx as u32))
+        .collect::<Vec<_>>();
+    if forbidden_ids.is_empty() {
+        return logits.sum_all()?.affine(0.0, 0.0).map_err(Into::into);
+    }
+    let rows = b * t;
+    let probs = ops::softmax(&logits.reshape((rows, v))?, candle_core::D::Minus1)?;
+    let mut gather_ids = Vec::with_capacity(rows * forbidden_ids.len());
+    for _ in 0..rows {
+        gather_ids.extend(forbidden_ids.iter().copied());
+    }
+    let ids = Tensor::from_vec(gather_ids, (rows, forbidden_ids.len()), logits.device())?;
+    let forbidden_prob = probs.gather(&ids, 1)?.sum(1)?;
+    let mask_flat = mask.reshape((rows,))?.to_dtype(forbidden_prob.dtype())?;
+    let weighted = forbidden_prob.broadcast_mul(&mask_flat)?.sum_all()?;
+    let normalizer = mask_flat.sum_all()?.clamp(1e-8, 1e10)?;
+    weighted.broadcast_div(&normalizer).map_err(Into::into)
+}
+
+fn forbidden_decoder_token(token: &str) -> bool {
+    if token.contains("```") {
+        return true;
+    }
+    matches!(
+        token,
+        "Here"
+            | "here"
+            | "explanation"
+            | "Explanation"
+            | "markdown"
+            | "Markdown"
+            | "assistant"
+            | "Assistant"
+            | "user"
+            | "User"
+            | "Compiler"
+            | "compiler"
+            | "feedback"
+            | "Feedback"
+            | "Previous"
+            | "previous"
+            | "attempt"
+            | "Attempt"
+            | "corrected"
+            | "Corrected"
+    )
+}
+
 pub(crate) fn multi_token_prediction_loss(
     logits: &Tensor,
     target: &Tensor,
@@ -1192,6 +1281,7 @@ pub(crate) fn decoder_selection_score(
     signature_loss_weight: f64,
     structure_loss_weight: f64,
 ) -> f32 {
+    let reward_proxy = decoder_reward_proxy(metrics);
     metrics.loss
         + 0.20 * (0.05 - metrics.conditioning_gain).max(0.0)
         + 0.25 * (0.05 - metrics.shuffle_gain).max(0.0)
@@ -1209,11 +1299,35 @@ pub(crate) fn decoder_selection_score(
         - 0.04 * metrics.conditioning_gain.max(0.0)
         - 0.04 * metrics.shuffle_gain.max(0.0)
         - 0.04 * metrics.hard_negative_gain.max(0.0)
+        - 0.35 * reward_proxy
+}
+
+pub(crate) fn decoder_reward_proxy(metrics: &DecoderBatchMetrics) -> f32 {
+    let syntax_quality = 0.20 * metrics.syntax_token_accuracy
+        + 0.15 * metrics.delimiter_balance_rate
+        + 0.15 * metrics.function_skeleton_rate;
+    let signature_quality = 0.15 * metrics.signature_token_accuracy
+        + 0.10 * metrics.signature_exact_rate
+        + 0.10 * metrics.function_name_token_accuracy
+        + 0.10 * metrics.function_name_exact_rate;
+    let token_quality = 0.10 * metrics.token_accuracy + 0.05 * metrics.identifier_accuracy;
+    let conditioning_quality = 0.05
+        * (metrics
+            .conditioning_gain
+            .min(metrics.shuffle_gain)
+            .min(metrics.hard_negative_gain)
+            .max(0.0)
+            / 0.25)
+            .clamp(0.0, 1.0);
+    (syntax_quality + signature_quality + token_quality + conditioning_quality).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{function_name_span_indices, signature_span_indices};
+    use super::{
+        decoder_conditioning_gains, decoder_reward_proxy, function_name_span_indices,
+        signature_span_indices,
+    };
     use crate::model::Vocab;
 
     fn vocab_with(tokens: &[&str]) -> (Vocab, Vec<u32>) {
@@ -1265,5 +1379,67 @@ mod tests {
         let positions = function_name_span_indices(&ids, &mask, &vocab);
 
         assert_eq!(positions, vec![1]);
+    }
+
+    #[test]
+    fn decoder_reward_proxy_prefers_structurally_correct_predictions() {
+        let weak = super::DecoderBatchMetrics {
+            loss: 2.0,
+            raw_loss: 2.0,
+            ablated_loss: 2.0,
+            conditioning_gain: 0.0,
+            zero_gain: 0.0,
+            shuffled_loss: 2.0,
+            shuffle_gain: 0.0,
+            hard_negative_gain: 0.0,
+            syntax_loss: 2.0,
+            signature_loss: 2.0,
+            structure_loss: 2.0,
+            perplexity: 7.0,
+            active_tokens: 1.0,
+            active_frac: 0.5,
+            world_rms: 1.0,
+            oov_rate: 0.2,
+            token_accuracy: 0.2,
+            identifier_accuracy: 0.1,
+            delimiter_balance_rate: 0.2,
+            syntax_token_accuracy: 0.2,
+            function_skeleton_rate: 0.0,
+            signature_token_accuracy: 0.1,
+            signature_exact_rate: 0.0,
+            function_name_token_accuracy: 0.0,
+            function_name_exact_rate: 0.0,
+        };
+        let weak_score = decoder_reward_proxy(&weak);
+        let strong = super::DecoderBatchMetrics {
+            token_accuracy: 0.9,
+            identifier_accuracy: 0.8,
+            delimiter_balance_rate: 1.0,
+            syntax_token_accuracy: 0.9,
+            function_skeleton_rate: 1.0,
+            signature_token_accuracy: 0.85,
+            signature_exact_rate: 0.7,
+            function_name_token_accuracy: 0.8,
+            function_name_exact_rate: 0.7,
+            conditioning_gain: 0.2,
+            shuffle_gain: 0.2,
+            hard_negative_gain: 0.2,
+            ..weak
+        };
+
+        assert!(decoder_reward_proxy(&strong) > weak_score);
+    }
+
+    #[test]
+    fn decoder_conditioning_gains_compare_against_raw_ce() {
+        let gains = decoder_conditioning_gains(2.0, 2.6, 2.4, 2.3, true);
+
+        assert!((gains.conditioning_gain - 0.6).abs() < 1e-6);
+        assert!((gains.shuffle_gain - 0.4).abs() < 1e-6);
+        assert!((gains.hard_negative_gain - 0.3).abs() < 1e-6);
+        assert_eq!(
+            decoder_conditioning_gains(2.0, 2.6, 2.4, 2.3, false).conditioning_gain,
+            0.0
+        );
     }
 }

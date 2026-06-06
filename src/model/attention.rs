@@ -147,47 +147,134 @@ fn append_to_compressed_cache(
     let dynamic_start = cache
         .token_count
         .saturating_sub(cache.k.dim(2)?.saturating_sub(prefix_len));
-    let old_k = full_k.narrow(2, prefix_len, overflow)?;
-    let old_v = full_v.narrow(2, prefix_len, overflow)?;
-    let compressed =
-        compress_prefix_blocks(&old_k, &old_v, overflow, compress_rate, dynamic_start)?;
+    let overflow_k = full_k.narrow(2, prefix_len, overflow)?;
+    let overflow_v = full_v.narrow(2, prefix_len, overflow)?;
     let prefix_k = full_k.narrow(2, 0, prefix_len)?;
     let prefix_v = full_v.narrow(2, 0, prefix_len)?;
     let k_tail = full_k.narrow(2, prefix_len + overflow, exact_tail)?;
     let v_tail = full_v.narrow(2, prefix_len + overflow, exact_tail)?;
     let k_cache = Tensor::cat(&[prefix_k, k_tail], 2)?;
     let v_cache = Tensor::cat(&[prefix_v, v_tail], 2)?;
-    let mut compressed_k_parts = Vec::new();
-    let mut compressed_v_parts = Vec::new();
-    let mut block_ends = cache.compressed_block_ends.clone();
-    if let (Some(ck), Some(cv)) = (&cache.compressed_k, &cache.compressed_v) {
-        compressed_k_parts.push(ck.clone());
-        compressed_v_parts.push(cv.clone());
-    }
-    if let Some((ck, cv, mut ends)) = compressed {
-        compressed_k_parts.push(ck);
-        compressed_v_parts.push(cv);
-        block_ends.append(&mut ends);
-    }
-    let compressed_k = if compressed_k_parts.is_empty() {
-        None
-    } else {
-        Some(Tensor::cat(&compressed_k_parts, 2)?)
-    };
-    let compressed_v = if compressed_v_parts.is_empty() {
-        None
-    } else {
-        Some(Tensor::cat(&compressed_v_parts, 2)?)
-    };
+    let (compressed_k, compressed_v, compressed_block_ends) = append_compressed_blocks(
+        cache.compressed_k.as_ref(),
+        cache.compressed_v.as_ref(),
+        &cache.compressed_block_ends,
+        &overflow_k,
+        &overflow_v,
+        dynamic_start,
+        prefix_len,
+        compress_rate,
+    )?;
     Ok(AttentionKvCache {
         k: k_cache,
         v: v_cache,
         compressed_k,
         compressed_v,
-        compressed_block_ends: block_ends,
+        compressed_block_ends,
         token_count: new_token_count,
         prefix_len,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_compressed_blocks(
+    compressed_k: Option<&Tensor>,
+    compressed_v: Option<&Tensor>,
+    block_ends: &[usize],
+    overflow_k: &Tensor,
+    overflow_v: &Tensor,
+    overflow_start: usize,
+    prefix_len: usize,
+    compress_rate: usize,
+) -> Result<(Option<Tensor>, Option<Tensor>, Vec<usize>)> {
+    let overflow_len = overflow_k.dim(2)?;
+    if overflow_len == 0 {
+        return Ok((
+            compressed_k.cloned(),
+            compressed_v.cloned(),
+            block_ends.to_vec(),
+        ));
+    }
+    let compress_rate = compress_rate.max(1);
+    let mut k_parts = Vec::new();
+    let mut v_parts = Vec::new();
+    let mut ends = block_ends.to_vec();
+
+    if let (Some(ck), Some(cv)) = (compressed_k, compressed_v) {
+        let block_count = ck.dim(2)?;
+        for idx in 0..block_count {
+            k_parts.push(ck.narrow(2, idx, 1)?);
+            v_parts.push(cv.narrow(2, idx, 1)?);
+        }
+    }
+
+    let mut consumed = 0usize;
+    if let Some(last_end_idx) = ends.len().checked_sub(1) {
+        let last_idx = k_parts.len().saturating_sub(1);
+        let last_start = if last_end_idx >= 1 {
+            ends[last_end_idx - 1]
+        } else {
+            prefix_len
+        };
+        let last_len = ends[last_end_idx].saturating_sub(last_start);
+        if last_len > 0
+            && last_len < compress_rate
+            && ends[last_end_idx] == overflow_start
+            && consumed < overflow_len
+        {
+            let take = (compress_rate - last_len).min(overflow_len - consumed);
+            let new_k_sum = overflow_k.narrow(2, consumed, take)?.sum(2)?.unsqueeze(2)?;
+            let new_v_sum = overflow_v.narrow(2, consumed, take)?.sum(2)?.unsqueeze(2)?;
+            let total_len = last_len + take;
+            let merged_k = k_parts[last_idx]
+                .affine(last_len as f64, 0.0)?
+                .broadcast_add(&new_k_sum)?
+                .affine(1.0 / total_len as f64, 0.0)?;
+            let merged_v = v_parts[last_idx]
+                .affine(last_len as f64, 0.0)?
+                .broadcast_add(&new_v_sum)?
+                .affine(1.0 / total_len as f64, 0.0)?;
+            k_parts[last_idx] = merged_k;
+            v_parts[last_idx] = merged_v;
+            ends[last_end_idx] += take;
+            consumed += take;
+        }
+    }
+
+    while consumed < overflow_len {
+        let take = (overflow_len - consumed).min(compress_rate);
+        let scale = 1.0 / take.max(1) as f64;
+        k_parts.push(
+            overflow_k
+                .narrow(2, consumed, take)?
+                .sum(2)?
+                .affine(scale, 0.0)?
+                .unsqueeze(2)?,
+        );
+        v_parts.push(
+            overflow_v
+                .narrow(2, consumed, take)?
+                .sum(2)?
+                .affine(scale, 0.0)?
+                .unsqueeze(2)?,
+        );
+        ends.push(overflow_start + consumed + take);
+        consumed += take;
+    }
+
+    let compressed_k = if k_parts.is_empty() {
+        None
+    } else {
+        let refs = k_parts.iter().collect::<Vec<_>>();
+        Some(Tensor::cat(&refs, 2)?)
+    };
+    let compressed_v = if v_parts.is_empty() {
+        None
+    } else {
+        let refs = v_parts.iter().collect::<Vec<_>>();
+        Some(Tensor::cat(&refs, 2)?)
+    };
+    Ok((compressed_k, compressed_v, ends))
 }
 
 fn topk_bias_from_scores(
@@ -754,7 +841,8 @@ impl MultiHeadAttention {
                 (q_start + q_len + radius).min(t)
             };
             let exact_prefix_len = prefix_len.min(t);
-            let include_prefix = causal && exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let include_prefix =
+                causal && chunk_contains_non_prefix_queries(q_start, q_len, exact_prefix_len);
             let local_kv_start = if include_prefix {
                 kv_start.max(exact_prefix_len)
             } else {
@@ -845,7 +933,10 @@ impl MultiHeadAttention {
             return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
-        let query_block = ((local_window.max(1) * 2).max(32)).min(t.max(1));
+        // Compressed blocks depend on each query's exact-tail boundary. Sharing a
+        // block layout across multiple query positions trains a different
+        // attention pattern than the incremental KV-cache path used at inference.
+        let query_block = 1usize;
         let local_radius = local_window.saturating_sub(1);
         let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
@@ -854,7 +945,8 @@ impl MultiHeadAttention {
             let q_len = (t - q_start).min(query_block);
             let local_start_raw = q_start.saturating_sub(local_radius);
             let local_end = q_start + q_len;
-            let include_prefix = exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let include_prefix =
+                chunk_contains_non_prefix_queries(q_start, q_len, exact_prefix_len);
             let local_start = if include_prefix {
                 local_start_raw.max(exact_prefix_len)
             } else {
@@ -892,11 +984,13 @@ impl MultiHeadAttention {
             v_parts.push(local_v);
             bias_parts.push(local_bias);
 
-            let compressed = compressed_causal_blocks_from(
+            let compressed = compressed_causal_blocks_for_local_queries(
                 &k,
                 &v,
                 exact_prefix_len,
-                q_start + q_len,
+                q_start,
+                q_len,
+                local_window.max(1),
                 compress_rate,
             )?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
@@ -905,7 +999,13 @@ impl MultiHeadAttention {
                 let index_bias = topk_bias_from_scores(&index_scores, index_topk, x.device())?;
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
-                let causal_bias = compressed_block_bias(q_start, q_len, &block_ends, x.device())?;
+                let causal_bias = compressed_local_block_bias(
+                    q_start,
+                    q_len,
+                    local_window.max(1),
+                    &block_ends,
+                    x.device(),
+                )?;
                 bias_parts.push(causal_bias.broadcast_add(&index_bias)?);
             }
 
@@ -946,7 +1046,9 @@ impl MultiHeadAttention {
             return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
-        let query_block = ((local_window.max(1) * 2).max(32)).min(t.max(1));
+        // Keep full training attention partitioned exactly like streaming
+        // compressed KV-cache attention.
+        let query_block = 1usize;
         let local_radius = local_window.saturating_sub(1);
         let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
@@ -955,7 +1057,8 @@ impl MultiHeadAttention {
             let q_len = (t - q_start).min(query_block);
             let local_start_raw = q_start.saturating_sub(local_radius);
             let local_end = q_start + q_len;
-            let include_prefix = exact_prefix_len > 0 && q_start >= exact_prefix_len;
+            let include_prefix =
+                chunk_contains_non_prefix_queries(q_start, q_len, exact_prefix_len);
             let local_start = if include_prefix {
                 local_start_raw.max(exact_prefix_len)
             } else {
@@ -991,19 +1094,22 @@ impl MultiHeadAttention {
             k_parts.push(local_k);
             v_parts.push(local_v);
             bias_parts.push(local_bias);
-            let compressed = compressed_causal_blocks_from(
+            let compressed = compressed_causal_blocks_for_local_queries(
                 &k,
                 &v,
                 exact_prefix_len,
-                q_start + q_len,
+                q_start,
+                q_len,
+                local_window.max(1),
                 compress_rate,
             )?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
-                bias_parts.push(compressed_block_bias(
+                bias_parts.push(compressed_local_block_bias(
                     q_start,
                     q_len,
+                    local_window.max(1),
                     &block_ends,
                     x.device(),
                 )?);
@@ -1436,6 +1542,10 @@ fn local_chunk_bias(
     Tensor::from_vec(v, (1, 1, q_len, kv_len), device).map_err(|e| anyhow::anyhow!("{:?}", e))
 }
 
+fn chunk_contains_non_prefix_queries(q_start: usize, q_len: usize, prefix_len: usize) -> bool {
+    prefix_len > 0 && q_start.saturating_add(q_len) > prefix_len
+}
+
 fn key_padding_bias(
     mask: &Tensor,
     batch: usize,
@@ -1499,6 +1609,7 @@ fn compressed_cache_block_bias(
     Tensor::from_vec(v, (1, 1, query_len, block_ends.len()), device).map_err(Into::into)
 }
 
+#[cfg(test)]
 fn compressed_causal_blocks_from(
     k: &Tensor,
     v: &Tensor,
@@ -1548,17 +1659,86 @@ fn compressed_causal_blocks_from(
     )))
 }
 
-fn compressed_block_bias(
+fn compressed_causal_blocks_for_local_queries(
+    k: &Tensor,
+    v: &Tensor,
+    start_at: usize,
     q_start: usize,
     q_len: usize,
+    local_window: usize,
+    compress_rate: usize,
+) -> Result<Option<(Tensor, Tensor, Vec<usize>)>> {
+    let (_, _, t, _) = k.dims4()?;
+    let start_at = start_at.min(t);
+    let radius = local_window.saturating_sub(1);
+    let mut forced_boundaries = Vec::with_capacity(q_len);
+    for qi in 0..q_len {
+        let boundary = (q_start + qi).saturating_sub(radius).clamp(start_at, t);
+        if boundary > start_at {
+            forced_boundaries.push(boundary);
+        }
+    }
+    forced_boundaries.sort_unstable();
+    forced_boundaries.dedup();
+    let upto = forced_boundaries.last().copied().unwrap_or(start_at);
+    if start_at >= upto || compress_rate <= 1 {
+        return Ok(None);
+    }
+
+    let mut k_blocks = Vec::new();
+    let mut v_blocks = Vec::new();
+    let mut block_ends = Vec::new();
+    let mut start = start_at;
+    while start < upto {
+        let next_boundary = forced_boundaries
+            .iter()
+            .copied()
+            .find(|boundary| *boundary > start)
+            .unwrap_or(upto);
+        let end = (start + compress_rate).min(upto).min(next_boundary);
+        let len = end.saturating_sub(start).max(1);
+        let scale = 1.0 / len as f64;
+        k_blocks.push(
+            k.narrow(2, start, len)?
+                .sum(2)?
+                .affine(scale, 0.0)?
+                .unsqueeze(2)?,
+        );
+        v_blocks.push(
+            v.narrow(2, start, len)?
+                .sum(2)?
+                .affine(scale, 0.0)?
+                .unsqueeze(2)?,
+        );
+        block_ends.push(start + len);
+        start += len;
+    }
+
+    if k_blocks.is_empty() {
+        return Ok(None);
+    }
+    let k_refs = k_blocks.iter().collect::<Vec<_>>();
+    let v_refs = v_blocks.iter().collect::<Vec<_>>();
+    Ok(Some((
+        Tensor::cat(&k_refs, 2)?,
+        Tensor::cat(&v_refs, 2)?,
+        block_ends,
+    )))
+}
+
+fn compressed_local_block_bias(
+    q_start: usize,
+    q_len: usize,
+    local_window: usize,
     block_ends: &[usize],
     device: &candle_core::Device,
 ) -> Result<Tensor> {
+    let radius = local_window.saturating_sub(1);
     let mut v = vec![0f32; q_len * block_ends.len()];
     for qi in 0..q_len {
-        let visible_until = q_start + qi + 1;
+        let exact_left = (q_start + qi).saturating_sub(radius);
         for (bi, &block_end) in block_ends.iter().enumerate() {
-            if block_end > visible_until {
+            if block_end > exact_left {
                 v[qi * block_ends.len() + bi] = ATTENTION_MASK_VALUE;
             }
         }
@@ -1600,6 +1780,25 @@ pub fn positional_encoding_from(
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    fn test_attention_input(
+        batch: usize,
+        seq: usize,
+        dim: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let values = (0..batch * seq * dim)
+            .map(|idx| ((idx % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (batch, seq, dim), device).map_err(Into::into)
+    }
+
+    fn assert_close(a: &Tensor, b: &Tensor, tol: f32, label: &str) -> Result<()> {
+        let max_diff = a.broadcast_sub(b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_diff < tol, "{label} mismatch: {max_diff}");
+        Ok(())
+    }
 
     #[test]
     fn cache_causal_bias_keeps_prefix_visible_and_masks_future_chunk_keys() -> Result<()> {
@@ -1638,6 +1837,38 @@ mod tests {
     }
 
     #[test]
+    fn compressed_local_block_bias_excludes_exact_window_overlap() -> Result<()> {
+        let device = Device::Cpu;
+        let bias = compressed_local_block_bias(4, 2, 3, &[1, 2, 3, 4, 5], &device)?
+            .reshape((2, 5))?
+            .to_vec2::<f32>()?;
+
+        assert_eq!(
+            bias[0],
+            vec![
+                0.0,
+                0.0,
+                ATTENTION_MASK_VALUE,
+                ATTENTION_MASK_VALUE,
+                ATTENTION_MASK_VALUE
+            ]
+        );
+        assert_eq!(
+            bias[1],
+            vec![0.0, 0.0, 0.0, ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_is_visible_for_chunks_that_cross_prefix_boundary() {
+        assert!(!chunk_contains_non_prefix_queries(0, 4, 4));
+        assert!(chunk_contains_non_prefix_queries(0, 5, 4));
+        assert!(chunk_contains_non_prefix_queries(4, 2, 4));
+        assert!(!chunk_contains_non_prefix_queries(0, 5, 0));
+    }
+
+    #[test]
     fn compressed_causal_blocks_from_keeps_prefix_out_of_blocks() -> Result<()> {
         let device = Device::Cpu;
         let values = (0..6).map(|value| value as f32).collect::<Vec<_>>();
@@ -1650,6 +1881,127 @@ mod tests {
         assert_eq!(block_ends, vec![4, 6]);
         let compressed = compressed_k.reshape((2, 1))?.to_vec2::<f32>()?;
         assert_eq!(compressed, vec![vec![2.5], vec![4.5]]);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_incremental_cache_merges_partial_blocks() -> Result<()> {
+        let device = Device::Cpu;
+        let values = (0..6).map(|value| value as f32).collect::<Vec<_>>();
+        let k = Tensor::from_vec(values.clone(), (1, 1, 6, 1), &device)?;
+        let v = Tensor::from_vec(values, (1, 1, 6, 1), &device)?;
+        let cache = compress_cache_from_full_kv(k, v, 2, 3, 0)?;
+
+        assert_eq!(cache.compressed_block_ends, vec![3, 4]);
+        let compressed = cache
+            .compressed_k
+            .as_ref()
+            .expect("compressed k")
+            .reshape((2, 1))?
+            .to_vec2::<f32>()?;
+        assert_eq!(compressed, vec![vec![1.0], vec![3.0]]);
+
+        let new_k = Tensor::from_vec(vec![6.0f32], (1, 1, 1, 1), &device)?;
+        let new_v = Tensor::from_vec(vec![6.0f32], (1, 1, 1, 1), &device)?;
+        let cache =
+            append_to_compressed_cache(Some(&cache), attention_kv_cache(new_k, new_v)?, 2, 3)?;
+
+        assert_eq!(cache.compressed_block_ends, vec![3, 5]);
+        let compressed = cache
+            .compressed_k
+            .as_ref()
+            .expect("compressed k")
+            .reshape((2, 1))?
+            .to_vec2::<f32>()?;
+        assert_eq!(compressed, vec![vec![1.0], vec![3.5]]);
+
+        let new_k = Tensor::from_vec(vec![7.0f32], (1, 1, 1, 1), &device)?;
+        let new_v = Tensor::from_vec(vec![7.0f32], (1, 1, 1, 1), &device)?;
+        let cache =
+            append_to_compressed_cache(Some(&cache), attention_kv_cache(new_k, new_v)?, 2, 3)?;
+
+        assert_eq!(cache.compressed_block_ends, vec![3, 6]);
+        let compressed = cache
+            .compressed_k
+            .as_ref()
+            .expect("compressed k")
+            .reshape((2, 1))?
+            .to_vec2::<f32>()?;
+        assert_eq!(compressed, vec![vec![1.0], vec![4.0]]);
+
+        let new_k = Tensor::from_vec(vec![8.0f32], (1, 1, 1, 1), &device)?;
+        let new_v = Tensor::from_vec(vec![8.0f32], (1, 1, 1, 1), &device)?;
+        let cache =
+            append_to_compressed_cache(Some(&cache), attention_kv_cache(new_k, new_v)?, 2, 3)?;
+
+        assert_eq!(cache.compressed_block_ends, vec![3, 6, 7]);
+        let compressed = cache
+            .compressed_k
+            .as_ref()
+            .expect("compressed k")
+            .reshape((3, 1))?
+            .to_vec2::<f32>()?;
+        assert_eq!(compressed, vec![vec![1.0], vec![4.0], vec![6.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn rope_sliding_incremental_matches_full_last_token_with_prefix() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let attn = MultiHeadAttention::new_with_rope(
+            VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("attn"),
+            8,
+            2,
+        )?;
+        let prefix_len = 3;
+        let window = 4;
+        let x = test_attention_input(1, 11, 8, &device)?;
+
+        let full = attn
+            .forward_causal_local_with_prefix(&x, window, prefix_len)?
+            .narrow(1, 10, 1)?;
+        let prefill = x.narrow(1, 0, 10)?;
+        let last = x.narrow(1, 10, 1)?;
+        let cache = attn.project_self_kv_with_prefix(&prefill, prefix_len)?;
+        let (incremental, _) =
+            attn.forward_causal_local_incremental(&last, Some(&cache), window)?;
+
+        assert_close(&full, &incremental, 1e-4, "rope sliding incremental")?;
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_sparse_incremental_matches_full_last_token_with_prefix() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let attn = MultiHeadAttention::new_with_rope(
+            VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("attn"),
+            8,
+            2,
+        )?;
+        let prefix_len = 2;
+        let local_window = 3;
+        let compress_rate = 2;
+        let topk = 4;
+        let x = test_attention_input(1, 12, 8, &device)?;
+
+        let full = attn
+            .forward_causal_compressed_sparse(&x, local_window, compress_rate, topk, prefix_len)?
+            .narrow(1, 11, 1)?;
+        let prefill = x.narrow(1, 0, 11)?;
+        let last = x.narrow(1, 11, 1)?;
+        let cache =
+            attn.project_self_kv_compressed(&prefill, local_window, compress_rate, prefix_len)?;
+        let (incremental, _) = attn.forward_causal_compressed_sparse_incremental(
+            &last,
+            Some(&cache),
+            local_window,
+            compress_rate,
+            topk,
+        )?;
+
+        assert_close(&full, &incremental, 1e-4, "compressed sparse incremental")?;
         Ok(())
     }
 }

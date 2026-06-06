@@ -21,6 +21,11 @@ use crate::util;
 const DEFAULT_MAX_NEW_TOKENS: usize = 384;
 const DEFAULT_RUST_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_GO_TIMEOUT_SECS: u64 = 6;
+const REFLEX_REPAIR_FREE_DEPTH: usize = 5;
+const REFLEX_REWARD_LAMBDA: f32 = 0.2;
+const REFLEX_REWARD_ETA: f32 = 0.5;
+const REFLEX_QUALITY_THRESHOLD: f32 = 0.95;
+const REFLEX_EPS: f32 = 1e-4;
 
 #[derive(Debug, Clone, Deserialize)]
 struct CodeEvalTask {
@@ -51,10 +56,13 @@ struct CodeEvalTaskResult {
     candidate_count: usize,
     repair_attempts_used: usize,
     route_ok: bool,
+    format_ok: bool,
     constraints_ok: bool,
     compile_ok: bool,
     tests_ok: bool,
     pass: bool,
+    reward_score: f32,
+    trajectory_reward: f32,
     duration_ms: u128,
     response_preview: String,
     code_preview: String,
@@ -68,10 +76,13 @@ struct CodeEvalSummary {
     route_ok: usize,
     rlm_used: usize,
     docs_used: usize,
+    format_ok: usize,
     constraints_ok: usize,
     compile_ok: usize,
     tests_ok: usize,
     pass_ok: usize,
+    reward_sum: f32,
+    trajectory_reward_sum: f32,
 }
 
 #[derive(Clone)]
@@ -108,12 +119,20 @@ struct CandidateEval {
     response: String,
     code: String,
     route_ok: bool,
+    format_ok: bool,
     constraints_ok: bool,
     compile_ok: bool,
     tests_ok: bool,
     quality_score: i32,
+    outcome_reward: f32,
+    trajectory_reward: f32,
     detail: String,
     repair_attempts_used: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReflexiveReward {
+    overall: f32,
 }
 
 fn default_language() -> String {
@@ -555,6 +574,9 @@ struct GoModelPreferenceRow {
     rejected: String,
     feedback: String,
     compile_ok: bool,
+    chosen_reward: f32,
+    rejected_reward: f32,
+    reward_margin: f32,
     chosen_source: String,
     rejected_source: String,
 }
@@ -826,6 +848,8 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
                 repair_rows += 1;
             }
             if let Some(writer) = preference_writer.as_mut() {
+                let chosen_reward = 1.0f32;
+                let rejected_reward = go_feedback_code_reward(&attempt.code, model_compile_ok);
                 let row = GoModelPreferenceRow {
                     task_index: attempt.task_index,
                     candidate_index: attempt.candidate_index,
@@ -834,6 +858,9 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
                     rejected: attempt.code.clone(),
                     feedback: checked_attempt.feedback,
                     compile_ok: false,
+                    chosen_reward,
+                    rejected_reward,
+                    reward_margin: chosen_reward - rejected_reward,
                     chosen_source: "canonical".to_string(),
                     rejected_source: "model_failed_attempt".to_string(),
                 };
@@ -1010,11 +1037,14 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         let summary_text = code_eval_summary_text(&summary);
         fs::write(run_path.join(format!("summary_{label}.txt")), &summary_text)?;
         pareto_rows.push(format!(
-            "{budget},{schedule},{:.4},{:.4},{:.4},{:.4}",
+            "{budget},{schedule},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
             summary.pass_ok as f32 / summary.task_count.max(1) as f32,
+            summary.format_ok as f32 / summary.task_count.max(1) as f32,
             summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
             summary.compile_ok as f32 / summary.task_count.max(1) as f32,
             summary.tests_ok as f32 / summary.task_count.max(1) as f32,
+            summary.reward_sum / summary.task_count.max(1) as f32,
+            summary.trajectory_reward_sum / summary.task_count.max(1) as f32,
         ));
         if !cfg.conditioning_pareto {
             fs::write(run_path.join("summary.txt"), &summary_text)?;
@@ -1022,9 +1052,8 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         }
     }
     if cfg.conditioning_pareto {
-        let mut csv =
-            "condition_budget,cross_schedule,suite_pass_rate,constraint_pass_rate,compile_rate,test_pass_rate\n"
-                .to_string();
+        let mut csv = "condition_budget,cross_schedule,suite_pass_rate,format_pass_rate,constraint_pass_rate,compile_rate,test_pass_rate,avg_reward,avg_trajectory_reward\n"
+            .to_string();
         csv.push_str(&pareto_rows.join("\n"));
         csv.push('\n');
         fs::write(run_path.join("conditioning_pareto.csv"), &csv)?;
@@ -1053,14 +1082,21 @@ fn evaluate_code_suite_once(
         let route_ok = predicted_action == expected_action
             || (expected_action == Action::Code && predicted_action == Action::FetchDocs);
         let best = evaluate_best_candidate(engine, cfg, scratch_dir, task, route_ok)?;
-        let pass = best.route_ok && best.constraints_ok && best.compile_ok && best.tests_ok;
+        let pass = best.route_ok
+            && best.format_ok
+            && best.constraints_ok
+            && best.compile_ok
+            && best.tests_ok;
         summary.route_ok += usize::from(route_ok);
         summary.rlm_used += usize::from(rlm_used);
         summary.docs_used += usize::from(docs_used);
+        summary.format_ok += usize::from(best.format_ok);
         summary.constraints_ok += usize::from(best.constraints_ok);
         summary.compile_ok += usize::from(best.compile_ok);
         summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
+        summary.reward_sum += best.outcome_reward;
+        summary.trajectory_reward_sum += best.trajectory_reward;
         let result = CodeEvalTaskResult {
             id: task.id.clone(),
             predicted_action: action_name(predicted_action).to_string(),
@@ -1070,10 +1106,13 @@ fn evaluate_code_suite_once(
             candidate_count: cfg.candidates,
             repair_attempts_used: best.repair_attempts_used,
             route_ok: best.route_ok,
+            format_ok: best.format_ok,
             constraints_ok: best.constraints_ok,
             compile_ok: best.compile_ok,
             tests_ok: best.tests_ok,
             pass,
+            reward_score: best.outcome_reward,
+            trajectory_reward: best.trajectory_reward,
             duration_ms: started.elapsed().as_millis(),
             response_preview: preview_text(&best.response, 240),
             code_preview: preview_text(&best.code, 240),
@@ -1082,15 +1121,18 @@ fn evaluate_code_suite_once(
         };
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
         println!(
-            "{} route={} rlm={} docs={} constraints={} compile={} tests={} pass={} {}",
+            "{} route={} format={} rlm={} docs={} constraints={} compile={} tests={} pass={} reward={:.3} traj={:.3} {}",
             result.id,
             result.route_ok,
+            result.format_ok,
             result.rlm_used,
             result.docs_used,
             result.constraints_ok,
             result.compile_ok,
             result.tests_ok,
             result.pass,
+            result.reward_score,
+            result.trajectory_reward,
             if result.detail.is_empty() {
                 String::new()
             } else {
@@ -1103,14 +1145,17 @@ fn evaluate_code_suite_once(
 
 fn code_eval_summary_text(summary: &CodeEvalSummary) -> String {
     format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
+        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nformat_pass_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\navg_reward={:.4}\navg_trajectory_reward={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
         summary.rlm_used as f32 / summary.task_count.max(1) as f32,
         summary.docs_used as f32 / summary.task_count.max(1) as f32,
+        summary.format_ok as f32 / summary.task_count.max(1) as f32,
         summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
         summary.compile_ok as f32 / summary.task_count.max(1) as f32,
         summary.tests_ok as f32 / summary.task_count.max(1) as f32,
+        summary.reward_sum / summary.task_count.max(1) as f32,
+        summary.trajectory_reward_sum / summary.task_count.max(1) as f32,
         summary.task_count,
     )
 }
@@ -1182,13 +1227,16 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
             best = Some(select_better_candidate(best, candidate));
         }
         let best = best.context("decoder-only eval produced no candidates")?;
-        let pass = best.constraints_ok && best.compile_ok && best.tests_ok;
+        let pass = best.format_ok && best.constraints_ok && best.compile_ok && best.tests_ok;
         summary.route_ok += 1;
         summary.rlm_used += 1;
+        summary.format_ok += usize::from(best.format_ok);
         summary.constraints_ok += usize::from(best.constraints_ok);
         summary.compile_ok += usize::from(best.compile_ok);
         summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
+        summary.reward_sum += best.outcome_reward;
+        summary.trajectory_reward_sum += best.trajectory_reward;
         let result = CodeEvalTaskResult {
             id: task.id,
             predicted_action: "code".to_string(),
@@ -1198,10 +1246,13 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
             candidate_count: cfg.candidates,
             repair_attempts_used: 0,
             route_ok: true,
+            format_ok: best.format_ok,
             constraints_ok: best.constraints_ok,
             compile_ok: best.compile_ok,
             tests_ok: best.tests_ok,
             pass,
+            reward_score: best.outcome_reward,
+            trajectory_reward: best.trajectory_reward,
             duration_ms: started.elapsed().as_millis(),
             response_preview: preview_text(&best.response, 240),
             code_preview: preview_text(&best.code, 240),
@@ -1210,12 +1261,14 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         };
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
         println!(
-            "{} constraints={} compile={} tests={} pass={} {}",
+            "{} format={} constraints={} compile={} tests={} pass={} reward={:.3} {}",
             result.id,
+            result.format_ok,
             result.constraints_ok,
             result.compile_ok,
             result.tests_ok,
             result.pass,
+            result.reward_score,
             if result.detail.is_empty() {
                 String::new()
             } else {
@@ -1225,14 +1278,17 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
     }
 
     let summary_text = format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\ntasks={}\n",
+        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nformat_pass_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\navg_reward={:.4}\navg_trajectory_reward={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
         summary.rlm_used as f32 / summary.task_count.max(1) as f32,
         summary.docs_used as f32 / summary.task_count.max(1) as f32,
+        summary.format_ok as f32 / summary.task_count.max(1) as f32,
         summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
         summary.compile_ok as f32 / summary.task_count.max(1) as f32,
         summary.tests_ok as f32 / summary.task_count.max(1) as f32,
+        summary.reward_sum / summary.task_count.max(1) as f32,
+        summary.trajectory_reward_sum / summary.task_count.max(1) as f32,
         summary.task_count,
     );
     fs::write(run_path.join("summary.txt"), &summary_text)?;
@@ -1252,7 +1308,7 @@ fn evaluate_best_candidate(
     for _ in 0..cfg.candidates.max(1) {
         let prompt = build_code_eval_prompt(task);
         let response = engine.generate(&prompt, max_new_tokens, cfg.ablate_conditioning)?;
-        let mut candidate = evaluate_candidate_response(
+        let candidate = evaluate_candidate_response(
             scratch_dir,
             &cfg.rustc_bin,
             &cfg.go_bin,
@@ -1263,19 +1319,29 @@ fn evaluate_best_candidate(
             response,
             0,
         )?;
-        best = Some(select_better_candidate(best, candidate.clone()));
+        let mut trajectory = vec![candidate];
+        assign_reflexive_trajectory_rewards(&mut trajectory);
+        best = Some(select_better_candidate(
+            best,
+            trajectory.last().context("empty trajectory")?.clone(),
+        ));
         for repair_idx in 0..cfg.repair_attempts {
-            if candidate.constraints_ok && candidate.compile_ok && candidate.tests_ok {
+            let previous = trajectory.last().context("empty trajectory")?;
+            if previous.format_ok
+                && previous.constraints_ok
+                && previous.compile_ok
+                && previous.tests_ok
+            {
                 break;
             }
-            let repair_prompt = build_repair_prompt(task, &candidate.code, &candidate.detail);
+            let repair_prompt = build_repair_prompt(task, &previous.code, &previous.detail);
             let repaired_response = engine.generate_for_action(
                 &repair_prompt,
                 Action::Code,
                 max_new_tokens,
                 cfg.ablate_conditioning,
             )?;
-            candidate = evaluate_candidate_response(
+            let candidate = evaluate_candidate_response(
                 scratch_dir,
                 &cfg.rustc_bin,
                 &cfg.go_bin,
@@ -1286,7 +1352,12 @@ fn evaluate_best_candidate(
                 repaired_response,
                 repair_idx + 1,
             )?;
-            best = Some(select_better_candidate(best, candidate.clone()));
+            trajectory.push(candidate);
+            assign_reflexive_trajectory_rewards(&mut trajectory);
+            best = Some(select_better_candidate(
+                best,
+                trajectory.last().context("empty trajectory")?.clone(),
+            ));
         }
     }
     best.context("eval produced no candidates")
@@ -1305,6 +1376,7 @@ fn evaluate_candidate_response(
     repair_attempts_used: usize,
 ) -> Result<CandidateEval> {
     let code = extract_code_candidate_for_language(&response, &task.language);
+    let format_ok = response_format_ok(&response, &code);
     let (constraints_ok, constraint_detail) = check_constraints(&code, task);
     let quality_score = candidate_quality_score(&code, task);
     let language = task.language.to_ascii_lowercase();
@@ -1330,17 +1402,23 @@ fn evaluate_candidate_response(
     } else {
         exec_detail
     };
-    Ok(CandidateEval {
+    let mut candidate = CandidateEval {
         response,
         code,
         route_ok,
+        format_ok,
         constraints_ok,
         compile_ok,
         tests_ok,
         quality_score,
+        outcome_reward: 0.0,
+        trajectory_reward: 0.0,
         detail,
         repair_attempts_used,
-    })
+    };
+    candidate.outcome_reward = candidate_outcome_reward(&candidate);
+    candidate.trajectory_reward = candidate.outcome_reward;
+    Ok(candidate)
 }
 
 fn select_better_candidate(
@@ -1360,15 +1438,19 @@ fn select_better_candidate(
 }
 
 fn candidate_rank(candidate: &CandidateEval) -> i32 {
-    128 * i32::from(
+    256 * i32::from(
         candidate.route_ok
+            && candidate.format_ok
             && candidate.constraints_ok
             && candidate.compile_ok
             && candidate.tests_ok,
-    ) + 64 * i32::from(candidate.tests_ok)
-        + 32 * i32::from(candidate.compile_ok)
-        + 16 * i32::from(candidate.constraints_ok)
+    ) + 128 * i32::from(candidate.tests_ok)
+        + 64 * i32::from(candidate.compile_ok)
+        + 32 * i32::from(candidate.constraints_ok)
+        + 16 * i32::from(candidate.format_ok)
         + 8 * i32::from(candidate.route_ok)
+        + (candidate.trajectory_reward * 64.0).round() as i32
+        + (candidate.outcome_reward * 32.0).round() as i32
         + candidate.quality_score.clamp(-8, 8)
         - candidate.repair_attempts_used as i32
 }
@@ -1576,6 +1658,147 @@ fn candidate_quality_score(code: &str, task: &CodeEvalTask) -> i32 {
     score
 }
 
+fn response_format_ok(response: &str, code: &str) -> bool {
+    let raw = response.trim();
+    if code.trim().is_empty() || raw.is_empty() {
+        return false;
+    }
+    if raw.contains("```") {
+        return false;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let prose_markers = [
+        "here is",
+        "here's",
+        "explanation",
+        "the code",
+        "return only",
+        "compiler feedback",
+        "```",
+    ];
+    !prose_markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn candidate_outcome_reward(candidate: &CandidateEval) -> f32 {
+    let surface = ((candidate.quality_score.clamp(-8, 8) + 8) as f32 / 16.0).clamp(0.0, 1.0);
+    let reward = 0.05 * reward_flag(candidate.route_ok)
+        + 0.10 * reward_flag(candidate.format_ok)
+        + 0.15 * reward_flag(candidate.constraints_ok)
+        + 0.25 * reward_flag(candidate.compile_ok)
+        + 0.35 * reward_flag(candidate.tests_ok)
+        + 0.10 * surface;
+    reward.clamp(0.0, 1.0)
+}
+
+fn reward_flag(value: bool) -> f32 {
+    if value {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn go_feedback_code_reward(code: &str, compile_ok: bool) -> f32 {
+    if code.trim().is_empty() {
+        return 0.0;
+    }
+    let mut reward: f32 = 0.10;
+    if delimiters_look_balanced(code) {
+        reward += 0.15;
+    }
+    if code.contains("func ") {
+        reward += 0.10;
+    }
+    if compile_ok {
+        reward += 0.65;
+    }
+    reward.clamp(0.0, 1.0)
+}
+
+fn assign_reflexive_trajectory_rewards(trajectory: &mut [CandidateEval]) {
+    for idx in 0..trajectory.len() {
+        let reward = reflexive_trajectory_reward(&trajectory[..=idx]);
+        trajectory[idx].trajectory_reward = reward.overall;
+    }
+}
+
+fn reflexive_trajectory_reward(trajectory: &[CandidateEval]) -> ReflexiveReward {
+    if trajectory.is_empty() {
+        return ReflexiveReward::default();
+    }
+    let qualities = trajectory
+        .iter()
+        .map(|candidate| candidate.outcome_reward)
+        .collect::<Vec<_>>();
+    let final_quality = *qualities.last().unwrap_or(&0.0);
+    let final_format_ok = trajectory
+        .last()
+        .map(|candidate| candidate.format_ok)
+        .unwrap_or(false);
+    let bad_format_count = trajectory
+        .iter()
+        .filter(|candidate| !candidate.format_ok)
+        .count() as f32;
+    let cycle_count = trajectory
+        .last()
+        .map(|candidate| candidate.repair_attempts_used)
+        .unwrap_or(0);
+    let cycle_penalty = reflection_cycle_penalty(cycle_count);
+    let format_penalty = 1.0 / (1.0 + 0.25 * bad_format_count);
+    let improvement = time_weighted_improvement_reward(&qualities);
+    let quality_reward = (final_quality + REFLEX_REWARD_ETA * improvement).clamp(0.0, 1.0);
+    let efficiency_reward = if final_quality >= REFLEX_QUALITY_THRESHOLD {
+        1.0 / (cycle_count + 1) as f32
+    } else {
+        final_quality / (cycle_count + 1) as f32
+    };
+    let overall = if !final_format_ok {
+        0.0
+    } else {
+        (cycle_penalty * format_penalty * ((quality_reward + 0.5 * efficiency_reward) / 1.5))
+            .clamp(0.0, 1.0)
+    };
+    ReflexiveReward { overall }
+}
+
+fn reflection_cycle_penalty(cycle_count: usize) -> f32 {
+    if cycle_count <= REFLEX_REPAIR_FREE_DEPTH {
+        return 1.0;
+    }
+    let excess = (cycle_count - REFLEX_REPAIR_FREE_DEPTH) as f32;
+    let polynomial = 1.0 / (1.0 + 0.1 * excess.powf(2.0));
+    let exponential = (-0.05 * excess).exp();
+    (polynomial * exponential).clamp(0.0, 1.0)
+}
+
+fn time_weighted_improvement_reward(qualities: &[f32]) -> f32 {
+    if qualities.len() <= 1 {
+        return 0.0;
+    }
+    let mut weighted = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for idx in 1..qualities.len() {
+        let weight = (REFLEX_REWARD_LAMBDA * idx as f32).exp();
+        let prev = qualities[idx - 1];
+        let next = qualities[idx];
+        let delta = next - prev;
+        let step_reward = if delta.abs() > REFLEX_EPS {
+            delta
+        } else if prev < REFLEX_QUALITY_THRESHOLD {
+            -0.05
+        } else {
+            0.0
+        };
+        weighted += weight * step_reward;
+        weight_sum += weight;
+    }
+    if weight_sum <= 0.0 {
+        0.0
+    } else {
+        weighted / weight_sum
+    }
+}
+
 fn delimiters_look_balanced(code: &str) -> bool {
     let mut stack = Vec::new();
     let mut in_string = false;
@@ -1777,7 +2000,8 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Outp
 mod tests {
     use super::{
         build_code_eval_prompt, build_repair_prompt, candidate_quality_score,
-        delimiters_look_balanced, CodeEvalTask,
+        delimiters_look_balanced, reflexive_trajectory_reward, response_format_ok, CandidateEval,
+        CodeEvalTask,
     };
 
     fn go_task() -> CodeEvalTask {
@@ -1834,5 +2058,94 @@ mod tests {
         assert!(good > bad);
         assert!(delimiters_look_balanced("func Add() int { return 1 }"));
         assert!(!delimiters_look_balanced("func Add() int { return 1 "));
+    }
+
+    #[test]
+    fn code_only_format_gate_rejects_fenced_or_explained_outputs() {
+        assert!(response_format_ok(
+            "func Add(a int, b int) int { return a + b }",
+            "func Add(a int, b int) int { return a + b }"
+        ));
+        assert!(!response_format_ok(
+            "```go\nfunc Add(a int, b int) int { return a + b }\n```",
+            "func Add(a int, b int) int { return a + b }"
+        ));
+        assert!(!response_format_ok(
+            "Here is the code:\nfunc Add(a int, b int) int { return a + b }",
+            "func Add(a int, b int) int { return a + b }"
+        ));
+    }
+
+    #[test]
+    fn reflexive_reward_prefers_improving_formatted_repair_trajectory() {
+        let failed = CandidateEval {
+            response: "func Add(a int, b int) int { return 0 }".to_string(),
+            code: "func Add(a int, b int) int { return 0 }".to_string(),
+            route_ok: true,
+            format_ok: true,
+            constraints_ok: true,
+            compile_ok: true,
+            tests_ok: false,
+            quality_score: 3,
+            outcome_reward: 0.55,
+            trajectory_reward: 0.0,
+            detail: String::new(),
+            repair_attempts_used: 0,
+        };
+        let repaired = CandidateEval {
+            response: "func Add(a int, b int) int { return a + b }".to_string(),
+            code: "func Add(a int, b int) int { return a + b }".to_string(),
+            route_ok: true,
+            format_ok: true,
+            constraints_ok: true,
+            compile_ok: true,
+            tests_ok: true,
+            quality_score: 4,
+            outcome_reward: 0.98,
+            trajectory_reward: 0.0,
+            detail: String::new(),
+            repair_attempts_used: 1,
+        };
+        let improving = reflexive_trajectory_reward(&[failed.clone(), repaired]);
+        let regressing = reflexive_trajectory_reward(&[failed.clone(), failed]);
+
+        assert!(improving.overall > regressing.overall);
+    }
+
+    #[test]
+    fn reflexive_reward_credits_repair_that_fixes_format() {
+        let fenced = CandidateEval {
+            response: "```go\nfunc Add(a int, b int) int { return 0 }\n```".to_string(),
+            code: "func Add(a int, b int) int { return 0 }".to_string(),
+            route_ok: true,
+            format_ok: false,
+            constraints_ok: true,
+            compile_ok: true,
+            tests_ok: false,
+            quality_score: 2,
+            outcome_reward: 0.45,
+            trajectory_reward: 0.0,
+            detail: String::new(),
+            repair_attempts_used: 0,
+        };
+        let repaired = CandidateEval {
+            response: "func Add(a int, b int) int { return a + b }".to_string(),
+            code: "func Add(a int, b int) int { return a + b }".to_string(),
+            route_ok: true,
+            format_ok: true,
+            constraints_ok: true,
+            compile_ok: true,
+            tests_ok: true,
+            quality_score: 4,
+            outcome_reward: 0.98,
+            trajectory_reward: 0.0,
+            detail: String::new(),
+            repair_attempts_used: 1,
+        };
+        let unrepaired = reflexive_trajectory_reward(std::slice::from_ref(&fenced));
+        let repaired_reward = reflexive_trajectory_reward(&[fenced, repaired]);
+
+        assert_eq!(unrepaired.overall, 0.0);
+        assert!(repaired_reward.overall > 0.0);
     }
 }

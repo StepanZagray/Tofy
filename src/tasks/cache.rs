@@ -7,15 +7,20 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
+use crate::data::data::{
+    encoder_texts_from_line, pair_input_paths, split_line_with_min_tokens_mode,
+};
 use crate::data::{
     build_vocab_from_pair_file, build_vocab_from_raw_world_file_with_mode,
-    encode_line_with_vocab_mode, encode_raw_world_line_with_vocab_mode, tokenizer_spec,
-    tokenizer_spec_signature, TokenizationMode, TokenizerSpec, DEFAULT_MIN_TOKENS_PER_LINE,
+    build_vocab_from_raw_world_file_with_mode_action_filter, encode_line_with_vocab_mode,
+    encode_raw_world_line_with_vocab_mode, encode_text_with_vocab_mode, tokenizer_spec,
+    tokenizer_spec_signature, TokenizationMode, TokenizerSpec, ACTION_CODE,
+    DEFAULT_MIN_TOKENS_PER_LINE,
 };
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 8;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
@@ -49,6 +54,7 @@ struct VocabManifest {
     tokenizer_spec: TokenizerSpec,
     tokenizer_spec_signature: String,
     max_vocab: usize,
+    action_filter: Option<u32>,
     vocab_path: String,
     vocab_signature: String,
     rows: usize,
@@ -63,6 +69,7 @@ struct TokenManifest {
     tokenizer_spec: TokenizerSpec,
     tokenizer_spec_signature: String,
     max_seq: usize,
+    action_filter: Option<u32>,
     vocab_path: String,
     vocab_signature: String,
     token_cache_path: String,
@@ -92,6 +99,7 @@ struct VocabCacheSpec<'a> {
     source: &'a SourceFingerprint,
     mode: TokenizationMode,
     max_vocab: usize,
+    action_filter: Option<u32>,
     vocab_path: &'a Path,
     manifest_path: &'a Path,
     force: bool,
@@ -108,6 +116,7 @@ struct TokenCacheSpec<'a> {
     source: &'a SourceFingerprint,
     mode: TokenizationMode,
     max_seq: usize,
+    action_filter: Option<u32>,
     token_cache_path: &'a Path,
     manifest_path: &'a Path,
     force: bool,
@@ -259,6 +268,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                 source: &encoder_source,
                 mode: TokenizationMode::Default,
                 max_vocab: config.encoder_max_vocab,
+                action_filter: None,
                 vocab_path: &config.encoder_vocab_path,
                 manifest_path: &encoder_vocab_manifest,
                 force: config.force,
@@ -272,6 +282,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                 source: &code_source,
                 mode: TokenizationMode::CodeAware,
                 max_vocab: config.code_max_vocab,
+                action_filter: Some(ACTION_CODE),
                 vocab_path: &config.code_vocab_path,
                 manifest_path: &code_vocab_manifest,
                 force: config.force,
@@ -303,6 +314,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     source: &encoder_source,
                     mode: TokenizationMode::Default,
                     max_seq: config.encoder_max_seq,
+                    action_filter: None,
                     token_cache_path: &encoder_tokens,
                     manifest_path: &encoder_tokens_manifest,
                     force: config.force,
@@ -319,6 +331,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     source: &world_source,
                     mode: TokenizationMode::Default,
                     max_seq: config.world_max_seq,
+                    action_filter: None,
                     token_cache_path: &world_tokens,
                     manifest_path: &world_tokens_manifest,
                     force: config.force,
@@ -335,6 +348,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     source: &code_source,
                     mode: TokenizationMode::CodeAware,
                     max_seq: config.code_max_seq,
+                    action_filter: Some(ACTION_CODE),
                     token_cache_path: &code_tokens,
                     manifest_path: &code_tokens_manifest,
                     force: config.force,
@@ -351,6 +365,7 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                     source: &code_source,
                     mode: TokenizationMode::CodeAware,
                     max_seq: config.code_max_seq,
+                    action_filter: Some(ACTION_CODE),
                     token_cache_path: &dual_tokens,
                     manifest_path: &dual_tokens_manifest,
                     force: config.force,
@@ -381,6 +396,7 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
                 && manifest.tokenizer == spec.mode.as_str()
                 && manifest.tokenizer_spec_signature == tokenizer_spec_sig
                 && manifest.max_vocab == spec.max_vocab
+                && manifest.action_filter == spec.action_filter
                 && manifest.vocab_path == path_string(spec.vocab_path)
             {
                 let vocab = load_vocab_from_file(spec.vocab_path)?;
@@ -417,6 +433,13 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
             spec.max_vocab,
             Some(DEFAULT_MIN_TOKENS_PER_LINE),
         )?
+    } else if let Some(action_filter) = spec.action_filter {
+        build_vocab_from_raw_world_file_with_mode_action_filter(
+            spec.data_path,
+            spec.max_vocab,
+            spec.mode,
+            Some(action_filter),
+        )?
     } else {
         build_vocab_from_raw_world_file_with_mode(spec.data_path, spec.max_vocab, spec.mode)?
     };
@@ -432,6 +455,7 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
             tokenizer_spec,
             tokenizer_spec_signature: tokenizer_spec_sig,
             max_vocab: spec.max_vocab,
+            action_filter: spec.action_filter,
             vocab_path: path_string(spec.vocab_path),
             vocab_signature: signature.clone(),
             rows,
@@ -475,12 +499,14 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
     let tmp_path = tmp_path_for(spec.token_cache_path);
     let mut writer = BufWriter::new(File::create(&tmp_path)?);
     writer.write_all(TOKEN_CACHE_MAGIC)?;
-    let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
+    let (input_paths, source_manifest) = pair_input_paths(spec.data_path)?;
     let chunk_lines = token_cache_encode_chunk_lines();
     let raw_cap = token_cache_raw_sequence_cap(spec.max_seq);
     println!(
-        "{} token cache parallel encode: chunk_lines={} rayon_threads={} raw_char_cap={}",
+        "{} token cache parallel encode: sources={} source_manifest={} chunk_lines={} rayon_threads={} raw_char_cap={}",
         spec.kind,
+        input_paths.len(),
+        source_manifest,
         chunk_lines,
         rayon::current_num_threads(),
         raw_cap
@@ -488,36 +514,57 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
     let mut next_progress = PROGRESS_EVERY_LINES;
-    loop {
-        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
-        if chunk.is_empty() {
-            break;
-        }
-        raw_lines += chunk.len();
-        let encoded = chunk
-            .par_iter()
-            .filter_map(|line| {
-                let line = cap_str_chars_tail(line, raw_cap);
-                let mut ids = encode_line_with_vocab_mode(
-                    line,
-                    vocab,
-                    spec.mode,
-                    DEFAULT_MIN_TOKENS_PER_LINE,
-                )?;
-                truncate_ids_tail(&mut ids, spec.max_seq);
-                Some(ids)
-            })
-            .collect::<Vec<_>>();
-        for ids in &encoded {
-            write_token_record(&mut writer, ids, &[], NO_ACTION)?;
-        }
-        rows += encoded.len();
-        while raw_lines >= next_progress {
-            println!(
-                "{} token cache progress: {raw_lines} raw lines, {rows} rows",
-                spec.kind
-            );
-            next_progress += PROGRESS_EVERY_LINES;
+    for input_path in input_paths {
+        let mut lines = BufReader::new(File::open(&input_path)?).lines();
+        loop {
+            let chunk = read_line_chunk(&mut lines, chunk_lines)?;
+            if chunk.is_empty() {
+                break;
+            }
+            raw_lines += chunk.len();
+            let encoded = chunk
+                .par_iter()
+                .flat_map_iter(|line| {
+                    let mut encoded_rows = Vec::new();
+                    if source_manifest {
+                        for text in encoder_texts_from_line(line) {
+                            let text = cap_str_chars_tail(&text, raw_cap);
+                            if split_line_with_min_tokens_mode(
+                                text,
+                                DEFAULT_MIN_TOKENS_PER_LINE,
+                                spec.mode,
+                            )
+                            .is_none()
+                            {
+                                continue;
+                            }
+                            let mut ids = encode_text_with_vocab_mode(text, vocab, spec.mode);
+                            truncate_ids_tail(&mut ids, spec.max_seq);
+                            encoded_rows.push(ids);
+                        }
+                    } else if let Some(mut ids) = encode_line_with_vocab_mode(
+                        cap_str_chars_tail(line, raw_cap),
+                        vocab,
+                        spec.mode,
+                        DEFAULT_MIN_TOKENS_PER_LINE,
+                    ) {
+                        truncate_ids_tail(&mut ids, spec.max_seq);
+                        encoded_rows.push(ids);
+                    }
+                    encoded_rows
+                })
+                .collect::<Vec<_>>();
+            for ids in &encoded {
+                write_token_record(&mut writer, ids, &[], NO_ACTION)?;
+            }
+            rows += encoded.len();
+            while raw_lines >= next_progress {
+                println!(
+                    "{} token cache progress: {raw_lines} raw lines, {rows} rows",
+                    spec.kind
+                );
+                next_progress += PROGRESS_EVERY_LINES;
+            }
         }
     }
     writer.flush()?;
@@ -532,6 +579,7 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
             token_cache_path: path_string(spec.token_cache_path),
@@ -593,8 +641,14 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             .filter_map(|line| {
                 let capped = cap_raw_world_line(line, raw_caps.world_side);
                 let mut example = encode_raw_world_line_with_vocab_mode(&capped, vocab, spec.mode)?;
+                if spec
+                    .action_filter
+                    .is_some_and(|wanted| example.action_label != wanted)
+                {
+                    return None;
+                }
                 truncate_ids_tail(&mut example.state_tokens, spec.max_seq);
-                truncate_ids_tail(&mut example.next_tokens, spec.max_seq);
+                truncate_decoder_next_ids(&mut example.next_tokens, spec.max_seq);
                 Some(example)
             })
             .collect::<Vec<_>>();
@@ -627,6 +681,7 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
             token_cache_path: path_string(spec.token_cache_path),
@@ -702,10 +757,16 @@ fn ensure_dual_world_token_cache(
                 )?;
                 let mut decoder_example =
                     encode_raw_world_line_with_vocab_mode(&capped, decoder_vocab, spec.mode)?;
+                if spec
+                    .action_filter
+                    .is_some_and(|wanted| decoder_example.action_label != wanted)
+                {
+                    return None;
+                }
                 truncate_ids_tail(&mut encoder_example.state_tokens, spec.max_seq);
                 truncate_ids_tail(&mut encoder_example.next_tokens, spec.max_seq);
                 truncate_ids_tail(&mut decoder_example.state_tokens, spec.max_seq);
-                truncate_ids_tail(&mut decoder_example.next_tokens, spec.max_seq);
+                truncate_decoder_next_ids(&mut decoder_example.next_tokens, spec.max_seq);
                 Some(DualWorldCacheRow {
                     encoder_state_tokens: encoder_example.state_tokens,
                     encoder_next_tokens: encoder_example.next_tokens,
@@ -746,6 +807,7 @@ fn ensure_dual_world_token_cache(
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
             token_cache_path: path_string(spec.token_cache_path),
@@ -769,6 +831,7 @@ fn token_cache_is_valid(spec: &TokenCacheSpec<'_>, vocab_signature: &str) -> boo
         && manifest.tokenizer == spec.mode.as_str()
         && manifest.tokenizer_spec_signature == tokenizer_spec_signature(spec.mode)
         && manifest.max_seq >= spec.max_seq
+        && manifest.action_filter == spec.action_filter
         && manifest.vocab_signature == vocab_signature
         && manifest.token_cache_path == path_string(spec.token_cache_path)
 }
@@ -838,6 +901,12 @@ fn truncate_ids_tail(ids: &mut Vec<u32>, max_seq: usize) {
         let start = ids.len() - max_seq;
         ids.drain(..start);
     }
+}
+
+fn truncate_decoder_next_ids(ids: &mut Vec<u32>, max_seq: usize) {
+    // Keep cache semantics aligned with make_decoder_batch_from_slice: long
+    // completions train on the tail so closing structure remains supervised.
+    truncate_ids_tail(ids, max_seq);
 }
 
 fn token_cache_raw_sequence_cap(max_seq: usize) -> usize {
@@ -961,6 +1030,16 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::data::PAIR_SOURCE_MANIFEST_HEADER;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn tail_truncation_keeps_recent_state_tokens() {
@@ -974,8 +1053,68 @@ mod tests {
     }
 
     #[test]
+    fn decoder_target_truncation_keeps_completion_tail() {
+        let mut ids = vec![10, 11, 12, 13, 14];
+        truncate_decoder_next_ids(&mut ids, 3);
+        assert_eq!(ids, vec![12, 13, 14]);
+    }
+
+    #[test]
     fn raw_world_cache_cap_keeps_state_and_target_tail() {
         let capped = cap_raw_world_line("abcdef\tuvwxyz\tcode", 3);
         assert_eq!(capped, "def\txyz\tcode");
+    }
+
+    #[test]
+    fn sequence_token_cache_expands_pair_source_manifest() -> Result<()> {
+        let dir = unique_temp_dir("tofy-sequence-cache-manifest");
+        fs::create_dir_all(&dir)?;
+        let pairs = dir.join("pairs.txt");
+        let plain = dir.join("plain.txt");
+        let manifest = dir.join("sources.txt");
+        let token_cache = dir.join("encoder.tokens.bin");
+        let token_manifest = dir.join("encoder_tokens.manifest.json");
+        fs::write(&pairs, "left\tright\n")?;
+        fs::write(&plain, "plain text\n")?;
+        fs::write(
+            &manifest,
+            format!(
+                "{PAIR_SOURCE_MANIFEST_HEADER}\n{}\n{}\n",
+                pairs.display(),
+                plain.display()
+            ),
+        )?;
+
+        let mut vocab = Vocab::new();
+        for ch in "leftrighplain tx".chars() {
+            vocab.add_token(&ch.to_string());
+        }
+        let source = source_fingerprint(&manifest)?;
+        ensure_sequence_token_cache(
+            TokenCacheSpec {
+                kind: "encoder",
+                data_path: &manifest,
+                source: &source,
+                mode: TokenizationMode::Default,
+                max_seq: 32,
+                action_filter: None,
+                token_cache_path: &token_cache,
+                manifest_path: &token_manifest,
+                force: true,
+                require_hit: false,
+            },
+            &vocab,
+        )?;
+
+        let mut stream = crate::data::CachedPairStream::with_shuffle(&token_cache, 1)?;
+        let mut decoded = Vec::new();
+        for pair in stream.next_batch(3)? {
+            decoded.push(vocab.decode_ids_lossy(&pair.tokens));
+        }
+        decoded.sort();
+        assert_eq!(decoded, vec!["left", "plain text", "right"]);
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

@@ -276,7 +276,7 @@ fn flatten_pair_side(text: &str) -> Option<String> {
     }
 }
 
-fn encoder_texts_from_line(line: &str) -> Vec<String> {
+pub(crate) fn encoder_texts_from_line(line: &str) -> Vec<String> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -324,7 +324,7 @@ fn pair_source_manifest_paths(path: &Path) -> Result<Option<Vec<PathBuf>>> {
     Ok(Some(paths))
 }
 
-fn pair_input_paths(path: &Path) -> Result<(Vec<PathBuf>, bool)> {
+pub(crate) fn pair_input_paths(path: &Path) -> Result<(Vec<PathBuf>, bool)> {
     if let Some(paths) = pair_source_manifest_paths(path)? {
         return Ok((paths, true));
     }
@@ -2726,6 +2726,15 @@ pub fn build_vocab_from_raw_world_file_with_mode(
     max_vocab: usize,
     mode: TokenizationMode,
 ) -> Result<(Vocab, VocabStats, usize)> {
+    build_vocab_from_raw_world_file_with_mode_action_filter(path, max_vocab, mode, None)
+}
+
+pub fn build_vocab_from_raw_world_file_with_mode_action_filter(
+    path: &PathBuf,
+    max_vocab: usize,
+    mode: TokenizationMode,
+    action_filter: Option<u32>,
+) -> Result<(Vocab, VocabStats, usize)> {
     let reader = BufReader::new(File::open(path)?);
     let mut row_count = 0usize;
     let mut texts = Vec::new();
@@ -2763,13 +2772,11 @@ pub fn build_vocab_from_raw_world_file_with_mode(
                 if line.is_empty() {
                     return None;
                 }
-                let (left, right, _) = parse_world_line_fields(line)?;
-                let state_tokens = tokenize_with_mode(&left, mode);
-                let next_tokens = tokenize_with_mode(&right, mode);
-                if state_tokens.is_empty() || next_tokens.is_empty() {
+                let row = raw_world_example_from_line_with_mode(line, mode)?;
+                if action_filter.is_some_and(|wanted| row.action_label != wanted) {
                     return None;
                 }
-                Some((left, right))
+                Some((row.state_text, row.next_text))
             })
             .collect::<Vec<_>>();
         for (left, right) in rows {
@@ -2851,6 +2858,22 @@ pub fn count_raw_world_rows_split_with_mode(
     split_modulus: Option<usize>,
     split_remainder: usize,
 ) -> Result<usize> {
+    count_raw_world_rows_split_with_mode_action_filter(
+        path,
+        mode,
+        split_modulus,
+        split_remainder,
+        None,
+    )
+}
+
+pub fn count_raw_world_rows_split_with_mode_action_filter(
+    path: &PathBuf,
+    mode: TokenizationMode,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    action_filter: Option<u32>,
+) -> Result<usize> {
     let reader = BufReader::new(File::open(path)?);
     let mut count = 0usize;
     for (line_idx, line) in reader.lines().enumerate() {
@@ -2864,11 +2887,10 @@ pub fn count_raw_world_rows_split_with_mode(
         if line.is_empty() {
             continue;
         }
-        let Some((left, right, _)) = parse_world_line_fields(line) else {
+        let Some(row) = raw_world_example_from_line_with_mode(line, mode) else {
             continue;
         };
-        if tokenize_with_mode(&left, mode).is_empty() || tokenize_with_mode(&right, mode).is_empty()
-        {
+        if action_filter.is_some_and(|wanted| row.action_label != wanted) {
             continue;
         }
         count += 1;
@@ -2923,24 +2945,33 @@ pub fn make_decoder_batch(
     let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
 
     for b in 0..batch_size {
-        let sl = state_lens.get(b).copied().unwrap_or(1).min(max_seq);
+        let raw_sl = state_lens.get(b).copied().unwrap_or(1).min(max_seq);
         let nl = next_lens.get(b).copied().unwrap_or(1).min(max_seq);
+        let prompt_len = if raw_sl == 0 && max_seq > 0 {
+            1
+        } else {
+            raw_sl
+        };
 
-        input_buf.extend(state_v[b].iter().take(sl).copied());
+        if raw_sl == 0 && prompt_len > 0 {
+            input_buf.push(pad_id);
+        } else {
+            input_buf.extend(state_v[b].iter().take(raw_sl).copied());
+        }
         input_buf.extend(next_v[b].iter().take(nl.saturating_sub(1)).copied());
-        let input_len = sl + nl.saturating_sub(1);
+        let input_len = prompt_len + nl.saturating_sub(1);
         for _ in input_len..decoder_len {
             input_buf.push(pad_id);
         }
 
-        target_buf.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
+        target_buf.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
         target_buf.extend(next_v[b].iter().take(nl).copied());
-        let target_len = sl.saturating_sub(1) + nl;
+        let target_len = prompt_len.saturating_sub(1) + nl;
         for _ in target_len..decoder_len {
             target_buf.push(pad_id);
         }
 
-        mask_buf.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
+        mask_buf.extend(std::iter::repeat_n(0.0f32, prompt_len.saturating_sub(1)));
         mask_buf.extend(std::iter::repeat_n(1.0f32, nl));
         mask_buf.extend(std::iter::repeat_n(
             0.0f32,
@@ -2956,7 +2987,8 @@ pub fn make_decoder_batch(
 
 /// Build decoder teacher-forcing tensors directly from CPU token rows.
 ///
-/// Long prompts keep their tail so late instructions and compiler feedback remain visible.
+/// Long prompts and completions keep their tail so late instructions, compiler feedback, and
+/// closing delimiters remain visible.
 pub fn make_decoder_batch_from_slice(
     rows: &[WorldExample],
     max_seq: usize,
@@ -2983,35 +3015,44 @@ pub fn make_decoder_batch_from_slice_with_prompt_dropout(
             let mut rng = rng();
             let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
             let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
-            let sl = state_len.min(max_seq);
+            let raw_sl = state_len.min(max_seq);
             let nl = next_len.min(max_seq);
+            let prompt_len = if raw_sl == 0 && max_seq > 0 {
+                1
+            } else {
+                raw_sl
+            };
 
             let mut input = Vec::with_capacity(decoder_len);
-            input.extend(state_seq.iter().take(sl).map(|token| {
-                if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
-                    drop_id
-                } else {
-                    *token
-                }
-            }));
+            if raw_sl == 0 && prompt_len > 0 {
+                input.push(pad_id);
+            } else {
+                input.extend(state_seq.iter().take(raw_sl).map(|token| {
+                    if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
+                        drop_id
+                    } else {
+                        *token
+                    }
+                }));
+            }
             input.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
-            let input_len = sl + nl.saturating_sub(1);
+            let input_len = prompt_len + nl.saturating_sub(1);
             input.extend(std::iter::repeat_n(
                 pad_id,
                 decoder_len.saturating_sub(input_len),
             ));
 
             let mut target = Vec::with_capacity(decoder_len);
-            target.extend(std::iter::repeat_n(pad_id, sl.saturating_sub(1)));
+            target.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
             target.extend(next_seq.iter().take(nl).copied());
-            let target_len = sl.saturating_sub(1) + nl;
+            let target_len = prompt_len.saturating_sub(1) + nl;
             target.extend(std::iter::repeat_n(
                 pad_id,
                 decoder_len.saturating_sub(target_len),
             ));
 
             let mut mask = Vec::with_capacity(decoder_len);
-            mask.extend(std::iter::repeat_n(0.0f32, sl.saturating_sub(1)));
+            mask.extend(std::iter::repeat_n(0.0f32, prompt_len.saturating_sub(1)));
             mask.extend(std::iter::repeat_n(1.0f32, nl));
             mask.extend(std::iter::repeat_n(
                 0.0f32,
@@ -3149,6 +3190,43 @@ mod tests {
 
         assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 0, 0, 0, 0]);
         assert_eq!(mask.to_vec2::<f32>()?[0], vec![0.0; 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_batch_seeds_empty_prompt_without_self_copy() -> Result<()> {
+        let device = Device::Cpu;
+        let row = WorldExample {
+            state_tokens: Vec::new(),
+            next_tokens: vec![20, 21],
+            action_label: ACTION_CODE,
+        };
+
+        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
+
+        assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
+        assert_eq!(
+            mask.to_vec2::<f32>()?[0],
+            vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_decoder_batch_seeds_empty_prompt_without_self_copy() -> Result<()> {
+        let device = Device::Cpu;
+        let state = Tensor::from_vec(vec![0u32, 0, 0], (1, 3), &device)?;
+        let next = Tensor::from_vec(vec![20u32, 21, 0], (1, 3), &device)?;
+
+        let (input, target, mask) = make_decoder_batch(&state, &next, &[0], &[2], 3, 0, &device)?;
+
+        assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
+        assert_eq!(
+            mask.to_vec2::<f32>()?[0],
+            vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        );
         Ok(())
     }
 

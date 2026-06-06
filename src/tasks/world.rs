@@ -18,11 +18,12 @@ use crate::config::{
     WorldEvalConfig, WorldTrainConfig,
 };
 use crate::data::{
-    build_vocab_from_raw_world_file_with_mode, count_raw_world_rows, count_raw_world_rows_split,
-    count_raw_world_rows_split_with_mode, encode_text_with_vocab_mode, encode_world_examples,
-    encode_world_examples_with_mode, make_decoder_batch_from_slice_with_prompt_dropout,
-    CachedDecoderStream, CachedWorldStream, RawWorldExample, RawWorldStream, TokenizationMode,
-    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    build_vocab_from_raw_world_file_with_mode_action_filter, count_raw_world_rows,
+    count_raw_world_rows_split, count_raw_world_rows_split_with_mode_action_filter,
+    encode_text_with_vocab_mode, encode_world_examples, encode_world_examples_with_mode,
+    make_decoder_batch_from_slice_with_prompt_dropout, CachedDecoderStream, CachedWorldStream,
+    RawWorldExample, RawWorldStream, TokenizationMode, WorldExample, ACTION_CODE, ACTION_DONE,
+    ACTION_FETCH_DOCS, ACTION_TEXT_REPLY, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::vocab_signature;
@@ -36,9 +37,10 @@ use crate::model::{
     StubLocalDecoder, Vocab,
 };
 use crate::tasks::world_support::{
-    action_cross_entropy, compute_action_metrics, decoder_prediction_metrics,
-    decoder_selection_score, encoded_examples_oov_rate, evaluate_decoder_batch,
-    evaluate_decoder_cached_batch, evaluate_world_encoded_batch,
+    action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
+    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score,
+    encoded_examples_oov_rate, evaluate_decoder_batch, evaluate_decoder_cached_batch,
+    evaluate_world_encoded_batch, forbidden_output_probability_loss,
     hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
     masked_weighted_cross_entropy, multi_token_prediction_loss, raw_examples_oov_rate,
     shuffled_conditioning_latent, signature_weight_mask, slot_delta_slots, structure_weight_mask,
@@ -49,8 +51,10 @@ use crate::util;
 
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
-const CONDITIONED_DECODER_CACHE_VERSION: u32 = 1;
-const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V1\n";
+const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
+const DECODER_VOCAB_MANIFEST_VERSION: u32 = 1;
+const CONDITIONED_DECODER_CACHE_VERSION: u32 = 2;
+const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 
 type WorldConfig = WorldTrainConfig;
@@ -89,12 +93,25 @@ struct CacheManifestSource {
 
 #[derive(Debug, Deserialize)]
 struct CacheTokenManifest {
+    #[serde(default)]
+    version: u32,
     kind: String,
     source: CacheManifestSource,
     tokenizer: String,
     max_seq: usize,
+    action_filter: Option<u32>,
     vocab_signature: String,
     token_cache_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DecoderVocabManifest {
+    version: u32,
+    kind: String,
+    tokenizer: String,
+    max_vocab: usize,
+    action_filter: u32,
+    vocab_signature: String,
 }
 
 fn token_cache_path(kind: &str) -> Option<PathBuf> {
@@ -154,9 +171,11 @@ fn compatible_world_cache_path(
     }
     let manifest = load_cache_token_manifest(&manifest_path)
         .with_context(|| format!("load world cache manifest from {:?}", manifest_path))?;
-    if manifest.kind != "world"
+    if manifest.version != TOKEN_CACHE_MANIFEST_VERSION
+        || manifest.kind != "world"
         || manifest.tokenizer != TokenizationMode::Default.as_str()
         || manifest.max_seq < max_seq
+        || manifest.action_filter.is_some()
         || manifest.vocab_signature != encoder_vocab_sig
         || manifest.token_cache_path != cache_path.to_string_lossy()
         || !source_fingerprint_matches(data_path, &manifest.source)?
@@ -183,10 +202,12 @@ fn compatible_decoder_dual_cache_path(
     let manifest = load_cache_token_manifest(&manifest_path)
         .with_context(|| format!("load decoder cache manifest from {:?}", manifest_path))?;
     let expected_sig = format!("{encoder_vocab_sig}+{decoder_vocab_sig}");
-    if manifest.kind != "code_decoder_dual"
+    if manifest.version != TOKEN_CACHE_MANIFEST_VERSION
+        || manifest.kind != "code_decoder_dual"
         || manifest.tokenizer != TokenizationMode::CodeAware.as_str()
         || manifest.max_seq < max_seq
-        || manifest.source.path != data_path.to_string_lossy()
+        || manifest.action_filter != Some(ACTION_CODE)
+        || !source_fingerprint_matches(data_path, &manifest.source)?
         || manifest.vocab_signature != expected_sig
         || manifest.token_cache_path != cache_path.to_string_lossy()
     {
@@ -824,14 +845,25 @@ fn maybe_prepare_conditioned_decoder_cache(
     let mut next_progress = 10_000usize;
     loop {
         let mut records = Vec::with_capacity(chunk_size);
+        let mut reached_eof = false;
         for _ in 0..chunk_size {
-            let Some(record) = read_source_dual_cache_record(&mut source_reader)? else {
-                break;
-            };
-            records.push(record);
+            match read_source_dual_cache_record(&mut source_reader)? {
+                Some(record) => {
+                    if record.action_label == decoder_action_label {
+                        records.push(record);
+                    }
+                }
+                None => {
+                    reached_eof = true;
+                    break;
+                }
+            }
         }
         if records.is_empty() {
-            break;
+            if reached_eof {
+                break;
+            }
+            continue;
         }
         fill_conditioned_slots_for_records(
             &mut records,
@@ -856,6 +888,13 @@ fn maybe_prepare_conditioned_decoder_cache(
             println!("Token cache: conditioned decoder slots progress rows={rows}");
             next_progress += 10_000;
         }
+    }
+    if rows == 0 {
+        bail!(
+            "conditioned decoder cache found no action={} rows in {:?}",
+            decoder_action_label,
+            source_cache_path
+        );
     }
     writer.flush()?;
     fs::rename(&tmp_path, &cache_path)?;
@@ -3044,6 +3083,49 @@ fn default_decoder_vocab_path(decoder_path: &Path) -> PathBuf {
     decoder_path.with_extension("vocab.txt")
 }
 
+fn decoder_vocab_manifest_path(vocab_path: &Path) -> PathBuf {
+    vocab_path.with_extension("manifest.json")
+}
+
+fn decoder_vocab_manifest_matches(
+    manifest: &DecoderVocabManifest,
+    vocab: &Vocab,
+    kind: DecoderKind,
+    token_mode: TokenizationMode,
+    max_vocab: usize,
+    action_filter: u32,
+) -> bool {
+    manifest.version == DECODER_VOCAB_MANIFEST_VERSION
+        && manifest.kind == kind.as_str()
+        && manifest.tokenizer == token_mode.as_str()
+        && manifest.max_vocab == max_vocab
+        && manifest.action_filter == action_filter
+        && manifest.vocab_signature == vocab_signature(vocab)
+}
+
+fn save_decoder_vocab_manifest(
+    vocab_path: &Path,
+    vocab: &Vocab,
+    kind: DecoderKind,
+    token_mode: TokenizationMode,
+    max_vocab: usize,
+    action_filter: u32,
+) -> Result<()> {
+    let manifest = DecoderVocabManifest {
+        version: DECODER_VOCAB_MANIFEST_VERSION,
+        kind: kind.as_str().to_string(),
+        tokenizer: token_mode.as_str().to_string(),
+        max_vocab,
+        action_filter,
+        vocab_signature: vocab_signature(vocab),
+    };
+    fs::write(
+        decoder_vocab_manifest_path(vocab_path),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
 fn decoder_varmap_checkpoint_artifact(
     varmap: &VarMap,
     path: &Path,
@@ -3277,6 +3359,151 @@ pub(crate) fn decoder_tokenization_mode(kind: DecoderKind) -> TokenizationMode {
         TokenizationMode::CodeAware
     } else {
         TokenizationMode::Default
+    }
+}
+
+pub(crate) fn decoder_action_label_for_kind(kind: DecoderKind) -> u32 {
+    match kind {
+        DecoderKind::TextGeneralist => ACTION_TEXT_REPLY,
+        DecoderKind::CodeSpecialist => ACTION_CODE,
+    }
+}
+
+fn decoder_action_matches_kind(kind: DecoderKind, action_label: u32) -> bool {
+    action_label == decoder_action_label_for_kind(kind)
+}
+
+fn decoder_action_name(kind: DecoderKind) -> &'static str {
+    match kind {
+        DecoderKind::TextGeneralist => "text_reply",
+        DecoderKind::CodeSpecialist => "code",
+    }
+}
+
+fn decoder_batch_refill_rounds() -> usize {
+    std::env::var("TOFY_DECODER_BATCH_REFILL_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(action_batch_refill_rounds)
+        .max(1)
+}
+
+fn ensure_decoder_batch_not_empty(len: usize, kind: DecoderKind) -> Result<()> {
+    if len == 0 {
+        bail!(
+            "{} decoder batch found no {} rows after {} refill rounds; use matching training data or increase TOFY_DECODER_BATCH_REFILL_ROUNDS",
+            kind.as_str(),
+            decoder_action_name(kind),
+            decoder_batch_refill_rounds()
+        );
+    }
+    Ok(())
+}
+
+fn collect_decoder_raw_batch(
+    stream: &mut RawWorldStream,
+    batch_size: usize,
+    kind: DecoderKind,
+) -> Result<Vec<RawWorldExample>> {
+    let target = batch_size.max(1);
+    let mut batch = Vec::with_capacity(target);
+    for _ in 0..decoder_batch_refill_rounds() {
+        for example in stream.next_batch(target)? {
+            if decoder_action_matches_kind(kind, example.action_label) {
+                batch.push(example);
+                if batch.len() >= target {
+                    return Ok(batch);
+                }
+            }
+        }
+    }
+    ensure_decoder_batch_not_empty(batch.len(), kind)?;
+    Ok(batch)
+}
+
+fn collect_decoder_cached_batch(
+    stream: &mut CachedDecoderStream,
+    batch_size: usize,
+    kind: DecoderKind,
+) -> Result<Vec<crate::data::CachedDecoderExample>> {
+    let target = batch_size.max(1);
+    let mut batch = Vec::with_capacity(target);
+    for _ in 0..decoder_batch_refill_rounds() {
+        for example in stream.next_batch(target)? {
+            if decoder_action_matches_kind(kind, example.decoder.action_label) {
+                batch.push(example);
+                if batch.len() >= target {
+                    return Ok(batch);
+                }
+            }
+        }
+    }
+    ensure_decoder_batch_not_empty(batch.len(), kind)?;
+    Ok(batch)
+}
+
+fn collect_conditioned_decoder_batch(
+    stream: &mut ConditionedDecoderStream,
+    batch_size: usize,
+    kind: DecoderKind,
+) -> Result<Vec<ConditionedDecoderExample>> {
+    let target = batch_size.max(1);
+    let mut batch = Vec::with_capacity(target);
+    for _ in 0..decoder_batch_refill_rounds() {
+        for example in stream.next_batch(target)? {
+            if decoder_action_matches_kind(kind, example.decoder.action_label) {
+                batch.push(example);
+                if batch.len() >= target {
+                    return Ok(batch);
+                }
+            }
+        }
+    }
+    ensure_decoder_batch_not_empty(batch.len(), kind)?;
+    Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decoder_action_label_for_kind, decoder_action_matches_kind};
+    use crate::data::{ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, ACTION_TEXT_REPLY};
+    use crate::model::DecoderKind;
+
+    #[test]
+    fn decoder_specialists_accept_only_their_declared_action() {
+        assert_eq!(
+            decoder_action_label_for_kind(DecoderKind::TextGeneralist),
+            ACTION_TEXT_REPLY
+        );
+        assert_eq!(
+            decoder_action_label_for_kind(DecoderKind::CodeSpecialist),
+            ACTION_CODE
+        );
+
+        assert!(decoder_action_matches_kind(
+            DecoderKind::TextGeneralist,
+            ACTION_TEXT_REPLY
+        ));
+        assert!(!decoder_action_matches_kind(
+            DecoderKind::TextGeneralist,
+            ACTION_CODE
+        ));
+        assert!(decoder_action_matches_kind(
+            DecoderKind::CodeSpecialist,
+            ACTION_CODE
+        ));
+        assert!(!decoder_action_matches_kind(
+            DecoderKind::CodeSpecialist,
+            ACTION_TEXT_REPLY
+        ));
+        assert!(!decoder_action_matches_kind(
+            DecoderKind::CodeSpecialist,
+            ACTION_DONE
+        ));
+        assert!(!decoder_action_matches_kind(
+            DecoderKind::CodeSpecialist,
+            ACTION_FETCH_DOCS
+        ));
     }
 }
 
@@ -3528,12 +3755,20 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let data_path = config.data_path.clone();
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let decoder_token_mode = decoder_tokenization_mode(config.decoder_kind);
-    let row_count = count_raw_world_rows_split_with_mode(&data_path, decoder_token_mode, None, 0)?;
-    let val_row_count = count_raw_world_rows_split_with_mode(
+    let decoder_action_label = decoder_action_label_for_kind(config.decoder_kind);
+    let row_count = count_raw_world_rows_split_with_mode_action_filter(
+        &data_path,
+        decoder_token_mode,
+        None,
+        0,
+        Some(decoder_action_label),
+    )?;
+    let val_row_count = count_raw_world_rows_split_with_mode_action_filter(
         &data_path,
         decoder_token_mode,
         Some(HELDOUT_SPLIT_MODULUS),
         HELDOUT_SPLIT_REMAINDER,
+        Some(decoder_action_label),
     )
     .unwrap_or(0);
     let train_row_count = row_count.saturating_sub(val_row_count);
@@ -3656,12 +3891,42 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_decoder_vocab_path(&decoder_path));
     let (decoder_vocab, built_decoder_vocab) = if decoder_vocab_path.exists() {
-        (load_vocab_from_file(&decoder_vocab_path)?, false)
+        let vocab = load_vocab_from_file(&decoder_vocab_path)?;
+        let manifest_path = decoder_vocab_manifest_path(&decoder_vocab_path);
+        let manifest_text = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "decoder vocab {:?} exists but matching manifest {:?} is missing; rebuild the vocab under the current decoder action filter",
+                decoder_vocab_path,
+                manifest_path
+            )
+        })?;
+        let manifest: DecoderVocabManifest = serde_json::from_str(&manifest_text)
+            .with_context(|| format!("parse decoder vocab manifest {:?}", manifest_path))?;
+        if !decoder_vocab_manifest_matches(
+            &manifest,
+            &vocab,
+            config.decoder_kind,
+            decoder_token_mode,
+            config.decoder_max_vocab,
+            decoder_action_label,
+        ) {
+            anyhow::bail!(
+                "decoder vocab {:?} manifest {:?} does not match kind={} tokenizer={} max_vocab={} action_filter={}; rebuild the decoder vocab",
+                decoder_vocab_path,
+                manifest_path,
+                config.decoder_kind.as_str(),
+                decoder_token_mode.as_str(),
+                config.decoder_max_vocab,
+                decoder_action_label
+            );
+        }
+        (vocab, false)
     } else {
-        let (vocab, _, _) = build_vocab_from_raw_world_file_with_mode(
+        let (vocab, _, _) = build_vocab_from_raw_world_file_with_mode_action_filter(
             &data_path,
             config.decoder_max_vocab,
             decoder_token_mode,
+            Some(decoder_action_label),
         )?;
         (vocab, true)
     };
@@ -3781,6 +4046,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     } else {
         0.0
     };
+    let format_loss_weight = std::env::var("TOFY_DECODER_FORMAT_LOSS_WEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            if config.decoder_kind == DecoderKind::CodeSpecialist {
+                0.03
+            } else {
+                0.0
+            }
+        })
+        .max(0.0);
     let compute_conditioning_metrics =
         config.conditioning_negative_forwards && env_bool("TOFY_DECODER_ABLATION_METRICS", false);
     let conditioning_margin = config.conditioning_margin;
@@ -3839,13 +4115,28 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         conditioning_loss_weight,
         conditioning_negatives.count()
     );
+    println!(
+        "Decoder action filter: {} rows only",
+        decoder_action_name(config.decoder_kind)
+    );
     println!("Save path: {:?}", decoder_path);
     println!("Decoder vocab path: {:?}", decoder_vocab_path);
     if let Some(parent) = decoder_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    if let Some(parent) = decoder_vocab_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     if built_decoder_vocab {
         save_vocab_to_file(&decoder_vocab, &decoder_vocab_path)?;
+        save_decoder_vocab_manifest(
+            &decoder_vocab_path,
+            &decoder_vocab,
+            config.decoder_kind,
+            decoder_token_mode,
+            config.decoder_max_vocab,
+            decoder_action_label,
+        )?;
     }
 
     let run_dir = util::create_run_dir("decoder")?;
@@ -3891,6 +4182,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         conditioning_loss_weight as f32,
         0,
     );
+    tb.add_scalar("config/format_loss_weight", format_loss_weight as f32, 0);
     tb.add_scalar(
         "config/requested_conditioning_loss_weight",
         requested_conditioning_loss_weight as f32,
@@ -3960,11 +4252,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let mut best_loss = resume_state.best_aux_metric;
     let mut best_metric = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
-    let decoder_action_label = if config.decoder_kind == DecoderKind::TextGeneralist {
-        0
-    } else {
-        1
-    };
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
@@ -4060,6 +4347,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_loss = None;
         let mut last_conditioning_loss_val = 0.0f32;
         let mut last_mtp_loss_val = 0.0f32;
+        let mut last_format_loss_val = 0.0f32;
         let batch_size = decoder_batch_size_for_step(step, &config);
         let grad_accum_steps = decoder_grad_accum_for_step(step, &config);
         if config.batch_warmup_steps > 0
@@ -4082,7 +4370,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         for micro_step in 0..grad_accum_steps {
             let capture_micro_metrics = logging_step && micro_step + 1 == grad_accum_steps;
             let micro_batch = if let Some(ref mut conditioned_stream) = conditioned_decoder_stream {
-                let conditioned_batch = conditioned_stream.next_batch(batch_size.max(1))?;
+                let conditioned_batch = collect_conditioned_decoder_batch(
+                    conditioned_stream,
+                    batch_size.max(1),
+                    config.decoder_kind,
+                )?;
                 let decoder_batch = conditioned_batch
                     .iter()
                     .map(|row| row.decoder.clone())
@@ -4106,7 +4398,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     next_context_slots: Some(next_context_slots),
                 }
             } else if let Some(ref mut cached_stream) = cached_decoder_stream {
-                let cached_batch = cached_stream.next_batch(batch_size.max(1))?;
+                let cached_batch = collect_decoder_cached_batch(
+                    cached_stream,
+                    batch_size.max(1),
+                    config.decoder_kind,
+                )?;
                 let encoder_batch = cached_batch
                     .iter()
                     .map(|row| row.encoder.clone())
@@ -4127,7 +4423,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     next_context_slots: None,
                 }
             } else {
-                let raw_batch = raw_stream.next_batch(batch_size.max(1))?;
+                let raw_batch = collect_decoder_raw_batch(
+                    &mut raw_stream,
+                    batch_size.max(1),
+                    config.decoder_kind,
+                )?;
                 let encoder_batch = encode_world_examples(&raw_batch, &encoder_vocab);
                 let decoder_batch =
                     encode_world_examples_with_mode(&raw_batch, &decoder_vocab, decoder_token_mode);
@@ -4247,6 +4547,19 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 loss =
                     loss.broadcast_add(&structure_loss.affine(config.structure_loss_weight, 0.0)?)?;
             }
+            let format_loss = if format_loss_weight > 0.0 {
+                forbidden_output_probability_loss(&logits, &loss_mask, &decoder_vocab)?
+            } else {
+                token_loss.affine(0.0, 0.0)?
+            };
+            if format_loss_weight > 0.0 {
+                loss = loss.broadcast_add(&format_loss.affine(format_loss_weight, 0.0)?)?;
+                if capture_micro_metrics {
+                    last_format_loss_val = util::scalar_f32(&format_loss)?;
+                }
+            } else {
+                last_format_loss_val = 0.0;
+            }
             let conditioning_loss = if conditioning_loss_weight > 0.0 {
                 let mut margin_sum = None;
                 let mut negative_count = 0usize;
@@ -4363,9 +4676,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         util::scalar_f32(&hard_mismatch_loss)?,
                     )
                 } else {
-                    (loss_val, loss_val, loss_val)
+                    (raw_loss_val, raw_loss_val, raw_loss_val)
                 };
             let conditioning_loss_val = last_conditioning_loss_val;
+            let format_loss_val = last_format_loss_val;
             let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
             let signature_mask =
@@ -4381,28 +4695,21 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let structure_loss_val = util::scalar_f32(&structure_loss)?;
             let mtp_loss_val = last_mtp_loss_val;
             let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
-            let total_tokens = (batch_size.max(1) * config.max_seq * 2) as f32;
+            let (loss_rows, _) = loss_mask.dims2()?;
+            let total_tokens = (loss_rows.max(1) * config.max_seq * 2) as f32;
             let active_frac = active_tokens / total_tokens.max(1.0);
-            let perplexity = loss_val.exp();
-            let conditioning_gain = if compute_conditioning_metrics {
-                ablated_loss_val - loss_val
-            } else {
-                0.0
-            };
-            let zero_gain = conditioning_gain;
-            let shuffle_gain = if compute_conditioning_metrics {
-                shuffled_loss_val - loss_val
-            } else {
-                0.0
-            };
-            let hard_negative_gain = if compute_conditioning_metrics {
-                ablated_loss_val
-                    .min(shuffled_loss_val)
-                    .min(hard_mismatch_loss_val)
-                    - loss_val
-            } else {
-                0.0
-            };
+            let perplexity = raw_loss_val.exp();
+            let gains = decoder_conditioning_gains(
+                raw_loss_val,
+                ablated_loss_val,
+                shuffled_loss_val,
+                hard_mismatch_loss_val,
+                compute_conditioning_metrics,
+            );
+            let conditioning_gain = gains.conditioning_gain;
+            let zero_gain = gains.zero_gain;
+            let shuffle_gain = gains.shuffle_gain;
+            let hard_negative_gain = gains.hard_negative_gain;
             let world_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
             let prediction_metrics =
                 decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
@@ -4423,6 +4730,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             tb.add_scalar("loss/hard_mismatch_token_ce", hard_mismatch_loss_val, step);
             tb.add_scalar("loss/conditioning_margin", conditioning_loss_val, step);
             tb.add_scalar("loss/mtp", mtp_loss_val, step);
+            tb.add_scalar("loss/format_forbidden_prob", format_loss_val, step);
             tb.add_scalar("loss/syntax_ce", syntax_loss_val, step);
             tb.add_scalar("loss/signature_ce", signature_loss_val, step);
             tb.add_scalar("loss/structure_ce", structure_loss_val, step);
@@ -4507,6 +4815,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 function_name_token_accuracy,
                 function_name_exact_rate,
             };
+            let train_reward_proxy = decoder_reward_proxy(&train_metrics);
+            tb.add_scalar("reward/proxy", train_reward_proxy, step);
             let mut selection_metric = decoder_selection_score(
                 &train_metrics,
                 config.syntax_loss_weight,
@@ -4521,7 +4831,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     .max(1)
                     .min(config.batch_size.max(1));
                 let val_metrics = if let Some(ref mut cached_stream) = cached_decoder_val_stream {
-                    let cached_batch = cached_stream.next_batch(eval_batch_size)?;
+                    let cached_batch = collect_decoder_cached_batch(
+                        cached_stream,
+                        eval_batch_size,
+                        config.decoder_kind,
+                    )?;
                     evaluate_decoder_cached_batch(
                         &cached_batch,
                         &encoder_vocab,
@@ -4541,7 +4855,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     let val_stream = val_stream
                         .as_mut()
                         .context("decoder validation stream missing")?;
-                    let val_raw_batch = val_stream.next_batch(eval_batch_size)?;
+                    let val_raw_batch = collect_decoder_raw_batch(
+                        val_stream,
+                        eval_batch_size,
+                        config.decoder_kind,
+                    )?;
                     evaluate_decoder_batch(
                         &val_raw_batch,
                         &encoder_vocab,
@@ -4564,6 +4882,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     config.signature_loss_weight,
                     config.structure_loss_weight,
                 );
+                let val_reward_proxy = decoder_reward_proxy(&val_metrics);
                 best_loss = best_loss.min(val_metrics.loss);
                 tb.add_scalar("val/token_ce", val_metrics.loss, step);
                 tb.add_scalar("val/raw_token_ce", val_metrics.raw_loss, step);
@@ -4626,6 +4945,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     val_metrics.delimiter_balance_rate,
                     step,
                 );
+                tb.add_scalar("val/reward_proxy", val_reward_proxy, step);
             } else {
                 best_loss = best_loss.min(loss_val);
             }
@@ -4681,7 +5001,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     "saved best"
                 };
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{} [{}]",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{} [{}]",
                     step,
                     config.steps,
                     loss_val,
@@ -4692,6 +5012,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     hard_negative_gain,
                     conditioning_loss_val,
                     mtp_loss_val,
+                    format_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
                     structure_loss_val,
@@ -4707,13 +5028,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     function_name_exact_rate * 100.0,
                     delimiter_balance_rate * 100.0,
                     function_skeleton_rate * 100.0,
+                    train_reward_proxy,
                     selection_metric,
                     memory_note,
                     best_note
                 );
             } else {
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% sel {:.4}{}",
+                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{}",
                     step,
                     config.steps,
                     loss_val,
@@ -4724,6 +5046,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     hard_negative_gain,
                     conditioning_loss_val,
                     mtp_loss_val,
+                    format_loss_val,
                     syntax_loss_val,
                     signature_loss_val,
                     structure_loss_val,
@@ -4739,6 +5062,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     function_name_exact_rate * 100.0,
                     delimiter_balance_rate * 100.0,
                     function_skeleton_rate * 100.0,
+                    train_reward_proxy,
                     selection_metric,
                     memory_note
                 );
@@ -6719,78 +7043,79 @@ fn context_slots_from_token_sequences_with_detach(
             }
             sample_slots.push(folded_slots.context("recursive planner fold produced no slots")?);
         }
-    } else {
-        let mut memory_by_record: Vec<Option<(Tensor, Tensor)>> =
-            (0..records.len()).map(|_| None).collect();
-        for chunk_start in (0..records.len()).step_by(segment_batch_limit) {
-            let chunk_end = (chunk_start + segment_batch_limit).min(records.len());
-            let chunk_len = chunk_end - chunk_start;
-            let offset = chunk_start * max_seq;
-            let end = chunk_end * max_seq;
-            let input_ids = Tensor::from_vec(
-                input_buf[offset..end].to_vec(),
-                (chunk_len, max_seq),
-                device,
-            )?;
-            let features =
-                maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
-            let mut summary_indices = Vec::new();
-            let mut full_indices = Vec::new();
-            for local_idx in 0..chunk_len {
-                if records[chunk_start + local_idx].include_tokens {
-                    full_indices.push(local_idx);
-                } else {
-                    summary_indices.push(local_idx);
-                }
-            }
-            for (include_tokens, local_indices) in [(false, summary_indices), (true, full_indices)]
-            {
-                if local_indices.is_empty() {
-                    continue;
-                }
-                let selected = select_encoder_features(&features, &local_indices)?;
-                let token_lengths = local_indices
-                    .iter()
-                    .map(|idx| records[chunk_start + *idx].token_len)
-                    .collect::<Vec<_>>();
-                let (memory, mask) = context_compressor_segment_batch_from_features(
-                    &selected,
-                    &token_lengths,
-                    include_tokens,
-                )?;
-                for (group_pos, local_idx) in local_indices.iter().copied().enumerate() {
-                    let record_idx = chunk_start + local_idx;
-                    memory_by_record[record_idx] = Some((
-                        memory.narrow(0, group_pos, 1)?,
-                        mask.narrow(0, group_pos, 1)?,
-                    ));
-                }
+
+        let refs = sample_slots.iter().collect::<Vec<_>>();
+        return Tensor::cat(&refs, 0).map_err(Into::into);
+    }
+
+    let mut memory_by_record: Vec<Option<(Tensor, Tensor)>> =
+        (0..records.len()).map(|_| None).collect();
+    for chunk_start in (0..records.len()).step_by(segment_batch_limit) {
+        let chunk_end = (chunk_start + segment_batch_limit).min(records.len());
+        let chunk_len = chunk_end - chunk_start;
+        let offset = chunk_start * max_seq;
+        let end = chunk_end * max_seq;
+        let input_ids = Tensor::from_vec(
+            input_buf[offset..end].to_vec(),
+            (chunk_len, max_seq),
+            device,
+        )?;
+        let features = maybe_detach_features(encoder.forward_features(&input_ids)?, detach_encoder);
+        let mut summary_indices = Vec::new();
+        let mut full_indices = Vec::new();
+        for local_idx in 0..chunk_len {
+            if records[chunk_start + local_idx].include_tokens {
+                full_indices.push(local_idx);
+            } else {
+                summary_indices.push(local_idx);
             }
         }
+        for (include_tokens, local_indices) in [(false, summary_indices), (true, full_indices)] {
+            if local_indices.is_empty() {
+                continue;
+            }
+            let selected = select_encoder_features(&features, &local_indices)?;
+            let token_lengths = local_indices
+                .iter()
+                .map(|idx| records[chunk_start + *idx].token_len)
+                .collect::<Vec<_>>();
+            let (memory, mask) = context_compressor_segment_batch_from_features(
+                &selected,
+                &token_lengths,
+                include_tokens,
+            )?;
+            for (group_pos, local_idx) in local_indices.iter().copied().enumerate() {
+                let record_idx = chunk_start + local_idx;
+                memory_by_record[record_idx] = Some((
+                    memory.narrow(0, group_pos, 1)?,
+                    mask.narrow(0, group_pos, 1)?,
+                ));
+            }
+        }
+    }
 
-        for sample_records in &records_by_sample {
-            let mut memory_refs = Vec::with_capacity(sample_records.len());
-            let mut mask_refs = Vec::with_capacity(sample_records.len());
-            for record_idx in sample_records {
-                let (memory, mask) = memory_by_record[*record_idx]
-                    .as_ref()
-                    .context("missing context compressor for segment record")?;
-                memory_refs.push(memory);
-                mask_refs.push(mask);
-            }
-            let memory = Tensor::cat(&memory_refs, 1)?;
-            let mask = Tensor::cat(&mask_refs, 1)?;
-            if hybrid_context && sample_records.len() > 1 {
-                sample_slots.push(context_compressor.forward_hybrid_masked(
-                    &memory,
-                    Some(&mask),
-                    hybrid_exact_tail,
-                    hybrid_block_size,
-                    hybrid_retrieval_slots,
-                )?);
-            } else {
-                sample_slots.push(context_compressor.forward_masked(&memory, Some(&mask))?);
-            }
+    for sample_records in &records_by_sample {
+        let mut memory_refs = Vec::with_capacity(sample_records.len());
+        let mut mask_refs = Vec::with_capacity(sample_records.len());
+        for record_idx in sample_records {
+            let (memory, mask) = memory_by_record[*record_idx]
+                .as_ref()
+                .context("missing context compressor for segment record")?;
+            memory_refs.push(memory);
+            mask_refs.push(mask);
+        }
+        let memory = Tensor::cat(&memory_refs, 1)?;
+        let mask = Tensor::cat(&mask_refs, 1)?;
+        if hybrid_context && sample_records.len() > 1 {
+            sample_slots.push(context_compressor.forward_hybrid_masked(
+                &memory,
+                Some(&mask),
+                hybrid_exact_tail,
+                hybrid_block_size,
+                hybrid_retrieval_slots,
+            )?);
+        } else {
+            sample_slots.push(context_compressor.forward_masked(&memory, Some(&mask))?);
         }
     }
 
