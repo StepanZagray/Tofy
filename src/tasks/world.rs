@@ -42,10 +42,9 @@ use crate::tasks::world_support::{
     encoded_examples_oov_rate, evaluate_decoder_batch, evaluate_decoder_cached_batch,
     evaluate_world_encoded_batch, forbidden_output_probability_loss,
     hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
-    masked_weighted_cross_entropy, multi_token_prediction_loss, raw_examples_oov_rate,
-    shuffled_conditioning_latent, signature_weight_mask, slot_delta_slots, structure_weight_mask,
-    syntax_weight_mask, world_selection_score, ActionMetrics, DecoderBatchMetrics,
-    WorldBatchMetrics,
+    masked_weighted_cross_entropy, raw_examples_oov_rate, shuffled_conditioning_latent,
+    signature_weight_mask, slot_delta_slots, structure_weight_mask, syntax_weight_mask,
+    world_selection_score, ActionMetrics, DecoderBatchMetrics, WorldBatchMetrics,
 };
 use crate::util;
 
@@ -1016,21 +1015,21 @@ pub fn try_run_train_decoder(args: &[String]) -> Result<bool> {
     let encoder_model_path = PathBuf::from(&args[2]);
     let encoder_vocab_path = PathBuf::from(&args[3]);
     let world_path = PathBuf::from(&args[4]);
-    let data_path = resolve_data_path(&args[5])?.path;
     let mut args_for_cfg = vec![
         encoder_model_path.to_string_lossy().to_string(),
         encoder_vocab_path.to_string_lossy().to_string(),
         world_path.to_string_lossy().to_string(),
-        data_path.to_string_lossy().to_string(),
+        args[5].clone(),
     ];
     args_for_cfg.extend(args.iter().skip(6).cloned());
-    let cfg = DecoderTrainConfig::from_args_after(&args_for_cfg)?;
+    let mut cfg = DecoderTrainConfig::from_args_after(&args_for_cfg)?;
     if cfg.mtp_loss_weight > 0.0 {
         anyhow::bail!(
             "--mtp-loss-weight is unsupported: this decoder has no dedicated future-token heads, \
              so reusing next-token logits for MTP trains conflicting targets"
         );
     }
+    cfg.data_path = resolve_data_path(&args[5])?.path;
     run_decoder_training(cfg)?;
     Ok(true)
 }
@@ -2007,6 +2006,57 @@ struct HighWorldMacroBatch {
     action_sequences: Vec<Vec<u32>>,
 }
 
+fn high_world_macro_example_from_raw_span(
+    span: &[RawWorldExample],
+    vocab: &Vocab,
+) -> Result<(WorldExample, Vec<u32>)> {
+    let first = span
+        .first()
+        .context("high-world macro span unexpectedly empty")?;
+    let mut next_tokens = Vec::new();
+    for row in span {
+        next_tokens.extend(encode_text_with_vocab_mode(
+            &row.next_text,
+            vocab,
+            TokenizationMode::Default,
+        ));
+    }
+    let action_sequence = span.iter().map(|row| row.action_label).collect();
+    Ok((
+        WorldExample {
+            state_tokens: encode_text_with_vocab_mode(
+                &first.state_text,
+                vocab,
+                TokenizationMode::Default,
+            ),
+            next_tokens,
+            action_label: first.action_label,
+        },
+        action_sequence,
+    ))
+}
+
+fn high_world_macro_example_from_cached_span(
+    span: &[WorldExample],
+) -> Result<(WorldExample, Vec<u32>)> {
+    let first = span
+        .first()
+        .context("cached high-world macro span unexpectedly empty")?;
+    let next_tokens = span
+        .iter()
+        .flat_map(|row| row.next_tokens.iter().copied())
+        .collect();
+    let action_sequence = span.iter().map(|row| row.action_label).collect();
+    Ok((
+        WorldExample {
+            state_tokens: first.state_tokens.clone(),
+            next_tokens,
+            action_label: first.action_label,
+        },
+        action_sequence,
+    ))
+}
+
 fn collect_high_world_macro_batch(
     stream: &mut RawWorldStream,
     vocab: &Vocab,
@@ -2017,26 +2067,17 @@ fn collect_high_world_macro_batch(
     let macro_min_len = macro_min_len.max(1);
     let macro_max_len = macro_max_len.max(macro_min_len);
     let span_range = macro_max_len - macro_min_len + 1;
-    let mut raw_examples = Vec::with_capacity(batch_size);
+    let mut examples = Vec::with_capacity(batch_size);
     let mut action_sequences = Vec::with_capacity(batch_size);
     for sample_idx in 0..batch_size {
         let span_len = macro_min_len + (sample_idx % span_range);
         let rows = stream.next_batch(span_len)?;
-        let first = rows
-            .first()
-            .context("high-world macro span unexpectedly empty")?;
-        let last = rows
-            .last()
-            .context("high-world macro span unexpectedly empty")?;
-        action_sequences.push(rows.iter().map(|row| row.action_label).collect());
-        raw_examples.push(RawWorldExample {
-            state_text: first.state_text.clone(),
-            next_text: last.next_text.clone(),
-            action_label: first.action_label,
-        });
+        let (example, action_sequence) = high_world_macro_example_from_raw_span(&rows, vocab)?;
+        examples.push(example);
+        action_sequences.push(action_sequence);
     }
     Ok(HighWorldMacroBatch {
-        examples: encode_world_examples(&raw_examples, vocab),
+        examples,
         action_sequences,
     })
 }
@@ -2061,18 +2102,9 @@ fn collect_high_world_macro_batch_cached(
     for span_len in span_lens {
         let span = &rows[offset..offset + span_len];
         offset += span_len;
-        let first = span
-            .first()
-            .context("cached high-world macro span unexpectedly empty")?;
-        let last = span
-            .last()
-            .context("cached high-world macro span unexpectedly empty")?;
-        action_sequences.push(span.iter().map(|row| row.action_label).collect());
-        examples.push(WorldExample {
-            state_tokens: first.state_tokens.clone(),
-            next_tokens: last.next_tokens.clone(),
-            action_label: first.action_label,
-        });
+        let (example, action_sequence) = high_world_macro_example_from_cached_span(span)?;
+        examples.push(example);
+        action_sequences.push(action_sequence);
     }
     Ok(HighWorldMacroBatch {
         examples,
@@ -3465,9 +3497,16 @@ fn collect_conditioned_decoder_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{decoder_action_label_for_kind, decoder_action_matches_kind};
-    use crate::data::{ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, ACTION_TEXT_REPLY};
-    use crate::model::DecoderKind;
+    use super::{
+        decoder_action_label_for_kind, decoder_action_matches_kind,
+        high_world_macro_example_from_cached_span, high_world_macro_example_from_raw_span,
+    };
+    use crate::data::{
+        RawWorldExample, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
+        ACTION_TEXT_REPLY,
+    };
+    use crate::model::{DecoderKind, Vocab};
+    use anyhow::Result;
 
     #[test]
     fn decoder_specialists_accept_only_their_declared_action() {
@@ -3504,6 +3543,81 @@ mod tests {
             DecoderKind::CodeSpecialist,
             ACTION_FETCH_DOCS
         ));
+    }
+
+    #[test]
+    fn train_decoder_rejects_mtp_before_data_resolution() {
+        let args = [
+            "tofy",
+            "--train-decoder",
+            "missing_encoder.safetensors",
+            "missing_vocab.txt",
+            "missing_world.safetensors",
+            "hub:missing/dataset",
+            "--mtp-loss-weight",
+            "0.1",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        let err = super::try_run_train_decoder(&args)
+            .expect_err("unsupported MTP should fail before resolving data");
+
+        assert!(
+            err.to_string().contains("--mtp-loss-weight is unsupported"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn high_world_raw_macro_example_concatenates_every_continuation() -> Result<()> {
+        let mut vocab = Vocab::new();
+        vocab.ensure_byte_tokens();
+        let span = vec![
+            RawWorldExample {
+                state_text: "s0".to_string(),
+                next_text: "a".to_string(),
+                action_label: ACTION_TEXT_REPLY,
+            },
+            RawWorldExample {
+                state_text: "s1".to_string(),
+                next_text: "b".to_string(),
+                action_label: ACTION_CODE,
+            },
+        ];
+
+        let (example, actions) = high_world_macro_example_from_raw_span(&span, &vocab)?;
+
+        assert_eq!(vocab.decode_ids_lossy(&example.state_tokens), "s0");
+        assert_eq!(vocab.decode_ids_lossy(&example.next_tokens), "ab");
+        assert_eq!(actions, vec![ACTION_TEXT_REPLY, ACTION_CODE]);
+        assert_eq!(example.action_label, ACTION_TEXT_REPLY);
+        Ok(())
+    }
+
+    #[test]
+    fn high_world_cached_macro_example_concatenates_every_continuation() -> Result<()> {
+        let span = vec![
+            WorldExample {
+                state_tokens: vec![1, 2],
+                next_tokens: vec![3],
+                action_label: ACTION_TEXT_REPLY,
+            },
+            WorldExample {
+                state_tokens: vec![1, 2, 3],
+                next_tokens: vec![4, 5],
+                action_label: ACTION_DONE,
+            },
+        ];
+
+        let (example, actions) = high_world_macro_example_from_cached_span(&span)?;
+
+        assert_eq!(example.state_tokens, vec![1, 2]);
+        assert_eq!(example.next_tokens, vec![3, 4, 5]);
+        assert_eq!(actions, vec![ACTION_TEXT_REPLY, ACTION_DONE]);
+        assert_eq!(example.action_label, ACTION_TEXT_REPLY);
+        Ok(())
     }
 }
 
@@ -4346,7 +4460,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         let mut last_loss_mask = None;
         let mut last_loss = None;
         let mut last_conditioning_loss_val = 0.0f32;
-        let mut last_mtp_loss_val = 0.0f32;
         let mut last_format_loss_val = 0.0f32;
         let batch_size = decoder_batch_size_for_step(step, &config);
         let grad_accum_steps = decoder_grad_accum_for_step(step, &config);
@@ -4511,19 +4624,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 importance_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
             let token_loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
             let mut loss = token_loss.clone();
-            let mtp_loss = if config.mtp_loss_weight > 0.0 {
-                multi_token_prediction_loss(&logits, &dec_target, &loss_mask, config.mtp_max_ahead)?
-            } else {
-                token_loss.affine(0.0, 0.0)?
-            };
-            if config.mtp_loss_weight > 0.0 {
-                loss = loss.broadcast_add(&mtp_loss.affine(config.mtp_loss_weight, 0.0)?)?;
-                if capture_micro_metrics {
-                    last_mtp_loss_val = util::scalar_f32(&mtp_loss)?;
-                }
-            } else {
-                last_mtp_loss_val = 0.0;
-            }
             if config.syntax_loss_weight > 0.0 {
                 let syntax_mask =
                     syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
@@ -4693,7 +4793,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
             let signature_loss_val = util::scalar_f32(&signature_loss)?;
             let structure_loss_val = util::scalar_f32(&structure_loss)?;
-            let mtp_loss_val = last_mtp_loss_val;
+            let mtp_loss_val = 0.0f32;
             let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
             let (loss_rows, _) = loss_mask.dims2()?;
             let total_tokens = (loss_rows.max(1) * config.max_seq * 2) as f32;

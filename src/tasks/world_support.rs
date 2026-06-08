@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::data::{
     encode_text_with_vocab_mode, make_decoder_batch_from_slice, RawWorldExample, TokenizationMode,
-    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
+    WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS, CODE_CONTROL_TOKENS, CODE_EOS_TOKEN,
 };
 use crate::model::{
     flatten_latent_slots, mean_cosine_similarity, prediction_loss, tensor_rms,
@@ -1211,6 +1211,15 @@ pub(crate) fn forbidden_output_probability_loss(
 }
 
 fn forbidden_decoder_token(token: &str) -> bool {
+    if matches!(token, "<pad>" | "<unk>" | "<mask>") {
+        return true;
+    }
+    if CODE_CONTROL_TOKENS
+        .iter()
+        .any(|control| *control != CODE_EOS_TOKEN && token == *control)
+    {
+        return true;
+    }
     if token.contains("```") {
         return true;
     }
@@ -1237,42 +1246,6 @@ fn forbidden_decoder_token(token: &str) -> bool {
             | "corrected"
             | "Corrected"
     )
-}
-
-pub(crate) fn multi_token_prediction_loss(
-    logits: &Tensor,
-    target: &Tensor,
-    mask: &Tensor,
-    max_ahead: usize,
-) -> Result<Tensor> {
-    let (_, seq_len, _) = logits.dims3()?;
-    if max_ahead <= 1 || seq_len <= 1 {
-        return logits.sum_all()?.affine(0.0, 0.0).map_err(Into::into);
-    }
-    let mut loss_sum: Option<Tensor> = None;
-    let mut count = 0usize;
-    for ahead in 2..=max_ahead {
-        let shift = ahead - 1;
-        if seq_len <= shift {
-            break;
-        }
-        let len = seq_len - shift;
-        let shifted_logits = logits.narrow(1, 0, len)?;
-        let shifted_target = target.narrow(1, shift, len)?;
-        let shifted_mask = mask.narrow(1, shift, len)?;
-        let loss = masked_cross_entropy(&shifted_logits, &shifted_target, &shifted_mask)?;
-        loss_sum = Some(match loss_sum {
-            Some(existing) => existing.broadcast_add(&loss)?,
-            None => loss,
-        });
-        count += 1;
-    }
-    match loss_sum {
-        Some(loss) => loss
-            .affine(1.0 / count.max(1) as f64, 0.0)
-            .map_err(Into::into),
-        None => logits.sum_all()?.affine(0.0, 0.0).map_err(Into::into),
-    }
 }
 
 pub(crate) fn decoder_selection_score(
@@ -1325,9 +1298,10 @@ pub(crate) fn decoder_reward_proxy(metrics: &DecoderBatchMetrics) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decoder_conditioning_gains, decoder_reward_proxy, function_name_span_indices,
-        signature_span_indices,
+        decoder_conditioning_gains, decoder_reward_proxy, forbidden_decoder_token,
+        function_name_span_indices, signature_span_indices,
     };
+    use crate::data::CODE_EOS_TOKEN;
     use crate::model::Vocab;
 
     fn vocab_with(tokens: &[&str]) -> (Vocab, Vec<u32>) {
@@ -1337,6 +1311,17 @@ mod tests {
             .map(|token| vocab.add_token(token))
             .collect::<Vec<_>>();
         (vocab, ids)
+    }
+
+    #[test]
+    fn forbidden_decoder_tokens_keep_code_eos_available() {
+        assert!(forbidden_decoder_token("<pad>"));
+        assert!(forbidden_decoder_token("<unk>"));
+        assert!(forbidden_decoder_token("<mask>"));
+        assert!(forbidden_decoder_token("<fim_prefix>"));
+        assert!(forbidden_decoder_token("<fim_suffix>"));
+        assert!(forbidden_decoder_token("<fim_middle>"));
+        assert!(!forbidden_decoder_token(CODE_EOS_TOKEN));
     }
 
     #[test]

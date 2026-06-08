@@ -771,9 +771,16 @@ impl CandleCrossAttnDecoder {
     }
 
     fn apply_token_masks(&self, logits: &mut [f32]) {
-        for &bad_id in &[self.vocab.pad_id, self.vocab.unk_id] {
+        for &bad_id in &[self.vocab.pad_id, self.vocab.unk_id, self.vocab.mask_id] {
             if let Some(logit) = logits.get_mut(bad_id as usize) {
                 *logit = f32::NEG_INFINITY;
+            }
+        }
+        for (token_id, token) in self.vocab.id_to_token.iter().enumerate() {
+            if decoder_control_token_is_not_stop(token) {
+                if let Some(logit) = logits.get_mut(token_id) {
+                    *logit = f32::NEG_INFINITY;
+                }
             }
         }
     }
@@ -1069,9 +1076,8 @@ fn treecoder_score_desc(a: &TreeCoderNode, b: &TreeCoderNode) -> std::cmp::Order
 }
 
 fn treecoder_forbidden_token(raw_token: &str, decoded_token: &str, cfg: &TreeCoderConfig) -> bool {
-    if CODE_CONTROL_TOKENS
-        .iter()
-        .any(|token| raw_token == *token || decoded_token == *token)
+    if decoder_control_token_is_not_stop(raw_token)
+        || decoder_control_token_is_not_stop(decoded_token)
     {
         return true;
     }
@@ -1170,6 +1176,12 @@ fn apply_conditioning_budget(context_slots: Tensor) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
+fn decoder_control_token_is_not_stop(token: &str) -> bool {
+    CODE_CONTROL_TOKENS
+        .iter()
+        .any(|control| *control != CODE_EOS_TOKEN && token == *control)
+}
+
 /// Strip prompt echo and UI junk from Candle decoder output (e.g. "assistant", "/", ">", repeated prompt).
 /// Public so world.rs can clean the accumulated segment when building assistant_content from streamed chunks.
 pub fn clean_candle_decoder_output(raw: &str) -> String {
@@ -1218,9 +1230,10 @@ pub fn clean_candle_decoder_output(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_prompt_ids, stream_decoded_token, treecoder_node_score, CodeTreeConstraintState,
-        TreeCoderConfig,
+        decoder_control_token_is_not_stop, prepare_prompt_ids, stream_decoded_token,
+        treecoder_node_score, CodeTreeConstraintState, TreeCoderConfig,
     };
+    use crate::data::{CODE_CONTROL_TOKENS, CODE_EOS_TOKEN};
     use crate::model::vocab::Vocab;
 
     fn cfg() -> TreeCoderConfig {
@@ -1308,5 +1321,15 @@ mod tests {
         });
         assert_eq!(chunks, vec![expected]);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn decoder_control_mask_keeps_eos_available() {
+        assert!(!decoder_control_token_is_not_stop(CODE_EOS_TOKEN));
+        for token in CODE_CONTROL_TOKENS {
+            if *token != CODE_EOS_TOKEN {
+                assert!(decoder_control_token_is_not_stop(token));
+            }
+        }
     }
 }

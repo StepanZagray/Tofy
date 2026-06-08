@@ -287,13 +287,6 @@ fn topk_bias_from_scores(
         return Tensor::zeros((batch, heads, queries, keys), DType::F32, device)
             .map_err(Into::into);
     }
-    let cpu_topk_enabled = std::env::var("TOFY_DECODER_CPU_TOPK_BIAS")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    if !cpu_topk_enabled {
-        return Tensor::zeros((batch, heads, queries, keys), DType::F32, device)
-            .map_err(Into::into);
-    }
     let values = scores
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -307,9 +300,12 @@ fn topk_bias_from_scores(
                     .map(|k_idx| (k_idx, values[base + k_idx]))
                     .filter(|(_, score)| score.is_finite())
                     .collect::<Vec<_>>();
-                ranked.sort_by(|(_, a), (_, b)| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                if ranked.len() > topk {
+                    ranked.select_nth_unstable_by(topk, |(_, a), (_, b)| {
+                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    ranked.truncate(topk);
+                }
                 for (k_idx, _) in ranked.into_iter().take(topk) {
                     bias[base + k_idx] = 0.0;
                 }
@@ -1856,6 +1852,28 @@ mod tests {
         assert_eq!(
             bias[1],
             vec![0.0, 0.0, 0.0, ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn topk_bias_masks_non_selected_compressed_entries() -> Result<()> {
+        let device = Device::Cpu;
+        let scores = Tensor::from_vec(vec![0.1f32, 0.5, -1.0, 0.4, 0.3], (1, 1, 1, 5), &device)?;
+
+        let bias = topk_bias_from_scores(&scores, 2, &device)?
+            .reshape((5,))?
+            .to_vec1::<f32>()?;
+
+        assert_eq!(
+            bias,
+            vec![
+                ATTENTION_MASK_VALUE,
+                0.0,
+                ATTENTION_MASK_VALUE,
+                0.0,
+                ATTENTION_MASK_VALUE
+            ]
         );
         Ok(())
     }
