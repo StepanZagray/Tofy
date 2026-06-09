@@ -514,6 +514,7 @@ pub struct CodeDecoder {
     embed: nn::Embedding,
     kind_embed: nn::Embedding,
     structure_proj: nn::Linear,
+    structure_gate: nn::Linear,
     blocks: Vec<CodeDecoderBlock>,
     ln_final: nn::RmsNorm,
     dim: usize,
@@ -562,6 +563,7 @@ impl CodeDecoder {
         let embed = nn::embedding(vocab_size, dim, vb.pp("embed"))?;
         let kind_embed = nn::embedding(2, dim, vb.pp("kind_embed"))?;
         let structure_proj = nn::linear(world_dim, dim, vb.pp("structure_proj"))?;
+        let structure_gate = nn::linear(world_dim, 1, vb.pp("structure_gate"))?;
         let mut blocks = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let block = CodeDecoderBlock::new(
@@ -578,6 +580,7 @@ impl CodeDecoder {
             embed,
             kind_embed,
             structure_proj,
+            structure_gate,
             blocks,
             ln_final,
             dim,
@@ -676,9 +679,10 @@ impl CodeDecoder {
     ) -> Result<Tensor> {
         let slots = world_latent.dim(1)?.max(1);
         let pooled = world_latent.sum(1)?.affine(1.0 / slots as f64, 0.0)?;
-        self.structure_proj
-            .forward(&pooled)?
-            .tanh()?
+        let structure = self.structure_proj.forward(&pooled)?.tanh()?;
+        let gate = nn::ops::sigmoid(&self.structure_gate.forward(&pooled)?)?;
+        structure
+            .broadcast_mul(&gate)?
             .unsqueeze(1)?
             .broadcast_as((batch, seq_len, self.dim))
             .map_err(Into::into)

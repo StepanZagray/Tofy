@@ -106,7 +106,31 @@ pub(crate) fn decoder_conditioning_gains(
 }
 
 pub(crate) fn shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
-    shifted_conditioning_latent(world_latent, 1)
+    slot_shuffled_conditioning_latent(world_latent)
+        .or_else(|_| shifted_conditioning_latent(world_latent, 1))
+}
+
+pub(crate) fn slot_shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
+    use rand::seq::SliceRandom;
+    let (batch, slots, _) = world_latent.dims3()?;
+    if slots <= 1 {
+        return shifted_conditioning_latent(world_latent, 1);
+    }
+    let device = world_latent.device();
+    let mut rng = rand::rng();
+    let mut out_rows = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let mut perm = (0..slots as u32).collect::<Vec<_>>();
+        perm.shuffle(&mut rng);
+        let indices = Tensor::from_vec(perm, (slots,), device)?;
+        let shuffled = world_latent
+            .narrow(0, row, 1)?
+            .squeeze(0)?
+            .index_select(&indices, 0)?
+            .unsqueeze(0)?;
+        out_rows.push(shuffled);
+    }
+    Tensor::cat(&out_rows, 0).map_err(Into::into)
 }
 
 pub(crate) fn hard_mismatched_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
@@ -140,16 +164,32 @@ pub(crate) struct DecoderPredictionMetrics {
     pub(crate) function_name_exact_rate: f32,
 }
 
+fn action_focal_gamma() -> f32 {
+    std::env::var("TOFY_ACTION_FOCAL_GAMMA")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(2.0)
+        .max(0.0)
+}
+
 pub(crate) fn action_cross_entropy(
     logits: &Tensor,
     labels: &[u32],
     device: &Device,
 ) -> Result<Tensor> {
-    let log_probs = ops::log_softmax(logits, 1)?;
     let b = logits.dim(0)?;
     let n_classes = logits.dim(1)?;
+    if labels.len() != b {
+        anyhow::bail!(
+            "action label count {} must match logits batch {}",
+            labels.len(),
+            b
+        );
+    }
+    let log_probs = ops::log_softmax(logits, 1)?;
+    let probs = ops::softmax(logits, 1)?;
     let class_weights = balanced_class_weights(labels, n_classes);
-    let sample_labels = labels.iter().take(b).copied().collect::<Vec<_>>();
+    let sample_labels = labels.to_vec();
     let indices = Tensor::from_vec(
         sample_labels.iter().map(|&x| x as i64).collect::<Vec<_>>(),
         (b,),
@@ -160,14 +200,22 @@ pub(crate) fn action_cross_entropy(
         .gather(&indices, 1)?
         .squeeze(1)?
         .affine(-1.0, 0.0)?;
-    let sample_weights = util::from_vec_like(
-        sample_labels
-            .iter()
-            .map(|&label| class_weights.get(label as usize).copied().unwrap_or(1.0))
-            .collect::<Vec<_>>(),
-        (b,),
-        &nll,
-    )?;
+    let mut sample_weights = sample_labels
+        .iter()
+        .map(|&label| class_weights.get(label as usize).copied().unwrap_or(1.0))
+        .collect::<Vec<_>>();
+    let focal_gamma = action_focal_gamma();
+    if focal_gamma > 0.0 {
+        let p_t = probs.gather(&indices, 1)?.squeeze(1)?;
+        let focal_scale = p_t
+            .affine(-1.0, 1.0)?
+            .powf(focal_gamma as f64)?
+            .to_vec1::<f32>()?;
+        for (weight, scale) in sample_weights.iter_mut().zip(focal_scale) {
+            *weight *= scale.max(1e-6);
+        }
+    }
+    let sample_weights = util::from_vec_like(sample_weights, (b,), &nll)?;
     let weighted_nll = nll.broadcast_mul(&sample_weights)?;
     let normalizer = sample_weights.sum_all()?.clamp(1e-8, 1e10)?;
     Ok(weighted_nll.sum_all()?.broadcast_div(&normalizer)?)
@@ -188,7 +236,7 @@ fn balanced_class_weights(labels: &[u32], n_classes: usize) -> Vec<f32> {
             if count == 0 {
                 1.0
             } else {
-                (total / (present * count as f32)).clamp(0.5, 4.0)
+                (total / (present * count as f32)).clamp(0.5, 12.0)
             }
         })
         .collect()
@@ -244,8 +292,34 @@ fn class_prf(confusion: &[Vec<usize>], label: usize) -> (f32, f32, f32, f32) {
     (precision, recall, f1, true_total / total)
 }
 
+pub(crate) fn world_sigreg_loss(
+    state_sigreg: &Tensor,
+    next_sigreg: &Tensor,
+    pred_sigreg: &Tensor,
+) -> Result<Tensor> {
+    let pred_weight = std::env::var("TOFY_WORLD_SIGREG_PRED_WEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.6)
+        .clamp(0.0, 1.0);
+    let other_weight = (1.0 - pred_weight) * 0.5;
+    pred_sigreg
+        .affine(pred_weight, 0.0)?
+        .broadcast_add(&state_sigreg.affine(other_weight, 0.0)?)?
+        .broadcast_add(&next_sigreg.affine(other_weight, 0.0)?)
+        .map_err(Into::into)
+}
+
 pub(crate) fn world_selection_score(metrics: &WorldBatchMetrics) -> f32 {
-    metrics.transition_loss + 0.2 * metrics.sigreg_loss
+    let code_rate_gap = (metrics.action_metrics.pred_code_rate - metrics.action_metrics.code_rate)
+        .abs();
+    metrics.transition_loss
+        + 0.2 * metrics.sigreg_loss
+        + 0.1 * metrics.action_loss
+        + 0.05 * metrics.inverse_loss
+        + 0.1 * code_rate_gap
+        - 0.05 * metrics.action_metrics.macro_f1
+        - 0.02 * metrics.transition_cosine
 }
 
 pub(crate) fn slot_delta_slots(next_slots: &Tensor, state_slots: &Tensor) -> Result<Tensor> {
@@ -254,6 +328,13 @@ pub(crate) fn slot_delta_slots(next_slots: &Tensor, state_slots: &Tensor) -> Res
 
 pub(crate) fn compute_action_metrics(logits: &Tensor, labels: &[u32]) -> Result<ActionMetrics> {
     let rows = util::vec2_f32(logits)?;
+    if labels.len() != rows.len() {
+        anyhow::bail!(
+            "action metric label count {} must match logits batch {}",
+            labels.len(),
+            rows.len()
+        );
+    }
     let n_classes = rows.first().map(|row| row.len()).unwrap_or(0).max(1);
     let mut confusion = vec![vec![0usize; n_classes]; n_classes];
     let mut correct = 0usize;
@@ -899,10 +980,7 @@ pub(crate) fn evaluate_world_encoded_batch(
         sigreg_slices,
         sigreg_points,
     )?;
-    let sigreg_loss = state_sigreg
-        .broadcast_add(&next_sigreg)?
-        .broadcast_add(&pred_sigreg)?
-        .affine(1.0 / 3.0, 0.0)?;
+    let sigreg_loss = world_sigreg_loss(&state_sigreg, &next_sigreg, &pred_sigreg)?;
     let action_logits = action_classifier_head.forward(&state_slots)?;
     let action_loss = action_cross_entropy(&action_logits, &action_labels, device)?;
     let (inverse_loss, inverse_action_metrics) = if inverse_loss_weight > 0.0 {
@@ -1152,6 +1230,14 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     })
 }
 
+fn label_smoothing_eps() -> f32 {
+    std::env::var("TOFY_LABEL_SMOOTHING")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.05)
+        .clamp(0.0, 0.2)
+}
+
 pub(crate) fn masked_weighted_cross_entropy(
     logits: &Tensor,
     target: &Tensor,
@@ -1163,10 +1249,19 @@ pub(crate) fn masked_weighted_cross_entropy(
         .reshape((b * t,))?
         .to_dtype(candle_core::DType::U32)?;
     let log_probs = ops::log_softmax(&logits_flat, candle_core::D::Minus1)?;
-    let nll_per = log_probs
+    let gathered = log_probs
         .gather(&target_flat.unsqueeze(1)?, 1)?
         .squeeze(1)?
         .affine(-1.0, 0.0)?;
+    let eps = label_smoothing_eps();
+    let nll_per = if eps > 0.0 {
+        let uniform = log_probs.mean(candle_core::D::Minus1)?.affine(-1.0, 0.0)?;
+        gathered
+            .affine((1.0 - eps) as f64, 0.0)?
+            .broadcast_add(&uniform.affine(eps as f64, 0.0)?)?
+    } else {
+        gathered
+    };
     let mask_flat = mask.reshape((b * t,))?.to_dtype(nll_per.dtype())?;
     let sum_nll = (nll_per.broadcast_mul(&mask_flat)?).sum_all()?;
     let sum_mask = mask_flat.sum_all()?.clamp(1e-8, 1e10)?;
@@ -1298,11 +1393,13 @@ pub(crate) fn decoder_reward_proxy(metrics: &DecoderBatchMetrics) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decoder_conditioning_gains, decoder_reward_proxy, forbidden_decoder_token,
-        function_name_span_indices, signature_span_indices,
+        action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
+        decoder_reward_proxy, forbidden_decoder_token, function_name_span_indices,
+        signature_span_indices,
     };
     use crate::data::CODE_EOS_TOKEN;
     use crate::model::Vocab;
+    use candle_core::{DType, Device, Tensor};
 
     fn vocab_with(tokens: &[&str]) -> (Vocab, Vec<u32>) {
         let mut vocab = Vocab::new();
@@ -1322,6 +1419,32 @@ mod tests {
         assert!(forbidden_decoder_token("<fim_suffix>"));
         assert!(forbidden_decoder_token("<fim_middle>"));
         assert!(!forbidden_decoder_token(CODE_EOS_TOKEN));
+    }
+
+    #[test]
+    fn action_cross_entropy_rejects_label_batch_mismatch() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let logits = Tensor::zeros((2, 4), DType::F32, &device)?;
+
+        let err = action_cross_entropy(&logits, &[0], &device)
+            .expect_err("label count mismatch should fail");
+
+        assert!(err.to_string().contains("action label count"));
+        Ok(())
+    }
+
+    #[test]
+    fn action_metrics_reject_label_batch_mismatch() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let logits = Tensor::zeros((2, 4), DType::F32, &device)?;
+
+        let err = match compute_action_metrics(&logits, &[0]) {
+            Ok(_) => anyhow::bail!("label count mismatch should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("action metric label count"));
+        Ok(())
     }
 
     #[test]

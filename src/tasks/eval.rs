@@ -710,7 +710,7 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
         &cfg.encoder_model_path,
         &cfg.encoder_vocab_path,
         &cfg.world_model_path,
-        cfg.high_world_model_path.as_ref(),
+        cfg.high_world_model_path.as_deref(),
         cfg.dim,
         cfg.max_seq,
         cfg.num_layers,
@@ -949,6 +949,12 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         "0"
     };
     set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
+    if cfg.ablate_conditioning {
+        // Zero the conditioning adapter output too: with only zeroed context
+        // slots, learned adapter query/action priors still condition the
+        // decoder and contaminate the ablation.
+        std::env::set_var("TOFY_DECODER_ABLATE_ADAPTER_OUTPUT", "1");
+    }
 
     if let Some(path) = cfg.code_decoder_path.as_ref() {
         std::env::set_var("JEPA_USE_CANDLE_DECODER", "1");
@@ -967,7 +973,7 @@ fn run_code_eval(cfg: EvalConfig) -> Result<()> {
         &cfg.encoder_model_path,
         &cfg.encoder_vocab_path,
         &cfg.world_model_path,
-        cfg.high_world_model_path.as_ref(),
+        cfg.high_world_model_path.as_deref(),
         cfg.dim,
         cfg.max_seq,
         cfg.num_layers,
@@ -1163,6 +1169,9 @@ fn code_eval_summary_text(summary: &CodeEvalSummary) -> String {
 fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
     let default_eval_temp = if cfg.candidates > 1 { "0.35" } else { "0" };
     set_eval_env_default("JEPA_DECODER_TEMP", default_eval_temp);
+    // Decoder-only means no world conditioning at all, including the
+    // adapter's learned query/action priors.
+    std::env::set_var("TOFY_DECODER_ABLATE_ADAPTER_OUTPUT", "1");
     let tasks = load_suite(&cfg.suite_path)?;
     if tasks.is_empty() {
         bail!("suite {:?} contains no tasks", cfg.suite_path);

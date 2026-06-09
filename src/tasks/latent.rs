@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_nn::{Optimizer, VarBuilder, VarMap};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
@@ -11,11 +11,11 @@ use crate::config::{LatentEvalConfig, LatentTrainConfig};
 use crate::data::{
     build_vocab_from_pair_file, count_pairs_with_vocab, make_augmented_jepa_batch,
     make_augmented_jepa_batch_from_pairs, make_jepa_batch_from_pairs, prepare_ultrachat_pairs,
-    tokenizer_spec_signature, CachedPairStream, CurriculumDenoisingConfig, PairStream,
-    TokenizationMode, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    tokenizer_spec_signature, AugmentedJepaBatch, CachedPairStream, CurriculumDenoisingConfig,
+    PairStream, TokenizationMode, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
-use crate::model::vocab::{vocab_signature, Pair};
+use crate::model::vocab::{vocab_signature, Pair, Vocab};
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
     save_vocab_to_file, sigreg_epps_pulley, tensor_rms, OnlineEncoder,
@@ -91,6 +91,162 @@ fn split_encoder_features(
                 .narrow(0, batch_size * 2, batch_size)?,
         },
     ])
+}
+
+const LATENT_HELDOUT_SPLIT_MODULUS: usize = 20;
+const LATENT_HELDOUT_SPLIT_REMAINDER: usize = 0;
+/// Below this many scanned pairs, train on everything and select on the train
+/// metric instead of starving the run with a tiny heldout split.
+const LATENT_MIN_PAIRS_FOR_VAL_SPLIT: usize = 200;
+
+struct LatentForward {
+    pred_loss: Tensor,
+    token_pred_loss: Tensor,
+    chunk_pred_loss: Tensor,
+    global_pred_loss: Tensor,
+    pred_token_flat: Tensor,
+    target_flat: Tensor,
+    context_targets: Tensor,
+    target_targets: Tensor,
+    pred_chunks_masked: Tensor,
+    target_chunks_masked: Tensor,
+    pred_global_flat: Tensor,
+    target_global_flat: Tensor,
+    valid_token_states: Tensor,
+}
+
+/// Shared three-view forward pass + multiscale prediction losses used by both
+/// the training loop and held-out validation.
+fn latent_forward(
+    encoder: &OnlineEncoder,
+    batch: &AugmentedJepaBatch,
+    batch_size: usize,
+    device: &Device,
+) -> Result<LatentForward> {
+    let all_view_ids = Tensor::cat(
+        &[&batch.view_a_ids, &batch.target_ids, &batch.view_b_ids],
+        0,
+    )?;
+    let all_view_features = encoder.forward_features(&all_view_ids)?;
+    let [view_a_features, target_features, paired_view_targets] =
+        split_encoder_features(&all_view_features, batch_size)?;
+    let target_features = target_features.detached();
+    let paired_view_targets = paired_view_targets.detached();
+    let context_hidden = view_a_features.token_states.clone();
+    let target_hidden = target_features.token_states.clone();
+    let (b, t, d) = context_hidden.dims3()?;
+    let pred_token_flat = context_hidden.reshape((b * t, d))?;
+    let target_flat = target_hidden.reshape((b * t, d))?;
+    let context_targets = pred_token_flat.index_select(&batch.target_linear_indices, 0)?;
+    let target_targets = target_flat.index_select(&batch.target_linear_indices, 0)?;
+    let token_pred_loss = prediction_loss(&context_targets, &target_targets)?;
+
+    // Restrict the chunk loss to chunks overlapping view A's masked spans:
+    // unmasked chunks are nearly identical across views and only flatter the
+    // chunk metric without contributing a learning signal.
+    let (_, num_chunks, chunk_dim) = view_a_features.chunk_states.dims3()?;
+    let chunk_size = encoder.chunk_size_for_seq_len(t).max(1);
+    let mut masked_chunks: Vec<u32> = batch
+        .target_linear_host
+        .iter()
+        .map(|&linear| {
+            let row = linear as usize / t;
+            let pos = linear as usize % t;
+            (row * num_chunks + (pos / chunk_size).min(num_chunks - 1)) as u32
+        })
+        .collect();
+    masked_chunks.sort_unstable();
+    masked_chunks.dedup();
+    let masked_chunk_count = masked_chunks.len();
+    let masked_chunk_indices = Tensor::from_vec(masked_chunks, (masked_chunk_count,), device)?;
+    let pred_chunks_masked = view_a_features
+        .chunk_states
+        .reshape((b * num_chunks, chunk_dim))?
+        .index_select(&masked_chunk_indices, 0)?;
+    let target_chunks_masked = paired_view_targets
+        .chunk_states
+        .reshape((b * num_chunks, chunk_dim))?
+        .index_select(&masked_chunk_indices, 0)?;
+    let chunk_pred_loss = prediction_loss(&pred_chunks_masked, &target_chunks_masked)?;
+
+    // Compare global latent tokens per slot instead of collapsing them into
+    // one batch-mean vector.
+    let pred_global_flat = flatten_latent_slots(&view_a_features.global_states)?;
+    let target_global_flat = flatten_latent_slots(&paired_view_targets.global_states)?;
+    let global_pred_loss = prediction_loss(&pred_global_flat, &target_global_flat)?;
+
+    let pred_loss = token_pred_loss
+        .affine(0.82, 0.0)?
+        .broadcast_add(&chunk_pred_loss.affine(0.12, 0.0)?)?
+        .broadcast_add(&global_pred_loss.affine(0.06, 0.0)?)?;
+
+    // SIGReg should only see real (non-pad) token rows; zeroed pad rows bias
+    // the Epps-Pulley statistic toward zero-mass dimensions.
+    let total_valid: usize = batch.valid_lens.iter().map(|&len| len.min(t)).sum();
+    let valid_token_states = if total_valid == 0 || total_valid == b * t {
+        pred_token_flat.clone()
+    } else {
+        let mut valid_linear = Vec::with_capacity(total_valid);
+        for (row, &len) in batch.valid_lens.iter().enumerate() {
+            for pos in 0..len.min(t) {
+                valid_linear.push((row * t + pos) as u32);
+            }
+        }
+        let valid_count = valid_linear.len();
+        let valid_indices = Tensor::from_vec(valid_linear, (valid_count,), device)?;
+        pred_token_flat.index_select(&valid_indices, 0)?
+    };
+
+    Ok(LatentForward {
+        pred_loss,
+        token_pred_loss,
+        chunk_pred_loss,
+        global_pred_loss,
+        pred_token_flat,
+        target_flat,
+        context_targets,
+        target_targets,
+        pred_chunks_masked,
+        target_chunks_masked,
+        pred_global_flat,
+        target_global_flat,
+        valid_token_states,
+    })
+}
+
+/// Mean multiscale prediction loss over a few held-out batches, used for
+/// checkpoint selection. Returns `None` when no validation stream exists.
+#[allow(clippy::too_many_arguments)]
+fn latent_validation_pred_loss(
+    encoder: &OnlineEncoder,
+    vocab: &Vocab,
+    curriculum: &CurriculumDenoisingConfig,
+    device: &Device,
+    val_pair_stream: &mut Option<PairStream>,
+    cached_val_stream: &mut Option<CachedPairStream>,
+    batch_size: usize,
+    batches: usize,
+) -> Result<Option<f32>> {
+    let mut total = 0f32;
+    let mut count = 0usize;
+    for _ in 0..batches {
+        let batch = if let Some(stream) = cached_val_stream.as_mut() {
+            let pairs = stream.next_batch(batch_size)?;
+            make_augmented_jepa_batch_from_pairs(&pairs, vocab, curriculum, device)?
+        } else if let Some(stream) = val_pair_stream.as_mut() {
+            let tokens = stream.next_batch(batch_size)?;
+            make_augmented_jepa_batch(&tokens, vocab, curriculum, device)?
+        } else {
+            return Ok(None);
+        };
+        let forward = latent_forward(encoder, &batch, batch_size, device)?;
+        total += util::scalar_f32(&forward.pred_loss.detach())?;
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(total / count as f32))
 }
 
 const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
@@ -380,22 +536,78 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         (vocab, Some(stats), pair_count)
     };
     println!("Vocab scan complete. Initializing streaming reader...");
-    let mut pair_stream = PairStream::new(
+    let min_tokens_per_line = min_tokens.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE);
+    let use_val_split = pair_count >= LATENT_MIN_PAIRS_FOR_VAL_SPLIT;
+    let (split_modulus, exclude_heldout) = if use_val_split {
+        (Some(LATENT_HELDOUT_SPLIT_MODULUS), true)
+    } else {
+        (None, false)
+    };
+    let mut pair_stream = PairStream::with_split(
         &config.data_path,
-        min_tokens.unwrap_or(DEFAULT_MIN_TOKENS_PER_LINE),
+        min_tokens_per_line,
+        DEFAULT_STREAM_SHUFFLE_BUFFER,
+        split_modulus,
+        LATENT_HELDOUT_SPLIT_REMAINDER,
+        exclude_heldout,
     )?;
+    let mut val_pair_stream = if use_val_split {
+        Some(PairStream::with_split(
+            &config.data_path,
+            min_tokens_per_line,
+            1,
+            Some(LATENT_HELDOUT_SPLIT_MODULUS),
+            LATENT_HELDOUT_SPLIT_REMAINDER,
+            false,
+        )?)
+    } else {
+        None
+    };
     let latent_source_budget = config.max_seq.max(1) * config.latent_context_segments.max(1);
-    let mut cached_pair_stream = if let Some(cache_path) = latent_token_cache_path(
+    let latent_cache_path = latent_token_cache_path(
         &config.data_path,
         &vocab_signature(&vocab),
         latent_source_budget,
-    )? {
+    )?;
+    let mut cached_pair_stream = if let Some(cache_path) = latent_cache_path.as_ref() {
         println!("Token cache: using latent encoder cache {:?}", cache_path);
-        Some(CachedPairStream::new(&cache_path)?)
+        Some(CachedPairStream::with_split(
+            cache_path,
+            DEFAULT_STREAM_SHUFFLE_BUFFER,
+            split_modulus,
+            LATENT_HELDOUT_SPLIT_REMAINDER,
+            exclude_heldout,
+        )?)
     } else {
         println!("Token cache: no compatible latent cache found; using raw tokenization stream");
         None
     };
+    let mut cached_val_stream = if use_val_split {
+        if let Some(cache_path) = latent_cache_path.as_ref() {
+            Some(CachedPairStream::with_split(
+                cache_path,
+                1,
+                Some(LATENT_HELDOUT_SPLIT_MODULUS),
+                LATENT_HELDOUT_SPLIT_REMAINDER,
+                false,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if use_val_split {
+        println!(
+            "Heldout split: 1/{} rows reserved for validation-based checkpoint selection",
+            LATENT_HELDOUT_SPLIT_MODULUS
+        );
+    } else {
+        println!(
+            "Heldout split: disabled ({} pairs < {}); selecting on train metric",
+            pair_count, LATENT_MIN_PAIRS_FOR_VAL_SPLIT
+        );
+    }
     println!("Streaming reader ready. Building training graph...");
     let vocab_size = vocab.id_to_token.len();
     let seq_len = config.max_seq;
@@ -474,18 +686,18 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        varmap.load(&train_checkpoint_path)?;
+        util::load_varmap_checked(&mut varmap, &train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut varmap, train_dtype)?;
         println!("Resuming latent weights from {:?}", train_checkpoint_path);
     } else if config.resume && model_path.exists() {
-        varmap.load(&model_path)?;
+        util::load_varmap_checked(&mut varmap, &model_path)?;
         util::cast_varmap_dtype(&mut varmap, train_dtype)?;
         println!(
             "Resuming latent weights from best export {:?} without optimizer state",
             model_path
         );
     } else if let Some(ref init_path) = config.init_encoder_path {
-        varmap.load(init_path)?;
+        util::load_varmap_checked(&mut varmap, init_path)?;
         util::cast_varmap_dtype(&mut varmap, train_dtype)?;
         println!("Initialized latent weights from {:?}", init_path);
     }
@@ -607,6 +819,13 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
     tb.add_scalar("config/sigreg_slices", sigreg_slices as f32, 0);
     tb.add_scalar("config/sigreg_points", sigreg_points as f32, 0);
+    // Global-norm gradient clipping (0 disables).
+    let clip_norm = std::env::var("TOFY_LATENT_CLIP_NORM")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let val_batches = env_usize("TOFY_LATENT_VAL_BATCHES", 4);
+    tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
     if start_step >= config.steps {
         println!(
             "Latent resume checkpoint already reached step {}/{}; skipping training.",
@@ -642,62 +861,38 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
             };
 
-            let all_view_ids = Tensor::cat(
-                &[&batch.view_a_ids, &batch.target_ids, &batch.view_b_ids],
-                0,
-            )?;
-            let all_view_features = encoder.forward_features(&all_view_ids)?;
-            let [view_a_features, target_features, paired_view_targets] =
-                split_encoder_features(&all_view_features, batch_size)?;
-            let target_features = target_features.detached();
-            let paired_view_targets = paired_view_targets.detached();
-            let context_hidden = view_a_features.token_states.clone();
-            let target_hidden = target_features.token_states.clone();
-            let (b, t, d) = context_hidden.dims3()?;
-            let pred_token_flat = context_hidden.reshape((b * t, d))?;
-            let target_flat = target_hidden.reshape((b * t, d))?;
-            let context_targets = pred_token_flat.index_select(&batch.target_linear_indices, 0)?;
-            let target_targets = target_flat.index_select(&batch.target_linear_indices, 0)?;
-            let token_pred_loss = prediction_loss(&context_targets, &target_targets)?;
-            let chunk_pred_loss = prediction_loss(
-                &view_a_features.chunk_states,
-                &paired_view_targets.chunk_states,
-            )?;
-            let target_global_mean = paired_view_targets.global_states.mean(1)?;
-            let pred_global_mean = view_a_features.global_states.mean(1)?;
-            let global_pred_loss = prediction_loss(&pred_global_mean, &target_global_mean)?;
-            let sigreg_loss = sigreg_epps_pulley(&pred_token_flat, sigreg_slices, sigreg_points)?;
-            let pred_loss = token_pred_loss
-                .affine(0.82, 0.0)?
-                .broadcast_add(&chunk_pred_loss.affine(0.12, 0.0)?)?
-                .broadcast_add(&global_pred_loss.affine(0.06, 0.0)?)?;
-            let loss = pred_loss.broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
+            let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
+            let sigreg_loss =
+                sigreg_epps_pulley(&forward.valid_token_states, sigreg_slices, sigreg_points)?;
+            let loss = forward
+                .pred_loss
+                .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
 
             let should_capture_log =
                 step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
             if should_capture_log {
-                let pred_chunk_flat = flatten_latent_slots(&view_a_features.chunk_states)?;
-                let target_chunk_flat = flatten_latent_slots(&paired_view_targets.chunk_states)?;
-                let pred_cos =
-                    util::scalar_f32(&mean_cosine_similarity(&context_targets, &target_targets)?)?;
+                let pred_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &forward.context_targets,
+                    &forward.target_targets,
+                )?)?;
                 let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
-                    &pred_chunk_flat,
-                    &target_chunk_flat,
+                    &forward.pred_chunks_masked,
+                    &forward.target_chunks_masked,
                 )?)?;
                 let global_cos = util::scalar_f32(&mean_cosine_similarity(
-                    &pred_global_mean,
-                    &target_global_mean,
+                    &forward.pred_global_flat,
+                    &forward.target_global_flat,
                 )?)?;
-                let context_rms = util::scalar_f32(&tensor_rms(&pred_token_flat)?)?;
-                let target_rms = util::scalar_f32(&tensor_rms(&target_flat)?)?;
+                let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
+                let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
                 let target_count = batch.target_count;
                 let target_frac = target_count as f32 / (batch_size * config.max_seq).max(1) as f32;
                 log_snapshot = Some(LatentLogSnapshot {
                     loss_val: util::scalar_f32(&loss)?,
-                    pred_val: util::scalar_f32(&pred_loss)?,
-                    token_pred_val: util::scalar_f32(&token_pred_loss)?,
-                    chunk_pred_val: util::scalar_f32(&chunk_pred_loss)?,
-                    global_pred_val: util::scalar_f32(&global_pred_loss)?,
+                    pred_val: util::scalar_f32(&forward.pred_loss)?,
+                    token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
+                    chunk_pred_val: util::scalar_f32(&forward.chunk_pred_loss)?,
+                    global_pred_val: util::scalar_f32(&forward.global_pred_loss)?,
                     sigreg_val: util::scalar_f32(&sigreg_loss)?,
                     pred_cos,
                     chunk_cos,
@@ -723,6 +918,10 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             )?;
         }
 
+        let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
+        opt.set_learning_rate(scheduled_lr);
+        let grad_norm =
+            util::clip_accumulated_gradients(&mut accumulated_grads, &train_vars, clip_norm)?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -759,6 +958,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 (batch_size * grad_accum_steps) as f32,
                 step,
             );
+            tb.add_scalar("schedule/lr", scheduled_lr as f32, step);
+            tb.add_scalar("metrics/grad_norm", grad_norm as f32, step);
             let mut memory_note = String::new();
             if let Some(vram) = vram_tracker.sample() {
                 tb.add_scalar("memory/used_mb", vram.used_mb, step);
@@ -770,17 +971,37 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     vram.used_mb, vram.total_mb, vram.peak_used_mb
                 );
             }
-            tb.flush();
 
-            if snapshot.pred_val < best_pred {
-                best_pred = snapshot.pred_val;
+            // Select checkpoints on held-out validation loss when available,
+            // train pred loss otherwise.
+            let val_pred = latent_validation_pred_loss(
+                &encoder,
+                &vocab,
+                &latent_curriculum(step, config.steps, &config),
+                &device,
+                &mut val_pair_stream,
+                &mut cached_val_stream,
+                batch_size,
+                val_batches,
+            )?;
+            let mut val_note = String::new();
+            if let Some(val_pred) = val_pred {
+                tb.add_scalar("val/pred", val_pred, step);
+                val_note = format!(" val_pred {:.4}", val_pred);
+            }
+            tb.flush();
+            let selection_metric = val_pred.unwrap_or(snapshot.pred_val);
+
+            if selection_metric < best_pred {
+                best_pred = selection_metric;
                 util::save_varmap_atomic(&varmap, &model_path)?;
                 saved_checkpoint = true;
                 println!(
-                    "step {step}/{} total {:.4} pred {:.4} tok {:.4} chk {:.4} glb {:.4} sigreg {:.4} pred_cos {:.4} chk_cos {:.4} glb_cos {:.4} targets {} code_frac {:.2} seq {} reg_w {:.4}{} [saved best_pred]",
+                    "step {step}/{} total {:.4} pred {:.4}{} tok {:.4} chk {:.4} glb {:.4} sigreg {:.4} pred_cos {:.4} chk_cos {:.4} glb_cos {:.4} targets {} code_frac {:.2} seq {} reg_w {:.4} lr {:.2e}{} [saved best]",
                     config.steps,
                     snapshot.loss_val,
                     snapshot.pred_val,
+                    val_note,
                     snapshot.token_pred_val,
                     snapshot.chunk_pred_val,
                     snapshot.global_pred_val,
@@ -792,14 +1013,16 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     snapshot.code_fraction,
                     snapshot.active_seq,
                     snapshot.reg_weight,
+                    scheduled_lr,
                     memory_note,
                 );
             } else {
                 println!(
-                    "step {step}/{} total {:.4} pred {:.4} tok {:.4} chk {:.4} glb {:.4} sigreg {:.4} pred_cos {:.4} chk_cos {:.4} glb_cos {:.4} targets {} code_frac {:.2} seq {} reg_w {:.4}{}",
+                    "step {step}/{} total {:.4} pred {:.4}{} tok {:.4} chk {:.4} glb {:.4} sigreg {:.4} pred_cos {:.4} chk_cos {:.4} glb_cos {:.4} targets {} code_frac {:.2} seq {} reg_w {:.4} lr {:.2e}{}",
                     config.steps,
                     snapshot.loss_val,
                     snapshot.pred_val,
+                    val_note,
                     snapshot.token_pred_val,
                     snapshot.chunk_pred_val,
                     snapshot.global_pred_val,
@@ -811,6 +1034,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     snapshot.code_fraction,
                     snapshot.active_seq,
                     snapshot.reg_weight,
+                    scheduled_lr,
                     memory_note,
                 );
             }
@@ -895,8 +1119,6 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
     let mut pair_stream = PairStream::new(&data_path, DEFAULT_MIN_TOKENS_PER_LINE)?;
 
     let mut varmap = VarMap::new();
-    varmap.load(&config.model_path)?;
-    util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
     let vb = VarBuilder::from_varmap(&varmap, runtime_dtype, &device);
 
     let vocab_size = vocab.id_to_token.len();
@@ -907,6 +1129,8 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
         config.num_layers,
         config.num_heads,
     )?;
+    util::load_varmap_checked(&mut varmap, &config.model_path)?;
+    util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
 
     let embed_params = vocab_size * config.dim;
     let block_params =
@@ -981,7 +1205,12 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
         let online_at_targets = online_flat.index_select(&target_linear_indices, 0)?;
         let target_latents = target_flat.index_select(&target_linear_indices, 0)?;
         let pred_loss = util::scalar_f32(&prediction_loss(&online_at_targets, &target_latents)?)?;
-        let sigreg_loss = util::scalar_f32(&sigreg_epps_pulley(&online_flat, 128, 17)?)?;
+        // Use the same SIGReg budget as training so eval values are comparable.
+        let sigreg_loss = util::scalar_f32(&sigreg_epps_pulley(
+            &online_flat,
+            env_usize("TOFY_SIGREG_SLICES", 1024),
+            env_usize("TOFY_SIGREG_POINTS", 17),
+        )?)?;
         let pred_chunk_flat = flatten_latent_slots(&context_features.chunk_states)?;
         let target_chunk_flat = flatten_latent_slots(&target_features.chunk_states)?;
         let target_global_mean = target_features.global_states.mean(1)?;

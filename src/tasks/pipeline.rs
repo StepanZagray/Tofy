@@ -566,7 +566,12 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_DECODER_CSA_TOPK", "16");
     set_env_default("TOFY_WORLD_TRAIN_ROLLOUT_STEPS", "2");
     set_env_default("TOFY_WORLD_ROLLOUT_STEPS", "2");
-    set_env_default("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.0");
+    set_env_default("TOFY_WORLD_INVERSE_LOSS_WEIGHT", "0.2");
+    set_env_default("TOFY_WORLD_TRANS_COSINE_WEIGHT", "0.1");
+    set_env_default("TOFY_WORLD_SIGREG_PRED_WEIGHT", "0.6");
+    set_env_default("TOFY_ACTION_FOCAL_GAMMA", "2.0");
+    set_env_default("TOFY_LABEL_SMOOTHING", "0.05");
+    set_env_default("TOFY_DECODER_MAX_CHECKPOINT_PPL", "50");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
     set_env_default("TOFY_BPE_MAX_MERGES", "24000");
@@ -586,8 +591,8 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
-    set_env_default("TOFY_DECODER_NEGATIVE_FORWARDS", "0");
-    set_env_default("TOFY_DECODER_ABLATION_METRICS", "0");
+    set_env_default("TOFY_DECODER_NEGATIVE_FORWARDS", "1");
+    set_env_default("TOFY_DECODER_ABLATION_METRICS", "1");
     set_env_default("TOFY_DECODER_PROMPT_DROPOUT", "0.12");
     set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.05");
     set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.15");
@@ -656,7 +661,10 @@ fn context_defaults_for_profile(
     ContextDefaults {
         latent_segments,
         world_segments,
-        hybrid_exact_tail: defaults.world_max_seq,
+        hybrid_exact_tail: tasks::world::default_context_hybrid_exact_tail(
+            defaults.world_max_seq,
+            1,
+        ),
         hybrid_block_size: 32,
         hybrid_retrieval_slots: retrieval_slots,
         hybrid_exact_old_tokens: exact_old_tokens,
@@ -1747,6 +1755,7 @@ fn decoder_args(
         lr.to_string(),
         "--conditioning-loss-weight".to_string(),
         conditioning_loss_weight.to_string(),
+        "--conditioning-negative-forwards".to_string(),
     ];
     if let Some(init_decoder) = init_decoder {
         args.extend([

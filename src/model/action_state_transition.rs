@@ -89,18 +89,27 @@ impl ActionStateTransition {
 
     fn action_vec(&self, state_slots: &Tensor, action_labels: &[u32]) -> Result<Tensor> {
         let (batch, _, _) = state_slots.dims3()?;
-        let mut action_ids = if action_labels.len() == 1 && batch > 1 {
+        let mut action_ids = if action_labels.len() == 1 {
             vec![action_labels[0]; batch]
-        } else {
+        } else if action_labels.len() == batch {
             action_labels.to_vec()
-        };
-        if action_ids.len() < batch {
-            action_ids.resize(batch, 0);
         } else {
-            action_ids.truncate(batch);
-        }
+            anyhow::bail!(
+                "action label count {} must be 1 or match batch size {}",
+                action_labels.len(),
+                batch
+            );
+        };
+        let strict_labels = std::env::var("TOFY_STRICT_ACTION_LABELS")
+            .ok()
+            .is_none_or(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         for action_id in &mut action_ids {
-            *action_id = (*action_id).min((NUM_ACTIONS - 1) as u32);
+            if *action_id >= NUM_ACTIONS as u32 {
+                if strict_labels {
+                    anyhow::bail!("invalid action label {action_id}; expected 0..{}", NUM_ACTIONS);
+                }
+                *action_id = (NUM_ACTIONS - 1) as u32;
+            }
         }
         let action_ids = Tensor::from_vec(action_ids, (batch,), state_slots.device())?;
         self.action_embed.forward(&action_ids).map_err(Into::into)
@@ -166,6 +175,22 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum::<f32>();
         assert!(diff < 1e-5, "forward_one diff {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn action_label_count_mismatch_is_rejected() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let transition = ActionStateTransition::new(vb, 16)?;
+        let state = Tensor::zeros((2, 3, 16), DType::F32, &device)?;
+
+        let err = transition
+            .forward(&state, &[])
+            .expect_err("empty label list should be rejected");
+
+        assert!(err.to_string().contains("action label count"));
         Ok(())
     }
 }

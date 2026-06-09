@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_nn::{Optimizer, VarBuilder, VarMap};
 use rand::seq::SliceRandom;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ use crate::model::{
 };
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
-    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score,
+    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score, world_sigreg_loss,
     encoded_examples_oov_rate, evaluate_decoder_batch, evaluate_decoder_cached_batch,
     evaluate_world_encoded_batch, forbidden_output_probability_loss,
     hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
@@ -449,6 +449,21 @@ fn cache_file_fingerprint(path: &Path, hash_contents: bool) -> Result<CacheFileF
     })
 }
 
+pub(crate) fn default_context_hybrid_exact_tail(
+    max_seq: usize,
+    recent_full_segments: usize,
+) -> usize {
+    let max_seq = max_seq.max(1);
+    let min_chunk = 16usize.min(max_seq);
+    let target_chunk = max_seq.div_ceil(16).max(min_chunk);
+    let chunk = target_chunk.min(max_seq).max(1);
+    let chunk_slots = max_seq.div_ceil(chunk).max(1);
+    max_seq
+        .saturating_add(chunk_slots)
+        .saturating_add(6)
+        .saturating_mul(recent_full_segments.max(1))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn conditioned_decoder_context_signature(
     max_seq: usize,
@@ -480,7 +495,7 @@ fn conditioned_decoder_context_signature(
         hybrid_context: env_bool("TOFY_CONTEXT_HYBRID_MEMORY", true),
         hybrid_exact_tail: env_usize(
             "TOFY_CONTEXT_HYBRID_EXACT_TAIL",
-            max_seq.saturating_mul(recent_full_segments.max(1)),
+            default_context_hybrid_exact_tail(max_seq, recent_full_segments),
         ),
         hybrid_block_size: env_usize("TOFY_CONTEXT_HYBRID_BLOCK_SIZE", 16),
         hybrid_retrieval_slots,
@@ -1152,7 +1167,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             config.num_layers,
             config.num_heads,
         )?;
-        encoder_varmap.load(&config.encoder_model_path)?;
+        util::load_varmap_checked(&mut encoder_varmap, &config.encoder_model_path)?;
         util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
         encoder
     } else {
@@ -1165,7 +1180,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             config.num_layers,
             config.num_heads,
         )?;
-        frozen_encoder_varmap.load(&config.encoder_model_path)?;
+        util::load_varmap_checked(&mut frozen_encoder_varmap, &config.encoder_model_path)?;
         util::cast_varmap_dtype(&mut frozen_encoder_varmap, train_dtype)?;
         let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&frozen_encoder_varmap)?;
         drop(loaded_encoder);
@@ -1240,11 +1255,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        world_varmap.load(&train_checkpoint_path)?;
+        util::load_varmap_checked(&mut world_varmap, &train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         println!("Resuming world weights from {:?}", train_checkpoint_path);
     } else if config.resume && model_path.exists() {
-        world_varmap.load(&model_path)?;
+        util::load_varmap_checked(&mut world_varmap, &model_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         println!(
             "Resuming world weights from best export {:?} without optimizer state",
@@ -1253,14 +1268,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     }
     if config.train_encoder {
         if config.resume && encoder_train_checkpoint_path.exists() {
-            encoder_varmap.load(&encoder_train_checkpoint_path)?;
+            util::load_varmap_checked(&mut encoder_varmap, &encoder_train_checkpoint_path)?;
             util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
             println!(
                 "Resuming LeWM encoder weights from {:?}",
                 encoder_train_checkpoint_path
             );
         } else if config.resume && encoder_model_path.exists() {
-            encoder_varmap.load(&encoder_model_path)?;
+            util::load_varmap_checked(&mut encoder_varmap, &encoder_model_path)?;
             util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
             println!(
                 "Resuming LeWM encoder weights from best export {:?}",
@@ -1432,6 +1447,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let post_state_loss_weight = world_post_state_loss_weight();
     let rollout_loss_weight = world_rollout_loss_weight();
     let rollout_steps = world_rollout_steps();
+    let transition_cosine_weight = std::env::var("TOFY_WORLD_TRANS_COSINE_WEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.1)
+        .max(0.0);
     tb.add_scalar(
         "config/post_state_loss_weight",
         post_state_loss_weight as f32,
@@ -1439,6 +1459,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     );
     tb.add_scalar("config/rollout_loss_weight", rollout_loss_weight as f32, 0);
     tb.add_scalar("config/rollout_steps", rollout_steps as f32, 0);
+    tb.add_scalar(
+        "config/transition_cosine_weight",
+        transition_cosine_weight as f32,
+        0,
+    );
     if start_step >= config.steps {
         println!(
             "World resume checkpoint already reached step {}/{}; skipping training.",
@@ -1510,6 +1535,17 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let fixed_next_slots = next_slots.detach();
 
             let transition_loss = prediction_loss(&pred_next_slots, &fixed_next_slots)?;
+            // Direction term: plain MSE permits the right norm with the wrong
+            // direction, but downstream decoder conditioning is directional.
+            let transition_direction_loss = if transition_cosine_weight > 0.0 {
+                let cos = mean_cosine_similarity(
+                    &flatten_latent_slots(&pred_next_slots)?,
+                    &flatten_latent_slots(&fixed_next_slots)?,
+                )?;
+                cos.affine(-transition_cosine_weight, transition_cosine_weight)?
+            } else {
+                transition_loss.affine(0.0, 0.0)?
+            };
             let post_state_loss = if post_state_loss_weight > 0.0 {
                 transition_loss.clone()
             } else {
@@ -1538,10 +1574,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 sigreg_slices,
                 sigreg_points,
             )?;
-            let sigreg_loss = state_sigreg
-                .broadcast_add(&next_sigreg)?
-                .broadcast_add(&pred_sigreg)?
-                .affine(1.0 / 3.0, 0.0)?;
+            let sigreg_loss = world_sigreg_loss(&state_sigreg, &next_sigreg, &pred_sigreg)?;
 
             let action_logits = action_classifier_head.forward(&state_slots)?;
             let action_loss = action_cross_entropy(&action_logits, &action_labels, &device)?;
@@ -1564,6 +1597,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 (transition_loss.affine(0.0, 0.0)?, None)
             };
             let loss = transition_loss
+                .broadcast_add(&transition_direction_loss)?
                 .broadcast_add(&post_state_loss.affine(post_state_loss_weight, 0.0)?)?
                 .broadcast_add(&rollout_loss.affine(rollout_loss_weight, 0.0)?)?
                 .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?
@@ -1592,6 +1626,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             last_state_slots = Some(state_slots);
         }
 
+        let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
+        opt.set_learning_rate(scheduled_lr);
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -1638,6 +1674,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
             tb.add_scalar("loss/total", loss_val, step);
             tb.add_scalar("loss/trans", trans_val, step);
+            tb.add_scalar("schedule/lr", scheduled_lr as f32, step);
             tb.add_scalar("loss/sigreg", sigreg_val, step);
             tb.add_scalar("loss/action", act_val, step);
             tb.add_scalar("loss/inverse_action", inv_val, step);
@@ -2006,6 +2043,7 @@ struct HighWorldMacroBatch {
     action_sequences: Vec<Vec<u32>>,
 }
 
+#[cfg(test)]
 fn high_world_macro_example_from_raw_span(
     span: &[RawWorldExample],
     vocab: &Vocab,
@@ -2036,6 +2074,7 @@ fn high_world_macro_example_from_raw_span(
     ))
 }
 
+#[cfg(test)]
 fn high_world_macro_example_from_cached_span(
     span: &[WorldExample],
 ) -> Result<(WorldExample, Vec<u32>)> {
@@ -2057,6 +2096,113 @@ fn high_world_macro_example_from_cached_span(
     ))
 }
 
+fn collect_macro_chains(
+    examples: &[WorldExample],
+    macro_min_len: usize,
+    macro_max_len: usize,
+) -> Vec<Vec<usize>> {
+    if examples.is_empty() {
+        return Vec::new();
+    }
+    let edges = continuation_edges(examples);
+    let span_range = macro_max_len.saturating_sub(macro_min_len) + 1;
+    let mut chains = Vec::new();
+    for start in 0..examples.len() {
+        for span_offset in 0..span_range {
+            let target_len = macro_min_len + span_offset;
+            let mut chain = vec![start];
+            let mut current = start;
+            while chain.len() < target_len {
+                match edges[current] {
+                    Some(next) if !chain.contains(&next) => {
+                        chain.push(next);
+                        current = next;
+                    }
+                    _ => break,
+                }
+            }
+            if chain.len() >= macro_min_len {
+                chains.push(chain);
+            }
+        }
+    }
+    chains
+}
+
+fn sample_macro_chains(chains: &[Vec<usize>], count: usize) -> Vec<Vec<usize>> {
+    if chains.is_empty() {
+        return Vec::new();
+    }
+    let mut rng = rand::rng();
+    (0..count)
+        .map(|_| chains[rng.random_range(0..chains.len())].clone())
+        .collect()
+}
+
+fn macro_example_from_chain(
+    examples: &[WorldExample],
+    chain: &[usize],
+) -> (WorldExample, Vec<u32>) {
+    let first = &examples[chain[0]];
+    let next_tokens = chain
+        .iter()
+        .flat_map(|&idx| examples[idx].next_tokens.iter().copied())
+        .collect();
+    let action_sequence = chain
+        .iter()
+        .map(|&idx| examples[idx].action_label)
+        .collect();
+    (
+        WorldExample {
+            state_tokens: first.state_tokens.clone(),
+            next_tokens,
+            action_label: first.action_label,
+        },
+        action_sequence,
+    )
+}
+
+fn macro_batch_from_examples(
+    examples: &[WorldExample],
+    batch_size: usize,
+    macro_min_len: usize,
+    macro_max_len: usize,
+) -> Result<HighWorldMacroBatch> {
+    let macro_min_len = macro_min_len.max(1);
+    let macro_max_len = macro_max_len.max(macro_min_len);
+    let chains = collect_macro_chains(examples, macro_min_len, macro_max_len);
+    let sampled = if chains.is_empty() {
+        examples
+            .iter()
+            .take(batch_size)
+            .map(|example| {
+                (
+                    example.clone(),
+                    vec![example.action_label],
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        sample_macro_chains(&chains, batch_size)
+            .into_iter()
+            .map(|chain| macro_example_from_chain(examples, &chain))
+            .collect()
+    };
+    if sampled.is_empty() {
+        anyhow::bail!("high-world macro batch could not be built from {} examples", examples.len());
+    }
+    let mut examples_out = Vec::with_capacity(sampled.len());
+    let mut action_sequences = Vec::with_capacity(sampled.len());
+    for (example, action_sequence) in sampled {
+        examples_out.push(example);
+        action_sequences.push(action_sequence);
+    }
+    Ok(HighWorldMacroBatch {
+        examples: examples_out,
+        action_sequences,
+    })
+}
+
 fn collect_high_world_macro_batch(
     stream: &mut RawWorldStream,
     vocab: &Vocab,
@@ -2066,20 +2212,31 @@ fn collect_high_world_macro_batch(
 ) -> Result<HighWorldMacroBatch> {
     let macro_min_len = macro_min_len.max(1);
     let macro_max_len = macro_max_len.max(macro_min_len);
-    let span_range = macro_max_len - macro_min_len + 1;
-    let mut examples = Vec::with_capacity(batch_size);
-    let mut action_sequences = Vec::with_capacity(batch_size);
-    for sample_idx in 0..batch_size {
-        let span_len = macro_min_len + (sample_idx % span_range);
-        let rows = stream.next_batch(span_len)?;
-        let (example, action_sequence) = high_world_macro_example_from_raw_span(&rows, vocab)?;
-        examples.push(example);
-        action_sequences.push(action_sequence);
-    }
-    Ok(HighWorldMacroBatch {
-        examples,
-        action_sequences,
-    })
+    let span_range = macro_max_len.saturating_sub(macro_min_len) + 1;
+    let prefetch = batch_size
+        .saturating_mul(span_range)
+        .saturating_mul(16)
+        .max(batch_size * macro_max_len);
+    let rows = stream.next_batch(prefetch)?;
+    let examples = rows
+        .iter()
+        .map(|row| {
+            Ok(WorldExample {
+                state_tokens: encode_text_with_vocab_mode(
+                    &row.state_text,
+                    vocab,
+                    TokenizationMode::Default,
+                ),
+                next_tokens: encode_text_with_vocab_mode(
+                    &row.next_text,
+                    vocab,
+                    TokenizationMode::Default,
+                ),
+                action_label: row.action_label,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    macro_batch_from_examples(&examples, batch_size, macro_min_len, macro_max_len)
 }
 
 fn collect_high_world_macro_batch_cached(
@@ -2090,26 +2247,13 @@ fn collect_high_world_macro_batch_cached(
 ) -> Result<HighWorldMacroBatch> {
     let macro_min_len = macro_min_len.max(1);
     let macro_max_len = macro_max_len.max(macro_min_len);
-    let span_range = macro_max_len - macro_min_len + 1;
-    let span_lens = (0..batch_size)
-        .map(|sample_idx| macro_min_len + (sample_idx % span_range))
-        .collect::<Vec<_>>();
-    let total_rows = span_lens.iter().sum();
-    let rows = stream.next_batch(total_rows)?;
-    let mut examples = Vec::with_capacity(batch_size);
-    let mut action_sequences = Vec::with_capacity(batch_size);
-    let mut offset = 0usize;
-    for span_len in span_lens {
-        let span = &rows[offset..offset + span_len];
-        offset += span_len;
-        let (example, action_sequence) = high_world_macro_example_from_cached_span(span)?;
-        examples.push(example);
-        action_sequences.push(action_sequence);
-    }
-    Ok(HighWorldMacroBatch {
-        examples,
-        action_sequences,
-    })
+    let span_range = macro_max_len.saturating_sub(macro_min_len) + 1;
+    let prefetch = batch_size
+        .saturating_mul(span_range)
+        .saturating_mul(16)
+        .max(batch_size * macro_max_len);
+    let examples = stream.next_batch(prefetch)?;
+    macro_batch_from_examples(&examples, batch_size, macro_min_len, macro_max_len)
 }
 
 fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
@@ -2161,6 +2305,32 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     } else {
         None
     };
+    let mut cached_val_macro_stream = if val_row_count > 0 {
+        if let Some(cache_path) = world_cache_path.as_ref() {
+            Some(CachedWorldStream::with_split(
+                cache_path,
+                1,
+                Some(HELDOUT_SPLIT_MODULUS),
+                HELDOUT_SPLIT_REMAINDER,
+                false,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut val_macro_stream = if val_row_count > 0 && cached_val_macro_stream.is_none() {
+        Some(RawWorldStream::with_split(
+            &config.data_path,
+            1,
+            Some(HELDOUT_SPLIT_MODULUS),
+            HELDOUT_SPLIT_REMAINDER,
+            false,
+        )?)
+    } else {
+        None
+    };
     let vocab_size = encoder_vocab.id_to_token.len();
 
     let encoder = {
@@ -2173,7 +2343,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             config.num_layers,
             config.num_heads,
         )?;
-        encoder_varmap.load(&config.encoder_model_path)?;
+        util::load_varmap_checked(&mut encoder_varmap, &config.encoder_model_path)?;
         util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
         let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
         drop(loaded_encoder);
@@ -2196,7 +2366,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             config.bridge_dim,
             config.num_latent_tokens,
         )?;
-        world_varmap.load(&config.world_model_path)?;
+        util::load_varmap_checked(&mut world_varmap, &config.world_model_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         let frozen_world_tensors = util::frozen_tensors_from_varmap(&world_varmap)?;
         drop(loaded_context_compressor);
@@ -2265,14 +2435,14 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        high_varmap.load(&train_checkpoint_path)?;
+        util::load_varmap_checked(&mut high_varmap, &train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut high_varmap, train_dtype)?;
         println!(
             "Resuming high-world weights from {:?}",
             train_checkpoint_path
         );
     } else if config.resume && model_path.exists() {
-        high_varmap.load(&model_path)?;
+        util::load_varmap_checked(&mut high_varmap, &model_path)?;
         util::cast_varmap_dtype(&mut high_varmap, train_dtype)?;
         println!(
             "Resuming high-world weights from best export {:?} without optimizer state",
@@ -2421,9 +2591,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
                 sigreg_slices,
                 sigreg_points,
             )?;
-            let sigreg_loss = target_sigreg
-                .broadcast_add(&pred_sigreg)?
-                .affine(0.5, 0.0)?;
+            let sigreg_loss = world_sigreg_loss(&target_sigreg, &target_sigreg, &pred_sigreg)?;
             let loss = transition_loss.broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
 
             util::accumulate_scaled_gradients(
@@ -2440,6 +2608,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             last_target_slots = Some(target_slots);
         }
 
+        opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -2458,7 +2627,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             let cosine = util::scalar_f32(&mean_cosine_similarity(&pred_slots, &target_slots)?)?;
             let pred_rms = util::scalar_f32(&tensor_rms(&pred_slots)?)?;
             let target_rms = util::scalar_f32(&tensor_rms(&target_slots)?)?;
-            let selection_metric = trans_val + config.lambda as f32 * sigreg_val;
+            let mut selection_metric = trans_val + config.lambda as f32 * sigreg_val;
             tb.add_scalar("loss/total", loss_val, step);
             tb.add_scalar("loss/transition", trans_val, step);
             tb.add_scalar("loss/sigreg", sigreg_val, step);
@@ -2466,6 +2635,65 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             tb.add_scalar("metrics/pred_rms", pred_rms, step);
             tb.add_scalar("metrics/target_rms", target_rms, step);
             tb.add_scalar("metrics/selection", selection_metric, step);
+            if cached_val_macro_stream.is_some() || val_macro_stream.is_some() {
+                let val_batch = if let Some(stream) = cached_val_macro_stream.as_mut() {
+                    collect_high_world_macro_batch_cached(
+                        stream,
+                        batch_size,
+                        config.macro_min_len,
+                        config.macro_max_len,
+                    )?
+                } else {
+                    collect_high_world_macro_batch(
+                        val_macro_stream
+                            .as_mut()
+                            .context("high-world validation stream missing")?,
+                        &encoder_vocab,
+                        batch_size,
+                        config.macro_min_len,
+                        config.macro_max_len,
+                    )?
+                };
+                let (val_state_slots, val_target_slots) = context_slots_from_world_pair_batch(
+                    &encoder,
+                    &context_compressor,
+                    &val_batch.examples,
+                    encoder_vocab.pad_id,
+                    config.max_seq,
+                    context_segments,
+                    recent_full_segments,
+                    recursive_context_compressor,
+                    true,
+                    &device,
+                )?;
+                let val_macro_action =
+                    macro_encoder.forward_from_slices(&val_batch.action_sequences, &device)?;
+                let val_pred_slots =
+                    macro_transition.forward(&val_state_slots, &val_macro_action)?;
+                let val_trans = util::scalar_f32(&prediction_loss(
+                    &val_pred_slots,
+                    &val_target_slots.detach(),
+                )?)?;
+                let val_target_sigreg = sigreg_epps_pulley(
+                    &flatten_latent_slots(&val_target_slots)?,
+                    sigreg_slices,
+                    sigreg_points,
+                )?;
+                let val_pred_sigreg = sigreg_epps_pulley(
+                    &flatten_latent_slots(&val_pred_slots)?,
+                    sigreg_slices,
+                    sigreg_points,
+                )?;
+                let val_sigreg = util::scalar_f32(&world_sigreg_loss(
+                    &val_target_sigreg,
+                    &val_target_sigreg,
+                    &val_pred_sigreg,
+                )?)?;
+                selection_metric = val_trans + config.lambda as f32 * val_sigreg;
+                tb.add_scalar("val/transition", val_trans, step);
+                tb.add_scalar("val/sigreg", val_sigreg, step);
+                tb.add_scalar("val/selection", selection_metric, step);
+            }
             if let Some(snapshot) = vram_tracker.sample() {
                 tb.add_scalar("memory/used_mb", snapshot.used_mb, step);
                 tb.add_scalar("memory/free_mb", snapshot.free_mb, step);
@@ -2636,7 +2864,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
             config.num_layers,
             config.num_heads,
         )?;
-        encoder_varmap.load(&config.encoder_model_path)?;
+        util::load_varmap_checked(&mut encoder_varmap, &config.encoder_model_path)?;
         util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
         let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
         drop(loaded_encoder);
@@ -2671,7 +2899,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         } else {
             None
         };
-    world_varmap.load(&config.world_model_path)?;
+    util::load_varmap_checked(&mut world_varmap, &config.world_model_path)?;
     util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
 
     let output_path = config
@@ -2687,7 +2915,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         util::checkpoint_sidecar_path(&output_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        world_varmap.load(&train_checkpoint_path)?;
+        util::load_varmap_checked(&mut world_varmap, &train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         println!(
             "Resuming action_classifier weights from {:?}",
@@ -2695,7 +2923,16 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         );
     }
 
-    let named_train_vars = util::named_train_vars(&world_varmap)?;
+    // Only the classifier (and, when tuning the planner, the context
+    // compressor) receive gradients here; keeping the frozen transition
+    // weights out of the optimizer avoids decaying or mutating them.
+    let named_train_vars = util::named_train_vars(&world_varmap)?
+        .into_iter()
+        .filter(|entry| {
+            entry.name.starts_with("next_action_classifier.")
+                || (config.tune_planner && entry.name.starts_with("context_compressor."))
+        })
+        .collect::<Vec<_>>();
     let train_vars = named_train_vars
         .iter()
         .map(|entry| entry.var.clone())
@@ -2850,6 +3087,7 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
             last_action_labels = action_labels;
         }
 
+        opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -3498,8 +3736,10 @@ fn collect_conditioned_decoder_batch(
 #[cfg(test)]
 mod tests {
     use super::{
+        append_padded_segment, collect_macro_chains, context_compressor_mask_from_lengths,
         decoder_action_label_for_kind, decoder_action_matches_kind,
-        high_world_macro_example_from_cached_span, high_world_macro_example_from_raw_span,
+        default_context_hybrid_exact_tail, high_world_macro_example_from_cached_span,
+        high_world_macro_example_from_raw_span,
     };
     use crate::data::{
         RawWorldExample, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
@@ -3507,6 +3747,7 @@ mod tests {
     };
     use crate::model::{DecoderKind, Vocab};
     use anyhow::Result;
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn decoder_specialists_accept_only_their_declared_action() {
@@ -3597,6 +3838,31 @@ mod tests {
     }
 
     #[test]
+    fn macro_chains_prefer_token_continuations_over_adjacent_rows() {
+        std::env::set_var("TOFY_WORLD_ROLLOUT_MIN_OVERLAP", "2");
+        let examples = vec![
+            WorldExample {
+                state_tokens: vec![10, 11],
+                next_tokens: vec![12, 13],
+                action_label: ACTION_TEXT_REPLY,
+            },
+            WorldExample {
+                state_tokens: vec![10, 11, 12, 13],
+                next_tokens: vec![14],
+                action_label: ACTION_CODE,
+            },
+            WorldExample {
+                state_tokens: vec![99],
+                next_tokens: vec![100],
+                action_label: ACTION_DONE,
+            },
+        ];
+        let chains = collect_macro_chains(&examples, 2, 2);
+        assert!(chains.iter().any(|chain| chain == &[0, 1]));
+        assert!(!chains.iter().any(|chain| chain == &[0, 2]));
+    }
+
+    #[test]
     fn high_world_cached_macro_example_concatenates_every_continuation() -> Result<()> {
         let span = vec![
             WorldExample {
@@ -3618,6 +3884,38 @@ mod tests {
         assert_eq!(actions, vec![ACTION_TEXT_REPLY, ACTION_DONE]);
         assert_eq!(example.action_label, ACTION_TEXT_REPLY);
         Ok(())
+    }
+
+    #[test]
+    fn empty_context_segment_keeps_token_and_chunk_masks_zero() -> Result<()> {
+        let mut buf = Vec::new();
+        let token_len = append_padded_segment(&mut buf, &[], 0, 0, 4, 0);
+
+        assert_eq!(token_len, 0);
+        assert_eq!(buf, vec![0, 0, 0, 0]);
+
+        let device = Device::Cpu;
+        let features = crate::model::encoders::EncoderFeatures {
+            token_states: Tensor::zeros((1, 4, 2), DType::F32, &device)?,
+            chunk_states: Tensor::zeros((1, 2, 2), DType::F32, &device)?,
+            global_states: Tensor::zeros((1, 1, 2), DType::F32, &device)?,
+            pooled_queries: Tensor::zeros((1, 2, 2), DType::F32, &device)?,
+        };
+
+        let mask = context_compressor_mask_from_lengths(&features, &[token_len])?;
+        let rows = mask.to_vec2::<f32>()?;
+
+        assert_eq!(&rows[0][0..4], &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&rows[0][4..6], &[0.0, 0.0]);
+        assert_eq!(&rows[0][6..], &[1.0, 1.0, 1.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_exact_tail_default_covers_recent_segment_summaries() {
+        assert_eq!(default_context_hybrid_exact_tail(512, 1), 534);
+        assert_eq!(default_context_hybrid_exact_tail(512, 2), 1068);
+        assert!(default_context_hybrid_exact_tail(67, 1) > 67);
     }
 }
 
@@ -3919,7 +4217,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             config.num_layers,
             config.num_heads,
         )?;
-        encoder_varmap.load(&config.encoder_model_path)?;
+        util::load_varmap_checked(&mut encoder_varmap, &config.encoder_model_path)?;
         util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
         let frozen_encoder_tensors = util::frozen_tensors_from_varmap(&encoder_varmap)?;
         drop(loaded_encoder);
@@ -3953,7 +4251,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             } else {
                 None
             };
-        world_varmap.load(&config.world_model_path)?;
+        util::load_varmap_checked(&mut world_varmap, &config.world_model_path)?;
         util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
         let frozen_world_tensors = util::frozen_tensors_from_varmap(&world_varmap)?;
         drop(loaded_context_compressor);
@@ -4108,18 +4406,18 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        decoder_varmap.load(&train_checkpoint_path)?;
+        util::load_varmap_checked(&mut decoder_varmap, &train_checkpoint_path)?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!("Resuming decoder weights from {:?}", train_checkpoint_path);
     } else if config.resume && decoder_path.exists() {
-        decoder_varmap.load(&decoder_path)?;
+        util::load_varmap_checked(&mut decoder_varmap, &decoder_path)?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!(
             "Resuming decoder weights from best export {:?} without optimizer state",
             decoder_path
         );
     } else if let Some(ref p) = config.init_decoder_path {
-        decoder_varmap.load(p)?;
+        util::load_varmap_checked(&mut decoder_varmap, p)?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!("Initialized decoder weights from {:?}", p);
     }
@@ -4158,6 +4456,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let conditioning_loss_weight = if config.conditioning_negative_forwards {
         requested_conditioning_loss_weight
     } else {
+        if requested_conditioning_loss_weight > 0.0 {
+            println!(
+                "WARNING: --conditioning-loss-weight {} ignored because negative-conditioning \
+                 forwards are disabled; pass --conditioning-negative-forwards or set \
+                 TOFY_DECODER_NEGATIVE_FORWARDS=1",
+                requested_conditioning_loss_weight
+            );
+        }
         0.0
     };
     let format_loss_weight = std::env::var("TOFY_DECODER_FORMAT_LOSS_WEIGHT")
@@ -4736,6 +5042,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             last_loss = Some(loss);
         }
 
+        opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -4923,6 +5230,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 config.signature_loss_weight,
                 config.structure_loss_weight,
             );
+            let mut checkpoint_perplexity = perplexity;
             if val_stream.is_some() || cached_decoder_val_stream.is_some() {
                 let eval_batch_size = std::env::var("TOFY_DECODER_EVAL_BATCH")
                     .ok()
@@ -4982,6 +5290,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     config.signature_loss_weight,
                     config.structure_loss_weight,
                 );
+                checkpoint_perplexity = val_metrics.perplexity;
                 let val_reward_proxy = decoder_reward_proxy(&val_metrics);
                 best_loss = best_loss.min(val_metrics.loss);
                 tb.add_scalar("val/token_ce", val_metrics.loss, step);
@@ -5050,7 +5359,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 best_loss = best_loss.min(loss_val);
             }
             tb.flush();
-            let metric_improved = selection_metric < best_metric;
+            let max_checkpoint_ppl = std::env::var("TOFY_DECODER_MAX_CHECKPOINT_PPL")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(50.0)
+                .max(1.0);
+            let perplexity_ok = checkpoint_perplexity <= max_checkpoint_ppl;
+            let metric_improved = selection_metric < best_metric && perplexity_ok;
             let candidate_best_metric = if metric_improved {
                 selection_metric
             } else {
@@ -5259,8 +5574,6 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
     };
 
     let mut encoder_varmap = VarMap::new();
-    encoder_varmap.load(&config.encoder_model_path)?;
-    util::cast_varmap_dtype(&mut encoder_varmap, runtime_dtype)?;
     let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, runtime_dtype, &device);
     let encoder = OnlineEncoder::new(
         encoder_vb.pp("encoder"),
@@ -5269,10 +5582,10 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
         config.num_layers,
         config.num_heads,
     )?;
+    util::load_varmap_checked(&mut encoder_varmap, &config.encoder_model_path)?;
+    util::cast_varmap_dtype(&mut encoder_varmap, runtime_dtype)?;
 
     let mut world_varmap = VarMap::new();
-    world_varmap.load(&config.model_path)?;
-    util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
     let world_vb = VarBuilder::from_varmap(&world_varmap, runtime_dtype, &device);
     let context_compressor = ContextCompressor::new(
         world_vb.pp("context_compressor"),
@@ -5284,6 +5597,8 @@ fn run_eval_world(config: WorldEvalConfig) -> Result<()> {
         ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
     let action_classifier_head =
         NextActionClassifier::new(world_vb.pp("next_action_classifier"), config.bridge_dim)?;
+    util::load_varmap_checked(&mut world_varmap, &config.model_path)?;
+    util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
 
     println!("World-model evaluation");
     println!("model: {:?}", config.model_path);
@@ -5465,7 +5780,7 @@ pub struct AgentEngine {
 }
 
 /// Returns true if the safetensors file contains any tensor whose name starts with `prefix`.
-fn checkpoint_has_prefix(model_path: &PathBuf, prefix: &str) -> bool {
+fn checkpoint_has_prefix(model_path: &Path, prefix: &str) -> bool {
     use candle_core::safetensors::MmapedSafetensors;
     let Ok(mapped) = (unsafe { MmapedSafetensors::new(model_path) }) else {
         return false;
@@ -5762,6 +6077,7 @@ fn maybe_repair_code_output(
     action: &str,
     cond_vec: &[f32],
     chunk_tokens: usize,
+    temperature: Option<f32>,
     initial: String,
 ) -> String {
     let repair_passes = std::env::var("TOFY_CODE_REPAIR_PASSES")
@@ -5774,7 +6090,13 @@ fn maybe_repair_code_output(
             break;
         }
         let repair_prompt = build_code_repair_prompt(prompt, &assistant_content);
-        let repaired = match decoder.generate(&repair_prompt, action, cond_vec, chunk_tokens) {
+        let repaired = match decoder.generate_with_temperature(
+            &repair_prompt,
+            action,
+            cond_vec,
+            chunk_tokens,
+            temperature,
+        ) {
             Ok(text) => text,
             Err(_) => break,
         };
@@ -5799,10 +6121,10 @@ fn build_code_repair_prompt(prompt: &str, attempt: &str) -> String {
 impl AgentEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        encoder_model_path: &PathBuf,
-        encoder_vocab_path: &PathBuf,
-        world_model_path: &PathBuf,
-        high_world_model_path: Option<&PathBuf>,
+        encoder_model_path: &Path,
+        encoder_vocab_path: &Path,
+        world_model_path: &Path,
+        high_world_model_path: Option<&Path>,
         dim: usize,
         max_seq: usize,
         num_layers: usize,
@@ -5818,8 +6140,6 @@ impl AgentEngine {
         let encoder_vocab = load_vocab_from_file(encoder_vocab_path)?;
 
         let mut encoder_varmap = VarMap::new();
-        encoder_varmap.load(encoder_model_path)?;
-        util::cast_varmap_dtype(&mut encoder_varmap, runtime_dtype)?;
         let encoder_vb = VarBuilder::from_varmap(&encoder_varmap, runtime_dtype, &device);
         let encoder = OnlineEncoder::new(
             encoder_vb.pp("encoder"),
@@ -5828,10 +6148,10 @@ impl AgentEngine {
             num_layers,
             num_heads,
         )?;
+        util::load_varmap_checked(&mut encoder_varmap, encoder_model_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, runtime_dtype)?;
 
         let mut world_varmap = VarMap::new();
-        world_varmap.load(world_model_path)?;
-        util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
         let world_vb = VarBuilder::from_varmap(&world_varmap, runtime_dtype, &device);
         let context_compressor = ContextCompressor::new(
             world_vb.pp("context_compressor"),
@@ -5850,7 +6170,9 @@ impl AgentEngine {
             } else {
                 None
             };
-        let explicit_high_world_model_path = high_world_model_path.cloned();
+        util::load_varmap_checked(&mut world_varmap, world_model_path)?;
+        util::cast_varmap_dtype(&mut world_varmap, runtime_dtype)?;
+        let explicit_high_world_model_path = high_world_model_path.map(Path::to_path_buf);
         let env_high_world_model_path = std::env::var("TOFY_HIGH_WORLD_MODEL")
             .ok()
             .map(PathBuf::from);
@@ -5873,8 +6195,6 @@ impl AgentEngine {
         let (high_world_varmap, action_sequence_encoder, macro_transition) =
             if let Some(path) = high_world_model_path.as_ref().filter(|path| path.exists()) {
                 let mut high_varmap = VarMap::new();
-                high_varmap.load(path)?;
-                util::cast_varmap_dtype(&mut high_varmap, runtime_dtype)?;
                 let high_vb = VarBuilder::from_varmap(&high_varmap, runtime_dtype, &device);
                 let macro_encoder = ActionSequenceEncoder::new(
                     high_vb.pp("action_sequence_encoder"),
@@ -5885,6 +6205,8 @@ impl AgentEngine {
                     high_vb.pp("macro_action_state_transition"),
                     bridge_dim,
                 )?;
+                util::load_varmap_checked(&mut high_varmap, path)?;
+                util::cast_varmap_dtype(&mut high_varmap, runtime_dtype)?;
                 (
                     Some(high_varmap),
                     Some(macro_encoder),
@@ -6114,7 +6436,9 @@ impl AgentEngine {
         let mut route_reward = 0.0f32;
         let mut prior_reward = 0.0f32;
         let mut smoothness = 0.0f32;
+        let mut executed_actions = Vec::new();
         for (idx, action) in actions.iter().enumerate() {
+            executed_actions.push(*action);
             route_reward += self.lewm_route_reward(&slots, *action)?;
             prior_reward += self.lewm_action_prior(prompt, *action);
             let next_slots = self.transition.forward_one(&slots, *action as u32)?;
@@ -6135,14 +6459,14 @@ impl AgentEngine {
         } else {
             0.0
         };
-        let denom = actions.len().max(1) as f32;
+        let denom = executed_actions.len().max(1) as f32;
         let score = cfg.goal_weight * goal_loss
             + cfg.smoothness_weight * (smoothness / denom)
             + premature_done_penalty
             - cfg.route_weight * (route_reward / denom)
             - cfg.prior_weight * (prior_reward / denom);
         Ok(LeWmPlan {
-            actions: actions.to_vec(),
+            actions: executed_actions,
             first_action,
             planned_slots: first_step_slots.unwrap_or(slots),
             score,
@@ -6165,7 +6489,9 @@ impl AgentEngine {
         let mut route_reward = 0.0f32;
         let mut prior_reward = 0.0f32;
         let mut smoothness = 0.0f32;
+        let mut executed_actions = Vec::new();
         for (idx, action) in actions.iter().enumerate() {
+            executed_actions.push(*action);
             route_reward += self.lewm_route_reward(&slots, *action)?;
             prior_reward += self.lewm_action_prior(prompt, *action);
             let next_slots = self.transition.forward_one(&slots, *action as u32)?;
@@ -6179,13 +6505,13 @@ impl AgentEngine {
             }
         }
         let subgoal_loss = util::scalar_f32(&prediction_loss(&slots, subgoal_slots)?)?;
-        let denom = actions.len().max(1) as f32;
+        let denom = executed_actions.len().max(1) as f32;
         let score = hwm_cfg.subgoal_weight * subgoal_loss
             + lewm_cfg.smoothness_weight * (smoothness / denom)
             - lewm_cfg.route_weight * (route_reward / denom)
             - lewm_cfg.prior_weight * (prior_reward / denom);
         Ok(LeWmPlan {
-            actions: actions.to_vec(),
+            actions: executed_actions,
             first_action,
             planned_slots: first_step_slots.unwrap_or(slots),
             score,
@@ -6407,6 +6733,7 @@ impl AgentEngine {
         prompt: &str,
         max_new_tokens: usize,
         ablate_conditioning: bool,
+        temperature: Option<f32>,
         registry: BashToolRegistry,
     ) -> Result<String> {
         let max_steps = env_usize("TOFY_AGENTIC_MAX_STEPS", 4).max(1);
@@ -6418,7 +6745,12 @@ impl AgentEngine {
 
         for step in 1..=max_steps {
             let tool_prompt = registry.build_prompt(&transcript, step, max_steps);
-            let output = self.generate_direct(&tool_prompt, step_tokens, ablate_conditioning)?;
+            let output = self.generate_direct_with_temperature(
+                &tool_prompt,
+                step_tokens,
+                ablate_conditioning,
+                temperature,
+            )?;
             let Some(call) = parse_tool_call(&output) else {
                 return Ok(clean_agentic_final(&output));
             };
@@ -6435,16 +6767,21 @@ impl AgentEngine {
         }
 
         let final_prompt = registry.build_final_prompt(&transcript, max_steps);
-        let output = self.generate_direct(&final_prompt, max_new_tokens, ablate_conditioning)?;
+        let output = self.generate_direct_with_temperature(
+            &final_prompt,
+            max_new_tokens,
+            ablate_conditioning,
+            temperature,
+        )?;
         Ok(clean_agentic_final(&output))
     }
 
-    /// Single-step reply: choose decoder mode once, then generate with that decoder.
-    fn generate_direct(
+    fn generate_direct_with_temperature(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         ablate_conditioning: bool,
+        temperature: Option<f32>,
     ) -> Result<String> {
         let start = Instant::now();
         use crate::tasks::orchestrator::Action;
@@ -6482,11 +6819,12 @@ impl AgentEngine {
         } else {
             chunk_tokens
         };
-        let mut assistant_content = decoder.generate(
+        let mut assistant_content = decoder.generate_with_temperature(
             &generation_prompt,
             action.as_str(),
             &cond_vec,
             decoder_tokens,
+            temperature,
         )?;
         if action == Action::Code && code_request_language(&generation_prompt).is_some() {
             assistant_content = maybe_repair_code_output(
@@ -6495,6 +6833,7 @@ impl AgentEngine {
                 action.as_str(),
                 &cond_vec,
                 decoder_tokens,
+                temperature,
                 assistant_content,
             );
         }
@@ -6515,17 +6854,33 @@ impl AgentEngine {
         max_new_tokens: usize,
         ablate_conditioning: bool,
     ) -> Result<String> {
+        self.generate_with_temperature(prompt, max_new_tokens, ablate_conditioning, None)
+    }
+
+    pub fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        ablate_conditioning: bool,
+        temperature: Option<f32>,
+    ) -> Result<String> {
         if agentic_decoder_requested() {
             if let Some(registry) = BashToolRegistry::load_from_env()? {
                 return self.generate_agentic_with_tools(
                     prompt,
                     max_new_tokens,
                     ablate_conditioning,
+                    temperature,
                     registry,
                 );
             }
         }
-        self.generate_direct(prompt, max_new_tokens, ablate_conditioning)
+        self.generate_direct_with_temperature(
+            prompt,
+            max_new_tokens,
+            ablate_conditioning,
+            temperature,
+        )
     }
 
     pub fn generate_for_action(
@@ -6567,11 +6922,12 @@ impl AgentEngine {
         } else {
             chunk_tokens
         };
-        let mut assistant_content = decoder.generate(
+        let mut assistant_content = decoder.generate_with_temperature(
             &generation_prompt,
             effective_action.as_str(),
             &cond_vec,
             decoder_tokens,
+            None,
         )?;
         if effective_action == Action::Code && code_request_language(&generation_prompt).is_some() {
             assistant_content = maybe_repair_code_output(
@@ -6580,6 +6936,7 @@ impl AgentEngine {
                 effective_action.as_str(),
                 &cond_vec,
                 decoder_tokens,
+                None,
                 assistant_content,
             );
         }
@@ -6624,10 +6981,32 @@ impl AgentEngine {
         ablate_conditioning: bool,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
+        self.generate_stream_with_temperature(
+            prompt,
+            max_new_tokens,
+            ablate_conditioning,
+            None,
+            on_chunk,
+        )
+    }
+
+    pub fn generate_stream_with_temperature(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        ablate_conditioning: bool,
+        temperature: Option<f32>,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
         let start = Instant::now();
         if agentic_decoder_requested() {
             on_chunk("Thinking... ");
-            let text = self.generate(prompt, max_new_tokens, ablate_conditioning)?;
+            let text = self.generate_with_temperature(
+                prompt,
+                max_new_tokens,
+                ablate_conditioning,
+                temperature,
+            )?;
             if !text.trim().is_empty() {
                 on_chunk(&text);
             }
@@ -6684,11 +7063,12 @@ impl AgentEngine {
             chunk_tokens
         };
         if action == Action::Code && code_request_language(&generation_prompt).is_some() {
-            let mut assistant_content = decoder.generate(
+            let mut assistant_content = decoder.generate_with_temperature(
                 &generation_prompt,
                 action.as_str(),
                 &cond_vec,
                 decoder_tokens,
+                temperature,
             )?;
             assistant_content = maybe_repair_code_output(
                 decoder.as_ref(),
@@ -6696,6 +7076,7 @@ impl AgentEngine {
                 action.as_str(),
                 &cond_vec,
                 decoder_tokens,
+                temperature,
                 assistant_content,
             );
             on_chunk(&assistant_content);
@@ -6709,11 +7090,12 @@ impl AgentEngine {
             }
             return Ok(());
         }
-        decoder.generate_stream(
+        decoder.generate_stream_with_temperature(
             &generation_prompt,
             action.as_str(),
             &cond_vec,
             decoder_tokens,
+            temperature,
             &mut |chunk: &str| on_chunk(chunk),
         )?;
         if std::env::var("JEPA_DEBUG").is_ok() {
@@ -6735,7 +7117,7 @@ fn context_compressor_mask_from_lengths(
     let (batch, token_slots, _) = features.token_states.dims3()?;
     let chunk_slots = features.chunk_states.dim(1)?;
     let global_slots = features.global_states.dim(1)?;
-    let chunk_size = (token_slots / chunk_slots.max(1)).max(1);
+    let chunk_size = token_slots.div_ceil(chunk_slots.max(1)).max(1);
     let total_slots = token_slots + chunk_slots + global_slots + 2;
     let mut mask_buf: Vec<f32> = Vec::with_capacity(batch * total_slots);
     for b in 0..batch {
@@ -6743,8 +7125,12 @@ fn context_compressor_mask_from_lengths(
             .get(b)
             .copied()
             .unwrap_or(token_slots)
-            .clamp(1, token_slots);
-        let chunk_len = token_len.div_ceil(chunk_size).clamp(1, chunk_slots);
+            .min(token_slots);
+        let chunk_len = if token_len == 0 {
+            0
+        } else {
+            token_len.div_ceil(chunk_size).min(chunk_slots)
+        };
         mask_buf.extend((0..token_slots).map(|idx| if idx < token_len { 1.0f32 } else { 0.0f32 }));
         mask_buf.extend((0..chunk_slots).map(|idx| if idx < chunk_len { 1.0f32 } else { 0.0f32 }));
         mask_buf.extend(std::iter::repeat_n(1.0f32, global_slots + 2));
@@ -6831,8 +7217,12 @@ fn context_compressor_segment_batch_from_features(
             .get(b)
             .copied()
             .unwrap_or(token_slots)
-            .clamp(1, token_slots);
-        let valid_chunks = token_len.div_ceil(chunk_size).clamp(1, chunk_slots);
+            .min(token_slots);
+        let valid_chunks = if token_len == 0 {
+            0
+        } else {
+            token_len.div_ceil(chunk_size).min(chunk_slots)
+        };
         if include_tokens {
             mask_buf.extend((0..token_slots).map(|idx| if idx < token_len { 1.0 } else { 0.0 }));
         }
@@ -6897,13 +7287,13 @@ fn append_padded_segment(
     pad_id: u32,
 ) -> usize {
     let row_start = out.len();
-    if start < end {
-        out.extend(tokens[start..end].iter().take(max_seq).copied());
-    }
-    if out.len() == row_start {
-        out.push(pad_id);
-    }
-    let token_len = (out.len() - row_start).min(max_seq).max(1);
+    let token_len = if start < end {
+        let len = (end - start).min(max_seq);
+        out.extend(tokens[start..end].iter().take(len).copied());
+        len
+    } else {
+        0
+    };
     while out.len() - row_start < max_seq {
         out.push(pad_id);
     }
@@ -7043,7 +7433,7 @@ fn context_slots_from_token_sequences_with_detach(
     let hybrid_context = env_bool("TOFY_CONTEXT_HYBRID_MEMORY", true);
     let hybrid_exact_tail = env_usize(
         "TOFY_CONTEXT_HYBRID_EXACT_TAIL",
-        max_seq.saturating_mul(recent_full_segments.max(1)),
+        default_context_hybrid_exact_tail(max_seq, recent_full_segments),
     );
     let hybrid_block_size = env_usize("TOFY_CONTEXT_HYBRID_BLOCK_SIZE", 16);
     let hybrid_retrieval_slots = env_usize("TOFY_CONTEXT_RETRIEVAL_SLOTS", 8);

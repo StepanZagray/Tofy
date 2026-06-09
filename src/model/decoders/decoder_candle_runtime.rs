@@ -394,14 +394,6 @@ impl CandleCrossAttnDecoder {
         let checkpoint_dtype =
             crate::util::checkpoint_float_dtype(&checkpoint_path)?.unwrap_or(DType::F32);
         let runtime_dtype = crate::util::resolve_runtime_dtype(&device);
-        if runtime_dtype != checkpoint_dtype {
-            anyhow::bail!(
-                "decoder runtime dtype {:?} does not match checkpoint dtype {:?} for {:?}",
-                runtime_dtype,
-                checkpoint_dtype,
-                checkpoint_path
-            );
-        }
         let mut varmap = VarMap::new();
         let vocab = load_vocab_from_file(&vocab_path)
             .with_context(|| format!("load decoder vocab from {:?}", vocab_path))?;
@@ -447,8 +439,7 @@ impl CandleCrossAttnDecoder {
             kind,
             attention,
         )?;
-        varmap
-            .load(&checkpoint_path)
+        crate::util::load_varmap_checked(&mut varmap, &checkpoint_path)
             .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
         crate::util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
         Ok(Self {
@@ -561,6 +552,7 @@ impl CandleCrossAttnDecoder {
         world_latent: &Tensor,
         max_new_tokens: usize,
         cfg: TreeCoderConfig,
+        temperature: f32,
     ) -> Result<String> {
         let root_state = self
             .decoder
@@ -589,7 +581,8 @@ impl CandleCrossAttnDecoder {
                     next_active.push(node);
                     break;
                 }
-                let candidates = self.treecoder_candidate_log_probs(&node.state, &cfg)?;
+                let candidates =
+                    self.treecoder_candidate_log_probs(&node.state, &cfg, temperature)?;
                 for (next_id, logprob) in candidates {
                     if self.is_stop_id(next_id) {
                         if node.generated.len() >= cfg.min_complete_tokens
@@ -681,12 +674,13 @@ impl CandleCrossAttnDecoder {
         &self,
         state: &DecoderGenerationState,
         cfg: &TreeCoderConfig,
+        temperature: f32,
     ) -> Result<Vec<(u32, f32)>> {
         let mut logits = self.decoder.last_token_logits(state)?;
         self.apply_repeat_penalty(&mut logits, state);
         self.apply_token_masks(&mut logits);
-        let scale = if self.temperature > 0.0 {
-            1.0 / self.temperature.max(1e-5)
+        let scale = if temperature > 0.0 {
+            1.0 / temperature.max(1e-5)
         } else {
             1.0
         };
@@ -719,11 +713,11 @@ impl CandleCrossAttnDecoder {
             .collect())
     }
 
-    fn sample_next_id(&self, state: &DecoderGenerationState) -> Result<u32> {
+    fn sample_next_id(&self, state: &DecoderGenerationState, temperature: f32) -> Result<u32> {
         let mut logits = self.decoder.last_token_logits(state)?;
         self.apply_repeat_penalty(&mut logits, state);
         self.apply_token_masks(&mut logits);
-        if self.temperature <= 0.0 {
+        if temperature <= 0.0 {
             return Ok(logits
                 .iter()
                 .enumerate()
@@ -731,7 +725,7 @@ impl CandleCrossAttnDecoder {
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0));
         }
-        let distribution = self.sample_distribution(&logits);
+        let distribution = self.sample_distribution(&logits, temperature);
         let mut rng = rand::rng();
         let r: f32 = rng.random();
         let mut cum = 0.0f32;
@@ -802,9 +796,9 @@ impl CandleCrossAttnDecoder {
         indexed.into_iter().map(|(idx, _)| idx).collect()
     }
 
-    fn sample_distribution(&self, logits: &[f32]) -> Vec<(usize, f32)> {
+    fn sample_distribution(&self, logits: &[f32], temperature: f32) -> Vec<(usize, f32)> {
         let candidates = self.sample_candidate_indices(logits);
-        self.softmax_over_candidates(logits, &candidates)
+        self.softmax_over_candidates(logits, &candidates, temperature)
             .unwrap_or_else(|_| vec![(0, 1.0)])
     }
 
@@ -812,8 +806,9 @@ impl CandleCrossAttnDecoder {
         &self,
         logits: &[f32],
         candidates: &[usize],
+        temperature: f32,
     ) -> Result<Vec<(usize, f32)>> {
-        let scale = 1.0f32 / self.temperature.max(1e-5);
+        let scale = 1.0f32 / temperature.max(1e-5);
         let max_logit = candidates
             .iter()
             .map(|&idx| logits[idx] * scale)
@@ -871,6 +866,10 @@ impl CandleCrossAttnDecoder {
             .get(token_id as usize)
             .is_some_and(|token| DECODER_STOP_TOKENS.contains(&token.as_str()))
     }
+
+    fn request_temperature(&self, temperature: Option<f32>) -> f32 {
+        temperature.unwrap_or(self.temperature).clamp(0.0, 2.0)
+    }
 }
 
 impl LocalDecoderRuntime for CandleCrossAttnDecoder {
@@ -885,6 +884,18 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         conditioning: &[f32],
         max_new_tokens: usize,
     ) -> Result<String> {
+        self.generate_with_temperature(prompt, action, conditioning, max_new_tokens, None)
+    }
+
+    fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        let temperature = self.request_temperature(temperature);
         let num_context_slots = conditioning.len() / self.planner_dim;
         if num_context_slots == 0 || conditioning.len() != num_context_slots * self.planner_dim {
             anyhow::bail!(
@@ -903,6 +914,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         let world_latent = self
             .adapter
             .forward_with_action(&context_slots, decoder_action_id(action))?;
+        let world_latent = ablate_world_latent_if_requested(world_latent)?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
         prepare_prompt_ids(&mut prompt_ids, self.max_prompt_tokens, self.vocab.pad_id);
@@ -913,6 +925,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
                 &world_latent,
                 max_new_tokens,
                 treecoder_cfg,
+                temperature,
             );
         }
         let mut state = self
@@ -920,7 +933,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             .begin_generation(&self.device, &prompt_ids, &world_latent)?;
         let mut generated = Vec::new();
         for _ in 0..max_new_tokens {
-            let next_id = self.sample_next_id(&state)?;
+            let next_id = self.sample_next_id(&state, temperature)?;
             if self.is_stop_id(next_id) {
                 break;
             }
@@ -941,6 +954,26 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         max_new_tokens: usize,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
+        self.generate_stream_with_temperature(
+            prompt,
+            action,
+            conditioning,
+            max_new_tokens,
+            None,
+            on_chunk,
+        )
+    }
+
+    fn generate_stream_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let temperature = self.request_temperature(temperature);
         let num_context_slots = conditioning.len() / self.planner_dim;
         if num_context_slots == 0 || conditioning.len() != num_context_slots * self.planner_dim {
             anyhow::bail!(
@@ -959,13 +992,19 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
         let world_latent = self
             .adapter
             .forward_with_action(&context_slots, decoder_action_id(action))?;
+        let world_latent = ablate_world_latent_if_requested(world_latent)?;
         let mut prompt_ids =
             encode_text_with_vocab_mode(prompt, &self.vocab, self.tokenization_mode);
         prepare_prompt_ids(&mut prompt_ids, self.max_prompt_tokens, self.vocab.pad_id);
         let treecoder_cfg = TreeCoderConfig::from_env(self.kind, action, max_new_tokens);
         if treecoder_cfg.enabled && max_new_tokens > 0 {
-            let text =
-                self.generate_treecoder(&prompt_ids, &world_latent, max_new_tokens, treecoder_cfg)?;
+            let text = self.generate_treecoder(
+                &prompt_ids,
+                &world_latent,
+                max_new_tokens,
+                treecoder_cfg,
+                temperature,
+            )?;
             if !text.is_empty() {
                 on_chunk(&text);
             }
@@ -976,7 +1015,7 @@ impl LocalDecoderRuntime for CandleCrossAttnDecoder {
             .begin_generation(&self.device, &prompt_ids, &world_latent)?;
         let mut pending_bytes = Vec::new();
         for _ in 0..max_new_tokens {
-            let next_id = self.sample_next_id(&state)?;
+            let next_id = self.sample_next_id(&state, temperature)?;
             if self.is_stop_id(next_id) {
                 break;
             }
@@ -1154,6 +1193,22 @@ fn decoder_action_id(action: &str) -> u32 {
         "fetch_docs" | "fetch-docs" | "docs" => 3,
         _ => 0,
     }
+}
+
+/// True ablation must remove the adapter output, not just its context input:
+/// the conditioning adapter has learned query/action priors that produce
+/// non-zero decoder conditioning even from all-zero context slots.
+fn ablate_world_latent_if_requested(world_latent: Tensor) -> Result<Tensor> {
+    if runtime_env_bool_any(
+        &[
+            "TOFY_DECODER_ABLATE_ADAPTER_OUTPUT",
+            "JEPA_DECODER_ABLATE_ADAPTER_OUTPUT",
+        ],
+        false,
+    ) {
+        return world_latent.zeros_like().map_err(Into::into);
+    }
+    Ok(world_latent)
 }
 
 fn apply_conditioning_budget(context_slots: Tensor) -> Result<Tensor> {

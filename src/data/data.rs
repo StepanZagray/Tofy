@@ -680,6 +680,10 @@ pub struct PairStream {
     shuffle_buffer_size: usize,
     shuffle_buffer: Vec<Vec<String>>,
     pending_texts: VecDeque<String>,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    exclude_split_matches: bool,
+    row_index: usize,
 }
 
 impl PairStream {
@@ -692,6 +696,17 @@ impl PairStream {
         min_tokens: usize,
         shuffle_buffer_size: usize,
     ) -> Result<Self> {
+        Self::with_split(path, min_tokens, shuffle_buffer_size, None, 0, false)
+    }
+
+    pub fn with_split(
+        path: &Path,
+        min_tokens: usize,
+        shuffle_buffer_size: usize,
+        split_modulus: Option<usize>,
+        split_remainder: usize,
+        exclude_split_matches: bool,
+    ) -> Result<Self> {
         let (paths, source_manifest) = pair_input_paths(path)?;
         let reader = BufReader::new(File::open(&paths[0])?);
         Ok(Self {
@@ -703,19 +718,43 @@ impl PairStream {
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
             pending_texts: VecDeque::new(),
+            split_modulus,
+            split_remainder,
+            exclude_split_matches,
+            row_index: 0,
         })
     }
 
     fn reset(&mut self) -> Result<()> {
         self.path_index = (self.path_index + 1) % self.paths.len();
+        if self.path_index == 0 {
+            self.row_index = 0;
+        }
         self.reader = BufReader::new(File::open(&self.paths[self.path_index])?);
         Ok(())
+    }
+
+    fn keep_row(&mut self) -> bool {
+        let row_idx = self.row_index;
+        self.row_index += 1;
+        let Some(modulus) = self.split_modulus else {
+            return true;
+        };
+        let is_match = row_idx % modulus == self.split_remainder;
+        if self.exclude_split_matches {
+            !is_match
+        } else {
+            is_match
+        }
     }
 
     fn read_next_tokens(&mut self) -> Result<Vec<String>> {
         loop {
             if let Some(text) = self.pending_texts.pop_front() {
                 if let Some(tokens) = split_line_with_min_tokens(&text, self.min_tokens) {
+                    if !self.keep_row() {
+                        continue;
+                    }
                     return Ok(tokens);
                 }
             }
@@ -729,6 +768,9 @@ impl PairStream {
                 continue;
             }
             if let Some(tokens) = split_line_with_min_tokens(&line, self.min_tokens) {
+                if !self.keep_row() {
+                    continue;
+                }
                 return Ok(tokens);
             }
         }
@@ -765,6 +807,10 @@ pub struct CachedPairStream {
     reader: BufReader<File>,
     shuffle_buffer_size: usize,
     shuffle_buffer: Vec<Pair>,
+    split_modulus: Option<usize>,
+    split_remainder: usize,
+    exclude_split_matches: bool,
+    row_index: usize,
     prefetch_rx: Option<PrefetchRx<Pair>>,
     prefetch_stash: VecDeque<Pair>,
 }
@@ -775,11 +821,25 @@ impl CachedPairStream {
     }
 
     pub fn with_shuffle(path: &PathBuf, shuffle_buffer_size: usize) -> Result<Self> {
+        Self::with_split(path, shuffle_buffer_size, None, 0, false)
+    }
+
+    pub fn with_split(
+        path: &PathBuf,
+        shuffle_buffer_size: usize,
+        split_modulus: Option<usize>,
+        split_remainder: usize,
+        exclude_split_matches: bool,
+    ) -> Result<Self> {
         let mut stream = Self {
             path: path.clone(),
             reader: token_cache_reader(path)?,
             shuffle_buffer_size: shuffle_buffer_size.max(1),
             shuffle_buffer: Vec::new(),
+            split_modulus,
+            split_remainder,
+            exclude_split_matches,
+            row_index: 0,
             prefetch_rx: None,
             prefetch_stash: VecDeque::new(),
         };
@@ -798,6 +858,7 @@ impl CachedPairStream {
 
     fn reset(&mut self) -> Result<()> {
         self.reader = token_cache_reader(&self.path)?;
+        self.row_index = 0;
         self.read_magic()
     }
 
@@ -805,6 +866,19 @@ impl CachedPairStream {
         loop {
             match read_token_cache_record(&mut self.reader)? {
                 Some((tokens, _right, _action)) if !tokens.is_empty() => {
+                    let row_idx = self.row_index;
+                    self.row_index += 1;
+                    if let Some(modulus) = self.split_modulus {
+                        let is_match = row_idx % modulus == self.split_remainder;
+                        let keep = if self.exclude_split_matches {
+                            !is_match
+                        } else {
+                            is_match
+                        };
+                        if !keep {
+                            continue;
+                        }
+                    }
                     return Ok(Pair { tokens });
                 }
                 Some(_) => continue,
@@ -848,12 +922,21 @@ impl CachedPairStream {
         }
         let path = self.path.clone();
         let shuffle_buffer_size = self.shuffle_buffer_size;
+        let split_modulus = self.split_modulus;
+        let split_remainder = self.split_remainder;
+        let exclude_split_matches = self.exclude_split_matches;
         let chunk_size = token_cache_prefetch_chunk_size(batch_size);
         let (tx, rx) = sync_channel(prefetch_chunks);
         thread::Builder::new()
             .name("tofy-cache-prefetch-pair".to_string())
             .spawn(move || {
-                let mut stream = match CachedPairStream::with_shuffle(&path, shuffle_buffer_size) {
+                let mut stream = match CachedPairStream::with_split(
+                    &path,
+                    shuffle_buffer_size,
+                    split_modulus,
+                    split_remainder,
+                    exclude_split_matches,
+                ) {
                     Ok(stream) => stream,
                     Err(err) => {
                         let _ = tx.send(Err(err));
@@ -1683,6 +1766,10 @@ pub struct AugmentedJepaBatch {
     pub view_b_ids: Tensor,
     pub target_ids: Tensor,
     pub target_linear_indices: Tensor,
+    /// Host copy of `target_linear_indices` (flattened `row * max_seq + pos`).
+    pub target_linear_host: Vec<u32>,
+    /// Valid (non-pad) token count per row, before padding to `max_seq`.
+    pub valid_lens: Vec<usize>,
     pub target_count: usize,
     pub code_fraction: f32,
 }
@@ -1948,277 +2035,235 @@ fn prepare_segmented_context_ids(
     combined
 }
 
-fn build_masked_view(
+struct MaskingPools {
+    valid_len: usize,
+    code_like: bool,
+    valid_positions: Vec<usize>,
+    identifier_positions: Vec<usize>,
+    comment_positions: Vec<usize>,
+    block_positions: Vec<usize>,
+    text_boundary_positions: Vec<usize>,
+}
+
+fn masking_pools(token_strs: &[&str], code_like: bool) -> MaskingPools {
+    let valid_len = token_strs.len().max(1);
+    MaskingPools {
+        valid_len,
+        code_like,
+        valid_positions: (0..valid_len).collect(),
+        identifier_positions: token_strs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tok)| is_identifier_like(tok).then_some(idx))
+            .collect(),
+        comment_positions: token_strs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tok)| is_comment_token(tok).then_some(idx))
+            .collect(),
+        block_positions: token_strs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tok)| is_block_token(tok).then_some(idx))
+            .collect(),
+        text_boundary_positions: token_strs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tok)| is_text_boundary_token(tok).then_some(idx))
+            .collect(),
+    }
+}
+
+fn select_masked_positions(
+    pools: &MaskingPools,
+    cfg: &CurriculumDenoisingConfig,
+    rng: &mut rand::rngs::ThreadRng,
+) -> Vec<usize> {
+    let MaskingPools {
+        valid_len,
+        code_like,
+        valid_positions,
+        identifier_positions,
+        comment_positions,
+        block_positions,
+        text_boundary_positions,
+    } = pools;
+    let valid_len = *valid_len;
+    let code_like = *code_like;
+    let mut selected: HashSet<usize> = HashSet::new();
+
+    let ratio_multiplier = if code_like {
+        cfg.code_masked_ratio_multiplier.max(1.0)
+    } else {
+        1.0
+    };
+    let min_ratio = (cfg.min_masked_ratio * ratio_multiplier).clamp(0.08, 0.9);
+    let max_ratio = (cfg.max_masked_ratio * ratio_multiplier).clamp(min_ratio, 0.9);
+    let min_masked = (valid_positions.len() as f64 * min_ratio).ceil() as usize;
+    let min_masked = min_masked.max(1).min(valid_positions.len());
+    let max_masked = (valid_positions.len() as f64 * max_ratio).ceil() as usize;
+    let max_masked = max_masked.max(min_masked).min(valid_positions.len());
+    let target_masked = if min_masked >= max_masked {
+        max_masked
+    } else {
+        rng.random_range(min_masked..=max_masked)
+    };
+    let span_count = rng.random_range(1..=cfg.max_spans_per_sample.max(1));
+    let mut span_len_cap = cfg.max_span_len.max(1);
+    if code_like {
+        span_len_cap = ((span_len_cap as f64) * cfg.code_span_multiplier).round() as usize;
+        span_len_cap = span_len_cap.max(1);
+    }
+
+    for span_idx in 0..span_count {
+        if selected.len() >= target_masked {
+            break;
+        }
+        let use_identifier_focus = code_like
+            && !identifier_positions.is_empty()
+            && (span_idx == 0 || rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
+        let use_comment_focus = !comment_positions.is_empty()
+            && rng.random_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
+        let use_block_focus = code_like
+            && !block_positions.is_empty()
+            && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
+        let use_text_boundary_focus = !code_like
+            && !text_boundary_positions.is_empty()
+            && rng.random_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
+        let start_pool = if use_comment_focus {
+            comment_positions
+        } else if use_block_focus {
+            block_positions
+        } else if use_text_boundary_focus {
+            text_boundary_positions
+        } else if use_identifier_focus {
+            identifier_positions
+        } else {
+            valid_positions
+        };
+        let Some(&start) = start_pool.choose(rng) else {
+            continue;
+        };
+        let span_len = if use_comment_focus {
+            rng.random_range(2..=span_len_cap.clamp(2, 12))
+        } else if use_block_focus {
+            rng.random_range(2..=span_len_cap.clamp(2, 10))
+        } else if use_text_boundary_focus {
+            rng.random_range(3..=span_len_cap.clamp(3, 12))
+        } else if use_identifier_focus {
+            rng.random_range(1..=span_len_cap.min(4))
+        } else {
+            rng.random_range(1..=span_len_cap)
+        };
+        for p in start..(start + span_len).min(valid_len) {
+            if selected.len() >= target_masked {
+                break;
+            }
+            selected.insert(p);
+        }
+    }
+
+    while selected.len() < target_masked {
+        let Some(&start) = valid_positions.choose(rng) else {
+            break;
+        };
+        let span_len = rng.random_range(
+            1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)),
+        );
+        for p in start..(start + span_len).min(valid_len) {
+            if selected.len() >= target_masked {
+                break;
+            }
+            selected.insert(p);
+        }
+    }
+
+    if selected.is_empty() {
+        if let Some(&fallback) = valid_positions.choose(rng) {
+            selected.insert(fallback);
+        }
+    }
+
+    let mut selected_positions: Vec<usize> = selected.into_iter().collect();
+    selected_positions.sort_unstable();
+    selected_positions
+}
+
+fn apply_mask(target_ids: &[u32], positions: &[usize], mask_id: u32) -> Vec<u32> {
+    let mut context_ids = target_ids.to_vec();
+    for &p in positions {
+        context_ids[p] = mask_id;
+    }
+    context_ids
+}
+
+struct MaskedViewPair {
+    view_a: Vec<u32>,
+    view_b: Vec<u32>,
+    target: Vec<u32>,
+    positions_a: Vec<usize>,
+    valid_len: usize,
+    code_like: bool,
+}
+
+/// Build two masked views over ONE shared crop/segment sample so that the
+/// chunk/global multi-view losses compare representations of the same text
+/// span.
+fn build_masked_view_pair(
     tokens: &[String],
     vocab: &Vocab,
     cfg: &CurriculumDenoisingConfig,
     rng: &mut rand::rngs::ThreadRng,
-) -> (Vec<u32>, Vec<u32>, Vec<usize>, bool) {
+) -> MaskedViewPair {
     let prepared_tokens = prepare_segmented_context_tokens(tokens, cfg, rng);
     let code_like = is_code_like_tokens(&prepared_tokens);
     let mut target_ids = vocab.encode(&prepared_tokens);
-    let valid_len = target_ids.len().max(1);
+    let valid_len = target_ids.len().clamp(1, cfg.max_seq);
     pad_or_truncate(&mut target_ids, cfg.max_seq, vocab.pad_id);
-    let mut context_ids = target_ids.clone();
-
-    let valid_positions: Vec<usize> = (0..valid_len).collect();
-    let identifier_positions: Vec<usize> = prepared_tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, tok)| is_identifier_like(tok).then_some(idx))
-        .collect();
-    let comment_positions: Vec<usize> = prepared_tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, tok)| is_comment_token(tok).then_some(idx))
-        .collect();
-    let block_positions: Vec<usize> = prepared_tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, tok)| is_block_token(tok).then_some(idx))
-        .collect();
-    let text_boundary_positions: Vec<usize> = prepared_tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, tok)| is_text_boundary_token(tok).then_some(idx))
-        .collect();
-    let mut selected: HashSet<usize> = HashSet::new();
-
-    let ratio_multiplier = if code_like {
-        cfg.code_masked_ratio_multiplier.max(1.0)
-    } else {
-        1.0
-    };
-    let min_ratio = (cfg.min_masked_ratio * ratio_multiplier).clamp(0.08, 0.9);
-    let max_ratio = (cfg.max_masked_ratio * ratio_multiplier).clamp(min_ratio, 0.9);
-    let min_masked = (valid_positions.len() as f64 * min_ratio).ceil() as usize;
-    let min_masked = min_masked.max(1).min(valid_positions.len());
-    let max_masked = (valid_positions.len() as f64 * max_ratio).ceil() as usize;
-    let max_masked = max_masked.max(min_masked).min(valid_positions.len());
-    let target_masked = if min_masked >= max_masked {
-        max_masked
-    } else {
-        rng.random_range(min_masked..=max_masked)
-    };
-    let span_count = rng.random_range(1..=cfg.max_spans_per_sample.max(1));
-    let mut span_len_cap = cfg.max_span_len.max(1);
-    if code_like {
-        span_len_cap = ((span_len_cap as f64) * cfg.code_span_multiplier).round() as usize;
-        span_len_cap = span_len_cap.max(1);
+    let token_strs: Vec<&str> = prepared_tokens.iter().map(String::as_str).collect();
+    let pools = masking_pools(&token_strs, code_like);
+    let positions_a = select_masked_positions(&pools, cfg, rng);
+    let positions_b = select_masked_positions(&pools, cfg, rng);
+    let view_a = apply_mask(&target_ids, &positions_a, vocab.mask_id);
+    let view_b = apply_mask(&target_ids, &positions_b, vocab.mask_id);
+    MaskedViewPair {
+        view_a,
+        view_b,
+        target: target_ids,
+        positions_a,
+        valid_len,
+        code_like,
     }
-
-    for span_idx in 0..span_count {
-        if selected.len() >= target_masked {
-            break;
-        }
-        let use_identifier_focus = code_like
-            && !identifier_positions.is_empty()
-            && (span_idx == 0 || rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
-        let use_comment_focus = !comment_positions.is_empty()
-            && rng.random_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
-        let use_block_focus = code_like
-            && !block_positions.is_empty()
-            && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
-        let use_text_boundary_focus = !code_like
-            && !text_boundary_positions.is_empty()
-            && rng.random_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
-        let start_pool = if use_comment_focus {
-            &comment_positions
-        } else if use_block_focus {
-            &block_positions
-        } else if use_text_boundary_focus {
-            &text_boundary_positions
-        } else if use_identifier_focus {
-            &identifier_positions
-        } else {
-            &valid_positions
-        };
-        let Some(&start) = start_pool.choose(rng) else {
-            continue;
-        };
-        let span_len = if use_comment_focus {
-            rng.random_range(2..=span_len_cap.clamp(2, 12))
-        } else if use_block_focus {
-            rng.random_range(2..=span_len_cap.clamp(2, 10))
-        } else if use_text_boundary_focus {
-            rng.random_range(3..=span_len_cap.clamp(3, 12))
-        } else if use_identifier_focus {
-            rng.random_range(1..=span_len_cap.min(4))
-        } else {
-            rng.random_range(1..=span_len_cap)
-        };
-        for p in start..(start + span_len).min(valid_len) {
-            if selected.len() >= target_masked {
-                break;
-            }
-            selected.insert(p);
-        }
-    }
-
-    while selected.len() < target_masked {
-        let Some(&start) = valid_positions.choose(rng) else {
-            break;
-        };
-        let span_len = rng.random_range(
-            1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)),
-        );
-        for p in start..(start + span_len).min(valid_len) {
-            if selected.len() >= target_masked {
-                break;
-            }
-            selected.insert(p);
-        }
-    }
-
-    if selected.is_empty() {
-        if let Some(&fallback) = valid_positions.choose(rng) {
-            selected.insert(fallback);
-        }
-    }
-
-    let mut selected_positions: Vec<usize> = selected.into_iter().collect();
-    selected_positions.sort_unstable();
-    for &p in &selected_positions {
-        context_ids[p] = vocab.mask_id;
-    }
-
-    (context_ids, target_ids, selected_positions, code_like)
 }
 
-fn build_masked_view_from_ids(
+fn build_masked_view_pair_from_ids(
     ids: &[u32],
     vocab: &Vocab,
     cfg: &CurriculumDenoisingConfig,
     rng: &mut rand::rngs::ThreadRng,
-) -> (Vec<u32>, Vec<u32>, Vec<usize>, bool) {
+) -> MaskedViewPair {
     let prepared_ids = prepare_segmented_context_ids(ids, cfg, rng);
     let code_like = is_code_like_ids(&prepared_ids, vocab);
     let mut target_ids = prepared_ids.clone();
-    let valid_len = target_ids.len().max(1);
+    let valid_len = target_ids.len().clamp(1, cfg.max_seq);
     pad_or_truncate(&mut target_ids, cfg.max_seq, vocab.pad_id);
-    let mut context_ids = target_ids.clone();
-
-    let valid_positions: Vec<usize> = (0..valid_len).collect();
-    let identifier_positions: Vec<usize> = prepared_ids
+    let token_strs: Vec<&str> = prepared_ids
         .iter()
-        .enumerate()
-        .filter_map(|(idx, &id)| is_identifier_like(token_str(vocab, id)).then_some(idx))
+        .map(|&id| token_str(vocab, id))
         .collect();
-    let comment_positions: Vec<usize> = prepared_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &id)| is_comment_token(token_str(vocab, id)).then_some(idx))
-        .collect();
-    let block_positions: Vec<usize> = prepared_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &id)| is_block_token(token_str(vocab, id)).then_some(idx))
-        .collect();
-    let text_boundary_positions: Vec<usize> = prepared_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &id)| is_text_boundary_token(token_str(vocab, id)).then_some(idx))
-        .collect();
-    let ratio_multiplier = if code_like {
-        cfg.code_masked_ratio_multiplier.max(1.0)
-    } else {
-        1.0
-    };
-    let min_ratio = (cfg.min_masked_ratio * ratio_multiplier).clamp(0.08, 0.9);
-    let max_ratio = (cfg.max_masked_ratio * ratio_multiplier).clamp(min_ratio, 0.9);
-    let min_masked = (valid_positions.len() as f64 * min_ratio).ceil() as usize;
-    let min_masked = min_masked.max(1).min(valid_positions.len());
-    let max_masked = (valid_positions.len() as f64 * max_ratio).ceil() as usize;
-    let max_masked = max_masked.max(min_masked).min(valid_positions.len());
-    let target_masked = if min_masked >= max_masked {
-        max_masked
-    } else {
-        rng.random_range(min_masked..=max_masked)
-    };
-    let span_count = rng.random_range(1..=cfg.max_spans_per_sample.max(1));
-    let mut span_len_cap = cfg.max_span_len.max(1);
-    if code_like {
-        span_len_cap = ((span_len_cap as f64) * cfg.code_span_multiplier).round() as usize;
-        span_len_cap = span_len_cap.max(1);
+    let pools = masking_pools(&token_strs, code_like);
+    let positions_a = select_masked_positions(&pools, cfg, rng);
+    let positions_b = select_masked_positions(&pools, cfg, rng);
+    let view_a = apply_mask(&target_ids, &positions_a, vocab.mask_id);
+    let view_b = apply_mask(&target_ids, &positions_b, vocab.mask_id);
+    MaskedViewPair {
+        view_a,
+        view_b,
+        target: target_ids,
+        positions_a,
+        valid_len,
+        code_like,
     }
-    let mut selected: HashSet<usize> = HashSet::new();
-
-    for span_idx in 0..span_count {
-        if selected.len() >= target_masked {
-            break;
-        }
-        let use_identifier_focus = code_like
-            && !identifier_positions.is_empty()
-            && (span_idx == 0 || rng.random_bool(cfg.identifier_focus_prob.clamp(0.0, 1.0)));
-        let use_comment_focus = !comment_positions.is_empty()
-            && rng.random_bool(cfg.comment_focus_prob.clamp(0.0, 1.0));
-        let use_block_focus = code_like
-            && !block_positions.is_empty()
-            && rng.random_bool(cfg.block_focus_prob.clamp(0.0, 1.0));
-        let use_text_boundary_focus = !code_like
-            && !text_boundary_positions.is_empty()
-            && rng.random_bool(cfg.text_boundary_focus_prob.clamp(0.0, 1.0));
-        let start_pool = if use_comment_focus {
-            &comment_positions
-        } else if use_block_focus {
-            &block_positions
-        } else if use_text_boundary_focus {
-            &text_boundary_positions
-        } else if use_identifier_focus {
-            &identifier_positions
-        } else {
-            &valid_positions
-        };
-        let Some(&start) = start_pool.choose(rng) else {
-            continue;
-        };
-        let span_len = if use_comment_focus {
-            rng.random_range(2..=span_len_cap.clamp(2, 12))
-        } else if use_block_focus {
-            rng.random_range(2..=span_len_cap.clamp(2, 10))
-        } else if use_text_boundary_focus {
-            rng.random_range(3..=span_len_cap.clamp(3, 12))
-        } else if use_identifier_focus {
-            rng.random_range(1..=span_len_cap.min(4))
-        } else {
-            rng.random_range(1..=span_len_cap)
-        };
-        for p in start..(start + span_len).min(valid_len) {
-            if selected.len() >= target_masked {
-                break;
-            }
-            selected.insert(p);
-        }
-    }
-
-    while selected.len() < target_masked {
-        let Some(&start) = valid_positions.choose(rng) else {
-            break;
-        };
-        let span_len = rng.random_range(
-            1..=span_len_cap.min(target_masked.saturating_sub(selected.len()).max(1)),
-        );
-        for p in start..(start + span_len).min(valid_len) {
-            if selected.len() >= target_masked {
-                break;
-            }
-            selected.insert(p);
-        }
-    }
-
-    if selected.is_empty() {
-        if let Some(&fallback) = valid_positions.choose(rng) {
-            selected.insert(fallback);
-        }
-    }
-
-    let mut selected_positions: Vec<usize> = selected.into_iter().collect();
-    selected_positions.sort_unstable();
-    for &p in &selected_positions {
-        context_ids[p] = vocab.mask_id;
-    }
-
-    (context_ids, target_ids, selected_positions, code_like)
 }
 
 pub fn make_augmented_jepa_batch(
@@ -2233,20 +2278,13 @@ pub fn make_augmented_jepa_batch(
         .enumerate()
         .map(|(b, tokens)| {
             let mut rng = rng();
-            let (view_a_ids, target_ids, selected_positions, code_like) =
-                build_masked_view(tokens, vocab, cfg, &mut rng);
-            let (view_b_ids, _, _, code_like_b) = build_masked_view(tokens, vocab, cfg, &mut rng);
-            let target_linear = selected_positions
-                .into_iter()
-                .map(|p| (b * cfg.max_seq + p) as u32)
+            let pair = build_masked_view_pair(tokens, vocab, cfg, &mut rng);
+            let target_linear = pair
+                .positions_a
+                .iter()
+                .map(|&p| (b * cfg.max_seq + p) as u32)
                 .collect::<Vec<_>>();
-            (
-                view_a_ids,
-                view_b_ids,
-                target_ids,
-                target_linear,
-                code_like || code_like_b,
-            )
+            (pair, target_linear)
         })
         .collect::<Vec<_>>();
 
@@ -2254,28 +2292,33 @@ pub fn make_augmented_jepa_batch(
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_linear = Vec::new();
+    let mut valid_lens = Vec::with_capacity(batch_size);
     let mut code_like_count = 0usize;
-    for (view_a_ids, view_b_ids, target_ids, row_target_linear, code_like) in rows {
-        if code_like {
+    for (pair, row_target_linear) in rows {
+        if pair.code_like {
             code_like_count += 1;
         }
         target_linear.extend(row_target_linear);
-        view_a_buf.extend(view_a_ids);
-        view_b_buf.extend(view_b_ids);
-        target_buf.extend(target_ids);
+        view_a_buf.extend(pair.view_a);
+        view_b_buf.extend(pair.view_b);
+        target_buf.extend(pair.target);
+        valid_lens.push(pair.valid_len);
     }
 
     let view_a_ids = Tensor::from_vec(view_a_buf, (batch_size, cfg.max_seq), device)?;
     let view_b_ids = Tensor::from_vec(view_b_buf, (batch_size, cfg.max_seq), device)?;
     let target_ids = Tensor::from_vec(target_buf, (batch_size, cfg.max_seq), device)?;
     let target_count = target_linear.len();
-    let target_linear_indices = Tensor::from_vec(target_linear, (target_count,), device)?;
+    let target_linear_indices =
+        Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
 
     Ok(AugmentedJepaBatch {
         view_a_ids,
         view_b_ids,
         target_ids,
         target_linear_indices,
+        target_linear_host: target_linear,
+        valid_lens,
         target_count,
         code_fraction: code_like_count as f32 / batch_size.max(1) as f32,
     })
@@ -2293,21 +2336,13 @@ pub fn make_augmented_jepa_batch_from_pairs(
         .enumerate()
         .map(|(b, pair)| {
             let mut rng = rng();
-            let (view_a_ids, target_ids, selected_positions, code_like) =
-                build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
-            let (view_b_ids, _, _, code_like_b) =
-                build_masked_view_from_ids(&pair.tokens, vocab, cfg, &mut rng);
-            let target_linear = selected_positions
-                .into_iter()
-                .map(|p| (b * cfg.max_seq + p) as u32)
+            let view_pair = build_masked_view_pair_from_ids(&pair.tokens, vocab, cfg, &mut rng);
+            let target_linear = view_pair
+                .positions_a
+                .iter()
+                .map(|&p| (b * cfg.max_seq + p) as u32)
                 .collect::<Vec<_>>();
-            (
-                view_a_ids,
-                view_b_ids,
-                target_ids,
-                target_linear,
-                code_like || code_like_b,
-            )
+            (view_pair, target_linear)
         })
         .collect::<Vec<_>>();
 
@@ -2315,28 +2350,33 @@ pub fn make_augmented_jepa_batch_from_pairs(
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut target_linear = Vec::new();
+    let mut valid_lens = Vec::with_capacity(batch_size);
     let mut code_like_count = 0usize;
-    for (view_a_ids, view_b_ids, target_ids, row_target_linear, code_like) in rows {
-        if code_like {
+    for (view_pair, row_target_linear) in rows {
+        if view_pair.code_like {
             code_like_count += 1;
         }
         target_linear.extend(row_target_linear);
-        view_a_buf.extend(view_a_ids);
-        view_b_buf.extend(view_b_ids);
-        target_buf.extend(target_ids);
+        view_a_buf.extend(view_pair.view_a);
+        view_b_buf.extend(view_pair.view_b);
+        target_buf.extend(view_pair.target);
+        valid_lens.push(view_pair.valid_len);
     }
 
     let view_a_ids = Tensor::from_vec(view_a_buf, (batch_size, cfg.max_seq), device)?;
     let view_b_ids = Tensor::from_vec(view_b_buf, (batch_size, cfg.max_seq), device)?;
     let target_ids = Tensor::from_vec(target_buf, (batch_size, cfg.max_seq), device)?;
     let target_count = target_linear.len();
-    let target_linear_indices = Tensor::from_vec(target_linear, (target_count,), device)?;
+    let target_linear_indices =
+        Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
 
     Ok(AugmentedJepaBatch {
         view_a_ids,
         view_b_ids,
         target_ids,
         target_linear_indices,
+        target_linear_host: target_linear,
+        valid_lens,
         target_count,
         code_fraction: code_like_count as f32 / batch_size.max(1) as f32,
     })

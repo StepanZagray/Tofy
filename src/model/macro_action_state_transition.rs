@@ -7,6 +7,10 @@ use super::attention::TransformerBlock;
 
 const MASK_VALUE: f32 = -1.0e4;
 
+/// Dedicated padding id for macro-action sequences. Reusing action id 0
+/// (`text_reply`) for padding would alias real actions in the embedding.
+pub const MACRO_PAD_ACTION_ID: u32 = NUM_ACTIONS as u32;
+
 /// Encodes a variable-length sequence of primitive actions into one macro-action vector.
 pub struct ActionSequenceEncoder {
     action_embed: nn::Embedding,
@@ -25,7 +29,7 @@ pub struct ActionSequenceEncoder {
 impl ActionSequenceEncoder {
     pub fn new(vb: VarBuilder<'_>, dim: usize, max_len: usize) -> Result<Self> {
         let max_len = max_len.max(1);
-        let action_embed = nn::embedding(NUM_ACTIONS, dim, vb.pp("action_embed"))?;
+        let action_embed = nn::embedding(NUM_ACTIONS + 1, dim, vb.pp("action_embed"))?;
         let position_embed = nn::embedding(max_len, dim, vb.pp("position_embed"))?;
         let len_embed = nn::embedding(max_len + 1, dim, vb.pp("len_embed"))?;
         let heads = transition_heads(dim);
@@ -128,8 +132,11 @@ impl ActionSequenceEncoder {
             let len = seq.len().clamp(1, macro_len);
             lens.push(len as u32);
             for pos in 0..macro_len {
-                let id = seq.get(pos).copied().unwrap_or(0);
-                flat.push(id.min((NUM_ACTIONS - 1) as u32));
+                let id = seq
+                    .get(pos)
+                    .map(|&id| id.min((NUM_ACTIONS - 1) as u32))
+                    .unwrap_or(MACRO_PAD_ACTION_ID);
+                flat.push(id);
             }
         }
         let action_tensor = Tensor::from_vec(flat, (batch, macro_len), device)?;

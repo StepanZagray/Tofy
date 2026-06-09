@@ -17,6 +17,18 @@ pub trait LocalDecoderRuntime {
         max_new_tokens: usize,
     ) -> Result<String>;
 
+    fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        let _ = temperature;
+        self.generate(prompt, action, conditioning, max_new_tokens)
+    }
+
     /// Stream generated text in chunks (e.g. for SSE). Default: run generate() and call on_chunk once with full result.
     fn generate_stream(
         &self,
@@ -27,6 +39,28 @@ pub trait LocalDecoderRuntime {
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
         let full = self.generate(prompt, action, conditioning, max_new_tokens)?;
+        if !full.is_empty() {
+            on_chunk(&full);
+        }
+        Ok(())
+    }
+
+    fn generate_stream_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let full = self.generate_with_temperature(
+            prompt,
+            action,
+            conditioning,
+            max_new_tokens,
+            temperature,
+        )?;
         if !full.is_empty() {
             on_chunk(&full);
         }
@@ -49,6 +83,23 @@ impl<T: LocalDecoderRuntime + ?Sized> LocalDecoderRuntime for Arc<T> {
         (**self).generate(prompt, action, conditioning, max_new_tokens)
     }
 
+    fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        (**self).generate_with_temperature(
+            prompt,
+            action,
+            conditioning,
+            max_new_tokens,
+            temperature,
+        )
+    }
+
     fn generate_stream(
         &self,
         prompt: &str,
@@ -58,6 +109,25 @@ impl<T: LocalDecoderRuntime + ?Sized> LocalDecoderRuntime for Arc<T> {
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
         (**self).generate_stream(prompt, action, conditioning, max_new_tokens, on_chunk)
+    }
+
+    fn generate_stream_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        (**self).generate_stream_with_temperature(
+            prompt,
+            action,
+            conditioning,
+            max_new_tokens,
+            temperature,
+            on_chunk,
+        )
     }
 }
 
@@ -239,15 +309,30 @@ impl RlmDecoderRuntime {
         conditioning: &[f32],
         max_new_tokens: usize,
     ) -> Result<String> {
+        self.generate_rlm_with_temperature(prompt, action, conditioning, max_new_tokens, None)
+    }
+
+    fn generate_rlm_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
         let cfg = RlmDecoderConfig::from_env(max_new_tokens);
         if !Self::should_recurse(prompt, action, &cfg) {
-            return self
-                .inner
-                .generate(prompt, action, conditioning, max_new_tokens);
+            return self.inner.generate_with_temperature(
+                prompt,
+                action,
+                conditioning,
+                max_new_tokens,
+                temperature,
+            );
         }
         let mut env = RlmDecoderEnvironment::new(prompt, action, &cfg);
         let mut program = if cfg.model_program {
-            self.generate_program(&env, conditioning, &cfg)
+            self.generate_program(&env, conditioning, &cfg, temperature)
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -259,7 +344,8 @@ impl RlmDecoderRuntime {
         } else {
             env.trace.push("root: model recursive program".to_string());
         }
-        let response = self.execute_program(&mut env, &program, 0, conditioning, &cfg)?;
+        let response =
+            self.execute_program(&mut env, &program, 0, conditioning, &cfg, temperature)?;
         if std::env::var("JEPA_DEBUG").is_ok() {
             let _ = writeln!(
                 std::io::stderr(),
@@ -275,11 +361,16 @@ impl RlmDecoderRuntime {
         env: &RlmDecoderEnvironment,
         conditioning: &[f32],
         cfg: &RlmDecoderConfig,
+        temperature: Option<f32>,
     ) -> Result<Vec<RlmProgramOp>> {
         let prompt = build_program_prompt(env, cfg);
-        let raw = self
-            .inner
-            .generate(&prompt, &env.action, conditioning, cfg.program_tokens)?;
+        let raw = self.inner.generate_with_temperature(
+            &prompt,
+            &env.action,
+            conditioning,
+            cfg.program_tokens,
+            temperature,
+        )?;
         Ok(parse_rlm_program(&raw))
     }
 
@@ -290,6 +381,7 @@ impl RlmDecoderRuntime {
         depth: usize,
         conditioning: &[f32],
         cfg: &RlmDecoderConfig,
+        temperature: Option<f32>,
     ) -> Result<String> {
         for op in program.iter().take(cfg.max_ops) {
             match op {
@@ -313,7 +405,14 @@ impl RlmDecoderRuntime {
                     let Some(input) = env.load(input_var) else {
                         continue;
                     };
-                    let output = self.invoke_sub_rlm(env, &input, depth + 1, conditioning, cfg)?;
+                    let output = self.invoke_sub_rlm(
+                        env,
+                        &input,
+                        depth + 1,
+                        conditioning,
+                        cfg,
+                        temperature,
+                    )?;
                     env.store(output_var, output);
                     env.trace
                         .push(format!("depth={depth} SUB_RLM {input_var} AS {output_var}"));
@@ -340,6 +439,7 @@ impl RlmDecoderRuntime {
         depth: usize,
         conditioning: &[f32],
         cfg: &RlmDecoderConfig,
+        temperature: Option<f32>,
     ) -> Result<String> {
         let nested = semantic_work_units(input, cfg.chunk_chars, cfg.max_units);
         if depth < cfg.max_depth && nested.len() > 1 {
@@ -352,11 +452,23 @@ impl RlmDecoderRuntime {
                 trace: Vec::new(),
             };
             let program = default_rlm_program(child.units.len());
-            return self.execute_program(&mut child, &program, depth, conditioning, cfg);
+            return self.execute_program(
+                &mut child,
+                &program,
+                depth,
+                conditioning,
+                cfg,
+                temperature,
+            );
         }
         let leaf_prompt = build_leaf_prompt(env, input, depth, cfg);
-        self.inner
-            .generate(&leaf_prompt, &env.action, conditioning, cfg.leaf_tokens)
+        self.inner.generate_with_temperature(
+            &leaf_prompt,
+            &env.action,
+            conditioning,
+            cfg.leaf_tokens,
+            temperature,
+        )
     }
 }
 
@@ -373,6 +485,23 @@ impl LocalDecoderRuntime for RlmDecoderRuntime {
         max_new_tokens: usize,
     ) -> Result<String> {
         self.generate_rlm(prompt, action, conditioning, max_new_tokens)
+    }
+
+    fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        self.generate_rlm_with_temperature(
+            prompt,
+            action,
+            conditioning,
+            max_new_tokens,
+            temperature,
+        )
     }
 }
 
@@ -464,6 +593,10 @@ impl LlamaCppDecoder {
     }
 }
 
+fn request_temperature(default: f32, override_temperature: Option<f32>) -> f32 {
+    override_temperature.unwrap_or(default).clamp(0.0, 2.0)
+}
+
 impl LocalDecoderRuntime for LlamaCppDecoder {
     fn is_available(&self) -> bool {
         true
@@ -476,6 +609,18 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
         _conditioning: &[f32],
         max_new_tokens: usize,
     ) -> Result<String> {
+        self.generate_with_temperature(prompt, action, _conditioning, max_new_tokens, None)
+    }
+
+    fn generate_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        _conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        let temperature = request_temperature(self.temperature, temperature);
         let full_prompt = format!(
             "System: You are Tofy, a JEPA-style dialog-transition agent. Action={action}. Reply directly to the user.\nUser: {prompt}\nAssistant:"
         );
@@ -491,7 +636,7 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
             .arg("-ngl")
             .arg(self.gpu_layers.to_string())
             .arg("--temp")
-            .arg(self.temperature.to_string())
+            .arg(temperature.to_string())
             .arg("--repeat-penalty")
             .arg(self.repeat_penalty.to_string())
             .arg("--simple-io")
@@ -535,6 +680,26 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
         max_new_tokens: usize,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<()> {
+        self.generate_stream_with_temperature(
+            prompt,
+            action,
+            _conditioning,
+            max_new_tokens,
+            None,
+            on_chunk,
+        )
+    }
+
+    fn generate_stream_with_temperature(
+        &self,
+        prompt: &str,
+        action: &str,
+        _conditioning: &[f32],
+        max_new_tokens: usize,
+        temperature: Option<f32>,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let temperature = request_temperature(self.temperature, temperature);
         let full_prompt = format!(
             "System: You are Tofy, a JEPA-style dialog-transition agent. Action={action}. Reply directly to the user.\nUser: {prompt}\nAssistant:"
         );
@@ -551,7 +716,7 @@ impl LocalDecoderRuntime for LlamaCppDecoder {
             .arg("-ngl")
             .arg(self.gpu_layers.to_string())
             .arg("--temp")
-            .arg(self.temperature.to_string())
+            .arg(temperature.to_string())
             .arg("--repeat-penalty")
             .arg(self.repeat_penalty.to_string())
             .arg("--simple-io")

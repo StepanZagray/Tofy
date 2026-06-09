@@ -143,6 +143,7 @@ async fn chat_completions(
     }
 
     let max_tokens = body.max_tokens.unwrap_or(4096) as usize;
+    let temperature = body.temperature.map(|value| value.clamp(0.0, 2.0));
     if std::env::var("JEPA_DEBUG").is_ok() {
         let _ = writeln!(
             std::io::stderr(),
@@ -170,7 +171,13 @@ async fn chat_completions(
             let mut send = |chunk: &str| {
                 let _ = tx.blocking_send(Some(chunk.to_string()));
             };
-            let _ = guard.generate_stream(&prompt_clone, max_tokens, false, &mut send);
+            let _ = guard.generate_stream_with_temperature(
+                &prompt_clone,
+                max_tokens,
+                false,
+                temperature,
+                &mut send,
+            );
             let _ = tx.blocking_send(None); // explicit done so client gets finish_reason
         });
         let id_for_finish = id.clone();
@@ -222,7 +229,7 @@ async fn chat_completions(
             .lock()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         guard
-            .generate(&prompt, max_tokens, false)
+            .generate_with_temperature(&prompt, max_tokens, false, temperature)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
@@ -286,7 +293,7 @@ pub async fn run(
         &encoder_model_path,
         &encoder_vocab_path,
         &world_model_path,
-        high_world_model_path.as_ref(),
+        high_world_model_path.as_deref(),
         dim,
         max_seq,
         num_layers,

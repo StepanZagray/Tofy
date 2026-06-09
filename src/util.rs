@@ -95,6 +95,24 @@ pub fn varmap_tensor_snapshot(varmap: &VarMap) -> Result<HashMap<String, Tensor>
         .collect())
 }
 
+pub fn load_varmap_checked(varmap: &mut VarMap, path: &Path) -> Result<()> {
+    let is_empty = {
+        let data = varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock varmap before checkpoint load"))?;
+        data.is_empty()
+    };
+    if is_empty {
+        anyhow::bail!(
+            "refusing to load checkpoint {:?} into an empty VarMap; construct model modules before loading",
+            path
+        );
+    }
+    varmap.load(path)?;
+    Ok(())
+}
+
 pub fn save_tensor_map_atomic(tensors: &HashMap<String, Tensor>, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1223,6 +1241,66 @@ pub fn optimizer_step_from_accumulated<O: Optimizer>(
     Ok(())
 }
 
+/// Linear-warmup + cosine-decay learning-rate schedule shared by the training
+/// stages. Controlled by `TOFY_LR_SCHEDULE` (`cosine` default, `constant` to
+/// opt out), `TOFY_LR_WARMUP_STEPS`, and `TOFY_LR_MIN_RATIO`.
+pub fn scheduled_lr(base_lr: f64, step: usize, total_steps: usize) -> f64 {
+    let schedule = std::env::var("TOFY_LR_SCHEDULE").unwrap_or_else(|_| "cosine".to_string());
+    if schedule.eq_ignore_ascii_case("constant") {
+        return base_lr;
+    }
+    let total = total_steps.max(1);
+    let step = step.min(total);
+    let default_warmup = (total / 20).clamp(100, 2000).min(total.saturating_sub(1));
+    let warmup = std::env::var("TOFY_LR_WARMUP_STEPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default_warmup)
+        .min(total.saturating_sub(1));
+    if warmup > 0 && step <= warmup {
+        return base_lr * step as f64 / warmup as f64;
+    }
+    let min_ratio = std::env::var("TOFY_LR_MIN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.05)
+        .clamp(0.0, 1.0);
+    let progress = (step - warmup) as f64 / (total - warmup).max(1) as f64;
+    let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
+}
+
+/// Clip accumulated gradients to a maximum global L2 norm. Returns the
+/// pre-clip global norm. A `max_norm` of 0 disables clipping.
+pub fn clip_accumulated_gradients(
+    accumulated: &mut Option<GradStore>,
+    train_vars: &[Var],
+    max_norm: f64,
+) -> Result<f64> {
+    if max_norm <= 0.0 {
+        return Ok(0.0);
+    }
+    let Some(grads) = accumulated.as_mut() else {
+        return Ok(0.0);
+    };
+    let mut total_sq = 0f64;
+    for var in train_vars {
+        if let Some(grad) = grads.get(var) {
+            total_sq += scalar_f32(&grad.sqr()?.sum_all()?)? as f64;
+        }
+    }
+    let norm = total_sq.sqrt();
+    if norm.is_finite() && norm > max_norm {
+        let scale = max_norm / norm;
+        for var in train_vars {
+            if let Some(grad) = grads.remove(var) {
+                grads.insert(var, grad.affine(scale, 0.0)?);
+            }
+        }
+    }
+    Ok(norm)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VramSnapshot {
     pub used_mb: f32,
@@ -1283,5 +1361,19 @@ impl VramTracker {
         };
         fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_varmap_checked_rejects_empty_varmap() {
+        let mut varmap = VarMap::new();
+        let err = load_varmap_checked(&mut varmap, Path::new("missing.safetensors"))
+            .expect_err("empty varmap loads must fail before reading checkpoint");
+
+        assert!(err.to_string().contains("empty VarMap"));
     }
 }

@@ -1,9 +1,30 @@
 use anyhow::Result;
 use candle_core::Tensor;
-use rand::RngExt;
+use rand::{RngExt, SeedableRng};
+
+fn l2_normalize_last_dim(x: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    let Some(&dim) = dims.last() else {
+        anyhow::bail!("normalization tensor must have at least one dimension");
+    };
+    let rows = dims[..dims.len().saturating_sub(1)]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let x = x.reshape((rows, dim))?;
+    let norm = x.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
+    x.broadcast_div(&norm.unsqueeze(1)?)
+        .and_then(|normalized| normalized.reshape(dims))
+        .map_err(Into::into)
+}
 
 pub fn prediction_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
-    Ok(pred.broadcast_sub(target)?.sqr()?.mean_all()?)
+    let pred_norm = l2_normalize_last_dim(pred)?;
+    let target_norm = l2_normalize_last_dim(target)?;
+    Ok(pred_norm
+        .broadcast_sub(&target_norm)?
+        .sqr()?
+        .mean_all()?)
 }
 
 pub fn mean_cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -40,13 +61,18 @@ pub fn flatten_latent_slots(latent_slots: &Tensor) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
-/// Lightweight in-repo SIGReg approximation using random 1D projections and
-/// an Epps-Pulley-style characteristic-function match to N(0, 1).
+/// Seed for the SIGReg projection directions. Fixed so the regularization
+/// target is stable across forward passes; resampling directions every call
+/// makes the loss a moving target with high-variance gradients.
+const SIGREG_PROJECTION_SEED: u64 = 0x5147_5253_4947_4552;
+
+/// Lightweight in-repo SIGReg approximation using fixed random 1D projections
+/// and an Epps-Pulley-style characteristic-function match to N(0, 1).
 pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> Result<Tensor> {
-    let (num_samples, dim) = x.dims2()?;
+    let (_, dim) = x.dims2()?;
     let device = x.device();
     let work_dtype = x.dtype();
-    let mut rng = rand::rng();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SIGREG_PROJECTION_SEED);
 
     let mut proj = vec![0f32; dim * num_slices];
     for slice in 0..num_slices {
@@ -83,7 +109,6 @@ pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> R
     }
 
     let stacked = Tensor::cat(&per_t, 0)?;
-    let _ = num_samples;
     stacked.mean_all().map_err(Into::into)
 }
 
@@ -91,6 +116,16 @@ pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> R
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn prediction_loss_is_invariant_to_vector_scale() -> Result<()> {
+        let device = Device::Cpu;
+        let target = Tensor::from_vec(vec![3.0f32, 4.0], (1, 2), &device)?;
+        let pred = Tensor::from_vec(vec![6.0f32, 8.0], (1, 2), &device)?;
+        let loss = prediction_loss(&pred, &target)?.to_vec0::<f32>()?;
+        assert!(loss < 1e-5, "normalized loss should be near zero, got {loss}");
+        Ok(())
+    }
 
     #[test]
     fn mean_cosine_similarity_uses_last_dimension_for_slot_tensors() -> Result<()> {

@@ -25,4 +25,9 @@ impl OnlineEncoder {
     pub fn forward_features(&self, x: &Tensor) -> Result<EncoderFeatures> {
         self.inner.forward_features(x)
     }
+
+    /// Effective chunk size the backbone will use for a given sequence length.
+    pub fn chunk_size_for_seq_len(&self, seq_len: usize) -> usize {
+        self.inner.chunk_size_for_seq_len(seq_len)
+    }
 }

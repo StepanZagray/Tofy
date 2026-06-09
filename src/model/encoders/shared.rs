@@ -124,15 +124,15 @@ impl EncoderBackbone {
         })
     }
 
+    pub(crate) fn chunk_size_for_seq_len(&self, seq_len: usize) -> usize {
+        self.effective_chunk_size(seq_len)
+    }
+
     fn effective_chunk_size(&self, seq_len: usize) -> usize {
         let seq_len = seq_len.max(1);
         let min_chunk = self.chunk_size.min(seq_len);
         let target_chunk = seq_len.div_ceil(TARGET_NUM_CHUNKS).max(min_chunk);
-        let mut chunk = target_chunk.min(seq_len);
-        while !seq_len.is_multiple_of(chunk) && chunk < seq_len {
-            chunk += 1;
-        }
-        chunk.max(1)
+        target_chunk.min(seq_len).max(1)
     }
 
     pub(crate) fn forward_features(&self, x: &Tensor) -> Result<EncoderFeatures> {
@@ -153,8 +153,20 @@ impl EncoderBackbone {
         }
 
         let (batch, _, dim) = token_states.dims3()?;
-        let num_chunks = seq_len / chunk_size;
-        let chunk_mask = token_mask.reshape((batch, num_chunks, chunk_size))?;
+        let num_chunks = seq_len.div_ceil(chunk_size);
+        let padded_len = num_chunks * chunk_size;
+        let (chunk_source, chunk_token_mask) = if padded_len > seq_len {
+            let pad_len = padded_len - seq_len;
+            let state_pad = Tensor::zeros((batch, pad_len, dim), token_states.dtype(), x.device())?;
+            let mask_pad = Tensor::zeros((batch, pad_len), token_mask.dtype(), x.device())?;
+            (
+                Tensor::cat(&[token_states.clone(), state_pad], 1)?,
+                Tensor::cat(&[token_mask.clone(), mask_pad], 1)?,
+            )
+        } else {
+            (token_states.clone(), token_mask.clone())
+        };
+        let chunk_mask = chunk_token_mask.reshape((batch, num_chunks, chunk_size))?;
         let chunk_weights = chunk_mask.unsqueeze(3)?.to_dtype(token_states.dtype())?;
         let chunk_denom = chunk_mask
             .sum(2)?
@@ -162,7 +174,7 @@ impl EncoderBackbone {
             .unsqueeze(2)?
             .to_dtype(token_states.dtype())?;
         let valid_chunks = chunk_mask.sum(2)?.clamp(0.0, 1.0)?;
-        let mut chunk_states = token_states
+        let mut chunk_states = chunk_source
             .reshape((batch, num_chunks, chunk_size, dim))?
             .broadcast_mul(&chunk_weights)?
             .sum(2)?
@@ -194,7 +206,8 @@ impl EncoderBackbone {
         let chunk_context = chunk_states
             .unsqueeze(2)?
             .broadcast_as((batch, num_chunks, chunk_size, dim))?
-            .reshape((batch, seq_len, dim))?;
+            .reshape((batch, padded_len, dim))?
+            .narrow(1, 0, seq_len)?;
         let token_context = self.token_context_proj.forward(&chunk_context)?;
         let token_states = self
             .token_ln_final
@@ -250,6 +263,29 @@ mod tests {
         for value in rows[0][2].iter().chain(rows[0][3].iter()) {
             assert!(value.abs() < 1e-5, "padded token output was {value}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_keeps_chunk_resolution_for_prime_sequence_lengths() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let encoder = EncoderBackbone::new(
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            128,
+            8,
+            2,
+            2,
+        )?;
+        let ids = (1u32..=67).collect::<Vec<_>>();
+        let input = Tensor::from_vec(ids, (1, 67), &device)?;
+
+        let features = encoder.forward_features(&input)?;
+
+        assert!(
+            features.chunk_states.dim(1)? > 1,
+            "prime-length inputs should not collapse to one chunk"
+        );
         Ok(())
     }
 }
