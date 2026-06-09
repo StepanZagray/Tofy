@@ -34,7 +34,7 @@ The pipeline now does Go execution-feedback decoder training after the mixed dec
 - Go feedback decoder run on `data/code_poc_go_mix.txt`
 - compiler-feedback Go repair rows from `data/go_repair_pairs.txt` are added when `go` is available
   reruns reuse `data/go_repair_pairs.txt` when its manifest still matches the instruction-pair input hash, Go version, and generation settings
-- after the base decoder exists, `--prepare-go-model-feedback-pairs` generates model-failure repair rows against canonical Go task solutions, writes chosen/rejected preference JSONL, and enables pass-only self-training rows only when compile rate clears `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
+- after the base decoder exists, `--prepare-go-model-feedback-pairs` generates model-failure repair rows against canonical Go task solutions, writes chosen/rejected preference JSONL, and enables pass-only self-training rows only when compile rate clears `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`; failed candidates are retained for configurable compiler-feedback repair rounds, turning one-shot failures into multi-turn repair transcripts
 
 The canonical training command is:
 
@@ -170,6 +170,7 @@ Decoder training knobs:
 - `TOFY_DECODER_SIGNATURE_LOSS_WEIGHT=<float>` upweights the predicted function-signature span during decoder training
 - `TOFY_PREPARE_REPAIR_TASKS=auto|0|1` controls compiler-feedback repair data generation, default `auto`
 - `CODE_REPAIR_REPEAT=<int>` controls repair-row oversampling in the code decoder mix, default `2`
+- `TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS=<int>` controls how many decode -> compile/test -> repair cycles are mined from each failed base-decoder Go candidate, default `2`
 - `go_feedback_steps`, `go_feedback_batch`, and `go_feedback_grad_accum` in `config/model_profiles.json` control the Go execution-feedback decoder stage
 
 Inference-side context hierarchy knobs:
@@ -730,7 +731,7 @@ The eval writes:
 - `runs/code_eval/<timestamp>/results.jsonl`
 - `runs/code_eval/<timestamp>/summary.txt`
 
-The main KPI is `suite_pass_rate`. Support metrics are `route_code_acc`, `compile_rate`, and `test_pass_rate`.
+The main KPI is `suite_pass_rate`. Support metrics are `route_code_acc`, `compile_rate`, `test_pass_rate`, and repair-depth rates such as `pass_after_0_rate`, `pass_after_1_rate`, `pass_after_2_rate`, and `pass_after_4_rate`.
 
 Run the conditioning-efficiency Pareto sweep:
 

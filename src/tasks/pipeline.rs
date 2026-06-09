@@ -1555,6 +1555,7 @@ fn prepare_go_model_feedback_data(
     }
     println!("== Stage 5a/6: model-failure Go feedback mining ==");
     let candidates = env_usize_or("TOFY_GO_MODEL_FEEDBACK_CANDIDATES", 1).max(1);
+    let repair_rounds = env_usize_or("TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS", 2);
     let max_new_tokens = env_usize_or("TOFY_GO_MODEL_FEEDBACK_MAX_TOKENS", 256).max(1);
     let workers = env_usize_or("TOFY_GO_MODEL_FEEDBACK_WORKERS", 0);
     let pass_min_compile_rate = std::env::var("TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE")
@@ -1586,6 +1587,8 @@ fn prepare_go_model_feedback_data(
         GO_PASS_SELF_TRAIN_DATA.to_string(),
         "--candidates".to_string(),
         candidates.to_string(),
+        "--repair-rounds".to_string(),
+        repair_rounds.to_string(),
         "--max-rows".to_string(),
         max_rows.to_string(),
         "--go-timeout-sec".to_string(),

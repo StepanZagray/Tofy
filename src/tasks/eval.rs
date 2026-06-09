@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use crate::model::decoders::{CandleCrossAttnDecoder, DecoderKind, LocalDecoderRuntime};
 use crate::tasks::orchestrator::Action;
 use crate::tasks::prepare::{
-    build_language_repair_prompt, default_go_repair_workers, escape_pair_field, go_version_string,
-    load_escaped_pairs, GoCompileFeedback,
+    default_go_repair_workers, escape_pair_field, go_version_string, load_escaped_pairs,
+    GoCompileFeedback,
 };
 use crate::tasks::world::AgentEngine;
 use crate::util;
@@ -81,6 +81,10 @@ struct CodeEvalSummary {
     compile_ok: usize,
     tests_ok: usize,
     pass_ok: usize,
+    pass_after_0: usize,
+    pass_after_1: usize,
+    pass_after_2: usize,
+    pass_after_4: usize,
     reward_sum: f32,
     trajectory_reward_sum: f32,
 }
@@ -409,6 +413,7 @@ struct GoModelFeedbackConfig {
     max_rows: usize,
     workers: usize,
     pass_min_compile_rate: f32,
+    repair_rounds: usize,
     force: bool,
 }
 
@@ -416,7 +421,7 @@ impl GoModelFeedbackConfig {
     fn from_args_after(args: &[String]) -> Result<Self> {
         if args.len() < 5 {
             bail!(
-                "usage: --prepare-go-model-feedback-pairs <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <input_pairs.tsv> <repair_output.tsv> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--preference-output <path>] [--pass-output <path>] [--candidates <int>] [--max-rows <int>] [--workers <int>] [--go <bin>] [--go-timeout-sec <int>] [--pass-min-compile-rate <float>] [--force]"
+                "usage: --prepare-go-model-feedback-pairs <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <input_pairs.tsv> <repair_output.tsv> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_context_slots] [--high-world-model <path>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--preference-output <path>] [--pass-output <path>] [--candidates <int>] [--repair-rounds <int>] [--max-rows <int>] [--workers <int>] [--go <bin>] [--go-timeout-sec <int>] [--pass-min-compile-rate <float>] [--force]"
             );
         }
         let mut filtered = Vec::new();
@@ -431,6 +436,7 @@ impl GoModelFeedbackConfig {
         let mut max_rows = 0usize;
         let mut workers = None;
         let mut pass_min_compile_rate = 0.10f32;
+        let mut repair_rounds = 0usize;
         let mut force = false;
         let mut i = 0usize;
         while i < args.len() {
@@ -504,6 +510,15 @@ impl GoModelFeedbackConfig {
                         .map_err(|_| anyhow::anyhow!("--max-rows must be integer"))?;
                     i += 2;
                 }
+                "--repair-rounds" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--repair-rounds requires integer"))?;
+                    repair_rounds = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--repair-rounds must be integer"))?;
+                    i += 2;
+                }
                 "--workers" => {
                     let value = args
                         .get(i + 1)
@@ -560,6 +575,7 @@ impl GoModelFeedbackConfig {
             max_rows,
             workers: workers.unwrap_or_else(default_go_repair_workers),
             pass_min_compile_rate,
+            repair_rounds,
             force,
         })
     }
@@ -569,6 +585,7 @@ impl GoModelFeedbackConfig {
 struct GoModelPreferenceRow {
     task_index: usize,
     candidate_index: usize,
+    repair_round: usize,
     prompt: String,
     chosen: String,
     rejected: String,
@@ -586,11 +603,19 @@ struct GoModelAttempt {
     candidate_index: usize,
     task_prompt: String,
     canonical_code: String,
+    prompt: String,
+    history: Vec<GoFeedbackTurn>,
     code: String,
 }
 
 struct GoModelCheckedAttempt {
     attempt: GoModelAttempt,
+    feedback: String,
+}
+
+#[derive(Clone)]
+struct GoFeedbackTurn {
+    code: String,
     feedback: String,
 }
 
@@ -682,7 +707,11 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
     let optional_outputs_ready = cfg
         .preference_output_path
         .as_ref()
-        .is_none_or(|path| path.exists());
+        .is_none_or(|path| path.exists())
+        && cfg
+            .pass_output_path
+            .as_ref()
+            .is_none_or(|path| path.exists());
     if !cfg.force && cfg.repair_output_path.exists() && optional_outputs_ready {
         println!(
             "Go model-feedback repair cache hit: {}",
@@ -751,9 +780,10 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
         );
     }
     println!(
-        "rows_limit={} candidates={} workers={} temp={}",
+        "rows_limit={} candidates={} repair_rounds={} workers={} temp={}",
         cfg.max_rows,
         cfg.candidates,
+        cfg.repair_rounds,
         cfg.workers,
         std::env::var("JEPA_DECODER_TEMP").unwrap_or_else(|_| default_eval_temp.to_string())
     );
@@ -765,6 +795,9 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
     let mut compile_ok = 0usize;
     let mut repair_rows = 0usize;
     let mut pass_rows = 0usize;
+    let mut compile_ok_by_round = vec![0usize; cfg.repair_rounds.saturating_add(1)];
+    let mut generated_by_round = vec![0usize; cfg.repair_rounds.saturating_add(1)];
+    let mut pass_by_round = vec![0usize; cfg.repair_rounds.saturating_add(1)];
 
     for (task_index, (task_prompt, canonical_code)) in pairs.iter().enumerate() {
         if cfg.max_rows > 0 && repair_rows >= cfg.max_rows {
@@ -772,107 +805,136 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
         }
         processed_tasks += 1;
         let generation_prompt = build_go_model_feedback_generation_prompt(task_prompt);
-        let mut attempts = Vec::with_capacity(cfg.candidates);
-        for candidate_index in 0..cfg.candidates {
-            let response = engine.generate_for_action(
-                &generation_prompt,
-                Action::Code,
-                cfg.max_new_tokens,
-                false,
-            )?;
-            let code = extract_code_candidate_for_language(&response, "go");
-            attempts.push(GoModelAttempt {
+        let mut active = (0..cfg.candidates)
+            .map(|candidate_index| GoModelAttempt {
                 task_index,
                 candidate_index,
                 task_prompt: task_prompt.clone(),
                 canonical_code: canonical_code.clone(),
-                code,
-            });
-        }
-        generated_candidates += attempts.len();
-        let checked = pool.install(|| {
-            attempts
-                .into_par_iter()
-                .map(|attempt| {
-                    let feedback = if attempt.code.trim().is_empty() {
-                        "empty model output".to_string()
-                    } else {
-                        go_feedback.compile(&attempt.code)?
-                    };
-                    Ok(GoModelCheckedAttempt { attempt, feedback })
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
+                prompt: generation_prompt.clone(),
+                history: Vec::new(),
+                code: String::new(),
+            })
+            .collect::<Vec<_>>();
 
-        for checked_attempt in checked {
-            let attempt = checked_attempt.attempt;
-            let model_compile_ok = checked_attempt.feedback.is_empty();
-            compile_ok += usize::from(model_compile_ok);
-            if model_compile_ok {
-                if let Some(writer) = pass_writer.as_mut() {
-                    let digest = format!(
-                        "{:x}",
-                        md5::compute(format!("{}\t{}", attempt.task_prompt, attempt.code))
-                    );
-                    if seen_pass.insert(digest) {
-                        writeln!(
-                            writer,
-                            "{}\t{}",
-                            escape_pair_field(&attempt.task_prompt),
-                            escape_pair_field(&attempt.code)
-                        )?;
-                        pass_rows += 1;
-                    }
-                }
-                continue;
-            }
-
-            let repair_prompt = build_language_repair_prompt(
-                "Go",
-                "go",
-                &attempt.task_prompt,
-                &attempt.code,
-                &checked_attempt.feedback,
-            );
-            let digest = format!(
-                "{:x}",
-                md5::compute(format!("{repair_prompt}\t{}", attempt.canonical_code))
-            );
-            if seen_repair.insert(digest) {
-                writeln!(
-                    repair_writer,
-                    "{}\t{}",
-                    escape_pair_field(&repair_prompt),
-                    escape_pair_field(&attempt.canonical_code)
-                )?;
-                repair_rows += 1;
-            }
-            if let Some(writer) = preference_writer.as_mut() {
-                let chosen_reward = 1.0f32;
-                let rejected_reward = go_feedback_code_reward(&attempt.code, model_compile_ok);
-                let row = GoModelPreferenceRow {
-                    task_index: attempt.task_index,
-                    candidate_index: attempt.candidate_index,
-                    prompt: attempt.task_prompt.clone(),
-                    chosen: attempt.canonical_code.clone(),
-                    rejected: attempt.code.clone(),
-                    feedback: checked_attempt.feedback,
-                    compile_ok: false,
-                    chosen_reward,
-                    rejected_reward,
-                    reward_margin: chosen_reward - rejected_reward,
-                    chosen_source: "canonical".to_string(),
-                    rejected_source: "model_failed_attempt".to_string(),
-                };
-                writeln!(writer, "{}", serde_json::to_string(&row)?)?;
-            }
-            if cfg.max_rows > 0 && repair_rows >= cfg.max_rows {
+        for repair_round in 0..=cfg.repair_rounds {
+            if active.is_empty() || (cfg.max_rows > 0 && repair_rows >= cfg.max_rows) {
                 break;
+            }
+            let mut attempts = Vec::with_capacity(active.len());
+            for mut attempt in active {
+                let response = engine.generate_for_action(
+                    &attempt.prompt,
+                    Action::Code,
+                    cfg.max_new_tokens,
+                    false,
+                )?;
+                attempt.code = extract_code_candidate_for_language(&response, "go");
+                attempts.push(attempt);
+            }
+            generated_candidates += attempts.len();
+            generated_by_round[repair_round] += attempts.len();
+            let checked = pool.install(|| {
+                attempts
+                    .into_par_iter()
+                    .map(|attempt| {
+                        let feedback = if attempt.code.trim().is_empty() {
+                            "empty model output".to_string()
+                        } else {
+                            go_feedback.compile(&attempt.code)?
+                        };
+                        Ok(GoModelCheckedAttempt { attempt, feedback })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            active = Vec::new();
+            for checked_attempt in checked {
+                let mut attempt = checked_attempt.attempt;
+                let model_compile_ok = checked_attempt.feedback.is_empty();
+                compile_ok += usize::from(model_compile_ok);
+                compile_ok_by_round[repair_round] += usize::from(model_compile_ok);
+                if model_compile_ok {
+                    if let Some(writer) = pass_writer.as_mut() {
+                        let pass_context = if repair_round == 0 {
+                            attempt.task_prompt.as_str()
+                        } else {
+                            attempt.prompt.as_str()
+                        };
+                        let digest = format!(
+                            "{:x}",
+                            md5::compute(format!("{pass_context}\t{}", attempt.code))
+                        );
+                        if seen_pass.insert(digest) {
+                            writeln!(
+                                writer,
+                                "{}\t{}",
+                                escape_pair_field(pass_context),
+                                escape_pair_field(&attempt.code)
+                            )?;
+                            pass_rows += 1;
+                            pass_by_round[repair_round] += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                attempt.history.push(GoFeedbackTurn {
+                    code: attempt.code.clone(),
+                    feedback: checked_attempt.feedback.clone(),
+                });
+                let repair_prompt =
+                    build_go_model_feedback_repair_prompt(&attempt.task_prompt, &attempt.history);
+                let digest = format!(
+                    "{:x}",
+                    md5::compute(format!("{repair_prompt}\t{}", attempt.canonical_code))
+                );
+                if seen_repair.insert(digest) {
+                    writeln!(
+                        repair_writer,
+                        "{}\t{}",
+                        escape_pair_field(&repair_prompt),
+                        escape_pair_field(&attempt.canonical_code)
+                    )?;
+                    repair_rows += 1;
+                }
+                if let Some(writer) = preference_writer.as_mut() {
+                    let chosen_reward = 1.0f32;
+                    let rejected_reward = go_feedback_code_reward(&attempt.code, model_compile_ok);
+                    let row = GoModelPreferenceRow {
+                        task_index: attempt.task_index,
+                        candidate_index: attempt.candidate_index,
+                        repair_round,
+                        prompt: attempt.prompt.clone(),
+                        chosen: attempt.canonical_code.clone(),
+                        rejected: attempt.code.clone(),
+                        feedback: checked_attempt.feedback,
+                        compile_ok: false,
+                        chosen_reward,
+                        rejected_reward,
+                        reward_margin: chosen_reward - rejected_reward,
+                        chosen_source: "canonical".to_string(),
+                        rejected_source: "model_failed_attempt".to_string(),
+                    };
+                    writeln!(writer, "{}", serde_json::to_string(&row)?)?;
+                }
+                if repair_round < cfg.repair_rounds
+                    && (cfg.max_rows == 0 || repair_rows < cfg.max_rows)
+                {
+                    attempt.prompt = build_go_model_feedback_repair_prompt(
+                        &attempt.task_prompt,
+                        &attempt.history,
+                    );
+                    attempt.code.clear();
+                    active.push(attempt);
+                }
+                if cfg.max_rows > 0 && repair_rows >= cfg.max_rows {
+                    break;
+                }
             }
         }
         if processed_tasks.is_multiple_of(100) {
             println!(
-                "Go model-feedback progress: tasks={} candidates={} repair_rows={} pass_rows={} compile_rate={:.3}",
+                "Go model-feedback progress: tasks={} attempts={} repair_rows={} pass_rows={} compile_rate={:.3}",
                 processed_tasks,
                 generated_candidates,
                 repair_rows,
@@ -889,6 +951,27 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
         }
     }
     let compile_rate = compile_ok as f32 / generated_candidates.max(1) as f32;
+    let compile_by_round = compile_ok_by_round
+        .iter()
+        .zip(generated_by_round.iter())
+        .enumerate()
+        .map(|(round, (ok, total))| {
+            format!(
+                "round{}={:.3}({}/{})",
+                round,
+                *ok as f32 / (*total).max(1) as f32,
+                ok,
+                total
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pass_by_round_text = pass_by_round
+        .iter()
+        .enumerate()
+        .map(|(round, rows)| format!("round{}={}", round, rows))
+        .collect::<Vec<_>>()
+        .join(" ");
     if let Some(writer) = pass_writer {
         if let Some(path) = cfg.pass_output_path.as_ref() {
             if compile_rate >= cfg.pass_min_compile_rate {
@@ -905,9 +988,11 @@ fn run_prepare_go_model_feedback_pairs(cfg: GoModelFeedbackConfig) -> Result<()>
         }
     }
     println!(
-        "Wrote Go model-feedback rows: tasks={} candidates={} repair_rows={} pass_rows={} compile_rate={:.3}",
+        "Wrote Go model-feedback rows: tasks={} attempts={} repair_rows={} pass_rows={} compile_rate={:.3}",
         processed_tasks, generated_candidates, repair_rows, pass_rows, compile_rate
     );
+    println!("Go model-feedback compile_by_round: {compile_by_round}");
+    println!("Go model-feedback pass_rows_by_round: {pass_by_round_text}");
     Ok(())
 }
 
@@ -915,6 +1000,26 @@ fn build_go_model_feedback_generation_prompt(task_prompt: &str) -> String {
     format!(
         "Return only Go code.\n{task_prompt}\n\nRules:\n- Keep the requested function name and signature.\n- Return only compilable Go code.\n- Do not add markdown fences or explanation.\n"
     )
+}
+
+fn build_go_model_feedback_repair_prompt(task_prompt: &str, history: &[GoFeedbackTurn]) -> String {
+    let mut out = String::from(
+        "Return only corrected Go code.\nFix the previous attempt using the compiler feedback.\n\nOriginal request:\n",
+    );
+    out.push_str(task_prompt);
+    out.push_str("\n\nRepair history:\n");
+    for (idx, turn) in history.iter().enumerate() {
+        out.push_str(&format!(
+            "\nAttempt {}:\n```go\n{}\n```\n\nCompiler feedback:\n{}\n",
+            idx + 1,
+            turn.code,
+            turn.feedback
+        ));
+    }
+    out.push_str(
+        "\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable Go code.\n- Do not add markdown fences or explanation.\n",
+    );
+    out
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
@@ -1101,6 +1206,10 @@ fn evaluate_code_suite_once(
         summary.compile_ok += usize::from(best.compile_ok);
         summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
+        summary.pass_after_0 += usize::from(pass && best.repair_attempts_used == 0);
+        summary.pass_after_1 += usize::from(pass && best.repair_attempts_used <= 1);
+        summary.pass_after_2 += usize::from(pass && best.repair_attempts_used <= 2);
+        summary.pass_after_4 += usize::from(pass && best.repair_attempts_used <= 4);
         summary.reward_sum += best.outcome_reward;
         summary.trajectory_reward_sum += best.trajectory_reward;
         let result = CodeEvalTaskResult {
@@ -1151,8 +1260,12 @@ fn evaluate_code_suite_once(
 
 fn code_eval_summary_text(summary: &CodeEvalSummary) -> String {
     format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nformat_pass_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\navg_reward={:.4}\navg_trajectory_reward={:.4}\ntasks={}\n",
+        "suite_pass_rate={:.4}\npass_after_0_rate={:.4}\npass_after_1_rate={:.4}\npass_after_2_rate={:.4}\npass_after_4_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nformat_pass_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\navg_reward={:.4}\navg_trajectory_reward={:.4}\ntasks={}\n",
         summary.pass_ok as f32 / summary.task_count.max(1) as f32,
+        summary.pass_after_0 as f32 / summary.task_count.max(1) as f32,
+        summary.pass_after_1 as f32 / summary.task_count.max(1) as f32,
+        summary.pass_after_2 as f32 / summary.task_count.max(1) as f32,
+        summary.pass_after_4 as f32 / summary.task_count.max(1) as f32,
         summary.route_ok as f32 / summary.task_count.max(1) as f32,
         summary.rlm_used as f32 / summary.task_count.max(1) as f32,
         summary.docs_used as f32 / summary.task_count.max(1) as f32,
@@ -1244,6 +1357,10 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         summary.compile_ok += usize::from(best.compile_ok);
         summary.tests_ok += usize::from(best.tests_ok);
         summary.pass_ok += usize::from(pass);
+        summary.pass_after_0 += usize::from(pass && best.repair_attempts_used == 0);
+        summary.pass_after_1 += usize::from(pass && best.repair_attempts_used <= 1);
+        summary.pass_after_2 += usize::from(pass && best.repair_attempts_used <= 2);
+        summary.pass_after_4 += usize::from(pass && best.repair_attempts_used <= 4);
         summary.reward_sum += best.outcome_reward;
         summary.trajectory_reward_sum += best.trajectory_reward;
         let result = CodeEvalTaskResult {
@@ -1286,20 +1403,7 @@ fn run_decoder_only_eval(cfg: DecoderOnlyEvalConfig) -> Result<()> {
         );
     }
 
-    let summary_text = format!(
-        "suite_pass_rate={:.4}\nroute_code_acc={:.4}\nrlm_used_rate={:.4}\ndocs_used_rate={:.4}\nformat_pass_rate={:.4}\nconstraint_pass_rate={:.4}\ncompile_rate={:.4}\ntest_pass_rate={:.4}\navg_reward={:.4}\navg_trajectory_reward={:.4}\ntasks={}\n",
-        summary.pass_ok as f32 / summary.task_count.max(1) as f32,
-        summary.route_ok as f32 / summary.task_count.max(1) as f32,
-        summary.rlm_used as f32 / summary.task_count.max(1) as f32,
-        summary.docs_used as f32 / summary.task_count.max(1) as f32,
-        summary.format_ok as f32 / summary.task_count.max(1) as f32,
-        summary.constraints_ok as f32 / summary.task_count.max(1) as f32,
-        summary.compile_ok as f32 / summary.task_count.max(1) as f32,
-        summary.tests_ok as f32 / summary.task_count.max(1) as f32,
-        summary.reward_sum / summary.task_count.max(1) as f32,
-        summary.trajectory_reward_sum / summary.task_count.max(1) as f32,
-        summary.task_count,
-    );
+    let summary_text = code_eval_summary_text(&summary);
     fs::write(run_path.join("summary.txt"), &summary_text)?;
     println!("\n{}", summary_text);
     Ok(())

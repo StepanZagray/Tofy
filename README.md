@@ -126,7 +126,7 @@ Default behavior:
 - world/action classifier rows now carry explicit action labels and synthetic terminal `done` rows
 - text decoder data = UltraChat
 - code decoder data = Go-only code POC mix built from GitHub Go code, synthetic Go function tasks, and Go compiler-feedback repair rows when `go` is available
-- after the base code decoder trains, the pipeline can mine its failed Go attempts into `data/go_model_failure_repair_pairs.txt`, chosen/rejected preference records in `data/go_model_preference_pairs.jsonl`, and pass-only rows in `data/go_pass_self_train_pairs.txt`; tune with `TOFY_GO_MODEL_FEEDBACK_ROWS`, `TOFY_GO_MODEL_FEEDBACK_CANDIDATES`, and `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
+- after the base code decoder trains, the pipeline can mine its failed Go attempts into `data/go_model_failure_repair_pairs.txt`, chosen/rejected preference records in `data/go_model_preference_pairs.jsonl`, and pass-only rows in `data/go_pass_self_train_pairs.txt`; by default it keeps failed candidates alive for two compiler-feedback repair rounds, producing transcript-shaped repair rows inspired by MiniMax-M3's interactive coding curriculum; tune with `TOFY_GO_MODEL_FEEDBACK_ROWS`, `TOFY_GO_MODEL_FEEDBACK_CANDIDATES`, `TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS`, and `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
 - Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
 - the pipeline CLI now saves stage checkpoints, launch metadata, and grouped TensorBoard outputs under run-owned directories such as `runs/code_poc_<timestamp>/...`
@@ -143,7 +143,7 @@ Default behavior:
   - world defaults to `32x8` (`256` effective) after a `32x1` warmup
   - high-world planning is trained by default from the selected profile (`12000` steps for `8gb`/`48gb`, `18000` for `80gb`) and loaded automatically from the run directory
   - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
-  - model-failure Go feedback mining defaults to `1024` rows on `8gb`, `2048` on `48gb`, and `4096` on `80gb`; set `TOFY_GO_MODEL_FEEDBACK_ROWS=0` to disable
+  - model-failure Go feedback mining defaults to `1024` rows on `8gb`, `2048` on `48gb`, and `4096` on `80gb`, with `TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS=2`; set `TOFY_GO_MODEL_FEEDBACK_ROWS=0` to disable
   - Go compile/test eval runs by default for verifier-guided base vs Go-feedback decoder promotion
   - direct `--eval-code-assistant` defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set; the canonical pipeline and Pi-style manual eval pass `--pi-agent-env` after loading `scripts/tofy_pi_runtime_env.sh`
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline
@@ -278,7 +278,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 - encoder local attention is now truly sliding-window instead of dense masked attention, and chunk size grows with sequence length so longer encoder contexts stay practical
 - world checkpoint selection for `--train-world` minimizes `transition_loss + 0.2 * sigreg_loss` on validation (`world_selection_score`); logged router metrics are diagnostic unless you run `--train-orchestrator`
 - decoder validation logging now also includes token accuracy, identifier accuracy, syntax-token accuracy, signature-token accuracy, signature-exact rate, function-skeleton rate, delimiter-balance rate, syntax-weighted CE, and signature-weighted CE for code generation quality
-- the new code eval suite writes per-task results plus `summary.txt` under `runs/code_eval/<timestamp>/`
+- the new code eval suite writes per-task results plus `summary.txt` under `runs/code_eval/<timestamp>/`; summaries include `pass_after_0_rate`, `pass_after_1_rate`, `pass_after_2_rate`, and `pass_after_4_rate` so repair-depth gains are visible
 - Candle decoder inference now uses batched prompt prefill, prefix-LM-style latent memory tokens, DeepSeek-V4-inspired hybrid local/compressed self-attention, query-selected CSA blocks, separate HCA blocks, per-layer compressed self-attention KV cache, and precomputed cross-attention K/V for the world latent
 - set `JEPA_CANDLE_DECODER_CTX=<tokens>` to cap Candle decoder prompt context at inference if you want a predictable latency / memory ceiling
 - set `TOFY_DECODER_CSA_TOPK=<blocks>` to tune how many compressed long-range blocks each CSA query keeps, default `8`
