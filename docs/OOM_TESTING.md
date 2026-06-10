@@ -89,19 +89,19 @@ cargo run --release -- --sustained-oom-probe --profile 80gb --stage all
 ```
 
 The probe loads the current `80gb` shape from `config/model_profiles.json`.
-That profile uses encoder `32x16` (`512` effective), frozen-encoder world
-`96x6` (`576` effective), decoder `16x16` (`256` effective), and Go feedback
-`16x16` (`256` effective). Decoder effective batch stays at `256`, but the
-microbatch stays small because the decoder is much wider.
+That profile uses encoder `16x32` (`512` effective), frozen-encoder world
+`32x16` (`512` effective), decoder `4x32` (`128` effective), and Go feedback
+`4x32` (`128` effective). Decoder effective batch is `128`; the microbatch stays
+small because the decoder is much wider.
 Prefer `--max-vram-probe --profile 80gb` for the first rental check, then run
 the sustained probe only after the short probe passes.
 
 ## 48 GB L40S/A40 Profile Probe
 
 Run the same flow with `--profile 48gb` on 48 GB pods. That profile uses
-encoder `48x11` (`528` effective), frozen-encoder world `128x4` (`512`
-effective), decoder `32x8` (`256` effective), and Go feedback `32x8` (`256`
-effective).
+encoder `32x16` (`512` effective), frozen-encoder world `96x5` (`480`
+effective), decoder `24x10` (`240` effective), and Go feedback `24x10`
+(`240` effective).
 
 ## High-Level World Stage
 

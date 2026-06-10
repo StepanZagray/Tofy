@@ -217,12 +217,12 @@ cargo run --release -- train 80gb
 
 This is the default large local/cloud profile. It uses `DIM=1024`,
 `BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1536`, decoder FF
-width `6144`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder
-`32x16` (`512` effective), world `96x6` (`576` effective) with the encoder
-frozen, decoder `16x16` (`256` effective), and Go feedback `16x16` (`256`
-effective). The profile keeps decoder effective batch at `256` but uses a small
-microbatch so activation memory can hold the much larger decoder. Do not raise
-the decoder microbatch just because VRAM is available; probe throughput first.
+width `6144`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder `16x32`
+(`512` effective), world `32x16` (`512` effective) with the encoder frozen,
+decoder `4x32` (`128` effective), and Go feedback `4x32` (`128` effective).
+The profile uses a small decoder microbatch so activation memory can hold the
+much wider decoder. Do not raise the decoder microbatch just because VRAM is
+available; probe throughput first.
 After the GPU is saturated, bigger decoder microbatches mostly buy fewer
 optimizer steps per token and higher activation memory pressure. It defaults to
 longer code-quality budgets: latent `24000`, world `90000`, high-world `18000`,
@@ -243,9 +243,9 @@ cargo run --release -- train 48gb
 
 The `48gb` profile uses `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`,
 `HEADS=16`, decoder width `768`, decoder FF width `3072`, and
-`NUM_LATENT_TOKENS=96`. Current 48 GB batches are encoder `48x11` (`528`
-effective), world `128x4` (`512` effective) with the encoder frozen, decoder
-`32x8` (`256` effective), and Go feedback `32x8` (`256` effective). It defaults
+`NUM_LATENT_TOKENS=96`. Current 48 GB batches are encoder `32x16` (`512`
+effective), world `96x5` (`480` effective) with the encoder frozen, decoder
+`24x10` (`240` effective), and Go feedback `24x10` (`240` effective). It defaults
 to latent `16000`, world `60000`, high-world `12000`, code decoder `80000`, and
 Go feedback `20000`.
 
