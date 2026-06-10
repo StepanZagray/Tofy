@@ -37,6 +37,11 @@ else
 fi
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
+if [[ -d "${REPO_DIR}/.cache/huggingface/download" ]]; then
+  echo "Clearing stale Hugging Face local-dir download locks..."
+  find "${REPO_DIR}/.cache/huggingface/download" -type f -name '*.lock' -delete
+fi
+
 if ! hf download "$HF_DATASET" \
   --repo-type dataset \
   --include "data/**" \
