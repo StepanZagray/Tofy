@@ -239,22 +239,29 @@ Run inside the pod from the cloned repo after Step 3. This installs system
 tools, Rust, Go, HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves
 auto-stop credentials, saves the HF token for cache download, and checks CUDA.
 
+Export these inside the pod before setup. `RUNPOD_API_KEY` is your RunPod
+account REST API key (RunPod console → Settings → API Keys). Training uses it
+to stop the pod when the run exits; without it, auto-stop fails and the pod
+keeps billing.
+
 ```bash
-cd /workspace/Tofy
-RUNPOD_POD_ID="<pod-id-from-create-step>"
-export HF_TOKEN="<hf-read-token>" 
+export RUNPOD_API_KEY="<runpod-rest-api-key>"
+export RUNPOD_POD_ID="<pod-id-from-create-step>"
+export HF_TOKEN="<hf-read-token>"
 scripts/runpod_pod_setup.sh
 ```
 
-If you already exported `RUNPOD_API_KEY` and `RUNPOD_POD_ID` inside the pod, the
-script will not prompt for them.
+Setup writes `/workspace/tofy-runpod.env` with those values. The auto-stop
+wrapper sources that file on train exit.
 
-When prompted for `Hugging Face token for cache download`, paste the HF token
-with access to `Grayza/80gb-profile-go-cache`. To set it non-interactively:
+If you skip the exports above, the script prompts for each value instead.
 
 `export` matters: `HF_TOKEN=...` without `export` is only a shell variable and
 child processes such as `scripts/runpod_restore_cache_build.sh` and `hf
 download` will not see it.
+
+To fix a bad or expired key later, edit `/workspace/tofy-runpod.env` on the pod
+or re-run setup with fresh exports.
 
 ## 5. Restore Cache And Build
 
