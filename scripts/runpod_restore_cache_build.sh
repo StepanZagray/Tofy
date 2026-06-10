@@ -8,6 +8,7 @@ ENV_FILE="${TOFY_RUNPOD_ENV_FILE:-${WORKSPACE}/tofy-runpod.env}"
 HF_DATASET="${TOFY_CACHE_HF_DATASET:-Grayza/80gb-profile-go-cache}"
 HF_MAX_WORKERS="${TOFY_CACHE_HF_MAX_WORKERS:-16}"
 ZSTD_THREADS="${TOFY_ZSTD_THREADS:-$(nproc 2>/dev/null || echo 1)}"
+RUNPOD_CACHE_DIR="${TOFY_RUNPOD_CACHE_DIR:-/dev/shm/tofy-cache}"
 
 source "$HOME/.cargo/env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -48,27 +49,6 @@ if ! hf download "$HF_DATASET" \
   exit 1
 fi
 
-mapfile -d '' compressed_files < <(
-  find data eval local_models/vocabs -type f -name '*.zst' -print0 2>/dev/null | sort -z
-)
-if (( ${#compressed_files[@]} > 0 )); then
-  echo "Decompressing ${#compressed_files[@]} prepared cache files..."
-  for compressed in "${compressed_files[@]}"; do
-    output="${compressed%.zst}"
-    echo "Decompressing ${compressed} -> ${output}"
-    if command -v pzstd >/dev/null 2>&1; then
-      pzstd -d -p "$ZSTD_THREADS" -f "$compressed" -o "$output"
-    else
-      zstd -d -T0 -f "$compressed" -o "$output"
-    fi
-    rm -f "$compressed"
-  done
-fi
-
-echo "Prepared cache:"
-du -sh data/cache eval local_models 2>/dev/null || true
-ls -lh data/cache eval local_models/vocabs 2>/dev/null || true
-
 required_paths=(
   "local_models/vocabs"
   "data/cache/encoder.tokens.bin"
@@ -84,6 +64,39 @@ required_paths=(
   "data/cache/go_feedback/code_decoder_dual.tokens.bin"
   "data/cache/go_feedback/code_decoder_dual_tokens.manifest.json"
 )
+
+compressed_files=()
+for path in "${required_paths[@]}"; do
+  compressed="${path}.zst"
+  if [[ ! -e "$path" && -f "$compressed" ]]; then
+    compressed_files+=("$compressed")
+  fi
+done
+
+if (( ${#compressed_files[@]} > 0 )); then
+  echo "Decompressing ${#compressed_files[@]} required prepared cache files..."
+  echo "Writing decompressed cache files to local scratch: ${RUNPOD_CACHE_DIR}"
+  mkdir -p "$RUNPOD_CACHE_DIR"
+  for compressed in "${compressed_files[@]}"; do
+    output="${compressed%.zst}"
+    scratch_output="${RUNPOD_CACHE_DIR}/${output}"
+    echo "Decompressing ${compressed} -> ${scratch_output}"
+    mkdir -p "$(dirname "$scratch_output")"
+    rm -f "$scratch_output" "$output"
+    if command -v pzstd >/dev/null 2>&1; then
+      pzstd -d -p "$ZSTD_THREADS" -f "$compressed" -o "$scratch_output"
+    else
+      zstd -d -T0 -f "$compressed" -o "$scratch_output"
+    fi
+    ln -s "$scratch_output" "$output"
+    rm -f "$compressed"
+  done
+fi
+
+echo "Prepared cache:"
+du -sh data/cache eval local_models 2>/dev/null || true
+ls -lh data/cache eval local_models/vocabs 2>/dev/null || true
+
 for path in "${required_paths[@]}"; do
   if [[ ! -e "$path" ]]; then
     echo "error: prepared cache tree is missing required path: $path" >&2

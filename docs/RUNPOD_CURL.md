@@ -242,7 +242,9 @@ key.
 
 ```bash
 cd /workspace/Tofy
-RUNPOD_POD_ID="<pod-id-from-create-step>" scripts/runpod_pod_setup.sh
+RUNPOD_POD_ID="<pod-id-from-create-step>"
+export HF_TOKEN="<hf-read-token>" 
+scripts/runpod_pod_setup.sh
 ```
 
 If you already exported `RUNPOD_API_KEY` and `RUNPOD_POD_ID` inside the pod, the
@@ -251,13 +253,6 @@ again if you skipped the key setup in Step 3.
 
 When prompted for `Hugging Face token for cache download`, paste the HF token
 with access to `Grayza/80gb-profile-go-cache`. To set it non-interactively:
-
-```bash
-cd /workspace/Tofy
-export HF_TOKEN="<hf-read-token>"
-scripts/runpod_pod_setup.sh
-hf auth whoami
-```
 
 `export` matters: `HF_TOKEN=...` without `export` is only a shell variable and
 child processes such as `scripts/runpod_restore_cache_build.sh` and `hf
