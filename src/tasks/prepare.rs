@@ -455,6 +455,15 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn prepared_cache_required() -> bool {
+    std::env::var("TOFY_REQUIRE_PREPARED_CACHE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "1" || value == "true" || value == "yes"
+        })
+        .unwrap_or(false)
+}
+
 fn artifact_cache_hit(
     kind: &str,
     output_path: &Path,
@@ -469,9 +478,22 @@ fn artifact_cache_hit(
         || manifest.version != ARTIFACT_CACHE_VERSION
         || manifest.kind != kind
         || manifest.output_path != output_path.to_string_lossy()
-        || manifest.params != *params
-        || manifest.inputs.len() != input_paths.len()
     {
+        return Ok(None);
+    }
+    if prepared_cache_required() {
+        if manifest.rows > 0 {
+            println!(
+                "{} prepared-cache handoff hit: {} (rows={})",
+                kind,
+                output_path.display(),
+                manifest.rows
+            );
+            return Ok(Some(manifest));
+        }
+        return Ok(None);
+    }
+    if manifest.params != *params || manifest.inputs.len() != input_paths.len() {
         return Ok(None);
     }
     for (path, stored) in input_paths.iter().zip(manifest.inputs.iter()) {
@@ -4947,6 +4969,43 @@ mod tests {
             artifact_cache_hit("github_top_code", &output, &changed_inputs, &params).unwrap();
         assert!(miss.is_none());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_cache_hit_trusts_handoff_when_prepared_cache_required() {
+        let dir = unique_prepare_test_dir("handoff");
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("go_repair_pairs.txt");
+        std::fs::write(&output, "prompt\tcode\n").unwrap();
+
+        let input = dir.join("go_instruction_pairs.txt");
+        std::fs::write(&input, "task\tanswer\n").unwrap();
+        let inputs = vec![input];
+        let params = json!({
+            "go_bin": "go",
+            "go_version": "go version go1.26.3 linux/amd64",
+            "workers": 14
+        });
+        write_artifact_manifest("go_repair_pairs", &output, &inputs, params, 1).unwrap();
+
+        let previous = std::env::var("TOFY_REQUIRE_PREPARED_CACHE").ok();
+        std::env::set_var("TOFY_REQUIRE_PREPARED_CACHE", "1");
+        let changed_inputs = vec![dir.join("other_input.txt")];
+        let changed_params = json!({
+            "go_bin": "go",
+            "go_version": "go version go1.22.0 linux/amd64",
+            "workers": 4
+        });
+        let hit =
+            artifact_cache_hit("go_repair_pairs", &output, &changed_inputs, &changed_params)
+                .unwrap();
+        match previous {
+            Some(value) => std::env::set_var("TOFY_REQUIRE_PREPARED_CACHE", value),
+            None => std::env::remove_var("TOFY_REQUIRE_PREPARED_CACHE"),
+        }
+
+        assert!(hit.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

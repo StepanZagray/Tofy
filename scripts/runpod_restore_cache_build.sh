@@ -17,10 +17,6 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 cd "$REPO_DIR"
-if [[ "${SKIP_GIT_PULL:-0}" != "1" && -d .git ]]; then
-  git fetch origin
-  git pull --ff-only
-fi
 
 if ! command -v hf >/dev/null 2>&1; then
   python3 -m pip install -U "huggingface_hub[cli]" --break-system-packages
@@ -56,6 +52,13 @@ fi
 
 required_paths=(
   "local_models/vocabs"
+  "data/encoder_mix.txt"
+  "data/world_mix_pairs.txt"
+  "data/code_poc_mix.txt"
+  "data/code_poc_go_mix.txt"
+  "data/go_repair_pairs.txt"
+  "data/cache/encoder_vocab.manifest.json"
+  "data/cache/code_decoder_vocab.manifest.json"
   "data/cache/encoder.tokens.bin"
   "data/cache/encoder_tokens.manifest.json"
   "data/cache/world.tokens.bin"
@@ -64,6 +67,8 @@ required_paths=(
   "data/cache/code_decoder_tokens.manifest.json"
   "data/cache/code_decoder_dual.tokens.bin"
   "data/cache/code_decoder_dual_tokens.manifest.json"
+  "data/cache/go_feedback/encoder_vocab.manifest.json"
+  "data/cache/go_feedback/code_decoder_vocab.manifest.json"
   "data/cache/go_feedback/code_decoder.tokens.bin"
   "data/cache/go_feedback/code_decoder_tokens.manifest.json"
   "data/cache/go_feedback/code_decoder_dual.tokens.bin"

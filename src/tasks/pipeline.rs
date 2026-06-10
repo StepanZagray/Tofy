@@ -399,6 +399,11 @@ fn run_prepare_cache(
         from_conditioned_cache: false,
     };
     set_pipeline_env(&cfg, &defaults);
+    if !command_available("go") {
+        bail!(
+            "prepare cache requires `go` on PATH to build go_repair_pairs and dependent mixes before Hugging Face upload"
+        );
+    }
     println!(
         "Preparing full local data/cache handoff for {} profile; no model training will run.",
         profile.as_str()

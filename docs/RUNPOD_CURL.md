@@ -235,10 +235,9 @@ then run status commands inside the shell.
 
 ## 4. Pod Setup
 
-Run inside the pod from the cloned repo. This installs system tools, Rust, Go,
-HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves auto-stop credentials,
-saves the HF token for cache download, checks CUDA, and prints a GitHub deploy
-key.
+Run inside the pod from the cloned repo after Step 3. This installs system
+tools, Rust, Go, HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves
+auto-stop credentials, saves the HF token for cache download, and checks CUDA.
 
 ```bash
 cd /workspace/Tofy
@@ -248,8 +247,7 @@ scripts/runpod_pod_setup.sh
 ```
 
 If you already exported `RUNPOD_API_KEY` and `RUNPOD_POD_ID` inside the pod, the
-script will not prompt for them. The setup script also prints the pod deploy key
-again if you skipped the key setup in Step 3.
+script will not prompt for them.
 
 When prompted for `Hugging Face token for cache download`, paste the HF token
 with access to `Grayza/80gb-profile-go-cache`. To set it non-interactively:

@@ -73,28 +73,7 @@ trap stop_pod EXIT
 EOF
 chmod +x "$STOP_WRAPPER"
 
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-if [[ ! -f ~/.ssh/runpod_tofy ]]; then
-  ssh-keygen -t ed25519 -C "runpod-tofy-pod" -f ~/.ssh/runpod_tofy -N ""
-fi
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/runpod_tofy
-    IdentitiesOnly yes
-EOF
-chmod 600 ~/.ssh/runpod_tofy ~/.ssh/config
-chmod 644 ~/.ssh/runpod_tofy.pub
-ssh-keyscan github.com >> ~/.ssh/known_hosts
-chmod 644 ~/.ssh/known_hosts
-
 nvidia-smi
 nvcc --version || true
 go version
 hf --help >/dev/null
-
-echo
-echo "Add this deploy key to GitHub repo -> Settings -> Deploy keys:"
-cat ~/.ssh/runpod_tofy.pub

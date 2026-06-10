@@ -40,6 +40,8 @@ Requirements:
   `--hf-dataset <org/dataset-name>` (for example `--hf-dataset my-org/tofy-cache`).
   The command errors if either flag is missing its partner. There is no built-in
   default dataset.
+- `go` must be on `PATH` during local `prepare cache`; the handoff includes
+  `go_repair_pairs` and mixes that depend on it.
 - `hf` must be on `PATH`; run `hf auth login` with write access to the target
   dataset before uploading.
 - `pzstd` or `zstd` must be on `PATH`. Files at least 8 MiB are compressed as
@@ -80,7 +82,10 @@ cache was built.
 
 On RunPod, train with `TOFY_REQUIRE_PREPARED_CACHE=1` so missing or mismatched
 cache files fail fast instead of being rebuilt on the network volume. The
-RunPod training script enables this by default.
+RunPod training script enables this by default. With that flag set, restored
+Stage 1 artifacts (mixes, `go_repair_pairs`, and their sidecar manifests) are
+trusted from the HF handoff instead of being rebuilt when Go version or worker
+counts differ from the local prepare machine.
 
 ## Technical / wiki-like / expert world model data
 
