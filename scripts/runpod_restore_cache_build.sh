@@ -8,7 +8,7 @@ ENV_FILE="${TOFY_RUNPOD_ENV_FILE:-${WORKSPACE}/tofy-runpod.env}"
 HF_DATASET="${TOFY_CACHE_HF_DATASET:-Grayza/80gb-profile-go-cache}"
 HF_MAX_WORKERS="${TOFY_CACHE_HF_MAX_WORKERS:-16}"
 ZSTD_THREADS="${TOFY_ZSTD_THREADS:-$(nproc 2>/dev/null || echo 1)}"
-RUNPOD_CACHE_DIR="${TOFY_RUNPOD_CACHE_DIR:-/dev/shm/tofy-cache}"
+RUNPOD_CACHE_DIR="${TOFY_RUNPOD_CACHE_DIR:-${WORKSPACE}/tofy-cache}"
 
 source "$HOME/.cargo/env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -50,6 +50,17 @@ if ! hf download "$HF_DATASET" \
   exit 1
 fi
 
+token_cache_paths=(
+  "data/cache/encoder.tokens.bin"
+  "data/cache/world.tokens.bin"
+  "data/cache/code_decoder.tokens.bin"
+  "data/cache/code_decoder_dual.tokens.bin"
+  "data/cache/go_feedback/encoder.tokens.bin"
+  "data/cache/go_feedback/world.tokens.bin"
+  "data/cache/go_feedback/code_decoder.tokens.bin"
+  "data/cache/go_feedback/code_decoder_dual.tokens.bin"
+)
+
 required_paths=(
   "local_models/vocabs"
   "data/encoder_mix.txt"
@@ -59,25 +70,22 @@ required_paths=(
   "data/go_repair_pairs.txt"
   "data/cache/encoder_vocab.manifest.json"
   "data/cache/code_decoder_vocab.manifest.json"
-  "data/cache/encoder.tokens.bin"
   "data/cache/encoder_tokens.manifest.json"
-  "data/cache/world.tokens.bin"
   "data/cache/world_tokens.manifest.json"
-  "data/cache/code_decoder.tokens.bin"
   "data/cache/code_decoder_tokens.manifest.json"
-  "data/cache/code_decoder_dual.tokens.bin"
   "data/cache/code_decoder_dual_tokens.manifest.json"
   "data/cache/go_feedback/encoder_vocab.manifest.json"
   "data/cache/go_feedback/code_decoder_vocab.manifest.json"
-  "data/cache/go_feedback/code_decoder.tokens.bin"
+  "data/cache/go_feedback/encoder_tokens.manifest.json"
+  "data/cache/go_feedback/world_tokens.manifest.json"
   "data/cache/go_feedback/code_decoder_tokens.manifest.json"
-  "data/cache/go_feedback/code_decoder_dual.tokens.bin"
   "data/cache/go_feedback/code_decoder_dual_tokens.manifest.json"
+  "${token_cache_paths[@]}"
 )
 
 token_cache_files=()
 repo_cache_files=()
-for path in "${required_paths[@]}"; do
+for path in "${token_cache_paths[@]}"; do
   compressed="${path}.zst"
   if [[ ! -e "$path" && -f "$compressed" ]]; then
     token_cache_files+=("$compressed")
@@ -110,6 +118,13 @@ if (( ${#repo_cache_files[@]} > 0 )); then
   echo "Decompressing ${#repo_cache_files[@]} prepared repository files..."
   for compressed in "${repo_cache_files[@]}"; do
     output="${compressed%.zst}"
+    if [[ ! -f "$compressed" ]]; then
+      continue
+    fi
+    if [[ -e "$output" ]]; then
+      rm -f "$compressed"
+      continue
+    fi
     echo "Decompressing ${compressed} -> ${output}"
     rm -f "$output"
     if command -v pzstd >/dev/null 2>&1; then
