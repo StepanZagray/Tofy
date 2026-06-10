@@ -65,19 +65,23 @@ required_paths=(
   "data/cache/go_feedback/code_decoder_dual_tokens.manifest.json"
 )
 
-compressed_files=()
+token_cache_files=()
+repo_cache_files=()
 for path in "${required_paths[@]}"; do
   compressed="${path}.zst"
   if [[ ! -e "$path" && -f "$compressed" ]]; then
-    compressed_files+=("$compressed")
+    token_cache_files+=("$compressed")
   fi
 done
+mapfile -d '' repo_cache_files < <(
+  find data eval local_models/vocabs -type f -name '*.zst' ! -path 'data/cache/*.tokens.bin.zst' ! -path 'data/cache/go_feedback/*.tokens.bin.zst' -print0 2>/dev/null | sort -z
+)
 
-if (( ${#compressed_files[@]} > 0 )); then
-  echo "Decompressing ${#compressed_files[@]} required prepared cache files..."
+if (( ${#token_cache_files[@]} > 0 )); then
+  echo "Decompressing ${#token_cache_files[@]} required token cache files..."
   echo "Writing decompressed cache files to local scratch: ${RUNPOD_CACHE_DIR}"
   mkdir -p "$RUNPOD_CACHE_DIR"
-  for compressed in "${compressed_files[@]}"; do
+  for compressed in "${token_cache_files[@]}"; do
     output="${compressed%.zst}"
     scratch_output="${RUNPOD_CACHE_DIR}/${output}"
     echo "Decompressing ${compressed} -> ${scratch_output}"
@@ -89,6 +93,20 @@ if (( ${#compressed_files[@]} > 0 )); then
       zstd -d -T0 -f "$compressed" -o "$scratch_output"
     fi
     ln -s "$scratch_output" "$output"
+    rm -f "$compressed"
+  done
+fi
+if (( ${#repo_cache_files[@]} > 0 )); then
+  echo "Decompressing ${#repo_cache_files[@]} prepared repository files..."
+  for compressed in "${repo_cache_files[@]}"; do
+    output="${compressed%.zst}"
+    echo "Decompressing ${compressed} -> ${output}"
+    rm -f "$output"
+    if command -v pzstd >/dev/null 2>&1; then
+      pzstd -d -p "$ZSTD_THREADS" -f "$compressed" -o "$output"
+    else
+      zstd -d -T0 -f "$compressed" -o "$output"
+    fi
     rm -f "$compressed"
   done
 fi
