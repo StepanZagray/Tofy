@@ -297,6 +297,11 @@ and upload the cache locally with the command from Step 1 before training.
 
 ## 6. Probe Or Train
 
+Both `runpod_probe.sh` and `runpod_train.sh` start inside **tmux** automatically.
+That keeps long runs alive after you disconnect SSH. Detach without stopping the
+job with **`Ctrl+b`**, then **`d`**. Reattach later with `tmux attach -t
+<session>`. List sessions with `tmux ls`.
+
 Probe first on a fresh GPU shape. The probe intentionally does not use the
 auto-stop wrapper, so the pod stays running for the training launch if the probe
 passes.
@@ -306,7 +311,7 @@ cd /workspace/Tofy
 PROFILE=80gb scripts/runpod_probe.sh
 ```
 
-Detach with `Ctrl+b`, then `d`. Reattach or monitor with:
+Default probe session: `tofy-probe`.
 
 ```bash
 tmux attach -t tofy-probe
@@ -319,6 +324,15 @@ Start the full 80 GB run. This uses the auto-stop wrapper by default.
 ```bash
 cd /workspace/Tofy
 PROFILE=80gb scripts/runpod_train.sh train
+```
+
+Default train session: `tofy-train`. Log file:
+`/workspace/tofy-train-80gb.log`.
+
+```bash
+tmux attach -t tofy-train
+tail -f /workspace/tofy-train-80gb.log
+nvidia-smi
 ```
 
 `scripts/runpod_train.sh` defaults to `TOFY_REQUIRE_PREPARED_CACHE=1`, so a
@@ -338,6 +352,9 @@ Resume latest:
 cd /workspace/Tofy
 PROFILE=80gb scripts/runpod_train.sh resume
 ```
+
+Default resume session: `tofy-resume`. Reattach with `tmux attach -t
+tofy-resume`.
 
 Resume a specific run:
 
