@@ -38,13 +38,14 @@ use crate::model::{
 };
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
-    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score, world_sigreg_loss,
+    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score,
     encoded_examples_oov_rate, evaluate_decoder_batch, evaluate_decoder_cached_batch,
     evaluate_world_encoded_batch, forbidden_output_probability_loss,
     hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
     masked_weighted_cross_entropy, raw_examples_oov_rate, shuffled_conditioning_latent,
     signature_weight_mask, slot_delta_slots, structure_weight_mask, syntax_weight_mask,
-    world_selection_score, ActionMetrics, DecoderBatchMetrics, WorldBatchMetrics,
+    world_selection_score, world_sigreg_loss, ActionMetrics, DecoderBatchMetrics,
+    WorldBatchMetrics,
 };
 use crate::util;
 
@@ -57,6 +58,43 @@ const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 
 type WorldConfig = WorldTrainConfig;
+
+struct WorldLogSnapshot {
+    loss_val: f32,
+    trans_val: f32,
+    sigreg_val: f32,
+    act_val: f32,
+    inv_val: f32,
+    post_state_val: f32,
+    rollout_val: f32,
+    action_metrics: ActionMetrics,
+    inverse_metrics: ActionMetrics,
+    trans_cos: f32,
+    state_slot_rms: f32,
+    pred_slot_rms: f32,
+}
+
+struct HighWorldLogSnapshot {
+    loss_val: f32,
+    trans_val: f32,
+    sigreg_val: f32,
+    cosine: f32,
+    pred_rms: f32,
+    target_rms: f32,
+}
+
+struct OrchestratorLogSnapshot {
+    action_loss_val: f32,
+    metrics: ActionMetrics,
+}
+
+struct DecoderLogSnapshot {
+    metrics: DecoderBatchMetrics,
+    hard_mismatch_loss_val: f32,
+    conditioning_loss_val: f32,
+    format_loss_val: f32,
+    mtp_loss_val: f32,
+}
 
 fn default_world_encoder_path(model_path: &Path) -> PathBuf {
     let raw = model_path.to_string_lossy();
@@ -1472,19 +1510,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     }
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut last_transition_loss = None;
-        let mut last_sigreg_loss = None;
-        let mut last_action_loss = None;
-        let mut last_inverse_loss = None;
-        let mut last_post_state_loss = None;
-        let mut last_rollout_loss = None;
-        let mut last_loss = None;
-        let mut last_action_logits = None;
-        let mut last_inverse_logits = None;
-        let mut last_action_labels = Vec::new();
-        let mut last_pred_next_slots = None;
-        let mut last_next_slots = None;
-        let mut last_state_slots = None;
+        let mut log_snapshot = None;
         let batch_size = world_batch_size_for_step(step, &config);
         let grad_accum_steps = world_grad_accum_for_step(step, &config);
         if config.batch_warmup_steps > 0
@@ -1501,7 +1527,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             );
         }
 
-        for _micro_step in 0..grad_accum_steps {
+        for micro_step in 0..grad_accum_steps {
             let batch = if let Some(ref mut cached_stream) = cached_world_stream {
                 collect_action_training_batch_cached(
                     cached_stream,
@@ -1611,19 +1637,47 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 grad_accum_steps,
             )?;
 
-            last_transition_loss = Some(transition_loss);
-            last_sigreg_loss = Some(sigreg_loss);
-            last_action_loss = Some(action_loss);
-            last_inverse_loss = Some(inverse_loss);
-            last_post_state_loss = Some(post_state_loss);
-            last_rollout_loss = Some(rollout_loss);
-            last_loss = Some(loss);
-            last_action_logits = Some(action_logits);
-            last_inverse_logits = inverse_logits;
-            last_action_labels = action_labels;
-            last_pred_next_slots = Some(pred_next_slots);
-            last_next_slots = Some(next_slots);
-            last_state_slots = Some(state_slots);
+            let should_capture_log =
+                step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
+            if should_capture_log {
+                let trans_val = util::scalar_f32(&transition_loss)?;
+                let loss_val = util::scalar_f32(&loss)?;
+                let sigreg_val = util::scalar_f32(&sigreg_loss)?;
+                let act_val = util::scalar_f32(&action_loss)?;
+                let inv_val = util::scalar_f32(&inverse_loss)?;
+                let post_state_val = util::scalar_f32(&post_state_loss)?;
+                let rollout_val = util::scalar_f32(&rollout_loss)?;
+                let metric_action_logits = action_logits.detach();
+                let action_metrics = compute_action_metrics(&metric_action_logits, &action_labels)?;
+                let inverse_metrics = if let Some(inverse_logits) = inverse_logits.as_ref() {
+                    let metric_inverse_logits = inverse_logits.detach();
+                    compute_action_metrics(&metric_inverse_logits, &action_labels)?
+                } else {
+                    ActionMetrics::default()
+                };
+                let metric_pred_next_slots = pred_next_slots.detach();
+                let metric_next_slots = next_slots.detach();
+                let pred_slots_flat = flatten_latent_slots(&metric_pred_next_slots)?;
+                let next_slots_flat = flatten_latent_slots(&metric_next_slots)?;
+                let trans_cos =
+                    util::scalar_f32(&mean_cosine_similarity(&pred_slots_flat, &next_slots_flat)?)?;
+                let state_slot_rms = util::scalar_f32(&tensor_rms(&state_slots.detach())?)?;
+                let pred_slot_rms = util::scalar_f32(&tensor_rms(&metric_pred_next_slots)?)?;
+                log_snapshot = Some(WorldLogSnapshot {
+                    loss_val,
+                    trans_val,
+                    sigreg_val,
+                    act_val,
+                    inv_val,
+                    post_state_val,
+                    rollout_val,
+                    action_metrics,
+                    inverse_metrics,
+                    trans_cos,
+                    state_slot_rms,
+                    pred_slot_rms,
+                });
+            }
         }
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
@@ -1631,46 +1685,20 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
-            let transition_loss = last_transition_loss
-                .context("world grad accumulation produced no transition loss")?;
-            let sigreg_loss =
-                last_sigreg_loss.context("world grad accumulation produced no sigreg loss")?;
-            let action_loss =
-                last_action_loss.context("world grad accumulation produced no action loss")?;
-            let inverse_loss =
-                last_inverse_loss.context("world grad accumulation produced no inverse loss")?;
-            let post_state_loss = last_post_state_loss
-                .context("world grad accumulation produced no post-state loss")?;
-            let rollout_loss =
-                last_rollout_loss.context("world grad accumulation produced no rollout loss")?;
-            let loss = last_loss.context("world grad accumulation produced no total loss")?;
-            let action_logits =
-                last_action_logits.context("world grad accumulation produced no action logits")?;
-            let pred_next_slots = last_pred_next_slots
-                .context("world grad accumulation produced no predicted slots")?;
-            let next_slots =
-                last_next_slots.context("world grad accumulation produced no next slots")?;
-            let state_slots =
-                last_state_slots.context("world grad accumulation produced no state slots")?;
-            let trans_val = util::scalar_f32(&transition_loss)?;
-            let loss_val = util::scalar_f32(&loss)?;
-            let sigreg_val = util::scalar_f32(&sigreg_loss)?;
-            let act_val = util::scalar_f32(&action_loss)?;
-            let inv_val = util::scalar_f32(&inverse_loss)?;
-            let post_state_val = util::scalar_f32(&post_state_loss)?;
-            let rollout_val = util::scalar_f32(&rollout_loss)?;
-            let action_metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
-            let inverse_metrics = if let Some(inverse_logits) = last_inverse_logits {
-                compute_action_metrics(&inverse_logits, &last_action_labels)?
-            } else {
-                ActionMetrics::default()
-            };
-            let pred_slots_flat = flatten_latent_slots(&pred_next_slots)?;
-            let next_slots_flat = flatten_latent_slots(&next_slots)?;
-            let trans_cos =
-                util::scalar_f32(&mean_cosine_similarity(&pred_slots_flat, &next_slots_flat)?)?;
-            let state_slot_rms = util::scalar_f32(&tensor_rms(&state_slots)?)?;
-            let pred_slot_rms = util::scalar_f32(&tensor_rms(&pred_next_slots)?)?;
+            let WorldLogSnapshot {
+                loss_val,
+                trans_val,
+                sigreg_val,
+                act_val,
+                inv_val,
+                post_state_val,
+                rollout_val,
+                action_metrics,
+                inverse_metrics,
+                trans_cos,
+                state_slot_rms,
+                pred_slot_rms,
+            } = log_snapshot.context("world grad accumulation produced no log snapshot")?;
 
             tb.add_scalar("loss/total", loss_val, step);
             tb.add_scalar("loss/trans", trans_val, step);
@@ -2175,12 +2203,7 @@ fn macro_batch_from_examples(
         examples
             .iter()
             .take(batch_size)
-            .map(|example| {
-                (
-                    example.clone(),
-                    vec![example.action_label],
-                )
-            })
+            .map(|example| (example.clone(), vec![example.action_label]))
             .collect::<Vec<_>>()
     } else {
         sample_macro_chains(&chains, batch_size)
@@ -2189,7 +2212,10 @@ fn macro_batch_from_examples(
             .collect()
     };
     if sampled.is_empty() {
-        anyhow::bail!("high-world macro batch could not be built from {} examples", examples.len());
+        anyhow::bail!(
+            "high-world macro batch could not be built from {} examples",
+            examples.len()
+        );
     }
     let mut examples_out = Vec::with_capacity(sampled.len());
     let mut action_sequences = Vec::with_capacity(sampled.len());
@@ -2524,11 +2550,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
 
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut last_loss = None;
-        let mut last_transition_loss = None;
-        let mut last_sigreg_loss = None;
-        let mut last_pred_slots = None;
-        let mut last_target_slots = None;
+        let mut log_snapshot = None;
         let batch_size = high_world_batch_size_for_step(step, &config);
         let grad_accum_steps = high_world_grad_accum_for_step(step, &config);
         if config.batch_warmup_steps > 0
@@ -2545,7 +2567,7 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
             );
         }
 
-        for _micro_step in 0..grad_accum_steps {
+        for micro_step in 0..grad_accum_steps {
             let batch = if let Some(stream) = cached_macro_stream.as_mut() {
                 collect_high_world_macro_batch_cached(
                     stream,
@@ -2601,32 +2623,37 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
                 grad_accum_steps,
             )?;
 
-            last_loss = Some(loss);
-            last_transition_loss = Some(transition_loss);
-            last_sigreg_loss = Some(sigreg_loss);
-            last_pred_slots = Some(pred_slots);
-            last_target_slots = Some(target_slots);
+            let should_capture_log =
+                step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
+            if should_capture_log {
+                let metric_pred_slots = pred_slots.detach();
+                let metric_target_slots = target_slots.detach();
+                log_snapshot = Some(HighWorldLogSnapshot {
+                    loss_val: util::scalar_f32(&loss)?,
+                    trans_val: util::scalar_f32(&transition_loss)?,
+                    sigreg_val: util::scalar_f32(&sigreg_loss)?,
+                    cosine: util::scalar_f32(&mean_cosine_similarity(
+                        &metric_pred_slots,
+                        &metric_target_slots,
+                    )?)?,
+                    pred_rms: util::scalar_f32(&tensor_rms(&metric_pred_slots)?)?,
+                    target_rms: util::scalar_f32(&tensor_rms(&metric_target_slots)?)?,
+                });
+            }
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
-            let loss = last_loss.context("high-world accumulation produced no loss")?;
-            let transition_loss = last_transition_loss
-                .context("high-world accumulation produced no transition loss")?;
-            let sigreg_loss =
-                last_sigreg_loss.context("high-world accumulation produced no sigreg loss")?;
-            let pred_slots =
-                last_pred_slots.context("high-world accumulation produced no predicted slots")?;
-            let target_slots =
-                last_target_slots.context("high-world accumulation produced no target slots")?;
-            let loss_val = util::scalar_f32(&loss)?;
-            let trans_val = util::scalar_f32(&transition_loss)?;
-            let sigreg_val = util::scalar_f32(&sigreg_loss)?;
-            let cosine = util::scalar_f32(&mean_cosine_similarity(&pred_slots, &target_slots)?)?;
-            let pred_rms = util::scalar_f32(&tensor_rms(&pred_slots)?)?;
-            let target_rms = util::scalar_f32(&tensor_rms(&target_slots)?)?;
+            let HighWorldLogSnapshot {
+                loss_val,
+                trans_val,
+                sigreg_val,
+                cosine,
+                pred_rms,
+                target_rms,
+            } = log_snapshot.context("high-world accumulation produced no log snapshot")?;
             let mut selection_metric = trans_val + config.lambda as f32 * sigreg_val;
             tb.add_scalar("loss/total", loss_val, step);
             tb.add_scalar("loss/transition", trans_val, step);
@@ -3032,11 +3059,10 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     }
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut last_action_loss = None;
-        let mut last_action_logits = None;
-        let mut last_action_labels = Vec::new();
+        let mut log_snapshot = None;
 
-        for _micro_step in 0..config.grad_accum_steps.max(1) {
+        let grad_accum_steps = config.grad_accum_steps.max(1);
+        for micro_step in 0..grad_accum_steps {
             let batch = if let Some(ref mut cached_stream) = cached_train_stream {
                 collect_action_training_batch_cached(
                     cached_stream,
@@ -3079,24 +3105,29 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
                 &mut accumulated_grads,
                 &train_vars,
                 &action_loss,
-                config.grad_accum_steps,
+                grad_accum_steps,
             )?;
 
-            last_action_loss = Some(action_loss);
-            last_action_logits = Some(action_logits);
-            last_action_labels = action_labels;
+            let should_capture_log =
+                step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
+            if should_capture_log {
+                let metric_action_logits = action_logits.detach();
+                log_snapshot = Some(OrchestratorLogSnapshot {
+                    action_loss_val: util::scalar_f32(&action_loss)?,
+                    metrics: compute_action_metrics(&metric_action_logits, &action_labels)?,
+                });
+            }
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
-            let action_loss = last_action_loss
-                .context("action_classifier grad accumulation produced no action loss")?;
-            let action_logits = last_action_logits
-                .context("action_classifier grad accumulation produced no action logits")?;
-            let metrics = compute_action_metrics(&action_logits, &last_action_labels)?;
-            let action_loss_val = util::scalar_f32(&action_loss)?;
+            let OrchestratorLogSnapshot {
+                action_loss_val,
+                metrics,
+            } = log_snapshot
+                .context("action_classifier grad accumulation produced no log snapshot")?;
             let mut selection_score = 1.0
                 - (0.7 * metrics.macro_f1 + 0.3 * metrics.balanced_accuracy)
                 + 0.05 * action_loss_val;
@@ -4758,15 +4789,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     }
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut last_oov_rate = None;
-        let mut last_world_latent = None;
-        let mut last_logits = None;
-        let mut last_dec_input = None;
-        let mut last_dec_target = None;
-        let mut last_loss_mask = None;
-        let mut last_loss = None;
-        let mut last_conditioning_loss_val = 0.0f32;
-        let mut last_format_loss_val = 0.0f32;
+        let mut log_snapshot = None;
         let batch_size = decoder_batch_size_for_step(step, &config);
         let grad_accum_steps = decoder_grad_accum_for_step(step, &config);
         if config.batch_warmup_steps > 0
@@ -4960,11 +4983,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             };
             if format_loss_weight > 0.0 {
                 loss = loss.broadcast_add(&format_loss.affine(format_loss_weight, 0.0)?)?;
-                if capture_micro_metrics {
-                    last_format_loss_val = util::scalar_f32(&format_loss)?;
-                }
-            } else {
-                last_format_loss_val = 0.0;
             }
             let conditioning_loss = if conditioning_loss_weight > 0.0 {
                 let mut margin_sum = None;
@@ -5017,13 +5035,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 token_loss.affine(0.0, 0.0)?
             };
             if conditioning_loss_weight > 0.0 {
-                if capture_micro_metrics {
-                    last_conditioning_loss_val = util::scalar_f32(&conditioning_loss)?;
-                }
                 loss =
                     loss.broadcast_add(&conditioning_loss.affine(conditioning_loss_weight, 0.0)?)?;
-            } else {
-                last_conditioning_loss_val = 0.0;
             }
 
             util::accumulate_scaled_gradients(
@@ -5033,102 +5046,156 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 grad_accum_steps,
             )?;
 
-            last_oov_rate = Some(oov_rate);
-            last_world_latent = Some(world_latent);
-            last_logits = Some(logits);
-            last_dec_input = Some(dec_input);
-            last_dec_target = Some(dec_target);
-            last_loss_mask = Some(loss_mask);
-            last_loss = Some(loss);
+            if capture_micro_metrics {
+                let metric_logits = logits.detach();
+                let metric_world_latent = world_latent.detach();
+                let loss_val = util::scalar_f32(&loss)?;
+                let raw_loss = masked_cross_entropy(&metric_logits, &dec_target, &loss_mask)?;
+                let raw_loss_val = util::scalar_f32(&raw_loss)?;
+                let (ablated_loss_val, shuffled_loss_val, hard_mismatch_loss_val) =
+                    if compute_conditioning_metrics {
+                        let zero_world_latent = metric_world_latent.affine(0.0, 0.0)?;
+                        let ablated_logits =
+                            decoder.forward(&dec_input, &zero_world_latent)?.detach();
+                        let ablated_loss =
+                            masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
+                        let shuffled_world_latent =
+                            shuffled_conditioning_latent(&metric_world_latent)?;
+                        let shuffled_logits = decoder
+                            .forward(&dec_input, &shuffled_world_latent)?
+                            .detach();
+                        let shuffled_loss =
+                            masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
+                        let hard_mismatch_world_latent =
+                            hard_mismatched_conditioning_latent(&metric_world_latent)?;
+                        let hard_mismatch_logits = decoder
+                            .forward(&dec_input, &hard_mismatch_world_latent)?
+                            .detach();
+                        let hard_mismatch_loss =
+                            masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
+                        (
+                            util::scalar_f32(&ablated_loss)?,
+                            util::scalar_f32(&shuffled_loss)?,
+                            util::scalar_f32(&hard_mismatch_loss)?,
+                        )
+                    } else {
+                        (raw_loss_val, raw_loss_val, raw_loss_val)
+                    };
+                let syntax_mask =
+                    syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let syntax_loss =
+                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &syntax_mask)?;
+                let signature_mask =
+                    signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let signature_loss =
+                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &signature_mask)?;
+                let structure_mask =
+                    structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
+                let structure_loss =
+                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &structure_mask)?;
+                let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
+                let signature_loss_val = util::scalar_f32(&signature_loss)?;
+                let structure_loss_val = util::scalar_f32(&structure_loss)?;
+                let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
+                let (loss_rows, _) = loss_mask.dims2()?;
+                let total_tokens = (loss_rows.max(1) * config.max_seq * 2) as f32;
+                let active_frac = active_tokens / total_tokens.max(1.0);
+                let perplexity = raw_loss_val.exp();
+                let gains = decoder_conditioning_gains(
+                    raw_loss_val,
+                    ablated_loss_val,
+                    shuffled_loss_val,
+                    hard_mismatch_loss_val,
+                    compute_conditioning_metrics,
+                );
+                let world_rms = util::scalar_f32(&tensor_rms(&metric_world_latent)?)?;
+                let prediction_metrics = decoder_prediction_metrics(
+                    &metric_logits,
+                    &dec_target,
+                    &loss_mask,
+                    &decoder_vocab,
+                )?;
+                log_snapshot = Some(DecoderLogSnapshot {
+                    metrics: DecoderBatchMetrics {
+                        loss: loss_val,
+                        raw_loss: raw_loss_val,
+                        ablated_loss: ablated_loss_val,
+                        conditioning_gain: gains.conditioning_gain,
+                        zero_gain: gains.zero_gain,
+                        shuffled_loss: shuffled_loss_val,
+                        shuffle_gain: gains.shuffle_gain,
+                        hard_negative_gain: gains.hard_negative_gain,
+                        syntax_loss: syntax_loss_val,
+                        signature_loss: signature_loss_val,
+                        structure_loss: structure_loss_val,
+                        perplexity,
+                        active_tokens,
+                        active_frac,
+                        world_rms,
+                        oov_rate,
+                        token_accuracy: prediction_metrics.token_accuracy,
+                        identifier_accuracy: prediction_metrics.identifier_accuracy,
+                        delimiter_balance_rate: prediction_metrics.delimiter_balance_rate,
+                        syntax_token_accuracy: prediction_metrics.syntax_token_accuracy,
+                        function_skeleton_rate: prediction_metrics.function_skeleton_rate,
+                        signature_token_accuracy: prediction_metrics.signature_token_accuracy,
+                        signature_exact_rate: prediction_metrics.signature_exact_rate,
+                        function_name_token_accuracy: prediction_metrics
+                            .function_name_token_accuracy,
+                        function_name_exact_rate: prediction_metrics.function_name_exact_rate,
+                    },
+                    hard_mismatch_loss_val,
+                    conditioning_loss_val: if conditioning_loss_weight > 0.0 {
+                        util::scalar_f32(&conditioning_loss)?
+                    } else {
+                        0.0
+                    },
+                    format_loss_val: if format_loss_weight > 0.0 {
+                        util::scalar_f32(&format_loss)?
+                    } else {
+                        0.0
+                    },
+                    mtp_loss_val: 0.0,
+                });
+            }
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
-            let oov_rate =
-                last_oov_rate.context("decoder grad accumulation produced no OOV rate")?;
-            let world_latent =
-                last_world_latent.context("decoder grad accumulation produced no latent")?;
-            let logits = last_logits.context("decoder grad accumulation produced no logits")?;
-            let dec_input =
-                last_dec_input.context("decoder grad accumulation produced no inputs")?;
-            let dec_target =
-                last_dec_target.context("decoder grad accumulation produced no targets")?;
-            let loss_mask =
-                last_loss_mask.context("decoder grad accumulation produced no loss mask")?;
-            let loss = last_loss.context("decoder grad accumulation produced no loss")?;
-            let loss_val = util::scalar_f32(&loss)?;
-            let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
-            let raw_loss_val = util::scalar_f32(&raw_loss)?;
-            let (ablated_loss_val, shuffled_loss_val, hard_mismatch_loss_val) =
-                if compute_conditioning_metrics {
-                    let zero_world_latent = world_latent.affine(0.0, 0.0)?;
-                    let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
-                    let ablated_loss =
-                        masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
-                    let shuffled_world_latent = shuffled_conditioning_latent(&world_latent)?;
-                    let shuffled_logits = decoder.forward(&dec_input, &shuffled_world_latent)?;
-                    let shuffled_loss =
-                        masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
-                    let hard_mismatch_world_latent =
-                        hard_mismatched_conditioning_latent(&world_latent)?;
-                    let hard_mismatch_logits =
-                        decoder.forward(&dec_input, &hard_mismatch_world_latent)?;
-                    let hard_mismatch_loss =
-                        masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
-                    (
-                        util::scalar_f32(&ablated_loss)?,
-                        util::scalar_f32(&shuffled_loss)?,
-                        util::scalar_f32(&hard_mismatch_loss)?,
-                    )
-                } else {
-                    (raw_loss_val, raw_loss_val, raw_loss_val)
-                };
-            let conditioning_loss_val = last_conditioning_loss_val;
-            let format_loss_val = last_format_loss_val;
-            let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
-            let signature_mask =
-                signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let signature_loss =
-                masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
-            let structure_mask =
-                structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let structure_loss =
-                masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
-            let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
-            let signature_loss_val = util::scalar_f32(&signature_loss)?;
-            let structure_loss_val = util::scalar_f32(&structure_loss)?;
-            let mtp_loss_val = 0.0f32;
-            let active_tokens = util::scalar_f32(&loss_mask.sum_all()?)?;
-            let (loss_rows, _) = loss_mask.dims2()?;
-            let total_tokens = (loss_rows.max(1) * config.max_seq * 2) as f32;
-            let active_frac = active_tokens / total_tokens.max(1.0);
-            let perplexity = raw_loss_val.exp();
-            let gains = decoder_conditioning_gains(
-                raw_loss_val,
-                ablated_loss_val,
-                shuffled_loss_val,
+            let DecoderLogSnapshot {
+                metrics: train_metrics,
                 hard_mismatch_loss_val,
-                compute_conditioning_metrics,
-            );
-            let conditioning_gain = gains.conditioning_gain;
-            let zero_gain = gains.zero_gain;
-            let shuffle_gain = gains.shuffle_gain;
-            let hard_negative_gain = gains.hard_negative_gain;
-            let world_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
-            let prediction_metrics =
-                decoder_prediction_metrics(&logits, &dec_target, &loss_mask, &decoder_vocab)?;
-            let token_accuracy = prediction_metrics.token_accuracy;
-            let identifier_accuracy = prediction_metrics.identifier_accuracy;
-            let delimiter_balance_rate = prediction_metrics.delimiter_balance_rate;
-            let syntax_token_accuracy = prediction_metrics.syntax_token_accuracy;
-            let function_skeleton_rate = prediction_metrics.function_skeleton_rate;
-            let signature_token_accuracy = prediction_metrics.signature_token_accuracy;
-            let signature_exact_rate = prediction_metrics.signature_exact_rate;
-            let function_name_token_accuracy = prediction_metrics.function_name_token_accuracy;
-            let function_name_exact_rate = prediction_metrics.function_name_exact_rate;
+                conditioning_loss_val,
+                format_loss_val,
+                mtp_loss_val,
+            } = log_snapshot.context("decoder grad accumulation produced no log snapshot")?;
+            let loss_val = train_metrics.loss;
+            let raw_loss_val = train_metrics.raw_loss;
+            let ablated_loss_val = train_metrics.ablated_loss;
+            let conditioning_gain = train_metrics.conditioning_gain;
+            let shuffled_loss_val = train_metrics.shuffled_loss;
+            let zero_gain = train_metrics.zero_gain;
+            let shuffle_gain = train_metrics.shuffle_gain;
+            let hard_negative_gain = train_metrics.hard_negative_gain;
+            let syntax_loss_val = train_metrics.syntax_loss;
+            let signature_loss_val = train_metrics.signature_loss;
+            let structure_loss_val = train_metrics.structure_loss;
+            let perplexity = train_metrics.perplexity;
+            let active_tokens = train_metrics.active_tokens;
+            let active_frac = train_metrics.active_frac;
+            let world_rms = train_metrics.world_rms;
+            let oov_rate = train_metrics.oov_rate;
+            let token_accuracy = train_metrics.token_accuracy;
+            let identifier_accuracy = train_metrics.identifier_accuracy;
+            let delimiter_balance_rate = train_metrics.delimiter_balance_rate;
+            let syntax_token_accuracy = train_metrics.syntax_token_accuracy;
+            let function_skeleton_rate = train_metrics.function_skeleton_rate;
+            let signature_token_accuracy = train_metrics.signature_token_accuracy;
+            let signature_exact_rate = train_metrics.signature_exact_rate;
+            let function_name_token_accuracy = train_metrics.function_name_token_accuracy;
+            let function_name_exact_rate = train_metrics.function_name_exact_rate;
 
             tb.add_scalar("loss/token_ce", loss_val, step);
             tb.add_scalar("loss/raw_token_ce", raw_loss_val, step);
@@ -5195,33 +5262,6 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     vram.used_mb, vram.total_mb, vram.peak_used_mb
                 );
             }
-            let train_metrics = DecoderBatchMetrics {
-                loss: loss_val,
-                raw_loss: raw_loss_val,
-                ablated_loss: ablated_loss_val,
-                conditioning_gain,
-                zero_gain,
-                shuffled_loss: shuffled_loss_val,
-                shuffle_gain,
-                hard_negative_gain,
-                syntax_loss: syntax_loss_val,
-                signature_loss: signature_loss_val,
-                structure_loss: structure_loss_val,
-                perplexity,
-                active_tokens,
-                active_frac,
-                world_rms,
-                oov_rate,
-                token_accuracy,
-                identifier_accuracy,
-                delimiter_balance_rate,
-                syntax_token_accuracy,
-                function_skeleton_rate,
-                signature_token_accuracy,
-                signature_exact_rate,
-                function_name_token_accuracy,
-                function_name_exact_rate,
-            };
             let train_reward_proxy = decoder_reward_proxy(&train_metrics);
             tb.add_scalar("reward/proxy", train_reward_proxy, step);
             let mut selection_metric = decoder_selection_score(

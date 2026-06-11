@@ -9,6 +9,7 @@ HF_DATASET="${TOFY_CACHE_HF_DATASET:-Grayza/80gb-profile-go-cache}"
 HF_MAX_WORKERS="${TOFY_CACHE_HF_MAX_WORKERS:-16}"
 ZSTD_THREADS="${TOFY_ZSTD_THREADS:-$(nproc 2>/dev/null || echo 1)}"
 RUNPOD_CACHE_DIR="${TOFY_RUNPOD_CACHE_DIR:-${WORKSPACE}/tofy-cache}"
+ZSTD_WRITE_BLOCK_SIZE="${TOFY_ZSTD_WRITE_BLOCK_SIZE:-64M}"
 
 source "$HOME/.cargo/env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -37,6 +38,19 @@ if [[ -d "${REPO_DIR}/.cache/huggingface/download" ]]; then
   echo "Clearing stale Hugging Face local-dir download locks..."
   find "${REPO_DIR}/.cache/huggingface/download" -type f -name '*.lock' -delete
 fi
+
+decompress_zstd_file() {
+  local compressed="$1"
+  local output="$2"
+
+  if command -v pzstd >/dev/null 2>&1; then
+    pzstd -dc -p "$ZSTD_THREADS" -f "$compressed" \
+      | dd of="$output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress
+  else
+    zstd -dc -T0 -f "$compressed" \
+      | dd of="$output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress
+  fi
+}
 
 if ! hf download "$HF_DATASET" \
   --repo-type dataset \
@@ -105,11 +119,7 @@ if (( ${#token_cache_files[@]} > 0 )); then
     echo "Decompressing ${compressed} -> ${scratch_output}"
     mkdir -p "$(dirname "$scratch_output")"
     rm -f "$scratch_output" "$output"
-    if command -v pzstd >/dev/null 2>&1; then
-      pzstd -d -p "$ZSTD_THREADS" -f "$compressed" -o "$scratch_output"
-    else
-      zstd -d -T0 -f "$compressed" -o "$scratch_output"
-    fi
+    decompress_zstd_file "$compressed" "$scratch_output"
     ln -s "$scratch_output" "$output"
     rm -f "$compressed"
   done
@@ -127,11 +137,7 @@ if (( ${#repo_cache_files[@]} > 0 )); then
     fi
     echo "Decompressing ${compressed} -> ${output}"
     rm -f "$output"
-    if command -v pzstd >/dev/null 2>&1; then
-      pzstd -d -p "$ZSTD_THREADS" -f "$compressed" -o "$output"
-    else
-      zstd -d -T0 -f "$compressed" -o "$output"
-    fi
+    decompress_zstd_file "$compressed" "$output"
     rm -f "$compressed"
   done
 fi
