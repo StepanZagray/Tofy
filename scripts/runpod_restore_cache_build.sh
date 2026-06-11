@@ -19,6 +19,15 @@ fi
 
 cd "$REPO_DIR"
 
+if command -v flock >/dev/null 2>&1; then
+  LOCK_FILE="${TOFY_RESTORE_LOCK_FILE:-${WORKSPACE}/tofy-restore-cache.lock}"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "Another restore/cache build is already running; exiting to avoid duplicate work."
+    exit 0
+  fi
+fi
+
 if ! command -v hf >/dev/null 2>&1; then
   python3 -m pip install -U "huggingface_hub[cli]" --break-system-packages
 fi
@@ -42,27 +51,24 @@ fi
 decompress_zstd_file() {
   local compressed="$1"
   local output="$2"
+  local tmp_output="${output}.tmp.$$"
 
+  rm -f "$tmp_output"
   if command -v pzstd >/dev/null 2>&1; then
-    pzstd -dc -p "$ZSTD_THREADS" -f "$compressed" \
-      | dd of="$output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress
+    if ! pzstd -dc -p "$ZSTD_THREADS" -f "$compressed" \
+      | dd of="$tmp_output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress; then
+      rm -f "$tmp_output"
+      return 1
+    fi
   else
-    zstd -dc -T0 -f "$compressed" \
-      | dd of="$output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress
+    if ! zstd -dc -T0 -f "$compressed" \
+      | dd of="$tmp_output" bs="$ZSTD_WRITE_BLOCK_SIZE" iflag=fullblock status=progress; then
+      rm -f "$tmp_output"
+      return 1
+    fi
   fi
+  mv -f "$tmp_output" "$output"
 }
-
-if ! hf download "$HF_DATASET" \
-  --repo-type dataset \
-  --include "data/**" \
-  --include "eval/**" \
-  --include "local_models/vocabs/**" \
-  --local-dir "$REPO_DIR" \
-  --max-workers "$HF_MAX_WORKERS"; then
-  echo "error: failed to download prepared cache tree from Hugging Face dataset ${HF_DATASET}" >&2
-  echo "Check that HF_TOKEN is exported and the dataset was uploaded with local prepare cache." >&2
-  exit 1
-fi
 
 token_cache_paths=(
   "data/cache/encoder.tokens.bin"
@@ -96,6 +102,45 @@ required_paths=(
   "data/cache/go_feedback/code_decoder_dual_tokens.manifest.json"
   "${token_cache_paths[@]}"
 )
+
+required_cache_tree_present() {
+  local path
+  for path in "${required_paths[@]}"; do
+    if [[ ! -e "$path" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+remove_redundant_compressed_files() {
+  local compressed output
+  while IFS= read -r -d '' compressed; do
+    output="${compressed%.zst}"
+    if [[ -e "$output" ]]; then
+      rm -f "$compressed"
+    fi
+  done < <(find data eval local_models/vocabs -type f -name '*.zst' -print0 2>/dev/null)
+}
+
+if required_cache_tree_present; then
+  echo "Prepared cache tree already exists; skipping Hugging Face download and decompression."
+  remove_redundant_compressed_files
+else
+  if ! hf download "$HF_DATASET" \
+    --repo-type dataset \
+    --include "data/**" \
+    --include "eval/**" \
+    --include "local_models/vocabs/**" \
+    --local-dir "$REPO_DIR" \
+    --max-workers "$HF_MAX_WORKERS"; then
+    echo "error: failed to download prepared cache tree from Hugging Face dataset ${HF_DATASET}" >&2
+    echo "Check that HF_TOKEN is exported and the dataset was uploaded with local prepare cache." >&2
+    exit 1
+  fi
+fi
+
+remove_redundant_compressed_files
 
 token_cache_files=()
 repo_cache_files=()
