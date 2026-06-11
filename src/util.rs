@@ -1208,24 +1208,42 @@ pub fn accumulate_scaled_gradients(
     loss: &Tensor,
     grad_accum_steps: usize,
 ) -> Result<()> {
+    let grads = scaled_gradients(loss, grad_accum_steps)?;
+    accumulate_gradients(accumulated, train_vars, grads)
+}
+
+pub fn scaled_gradients(loss: &Tensor, grad_accum_steps: usize) -> Result<GradStore> {
     let scale = 1.0 / grad_accum_steps.max(1) as f64;
     let scaled_loss = if (scale - 1.0).abs() < f64::EPSILON {
         loss.clone()
     } else {
         loss.affine(scale, 0.0)?
     };
-    let mut grads = scaled_loss.backward()?;
+    Ok(scaled_loss.backward()?)
+}
+
+pub fn accumulate_gradients(
+    accumulated: &mut Option<GradStore>,
+    train_vars: &[Var],
+    mut grads: GradStore,
+) -> Result<()> {
     if let Some(existing) = accumulated.as_mut() {
         for var in train_vars {
             if let Some(grad) = grads.remove(var) {
+                let grad = grad.detach();
                 if let Some(prev) = existing.remove(var) {
-                    existing.insert(var, prev.broadcast_add(&grad)?);
+                    existing.insert(var, prev.broadcast_add(&grad)?.detach());
                 } else {
                     existing.insert(var, grad);
                 }
             }
         }
     } else {
+        for var in train_vars {
+            if let Some(grad) = grads.remove(var) {
+                grads.insert(var, grad.detach());
+            }
+        }
         *accumulated = Some(grads);
     }
     Ok(())

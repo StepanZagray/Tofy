@@ -852,70 +852,74 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         }
 
         for micro_step in 0..grad_accum_steps {
-            let curriculum = latent_curriculum(step, config.steps, &config);
-            let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
-                let batch_pairs = cached_stream.next_batch(batch_size)?;
-                make_augmented_jepa_batch_from_pairs(&batch_pairs, &vocab, &curriculum, &device)?
-            } else {
-                let batch_tokens = pair_stream.next_batch(batch_size)?;
-                make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
+            let micro_grads = {
+                let curriculum = latent_curriculum(step, config.steps, &config);
+                let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
+                    let batch_pairs = cached_stream.next_batch(batch_size)?;
+                    make_augmented_jepa_batch_from_pairs(
+                        &batch_pairs,
+                        &vocab,
+                        &curriculum,
+                        &device,
+                    )?
+                } else {
+                    let batch_tokens = pair_stream.next_batch(batch_size)?;
+                    make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
+                };
+
+                let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
+                let sigreg_loss =
+                    sigreg_epps_pulley(&forward.valid_token_states, sigreg_slices, sigreg_points)?;
+                let loss = forward
+                    .pred_loss
+                    .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
+
+                let should_capture_log =
+                    step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
+                if should_capture_log {
+                    let pred_cos = util::scalar_f32(&mean_cosine_similarity(
+                        &forward.context_targets,
+                        &forward.target_targets,
+                    )?)?;
+                    let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
+                        &forward.pred_chunks_masked,
+                        &forward.target_chunks_masked,
+                    )?)?;
+                    let global_cos = util::scalar_f32(&mean_cosine_similarity(
+                        &forward.pred_global_flat,
+                        &forward.target_global_flat,
+                    )?)?;
+                    let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
+                    let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
+                    let target_count = batch.target_count;
+                    let target_frac =
+                        target_count as f32 / (batch_size * config.max_seq).max(1) as f32;
+                    log_snapshot = Some(LatentLogSnapshot {
+                        loss_val: util::scalar_f32(&loss)?,
+                        pred_val: util::scalar_f32(&forward.pred_loss)?,
+                        token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
+                        chunk_pred_val: util::scalar_f32(&forward.chunk_pred_loss)?,
+                        global_pred_val: util::scalar_f32(&forward.global_pred_loss)?,
+                        sigreg_val: util::scalar_f32(&sigreg_loss)?,
+                        pred_cos,
+                        chunk_cos,
+                        global_cos,
+                        context_rms,
+                        target_rms,
+                        target_count,
+                        target_frac,
+                        code_fraction: batch.code_fraction,
+                        active_seq: curriculum.active_seq,
+                        max_spans_per_sample: curriculum.max_spans_per_sample,
+                        min_masked_ratio: curriculum.min_masked_ratio as f32,
+                        max_masked_ratio: curriculum.max_masked_ratio as f32,
+                        reg_weight: config.lambda as f32,
+                    });
+                }
+
+                util::scaled_gradients(&loss, grad_accum_steps)?
             };
-
-            let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
-            let sigreg_loss =
-                sigreg_epps_pulley(&forward.valid_token_states, sigreg_slices, sigreg_points)?;
-            let loss = forward
-                .pred_loss
-                .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
-
-            let should_capture_log =
-                step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
-            if should_capture_log {
-                let pred_cos = util::scalar_f32(&mean_cosine_similarity(
-                    &forward.context_targets,
-                    &forward.target_targets,
-                )?)?;
-                let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
-                    &forward.pred_chunks_masked,
-                    &forward.target_chunks_masked,
-                )?)?;
-                let global_cos = util::scalar_f32(&mean_cosine_similarity(
-                    &forward.pred_global_flat,
-                    &forward.target_global_flat,
-                )?)?;
-                let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
-                let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
-                let target_count = batch.target_count;
-                let target_frac = target_count as f32 / (batch_size * config.max_seq).max(1) as f32;
-                log_snapshot = Some(LatentLogSnapshot {
-                    loss_val: util::scalar_f32(&loss)?,
-                    pred_val: util::scalar_f32(&forward.pred_loss)?,
-                    token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
-                    chunk_pred_val: util::scalar_f32(&forward.chunk_pred_loss)?,
-                    global_pred_val: util::scalar_f32(&forward.global_pred_loss)?,
-                    sigreg_val: util::scalar_f32(&sigreg_loss)?,
-                    pred_cos,
-                    chunk_cos,
-                    global_cos,
-                    context_rms,
-                    target_rms,
-                    target_count,
-                    target_frac,
-                    code_fraction: batch.code_fraction,
-                    active_seq: curriculum.active_seq,
-                    max_spans_per_sample: curriculum.max_spans_per_sample,
-                    min_masked_ratio: curriculum.min_masked_ratio as f32,
-                    max_masked_ratio: curriculum.max_masked_ratio as f32,
-                    reg_weight: config.lambda as f32,
-                });
-            }
-
-            util::accumulate_scaled_gradients(
-                &mut accumulated_grads,
-                &train_vars,
-                &loss,
-                grad_accum_steps,
-            )?;
+            util::accumulate_gradients(&mut accumulated_grads, &train_vars, micro_grads)?;
         }
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
