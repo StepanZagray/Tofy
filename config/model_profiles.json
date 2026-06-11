@@ -81,7 +81,7 @@
     "decoder_layers": 16,
     "decoder_heads": 16,
     "decoder_ff_dim": 6144,
-    "latent_batch": 16,
+    "latent_batch": 8,
     "latent_warmup_batch": 16,
     "world_batch": 32,
     "world_warmup_batch": 32,
