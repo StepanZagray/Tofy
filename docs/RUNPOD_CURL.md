@@ -363,6 +363,13 @@ cd /workspace/Tofy
 PROFILE=80gb RESUME_TARGET=code_poc_<timestamp> scripts/runpod_train.sh resume
 ```
 
+Resume a run but treat the existing encoder as complete and start world training:
+
+```bash
+cd /workspace/Tofy
+PROFILE=80gb RESUME_TARGET=code_poc_<timestamp> SKIP_TRAINED_STAGES=latent scripts/runpod_train.sh resume
+```
+
 Resume only with the same architecture/profile that created the run.
 
 ## 8. Manual Go Eval

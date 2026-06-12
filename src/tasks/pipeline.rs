@@ -88,6 +88,7 @@ struct PipelineConfig {
     until: PipelineUntil,
     resume: bool,
     resume_selector: Option<String>,
+    skip_trained_stages: Vec<String>,
     with_code_eval: bool,
     build_conditioned_cache: bool,
     from_conditioned_cache: bool,
@@ -321,13 +322,14 @@ impl PipelineConfig {
     fn from_args(args: &[String]) -> Result<Self> {
         let profile_arg = args.first().ok_or_else(|| {
             anyhow::anyhow!(
-                "usage: train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
+                "usage: train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run]] [--skip-trained STAGE[,STAGE...]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
             )
         })?;
         let profile = MemoryProfile::parse(profile_arg)?;
         let mut until = PipelineUntil::Full;
         let mut resume = false;
         let mut resume_selector = None;
+        let mut skip_trained_stages = parse_stage_list_env("TOFY_SKIP_TRAINED_STAGES");
         let mut with_code_eval = true;
         let mut build_conditioned_cache = false;
         let mut from_conditioned_cache = false;
@@ -354,6 +356,13 @@ impl PipelineConfig {
                         i += 1;
                     }
                 }
+                "--skip-trained" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--skip-trained requires STAGE[,STAGE...]"))?;
+                    skip_trained_stages.extend(parse_stage_list(value));
+                    i += 2;
+                }
                 "--with-code-eval" => {
                     with_code_eval = true;
                     i += 1;
@@ -367,7 +376,7 @@ impl PipelineConfig {
                     i += 1;
                 }
                 other => bail!(
-                    "unsupported train argument '{other}' (accepted: --until, --resume, --with-code-eval, --build-conditioned-cache, --from-conditioned-cache)"
+                    "unsupported train argument '{other}' (accepted: --until, --resume, --skip-trained, --with-code-eval, --build-conditioned-cache, --from-conditioned-cache)"
                 ),
             }
         }
@@ -376,6 +385,7 @@ impl PipelineConfig {
             until,
             resume,
             resume_selector,
+            skip_trained_stages,
             with_code_eval,
             build_conditioned_cache,
             from_conditioned_cache,
@@ -394,6 +404,7 @@ fn run_prepare_cache(
         until: PipelineUntil::Full,
         resume: false,
         resume_selector: None,
+        skip_trained_stages: Vec::new(),
         with_code_eval: true,
         build_conditioned_cache: false,
         from_conditioned_cache: false,
@@ -2405,7 +2416,18 @@ fn stage_complete(
     stage: &str,
     target_steps: usize,
 ) -> Result<bool> {
-    if !cfg.resume || !model_path.exists() {
+    if !cfg.resume {
+        return Ok(false);
+    }
+    if skip_trained_stage(cfg, stage) {
+        ensure_file(model_path)?;
+        println!(
+            "Skipping {stage}; --skip-trained accepted existing model {}.",
+            model_path.display()
+        );
+        return Ok(true);
+    }
+    if !model_path.exists() {
         return Ok(false);
     }
     let state_path = util::checkpoint_sidecar_path(model_path, stage, "resume.json");
@@ -2413,6 +2435,37 @@ fn stage_complete(
         return Ok(false);
     };
     Ok(state.step >= target_steps)
+}
+
+fn parse_stage_list_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| parse_stage_list(&value))
+        .unwrap_or_default()
+}
+
+fn parse_stage_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|stage| !stage.is_empty())
+        .map(canonical_skip_stage)
+        .collect()
+}
+
+fn canonical_skip_stage(stage: &str) -> String {
+    match stage {
+        "encoder" => "latent",
+        "decoder" => "decoder_code",
+        "go-feedback" | "go_feedback" | "feedback_decoder" => "decoder_code_go_feedback",
+        other => other,
+    }
+    .to_string()
+}
+
+fn skip_trained_stage(cfg: &PipelineConfig, stage: &str) -> bool {
+    let stage = canonical_skip_stage(stage);
+    cfg.skip_trained_stages.iter().any(|skip| skip == &stage)
 }
 
 fn resolve_run_root(selector: &str) -> Result<PathBuf> {

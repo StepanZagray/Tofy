@@ -325,6 +325,17 @@ The pipeline passes `--resume` into the supported stages automatically and reuse
 cargo run --release -- --latent data/encoder_mix.txt 25000 32 640 256 7 8 8000 --grad-accum 1 --output runs/latent/manual_run/model.safetensors --resume
 ```
 
+To accept an existing trained module before it reaches the profile's full step
+count, pass `--skip-trained` with the completed stage names. This still requires
+`--resume` and verifies the model file exists before skipping.
+
+```bash
+cargo run --release -- train 80gb --resume code_poc_1234567890 --skip-trained latent
+```
+
+Stage aliases: `encoder` maps to `latent`, `decoder` maps to `decoder_code`,
+and `go-feedback` maps to `decoder_code_go_feedback`.
+
 ```bash
 cargo run --release -- --train-world runs/latent/manual_run/model.safetensors runs/latent/manual_run/model.vocab.txt data/world_mix_pairs.txt 60000 64 640 256 7 8 640 64 --grad-accum 2 --output runs/world/manual_run/model.safetensors --resume
 ```
@@ -358,6 +369,9 @@ Resume rules:
 - For the full pipeline, use the same run directory. `--resume latest` picks the newest matching run directory by timestamp; `--resume <run_id>` resumes that exact run.
 - If optimizer sidecars do not exist, `--resume` can still load the exported best/final model weights when available, but optimizer momentum and exact step continuation are not restored.
 - If `resume.json` already reached the profile step count, the stage exits without doing more training.
+- If a partially trained stage is good enough, `--skip-trained STAGE[,STAGE...]`
+  treats its existing model as complete for the pipeline resume and continues
+  with later stages.
 - Do not use old checkpoints from a different architecture, for example previous `DIM=768` 48 GB encoder/world checkpoints with the current `DIM=1024` 48 GB setup.
 
 ## Context Guide

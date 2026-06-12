@@ -36,7 +36,7 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training (learn from data):");
     eprintln!(
-        "    {program} train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run_id|runs/path]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
+        "    {program} train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run_id|runs/path]] [--skip-trained STAGE[,STAGE...]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
     );
     eprintln!(
         "      Go eval selection runs by default; --with-code-eval is accepted for old scripts."
