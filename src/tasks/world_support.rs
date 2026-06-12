@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::ops;
 use std::collections::HashSet;
 
@@ -210,6 +210,7 @@ pub(crate) fn action_cross_entropy(
         let focal_scale = p_t
             .affine(-1.0, 1.0)?
             .powf(focal_gamma as f64)?
+            .to_dtype(DType::F32)?
             .to_vec1::<f32>()?;
         for (weight, scale) in sample_weights.iter_mut().zip(focal_scale) {
             *weight *= scale.max(1e-6);
