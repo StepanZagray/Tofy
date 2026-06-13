@@ -64,10 +64,12 @@ struct ProfileDefaults {
     latent_warmup_batch: usize,
     world_batch: usize,
     world_warmup_batch: usize,
+    high_world_batch: usize,
     code_decoder_batch: usize,
     go_feedback_batch: usize,
     latent_grad_accum: usize,
     world_grad_accum: usize,
+    high_world_grad_accum: usize,
     code_decoder_grad_accum: usize,
     go_feedback_grad_accum: usize,
 }
@@ -168,10 +170,12 @@ struct PipelineMeta<'a> {
     go_feedback_steps: usize,
     latent_batch: usize,
     world_batch: usize,
+    high_world_batch: usize,
     code_decoder_batch: usize,
     go_feedback_batch: usize,
     latent_grad_accum: usize,
     world_grad_accum: usize,
+    high_world_grad_accum: usize,
     code_decoder_grad_accum: usize,
     go_feedback_grad_accum: usize,
     dim: usize,
@@ -604,7 +608,7 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
         defaults.world_warmup_batch.to_string(),
     );
     set_env_default("TOFY_WORLD_WARMUP_GRAD_ACCUM", "1");
-    set_env_default("TOFY_WORLD_WARMUP_STEPS", "1200");
+    set_env_default("TOFY_WORLD_WARMUP_STEPS", "5000");
     set_env_default("TOFY_WORLD_LOG_EVERY", "1000");
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
     set_env_default("TOFY_DECODER_NEGATIVE_FORWARDS", "1");
@@ -1485,7 +1489,7 @@ fn train_high_world(
         paths.world_model.to_string_lossy().to_string(),
         WORLD_DATA.to_string(),
         defaults.high_world_steps.to_string(),
-        defaults.world_batch.to_string(),
+        defaults.high_world_batch.to_string(),
         defaults.dim.to_string(),
         defaults.world_max_seq.to_string(),
         defaults.layers.to_string(),
@@ -1501,7 +1505,7 @@ fn train_high_world(
         "--lr".to_string(),
         "2e-4".to_string(),
         "--grad-accum".to_string(),
-        defaults.world_grad_accum.to_string(),
+        defaults.high_world_grad_accum.to_string(),
         "--output".to_string(),
         paths.high_world_model.to_string_lossy().to_string(),
     ];
@@ -2627,10 +2631,12 @@ fn write_meta(
         go_feedback_steps: defaults.go_feedback_steps,
         latent_batch: defaults.latent_batch,
         world_batch: defaults.world_batch,
+        high_world_batch: defaults.high_world_batch,
         code_decoder_batch: defaults.code_decoder_batch,
         go_feedback_batch: defaults.go_feedback_batch,
         latent_grad_accum: defaults.latent_grad_accum,
         world_grad_accum: defaults.world_grad_accum,
+        high_world_grad_accum: defaults.high_world_grad_accum,
         code_decoder_grad_accum: defaults.code_decoder_grad_accum,
         go_feedback_grad_accum: defaults.go_feedback_grad_accum,
         dim: defaults.dim,
