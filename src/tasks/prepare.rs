@@ -4104,9 +4104,10 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         "TOFY_CONTEXT_EXACT_OLD_TOKENS".to_string(),
         "16".to_string(),
     );
+    let decoder_local_window = args.decoder_max_seq.clamp(128, 256);
     env.insert(
         "TOFY_DECODER_LOCAL_WINDOW".to_string(),
-        args.decoder_max_seq.clamp(128, 256).to_string(),
+        decoder_local_window.to_string(),
     );
     env.insert(
         "TOFY_DECODER_CSA_COMPRESS_RATE".to_string(),
@@ -4118,6 +4119,11 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     );
     env.insert("TOFY_DECODER_ANCHOR_PERIOD".to_string(), "3".to_string());
     env.insert("TOFY_DECODER_CSA_TOPK".to_string(), "16".to_string());
+    env.insert("TOFY_ATTENTION_CPU_TOPK".to_string(), "0".to_string());
+    env.insert(
+        "TOFY_DECODER_ATTENTION_QUERY_BLOCK".to_string(),
+        decoder_local_window.clamp(64, 256).to_string(),
+    );
     env.insert(
         "TOFY_WORLD_TRAIN_ROLLOUT_STEPS".to_string(),
         "2".to_string(),

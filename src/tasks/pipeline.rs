@@ -620,6 +620,14 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
     set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "zero,shuffle");
     set_env_default("TOFY_DECODER_CHECKPOINT_EVERY", "1000");
+    set_env_default("TOFY_ATTENTION_CPU_TOPK", "0");
+    set_env_default_owned(
+        "TOFY_DECODER_ATTENTION_QUERY_BLOCK",
+        context_defaults
+            .decoder_local_window
+            .clamp(64, 256)
+            .to_string(),
+    );
     set_env_default("TOFY_HWM_MACRO_MIN_LEN", "2");
     set_env_default("TOFY_HWM_MACRO_MAX_LEN", "4");
     set_env_default("TOFY_CACHE_DIR", CACHE_DIR);

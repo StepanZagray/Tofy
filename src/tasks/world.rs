@@ -4572,6 +4572,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     } else {
         DecoderConditioningNegatives::none()
     };
+    let decoder_attention_query_block = env_usize("TOFY_DECODER_ATTENTION_QUERY_BLOCK", 1).max(1);
+    let decoder_attention_cpu_topk = env_bool("TOFY_ATTENTION_CPU_TOPK", false);
 
     println!(
         "Training ({} decoder with cross-attention to world latent)",
@@ -4611,6 +4613,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         decoder_attention.cross_attention_schedule.as_str(),
         decoder_attention.latent_prefix,
         decoder_adapter_compress_rate
+    );
+    println!(
+        "Decoder attention runtime: query_block={} cpu_topk={}",
+        decoder_attention_query_block, decoder_attention_cpu_topk
     );
     println!(
         "Decoder negative conditioning forwards: {} (weight={} negatives={})",
@@ -4732,6 +4738,16 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         0,
     );
     tb.add_scalar("config/grad_accum", config.grad_accum_steps as f32, 0);
+    tb.add_scalar(
+        "config/decoder_attention_query_block",
+        decoder_attention_query_block as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/attention_cpu_topk",
+        if decoder_attention_cpu_topk { 1.0 } else { 0.0 },
+        0,
+    );
     tb.add_scalar(
         "config/effective_batch_size",
         (config.batch_size * config.grad_accum_steps.max(1)) as f32,

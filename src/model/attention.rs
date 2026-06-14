@@ -277,7 +277,13 @@ fn append_compressed_blocks(
     Ok((compressed_k, compressed_v, ends))
 }
 
-fn topk_bias_from_scores(
+fn attention_cpu_topk_enabled() -> bool {
+    std::env::var("TOFY_ATTENTION_CPU_TOPK")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn cpu_topk_bias_from_scores(
     scores: &Tensor,
     topk: usize,
     device: &candle_core::Device,
@@ -314,6 +320,15 @@ fn topk_bias_from_scores(
     }
     Tensor::from_vec(bias, (batch, heads, queries, keys), device)
         .map_err(|e| anyhow::anyhow!("{:?}", e))
+}
+
+fn decoder_attention_query_block(_local_window: usize, seq_len: usize) -> usize {
+    std::env::var("TOFY_DECODER_ATTENTION_QUERY_BLOCK")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(1)
+        .min(seq_len.max(1))
 }
 
 /// Multi-Head Attention using Candle's built-in primitives
@@ -769,17 +784,15 @@ impl MultiHeadAttention {
             x.device(),
         )?];
         if let (Some(comp_k), Some(comp_v)) = (&full_kv.compressed_k, &full_kv.compressed_v) {
-            let comp_bias = if let Some(topk) = index_topk {
+            let comp_len = comp_k.dim(2)?;
+            let comp_bias = if let Some(topk) = index_topk.filter(|_| attention_cpu_topk_enabled())
+            {
                 let scores = q
                     .contiguous()?
                     .matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-                topk_bias_from_scores(&scores, topk, x.device())?
+                cpu_topk_bias_from_scores(&scores, topk, x.device())?
             } else {
-                Tensor::zeros(
-                    (b, self.num_heads, t_q, comp_k.dim(2)?),
-                    DType::F32,
-                    x.device(),
-                )?
+                Tensor::zeros((b, self.num_heads, t_q, comp_len), DType::F32, x.device())?
             };
             k_parts.push(comp_k.clone());
             v_parts.push(comp_v.clone());
@@ -789,7 +802,7 @@ impl MultiHeadAttention {
                 &full_kv.compressed_block_ends,
                 x.device(),
             )?
-            .broadcast_as((b, self.num_heads, t_q, comp_k.dim(2)?))?;
+            .broadcast_as((b, self.num_heads, t_q, comp_len))?;
             bias_parts.push(causal_comp_bias.broadcast_add(&comp_bias)?);
         }
 
@@ -929,10 +942,8 @@ impl MultiHeadAttention {
             return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
-        // Compressed blocks depend on each query's exact-tail boundary. Sharing a
-        // block layout across multiple query positions trains a different
-        // attention pattern than the incremental KV-cache path used at inference.
-        let query_block = 1usize;
+        let query_block = decoder_attention_query_block(local_window.max(1), t);
+        let cpu_topk = attention_cpu_topk_enabled();
         let local_radius = local_window.saturating_sub(1);
         let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
@@ -990,19 +1001,25 @@ impl MultiHeadAttention {
                 compress_rate,
             )?;
             if let Some((comp_k, comp_v, block_ends)) = compressed {
-                let index_scores =
-                    q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-                let index_bias = topk_bias_from_scores(&index_scores, index_topk, x.device())?;
-                k_parts.push(comp_k);
-                v_parts.push(comp_v);
                 let causal_bias = compressed_local_block_bias(
                     q_start,
                     q_len,
                     local_window.max(1),
                     &block_ends,
                     x.device(),
-                )?;
-                bias_parts.push(causal_bias.broadcast_add(&index_bias)?);
+                )?
+                .broadcast_as((b, self.num_heads, q_len, block_ends.len()))?;
+                if cpu_topk {
+                    let index_scores =
+                        q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+                    let index_bias =
+                        cpu_topk_bias_from_scores(&index_scores, index_topk, x.device())?;
+                    bias_parts.push(causal_bias.broadcast_add(&index_bias)?);
+                } else {
+                    bias_parts.push(causal_bias);
+                }
+                k_parts.push(comp_k);
+                v_parts.push(comp_v);
             }
 
             let k_chunk = Tensor::cat(&k_parts, 2)?;
@@ -1042,9 +1059,7 @@ impl MultiHeadAttention {
             return self.forward_local_windowed(&x, local_window.max(1), true, None, prefix_len);
         }
 
-        // Keep full training attention partitioned exactly like streaming
-        // compressed KV-cache attention.
-        let query_block = 1usize;
+        let query_block = decoder_attention_query_block(local_window.max(1), t);
         let local_radius = local_window.saturating_sub(1);
         let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
@@ -1082,14 +1097,14 @@ impl MultiHeadAttention {
                 k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
                 v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
                 bias_parts.push(Tensor::zeros(
-                    (1, 1, q_len, exact_prefix_len),
+                    (b, self.num_heads, q_len, exact_prefix_len),
                     DType::F32,
                     x.device(),
                 )?);
             }
             k_parts.push(local_k);
             v_parts.push(local_v);
-            bias_parts.push(local_bias);
+            bias_parts.push(local_bias.broadcast_as((b, self.num_heads, q_len, local_len))?);
             let compressed = compressed_causal_blocks_for_local_queries(
                 &k,
                 &v,
@@ -1102,13 +1117,21 @@ impl MultiHeadAttention {
             if let Some((comp_k, comp_v, block_ends)) = compressed {
                 k_parts.push(comp_k);
                 v_parts.push(comp_v);
-                bias_parts.push(compressed_local_block_bias(
-                    q_start,
-                    q_len,
-                    local_window.max(1),
-                    &block_ends,
-                    x.device(),
-                )?);
+                bias_parts.push(
+                    compressed_local_block_bias(
+                        q_start,
+                        q_len,
+                        local_window.max(1),
+                        &block_ends,
+                        x.device(),
+                    )?
+                    .broadcast_as((
+                        b,
+                        self.num_heads,
+                        q_len,
+                        block_ends.len(),
+                    ))?,
+                );
             }
 
             let k_chunk = Tensor::cat(&k_parts, 2)?;
@@ -1861,7 +1884,7 @@ mod tests {
         let device = Device::Cpu;
         let scores = Tensor::from_vec(vec![0.1f32, 0.5, -1.0, 0.4, 0.3], (1, 1, 1, 5), &device)?;
 
-        let bias = topk_bias_from_scores(&scores, 2, &device)?
+        let bias = cpu_topk_bias_from_scores(&scores, 2, &device)?
             .reshape((5,))?
             .to_vec1::<f32>()?;
 
