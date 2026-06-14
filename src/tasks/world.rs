@@ -3427,6 +3427,18 @@ fn save_decoder_vocab_manifest(
     Ok(())
 }
 
+pub(crate) fn ensure_code_decoder_vocab_manifest(vocab_path: &Path, max_vocab: usize) -> Result<()> {
+    let vocab = load_vocab_from_file(vocab_path)?;
+    save_decoder_vocab_manifest(
+        vocab_path,
+        &vocab,
+        DecoderKind::CodeSpecialist,
+        TokenizationMode::CodeAware,
+        max_vocab,
+        ACTION_CODE,
+    )
+}
+
 fn decoder_varmap_checkpoint_artifact(
     varmap: &VarMap,
     path: &Path,

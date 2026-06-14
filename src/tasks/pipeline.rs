@@ -908,6 +908,12 @@ fn prepare_data(
         }
         fs::copy(&paths.code_decoder_cache_vocab, &paths.code_decoder_vocab)?;
     }
+    if paths.code_decoder_vocab.exists() {
+        tasks::world::ensure_code_decoder_vocab_manifest(
+            &paths.code_decoder_vocab,
+            defaults.code_decoder_max_vocab,
+        )?;
+    }
     if !resume {
         std::env::set_var("TOFY_ENCODER_VOCAB", &paths.encoder_cache_vocab);
     }
