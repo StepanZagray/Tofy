@@ -437,7 +437,11 @@ fn sha256_text(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -452,7 +456,8 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn prepared_cache_required() -> bool {
@@ -3581,7 +3586,7 @@ fn default_oom_probe_args() -> OomProbeArgs {
         world_warmup_steps: None,
         world_lambda: 0.2,
         world_lr: 2e-4,
-        world_action_loss_weight: 0.0,
+        world_action_loss_weight: 1.0,
         high_world_steps: 1000,
         high_world_batch: 64,
         high_world_accum: 2,
@@ -3605,6 +3610,42 @@ fn default_oom_probe_args() -> OomProbeArgs {
         latent_model: None,
         encoder_vocab: None,
         world_model: None,
+    }
+}
+
+struct ProbeContextDefaults {
+    latent_segments: usize,
+    world_segments: usize,
+    retrieval_slots: usize,
+    exact_old_tokens: usize,
+    segment_batch: usize,
+}
+
+fn probe_context_defaults(args: &OomProbeArgs) -> ProbeContextDefaults {
+    if args.dim >= 1024 || args.max_seq >= 384 || args.planner_slots >= 128 {
+        ProbeContextDefaults {
+            latent_segments: 8,
+            world_segments: 8,
+            retrieval_slots: 16,
+            exact_old_tokens: 32,
+            segment_batch: 128,
+        }
+    } else if args.dim >= 768 || args.max_seq >= 320 || args.planner_slots >= 96 {
+        ProbeContextDefaults {
+            latent_segments: 6,
+            world_segments: 6,
+            retrieval_slots: 12,
+            exact_old_tokens: 24,
+            segment_batch: 64,
+        }
+    } else {
+        ProbeContextDefaults {
+            latent_segments: 4,
+            world_segments: 4,
+            retrieval_slots: 8,
+            exact_old_tokens: 16,
+            segment_batch: 16,
+        }
     }
 }
 
@@ -4051,6 +4092,7 @@ fn write_probe_data(path: &Path, rows: usize) -> Result<()> {
 
 fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
+    let context_defaults = probe_context_defaults(args);
     env.insert("TOFY_TRAIN_DTYPE".to_string(), args.dtype.clone());
     if let Some(path) = cached_encoder_vocab_for_probe(args) {
         env.insert(
@@ -4058,7 +4100,10 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
             path.to_string_lossy().to_string(),
         );
     }
-    env.insert("TOFY_LATENT_CONTEXT_SEGMENTS".to_string(), "4".to_string());
+    env.insert(
+        "TOFY_LATENT_CONTEXT_SEGMENTS".to_string(),
+        context_defaults.latent_segments.to_string(),
+    );
     env.insert(
         "TOFY_LATENT_RECENT_FULL_SEGMENTS".to_string(),
         "1".to_string(),
@@ -4080,8 +4125,14 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
             env.remove("TOFY_LATENT_WARMUP_STEPS");
         }
     }
-    env.insert("TOFY_WORLD_CONTEXT_SEGMENTS".to_string(), "4".to_string());
-    env.insert("TOFY_ENCODER_CONTEXT_SEGMENTS".to_string(), "4".to_string());
+    env.insert(
+        "TOFY_WORLD_CONTEXT_SEGMENTS".to_string(),
+        context_defaults.world_segments.to_string(),
+    );
+    env.insert(
+        "TOFY_ENCODER_CONTEXT_SEGMENTS".to_string(),
+        context_defaults.world_segments.to_string(),
+    );
     env.insert(
         "TOFY_WORLD_RECENT_FULL_SEGMENTS".to_string(),
         "1".to_string(),
@@ -4093,16 +4144,19 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     env.insert("TOFY_CONTEXT_HYBRID_MEMORY".to_string(), "1".to_string());
     env.insert(
         "TOFY_CONTEXT_HYBRID_EXACT_TAIL".to_string(),
-        args.max_seq.to_string(),
+        crate::tasks::world::default_context_hybrid_exact_tail(args.max_seq, 1).to_string(),
     );
     env.insert(
         "TOFY_CONTEXT_HYBRID_BLOCK_SIZE".to_string(),
         "32".to_string(),
     );
-    env.insert("TOFY_CONTEXT_RETRIEVAL_SLOTS".to_string(), "8".to_string());
+    env.insert(
+        "TOFY_CONTEXT_RETRIEVAL_SLOTS".to_string(),
+        context_defaults.retrieval_slots.to_string(),
+    );
     env.insert(
         "TOFY_CONTEXT_EXACT_OLD_TOKENS".to_string(),
-        "16".to_string(),
+        context_defaults.exact_old_tokens.to_string(),
     );
     let decoder_local_window = args.decoder_max_seq.clamp(128, 256);
     env.insert(
@@ -4119,7 +4173,6 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     );
     env.insert("TOFY_DECODER_ANCHOR_PERIOD".to_string(), "3".to_string());
     env.insert("TOFY_DECODER_CSA_TOPK".to_string(), "16".to_string());
-    env.insert("TOFY_ATTENTION_CPU_TOPK".to_string(), "0".to_string());
     env.insert(
         "TOFY_DECODER_ATTENTION_QUERY_BLOCK".to_string(),
         decoder_local_window.clamp(64, 256).to_string(),
@@ -4129,14 +4182,14 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
         "2".to_string(),
     );
     env.insert("TOFY_WORLD_ROLLOUT_STEPS".to_string(), "2".to_string());
+    env.insert(
+        "TOFY_CONTEXT_SEGMENT_BATCH".to_string(),
+        context_defaults.segment_batch.to_string(),
+    );
     if args.max_vram {
         env.insert("TOFY_WORLD_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_HIGH_WORLD_LOG_EVERY".to_string(), "25".to_string());
         env.insert("TOFY_CACHE_PREFETCH_BATCHES".to_string(), "8".to_string());
-        env.insert(
-            "TOFY_CONTEXT_SEGMENT_BATCH".to_string(),
-            if args.dim >= 1024 { "128" } else { "64" }.to_string(),
-        );
     }
     env.insert("TOFY_RUN_GROUP".to_string(), args.run_group.clone());
     env.insert("TOFY_RUN_STAGE_NAME".to_string(), stage_name.to_string());
@@ -5003,9 +5056,8 @@ mod tests {
             "go_version": "go version go1.22.0 linux/amd64",
             "workers": 4
         });
-        let hit =
-            artifact_cache_hit("go_repair_pairs", &output, &changed_inputs, &changed_params)
-                .unwrap();
+        let hit = artifact_cache_hit("go_repair_pairs", &output, &changed_inputs, &changed_params)
+            .unwrap();
         match previous {
             Some(value) => std::env::set_var("TOFY_REQUIRE_PREPARED_CACHE", value),
             None => std::env::remove_var("TOFY_REQUIRE_PREPARED_CACHE"),

@@ -136,7 +136,7 @@ World/context compressor knobs:
 - `TOFY_CONTEXT_HYBRID_BLOCK_SIZE=<int>` sets the old-memory compression block size, default `16`
 - `TOFY_CONTEXT_RETRIEVAL_SLOTS=<int>` sets how many compressor slot queries retrieve old-memory summaries, default `8`
 - `TOFY_CONTEXT_EXACT_OLD_TOKENS=<int>` keeps this many learned high-salience old tokens exact alongside learned old-block summaries, default `min(16, 2 * TOFY_CONTEXT_RETRIEVAL_SLOTS)`
-- `TOFY_WORLD_POST_STATE_LOSS_WEIGHT=<float>` trains the transition prediction against the encoded post-turn state (`state + next`) as an auxiliary state-update target, default `0.35`
+- `TOFY_WORLD_POST_STATE_LOSS_WEIGHT=<float>` is ignored for current checkpoints because the main transition target is already the encoded post-turn state (`state + next`); keeping this at `0` avoids duplicating the transition loss
 - `TOFY_WORLD_ROLLOUT_LOSS_WEIGHT=<float>` trains open-loop transition rollouts on real continuation chains found inside the world batch, default `0.25`
 - `TOFY_WORLD_TRAIN_ROLLOUT_STEPS=<int>` controls both world-model chained rollout-loss depth and decoder-training transition rollouts, default pipeline value `2`
 - `TOFY_WORLD_ROLLOUT_MIN_OVERLAP=<int>` minimum token overlap required to treat two rows as a real continuation chain for rollout loss, default `24`
@@ -785,7 +785,7 @@ Typical flow:
 
 1. Start a training command such as `--latent`, `--train-world`, or `--train-decoder`.
 2. In another terminal, run `tensorboard --logdir runs/`.
-3. Open the Scalars tab to watch useful tags such as `loss/total`, `loss/pred`, `loss/sigreg`, `loss/trans`, `loss/token_ce`, `metrics/pred_cosine`, `metrics/trans_cosine`, `metrics/perplexity`, and `memory/used_mb`.
+3. Open the Scalars tab to watch useful tags such as `loss/total`, `loss/pred`, `loss/sigreg`, `loss/trans`, `loss/objective`, `loss/token_nll`, `metrics/pred_cosine`, `metrics/trans_cosine`, `metrics/perplexity`, and `memory/used_mb`.
 4. For encoder runs, pay special attention to `loss/pred_token`, `loss/pred_chunk`, `loss/pred_global`, `metrics/chunk_cosine`, and `metrics/global_cosine`. Those tell you whether the encoder is learning local detail, mid-level structure, and whole-sequence semantics instead of only improving one pooled number.
 5. For strict transition-model runs, prioritize `loss/trans`, `loss/sigreg`, `metrics/trans_cosine`, and `val/selection_score`. If you enable downstream router training, compare `metrics/action_acc` with `metrics/action_balanced_acc`, `metrics/code_rate`, `metrics/pred_code_rate`, and `metrics/code_f1`; high raw accuracy with near-zero predicted code rate still means router collapse.
 6. For proof-of-concept tracking, prefer the code eval suite over any single proxy metric. A lower world loss with no improvement in `suite_pass_rate` is not a meaningful win.

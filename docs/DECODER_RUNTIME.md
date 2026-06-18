@@ -48,7 +48,7 @@ Additional Candle decoding controls:
 - **`JEPA_CANDLE_DECODER_CTX`** — Maximum prompt tokens kept by the Candle runtime before generation.
 - **`TOFY_DECODER_CONDITION_BUDGET`** / **`JEPA_DECODER_CONDITION_BUDGET`** — Keep only the most recent N context-conditioning slots before the decoder conditioning adapter. `0` keeps the shape but zeros conditioning, which is useful for ablations.
 - **`TOFY_DECODER_CROSS_ATTN_SCHEDULE`** — Controls which decoder layers use context/state cross-attention. Supported values: `all`, `every-2nd`, `every-3rd`, `last-only`.
-- **`TOFY_DECODER_CSA_TOPK`** — Number of compressed long-range blocks selected per query in compressed sparse self-attention. Default: `8`.
+- **`TOFY_DECODER_CSA_TOPK`** — Number of compressed long-range blocks kept per query by the on-device DSA-style top-k mask in compressed sparse self-attention. Standalone default: `8`; pipeline default: `16`.
 - **`TOFY_DECODER_LATENT_PREFIX`** — Enables prefix-LM-style latent memory tokens in decoder self-attention. Default: `1`; set `0` to compare against cross-attention-only conditioning.
 
 The Candle path now uses:

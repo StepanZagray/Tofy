@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use candle_nn::ops;
 use std::collections::HashSet;
 
@@ -76,6 +76,13 @@ pub(crate) struct DecoderBatchMetrics {
     pub(crate) signature_exact_rate: f32,
     pub(crate) function_name_token_accuracy: f32,
     pub(crate) function_name_exact_rate: f32,
+}
+
+pub(crate) struct DecoderLossMasks {
+    pub(crate) importance: Tensor,
+    pub(crate) syntax: Tensor,
+    pub(crate) signature: Tensor,
+    pub(crate) structure: Tensor,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -200,23 +207,22 @@ pub(crate) fn action_cross_entropy(
         .gather(&indices, 1)?
         .squeeze(1)?
         .affine(-1.0, 0.0)?;
-    let mut sample_weights = sample_labels
-        .iter()
-        .map(|&label| class_weights.get(label as usize).copied().unwrap_or(1.0))
-        .collect::<Vec<_>>();
+    let class_weights = Tensor::from_vec(class_weights, (n_classes,), device)?
+        .to_dtype(nll.dtype())?
+        .unsqueeze(0)?
+        .broadcast_as((b, n_classes))?
+        .contiguous()?;
+    let mut sample_weights = class_weights.gather(&indices, 1)?.squeeze(1)?;
     let focal_gamma = action_focal_gamma();
     if focal_gamma > 0.0 {
         let p_t = probs.gather(&indices, 1)?.squeeze(1)?;
         let focal_scale = p_t
             .affine(-1.0, 1.0)?
             .powf(focal_gamma as f64)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        for (weight, scale) in sample_weights.iter_mut().zip(focal_scale) {
-            *weight *= scale.max(1e-6);
-        }
+            .clamp(1e-6, 1e10)?
+            .to_dtype(sample_weights.dtype())?;
+        sample_weights = sample_weights.broadcast_mul(&focal_scale)?;
     }
-    let sample_weights = util::from_vec_like(sample_weights, (b,), &nll)?;
     let weighted_nll = nll.broadcast_mul(&sample_weights)?;
     let normalizer = sample_weights.sum_all()?.clamp(1e-8, 1e10)?;
     Ok(weighted_nll.sum_all()?.broadcast_div(&normalizer)?)
@@ -312,8 +318,8 @@ pub(crate) fn world_sigreg_loss(
 }
 
 pub(crate) fn world_selection_score(metrics: &WorldBatchMetrics) -> f32 {
-    let code_rate_gap = (metrics.action_metrics.pred_code_rate - metrics.action_metrics.code_rate)
-        .abs();
+    let code_rate_gap =
+        (metrics.action_metrics.pred_code_rate - metrics.action_metrics.code_rate).abs();
     metrics.transition_loss
         + 0.2 * metrics.sigreg_loss
         + 0.1 * metrics.action_loss
@@ -485,6 +491,12 @@ fn delimiter_balance_for_tokens(tokens: &[String]) -> bool {
     round == 0 && square == 0 && curly == 0
 }
 
+fn has_delimiter(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "(" | ")" | "[" | "]" | "{" | "}"))
+}
+
 fn decode_active_tokens(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<String> {
     ids.iter()
         .zip(mask.iter())
@@ -591,31 +603,103 @@ fn importance_weight_for_token(token: &str) -> f32 {
     }
 }
 
-pub(crate) fn syntax_weight_mask(
-    target: &Tensor,
-    mask: &Tensor,
+pub(crate) fn decoder_loss_masks_from_examples(
+    rows: &[WorldExample],
+    max_seq: usize,
+    pad_id: u32,
     vocab: &Vocab,
-    _device: &Device,
-) -> Result<Tensor> {
-    let target_ids = target.reshape((target.elem_count(),))?.to_vec1::<u32>()?;
-    let mask_values = util::vec1_f32(&mask.reshape((mask.elem_count(),))?)?;
-    let weights = target_ids
-        .iter()
-        .zip(mask_values.iter())
-        .map(|(&id, &m)| {
+    device: &Device,
+) -> Result<DecoderLossMasks> {
+    let (target_rows, mask_rows) = decoder_target_mask_rows(rows, max_seq, pad_id);
+    let shape = (rows.len(), 2 * max_seq);
+    Ok(DecoderLossMasks {
+        importance: Tensor::from_vec(
+            importance_weights_from_rows(&target_rows, &mask_rows, vocab),
+            shape,
+            device,
+        )?,
+        syntax: Tensor::from_vec(
+            syntax_weights_from_rows(&target_rows, &mask_rows, vocab),
+            shape,
+            device,
+        )?,
+        signature: Tensor::from_vec(
+            signature_weights_from_rows(&target_rows, &mask_rows, vocab),
+            shape,
+            device,
+        )?,
+        structure: Tensor::from_vec(
+            structure_weights_from_rows(&target_rows, &mask_rows, vocab),
+            shape,
+            device,
+        )?,
+    })
+}
+
+fn decoder_target_mask_rows(
+    rows: &[WorldExample],
+    max_seq: usize,
+    pad_id: u32,
+) -> (Vec<Vec<u32>>, Vec<Vec<f32>>) {
+    let decoder_len = 2 * max_seq;
+    let mut target_rows = Vec::with_capacity(rows.len());
+    let mut mask_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_sl = row.state_tokens.len().min(max_seq);
+        let nl = row.next_tokens.len().min(max_seq);
+        let prompt_len = if raw_sl == 0 && max_seq > 0 {
+            1
+        } else {
+            raw_sl
+        };
+        let next_start = row.next_tokens.len().saturating_sub(max_seq);
+        let next_tail = &row.next_tokens[next_start..next_start + nl];
+
+        let mut target = Vec::with_capacity(decoder_len);
+        target.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
+        target.extend(next_tail.iter().copied());
+        target.extend(std::iter::repeat_n(
+            pad_id,
+            decoder_len.saturating_sub(target.len()),
+        ));
+
+        let mut mask = Vec::with_capacity(decoder_len);
+        mask.extend(std::iter::repeat_n(0.0f32, prompt_len.saturating_sub(1)));
+        mask.extend(std::iter::repeat_n(1.0f32, nl));
+        mask.extend(std::iter::repeat_n(
+            0.0f32,
+            decoder_len.saturating_sub(mask.len()),
+        ));
+
+        target_rows.push(target);
+        mask_rows.push(mask);
+    }
+    (target_rows, mask_rows)
+}
+
+fn syntax_weights_from_rows(
+    target_rows: &[Vec<u32>],
+    mask_rows: &[Vec<f32>],
+    vocab: &Vocab,
+) -> Vec<f32> {
+    let total = target_rows.iter().map(Vec::len).sum();
+    let mut weights = Vec::with_capacity(total);
+    for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
+        for (&id, &m) in target_row.iter().zip(mask_row.iter()) {
             if m <= 0.0 {
-                0.0
+                weights.push(0.0);
             } else {
-                vocab
-                    .id_to_token
-                    .get(id as usize)
-                    .map(|token| syntax_weight_for_token(token))
-                    .unwrap_or(1.0)
+                weights.push(
+                    vocab
+                        .id_to_token
+                        .get(id as usize)
+                        .map(|token| syntax_weight_for_token(token))
+                        .unwrap_or(1.0),
+                );
             }
-        })
-        .collect::<Vec<_>>();
-    let mask_like = mask.reshape((mask.elem_count(),))?;
-    util::from_vec_like(weights, (target.elem_count(),), &mask_like)
+        }
+    }
+    weights
 }
 
 fn signature_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<usize> {
@@ -690,21 +774,18 @@ fn function_name_span_indices(ids: &[u32], mask: &[f32], vocab: &Vocab) -> Vec<u
     positions
 }
 
-pub(crate) fn signature_weight_mask(
-    target: &Tensor,
-    mask: &Tensor,
+fn signature_weights_from_rows(
+    target_rows: &[Vec<u32>],
+    mask_rows: &[Vec<f32>],
     vocab: &Vocab,
-    _device: &Device,
-) -> Result<Tensor> {
-    let target_rows = target.to_vec2::<u32>()?;
-    let mask_rows = util::vec2_f32(mask)?;
-    let seq_len = target.dim(1)?;
-    let mut weights = Vec::with_capacity(target.elem_count());
+) -> Vec<f32> {
+    let total = target_rows.iter().map(Vec::len).sum();
+    let mut weights = Vec::with_capacity(total);
     for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
         let signature_positions = signature_span_indices(target_row, mask_row, vocab)
             .into_iter()
             .collect::<HashSet<_>>();
-        for (idx, &m) in mask_row.iter().enumerate().take(seq_len) {
+        for (idx, &m) in mask_row.iter().enumerate().take(target_row.len()) {
             if m <= 0.0 {
                 weights.push(0.0);
             } else if signature_positions.contains(&idx) {
@@ -714,19 +795,16 @@ pub(crate) fn signature_weight_mask(
             }
         }
     }
-    util::from_vec_like(weights, (target.elem_count(),), mask)
+    weights
 }
 
-pub(crate) fn structure_weight_mask(
-    target: &Tensor,
-    mask: &Tensor,
+fn structure_weights_from_rows(
+    target_rows: &[Vec<u32>],
+    mask_rows: &[Vec<f32>],
     vocab: &Vocab,
-    _device: &Device,
-) -> Result<Tensor> {
-    let target_rows = target.to_vec2::<u32>()?;
-    let mask_rows = util::vec2_f32(mask)?;
-    let seq_len = target.dim(1)?;
-    let mut weights = Vec::with_capacity(target.elem_count());
+) -> Vec<f32> {
+    let total = target_rows.iter().map(Vec::len).sum();
+    let mut weights = Vec::with_capacity(total);
     for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
         let signature_positions = signature_span_indices(target_row, mask_row, vocab)
             .into_iter()
@@ -750,7 +828,7 @@ pub(crate) fn structure_weight_mask(
                 }
             })
             .next_back();
-        for (idx, &m) in mask_row.iter().enumerate().take(seq_len) {
+        for (idx, &m) in mask_row.iter().enumerate().take(target_row.len()) {
             if m <= 0.0 {
                 weights.push(0.0);
             } else if name_positions.contains(&idx) {
@@ -764,19 +842,16 @@ pub(crate) fn structure_weight_mask(
             }
         }
     }
-    util::from_vec_like(weights, (target.elem_count(),), mask)
+    weights
 }
 
-pub(crate) fn importance_weight_mask(
-    target: &Tensor,
-    mask: &Tensor,
+fn importance_weights_from_rows(
+    target_rows: &[Vec<u32>],
+    mask_rows: &[Vec<f32>],
     vocab: &Vocab,
-    _device: &Device,
-) -> Result<Tensor> {
-    let target_rows = target.to_vec2::<u32>()?;
-    let mask_rows = util::vec2_f32(mask)?;
-    let seq_len = target.dim(1)?;
-    let mut weights = Vec::with_capacity(target.elem_count());
+) -> Vec<f32> {
+    let total = target_rows.iter().map(Vec::len).sum();
+    let mut weights = Vec::with_capacity(total);
     for (target_row, mask_row) in target_rows.iter().zip(mask_rows.iter()) {
         let signature_positions = signature_span_indices(target_row, mask_row, vocab)
             .into_iter()
@@ -788,7 +863,7 @@ pub(crate) fn importance_weight_mask(
             .iter()
             .zip(mask_row.iter())
             .enumerate()
-            .take(seq_len)
+            .take(target_row.len())
         {
             if m <= 0.0 {
                 weights.push(0.0);
@@ -809,7 +884,7 @@ pub(crate) fn importance_weight_mask(
             weights.push(weight);
         }
     }
-    util::from_vec_like(weights, (target.elem_count(),), mask)
+    weights
 }
 
 fn go_function_skeleton_for_tokens(tokens: &[String]) -> bool {
@@ -836,15 +911,19 @@ pub(crate) fn decoder_prediction_metrics(
     let mut ident_total = 0usize;
     let mut ident_correct = 0usize;
     let mut balanced = 0usize;
+    let mut delimiter_rows = 0usize;
     let mut syntax_total = 0usize;
     let mut syntax_correct = 0usize;
     let mut function_skeletons = 0usize;
+    let mut function_skeleton_rows = 0usize;
     let mut signature_total = 0usize;
     let mut signature_correct = 0usize;
     let mut signature_exact = 0usize;
+    let mut signature_rows = 0usize;
     let mut function_name_total = 0usize;
     let mut function_name_correct = 0usize;
     let mut function_name_exact = 0usize;
+    let mut function_name_rows = 0usize;
     for ((pred_row, target_row), mask_row) in pred_rows
         .iter()
         .zip(target_rows.iter())
@@ -852,6 +931,12 @@ pub(crate) fn decoder_prediction_metrics(
     {
         let signature_positions = signature_span_indices(target_row, mask_row, vocab);
         let function_name_positions = function_name_span_indices(target_row, mask_row, vocab);
+        if !signature_positions.is_empty() {
+            signature_rows += 1;
+        }
+        if !function_name_positions.is_empty() {
+            function_name_rows += 1;
+        }
         let mut row_signature_ok = !signature_positions.is_empty();
         let mut row_function_name_ok = !function_name_positions.is_empty();
         for (idx, ((&pred_id, &target_id), &m)) in pred_row
@@ -902,11 +987,20 @@ pub(crate) fn decoder_prediction_metrics(
             }
         }
         let active_pred_tokens = decode_active_tokens(pred_row, mask_row, vocab);
-        if delimiter_balance_for_tokens(&active_pred_tokens) {
-            balanced += 1;
+        let active_target_tokens = decode_active_tokens(target_row, mask_row, vocab);
+        if has_delimiter(&active_target_tokens) {
+            delimiter_rows += 1;
+            if has_delimiter(&active_pred_tokens)
+                && delimiter_balance_for_tokens(&active_pred_tokens)
+            {
+                balanced += 1;
+            }
         }
-        if go_function_skeleton_for_tokens(&active_pred_tokens) {
-            function_skeletons += 1;
+        if go_function_skeleton_for_tokens(&active_target_tokens) {
+            function_skeleton_rows += 1;
+            if go_function_skeleton_for_tokens(&active_pred_tokens) {
+                function_skeletons += 1;
+            }
         }
         if row_signature_ok {
             signature_exact += 1;
@@ -916,18 +1010,17 @@ pub(crate) fn decoder_prediction_metrics(
         }
     }
 
-    let row_count = pred_rows.len().max(1) as f32;
     Ok(DecoderPredictionMetrics {
         token_accuracy: correct as f32 / total.max(1) as f32,
         identifier_accuracy: ident_correct as f32 / ident_total.max(1) as f32,
-        delimiter_balance_rate: balanced as f32 / row_count,
+        delimiter_balance_rate: balanced as f32 / delimiter_rows.max(1) as f32,
         syntax_token_accuracy: syntax_correct as f32 / syntax_total.max(1) as f32,
-        function_skeleton_rate: function_skeletons as f32 / row_count,
+        function_skeleton_rate: function_skeletons as f32 / function_skeleton_rows.max(1) as f32,
         signature_token_accuracy: signature_correct as f32 / signature_total.max(1) as f32,
-        signature_exact_rate: signature_exact as f32 / row_count,
+        signature_exact_rate: signature_exact as f32 / signature_rows.max(1) as f32,
         function_name_token_accuracy: function_name_correct as f32
             / function_name_total.max(1) as f32,
-        function_name_exact_rate: function_name_exact as f32 / row_count,
+        function_name_exact_rate: function_name_exact as f32 / function_name_rows.max(1) as f32,
     })
 }
 
@@ -1152,16 +1245,21 @@ pub(crate) fn evaluate_decoder_encoded_batch(
     let (dec_input, dec_target, loss_mask) =
         make_decoder_batch_from_slice(decoder_batch, max_seq, decoder_vocab.pad_id, device)?;
     let logits = decoder.forward(&dec_input, &world_latent)?;
-    let importance_mask = importance_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
+    let decoder_masks = decoder_loss_masks_from_examples(
+        decoder_batch,
+        max_seq,
+        decoder_vocab.pad_id,
+        decoder_vocab,
+        device,
+    )?;
     let raw_loss = masked_cross_entropy(&logits, &dec_target, &loss_mask)?;
-    let syntax_mask = syntax_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
-    let signature_mask = signature_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
-    let structure_mask = structure_weight_mask(&dec_target, &loss_mask, decoder_vocab, device)?;
-    let loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
+    let loss = masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.importance)?;
     let raw_loss_val = util::scalar_f32(&raw_loss)?;
-    let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
-    let signature_loss = masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
-    let structure_loss = masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
+    let syntax_loss = masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.syntax)?;
+    let signature_loss =
+        masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.signature)?;
+    let structure_loss =
+        masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.structure)?;
     let loss_val = util::scalar_f32(&loss)?;
     let ablated_loss_val = if compute_conditioning_metrics {
         let zero_world_latent = world_latent.affine(0.0, 0.0)?;
@@ -1214,7 +1312,7 @@ pub(crate) fn evaluate_decoder_encoded_batch(
         syntax_loss: syntax_loss_val,
         signature_loss: signature_loss_val,
         structure_loss: structure_loss_val,
-        perplexity: raw_loss_val.exp(),
+        perplexity: perplexity_from_nll(raw_loss_val),
         active_tokens,
         active_frac: active_tokens / total_tokens.max(1.0),
         world_rms: util::scalar_f32(&tensor_rms(&world_latent)?)?,
@@ -1239,10 +1337,11 @@ fn label_smoothing_eps() -> f32 {
         .clamp(0.0, 0.2)
 }
 
-pub(crate) fn masked_weighted_cross_entropy(
+fn masked_cross_entropy_with_smoothing(
     logits: &Tensor,
     target: &Tensor,
     mask: &Tensor,
+    smoothing: f32,
 ) -> Result<Tensor> {
     let (b, t, v) = logits.dims3()?;
     let logits_flat = logits.reshape((b * t, v))?;
@@ -1254,7 +1353,7 @@ pub(crate) fn masked_weighted_cross_entropy(
         .gather(&target_flat.unsqueeze(1)?, 1)?
         .squeeze(1)?
         .affine(-1.0, 0.0)?;
-    let eps = label_smoothing_eps();
+    let eps = smoothing.clamp(0.0, 0.2);
     let nll_per = if eps > 0.0 {
         let uniform = log_probs.mean(candle_core::D::Minus1)?.affine(-1.0, 0.0)?;
         gathered
@@ -1269,12 +1368,32 @@ pub(crate) fn masked_weighted_cross_entropy(
     Ok(sum_nll.broadcast_div(&sum_mask)?)
 }
 
+pub(crate) fn masked_weighted_cross_entropy(
+    logits: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    masked_cross_entropy_with_smoothing(logits, target, mask, label_smoothing_eps())
+}
+
+pub(crate) fn masked_label_smoothed_cross_entropy(
+    logits: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    masked_cross_entropy_with_smoothing(logits, target, mask, label_smoothing_eps())
+}
+
 pub(crate) fn masked_cross_entropy(
     logits: &Tensor,
     target: &Tensor,
     mask: &Tensor,
 ) -> Result<Tensor> {
-    masked_weighted_cross_entropy(logits, target, mask)
+    masked_cross_entropy_with_smoothing(logits, target, mask, 0.0)
+}
+
+pub(crate) fn perplexity_from_nll(nll: f32) -> f32 {
+    (nll as f64).exp().min(f32::MAX as f64) as f32
 }
 
 pub(crate) fn forbidden_output_probability_loss(
@@ -1395,11 +1514,13 @@ pub(crate) fn decoder_reward_proxy(metrics: &DecoderBatchMetrics) -> f32 {
 mod tests {
     use super::{
         action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
-        decoder_reward_proxy, forbidden_decoder_token, function_name_span_indices,
+        decoder_prediction_metrics, decoder_reward_proxy, forbidden_decoder_token,
+        function_name_span_indices, masked_cross_entropy, perplexity_from_nll,
         signature_span_indices,
     };
     use crate::data::CODE_EOS_TOKEN;
     use crate::model::Vocab;
+    use crate::util;
     use candle_core::{DType, Device, Tensor};
 
     fn vocab_with(tokens: &[&str]) -> (Vocab, Vec<u32>) {
@@ -1409,6 +1530,14 @@ mod tests {
             .map(|token| vocab.add_token(token))
             .collect::<Vec<_>>();
         (vocab, ids)
+    }
+
+    fn logits_for_predictions(predictions: &[u32], vocab_size: usize) -> Vec<f32> {
+        let mut logits = vec![-8.0; predictions.len() * vocab_size];
+        for (row, &prediction) in predictions.iter().enumerate() {
+            logits[row * vocab_size + prediction as usize] = 8.0;
+        }
+        logits
     }
 
     #[test]
@@ -1431,6 +1560,24 @@ mod tests {
             .expect_err("label count mismatch should fail");
 
         assert!(err.to_string().contains("action label count"));
+        Ok(())
+    }
+
+    #[test]
+    fn action_cross_entropy_handles_balanced_class_weights() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![
+                4.0f32, 1.0, 0.0, -1.0, //
+                0.0, 3.0, 1.0, -2.0,
+            ],
+            (2, 4),
+            &device,
+        )?;
+
+        let loss = action_cross_entropy(&logits, &[0, 1], &device)?;
+
+        assert!(util::scalar_f32(&loss)?.is_finite());
         Ok(())
     }
 
@@ -1550,5 +1697,69 @@ mod tests {
             decoder_conditioning_gains(2.0, 2.6, 2.4, 2.3, false).conditioning_gain,
             0.0
         );
+    }
+
+    #[test]
+    fn masked_cross_entropy_is_unsmoothed_nll() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let logits = Tensor::zeros((1, 1, 2), DType::F32, &device)?;
+        let target = Tensor::from_vec(vec![1u32], (1, 1), &device)?;
+        let mask = Tensor::ones((1, 1), DType::F32, &device)?;
+
+        let loss = util::scalar_f32(&masked_cross_entropy(&logits, &target, &mask)?)?;
+
+        assert!((loss - std::f32::consts::LN_2).abs() < 1e-5);
+        assert_eq!(perplexity_from_nll(loss), 2.0);
+        assert!(perplexity_from_nll(100.0).is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_exact_rates_use_only_eligible_rows() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let (vocab, ids) = vocab_with(&["func", "Parse", "(", ")", "{", "}", "return"]);
+        let [func, parse, open, close, left, right, ret] = ids.as_slice() else {
+            unreachable!()
+        };
+        let targets = vec![
+            *func, *parse, *open, *close, *left, *right, //
+            *ret, *ret, *ret, *ret, *ret, *ret,
+        ];
+        let logits = Tensor::from_vec(
+            logits_for_predictions(&targets, vocab.id_to_token.len()),
+            (2, 6, vocab.id_to_token.len()),
+            &device,
+        )?;
+        let target = Tensor::from_vec(targets, (2, 6), &device)?;
+        let mask = Tensor::ones((2, 6), DType::F32, &device)?;
+
+        let metrics = decoder_prediction_metrics(&logits, &target, &mask, &vocab)?;
+
+        assert_eq!(metrics.signature_exact_rate, 1.0);
+        assert_eq!(metrics.function_name_exact_rate, 1.0);
+        assert_eq!(metrics.function_skeleton_rate, 1.0);
+        assert_eq!(metrics.delimiter_balance_rate, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn delimiter_balance_rejects_predictions_without_delimiters() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let (vocab, ids) = vocab_with(&["(", ")", "name"]);
+        let [open, close, name] = ids.as_slice() else {
+            unreachable!()
+        };
+        let logits = Tensor::from_vec(
+            logits_for_predictions(&[*name, *name], vocab.id_to_token.len()),
+            (1, 2, vocab.id_to_token.len()),
+            &device,
+        )?;
+        let target = Tensor::from_vec(vec![*open, *close], (1, 2), &device)?;
+        let mask = Tensor::ones((1, 2), DType::F32, &device)?;
+
+        let metrics = decoder_prediction_metrics(&logits, &target, &mask, &vocab)?;
+
+        assert_eq!(metrics.delimiter_balance_rate, 0.0);
+        Ok(())
     }
 }

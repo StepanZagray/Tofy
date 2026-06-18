@@ -249,71 +249,37 @@ impl ContextCompressor {
         old_mask: &Tensor,
         keep: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let (batch, old_len, _) = old_memory.dims3()?;
+        let old_memory = old_memory.contiguous()?;
+        let old_mask = old_mask.contiguous()?;
+        let (batch, old_len, dim) = old_memory.dims3()?;
         let keep = keep.min(old_len).max(1);
-        let normed = self.memory_ln.forward(old_memory)?;
+        let normed = self.memory_ln.forward(&old_memory)?;
         let scores = self
             .memory_importance
             .forward(&normed)?
             .squeeze(2)?
+            .to_dtype(candle_core::DType::F32)?;
+        let mask_bias = old_mask
             .to_dtype(candle_core::DType::F32)?
-            .to_vec2::<f32>()?;
-        let mask = old_mask
-            .to_dtype(candle_core::DType::F32)?
-            .to_vec2::<f32>()?;
-        let mut memory_rows = Vec::with_capacity(batch);
-        let mut mask_rows = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let mut ranked = (0..old_len)
-                .map(|idx| {
-                    let valid = mask
-                        .get(b)
-                        .and_then(|row| row.get(idx))
-                        .copied()
-                        .unwrap_or(0.0)
-                        > 0.0;
-                    let score = if valid {
-                        scores
-                            .get(b)
-                            .and_then(|row| row.get(idx))
-                            .copied()
-                            .unwrap_or(f32::NEG_INFINITY)
-                    } else {
-                        f32::NEG_INFINITY
-                    };
-                    (idx, score)
-                })
-                .collect::<Vec<_>>();
-            ranked.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let mut chosen = ranked
-                .into_iter()
-                .take(keep)
-                .map(|(idx, _)| idx)
-                .collect::<Vec<_>>();
-            chosen.sort_unstable();
-            let chosen_ids = Tensor::from_vec(
-                chosen.iter().map(|idx| *idx as u32).collect::<Vec<_>>(),
-                (keep,),
-                old_memory.device(),
-            )?;
-            memory_rows.push(
-                old_memory
-                    .narrow(0, b, 1)?
-                    .squeeze(0)?
-                    .index_select(&chosen_ids, 0)?
-                    .unsqueeze(0)?,
-            );
-            mask_rows.push(
-                old_mask
-                    .narrow(0, b, 1)?
-                    .squeeze(0)?
-                    .index_select(&chosen_ids, 0)?
-                    .unsqueeze(0)?,
-            );
-        }
-        let memory_refs = memory_rows.iter().collect::<Vec<_>>();
-        let mask_refs = mask_rows.iter().collect::<Vec<_>>();
-        Ok((Tensor::cat(&memory_refs, 0)?, Tensor::cat(&mask_refs, 0)?))
+            .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?;
+        let top_ids = scores
+            .broadcast_add(&mask_bias)?
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, keep)?
+            .contiguous()?;
+        let chronological_order = top_ids.arg_sort_last_dim(true)?.contiguous()?;
+        let top_ids = top_ids
+            .gather(&chronological_order, D::Minus1)?
+            .contiguous()?;
+        let memory_idx = top_ids
+            .unsqueeze(2)?
+            .broadcast_as((batch, keep, dim))?
+            .contiguous()?;
+        let mask_idx = top_ids.contiguous()?;
+        Ok((
+            old_memory.gather(&memory_idx, 1)?,
+            old_mask.gather(&mask_idx, 1)?,
+        ))
     }
 
     #[allow(dead_code)]

@@ -277,14 +277,27 @@ fn append_compressed_blocks(
     Ok((compressed_k, compressed_v, ends))
 }
 
-fn attention_cpu_topk_enabled() -> bool {
-    std::env::var("TOFY_ATTENTION_CPU_TOPK")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+fn dsa_topk_indices_from_scores(
+    scores: &Tensor,
+    causal_bias: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    let (_, _, _, keys) = scores.dims4()?;
+    let topk = topk.max(1).min(keys.max(1));
+    let selector_scores = scores.to_dtype(DType::F32)?.relu()?.mean_keepdim(1)?;
+    let selector_causal_bias = causal_bias.to_dtype(DType::F32)?.narrow(1, 0, 1)?;
+    selector_scores
+        .broadcast_add(&selector_causal_bias)?
+        .contiguous()?
+        .arg_sort_last_dim(false)?
+        .narrow(D::Minus1, 0, topk)
+        .and_then(|ids| ids.contiguous())
+        .map_err(Into::into)
 }
 
-fn cpu_topk_bias_from_scores(
+fn dsa_topk_bias_from_scores(
     scores: &Tensor,
+    causal_bias: &Tensor,
     topk: usize,
     device: &candle_core::Device,
 ) -> Result<Tensor> {
@@ -293,33 +306,12 @@ fn cpu_topk_bias_from_scores(
         return Tensor::zeros((batch, heads, queries, keys), DType::F32, device)
             .map_err(Into::into);
     }
-    let values = scores
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let mut bias = vec![ATTENTION_MASK_VALUE; batch * heads * queries * keys];
-    for b_idx in 0..batch {
-        for h_idx in 0..heads {
-            for q_idx in 0..queries {
-                let base = ((b_idx * heads + h_idx) * queries + q_idx) * keys;
-                let mut ranked = (0..keys)
-                    .map(|k_idx| (k_idx, values[base + k_idx]))
-                    .filter(|(_, score)| score.is_finite())
-                    .collect::<Vec<_>>();
-                if ranked.len() > topk {
-                    ranked.select_nth_unstable_by(topk, |(_, a), (_, b)| {
-                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    ranked.truncate(topk);
-                }
-                for (k_idx, _) in ranked.into_iter().take(topk) {
-                    bias[base + k_idx] = 0.0;
-                }
-            }
-        }
-    }
-    Tensor::from_vec(bias, (batch, heads, queries, keys), device)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))
+    let topk_idxs = dsa_topk_indices_from_scores(scores, causal_bias, topk)?;
+    let init = Tensor::full(ATTENTION_MASK_VALUE, (batch, 1, queries, keys), device)?;
+    let zeros = Tensor::zeros((batch, 1, queries, topk.min(keys)), DType::F32, device)?;
+    init.scatter(&topk_idxs, &zeros, D::Minus1)?
+        .broadcast_as((batch, heads, queries, keys))
+        .map_err(Into::into)
 }
 
 fn decoder_attention_query_block(_local_window: usize, seq_len: usize) -> usize {
@@ -775,45 +767,37 @@ impl MultiHeadAttention {
         let full_kv =
             append_to_compressed_cache(cache, new_kv, exact_tail.max(1), compress_rate.max(1))?;
 
-        let mut k_parts = vec![full_kv.k.clone()];
-        let mut v_parts = vec![full_kv.v.clone()];
-        let mut bias_parts = vec![cache_causal_bias(
-            &full_kv,
-            position_offset,
-            t_q,
-            x.device(),
-        )?];
-        if let (Some(comp_k), Some(comp_v)) = (&full_kv.compressed_k, &full_kv.compressed_v) {
-            let comp_len = comp_k.dim(2)?;
-            let comp_bias = if let Some(topk) = index_topk.filter(|_| attention_cpu_topk_enabled())
-            {
-                let scores = q
-                    .contiguous()?
-                    .matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-                cpu_topk_bias_from_scores(&scores, topk, x.device())?
+        let exact_bias = cache_causal_bias(&full_kv, position_offset, t_q, x.device())?;
+        let attn_output =
+            if let (Some(comp_k), Some(comp_v)) = (&full_kv.compressed_k, &full_kv.compressed_v) {
+                let comp_len = comp_k.dim(2)?;
+                let causal_comp_bias = compressed_cache_block_bias(
+                    position_offset,
+                    t_q,
+                    &full_kv.compressed_block_ends,
+                    x.device(),
+                )?
+                .broadcast_as((b, self.num_heads, t_q, comp_len))?;
+                self.compressed_sparse_attention_output(
+                    &q,
+                    &full_kv.k,
+                    &full_kv.v,
+                    &exact_bias,
+                    Some((comp_k, comp_v, &causal_comp_bias)),
+                    index_topk.unwrap_or(comp_len).max(1),
+                    "compressed incremental attention q/k",
+                )?
             } else {
-                Tensor::zeros((b, self.num_heads, t_q, comp_len), DType::F32, x.device())?
+                self.compressed_sparse_attention_output(
+                    &q,
+                    &full_kv.k,
+                    &full_kv.v,
+                    &exact_bias,
+                    None,
+                    1,
+                    "compressed incremental attention q/k",
+                )?
             };
-            k_parts.push(comp_k.clone());
-            v_parts.push(comp_v.clone());
-            let causal_comp_bias = compressed_cache_block_bias(
-                position_offset,
-                t_q,
-                &full_kv.compressed_block_ends,
-                x.device(),
-            )?
-            .broadcast_as((b, self.num_heads, t_q, comp_len))?;
-            bias_parts.push(causal_comp_bias.broadcast_add(&comp_bias)?);
-        }
-
-        let k_all = Tensor::cat(&k_parts, 2)?;
-        let v_all = Tensor::cat(&v_parts, 2)?;
-        let bias = Tensor::cat(&bias_parts, 3)?.to_dtype(q.dtype())?;
-        util::ensure_same_dtype(&q, &k_all, "compressed incremental attention q/k")?;
-        let scores =
-            (q.matmul(&k_all.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.scale)?;
-        let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-        let attn_output = attn_weights.contiguous()?.matmul(&v_all.contiguous()?)?;
         let out = attn_output.transpose(1, 2)?.contiguous()?.reshape((
             b,
             t_q,
@@ -943,7 +927,6 @@ impl MultiHeadAttention {
         }
 
         let query_block = decoder_attention_query_block(local_window.max(1), t);
-        let cpu_topk = attention_cpu_topk_enabled();
         let local_radius = local_window.saturating_sub(1);
         let exact_prefix_len = prefix_len.min(t);
         let mut outputs = Vec::new();
@@ -975,21 +958,24 @@ impl MultiHeadAttention {
             )?
             .broadcast_as((b, self.num_heads, q_len, local_len))?;
 
-            let mut k_parts = Vec::new();
-            let mut v_parts = Vec::new();
-            let mut bias_parts = Vec::new();
+            let mut exact_k_parts = Vec::new();
+            let mut exact_v_parts = Vec::new();
+            let mut exact_bias_parts = Vec::new();
             if include_prefix {
-                k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
-                v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
-                bias_parts.push(Tensor::zeros(
+                exact_k_parts.push(k.narrow(2, 0, exact_prefix_len)?);
+                exact_v_parts.push(v.narrow(2, 0, exact_prefix_len)?);
+                exact_bias_parts.push(Tensor::zeros(
                     (b, self.num_heads, q_len, exact_prefix_len),
                     DType::F32,
                     x.device(),
                 )?);
             }
-            k_parts.push(local_k);
-            v_parts.push(local_v);
-            bias_parts.push(local_bias);
+            exact_k_parts.push(local_k);
+            exact_v_parts.push(local_v);
+            exact_bias_parts.push(local_bias);
+            let exact_k = Tensor::cat(&exact_k_parts, 2)?;
+            let exact_v = Tensor::cat(&exact_v_parts, 2)?;
+            let exact_bias = Tensor::cat(&exact_bias_parts, 3)?;
 
             let compressed = compressed_causal_blocks_for_local_queries(
                 &k,
@@ -1000,7 +986,7 @@ impl MultiHeadAttention {
                 local_window.max(1),
                 compress_rate,
             )?;
-            if let Some((comp_k, comp_v, block_ends)) = compressed {
+            let attn_output = if let Some((comp_k, comp_v, block_ends)) = compressed {
                 let causal_bias = compressed_local_block_bias(
                     q_start,
                     q_len,
@@ -1009,29 +995,27 @@ impl MultiHeadAttention {
                     x.device(),
                 )?
                 .broadcast_as((b, self.num_heads, q_len, block_ends.len()))?;
-                if cpu_topk {
-                    let index_scores =
-                        q_chunk.matmul(&comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-                    let index_bias =
-                        cpu_topk_bias_from_scores(&index_scores, index_topk, x.device())?;
-                    bias_parts.push(causal_bias.broadcast_add(&index_bias)?);
-                } else {
-                    bias_parts.push(causal_bias);
-                }
-                k_parts.push(comp_k);
-                v_parts.push(comp_v);
-            }
-
-            let k_chunk = Tensor::cat(&k_parts, 2)?;
-            let v_chunk = Tensor::cat(&v_parts, 2)?;
-            let bias = Tensor::cat(&bias_parts, 3)?;
-            util::ensure_same_dtype(&q_chunk, &k_chunk, "compressed causal attention q/k")?;
-            let scores = (q_chunk
-                .matmul(&k_chunk.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
-                / self.scale)?;
-            let bias = bias.to_dtype(scores.dtype())?;
-            let attn_weights = candle_nn::ops::softmax(&scores.broadcast_add(&bias)?, D::Minus1)?;
-            outputs.push(attn_weights.contiguous()?.matmul(&v_chunk.contiguous()?)?);
+                self.compressed_sparse_attention_output(
+                    &q_chunk,
+                    &exact_k,
+                    &exact_v,
+                    &exact_bias,
+                    Some((&comp_k, &comp_v, &causal_bias)),
+                    index_topk,
+                    "compressed causal attention q/k",
+                )?
+            } else {
+                self.compressed_sparse_attention_output(
+                    &q_chunk,
+                    &exact_k,
+                    &exact_v,
+                    &exact_bias,
+                    None,
+                    index_topk,
+                    "compressed causal attention q/k",
+                )?
+            };
+            outputs.push(attn_output);
         }
 
         let attn_output = Tensor::cat(&outputs, 2)?;
@@ -1159,6 +1143,61 @@ impl MultiHeadAttention {
         self.out_proj
             .forward(&attn_output)
             .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compressed_sparse_attention_output(
+        &self,
+        q: &Tensor,
+        exact_k: &Tensor,
+        exact_v: &Tensor,
+        exact_bias: &Tensor,
+        compressed: Option<(&Tensor, &Tensor, &Tensor)>,
+        index_topk: usize,
+        dtype_label: &str,
+    ) -> Result<Tensor> {
+        let (batch, heads, queries, _) = q.dims4()?;
+        let exact_len = exact_k.dim(2)?;
+        util::ensure_same_dtype(q, exact_k, dtype_label)?;
+        let exact_scores =
+            (q.matmul(&exact_k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.scale)?;
+        let exact_scores =
+            exact_scores.broadcast_add(&exact_bias.to_dtype(exact_scores.dtype())?)?;
+
+        if let Some((comp_k, comp_v, comp_bias)) = compressed {
+            util::ensure_same_dtype(q, comp_k, dtype_label)?;
+            let comp_len = comp_k.dim(2)?;
+            let comp_k_t = comp_k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+            let comp_index_scores = q.matmul(&comp_k_t)?;
+            let comp_scores = comp_index_scores.affine(1.0 / self.scale, 0.0)?;
+            let comp_bias = if comp_len > 0 && index_topk < comp_len {
+                let topk_bias = dsa_topk_bias_from_scores(
+                    &comp_index_scores,
+                    comp_bias,
+                    index_topk,
+                    q.device(),
+                )?;
+                comp_bias.broadcast_add(&topk_bias)?
+            } else {
+                comp_bias.clone()
+            };
+            let comp_scores =
+                comp_scores.broadcast_add(&comp_bias.to_dtype(comp_scores.dtype())?)?;
+            let scores = Tensor::cat(&[exact_scores, comp_scores], D::Minus1)?;
+            let attn_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
+            let exact_weights = attn_weights.narrow(D::Minus1, 0, exact_len)?;
+            let exact_out = exact_weights.contiguous()?.matmul(&exact_v.contiguous()?)?;
+            let comp_weights = attn_weights.narrow(D::Minus1, exact_len, comp_len)?;
+            let comp_out = comp_weights.contiguous()?.matmul(&comp_v.contiguous()?)?;
+            let output = exact_out.broadcast_add(&comp_out)?;
+            debug_assert_eq!(output.dims(), &[batch, heads, queries, self.head_dim]);
+            return Ok(output);
+        }
+
+        let attn_weights = candle_nn::ops::softmax(&exact_scores, D::Minus1)?;
+        let output = attn_weights.contiguous()?.matmul(&exact_v.contiguous()?)?;
+        debug_assert_eq!(output.dims(), &[batch, heads, queries, self.head_dim]);
+        Ok(output)
     }
 
     fn attention_scores_to_output(
@@ -1883,8 +1922,9 @@ mod tests {
     fn topk_bias_masks_non_selected_compressed_entries() -> Result<()> {
         let device = Device::Cpu;
         let scores = Tensor::from_vec(vec![0.1f32, 0.5, -1.0, 0.4, 0.3], (1, 1, 1, 5), &device)?;
+        let causal_bias = Tensor::zeros((1, 1, 1, 5), DType::F32, &device)?;
 
-        let bias = cpu_topk_bias_from_scores(&scores, 2, &device)?
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 2, &device)?
             .reshape((5,))?
             .to_vec1::<f32>()?;
 
@@ -1896,6 +1936,51 @@ mod tests {
                 ATTENTION_MASK_VALUE,
                 0.0,
                 ATTENTION_MASK_VALUE
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn topk_bias_masks_future_before_selecting() -> Result<()> {
+        let device = Device::Cpu;
+        let scores = Tensor::from_vec(vec![0.1f32, 100.0, 0.5], (1, 1, 1, 3), &device)?;
+        let causal_bias = Tensor::from_vec(
+            vec![0.0f32, ATTENTION_MASK_VALUE, 0.0],
+            (1, 1, 1, 3),
+            &device,
+        )?;
+
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?
+            .reshape((3,))?
+            .to_vec1::<f32>()?;
+
+        assert_eq!(bias, vec![ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn topk_bias_uses_shared_deepseek_style_selector_across_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let scores = Tensor::from_vec(
+            vec![
+                10.0f32, 0.0, 0.0, //
+                0.0, 5.0, 0.0,
+            ],
+            (1, 2, 1, 3),
+            &device,
+        )?;
+        let causal_bias = Tensor::zeros((1, 2, 1, 3), DType::F32, &device)?;
+
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?
+            .reshape((2, 3))?
+            .to_vec2::<f32>()?;
+
+        assert_eq!(
+            bias,
+            vec![
+                vec![0.0, ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE],
+                vec![0.0, ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE],
             ]
         );
         Ok(())

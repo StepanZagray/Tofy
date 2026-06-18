@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -591,7 +592,6 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_WORLD_SIGREG_PRED_WEIGHT", "0.6");
     set_env_default("TOFY_ACTION_FOCAL_GAMMA", "2.0");
     set_env_default("TOFY_LABEL_SMOOTHING", "0.05");
-    set_env_default("TOFY_DECODER_MAX_CHECKPOINT_PPL", "50");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_ROWS", "500000");
     set_env_default("TOFY_ENCODER_VOCAB_SAMPLE_BYTES", "67108864");
     set_env_default("TOFY_BPE_MAX_MERGES", "24000");
@@ -620,7 +620,6 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
     set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "zero,shuffle");
     set_env_default("TOFY_DECODER_CHECKPOINT_EVERY", "1000");
-    set_env_default("TOFY_ATTENTION_CPU_TOPK", "0");
     set_env_default_owned(
         "TOFY_DECODER_ATTENTION_QUERY_BLOCK",
         context_defaults
@@ -2165,9 +2164,18 @@ fn sha256_file(path: &Path) -> Result<String> {
     let mut file =
         fs::File::open(path).with_context(|| format!("open {} for sha256", path.display()))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .with_context(|| format!("hash {} with sha256", path.display()))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {} for sha256", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn managed_prepare_cache_remote_path(path: &str) -> bool {

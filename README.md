@@ -281,7 +281,7 @@ cargo run --release -- --serve local_models/model_latent_<size>.safetensors loca
 - the new code eval suite writes per-task results plus `summary.txt` under `runs/code_eval/<timestamp>/`; summaries include `pass_after_0_rate`, `pass_after_1_rate`, `pass_after_2_rate`, and `pass_after_4_rate` so repair-depth gains are visible
 - Candle decoder inference now uses batched prompt prefill, prefix-LM-style latent memory tokens, DeepSeek-V4-inspired hybrid local/compressed self-attention, query-selected CSA blocks, separate HCA blocks, per-layer compressed self-attention KV cache, and precomputed cross-attention K/V for the world latent
 - set `JEPA_CANDLE_DECODER_CTX=<tokens>` to cap Candle decoder prompt context at inference if you want a predictable latency / memory ceiling
-- set `TOFY_DECODER_CSA_TOPK=<blocks>` to tune how many compressed long-range blocks each CSA query keeps, default `8`
+- set `TOFY_DECODER_CSA_TOPK=<blocks>` to tune how many compressed long-range blocks each CSA query keeps via the on-device DSA-style top-k mask; standalone default is `8`, pipeline default is `16`
 - set `TOFY_DECODER_LATENT_PREFIX=0|1` to disable/enable planner/context slots as self-attention prefix tokens, default `1`
 - set `TOFY_DECODER_CONDITION_BUDGET=<slots>` and `TOFY_DECODER_CROSS_ATTN_SCHEDULE=all|every-2nd|every-3rd|last-only` to sweep conditioning efficiency at eval/runtime; `--eval-code-assistant --conditioning-pareto` writes `conditioning_pareto.csv`
 - Candle latent conditioning is vector-native only: GGUF fallback no longer receives textual latent summaries, and the Candle adapter uses exact recent context slots plus compressed older latent blocks

@@ -38,14 +38,13 @@ use crate::model::{
 };
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
-    decoder_prediction_metrics, decoder_reward_proxy, decoder_selection_score,
-    encoded_examples_oov_rate, evaluate_decoder_batch, evaluate_decoder_cached_batch,
-    evaluate_world_encoded_batch, forbidden_output_probability_loss,
-    hard_mismatched_conditioning_latent, importance_weight_mask, masked_cross_entropy,
-    masked_weighted_cross_entropy, raw_examples_oov_rate, shuffled_conditioning_latent,
-    signature_weight_mask, slot_delta_slots, structure_weight_mask, syntax_weight_mask,
-    world_selection_score, world_sigreg_loss, ActionMetrics, DecoderBatchMetrics,
-    WorldBatchMetrics,
+    decoder_loss_masks_from_examples, decoder_prediction_metrics, decoder_reward_proxy,
+    decoder_selection_score, encoded_examples_oov_rate, evaluate_decoder_batch,
+    evaluate_decoder_cached_batch, evaluate_world_encoded_batch, forbidden_output_probability_loss,
+    hard_mismatched_conditioning_latent, masked_cross_entropy, masked_label_smoothed_cross_entropy,
+    masked_weighted_cross_entropy, perplexity_from_nll, raw_examples_oov_rate,
+    shuffled_conditioning_latent, slot_delta_slots, world_selection_score, world_sigreg_loss,
+    ActionMetrics, DecoderBatchMetrics, WorldBatchMetrics,
 };
 use crate::util;
 
@@ -1508,6 +1507,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(0.1)
         .max(0.0);
+    let clip_norm = env_f64("TOFY_WORLD_CLIP_NORM", 1.0).max(0.0);
     tb.add_scalar(
         "config/post_state_loss_weight",
         post_state_loss_weight as f32,
@@ -1515,6 +1515,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     );
     tb.add_scalar("config/rollout_loss_weight", rollout_loss_weight as f32, 0);
     tb.add_scalar("config/rollout_steps", rollout_steps as f32, 0);
+    tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
     tb.add_scalar(
         "config/transition_cosine_weight",
         transition_cosine_weight as f32,
@@ -1700,9 +1701,17 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
         opt.set_learning_rate(scheduled_lr);
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
+            if let Some(grad_norm) = grad_norm.as_ref() {
+                tb.add_scalar("grad/global_norm", util::scalar_f32(grad_norm)?, step);
+            }
             let WorldLogSnapshot {
                 loss_val,
                 trans_val,
@@ -2552,6 +2561,8 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
     let sigreg_slices = env_usize("TOFY_SIGREG_SLICES", 1024);
     let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
+    let clip_norm = env_f64("TOFY_HIGH_WORLD_CLIP_NORM", 1.0).max(0.0);
+    tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
     let mut best_metric = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
     let start_step = if config.resume {
@@ -2661,9 +2672,17 @@ fn run_high_world_training(config: HighWorldTrainConfig) -> Result<()> {
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
+            if let Some(grad_norm) = grad_norm.as_ref() {
+                tb.add_scalar("grad/global_norm", util::scalar_f32(grad_norm)?, step);
+            }
             let HighWorldLogSnapshot {
                 loss_val,
                 trans_val,
@@ -3066,6 +3085,8 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
+    let clip_norm = env_f64("TOFY_ORCHESTRATOR_CLIP_NORM", 1.0).max(0.0);
+    tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
     let mut best_score = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
 
@@ -3138,9 +3159,17 @@ fn run_orchestrator_training(config: OrchestratorTrainConfig) -> Result<()> {
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
+            if let Some(grad_norm) = grad_norm.as_ref() {
+                tb.add_scalar("grad/global_norm", util::scalar_f32(grad_norm)?, step);
+            }
             let OrchestratorLogSnapshot {
                 action_loss_val,
                 metrics,
@@ -4573,7 +4602,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         DecoderConditioningNegatives::none()
     };
     let decoder_attention_query_block = env_usize("TOFY_DECODER_ATTENTION_QUERY_BLOCK", 1).max(1);
-    let decoder_attention_cpu_topk = env_bool("TOFY_ATTENTION_CPU_TOPK", false);
+    let clip_norm = env_f64("TOFY_DECODER_CLIP_NORM", 1.0).max(0.0);
 
     println!(
         "Training ({} decoder with cross-attention to world latent)",
@@ -4615,8 +4644,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         decoder_adapter_compress_rate
     );
     println!(
-        "Decoder attention runtime: query_block={} cpu_topk={}",
-        decoder_attention_query_block, decoder_attention_cpu_topk
+        "Decoder attention runtime: query_block={} csa_topk_mask=on-device",
+        decoder_attention_query_block
     );
     println!(
         "Decoder negative conditioning forwards: {} (weight={} negatives={})",
@@ -4738,16 +4767,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         0,
     );
     tb.add_scalar("config/grad_accum", config.grad_accum_steps as f32, 0);
+    tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
     tb.add_scalar(
         "config/decoder_attention_query_block",
         decoder_attention_query_block as f32,
         0,
     );
-    tb.add_scalar(
-        "config/attention_cpu_topk",
-        if decoder_attention_cpu_topk { 1.0 } else { 0.0 },
-        0,
-    );
+    tb.add_scalar("config/attention_csa_gpu_topk", 1.0, 0);
     tb.add_scalar(
         "config/effective_batch_size",
         (config.batch_size * config.grad_accum_steps.max(1)) as f32,
@@ -5001,32 +5027,32 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     prompt_dropout,
                     &device,
                 )?;
+            let decoder_masks = decoder_loss_masks_from_examples(
+                &decoder_batch,
+                config.max_seq,
+                decoder_vocab.pad_id,
+                &decoder_vocab,
+                &device,
+            )?;
 
             let logits = decoder.forward(&dec_input, &world_latent)?;
-            let importance_mask =
-                importance_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-            let token_loss = masked_weighted_cross_entropy(&logits, &dec_target, &importance_mask)?;
+            let token_loss =
+                masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.importance)?;
             let mut loss = token_loss.clone();
             if config.syntax_loss_weight > 0.0 {
-                let syntax_mask =
-                    syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
                 let syntax_loss =
-                    masked_weighted_cross_entropy(&logits, &dec_target, &syntax_mask)?;
+                    masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.syntax)?;
                 loss = loss.broadcast_add(&syntax_loss.affine(config.syntax_loss_weight, 0.0)?)?;
             }
             if config.signature_loss_weight > 0.0 {
-                let signature_mask =
-                    signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
                 let signature_loss =
-                    masked_weighted_cross_entropy(&logits, &dec_target, &signature_mask)?;
+                    masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.signature)?;
                 loss =
                     loss.broadcast_add(&signature_loss.affine(config.signature_loss_weight, 0.0)?)?;
             }
             if config.structure_loss_weight > 0.0 {
-                let structure_mask =
-                    structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
                 let structure_loss =
-                    masked_weighted_cross_entropy(&logits, &dec_target, &structure_mask)?;
+                    masked_weighted_cross_entropy(&logits, &dec_target, &decoder_masks.structure)?;
                 loss =
                     loss.broadcast_add(&structure_loss.affine(config.structure_loss_weight, 0.0)?)?;
             }
@@ -5039,16 +5065,21 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 loss = loss.broadcast_add(&format_loss.affine(format_loss_weight, 0.0)?)?;
             }
             let conditioning_loss = if conditioning_loss_weight > 0.0 {
+                let conditioned_loss =
+                    masked_label_smoothed_cross_entropy(&logits, &dec_target, &loss_mask)?;
                 let mut margin_sum = None;
                 let mut negative_count = 0usize;
                 if conditioning_negatives.zero {
                     let zero_world_latent = world_latent.affine(0.0, 0.0)?;
                     let ablated_logits = decoder.forward(&dec_input, &zero_world_latent)?;
-                    let ablated_loss =
-                        masked_cross_entropy(&ablated_logits, &dec_target, &loss_mask)?;
+                    let ablated_loss = masked_label_smoothed_cross_entropy(
+                        &ablated_logits,
+                        &dec_target,
+                        &loss_mask,
+                    )?;
                     margin_sum = Some(add_conditioning_margin_loss(
                         margin_sum,
-                        &token_loss,
+                        &conditioned_loss,
                         &ablated_loss,
                         conditioning_margin,
                     )?);
@@ -5057,11 +5088,14 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 if conditioning_negatives.shuffle {
                     let shuffled_world_latent = shuffled_conditioning_latent(&world_latent)?;
                     let shuffled_logits = decoder.forward(&dec_input, &shuffled_world_latent)?;
-                    let shuffled_loss =
-                        masked_cross_entropy(&shuffled_logits, &dec_target, &loss_mask)?;
+                    let shuffled_loss = masked_label_smoothed_cross_entropy(
+                        &shuffled_logits,
+                        &dec_target,
+                        &loss_mask,
+                    )?;
                     margin_sum = Some(add_conditioning_margin_loss(
                         margin_sum,
-                        &token_loss,
+                        &conditioned_loss,
                         &shuffled_loss,
                         conditioning_margin,
                     )?);
@@ -5072,18 +5106,21 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                         hard_mismatched_conditioning_latent(&world_latent)?;
                     let hard_mismatch_logits =
                         decoder.forward(&dec_input, &hard_mismatch_world_latent)?;
-                    let hard_mismatch_loss =
-                        masked_cross_entropy(&hard_mismatch_logits, &dec_target, &loss_mask)?;
+                    let hard_mismatch_loss = masked_label_smoothed_cross_entropy(
+                        &hard_mismatch_logits,
+                        &dec_target,
+                        &loss_mask,
+                    )?;
                     margin_sum = Some(add_conditioning_margin_loss(
                         margin_sum,
-                        &token_loss,
+                        &conditioned_loss,
                         &hard_mismatch_loss,
                         conditioning_margin,
                     )?);
                     negative_count += 1;
                 }
                 margin_sum
-                    .unwrap_or(token_loss.affine(0.0, 0.0)?)
+                    .unwrap_or(conditioned_loss.affine(0.0, 0.0)?)
                     .affine(1.0 / negative_count.max(1) as f64, 0.0)?
             } else {
                 token_loss.affine(0.0, 0.0)?
@@ -5149,18 +5186,21 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     } else {
                         (raw_loss_val, raw_loss_val, raw_loss_val)
                     };
-                let syntax_mask =
-                    syntax_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-                let syntax_loss =
-                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &syntax_mask)?;
-                let signature_mask =
-                    signature_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-                let signature_loss =
-                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &signature_mask)?;
-                let structure_mask =
-                    structure_weight_mask(&dec_target, &loss_mask, &decoder_vocab, &device)?;
-                let structure_loss =
-                    masked_weighted_cross_entropy(&metric_logits, &dec_target, &structure_mask)?;
+                let syntax_loss = masked_weighted_cross_entropy(
+                    &metric_logits,
+                    &dec_target,
+                    &decoder_masks.syntax,
+                )?;
+                let signature_loss = masked_weighted_cross_entropy(
+                    &metric_logits,
+                    &dec_target,
+                    &decoder_masks.signature,
+                )?;
+                let structure_loss = masked_weighted_cross_entropy(
+                    &metric_logits,
+                    &dec_target,
+                    &decoder_masks.structure,
+                )?;
                 let syntax_loss_val = util::scalar_f32(&syntax_loss)?;
                 let signature_loss_val = util::scalar_f32(&signature_loss)?;
                 let structure_loss_val = util::scalar_f32(&structure_loss)?;
@@ -5168,7 +5208,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 let (loss_rows, _) = loss_mask.dims2()?;
                 let total_tokens = (loss_rows.max(1) * config.max_seq * 2) as f32;
                 let active_frac = active_tokens / total_tokens.max(1.0);
-                let perplexity = raw_loss_val.exp();
+                let perplexity = perplexity_from_nll(raw_loss_val);
                 let gains = decoder_conditioning_gains(
                     raw_loss_val,
                     ablated_loss_val,
@@ -5229,6 +5269,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         }
 
         opt.set_learning_rate(util::scheduled_lr(config.lr, step, config.steps));
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
         if decoder_heartbeat_every > 0
             && step % config.log_every != 0
@@ -5247,6 +5292,9 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         }
 
         if step % config.log_every == 0 {
+            if let Some(grad_norm) = grad_norm.as_ref() {
+                tb.add_scalar("grad/global_norm", util::scalar_f32(grad_norm)?, step);
+            }
             let DecoderLogSnapshot {
                 metrics: train_metrics,
                 hard_mismatch_loss_val,
@@ -5280,11 +5328,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let function_name_token_accuracy = train_metrics.function_name_token_accuracy;
             let function_name_exact_rate = train_metrics.function_name_exact_rate;
 
-            tb.add_scalar("loss/token_ce", loss_val, step);
-            tb.add_scalar("loss/raw_token_ce", raw_loss_val, step);
-            tb.add_scalar("loss/ablated_token_ce", ablated_loss_val, step);
-            tb.add_scalar("loss/shuffled_token_ce", shuffled_loss_val, step);
-            tb.add_scalar("loss/hard_mismatch_token_ce", hard_mismatch_loss_val, step);
+            tb.add_scalar("loss/objective", loss_val, step);
+            tb.add_scalar("loss/token_nll", raw_loss_val, step);
+            tb.add_scalar("loss/ablated_token_nll", ablated_loss_val, step);
+            tb.add_scalar("loss/shuffled_token_nll", shuffled_loss_val, step);
+            tb.add_scalar("loss/hard_mismatch_token_nll", hard_mismatch_loss_val, step);
             tb.add_scalar("loss/conditioning_margin", conditioning_loss_val, step);
             tb.add_scalar("loss/mtp", mtp_loss_val, step);
             tb.add_scalar("loss/format_forbidden_prob", format_loss_val, step);
@@ -5353,7 +5401,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 config.signature_loss_weight,
                 config.structure_loss_weight,
             );
-            let mut checkpoint_perplexity = perplexity;
+            let mut checkpoint_nll = raw_loss_val;
             if val_stream.is_some() || cached_decoder_val_stream.is_some() {
                 let eval_batch_size = std::env::var("TOFY_DECODER_EVAL_BATCH")
                     .ok()
@@ -5413,13 +5461,13 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     config.signature_loss_weight,
                     config.structure_loss_weight,
                 );
-                checkpoint_perplexity = val_metrics.perplexity;
+                checkpoint_nll = val_metrics.raw_loss;
                 let val_reward_proxy = decoder_reward_proxy(&val_metrics);
                 best_loss = best_loss.min(val_metrics.loss);
-                tb.add_scalar("val/token_ce", val_metrics.loss, step);
-                tb.add_scalar("val/raw_token_ce", val_metrics.raw_loss, step);
-                tb.add_scalar("val/ablated_token_ce", val_metrics.ablated_loss, step);
-                tb.add_scalar("val/shuffled_token_ce", val_metrics.shuffled_loss, step);
+                tb.add_scalar("val/objective", val_metrics.loss, step);
+                tb.add_scalar("val/token_nll", val_metrics.raw_loss, step);
+                tb.add_scalar("val/ablated_token_nll", val_metrics.ablated_loss, step);
+                tb.add_scalar("val/shuffled_token_nll", val_metrics.shuffled_loss, step);
                 tb.add_scalar("val/syntax_ce", val_metrics.syntax_loss, step);
                 tb.add_scalar("val/signature_ce", val_metrics.signature_loss, step);
                 tb.add_scalar("val/structure_ce", val_metrics.structure_loss, step);
@@ -5482,13 +5530,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 best_loss = best_loss.min(loss_val);
             }
             tb.flush();
-            let max_checkpoint_ppl = std::env::var("TOFY_DECODER_MAX_CHECKPOINT_PPL")
-                .ok()
-                .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(50.0)
-                .max(1.0);
-            let perplexity_ok = checkpoint_perplexity <= max_checkpoint_ppl;
-            let metric_improved = selection_metric < best_metric && perplexity_ok;
+            let metric_improved = selection_metric < best_metric && checkpoint_nll.is_finite();
             let candidate_best_metric = if metric_improved {
                 selection_metric
             } else {
@@ -5539,10 +5581,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                     "saved best"
                 };
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{} [{}]",
+                    "step {}/{} objective {:.4} token_nll {:.4} ablate_nll {:.4} shuffle_nll {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{} [{}]",
                     step,
                     config.steps,
                     loss_val,
+                    raw_loss_val,
                     ablated_loss_val,
                     shuffled_loss_val,
                     zero_gain,
@@ -5573,10 +5616,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 );
             } else {
                 println!(
-                    "step {}/{} token_ce {:.4} ablate_ce {:.4} shuffle_ce {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{}",
+                    "step {}/{} objective {:.4} token_nll {:.4} ablate_nll {:.4} shuffle_nll {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{}",
                     step,
                     config.steps,
                     loss_val,
+                    raw_loss_val,
                     ablated_loss_val,
                     shuffled_loss_val,
                     zero_gain,
@@ -7823,11 +7867,18 @@ fn world_post_state_token_sequences(batch: &[WorldExample]) -> Vec<Vec<u32>> {
 }
 
 fn world_post_state_loss_weight() -> f64 {
-    std::env::var("TOFY_WORLD_POST_STATE_LOSS_WEIGHT")
+    let requested = std::env::var("TOFY_WORLD_POST_STATE_LOSS_WEIGHT")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(0.0)
-        .max(0.0)
+        .max(0.0);
+    if requested > 0.0 {
+        eprintln!(
+            "WARNING: TOFY_WORLD_POST_STATE_LOSS_WEIGHT={} ignored; the transition target is already encoded as post-state (state + next), so this auxiliary would duplicate transition loss.",
+            requested
+        );
+    }
+    0.0
 }
 
 fn world_rollout_loss_weight() -> f64 {
@@ -8015,6 +8066,13 @@ pub(crate) fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
         .max(1)
+}
+
+pub(crate) fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 pub(crate) fn env_bool(name: &str, default: bool) -> bool {

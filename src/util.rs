@@ -89,10 +89,13 @@ pub fn varmap_tensor_snapshot(varmap: &VarMap) -> Result<HashMap<String, Tensor>
         .data()
         .lock()
         .map_err(|_| anyhow::anyhow!("failed to lock varmap for checkpoint snapshot"))?;
-    Ok(data
-        .iter()
-        .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
-        .collect())
+    data.iter()
+        .map(|(name, var)| Ok((name.clone(), snapshot_tensor(var.as_tensor())?)))
+        .collect()
+}
+
+fn snapshot_tensor(tensor: &Tensor) -> Result<Tensor> {
+    tensor.detach().to_device(&Device::Cpu).map_err(Into::into)
 }
 
 pub fn load_varmap_checked(varmap: &mut VarMap, path: &Path) -> Result<()> {
@@ -264,28 +267,23 @@ impl ResumableAdamW {
     }
 
     pub fn state_tensors_snapshot(&self) -> Result<HashMap<String, Tensor>> {
-        let device = self
-            .vars
-            .first()
-            .map(|state| state.var.device().clone())
-            .unwrap_or(Device::Cpu);
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         tensors.insert(
             "__step".to_string(),
-            Tensor::from_vec(vec![self.step_t as i64], (1,), &device)?,
+            Tensor::from_vec(vec![self.step_t as i64], (1,), &Device::Cpu)?,
         );
         tensors.insert(
             "__lr".to_string(),
-            Tensor::from_vec(vec![self.params.lr], (1,), &device)?,
+            Tensor::from_vec(vec![self.params.lr], (1,), &Device::Cpu)?,
         );
         for state in &self.vars {
             tensors.insert(
                 format!("{}.first_moment", state.name),
-                state.first_moment.as_tensor().clone(),
+                snapshot_tensor(state.first_moment.as_tensor())?,
             );
             tensors.insert(
                 format!("{}.second_moment", state.name),
-                state.second_moment.as_tensor().clone(),
+                snapshot_tensor(state.second_moment.as_tensor())?,
             );
         }
         Ok(tensors)
@@ -461,43 +459,35 @@ impl ResumableHybridMuon {
     }
 
     pub fn state_tensors_snapshot(&self) -> Result<HashMap<String, Tensor>> {
-        let device = self
-            .vars
-            .first()
-            .map(|state| match state {
-                HybridMuonVarState::Muon(state) => state.var.device().clone(),
-                HybridMuonVarState::AdamW(state) => state.var.device().clone(),
-            })
-            .unwrap_or(Device::Cpu);
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         tensors.insert(
             "__step".to_string(),
-            Tensor::from_vec(vec![self.step_t as i64], (1,), &device)?,
+            Tensor::from_vec(vec![self.step_t as i64], (1,), &Device::Cpu)?,
         );
         tensors.insert(
             "__lr".to_string(),
-            Tensor::from_vec(vec![self.params.lr], (1,), &device)?,
+            Tensor::from_vec(vec![self.params.lr], (1,), &Device::Cpu)?,
         );
         tensors.insert(
             "__optimizer_kind".to_string(),
-            Tensor::from_vec(vec![1i64], (1,), &device)?,
+            Tensor::from_vec(vec![1i64], (1,), &Device::Cpu)?,
         );
         for state in &self.vars {
             match state {
                 HybridMuonVarState::Muon(state) => {
                     tensors.insert(
                         format!("{}.muon_momentum", state.name),
-                        state.momentum.as_tensor().clone(),
+                        snapshot_tensor(state.momentum.as_tensor())?,
                     );
                 }
                 HybridMuonVarState::AdamW(state) => {
                     tensors.insert(
                         format!("{}.first_moment", state.name),
-                        state.first_moment.as_tensor().clone(),
+                        snapshot_tensor(state.first_moment.as_tensor())?,
                     );
                     tensors.insert(
                         format!("{}.second_moment", state.name),
-                        state.second_moment.as_tensor().clone(),
+                        snapshot_tensor(state.second_moment.as_tensor())?,
                     );
                 }
             }
@@ -1317,6 +1307,47 @@ pub fn clip_accumulated_gradients(
         }
     }
     Ok(norm)
+}
+
+/// Clip accumulated gradients on-device. This avoids the host synchronization
+/// in `clip_accumulated_gradients` and is the preferred path for large trainers.
+pub fn clip_accumulated_gradients_device(
+    accumulated: &mut Option<GradStore>,
+    train_vars: &[Var],
+    max_norm: f64,
+) -> Result<Option<Tensor>> {
+    if max_norm <= 0.0 {
+        return Ok(None);
+    }
+    let Some(grads) = accumulated.as_mut() else {
+        return Ok(None);
+    };
+    let mut total_sq: Option<Tensor> = None;
+    for var in train_vars {
+        if let Some(grad) = grads.get(var) {
+            let sq = grad.sqr()?.sum_all()?;
+            total_sq = Some(match total_sq {
+                Some(total) => total.broadcast_add(&sq)?,
+                None => sq,
+            });
+        }
+    }
+    let Some(total_sq) = total_sq else {
+        return Ok(None);
+    };
+    let norm = total_sq.sqrt()?;
+    let denom = norm.clamp(max_norm, f64::INFINITY)?;
+    let scale = norm
+        .ones_like()?
+        .affine(max_norm, 0.0)?
+        .broadcast_div(&denom)?;
+    for var in train_vars {
+        if let Some(grad) = grads.remove(var) {
+            let scale = scale.to_dtype(grad.dtype())?;
+            grads.insert(var, grad.broadcast_mul(&scale)?);
+        }
+    }
+    Ok(Some(norm))
 }
 
 #[derive(Clone, Debug, Default)]
