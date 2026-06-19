@@ -6,7 +6,7 @@ use candle_core::{
 };
 use candle_nn::{Optimizer, ParamsAdamW, VarMap};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -113,6 +113,78 @@ pub fn load_varmap_checked(varmap: &mut VarMap, path: &Path) -> Result<()> {
         );
     }
     varmap.load(path)?;
+    Ok(())
+}
+
+pub fn load_varmap_allow_missing(
+    varmap: &mut VarMap,
+    path: &Path,
+    allowed_missing: &[&str],
+) -> Result<Vec<String>> {
+    let is_empty = {
+        let data = varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock varmap before checkpoint load"))?;
+        data.is_empty()
+    };
+    if is_empty {
+        anyhow::bail!(
+            "refusing to load checkpoint {:?} into an empty VarMap; construct model modules before loading",
+            path
+        );
+    }
+
+    let allowed_missing = allowed_missing.iter().copied().collect::<HashSet<_>>();
+    let mapped = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
+        .with_context(|| format!("read checkpoint {:?}", path))?;
+    let available = mapped
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    let mut missing = Vec::new();
+    let mut data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to lock varmap before checkpoint load"))?;
+    for (name, var) in data.iter_mut() {
+        if !available.contains(name) {
+            if allowed_missing.contains(name.as_str()) {
+                missing.push(name.clone());
+                continue;
+            }
+            anyhow::bail!("checkpoint {:?} missing tensor {}", path, name);
+        }
+        let tensor = mapped
+            .load(name, var.device())
+            .with_context(|| format!("load tensor {name} from {:?}", path))?;
+        var.set(&tensor)
+            .with_context(|| format!("set tensor {name} from {:?}", path))?;
+    }
+    Ok(missing)
+}
+
+pub fn init_linear_head_from_embedding(
+    varmap: &mut VarMap,
+    embedding_key: &str,
+    head_key: &str,
+    scale: f64,
+) -> Result<()> {
+    let embedding = {
+        let data = varmap
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to lock varmap for head migration"))?;
+        data.get(embedding_key)
+            .ok_or_else(|| anyhow::anyhow!("missing embedding tensor {embedding_key}"))?
+            .as_tensor()
+            .clone()
+    };
+    let head = embedding.affine(scale, 0.0)?;
+    varmap
+        .set_one(head_key, &head)
+        .with_context(|| format!("initialize {head_key} from {embedding_key}"))?;
     Ok(())
 }
 
@@ -302,18 +374,35 @@ impl ResumableAdamW {
             let step_values = step.to_dtype(DType::I64)?.flatten_all()?.to_vec1::<i64>()?;
             self.step_t = step_values.first().copied().unwrap_or(0).max(0) as usize;
         }
+        let mut loaded = 0usize;
+        let mut missing = 0usize;
         for state in &mut self.vars {
             let m_key = format!("{}.first_moment", state.name);
             let v_key = format!("{}.second_moment", state.name);
-            let m = tensors.get(&m_key).ok_or_else(|| {
-                anyhow::anyhow!("optimizer state {:?} missing tensor {}", path, m_key)
-            })?;
-            let v = tensors.get(&v_key).ok_or_else(|| {
-                anyhow::anyhow!("optimizer state {:?} missing tensor {}", path, v_key)
-            })?;
-            state.first_moment.set(&m.to_dtype(DType::F32)?)?;
-            state.second_moment.set(&v.to_dtype(DType::F32)?)?;
+            let mut matched = false;
+            if let Some(m) = tensors.get(&m_key) {
+                state.first_moment.set(&m.to_dtype(DType::F32)?)?;
+                matched = true;
+            }
+            if let Some(v) = tensors.get(&v_key) {
+                state.second_moment.set(&v.to_dtype(DType::F32)?)?;
+                matched = true;
+            }
+            if matched {
+                loaded += 1;
+            } else {
+                missing += 1;
+            }
         }
+        if missing > 0 {
+            println!(
+                "AdamW optimizer state missing {missing} variable state(s); initialized them from zero moments"
+            );
+        }
+        println!(
+            "AdamW optimizer state loaded from {} (matched_vars={loaded})",
+            path.display()
+        );
         Ok(())
     }
 }
@@ -974,6 +1063,7 @@ struct CheckpointQueue {
 struct CheckpointQueueState {
     pending: Option<CheckpointJob>,
     closed: bool,
+    fatal_error: Option<String>,
 }
 
 pub struct CheckpointJob {
@@ -1047,8 +1137,15 @@ impl AsyncCheckpointWriter {
             .spawn(move || -> Result<usize> {
                 let mut saved = 0usize;
                 while let Some(job) = worker_shared.recv()? {
-                    save_checkpoint_artifacts(job.artifacts)
-                        .with_context(|| format!("save async checkpoint {}", job.label))?;
+                    let label = job.label;
+                    if let Err(err) = save_checkpoint_artifacts(job.artifacts)
+                        .with_context(|| format!("save async checkpoint {label}"))
+                    {
+                        let message = format!("{err:#}");
+                        let _ = worker_shared.record_failure(message.clone());
+                        eprintln!("Async checkpoint writer failed: {message}");
+                        return Err(anyhow::anyhow!(message));
+                    }
                     saved += 1;
                 }
                 Ok(saved)
@@ -1100,6 +1197,9 @@ impl CheckpointQueue {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        if let Some(err) = &state.fatal_error {
+            anyhow::bail!("checkpoint writer failed earlier: {err}");
+        }
         if state.closed {
             anyhow::bail!("checkpoint writer is closed");
         }
@@ -1134,6 +1234,18 @@ impl CheckpointQueue {
             .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
         state.closed = true;
         self.condvar.notify_one();
+        Ok(())
+    }
+
+    fn record_failure(&self, message: String) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?;
+        state.fatal_error = Some(message);
+        state.closed = true;
+        state.pending = None;
+        self.condvar.notify_all();
         Ok(())
     }
 }
@@ -1416,6 +1528,7 @@ impl VramTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn load_varmap_checked_rejects_empty_varmap() {
@@ -1424,5 +1537,154 @@ mod tests {
             .expect_err("empty varmap loads must fail before reading checkpoint");
 
         assert!(err.to_string().contains("empty VarMap"));
+    }
+
+    #[test]
+    fn partial_varmap_load_allows_declared_missing_tensors() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "tofy-partial-varmap-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&base)?;
+        let checkpoint = base.join("checkpoint.safetensors");
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "present.weight".to_string(),
+            Tensor::from_vec(vec![1.0f32, 2.0], (2,), &device)?,
+        );
+        save_tensor_map_atomic(&tensors, &checkpoint)?;
+
+        let mut varmap = VarMap::new();
+        varmap.get(
+            (2,),
+            "present.weight",
+            candle_nn::Init::Const(0.0),
+            DType::F32,
+            &device,
+        )?;
+        varmap.get(
+            (2,),
+            "missing.weight",
+            candle_nn::Init::Const(0.0),
+            DType::F32,
+            &device,
+        )?;
+
+        let missing = load_varmap_allow_missing(&mut varmap, &checkpoint, &["missing.weight"])?;
+        assert_eq!(missing, vec!["missing.weight".to_string()]);
+
+        let present = {
+            let data = varmap
+                .data()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("failed to lock varmap"))?;
+            data.get("present.weight")
+                .unwrap()
+                .as_tensor()
+                .to_vec1::<f32>()?
+        };
+        assert_eq!(present, vec![1.0, 2.0]);
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_head_can_be_initialized_from_embedding() -> Result<()> {
+        let device = Device::Cpu;
+        let mut varmap = VarMap::new();
+        varmap.get(
+            (2, 3),
+            "decoder.embed.weight",
+            candle_nn::Init::Const(0.0),
+            DType::F32,
+            &device,
+        )?;
+        varmap.get(
+            (2, 3),
+            "decoder.lm_head.weight",
+            candle_nn::Init::Const(0.0),
+            DType::F32,
+            &device,
+        )?;
+        let embed = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)?;
+        varmap.set_one("decoder.embed.weight", &embed)?;
+
+        init_linear_head_from_embedding(
+            &mut varmap,
+            "decoder.embed.weight",
+            "decoder.lm_head.weight",
+            0.5,
+        )?;
+
+        let head = {
+            let data = varmap
+                .data()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("failed to lock varmap"))?;
+            data.get("decoder.lm_head.weight")
+                .unwrap()
+                .as_tensor()
+                .to_vec2::<f32>()?
+        };
+        assert_eq!(head, vec![vec![0.5, 1.0, 1.5], vec![2.0, 2.5, 3.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn async_checkpoint_writer_reports_worker_failure() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "tofy-checkpoint-writer-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&base)?;
+        let file_parent = base.join("not_a_directory");
+        fs::write(&file_parent, "not a directory")?;
+        let bad_path = file_parent.join("checkpoint.json");
+
+        let mut writer = AsyncCheckpointWriter::new();
+        writer.try_submit(CheckpointJob {
+            label: "expected failure".to_string(),
+            artifacts: vec![CheckpointArtifact::Json {
+                path: bad_path,
+                text: "{}".to_string(),
+            }],
+        })?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let failed = writer
+                .shared
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint queue lock poisoned"))?
+                .fatal_error
+                .is_some();
+            if failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint worker did not report its failure"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let err = writer
+            .try_submit(CheckpointJob {
+                label: "must not queue after failure".to_string(),
+                artifacts: vec![CheckpointArtifact::Json {
+                    path: base.join("ok.json"),
+                    text: "{}".to_string(),
+                }],
+            })
+            .expect_err("checkpoint submit after worker failure must fail");
+
+        assert!(err.to_string().contains("checkpoint writer failed earlier"));
+        assert!(writer.finish().is_err());
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
     }
 }

@@ -3427,6 +3427,23 @@ fn decoder_param_count(
         + lm_head
 }
 
+fn load_decoder_varmap_checked(varmap: &mut VarMap, path: &Path, dim: usize) -> Result<()> {
+    let missing = util::load_varmap_allow_missing(varmap, path, &["decoder.lm_head.weight"])?;
+    if missing.iter().any(|name| name == "decoder.lm_head.weight") {
+        util::init_linear_head_from_embedding(
+            varmap,
+            "decoder.embed.weight",
+            "decoder.lm_head.weight",
+            1.0 / (dim as f64).sqrt(),
+        )?;
+        println!(
+            "Initialized decoder lm_head.weight from legacy tied embedding in {:?}",
+            path
+        );
+    }
+    Ok(())
+}
+
 fn default_decoder_vocab_path(decoder_path: &Path) -> PathBuf {
     decoder_path.with_extension("vocab.txt")
 }
@@ -4522,18 +4539,22 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
     if config.resume && train_checkpoint_path.exists() {
-        util::load_varmap_checked(&mut decoder_varmap, &train_checkpoint_path)?;
+        load_decoder_varmap_checked(
+            &mut decoder_varmap,
+            &train_checkpoint_path,
+            decoder_arch.dim,
+        )?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!("Resuming decoder weights from {:?}", train_checkpoint_path);
     } else if config.resume && decoder_path.exists() {
-        util::load_varmap_checked(&mut decoder_varmap, &decoder_path)?;
+        load_decoder_varmap_checked(&mut decoder_varmap, &decoder_path, decoder_arch.dim)?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!(
             "Resuming decoder weights from best export {:?} without optimizer state",
             decoder_path
         );
     } else if let Some(ref p) = config.init_decoder_path {
-        util::load_varmap_checked(&mut decoder_varmap, p)?;
+        load_decoder_varmap_checked(&mut decoder_varmap, p, decoder_arch.dim)?;
         util::cast_varmap_dtype(&mut decoder_varmap, train_dtype)?;
         println!("Initialized decoder weights from {:?}", p);
     }

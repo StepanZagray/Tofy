@@ -199,7 +199,7 @@ impl CandleCrossAttnDecoder {
         adapter_compress_rate: usize,
     ) -> Result<()> {
         let metadata = format!(
-            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v2\ndecoder_arch=rope_rmsnorm_swiglu_tied_v3\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\ndecoder_adapter_compress_rate={}\ndecoder_local_window={}\ndecoder_anchor_period={}\ndecoder_csa_compress_rate={}\ndecoder_hca_compress_rate={}\ndecoder_csa_topk={}\ndecoder_cross_attention_schedule={}\ndecoder_latent_prefix={}\n",
+            "kind={}\nvocab_signature={}\nvocab_size={}\nplanner_dim={}\ncontext_slots={}\nconditioner=action_aware_local_plan_v2\ndecoder_arch=rope_rmsnorm_swiglu_untied_head_v4\ndecoder_dim={}\ndecoder_layers={}\ndecoder_heads={}\ndecoder_ff_dim={}\ndecoder_adapter_compress_rate={}\ndecoder_local_window={}\ndecoder_anchor_period={}\ndecoder_csa_compress_rate={}\ndecoder_hca_compress_rate={}\ndecoder_csa_topk={}\ndecoder_cross_attention_schedule={}\ndecoder_latent_prefix={}\n",
             kind.as_str(),
             vocab_signature(vocab),
             vocab.id_to_token.len(),
@@ -301,7 +301,25 @@ impl CandleCrossAttnDecoder {
             Ok(())
         };
         require_metadata_value("conditioner", "action_aware_local_plan_v2")?;
-        require_metadata_value("decoder_arch", "rope_rmsnorm_swiglu_tied_v3")?;
+        let decoder_arch = parsed
+            .get("decoder_arch")
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decoder metadata {:?} is missing decoder_arch",
+                    metadata_path
+                )
+            })?
+            .as_str();
+        if !matches!(
+            decoder_arch,
+            "rope_rmsnorm_swiglu_tied_v3" | "rope_rmsnorm_swiglu_untied_head_v4"
+        ) {
+            anyhow::bail!(
+                "decoder metadata {:?} has decoder_arch={}, expected rope_rmsnorm_swiglu_untied_head_v4",
+                metadata_path,
+                decoder_arch
+            );
+        }
         let parse_required = |key: &str| -> Result<usize> {
             parsed
                 .get(key)
@@ -439,8 +457,26 @@ impl CandleCrossAttnDecoder {
             kind,
             attention,
         )?;
-        crate::util::load_varmap_checked(&mut varmap, &checkpoint_path)
-            .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
+        let missing = crate::util::load_varmap_allow_missing(
+            &mut varmap,
+            &checkpoint_path,
+            &["decoder.lm_head.weight"],
+        )
+        .with_context(|| format!("load code decoder from {:?}", checkpoint_path))?;
+        if missing.iter().any(|name| name == "decoder.lm_head.weight") {
+            crate::util::init_linear_head_from_embedding(
+                &mut varmap,
+                "decoder.embed.weight",
+                "decoder.lm_head.weight",
+                1.0 / (architecture.dim as f64).sqrt(),
+            )
+            .with_context(|| {
+                format!(
+                    "initialize decoder lm_head.weight from legacy tied embedding in {:?}",
+                    checkpoint_path
+                )
+            })?;
+        }
         crate::util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
         Ok(Self {
             adapter,

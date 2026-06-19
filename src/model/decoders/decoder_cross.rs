@@ -512,13 +512,13 @@ impl CodeDecoderBlock {
 /// Output: logits [B, T, vocab_size].
 pub struct CodeDecoder {
     embed: nn::Embedding,
+    lm_head: nn::Linear,
     kind_embed: nn::Embedding,
     structure_proj: nn::Linear,
     structure_gate: nn::Linear,
     blocks: Vec<CodeDecoderBlock>,
     ln_final: nn::RmsNorm,
     dim: usize,
-    vocab_size: usize,
     kind: DecoderKind,
     attention: DecoderAttentionConfig,
 }
@@ -561,6 +561,7 @@ impl CodeDecoder {
         attention: DecoderAttentionConfig,
     ) -> Result<Self> {
         let embed = nn::embedding(vocab_size, dim, vb.pp("embed"))?;
+        let lm_head = nn::linear_no_bias(dim, vocab_size, vb.pp("lm_head"))?;
         let kind_embed = nn::embedding(2, dim, vb.pp("kind_embed"))?;
         let structure_proj = nn::linear(world_dim, dim, vb.pp("structure_proj"))?;
         let structure_gate = nn::linear(world_dim, 1, vb.pp("structure_gate"))?;
@@ -578,13 +579,13 @@ impl CodeDecoder {
         let ln_final = nn::rms_norm(dim, 1e-5, vb.pp("ln_final"))?;
         Ok(Self {
             embed,
+            lm_head,
             kind_embed,
             structure_proj,
             structure_gate,
             blocks,
             ln_final,
             dim,
-            vocab_size,
             kind,
             attention,
         })
@@ -654,12 +655,7 @@ impl CodeDecoder {
     }
 
     fn token_logits(&self, h: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, _) = h.dims3()?;
-        let flat = h.reshape((batch * seq_len, self.dim))?;
-        let weights_t = self.embed.embeddings().t()?.contiguous()?;
-        flat.matmul(&weights_t)?
-            .reshape((batch, seq_len, self.vocab_size))
-            .map_err(Into::into)
+        self.lm_head.forward(h).map_err(Into::into)
     }
 
     fn domain_state(&self, device: &Device, batch: usize, seq_len: usize) -> Result<Tensor> {
@@ -925,6 +921,36 @@ mod tests {
     fn assert_close(a: &Tensor, b: &Tensor, tol: f32, label: &str) -> Result<()> {
         let max_diff = a.broadcast_sub(b)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(max_diff < tol, "{label} mismatch: {max_diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_logits_use_separate_lm_head() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let dim = 8usize;
+        let vocab_size = 16usize;
+        let decoder = CodeDecoder::new_with_attention_config(
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            vocab_size,
+            dim,
+            6,
+            1,
+            2,
+            16,
+            DecoderKind::CodeSpecialist,
+            DecoderAttentionConfig::new(3, 2, 2, 2, 4, DecoderCrossAttentionSchedule::All, true)?,
+        )?;
+        let h_values = (0..2 * dim)
+            .map(|idx| (idx as f32 - 5.0) / 7.0)
+            .collect::<Vec<_>>();
+        let h = Tensor::from_vec(h_values, (1, 2, dim), &device)?;
+        let logits = decoder.token_logits(&h)?;
+        let raw = decoder.lm_head.forward(&h)?;
+
+        assert_close(&logits, &raw, 1e-5, "untied lm_head logits")?;
+        assert_eq!(decoder.embed.embeddings().dims(), &[vocab_size, dim]);
+        assert_eq!(decoder.lm_head.weight().dims(), &[vocab_size, dim]);
         Ok(())
     }
 
