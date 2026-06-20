@@ -106,7 +106,10 @@ impl ActionStateTransition {
         for action_id in &mut action_ids {
             if *action_id >= NUM_ACTIONS as u32 {
                 if strict_labels {
-                    anyhow::bail!("invalid action label {action_id}; expected 0..{}", NUM_ACTIONS);
+                    anyhow::bail!(
+                        "invalid action label {action_id}; expected 0..{}",
+                        NUM_ACTIONS
+                    );
                 }
                 *action_id = (NUM_ACTIONS - 1) as u32;
             }

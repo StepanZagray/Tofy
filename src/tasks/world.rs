@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::cli::resolve_data_path;
@@ -36,6 +36,7 @@ use crate::model::{
     MacroActionStateTransition, NextActionClassifier, OnlineEncoder, RlmDecoderRuntime,
     StubLocalDecoder, Vocab,
 };
+use crate::tasks::prepare::{go_version_string, GoCompileFeedback};
 use crate::tasks::world_support::{
     action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
     decoder_loss_masks_from_examples, decoder_prediction_metrics, decoder_reward_proxy,
@@ -3846,10 +3847,11 @@ fn collect_conditioned_decoder_batch(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_padded_segment, collect_macro_chains, context_compressor_mask_from_lengths,
-        decoder_action_label_for_kind, decoder_action_matches_kind,
-        default_context_hybrid_exact_tail, high_world_macro_example_from_cached_span,
-        high_world_macro_example_from_raw_span,
+        append_padded_segment, build_code_repair_prompt, collect_macro_chains,
+        context_compressor_mask_from_lengths, decoder_action_label_for_kind,
+        decoder_action_matches_kind, default_context_hybrid_exact_tail,
+        extract_go_prompt_declarations, high_world_macro_example_from_cached_span,
+        high_world_macro_example_from_raw_span, output_needs_code_repair,
     };
     use crate::data::{
         RawWorldExample, WorldExample, ACTION_CODE, ACTION_DONE, ACTION_FETCH_DOCS,
@@ -3893,6 +3895,52 @@ mod tests {
         assert!(!decoder_action_matches_kind(
             DecoderKind::CodeSpecialist,
             ACTION_FETCH_DOCS
+        ));
+    }
+
+    #[test]
+    fn extract_go_prompt_declarations_keeps_contract_lines() {
+        let prompt = "Return only Go code. Implement exactly this function:\n\
+type Interval struct { Start int; End int }\n\
+func MergeIntervals(intervals []Interval) []Interval\n\n\
+Rules:\n- Use package main.\n";
+        let declarations = extract_go_prompt_declarations(prompt);
+        assert_eq!(
+            declarations,
+            vec![
+                "type Interval struct { Start int; End int }".to_string(),
+                "func MergeIntervals(intervals []Interval) []Interval".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn repair_prompt_includes_real_feedback_and_required_declarations() {
+        let prompt = "Return only Go code. Implement exactly this function:\n\
+type Interval struct { Start int; End int }\n\
+func MergeIntervals(intervals []Interval) []Interval\n";
+        let repair_prompt = build_code_repair_prompt(
+            prompt,
+            "func MergeIntervals(intervals []Interval) []Interval { return nil }",
+            "candidate.go:3:1: undefined: Interval",
+        );
+        assert!(repair_prompt.contains("Compiler feedback:\ncandidate.go:3:1: undefined: Interval"));
+        assert!(repair_prompt
+            .contains("Required declarations:\n- type Interval struct { Start int; End int }"));
+        assert!(repair_prompt.contains("- func MergeIntervals(intervals []Interval) []Interval"));
+    }
+
+    #[test]
+    fn code_repair_gate_rejects_non_code_noise() {
+        let prompt =
+            "Return only Go code. Implement exactly this function:\nfunc Add(a int, b int) int";
+        assert!(output_needs_code_repair(
+            prompt,
+            "Here is the code:\nfunc Add(a int, b int) int { return a + b }",
+        ));
+        assert!(!output_needs_code_repair(
+            prompt,
+            "func Add(a int, b int) int { return a + b }",
         ));
     }
 
@@ -6242,6 +6290,17 @@ fn output_needs_code_repair(prompt: &str, output: &str) -> bool {
     }
     let lower = trimmed.to_ascii_lowercase();
     let prompt_lower = prompt.to_ascii_lowercase();
+    for marker in [
+        "here is",
+        "here's",
+        "the code",
+        "explanation",
+        "compiler feedback",
+    ] {
+        if lower.contains(marker) {
+            return true;
+        }
+    }
     let angle_noise = trimmed.matches('<').count() + trimmed.matches('>').count();
     let expected_keyword = match code_request_language(prompt) {
         Some(CodeRequestLanguage::Go) if prompt_lower.contains("func") => Some("func "),
@@ -6272,12 +6331,31 @@ fn maybe_repair_code_output(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1usize);
+    if matches!(code_request_language(prompt), Some(CodeRequestLanguage::Go)) {
+        if let Some(go_feedback) = go_compile_feedback_from_env() {
+            return maybe_repair_go_output_with_compile(
+                decoder,
+                prompt,
+                action,
+                cond_vec,
+                chunk_tokens,
+                temperature,
+                repair_passes,
+                initial,
+                go_feedback,
+            );
+        }
+    }
     let mut assistant_content = initial;
     for _ in 0..repair_passes {
         if !output_needs_code_repair(prompt, &assistant_content) {
             break;
         }
-        let repair_prompt = build_code_repair_prompt(prompt, &assistant_content);
+        let repair_prompt = build_code_repair_prompt(
+            prompt,
+            &assistant_content,
+            "No compiler feedback was captured; repair malformed or incomplete output.",
+        );
         let repaired = match decoder.generate_with_temperature(
             &repair_prompt,
             action,
@@ -6296,13 +6374,199 @@ fn maybe_repair_code_output(
     assistant_content
 }
 
-fn build_code_repair_prompt(prompt: &str, attempt: &str) -> String {
+#[derive(Clone, Debug)]
+struct GoCompileCandidate {
+    text: String,
+    compile_feedback: String,
+    compile_ok: bool,
+    heuristic_ok: bool,
+    repair_depth: usize,
+}
+
+fn go_compile_feedback_from_env() -> Option<&'static GoCompileFeedback> {
+    static FEEDBACK: OnceLock<Option<GoCompileFeedback>> = OnceLock::new();
+    FEEDBACK
+        .get_or_init(|| {
+            let go_bin =
+                std::env::var("TOFY_GO_CODE_REPAIR_BIN").unwrap_or_else(|_| "go".to_string());
+            let timeout_sec = std::env::var("TOFY_GO_CODE_REPAIR_TIMEOUT_SEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6.0f64)
+                .max(1.0);
+            let version = go_version_string(&go_bin).ok()?;
+            GoCompileFeedback::new(&go_bin, &version, timeout_sec).ok()
+        })
+        .as_ref()
+}
+
+fn maybe_repair_go_output_with_compile(
+    decoder: &dyn LocalDecoderRuntime,
+    prompt: &str,
+    action: &str,
+    cond_vec: &[f32],
+    chunk_tokens: usize,
+    temperature: Option<f32>,
+    repair_passes: usize,
+    initial: String,
+    go_feedback: &GoCompileFeedback,
+) -> String {
+    let candidate_count = std::env::var("TOFY_GO_COMPILE_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4usize)
+        .max(1);
+    let search_temperature = go_compile_search_temperature(temperature, candidate_count);
+    let mut best = evaluate_go_compile_candidate(go_feedback, prompt, initial, 0);
+    if best.compile_ok {
+        return best.text;
+    }
+
+    for _ in 1..candidate_count {
+        let extra = match decoder.generate_with_temperature(
+            prompt,
+            action,
+            cond_vec,
+            chunk_tokens,
+            search_temperature,
+        ) {
+            Ok(text) => text,
+            Err(_) => break,
+        };
+        let candidate = evaluate_go_compile_candidate(go_feedback, prompt, extra, 0);
+        best = select_better_go_compile_candidate(best, candidate);
+        if best.compile_ok {
+            return best.text;
+        }
+    }
+
+    for repair_depth in 1..=repair_passes {
+        let repair_prompt = build_code_repair_prompt(prompt, &best.text, &best.compile_feedback);
+        let repaired = match decoder.generate_with_temperature(
+            &repair_prompt,
+            action,
+            cond_vec,
+            chunk_tokens,
+            search_temperature,
+        ) {
+            Ok(text) => text,
+            Err(_) => break,
+        };
+        if repaired.trim().is_empty() || repaired.trim() == best.text.trim() {
+            break;
+        }
+        let candidate = evaluate_go_compile_candidate(go_feedback, prompt, repaired, repair_depth);
+        best = select_better_go_compile_candidate(best, candidate);
+        if best.compile_ok {
+            return best.text;
+        }
+    }
+
+    best.text
+}
+
+fn go_compile_search_temperature(temperature: Option<f32>, candidate_count: usize) -> Option<f32> {
+    if candidate_count <= 1 {
+        return temperature;
+    }
+    if let Some(value) = std::env::var("TOFY_GO_COMPILE_SEARCH_TEMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Some(value);
+    }
+    match temperature {
+        Some(value) if value > 0.0 => Some(value),
+        _ => Some(0.35),
+    }
+}
+
+fn evaluate_go_compile_candidate(
+    go_feedback: &GoCompileFeedback,
+    prompt: &str,
+    text: String,
+    repair_depth: usize,
+) -> GoCompileCandidate {
+    let heuristic_ok = !output_needs_code_repair(prompt, &text);
+    let compile_feedback = if text.trim().is_empty() {
+        "empty model output".to_string()
+    } else {
+        go_feedback
+            .compile(&text)
+            .unwrap_or_else(|err| format!("compile harness error: {err}"))
+    };
+    GoCompileCandidate {
+        text,
+        compile_ok: compile_feedback.trim().is_empty(),
+        heuristic_ok,
+        compile_feedback,
+        repair_depth,
+    }
+}
+
+fn select_better_go_compile_candidate(
+    current: GoCompileCandidate,
+    challenger: GoCompileCandidate,
+) -> GoCompileCandidate {
+    if go_compile_candidate_rank(&challenger) > go_compile_candidate_rank(&current) {
+        challenger
+    } else {
+        current
+    }
+}
+
+fn go_compile_candidate_rank(candidate: &GoCompileCandidate) -> i32 {
+    let compile_lines = candidate
+        .compile_feedback
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as i32;
+    let text = candidate.text.trim();
+    let balanced = i32::from(balanced_braces(text));
+    let has_func = i32::from(text.to_ascii_lowercase().contains("func "));
+    1024 * i32::from(candidate.compile_ok)
+        + 64 * i32::from(candidate.heuristic_ok)
+        + 16 * balanced
+        + 8 * has_func
+        - 2 * compile_lines
+        - candidate.repair_depth as i32
+}
+
+fn extract_go_prompt_declarations(prompt: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("func ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("var ")
+        {
+            declarations.push(trimmed.to_string());
+        }
+    }
+    declarations
+}
+
+fn build_code_repair_prompt(prompt: &str, attempt: &str, compiler_feedback: &str) -> String {
     let language = code_request_language(prompt).unwrap_or(CodeRequestLanguage::Go);
     let (language_name, fence) = match language {
         CodeRequestLanguage::Go => ("Go", "go"),
     };
+    let declarations = extract_go_prompt_declarations(prompt);
+    let declarations_block = if declarations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Required declarations:\n{}\n\n",
+            declarations
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     format!(
-        "Return only corrected {language_name} code.\nFix the previous attempt using the compiler feedback.\n\nOriginal request:\n{prompt}\n\nPrevious attempt:\n```{fence}\n{attempt}\n```\n\nCompiler feedback:\nNo compiler feedback was captured; repair malformed or incomplete output.\n\nRules:\n- Keep the exact requested function name and signature.\n- Return only compilable {language_name} code.\n- Do not add explanation.\n"
+        "Return only corrected {language_name} code.\nFix the previous attempt using the compiler feedback.\n\nOriginal request:\n{prompt}\n\n{declarations_block}Previous attempt:\n```{fence}\n{attempt}\n```\n\nCompiler feedback:\n{compiler_feedback}\n\nRules:\n- Keep the exact requested function name and signature.\n- Keep any required type declarations.\n- Return only compilable {language_name} code.\n- Do not add explanation.\n"
     )
 }
 

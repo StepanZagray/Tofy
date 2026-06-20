@@ -21,10 +21,7 @@ fn l2_normalize_last_dim(x: &Tensor) -> Result<Tensor> {
 pub fn prediction_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
     let pred_norm = l2_normalize_last_dim(pred)?;
     let target_norm = l2_normalize_last_dim(target)?;
-    Ok(pred_norm
-        .broadcast_sub(&target_norm)?
-        .sqr()?
-        .mean_all()?)
+    Ok(pred_norm.broadcast_sub(&target_norm)?.sqr()?.mean_all()?)
 }
 
 pub fn mean_cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -123,7 +120,10 @@ mod tests {
         let target = Tensor::from_vec(vec![3.0f32, 4.0], (1, 2), &device)?;
         let pred = Tensor::from_vec(vec![6.0f32, 8.0], (1, 2), &device)?;
         let loss = prediction_loss(&pred, &target)?.to_vec0::<f32>()?;
-        assert!(loss < 1e-5, "normalized loss should be near zero, got {loss}");
+        assert!(
+            loss < 1e-5,
+            "normalized loss should be near zero, got {loss}"
+        );
         Ok(())
     }
 

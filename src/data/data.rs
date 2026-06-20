@@ -2309,8 +2309,7 @@ pub fn make_augmented_jepa_batch(
     let view_b_ids = Tensor::from_vec(view_b_buf, (batch_size, cfg.max_seq), device)?;
     let target_ids = Tensor::from_vec(target_buf, (batch_size, cfg.max_seq), device)?;
     let target_count = target_linear.len();
-    let target_linear_indices =
-        Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
+    let target_linear_indices = Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
 
     Ok(AugmentedJepaBatch {
         view_a_ids,
@@ -2367,8 +2366,7 @@ pub fn make_augmented_jepa_batch_from_pairs(
     let view_b_ids = Tensor::from_vec(view_b_buf, (batch_size, cfg.max_seq), device)?;
     let target_ids = Tensor::from_vec(target_buf, (batch_size, cfg.max_seq), device)?;
     let target_count = target_linear.len();
-    let target_linear_indices =
-        Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
+    let target_linear_indices = Tensor::from_vec(target_linear.clone(), (target_count,), device)?;
 
     Ok(AugmentedJepaBatch {
         view_a_ids,
