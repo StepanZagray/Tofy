@@ -81,7 +81,7 @@
     "code_decoder_max_vocab": 32000,
     "bridge_dim": 1024,
     "num_latent_tokens": 128,
-    "decoder_dim": 1744,
+    "decoder_dim": 1728,
     "decoder_layers": 16,
     "decoder_heads": 16,
     "decoder_ff_dim": 6144,
