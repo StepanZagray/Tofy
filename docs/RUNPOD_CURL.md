@@ -236,23 +236,16 @@ then run status commands inside the shell.
 ## 4. Pod Setup
 
 Run inside the pod from the cloned repo after Step 3. This installs system
-tools, Rust, Go, HF CLI, creates `/workspace/run-tofy-and-stop.sh`, saves
-auto-stop credentials, saves the HF token for cache download, and checks CUDA.
+tools, Rust, Go, HF CLI, saves the HF token for cache download, and checks CUDA.
 
-Export these inside the pod before setup. `RUNPOD_API_KEY` is your RunPod
-account REST API key (RunPod console → Settings → API Keys). Training uses it
-to stop the pod when the run exits; without it, auto-stop fails and the pod
-keeps billing.
+Export the HF token inside the pod before setup:
 
 ```bash
-export RUNPOD_API_KEY="<runpod-rest-api-key>"
-export RUNPOD_POD_ID="<pod-id-from-create-step>"
 export HF_TOKEN="<hf-read-token>"
 scripts/runpod_pod_setup.sh
 ```
 
-Setup writes `/workspace/tofy-runpod.env` with those values. The auto-stop
-wrapper sources that file on train exit.
+Setup writes `/workspace/tofy-runpod.env` with that value when provided.
 
 If you skip the exports above, the script prompts for each value instead.
 
@@ -302,9 +295,7 @@ That keeps long runs alive after you disconnect SSH. Detach without stopping the
 job with **`Ctrl+b`**, then **`d`**. Reattach later with `tmux attach -t
 <session>`. List sessions with `tmux ls`.
 
-Probe first on a fresh GPU shape. The probe intentionally does not use the
-auto-stop wrapper, so the pod stays running for the training launch if the probe
-passes.
+Probe first on a fresh GPU shape.
 
 ```bash
 cd /workspace/Tofy
@@ -319,7 +310,7 @@ tail -f /workspace/tofy-vram-probe-80gb.log
 nvidia-smi
 ```
 
-Start the full 80 GB run. This uses the auto-stop wrapper by default.
+Start the full 80 GB run:
 
 ```bash
 cd /workspace/Tofy

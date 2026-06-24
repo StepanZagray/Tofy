@@ -7,7 +7,6 @@ MODE="${1:-train}"
 PROFILE="${PROFILE:-80gb}"
 RESUME_TARGET="${RESUME_TARGET:-latest}"
 SESSION="${TMUX_SESSION:-tofy-${MODE}}"
-STOP_WRAPPER="${TOFY_RUNPOD_STOP_WRAPPER:-/workspace/run-tofy-and-stop.sh}"
 
 if [[ "$MODE" != "train" && "$MODE" != "resume" ]]; then
   echo "usage: $0 [train|resume]" >&2
@@ -23,7 +22,7 @@ fi
 
 if [[ "${TOFY_RUNPOD_TMUX_CHILD:-0}" != "1" && -z "${TMUX:-}" ]]; then
   exec tmux new -s "$SESSION" \
-    "TOFY_RUNPOD_TMUX_CHILD=1 PROFILE='$PROFILE' RESUME_TARGET='$RESUME_TARGET' SKIP_TRAINED_STAGES='${SKIP_TRAINED_STAGES:-}' LOG_PATH='$LOG_PATH' TOFY_REPO_DIR='$REPO_DIR' SKIP_GIT_PULL='${SKIP_GIT_PULL:-0}' TOFY_AUTO_STOP='${TOFY_AUTO_STOP:-1}' TOFY_RUNPOD_STOP_WRAPPER='$STOP_WRAPPER' bash '$0' '$MODE'"
+    "TOFY_RUNPOD_TMUX_CHILD=1 PROFILE='$PROFILE' RESUME_TARGET='$RESUME_TARGET' SKIP_TRAINED_STAGES='${SKIP_TRAINED_STAGES:-}' LOG_PATH='$LOG_PATH' TOFY_REPO_DIR='$REPO_DIR' SKIP_GIT_PULL='${SKIP_GIT_PULL:-0}' bash '$0' '$MODE'"
 fi
 
 cd "$REPO_DIR"
@@ -48,8 +47,4 @@ if [[ -n "${SKIP_TRAINED_STAGES:-}" ]]; then
   cmd+=(--skip-trained "$SKIP_TRAINED_STAGES")
 fi
 
-if [[ "${TOFY_AUTO_STOP:-1}" == "1" && -x "$STOP_WRAPPER" ]]; then
-  "$STOP_WRAPPER" "${cmd[@]}" 2>&1 | tee "$LOG_PATH"
-else
-  "${cmd[@]}" 2>&1 | tee "$LOG_PATH"
-fi
+"${cmd[@]}" 2>&1 | tee "$LOG_PATH"
