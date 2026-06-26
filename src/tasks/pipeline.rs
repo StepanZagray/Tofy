@@ -1557,11 +1557,13 @@ fn train_code_decoder(
         defaults.code_decoder_grad_accum,
         &paths.code_decoder_base_model,
         None,
-        "3e-4",
-        "0.20",
+        "1e-4",
+        "0.10",
     );
-    with_stage("decoder_code", || {
-        tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
+    with_base_decoder_pretrain_env(|| {
+        with_stage("decoder_code", || {
+            tasks::world::try_run_train_decoder(&append_resume(args, cfg.resume))
+        })
     })?;
     ensure_file(&paths.code_decoder_base_model)?;
     Ok(())
@@ -2830,6 +2832,31 @@ where
         std::env::remove_var(key);
     }
     result
+}
+
+fn with_env_defaults<F>(defaults: &[(&str, &str)], f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let mut added = Vec::new();
+    for (key, value) in defaults {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+            added.push(*key);
+        }
+    }
+    let result = f();
+    for key in added {
+        std::env::remove_var(key);
+    }
+    result
+}
+
+fn with_base_decoder_pretrain_env<F>(f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    with_env_defaults(&[("TOFY_DECODER_CLIP_NORM", "0.30")], f)
 }
 
 fn vocab_dir() -> PathBuf {

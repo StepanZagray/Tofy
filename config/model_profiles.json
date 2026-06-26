@@ -69,7 +69,7 @@
     "latent_steps": 24000,
     "world_steps": 25000,
     "high_world_steps": 18000,
-    "code_decoder_steps": 120000,
+    "code_decoder_steps": 15000,
     "go_feedback_steps": 30000,
     "dim": 1024,
     "latent_max_seq": 384,
