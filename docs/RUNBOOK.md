@@ -159,7 +159,7 @@ Decoder training knobs:
 - `TOFY_DECODER_NEGATIVE_FORWARDS=1` or `--conditioning-negative-forwards` enables extra negative-conditioning decoder forwards for the conditioning-margin loss and optional ablation metrics.
 - `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` sets the conditioning-margin weight used only when negative forwards are enabled, default `0.10`
 - `TOFY_DECODER_CONDITIONING_MARGIN=<float>` sets the conditioning-loss margin, default `0.10`
-- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all|none` controls which negative-conditioning forwards are used for the training margin after `TOFY_DECODER_NEGATIVE_FORWARDS=1`; pipeline default `zero,shuffle`
+- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all|none` controls which negative-conditioning forwards are used for the training margin after `TOFY_DECODER_NEGATIVE_FORWARDS=1`; pipeline default `hard`, which uses another batch row
 - `TOFY_DECODER_ABLATION_METRICS=1` logs zero/shuffle/hard negative-conditioning losses when negative forwards are enabled.
 - `TOFY_DECODER_PROMPT_DROPOUT=<float>` randomly masks prompt tokens during decoder training so the decoder must use world conditioning; pipeline default `0.12`
 - `TOFY_DECODER_CLIP_NORM=<float>` sets decoder global-norm clipping, default `1.0`; the canonical base code-decoder pretrain stage uses `0.30` when this is unset
@@ -220,14 +220,14 @@ This is the default large local/cloud profile. It uses `DIM=1024`,
 `BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1728`, decoder FF
 width `6144`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder `8x16`
 (`128` effective), world `64x8` (`512` effective) with the encoder frozen,
-high-world `128x4` (`512` effective), decoder `8x8` (`64` effective), and Go
-feedback `8x8` (`64` effective).
+high-world `128x4` (`512` effective), decoder `16x4` (`64` effective), and Go
+feedback `16x4` (`64` effective).
 The profile uses a small decoder microbatch so activation memory can hold the
 much wider decoder. Do not raise the decoder microbatch just because VRAM is
 available; probe throughput first.
 After the GPU is saturated, bigger decoder microbatches mostly buy fewer
 optimizer steps per token and higher activation memory pressure. It defaults to
-latent `24000`, world `25000`, high-world `18000`, code decoder `15000`, and
+latent `24000`, world `25000`, high-world `18000`, code decoder `120000`, and
 Go feedback `30000`.
 
 Before a long 80 GB launch, run:

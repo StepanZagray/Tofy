@@ -328,10 +328,9 @@ nvidia-smi
 
 `scripts/runpod_train.sh` defaults to `TOFY_REQUIRE_PREPARED_CACHE=1`, so a
 missing cache exits immediately instead of writing large token caches to the
-RunPod volume. It also defaults `TOFY_GO_MODEL_FEEDBACK_ROWS=0`, because
-model-failure feedback mining depends on the just-trained decoder and would
-force pod-side data/cache regeneration. Override those variables only when you
-intentionally want the pod to generate new feedback/cache files.
+RunPod volume. Model-failure feedback mining uses the profile default unless
+`TOFY_GO_MODEL_FEEDBACK_ROWS` is explicitly overridden; set it to `0` only when
+you intentionally want to skip feedback generation.
 
 For 48 GB pods, use `PROFILE=48gb`.
 

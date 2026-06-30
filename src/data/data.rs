@@ -18,6 +18,60 @@ use crate::model::vocab::{Pair, Vocab};
 
 pub const PAIR_SOURCE_MANIFEST_HEADER: &str = "# tofy-pair-sources-v1";
 
+fn stable_split_hash_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> usize {
+    fn update(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in parts {
+        hash = update(hash, part);
+        hash = update(hash, &[0xff]);
+    }
+    hash as usize
+}
+
+fn stable_token_pair_split_hash(left: &[u32], right: &[u32], action: u32) -> usize {
+    let mut hash = 0xcbf29ce484222325u64;
+    for ids in [left, right] {
+        for id in ids {
+            for byte in id.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let action = action.to_le_bytes();
+    for byte in action {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as usize
+}
+
+fn split_keeps(
+    hash: usize,
+    modulus: Option<usize>,
+    remainder: usize,
+    exclude_matches: bool,
+) -> bool {
+    let Some(modulus) = modulus else {
+        return true;
+    };
+    let is_match = hash % modulus == remainder;
+    if exclude_matches {
+        !is_match
+    } else {
+        is_match
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenizationMode {
     Default,
@@ -979,7 +1033,6 @@ pub struct RawWorldStream {
     split_modulus: Option<usize>,
     split_remainder: usize,
     exclude_split_matches: bool,
-    line_index: usize,
     prefetch_rx: Option<PrefetchRx<RawWorldExample>>,
     prefetch_stash: VecDeque<RawWorldExample>,
 }
@@ -1011,7 +1064,6 @@ pub struct CachedDecoderStream {
     split_modulus: Option<usize>,
     split_remainder: usize,
     exclude_split_matches: bool,
-    row_index: usize,
     prefetch_rx: Option<PrefetchRx<CachedDecoderExample>>,
     prefetch_stash: VecDeque<CachedDecoderExample>,
 }
@@ -1186,7 +1238,6 @@ impl CachedDecoderStream {
             split_modulus,
             split_remainder,
             exclude_split_matches,
-            row_index: 0,
             prefetch_rx: None,
             prefetch_stash: VecDeque::new(),
         };
@@ -1205,7 +1256,6 @@ impl CachedDecoderStream {
 
     fn reset(&mut self) -> Result<()> {
         self.reader = token_cache_reader(&self.path)?;
-        self.row_index = 0;
         self.read_magic()
     }
 
@@ -1217,24 +1267,20 @@ impl CachedDecoderStream {
                 self.reset()?;
                 continue;
             };
-            let row_idx = self.row_index;
-            self.row_index += 1;
-            if let Some(modulus) = self.split_modulus {
-                let is_match = row_idx % modulus == self.split_remainder;
-                let keep = if self.exclude_split_matches {
-                    !is_match
-                } else {
-                    is_match
-                };
-                if !keep {
-                    continue;
-                }
-            }
             if enc_state.is_empty()
                 || enc_next.is_empty()
                 || dec_state.is_empty()
                 || dec_next.is_empty()
             {
+                continue;
+            }
+            let split_hash = stable_token_pair_split_hash(&dec_state, &dec_next, action_label);
+            if !split_keeps(
+                split_hash,
+                self.split_modulus,
+                self.split_remainder,
+                self.exclude_split_matches,
+            ) {
                 continue;
             }
             return Ok(CachedDecoderExample {
@@ -1462,7 +1508,6 @@ impl RawWorldStream {
             split_modulus,
             split_remainder,
             exclude_split_matches,
-            line_index: 0,
             prefetch_rx: None,
             prefetch_stash: VecDeque::new(),
         })
@@ -1470,7 +1515,6 @@ impl RawWorldStream {
 
     fn reset(&mut self) -> Result<()> {
         self.reader = BufReader::new(File::open(&self.path)?);
-        self.line_index = 0;
         Ok(())
     }
 
@@ -1480,19 +1524,6 @@ impl RawWorldStream {
             if self.reader.read_line(&mut line)? == 0 {
                 self.reset()?;
                 continue;
-            }
-            let line_idx = self.line_index;
-            self.line_index += 1;
-            if let Some(modulus) = self.split_modulus {
-                let is_match = line_idx % modulus == self.split_remainder;
-                let keep = if self.exclude_split_matches {
-                    !is_match
-                } else {
-                    is_match
-                };
-                if !keep {
-                    continue;
-                }
             }
             let line = line.trim();
             if line.is_empty() {
@@ -1515,6 +1546,20 @@ impl RawWorldStream {
             } else {
                 action_label_heuristic(&next_text)
             };
+            let action_bytes = action_label.to_le_bytes();
+            let split_hash = stable_split_hash_parts([
+                state_text.as_bytes(),
+                next_text.as_bytes(),
+                action_bytes.as_slice(),
+            ]);
+            if !split_keeps(
+                split_hash,
+                self.split_modulus,
+                self.split_remainder,
+                self.exclude_split_matches,
+            ) {
+                continue;
+            }
             let state_tokens = tokenize_with_mode(&state_text, self.tokenization_mode);
             let next_tokens = tokenize_with_mode(&next_text, self.tokenization_mode);
             if state_tokens.is_empty() || next_tokens.is_empty() {
@@ -2956,6 +3001,14 @@ fn encode_sequence_tail(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32
     encode_sequence(&tokens[start..], max_seq, pad_id)
 }
 
+fn encode_sequence_head(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32>, usize) {
+    let len = tokens.len().min(max_seq);
+    let mut out = Vec::with_capacity(max_seq);
+    out.extend(tokens.iter().take(len).copied());
+    out.extend(std::iter::repeat_n(pad_id, max_seq.saturating_sub(len)));
+    (out, len)
+}
+
 /// Build decoder teacher-forcing batch from world batch.
 /// input[b] = state[b, 0..state_len] ++ next[b, 0..next_len-1], padded to decoder_len.
 /// target[b] = <pad> for prompt-only positions, then next[b, 0..next_len], padded to decoder_len.
@@ -3025,8 +3078,9 @@ pub fn make_decoder_batch(
 
 /// Build decoder teacher-forcing tensors directly from CPU token rows.
 ///
-/// Long prompts and completions keep their tail so late instructions, compiler feedback, and
-/// closing delimiters remain visible.
+/// Long prompts keep their tail so late constraints remain visible. Long completions keep their
+/// head because autoregressive generation must learn imports, declarations, and exact signatures
+/// before it can produce a valid body.
 pub fn make_decoder_batch_from_slice(
     rows: &[WorldExample],
     max_seq: usize,
@@ -3052,7 +3106,7 @@ pub fn make_decoder_batch_from_slice_with_prompt_dropout(
         .map(|row| {
             let mut rng = rng();
             let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
-            let (next_seq, next_len) = encode_sequence_tail(&row.next_tokens, max_seq, pad_id);
+            let (next_seq, next_len) = encode_sequence_head(&row.next_tokens, max_seq, pad_id);
             let raw_sl = state_len.min(max_seq);
             let nl = next_len.min(max_seq);
             let prompt_len = if raw_sl == 0 && max_seq > 0 {
@@ -3165,6 +3219,22 @@ mod tests {
     }
 
     #[test]
+    fn repeated_decoder_rows_always_share_the_same_split() {
+        let left = [10, 11, 12];
+        let right = [20, 21, 22];
+        let first = stable_token_pair_split_hash(&left, &right, ACTION_CODE);
+        let repeated = stable_token_pair_split_hash(&left, &right, ACTION_CODE);
+        let changed = stable_token_pair_split_hash(&left, &[20, 21, 23], ACTION_CODE);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, changed);
+        assert_ne!(
+            split_keeps(first, Some(20), 0, true),
+            split_keeps(first, Some(20), 0, false)
+        );
+    }
+
+    #[test]
     fn pair_source_manifest_counts_and_streams_both_pair_sides() -> Result<()> {
         let dir = unique_temp_dir("tofy-pair-source-manifest");
         fs::create_dir_all(&dir)?;
@@ -3269,7 +3339,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_batch_keeps_tail_of_long_target() -> Result<()> {
+    fn decoder_batch_keeps_head_of_long_target() -> Result<()> {
         let device = Device::Cpu;
         let row = WorldExample {
             state_tokens: vec![10, 11],
@@ -3279,8 +3349,8 @@ mod tests {
 
         let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
 
-        assert_eq!(input.to_vec2::<u32>()?[0], vec![10, 11, 22, 23, 0, 0]);
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 22, 23, 24, 0, 0]);
+        assert_eq!(input.to_vec2::<u32>()?[0], vec![10, 11, 20, 21, 0, 0]);
+        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 20, 21, 22, 0, 0]);
         assert_eq!(
             mask.to_vec2::<f32>()?[0],
             vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]

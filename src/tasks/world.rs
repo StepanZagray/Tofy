@@ -51,7 +51,7 @@ use crate::util;
 
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
-const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
+const TOKEN_CACHE_MANIFEST_VERSION: u32 = 9;
 const DECODER_VOCAB_MANIFEST_VERSION: u32 = 1;
 const CONDITIONED_DECODER_CACHE_VERSION: u32 = 2;
 const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V2\n";
@@ -4872,6 +4872,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     let mut best_loss = resume_state.best_aux_metric;
     let mut best_metric = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
+    let mut conditioning_diversity_logged = false;
     let context_segments = env_usize("TOFY_WORLD_CONTEXT_SEGMENTS", 4);
     let recent_full_segments = env_usize("TOFY_WORLD_RECENT_FULL_SEGMENTS", 1);
     let recursive_context_compressor = env_bool("TOFY_RECURSIVE_CONTEXT_COMPRESSION", false);
@@ -5086,6 +5087,23 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             let decoder_action_labels = vec![decoder_action_label; decoder_batch.len()];
             let world_latent = decoder_conditioning_adapter
                 .forward_with_actions(&micro_next_context_slots, &decoder_action_labels)?;
+            if !conditioning_diversity_logged && decoder_batch.len() > 1 {
+                let mismatched = hard_mismatched_conditioning_latent(&world_latent)?;
+                let delta_rms =
+                    util::scalar_f32(&tensor_rms(&world_latent.broadcast_sub(&mismatched)?)?)?;
+                let latent_rms = util::scalar_f32(&tensor_rms(&world_latent)?)?;
+                let relative_delta = delta_rms / latent_rms.max(1e-8);
+                println!(
+                    "Decoder conditioning diversity: mismatch_delta_rms={delta_rms:.6} latent_rms={latent_rms:.6} relative={relative_delta:.6}"
+                );
+                tb.add_scalar("metrics/conditioning_mismatch_delta_rms", delta_rms, step);
+                tb.add_scalar(
+                    "metrics/conditioning_mismatch_relative",
+                    relative_delta,
+                    step,
+                );
+                conditioning_diversity_logged = true;
+            }
 
             let (dec_input, dec_target, loss_mask) =
                 make_decoder_batch_from_slice_with_prompt_dropout(
@@ -5475,9 +5493,8 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 let eval_batch_size = std::env::var("TOFY_DECODER_EVAL_BATCH")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(config.batch_size)
-                    .max(1)
-                    .min(config.batch_size.max(1));
+                    .unwrap_or_else(|| config.batch_size.saturating_mul(4).min(32))
+                    .max(1);
                 let val_metrics = if let Some(ref mut cached_stream) = cached_decoder_val_stream {
                     let cached_batch = collect_decoder_cached_batch(
                         cached_stream,
@@ -6400,6 +6417,7 @@ fn go_compile_feedback_from_env() -> Option<&'static GoCompileFeedback> {
         .as_ref()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_repair_go_output_with_compile(
     decoder: &dyn LocalDecoderRuntime,
     prompt: &str,
@@ -8385,7 +8403,7 @@ impl DecoderConditioningNegatives {
 
     fn from_env() -> Self {
         let value = std::env::var("TOFY_DECODER_CONDITIONING_NEGATIVES")
-            .unwrap_or_else(|_| "zero,shuffle".to_string());
+            .unwrap_or_else(|_| "hard".to_string());
         let mut out = Self::none();
         let mut allow_empty = false;
         for part in value.split(',') {
@@ -8423,7 +8441,7 @@ fn add_conditioning_margin_loss(
     margin: f64,
 ) -> Result<Tensor> {
     let margin_loss = token_loss
-        .broadcast_sub(&negative_loss.detach())?
+        .broadcast_sub(negative_loss)?
         .affine(1.0, margin)?
         .relu()?;
     if let Some(existing) = existing {

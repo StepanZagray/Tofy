@@ -37,7 +37,6 @@ cargo build --release
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 export TOFY_TRAIN_DTYPE="${TOFY_TRAIN_DTYPE:-bf16}"
 export TOFY_REQUIRE_PREPARED_CACHE="${TOFY_REQUIRE_PREPARED_CACHE:-1}"
-export TOFY_GO_MODEL_FEEDBACK_ROWS="${TOFY_GO_MODEL_FEEDBACK_ROWS:-0}"
 
 cmd=(./target/release/jepa_ai train "$PROFILE")
 if [[ "$MODE" == "resume" ]]; then

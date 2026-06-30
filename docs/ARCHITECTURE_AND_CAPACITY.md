@@ -155,7 +155,7 @@ Teacher forcing is built as:
 - `input = state + shifted(next)`
 - `target = shifted(state) + next`
 
-The decoder objective uses matched world conditioning by default. Set `TOFY_DECODER_NEGATIVE_FORWARDS=1` or pass `--conditioning-negative-forwards` to add the conditioning-margin term, which compares the matched context/state latent against configurable negative conditioning (`TOFY_DECODER_CONDITIONING_NEGATIVES`, default `zero,shuffle`). With `TOFY_DECODER_ABLATION_METRICS=1`, it also logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain`. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
+The decoder objective uses matched world conditioning by default. Set `TOFY_DECODER_NEGATIVE_FORWARDS=1` or pass `--conditioning-negative-forwards` to add the conditioning-margin term, which compares the matched context/state latent against configurable cross-example negative conditioning (`TOFY_DECODER_CONDITIONING_NEGATIVES`, default `hard`). With `TOFY_DECODER_ABLATION_METRICS=1`, it also logs `zero_gain`, `shuffle_gain`, and `hard_negative_gain`. The mismatched negatives matter because they check whether the decoder is using the right latent, not merely reacting to any nonzero conditioning vector.
 
 So the decoder training sequence length is effectively **`2 * max_seq`**, even though `max_seq` is still the configuration knob for each side individually.
 
@@ -165,7 +165,7 @@ This means `max_seq = 192` for the current 8 GB code-decoder profile really mean
 - up to `192` tokens from the right side
 - up to `384` autoregressive positions inside the decoder loss
 
-If either side is longer than its per-side budget, training keeps the tail of that side. The newest prompt tokens and the end of the target completion are usually where instructions, compiler feedback, return values, and closing braces live.
+If either side is longer than its per-side budget, training keeps the prompt tail but the completion head. This preserves late prompt constraints while supervising the imports, declarations, and exact function signature that autoregressive generation must emit first.
 
 ### 5. Dataset context
 

@@ -613,12 +613,12 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_ORCHESTRATOR_LOG_EVERY", "500");
     set_env_default("TOFY_DECODER_NEGATIVE_FORWARDS", "1");
     set_env_default("TOFY_DECODER_ABLATION_METRICS", "1");
-    set_env_default("TOFY_DECODER_PROMPT_DROPOUT", "0.12");
+    set_env_default("TOFY_DECODER_PROMPT_DROPOUT", "0.02");
     set_env_default("TOFY_DECODER_SYNTAX_LOSS_WEIGHT", "0.05");
     set_env_default("TOFY_DECODER_SIGNATURE_LOSS_WEIGHT", "0.15");
     set_env_default("TOFY_DECODER_STRUCTURE_LOSS_WEIGHT", "0.05");
     set_env_default("TOFY_DECODER_CONDITIONING_MARGIN", "0.10");
-    set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "zero,shuffle");
+    set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "hard");
     set_env_default("TOFY_DECODER_CHECKPOINT_EVERY", "1000");
     set_env_default_owned(
         "TOFY_DECODER_ATTENTION_QUERY_BLOCK",

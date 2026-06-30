@@ -20,7 +20,7 @@ use crate::data::{
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
-const CACHE_VERSION: u32 = 8;
+const CACHE_VERSION: u32 = 9;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
 const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
@@ -904,9 +904,11 @@ fn truncate_ids_tail(ids: &mut Vec<u32>, max_seq: usize) {
 }
 
 fn truncate_decoder_next_ids(ids: &mut Vec<u32>, max_seq: usize) {
-    // Keep cache semantics aligned with make_decoder_batch_from_slice: long
-    // completions train on the tail so closing structure remains supervised.
-    truncate_ids_tail(ids, max_seq);
+    // Decoder targets retain their autoregressive beginning: imports, declarations, and exact
+    // signatures must be learned before the model can generate a valid body.
+    if max_seq > 0 {
+        ids.truncate(max_seq);
+    }
 }
 
 fn token_cache_raw_sequence_cap(max_seq: usize) -> usize {
@@ -1053,10 +1055,10 @@ mod tests {
     }
 
     #[test]
-    fn decoder_target_truncation_keeps_completion_tail() {
+    fn decoder_target_truncation_keeps_completion_head() {
         let mut ids = vec![10, 11, 12, 13, 14];
         truncate_decoder_next_ids(&mut ids, 3);
-        assert_eq!(ids, vec![12, 13, 14]);
+        assert_eq!(ids, vec![10, 11, 12]);
     }
 
     #[test]

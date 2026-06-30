@@ -29,6 +29,7 @@ const SQUAD_V2_DATASET_ID: &str = "rajpurkar/squad_v2";
 const DEFAULT_GITHUB_LANGUAGES: &[&str] = &["Go"];
 const CODE_EVAL_SUITE_JSONL: &str = include_str!("../../eval/code_assistant_go_hard.jsonl");
 const DEFAULT_PREPARE_CHUNK_LINES: usize = 16_384;
+const DEFAULT_CODE_MIX_SHUFFLE_BUCKETS: usize = 128;
 const FORBIDDEN_DTYPE_PATTERNS: &[&str] = &[
     ".to_scalar::<f32>()",
     ".to_vec1::<f32>()",
@@ -41,6 +42,14 @@ fn prepare_chunk_lines() -> usize {
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)
         .unwrap_or(DEFAULT_PREPARE_CHUNK_LINES)
+}
+
+fn code_mix_shuffle_buckets() -> usize {
+    std::env::var("TOFY_CODE_MIX_SHUFFLE_BUCKETS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_CODE_MIX_SHUFFLE_BUCKETS)
 }
 
 fn read_line_chunk<I>(lines: &mut I, max_lines: usize) -> Result<Vec<String>>
@@ -2791,6 +2800,8 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
         "target_stop_token": CODE_EOS_TOKEN,
         "max_rows": if max_rows > 0 { Some(max_rows) } else { None::<usize> },
         "seed": seed,
+        "row_shuffle": "bucket_v1",
+        "shuffle_buckets": code_mix_shuffle_buckets(),
     });
     if !force {
         if let Some(manifest) = artifact_cache_hit("code_poc_mix", &output, &inputs, &params)? {
@@ -2828,7 +2839,7 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut out = BufWriter::new(File::create(&tmp)?);
+    let mut out = CodePocShuffledWriter::new(&tmp, seed, code_mix_shuffle_buckets())?;
     let mut remaining = if max_rows > 0 { Some(max_rows) } else { None };
     let mut written = 0usize;
     let mut fim_rows = 0usize;
@@ -2859,8 +2870,7 @@ fn run_prepare_code_poc_mix(args: &[String]) -> Result<()> {
             }
         }
     }
-    out.flush()?;
-    drop(out);
+    out.finish()?;
     fs::rename(&tmp, &output)?;
     write_artifact_manifest("code_poc_mix", &output, &inputs, params, written)?;
     println!(
@@ -2884,23 +2894,80 @@ fn has_row_budget(remaining: &Option<usize>) -> bool {
     remaining.map(|rows| rows > 0).unwrap_or(true)
 }
 
-fn write_limited_row<W: Write>(
-    out: &mut W,
+struct CodePocShuffledWriter {
+    output: PathBuf,
+    bucket_dir: PathBuf,
+    buckets: Vec<BufWriter<File>>,
+    rng: rand::rngs::StdRng,
+}
+
+impl CodePocShuffledWriter {
+    fn new(output: &Path, seed: u64, bucket_count: usize) -> Result<Self> {
+        let bucket_dir = side_tmp_path(output, "shuffle-buckets");
+        if bucket_dir.exists() {
+            fs::remove_dir_all(&bucket_dir)?;
+        }
+        fs::create_dir_all(&bucket_dir)?;
+        let buckets = (0..bucket_count.max(1))
+            .map(|idx| File::create(bucket_dir.join(format!("{idx:04}.rows"))).map(BufWriter::new))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self {
+            output: output.to_path_buf(),
+            bucket_dir,
+            buckets,
+            rng: rand::rngs::StdRng::seed_from_u64(seed ^ 0xA076_1D64_78BD_642F),
+        })
+    }
+
+    fn write_row(&mut self, row: &str) -> Result<()> {
+        let bucket = self.rng.random_range(0..self.buckets.len());
+        writeln!(self.buckets[bucket], "{row}")?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let bucket_count = self.buckets.len();
+        for bucket in &mut self.buckets {
+            bucket.flush()?;
+        }
+        drop(self.buckets);
+
+        let mut order = (0..bucket_count).collect::<Vec<_>>();
+        order.shuffle(&mut self.rng);
+        let mut output = BufWriter::new(File::create(&self.output)?);
+        for idx in order {
+            let path = self.bucket_dir.join(format!("{idx:04}.rows"));
+            let mut rows = BufReader::new(File::open(&path)?)
+                .lines()
+                .collect::<std::io::Result<Vec<_>>>()?;
+            rows.shuffle(&mut self.rng);
+            for row in rows {
+                writeln!(output, "{row}")?;
+            }
+        }
+        output.flush()?;
+        fs::remove_dir_all(&self.bucket_dir)?;
+        Ok(())
+    }
+}
+
+fn write_limited_row(
+    out: &mut CodePocShuffledWriter,
     row: &str,
     remaining: &mut Option<usize>,
 ) -> Result<bool> {
     if !has_row_budget(remaining) {
         return Ok(false);
     }
-    writeln!(out, "{row}")?;
+    out.write_row(row)?;
     if let Some(rows) = remaining.as_mut() {
         *rows -= 1;
     }
     Ok(true)
 }
 
-fn write_code_poc_rows_from_path<W: Write>(
-    out: &mut W,
+fn write_code_poc_rows_from_path(
+    out: &mut CodePocShuffledWriter,
     path: &Path,
     remaining: &mut Option<usize>,
 ) -> Result<usize> {
@@ -2931,8 +2998,8 @@ fn write_code_poc_rows_from_path<W: Write>(
     Ok(written)
 }
 
-fn write_code_poc_fim_rows<W: Write>(
-    out: &mut W,
+fn write_code_poc_fim_rows(
+    out: &mut CodePocShuffledWriter,
     instruction_pairs: &Path,
     extra_pairs: &[PathBuf],
     remaining: &mut Option<usize>,
@@ -2947,8 +3014,8 @@ fn write_code_poc_fim_rows<W: Write>(
     Ok(written)
 }
 
-fn write_code_poc_fim_rows_from_path<W: Write>(
-    out: &mut W,
+fn write_code_poc_fim_rows_from_path(
+    out: &mut CodePocShuffledWriter,
     path: &Path,
     remaining: &mut Option<usize>,
 ) -> Result<usize> {

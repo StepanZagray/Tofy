@@ -108,36 +108,22 @@ pub(crate) fn decoder_conditioning_gains(
         conditioning_gain,
         zero_gain: conditioning_gain,
         shuffle_gain: shuffled_loss - raw_loss,
-        hard_negative_gain: ablated_loss.min(shuffled_loss).min(hard_mismatch_loss) - raw_loss,
+        hard_negative_gain: hard_mismatch_loss - raw_loss,
     }
 }
 
 pub(crate) fn shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
-    slot_shuffled_conditioning_latent(world_latent)
-        .or_else(|_| shifted_conditioning_latent(world_latent, 1))
+    batch_shuffled_conditioning_latent(world_latent)
 }
 
-pub(crate) fn slot_shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
-    use rand::seq::SliceRandom;
-    let (batch, slots, _) = world_latent.dims3()?;
-    if slots <= 1 {
-        return shifted_conditioning_latent(world_latent, 1);
+pub(crate) fn batch_shuffled_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
+    use rand::RngExt;
+    let (batch, _, _) = world_latent.dims3()?;
+    if batch <= 1 {
+        return world_latent.affine(0.0, 0.0).map_err(Into::into);
     }
-    let device = world_latent.device();
-    let mut rng = rand::rng();
-    let mut out_rows = Vec::with_capacity(batch);
-    for row in 0..batch {
-        let mut perm = (0..slots as u32).collect::<Vec<_>>();
-        perm.shuffle(&mut rng);
-        let indices = Tensor::from_vec(perm, (slots,), device)?;
-        let shuffled = world_latent
-            .narrow(0, row, 1)?
-            .squeeze(0)?
-            .index_select(&indices, 0)?
-            .unsqueeze(0)?;
-        out_rows.push(shuffled);
-    }
-    Tensor::cat(&out_rows, 0).map_err(Into::into)
+    let offset = rand::rng().random_range(1..batch);
+    shifted_conditioning_latent(world_latent, offset)
 }
 
 pub(crate) fn hard_mismatched_conditioning_latent(world_latent: &Tensor) -> Result<Tensor> {
@@ -652,12 +638,11 @@ fn decoder_target_mask_rows(
         } else {
             raw_sl
         };
-        let next_start = row.next_tokens.len().saturating_sub(max_seq);
-        let next_tail = &row.next_tokens[next_start..next_start + nl];
+        let next_head = &row.next_tokens[..nl];
 
         let mut target = Vec::with_capacity(decoder_len);
         target.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
-        target.extend(next_tail.iter().copied());
+        target.extend(next_head.iter().copied());
         target.extend(std::iter::repeat_n(
             pad_id,
             decoder_len.saturating_sub(target.len()),
@@ -1513,10 +1498,10 @@ pub(crate) fn decoder_reward_proxy(metrics: &DecoderBatchMetrics) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_cross_entropy, compute_action_metrics, decoder_conditioning_gains,
-        decoder_prediction_metrics, decoder_reward_proxy, forbidden_decoder_token,
-        function_name_span_indices, masked_cross_entropy, perplexity_from_nll,
-        signature_span_indices,
+        action_cross_entropy, batch_shuffled_conditioning_latent, compute_action_metrics,
+        decoder_conditioning_gains, decoder_prediction_metrics, decoder_reward_proxy,
+        forbidden_decoder_token, function_name_span_indices, masked_cross_entropy,
+        perplexity_from_nll, signature_span_indices,
     };
     use crate::data::CODE_EOS_TOKEN;
     use crate::model::Vocab;
@@ -1697,6 +1682,24 @@ mod tests {
             decoder_conditioning_gains(2.0, 2.6, 2.4, 2.3, false).conditioning_gain,
             0.0
         );
+    }
+
+    #[test]
+    fn shuffled_conditioning_uses_another_batch_row_without_scrambling_slots() -> anyhow::Result<()>
+    {
+        let device = Device::Cpu;
+        let latent = Tensor::from_vec(
+            vec![10f32, 11.0, 20.0, 21.0, 30.0, 31.0],
+            (3, 2, 1),
+            &device,
+        )?;
+        let shuffled = batch_shuffled_conditioning_latent(&latent)?.to_vec3::<f32>()?;
+
+        for (row_idx, row) in shuffled.iter().enumerate() {
+            assert_ne!(row[0][0], latent.to_vec3::<f32>()?[row_idx][0][0]);
+            assert_eq!(row[1][0], row[0][0] + 1.0);
+        }
+        Ok(())
     }
 
     #[test]
