@@ -869,16 +869,23 @@ fn prepare_data(
         join_result(encoder_corpus_handle, "encoder corpus")?;
 
         let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
-        run_stage1_mix_jobs(vec![
+        let mut mix_jobs = vec![
             PrepareMixJob::new("world mix", world_args, 2_048, 4_096),
             PrepareMixJob::new("code decoder mix", code_mix_args, 1_024, 3_072),
-            PrepareMixJob::new(
+        ];
+        if prepared_cache_required() {
+            mix_jobs.push(PrepareMixJob::new(
                 "go feedback decoder mix",
                 go_feedback_mix_args,
                 1_024,
                 3_072,
-            ),
-        ])?;
+            ));
+        } else {
+            println!(
+                "Deferring Go feedback mix until model-failure feedback is generated after base decoder training."
+            );
+        }
+        run_stage1_mix_jobs(mix_jobs)?;
         Ok(())
     })?;
 
