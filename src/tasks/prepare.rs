@@ -2903,7 +2903,17 @@ struct CodePocShuffledWriter {
 
 impl CodePocShuffledWriter {
     fn new(output: &Path, seed: u64, bucket_count: usize) -> Result<Self> {
-        let bucket_dir = side_tmp_path(output, "shuffle-buckets");
+        let bucket_root = std::env::var("TOFY_CODE_MIX_SHUFFLE_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let output_name = output
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("code-mix");
+        let bucket_dir = bucket_root.join(format!(
+            "tofy-{output_name}-{}-shuffle-buckets",
+            std::process::id()
+        ));
         if bucket_dir.exists() {
             fs::remove_dir_all(&bucket_dir)?;
         }

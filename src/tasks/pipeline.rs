@@ -424,7 +424,13 @@ fn run_prepare_cache(
         "Preparing full local data/cache handoff for {} profile; no model training will run.",
         profile.as_str()
     );
-    prepare_data(&prepare_cache_paths(&defaults), &defaults, false, force)?;
+    prepare_data(
+        &prepare_cache_paths(&defaults),
+        &defaults,
+        false,
+        force,
+        false,
+    )?;
     prepare_go_feedback_decoder_token_cache(&prepare_cache_paths(&defaults), &defaults)?;
     println!("Data/cache preparation complete.");
     if let Some(repo) = hf_upload_dataset {
@@ -475,7 +481,8 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         context_defaults.decoder_prompt_tokens
     );
 
-    prepare_data(&paths, &defaults, cfg.resume, false)?;
+    let reuse_world_data = skip_trained_stage(&cfg, "world") && paths.world_model.exists();
+    prepare_data(&paths, &defaults, cfg.resume, false, reuse_world_data)?;
     configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
@@ -803,6 +810,7 @@ fn prepare_data(
     defaults: &ProfileDefaults,
     resume: bool,
     force_cache: bool,
+    reuse_world_data: bool,
 ) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
     thread::scope(|scope| -> Result<()> {
@@ -869,10 +877,17 @@ fn prepare_data(
         join_result(encoder_corpus_handle, "encoder corpus")?;
 
         let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
-        let mut mix_jobs = vec![
-            PrepareMixJob::new("world mix", world_args, 2_048, 4_096),
-            PrepareMixJob::new("code decoder mix", code_mix_args, 1_024, 3_072),
-        ];
+        let mut mix_jobs = vec![PrepareMixJob::new(
+            "code decoder mix",
+            code_mix_args,
+            1_024,
+            3_072,
+        )];
+        if reuse_world_data {
+            println!("Reusing existing world data because the trained world stage is skipped.");
+        } else {
+            mix_jobs.push(PrepareMixJob::new("world mix", world_args, 2_048, 4_096));
+        }
         if prepared_cache_required() {
             mix_jobs.push(PrepareMixJob::new(
                 "go feedback decoder mix",
