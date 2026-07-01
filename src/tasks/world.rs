@@ -5493,7 +5493,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 let eval_batch_size = std::env::var("TOFY_DECODER_EVAL_BATCH")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| config.batch_size.saturating_mul(4).min(32))
+                    .unwrap_or_else(|| config.batch_size.min(8))
                     .max(1);
                 let val_metrics = if let Some(ref mut cached_stream) = cached_decoder_val_stream {
                     let cached_batch = collect_decoder_cached_batch(
