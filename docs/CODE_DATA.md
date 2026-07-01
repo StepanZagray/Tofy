@@ -27,6 +27,7 @@ The generator now also:
 - deduplicates identical pairs
 - prefixes code rows with tags such as `<lang:go>`, `<ctx>`, and `<reply>`
 - relies on the code-aware tokenizer path, which still does identifier-aware splitting first but now falls back to reserved UTF-8 byte tokens for uncovered pieces instead of raw `<unk>` collapse
+- retains only documented standalone targets accepted by the Go compiler, carries through used standard-library imports, and rejects project-context functions with unresolved symbols; the adjacent Go doc comment supplies the behavioral instruction instead of asking the model to infer behavior from a signature alone
 
 Then train the pure world model + code decoder on the output file, e.g.:
 
@@ -103,4 +104,9 @@ and Go repair rows, then trains
 `runs/.../decoder_code_go_feedback/model.safetensors` initialized from the base
 code decoder.
 
-The assistant eval uses the same plain repair prompt shape. Direct manual eval defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set before the eval command; the canonical pipeline and Pi-style eval pass `--pi-agent-env` after loading `scripts/tofy_pi_runtime_env.sh`.
+Both the corrupted attempt and the canonical repair target are checked. Rows are discarded when
+the canonical target does not compile, so compiler feedback cannot point to a second broken answer.
+
+The assistant eval uses the same plain repair prompt shape. The canonical pipeline passes
+`--direct-greedy`, which also disables TreeCoder and prevents inherited environment variables from
+changing the measurement. Use `--pi-agent-env` separately when measuring the served-agent stack.

@@ -52,6 +52,7 @@ use crate::util;
 const HELDOUT_SPLIT_MODULUS: usize = 20;
 const HELDOUT_SPLIT_REMAINDER: usize = 0;
 const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
+const DECODER_TARGET_CROP_POLICY: &str = "completion_head_v1";
 const DECODER_VOCAB_MANIFEST_VERSION: u32 = 1;
 const CONDITIONED_DECODER_CACHE_VERSION: u32 = 2;
 const CONDITIONED_DECODER_CACHE_MAGIC: &[u8] = b"TOFY_CONDITIONED_DECODER_CACHE_V2\n";
@@ -136,6 +137,8 @@ struct CacheTokenManifest {
     source: CacheManifestSource,
     tokenizer: String,
     max_seq: usize,
+    #[serde(default)]
+    target_crop: Option<String>,
     action_filter: Option<u32>,
     vocab_signature: String,
     token_cache_path: String,
@@ -259,6 +262,7 @@ fn compatible_decoder_dual_cache_info(
         || manifest.tokenizer != TokenizationMode::CodeAware.as_str()
         || manifest.max_seq < max_seq
         || manifest.action_filter != Some(ACTION_CODE)
+        || manifest.target_crop.as_deref() != Some(DECODER_TARGET_CROP_POLICY)
         || !source_fingerprint_matches(data_path, &manifest.source)?
         || manifest.vocab_signature != expected_sig
         || manifest.token_cache_path != cache_path.to_string_lossy()
@@ -3411,6 +3415,8 @@ fn decoder_param_count(
         + dim
         + dim * ff
         + ff
+        + dim * ff
+        + ff
         + ff * dim
         + dim;
     let adapter_slots = DecoderConditioningAdapter::output_slots_for(kind, context_slots);
@@ -5617,25 +5623,17 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
             }
             tb.flush();
             let metric_improved = selection_metric < best_metric && checkpoint_nll.is_finite();
-            let candidate_best_metric = if metric_improved {
-                selection_metric
-            } else {
-                best_metric
-            };
+            if metric_improved {
+                best_metric = selection_metric;
+            }
             let checkpoint_due = step % decoder_checkpoint_every == 0;
             let mut checkpoint_artifacts = Vec::new();
-            if metric_improved {
-                checkpoint_artifacts.push(decoder_varmap_checkpoint_artifact(
-                    &decoder_varmap,
-                    &decoder_path,
-                )?);
-            }
             let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
-                best_metric: candidate_best_metric,
+                best_metric,
                 best_aux_metric: best_loss,
-                saved_checkpoint: saved_checkpoint || metric_improved,
+                saved_checkpoint: saved_checkpoint || checkpoint_due,
             };
             if checkpoint_due {
                 checkpoint_artifacts.push(decoder_varmap_checkpoint_artifact(
@@ -5656,16 +5654,11 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
                 format!("decoder step {step}"),
                 checkpoint_artifacts,
             )?;
-            if metric_improved && checkpoint_written_or_queued {
-                best_metric = selection_metric;
+            if checkpoint_due && checkpoint_written_or_queued {
                 saved_checkpoint = true;
             }
             if metric_improved {
-                let best_note = if async_checkpoints {
-                    "queued latest best"
-                } else {
-                    "saved best"
-                };
+                let best_note = "new validation best";
                 println!(
                     "step {}/{} objective {:.4} token_nll {:.4} ablate_nll {:.4} shuffle_nll {:.4} zero_gain {:.4} shuffle_gain {:.4} hard_gain {:.4} cond_loss {:.4} mtp {:.4} fmt {:.4} syntax_ce {:.4} sig_ce {:.4} struct_ce {:.4} ppl {:.2} active {:.1}% oov {:.2}% tok_acc {:.2}% ident_acc {:.2}% syntax_acc {:.2}% sig_acc {:.2}% sig_exact {:.2}% fn_name {:.2}% fn_name_exact {:.2}% delim {:.2}% fn_skel {:.2}% reward {:.3} sel {:.4}{} [{}]",
                     step,
@@ -5742,13 +5735,10 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
         writer.finish()?;
     }
 
-    if !saved_checkpoint {
-        util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
-        println!(
-            "No checkpoint was saved during logging; saved final decoder weights to {:?}",
-            decoder_path
-        );
-    }
+    // Teacher-forced loss on a small heterogeneous validation batch is too noisy to select a
+    // generative code checkpoint. Always export the fully trained weights; the pipeline's hard
+    // compile/test suite performs model promotion after training.
+    util::save_varmap_atomic(&decoder_varmap, &decoder_path)?;
     util::save_varmap_atomic(&decoder_varmap, &train_checkpoint_path)?;
     opt.save_state(&optimizer_checkpoint_path)?;
     resume_state = util::TrainingResumeState {
@@ -5762,17 +5752,7 @@ fn run_decoder_training(config: DecoderTrainConfig) -> Result<()> {
     tb.flush();
     tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "decoder");
-    if saved_checkpoint {
-        println!(
-            "Best decoder saved to {:?} (loss {:.4})",
-            decoder_path, best_loss
-        );
-    } else {
-        println!(
-            "Final decoder saved to {:?} (run finished before first logging checkpoint)",
-            decoder_path
-        );
-    }
+    println!("Final decoder saved to {:?}", decoder_path);
     CandleCrossAttnDecoder::write_metadata(
         &decoder_path,
         &decoder_vocab,

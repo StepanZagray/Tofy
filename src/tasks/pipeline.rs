@@ -1014,7 +1014,9 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
             "--code-pairs".to_string(),
             GO_ALGORITHM_TASK_DATA.to_string(),
         ]);
-        extra_code_pairs.push(GO_ALGORITHM_TASK_DATA.to_string());
+        // This is the small, compiler-verified task set closest to the hard eval shape.
+        // Repeat the path here rather than duplicating every large auxiliary dataset equally.
+        extra_code_pairs.extend(std::iter::repeat_n(GO_ALGORITHM_TASK_DATA.to_string(), 16));
     }
     if nonempty_file(GO_SEMANTIC_TASK_DATA) {
         world_args.extend([
@@ -1042,19 +1044,19 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         "--base-pairs".to_string(),
         GO_CODE_DATA.to_string(),
         "--base-repeat".to_string(),
-        "1".to_string(),
+        "0".to_string(),
         "--instruction-pairs".to_string(),
         GO_TASK_DATA.to_string(),
         "--instruction-repeat".to_string(),
-        "18".to_string(),
+        "3".to_string(),
         "--fim-repeat".to_string(),
-        "4".to_string(),
+        "0".to_string(),
     ];
     for path in &extra_code_pairs {
         code_mix_args.extend(["--extra-pairs".to_string(), path.clone()]);
     }
     if !extra_code_pairs.is_empty() {
-        code_mix_args.extend(["--extra-repeat".to_string(), "24".to_string()]);
+        code_mix_args.extend(["--extra-repeat".to_string(), "4".to_string()]);
     }
     code_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
     let mut go_feedback_mix_args = vec![
@@ -1064,19 +1066,21 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         "--base-pairs".to_string(),
         GO_CODE_DATA.to_string(),
         "--base-repeat".to_string(),
-        "1".to_string(),
+        "0".to_string(),
         "--instruction-pairs".to_string(),
         GO_TASK_DATA.to_string(),
         "--instruction-repeat".to_string(),
-        "20".to_string(),
+        "4".to_string(),
         "--fim-repeat".to_string(),
-        "6".to_string(),
+        "0".to_string(),
     ];
     if nonempty_file(GO_ALGORITHM_TASK_DATA) {
-        go_feedback_mix_args.extend([
-            "--extra-pairs".to_string(),
-            GO_ALGORITHM_TASK_DATA.to_string(),
-        ]);
+        for _ in 0..16 {
+            go_feedback_mix_args.extend([
+                "--extra-pairs".to_string(),
+                GO_ALGORITHM_TASK_DATA.to_string(),
+            ]);
+        }
     }
     if nonempty_file(GO_REPAIR_DATA) {
         go_feedback_mix_args.extend(["--extra-pairs".to_string(), GO_REPAIR_DATA.to_string()]);
@@ -1098,7 +1102,7 @@ fn build_stage1_mix_args() -> (Vec<String>, Vec<String>, Vec<String>) {
         || nonempty_file(GO_MODEL_FAILURE_REPAIR_DATA)
         || nonempty_file(GO_PASS_SELF_TRAIN_DATA)
     {
-        go_feedback_mix_args.extend(["--extra-repeat".to_string(), "32".to_string()]);
+        go_feedback_mix_args.extend(["--extra-repeat".to_string(), "4".to_string()]);
     }
     go_feedback_mix_args.extend(["--max-rows".to_string(), "0".to_string()]);
     (world_args, code_mix_args, go_feedback_mix_args)
@@ -1908,10 +1912,10 @@ fn run_code_eval(
         "--code-decoder-vocab".to_string(),
         paths.code_decoder_vocab.to_string_lossy().to_string(),
         "--candidates".to_string(),
-        "8".to_string(),
+        "1".to_string(),
         "--repair-attempts".to_string(),
-        "4".to_string(),
-        "--pi-agent-env".to_string(),
+        "0".to_string(),
+        "--direct-greedy".to_string(),
         "--go-timeout-sec".to_string(),
         "10".to_string(),
     ];

@@ -114,8 +114,8 @@ generalist:
 
 - base code data defaults to Go code pairs
 - `--prepare-go-function-tasks` derives synthetic instruction -> function pairs from the Go code corpus
-- `--prepare-code-poc-mix` oversamples instruction, semantic, repair, FIM, and EOS-terminated rows before code-decoder training
-- the second decoder stage trains on `data/code_poc_go_mix.txt`, built from Go code, Go instruction pairs, cold compiler-feedback repair rows, model-failure repair rows, and pass-only self-training rows when available
+- `--prepare-code-poc-mix` builds EOS-terminated rows from compiler-verified documented functions, curated algorithm tasks, and verified repair trajectories
+- the second decoder stage trains on `data/code_poc_go_mix.txt`, built from verified Go instruction pairs, cold compiler-feedback repair rows, model-failure repair rows, and pass-only self-training rows when available
 - the canonical eval suite is `eval/code_assistant_go_hard.jsonl`
 
 Default behavior:
@@ -125,7 +125,7 @@ Default behavior:
 - world model data = balanced chat+code mix from `--prepare-world-mix`
 - world/action classifier rows now carry explicit action labels and synthetic terminal `done` rows
 - text decoder data = UltraChat
-- code decoder data = Go-only code POC mix built from GitHub Go code, synthetic Go function tasks, and Go compiler-feedback repair rows when `go` is available
+- code decoder data = Go-only code POC mix built from documented, standalone-compiling GitHub functions, curated Go tasks, and compiler-verified repair rows
 - after the base code decoder trains, the pipeline can mine its failed Go attempts into `data/go_model_failure_repair_pairs.txt`, chosen/rejected preference records in `data/go_model_preference_pairs.jsonl`, and pass-only rows in `data/go_pass_self_train_pairs.txt`; by default it keeps failed candidates alive for two compiler-feedback repair rounds, producing transcript-shaped repair rows inspired by MiniMax-M3's interactive coding curriculum; tune with `TOFY_GO_MODEL_FEEDBACK_ROWS`, `TOFY_GO_MODEL_FEEDBACK_CANDIDATES`, `TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS`, and `TOFY_GO_MODEL_FEEDBACK_PASS_MIN_COMPILE_RATE`
 - Stage 1 now covers source bootstrapping, prepared-data artifacts, and vocab/token caches; unchanged reruns avoid rebuilding them through sidecar manifests and non-empty file checks
 - hub-backed dataset files are published atomically, so an interrupted pod leaves a temporary file instead of replacing the canonical training input
@@ -136,7 +136,9 @@ Default behavior:
 - `cargo run --release -- prepare cache <8gb|48gb|80gb>` runs Stage 1 only, so you can prepare source data, mixes, eval data, vocabs, and token caches locally before copying `data/`, `eval/`, and `local_models/vocabs/` to a pod; add `--auto-hf-upload --hf-dataset <org/dataset-name>` to archive those handoff directories and upload them to your Hugging Face dataset with the `hf` CLI (see [docs/DATA_FORMATS.md](docs/DATA_FORMATS.md#prepared-cache-hf-upload))
 - raw and cached training streams prefetch ordered chunks by default; set `TOFY_CACHE_PREFETCH_BATCHES=0` to disable, `TOFY_CACHE_PREFETCH_BATCHES=N` to tune queue depth, `TOFY_CACHE_PREFETCH_CHUNK=N` to force chunk size, or `TOFY_TOKEN_CACHE_READER_MB=N` to tune the cache reader buffer
 - world/action classifier/decoder context encoding batches token segments on GPU; set `TOFY_CONTEXT_SEGMENT_BATCH=N` to tune the segment micro-batch size, default `64`
-- token caches and decoder/world batches keep the tail of overlong pair sides so late instructions, compiler feedback, and completion endings are retained
+- token caches keep overlong prompt/state tails so late instructions and compiler feedback survive, while decoder targets keep their heads for imports and exact declarations
+- decoder target caches carry an explicit `completion_head_v1` policy and keep completion heads so imports and exact declarations cannot be replaced by stale tail-only cache rows
+- generated Go instruction and repair targets are compiler-verified before entering the decoder mix; project-context functions that do not compile standalone are discarded
 - the canonical training entrypoint is `cargo run --release -- train <8gb|48gb|80gb>`:
   - encoder/world keep `256` per-segment context
   - encoder defaults to `16x4` (`64` rows with segmented context) after a `16x1` warmup
@@ -145,8 +147,9 @@ Default behavior:
   - code decoder defaults to `8x16` (`128` effective) with `CODE_DECODER_MAX_SEQ=192`, `CODE_DECODER_MAX_VOCAB=24000`, and decoder FF width `3072`
   - model-failure Go feedback mining defaults to `1024` rows on `8gb`, `2048` on `48gb`, and `4096` on `80gb`, with `TOFY_GO_MODEL_FEEDBACK_REPAIR_ROUNDS=2`; set `TOFY_GO_MODEL_FEEDBACK_ROWS=0` to disable
   - Go compile/test eval runs by default for verifier-guided base vs Go-feedback decoder promotion
-  - direct `--eval-code-assistant` defaults to deterministic direct decoding (`JEPA_DECODER_TEMP=0`, `TOFY_DECODER_RLM=0`, `TOFY_LATENT_REASONING=0`) unless those variables are explicitly set; the canonical pipeline and Pi-style manual eval pass `--pi-agent-env` after loading `scripts/tofy_pi_runtime_env.sh`
+  - the canonical pipeline selects checkpoints with `--direct-greedy`: temperature, TreeCoder, recursive decoding, latent reasoning, candidates, and repair attempts are disabled so compile rate measures the decoder itself; `--pi-agent-env` remains available for a separate served-agent evaluation
   - decoder conditioning-margin ablation is fixed off in the canonical pipeline
+- the 80 GB decoder uses width `1024`, `12` layers, FF width `4096`, and `32x8` (`256` effective) for `240000` base plus `60000` Go-feedback steps; FP32 optimizer master weights preserve BF16 updates
 - the 48 GB A40 profile is available through `cargo run --release -- train 48gb`:
   - uses shared `DIM=768`, `BRIDGE_DIM=768`, `LAYERS=12`, `HEADS=16`
   - uses `MAX_VOCAB=16000`, `CODE_DECODER_MAX_VOCAB=32000`, `NUM_LATENT_TOKENS=96`
@@ -221,7 +224,7 @@ Run the code-assistant eval suite:
 ```bash
 cargo run --release -- --generate-go-code-eval-suite --output eval/code_assistant_go_hard.jsonl
 source scripts/tofy_pi_runtime_env.sh latest 80gb
-cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --pi-agent-env --go-timeout-sec 6
+cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --direct-greedy --go-timeout-sec 6
 ```
 
 Main KPI from this eval:

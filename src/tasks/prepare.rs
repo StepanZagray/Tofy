@@ -1122,6 +1122,8 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
     let mut split = "train".to_string();
     let mut max_files: Option<usize> = None;
     let mut max_rows: Option<usize> = None;
+    let mut go_bin = "go".to_string();
+    let mut compile_timeout_sec = 5.0f64;
     let mut force = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -1150,6 +1152,14 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
                 max_rows = Some(parse_usize_value(args, i, "--max-rows")?);
                 i += 2;
             }
+            "--go" => {
+                go_bin = parse_flag_value(args, i, "--go")?;
+                i += 2;
+            }
+            "--compile-timeout-sec" => {
+                compile_timeout_sec = parse_f64_value(args, i, "--compile-timeout-sec")?;
+                i += 2;
+            }
             "--force" => {
                 force = true;
                 i += 1;
@@ -1162,11 +1172,16 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
         bail!("either --input or --github-top-code is required");
     }
     let input_paths = input.clone().into_iter().collect::<Vec<_>>();
+    let go_version = go_version_string(&go_bin)?;
     let params = json!({
         "github_top_code": github_top_code,
         "split": split,
         "max_files": max_files,
         "max_rows": max_rows,
+        "compile_verified": true,
+        "documented_functions_only": true,
+        "go_version": go_version,
+        "compile_timeout_sec": compile_timeout_sec,
     });
     if !force {
         if let Some(manifest) =
@@ -1180,12 +1195,20 @@ fn run_prepare_go_function_tasks(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let samples = if github_top_code {
+    let mut samples = if github_top_code {
         collect_go_functions_from_github_top_code(&split, max_files)?
     } else {
         collect_go_functions_from_pairs(input.as_ref().unwrap())?
     };
-    let written = write_go_instruction_pairs(&samples, &output, max_rows)?;
+    let mut seen = HashSet::new();
+    samples.retain(|(signature, body)| {
+        seen.insert(format!(
+            "{:x}",
+            md5::compute(format!("{signature}\0{body}"))
+        ))
+    });
+    let compiler = GoCompileFeedback::new(&go_bin, &go_version, compile_timeout_sec)?;
+    let written = write_go_instruction_pairs(&samples, &output, max_rows, &compiler)?;
     write_artifact_manifest("go_function_tasks", &output, &input_paths, params, written)?;
     println!(
         "Wrote {written} Go instruction pairs to {}",
@@ -1279,22 +1302,119 @@ fn extract_go_functions(src: &str) -> Vec<(String, String)> {
             .join(" ")
             .trim()
             .to_string();
-        let body = src[sig_match.start()..=close_idx].trim().to_string();
+        let Some(description) = preceding_go_doc_comment(src, sig_match.start()) else {
+            continue;
+        };
+        let function = src[sig_match.start()..=close_idx].trim().to_string();
+        let imports = go_imports_used_by_function(src, &function);
+        let body = if imports.is_empty() {
+            function
+        } else {
+            format!("{imports}\n\n{function}")
+        };
         let line_count = body.lines().count();
         if !(2..=120).contains(&line_count) || signature.len() > 240 || body.len() > 8_000 {
             continue;
         }
-        results.push((signature, body));
+        results.push((
+            format!("{description}\n\nExact signature:\n{signature}"),
+            body,
+        ));
     }
     results
 }
 
-fn build_go_prompt_variants(signature: &str) -> [String; 3] {
+fn preceding_go_doc_comment(src: &str, function_start: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in src[..function_start].lines().rev() {
+        let trimmed = line.trim();
+        let Some(comment) = trimmed.strip_prefix("//") else {
+            break;
+        };
+        let comment = comment.trim();
+        if comment.starts_with("go:") || comment.starts_with("line ") {
+            continue;
+        }
+        lines.push(comment);
+    }
+    lines.reverse();
+    let description = lines.join(" ");
+    (description.len() >= 12).then_some(description)
+}
+
+fn go_imports_used_by_function(src: &str, function: &str) -> String {
+    let mut candidates = Vec::new();
+    for capture in go_single_import_re().captures_iter(src) {
+        if let Some(path) = capture.name("path") {
+            candidates.push((
+                capture
+                    .name("alias")
+                    .map(|value| value.as_str().to_string()),
+                path.as_str().to_string(),
+            ));
+        }
+    }
+    for block in go_import_block_re().captures_iter(src) {
+        let Some(body) = block.name("body") else {
+            continue;
+        };
+        for capture in go_import_line_re().captures_iter(body.as_str()) {
+            if let Some(path) = capture.name("path") {
+                candidates.push((
+                    capture
+                        .name("alias")
+                        .map(|value| value.as_str().to_string()),
+                    path.as_str().to_string(),
+                ));
+            }
+        }
+    }
+    let mut imports = Vec::new();
+    let mut seen = HashSet::new();
+    for (explicit_alias, path) in candidates {
+        // Standalone training targets must not require downloading the source repository's
+        // private dependency graph. Standard-library paths have no dot in the first component.
+        if path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.contains('.'))
+        {
+            continue;
+        }
+        let alias = explicit_alias
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path));
+        if matches!(alias, "_" | ".") || !function.contains(&format!("{alias}.")) {
+            continue;
+        }
+        let spec = if explicit_alias.is_some() {
+            format!("{alias} \"{path}\"")
+        } else {
+            format!("\"{path}\"")
+        };
+        if seen.insert(spec.clone()) {
+            imports.push(spec);
+        }
+    }
+    match imports.as_slice() {
+        [] => String::new(),
+        [only] => format!("import {only}"),
+        many => format!(
+            "import (\n{}\n)",
+            many.iter()
+                .map(|spec| format!("\t{spec}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+fn build_go_prompt_variants(task: &str) -> [String; 3] {
     let rules = "Rules:\n- Keep the exact function name and signature.\n- Return compilable Go code for package main.\n- Imports are allowed.\n- Do not add explanation.\n";
     [
-        format!("Return only Go code. Implement exactly this function:\n{signature}\n\n{rules}"),
-        format!("Write the Go function below and return code only:\n{signature}\n\n{rules}"),
-        format!("Complete this Go function implementation. Output only the complete function and required imports:\n{signature}\n\n{rules}"),
+        format!("Return only Go code. Implement this documented function:\n{task}\n\n{rules}"),
+        format!("Write the documented Go function below and return code only:\n{task}\n\n{rules}"),
+        format!("Complete this documented Go function. Output only the complete function and required imports:\n{task}\n\n{rules}"),
     ]
 }
 
@@ -1302,6 +1422,7 @@ fn write_go_instruction_pairs(
     samples: &[(String, String)],
     output: &Path,
     max_rows: Option<usize>,
+    compiler: &GoCompileFeedback,
 ) -> Result<usize> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -1310,36 +1431,52 @@ fn write_go_instruction_pairs(
     let mut out = BufWriter::new(File::create(&tmp)?);
     let mut seen = HashSet::new();
     let mut written = 0usize;
-    let prepared = samples
-        .par_iter()
-        .map(|(signature, body)| {
-            build_go_prompt_variants(signature)
-                .into_iter()
-                .map(|prompt| {
-                    let digest = format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
-                    (digest, prompt, body.clone())
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    for rows in prepared {
+    let sample_limit = samples.len();
+    for (chunk_idx, chunk) in samples.chunks(1024).enumerate() {
+        let prepared = chunk
+            .par_iter()
+            .map(
+                |(signature, body)| -> Result<Option<Vec<(String, String, String)>>> {
+                    if !compiler.compile(body)?.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        build_go_prompt_variants(signature)
+                            .into_iter()
+                            .map(|prompt| {
+                                let digest =
+                                    format!("{:x}", md5::compute(format!("{prompt}\t{body}")));
+                                (digest, prompt, body.clone())
+                            })
+                            .collect(),
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        for rows in prepared.into_iter().flatten() {
+            for (digest, prompt, body) in rows {
+                if max_rows.is_some_and(|max| written >= max) {
+                    break;
+                }
+                if !seen.insert(digest) {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "{}\t{}",
+                    escape_pair_field(&prompt),
+                    escape_pair_field(&body)
+                )?;
+                written += 1;
+            }
+        }
+        let processed = ((chunk_idx + 1) * 1024).min(sample_limit);
+        println!(
+            "Go instruction compile filter: processed={processed}/{} accepted_rows={written}",
+            sample_limit
+        );
         if max_rows.is_some_and(|max| written >= max) {
             break;
-        }
-        for (digest, prompt, body) in rows {
-            if max_rows.is_some_and(|max| written >= max) {
-                break;
-            }
-            if !seen.insert(digest) {
-                continue;
-            }
-            writeln!(
-                out,
-                "{}\t{}",
-                escape_pair_field(&prompt),
-                escape_pair_field(&body)
-            )?;
-            written += 1;
         }
     }
     out.flush()?;
@@ -2012,6 +2149,7 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
         "max_rows": max_rows,
         "workers": repair_workers,
         "cache_strategy": "shared-warmed-go-build-cache-v1",
+        "canonical_targets_compile_verified": true,
     });
     let inputs = vec![input.clone()];
     if !force {
@@ -2024,7 +2162,9 @@ fn run_prepare_go_repair_tasks(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let pairs = load_escaped_pairs(&input)?;
+    let mut pairs = load_escaped_pairs(&input)?;
+    let mut seen_targets = HashSet::new();
+    pairs.retain(|(_, code)| seen_targets.insert(format!("{:x}", md5::compute(code))));
     if pairs.is_empty() {
         bail!("no usable pairs found in {}", input.display());
     }
@@ -2130,6 +2270,12 @@ fn prepare_go_repair_rows_for_pair(
     variants_per_sample: usize,
     go_feedback: &GoCompileFeedback,
 ) -> Result<GoRepairPairRows> {
+    if !go_feedback.compile(correct_code)?.is_empty() {
+        return Ok(GoRepairPairRows {
+            pair_index,
+            rows: Vec::new(),
+        });
+    }
     let mut variants = go_corruption_variants(correct_code);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ ((pair_index as u64) << 32));
     variants.shuffle(&mut rng);
@@ -2382,6 +2528,31 @@ fn go_func_start_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(
             r"(?m)^(?P<sig>\s*func\s+(?:\([^)]+\)\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?:\([^{};]*\)|[A-Za-z_][A-Za-z0-9_\.\*\[\]]*)?\s*)\{",
+        )
+        .unwrap()
+    })
+}
+
+fn go_single_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^\s*import\s+(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*|\.)\s+)?\"(?P<path>[^\"]+)\"\s*$"#,
+        )
+        .unwrap()
+    })
+}
+
+fn go_import_block_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?ms)^\s*import\s*\((?P<body>.*?)^\s*\)\s*$").unwrap())
+}
+
+fn go_import_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^\s*(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*|\.)\s+)?\"(?P<path>[^\"]+)\"\s*(?://.*)?$"#,
         )
         .unwrap()
     })
@@ -5017,7 +5188,8 @@ fn run_max_vram_probe(args: &[String]) -> Result<()> {
 mod tests {
     use super::{
         artifact_cache_hit, code_poc_fim_row, code_poc_row_with_eos, escape_pair_field,
-        flatten_for_encoder, is_base_model_artifact, remote_source_fingerprint,
+        extract_go_functions, flatten_for_encoder, go_imports_used_by_function,
+        is_base_model_artifact, preceding_go_doc_comment, remote_source_fingerprint,
         run_prepare_code_poc_mix, run_prepare_world_mix, split_pair_line_first_two,
         unescape_pair_field, world_mix_code_action, write_artifact_manifest,
     };
@@ -5035,6 +5207,53 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn standalone_go_target_keeps_only_used_standard_imports() {
+        let source = r#"
+package sample
+import (
+    "fmt"
+    "strings"
+    third "example.com/private/pkg"
+)
+func Render(value string) string { return fmt.Sprintf("%s", value) }
+"#;
+        let function = "func Render(value string) string { return fmt.Sprintf(\"%s\", value) }";
+        assert_eq!(
+            go_imports_used_by_function(source, function),
+            "import \"fmt\""
+        );
+    }
+
+    #[test]
+    fn go_instruction_requires_adjacent_documentation() {
+        let source = "// Add returns the sum of a and b.\nfunc Add(a, b int) int { return a + b }";
+        let start = source.find("func Add").unwrap();
+        assert_eq!(
+            preceding_go_doc_comment(source, start).as_deref(),
+            Some("Add returns the sum of a and b.")
+        );
+        assert_eq!(preceding_go_doc_comment("func Add() {}", 0), None);
+    }
+
+    #[test]
+    fn go_extraction_builds_documented_compilable_shape() {
+        let source = r#"
+package sample
+import "fmt"
+// Render formats value as a decimal string.
+func Render(value int) string {
+    return fmt.Sprintf("%d", value)
+}
+func Hidden(value int) int { return value }
+"#;
+        let samples = extract_go_functions(source);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].0.contains("Render formats value"));
+        assert!(samples[0].0.contains("func Render(value int) string"));
+        assert!(samples[0].1.starts_with("import \"fmt\""));
     }
 
     #[test]

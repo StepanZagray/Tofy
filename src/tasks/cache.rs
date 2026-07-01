@@ -28,6 +28,7 @@ const PROGRESS_EVERY_LINES: usize = 500_000;
 const DEFAULT_TOKEN_CACHE_ENCODE_CHUNK_LINES: usize = 16_384;
 const DEFAULT_TOKEN_CACHE_RAW_CHARS_PER_TOKEN: usize = 24;
 const DEFAULT_TOKEN_CACHE_RAW_CHAR_CAP: usize = 64 * 1024;
+const DECODER_TARGET_CROP_POLICY: &str = "completion_head_v1";
 
 struct DualWorldCacheRow {
     encoder_state_tokens: Vec<u32>,
@@ -69,6 +70,8 @@ struct TokenManifest {
     tokenizer_spec: TokenizerSpec,
     tokenizer_spec_signature: String,
     max_seq: usize,
+    #[serde(default)]
+    target_crop: Option<String>,
     action_filter: Option<u32>,
     vocab_path: String,
     vocab_signature: String,
@@ -121,6 +124,10 @@ struct TokenCacheSpec<'a> {
     manifest_path: &'a Path,
     force: bool,
     require_hit: bool,
+}
+
+fn target_crop_policy(kind: &str) -> Option<&'static str> {
+    matches!(kind, "code_decoder" | "code_decoder_dual").then_some(DECODER_TARGET_CROP_POLICY)
 }
 
 pub fn try_run_prepare_pipeline_cache(args: &[String]) -> Result<bool> {
@@ -579,6 +586,7 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            target_crop: target_crop_policy(spec.kind).map(str::to_string),
             action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -681,6 +689,7 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            target_crop: target_crop_policy(spec.kind).map(str::to_string),
             action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -807,6 +816,7 @@ fn ensure_dual_world_token_cache(
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
+            target_crop: target_crop_policy(spec.kind).map(str::to_string),
             action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -831,6 +841,7 @@ fn token_cache_is_valid(spec: &TokenCacheSpec<'_>, vocab_signature: &str) -> boo
         && manifest.tokenizer == spec.mode.as_str()
         && manifest.tokenizer_spec_signature == tokenizer_spec_signature(spec.mode)
         && manifest.max_seq >= spec.max_seq
+        && manifest.target_crop.as_deref() == target_crop_policy(spec.kind)
         && manifest.action_filter == spec.action_filter
         && manifest.vocab_signature == vocab_signature
         && manifest.token_cache_path == path_string(spec.token_cache_path)
@@ -1059,6 +1070,15 @@ mod tests {
         let mut ids = vec![10, 11, 12, 13, 14];
         truncate_decoder_next_ids(&mut ids, 3);
         assert_eq!(ids, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn decoder_cache_requires_explicit_head_crop_policy() {
+        assert_eq!(
+            target_crop_policy("code_decoder_dual"),
+            Some(DECODER_TARGET_CROP_POLICY)
+        );
+        assert_eq!(target_crop_policy("world"), None);
     }
 
     #[test]

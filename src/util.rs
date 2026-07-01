@@ -288,6 +288,7 @@ pub fn frozen_tensors_from_varmap(varmap: &VarMap) -> Result<HashMap<String, Ten
 struct AdamWVarState {
     name: String,
     var: Var,
+    master: Var,
     first_moment: Var,
     second_moment: Var,
 }
@@ -315,6 +316,7 @@ impl ResumableAdamW {
                 let device = entry.var.device().clone();
                 Ok(AdamWVarState {
                     name: entry.name,
+                    master: Var::from_tensor(&entry.var.as_tensor().to_dtype(DType::F32)?)?,
                     var: entry.var,
                     first_moment: Var::zeros(shape.clone(), DType::F32, &device)?,
                     second_moment: Var::zeros(shape, DType::F32, &device)?,
@@ -350,6 +352,10 @@ impl ResumableAdamW {
         );
         for state in &self.vars {
             tensors.insert(
+                format!("{}.master", state.name),
+                snapshot_tensor(state.master.as_tensor())?,
+            );
+            tensors.insert(
                 format!("{}.first_moment", state.name),
                 snapshot_tensor(state.first_moment.as_tensor())?,
             );
@@ -377,9 +383,17 @@ impl ResumableAdamW {
         let mut loaded = 0usize;
         let mut missing = 0usize;
         for state in &mut self.vars {
+            let master_key = format!("{}.master", state.name);
             let m_key = format!("{}.first_moment", state.name);
             let v_key = format!("{}.second_moment", state.name);
             let mut matched = false;
+            if let Some(master) = tensors.get(&master_key) {
+                state.master.set(&master.to_dtype(DType::F32)?)?;
+            } else {
+                state
+                    .master
+                    .set(&state.var.as_tensor().to_dtype(DType::F32)?)?;
+            }
             if let Some(m) = tensors.get(&m_key) {
                 state.first_moment.set(&m.to_dtype(DType::F32)?)?;
                 matched = true;
@@ -444,7 +458,7 @@ impl Optimizer for ResumableAdamW {
         let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
         for state in &self.vars {
             if let Some(g) = grads.get(&state.var) {
-                let theta_f32 = state.var.as_tensor().to_dtype(DType::F32)?;
+                let theta_f32 = state.master.as_tensor();
                 let grad_f32 = g.to_dtype(DType::F32)?;
                 let m = state.first_moment.as_tensor();
                 let v = state.second_moment.as_tensor();
@@ -457,6 +471,7 @@ impl Optimizer for ResumableAdamW {
                 let next_theta = (decayed_theta - (adjusted_grad * lr)?)?;
                 state.first_moment.set(&next_m)?;
                 state.second_moment.set(&next_v)?;
+                state.master.set(&next_theta)?;
                 state.var.set(&next_theta.to_dtype(state.var.dtype())?)?;
             }
         }
@@ -468,6 +483,7 @@ impl Optimizer for ResumableAdamW {
 struct MuonVarState {
     name: String,
     var: Var,
+    master: Var,
     momentum: Var,
 }
 
@@ -510,6 +526,7 @@ impl ResumableHybridMuon {
                     muon_count += 1;
                     Ok(HybridMuonVarState::Muon(MuonVarState {
                         name: entry.name,
+                        master: Var::from_tensor(&entry.var.as_tensor().to_dtype(DType::F32)?)?,
                         var: entry.var,
                         momentum: Var::zeros(shape, DType::F32, &device)?,
                     }))
@@ -517,6 +534,7 @@ impl ResumableHybridMuon {
                     adamw_count += 1;
                     Ok(HybridMuonVarState::AdamW(AdamWVarState {
                         name: entry.name,
+                        master: Var::from_tensor(&entry.var.as_tensor().to_dtype(DType::F32)?)?,
                         var: entry.var,
                         first_moment: Var::zeros(shape.clone(), DType::F32, &device)?,
                         second_moment: Var::zeros(shape, DType::F32, &device)?,
@@ -565,11 +583,19 @@ impl ResumableHybridMuon {
             match state {
                 HybridMuonVarState::Muon(state) => {
                     tensors.insert(
+                        format!("{}.master", state.name),
+                        snapshot_tensor(state.master.as_tensor())?,
+                    );
+                    tensors.insert(
                         format!("{}.muon_momentum", state.name),
                         snapshot_tensor(state.momentum.as_tensor())?,
                     );
                 }
                 HybridMuonVarState::AdamW(state) => {
+                    tensors.insert(
+                        format!("{}.master", state.name),
+                        snapshot_tensor(state.master.as_tensor())?,
+                    );
                     tensors.insert(
                         format!("{}.first_moment", state.name),
                         snapshot_tensor(state.first_moment.as_tensor())?,
@@ -605,6 +631,14 @@ impl ResumableHybridMuon {
         for state in &mut self.vars {
             match state {
                 HybridMuonVarState::Muon(state) => {
+                    let master_key = format!("{}.master", state.name);
+                    if let Some(master) = tensors.get(&master_key) {
+                        state.master.set(&master.to_dtype(DType::F32)?)?;
+                    } else {
+                        state
+                            .master
+                            .set(&state.var.as_tensor().to_dtype(DType::F32)?)?;
+                    }
                     let key = format!("{}.muon_momentum", state.name);
                     if let Some(momentum) = tensors.get(&key) {
                         state.momentum.set(&momentum.to_dtype(DType::F32)?)?;
@@ -618,6 +652,14 @@ impl ResumableHybridMuon {
                     }
                 }
                 HybridMuonVarState::AdamW(state) => {
+                    let master_key = format!("{}.master", state.name);
+                    if let Some(master) = tensors.get(&master_key) {
+                        state.master.set(&master.to_dtype(DType::F32)?)?;
+                    } else {
+                        state
+                            .master
+                            .set(&state.var.as_tensor().to_dtype(DType::F32)?)?;
+                    }
                     let m_key = format!("{}.first_moment", state.name);
                     let v_key = format!("{}.second_moment", state.name);
                     if let Some(m) = tensors.get(&m_key) {
@@ -684,7 +726,7 @@ impl Optimizer for ResumableHybridMuon {
                     let Some(g) = grads.get(&state.var) else {
                         continue;
                     };
-                    let theta_f32 = state.var.as_tensor().to_dtype(DType::F32)?;
+                    let theta_f32 = state.master.as_tensor();
                     let grad_f32 = g.to_dtype(DType::F32)?;
                     let next_m = ((state.momentum.as_tensor() * self.muon_momentum)? + &grad_f32)?;
                     let nesterov_update = ((&next_m * self.muon_momentum)? + &grad_f32)?;
@@ -694,13 +736,14 @@ impl Optimizer for ResumableHybridMuon {
                     let decayed_theta = (theta_f32 * (1f64 - lr_decay))?;
                     let next_theta = (decayed_theta - (update * lr)?)?;
                     state.momentum.set(&next_m)?;
+                    state.master.set(&next_theta)?;
                     state.var.set(&next_theta.to_dtype(state.var.dtype())?)?;
                 }
                 HybridMuonVarState::AdamW(state) => {
                     let Some(g) = grads.get(&state.var) else {
                         continue;
                     };
-                    let theta_f32 = state.var.as_tensor().to_dtype(DType::F32)?;
+                    let theta_f32 = state.master.as_tensor();
                     let grad_f32 = g.to_dtype(DType::F32)?;
                     let m = state.first_moment.as_tensor();
                     let v = state.second_moment.as_tensor();
@@ -713,6 +756,7 @@ impl Optimizer for ResumableHybridMuon {
                     let next_theta = (decayed_theta - (adjusted_grad * lr)?)?;
                     state.first_moment.set(&next_m)?;
                     state.second_moment.set(&next_v)?;
+                    state.master.set(&next_theta)?;
                     state.var.set(&next_theta.to_dtype(state.var.dtype())?)?;
                 }
             }
@@ -1529,6 +1573,26 @@ impl VramTracker {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn mixed_precision_optimizer_keeps_f32_master_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let tensor = Tensor::from_vec(vec![1.0f32, 2.0], (2,), &device)?.to_dtype(DType::BF16)?;
+        let var = Var::from_tensor(&tensor)?;
+        let optimizer = ResumableAdamW::new_lr_named(
+            vec![NamedVar {
+                name: "weight".to_string(),
+                var,
+            }],
+            1e-4,
+        )?;
+
+        assert_eq!(optimizer.vars[0].master.dtype(), DType::F32);
+        assert!(optimizer
+            .state_tensors_snapshot()?
+            .contains_key("weight.master"));
+        Ok(())
+    }
 
     #[test]
     fn load_varmap_checked_rejects_empty_varmap() {

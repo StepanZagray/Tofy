@@ -147,7 +147,7 @@ World/context compressor knobs:
 - `TOFY_LATENT_REASONING_PATIENCE=<int>` stops latent refinement after this many non-improving steps beyond the minimum, default `2`
 - `TOFY_LATENT_REASONING_ALPHA=<float>` blends each recurrent proposal with the selected next-action latent anchor, default `0.35`
 - `TOFY_LATENT_REASONING_GOAL_WEIGHT`, `TOFY_LATENT_REASONING_ROUTE_WEIGHT`, and `TOFY_LATENT_REASONING_STABILITY_WEIGHT` tune the latent selection score
-- direct `--eval-code-assistant` defaults to `TOFY_LATENT_REASONING=0`, `TOFY_DECODER_RLM=0`, and `JEPA_DECODER_TEMP=0` unless you set those variables yourself, so it can match decoder training; the canonical pipeline and Pi-style manual eval use `--pi-agent-env` after sourcing `scripts/tofy_pi_runtime_env.sh` to match the Pi/serve runtime
+- the canonical pipeline passes `--direct-greedy`, forcibly disabling latent reasoning, recursive decoding, TreeCoder, sampling, candidates, and repair attempts; use `--pi-agent-env` only for a separate Pi/serve measurement
 - the integrated high-world training stage is fixed by profile: `12000` for `8gb`/`48gb` and `18000` for `80gb`
 - `HWM_MACRO_MIN_LEN=<int>` and `HWM_MACRO_MAX_LEN=<int>` set the primitive-action span encoded into each macro-action, defaults `2..4`
 - serve/eval auto-load `runs/.../high_world/model.safetensors` next to the world checkpoint; `TOFY_HIGH_WORLD_MODEL=<path>` or `--high-world-model <path>` overrides that path
@@ -217,8 +217,8 @@ cargo run --release -- train 80gb
 ```
 
 This is the default large local/cloud profile. It uses `DIM=1024`,
-`BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1728`, decoder FF
-width `6144`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder `8x16`
+`BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1024`, decoder layers
+`12`, decoder FF width `4096`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder `8x16`
 (`128` effective), world `64x8` (`512` effective) with the encoder frozen,
 high-world `128x4` (`512` effective), decoder `16x4` (`64` effective), and Go
 feedback `16x4` (`64` effective).
@@ -227,8 +227,13 @@ much wider decoder. Do not raise the decoder microbatch just because VRAM is
 available; probe throughput first.
 After the GPU is saturated, bigger decoder microbatches mostly buy fewer
 optimizer steps per token and higher activation memory pressure. It defaults to
-latent `24000`, world `25000`, high-world `18000`, code decoder `120000`, and
-Go feedback `30000`.
+latent `24000`, world `25000`, high-world `18000`, code decoder `240000`, and
+Go feedback `60000`. Decoder micro-batches are `32x8` (`256` effective).
+
+Decoder token caches include the target crop policy in their manifests. A cache without
+`target_crop: "completion_head_v1"` is rejected and must be rebuilt; this prevents an older
+tail-cropped cache from silently removing imports and function declarations. Go instruction and
+repair targets are also compiled before inclusion in the canonical decoder mix.
 
 Before a long 80 GB launch, run:
 
@@ -739,7 +744,7 @@ Run the end-to-end eval:
 
 ```bash
 source scripts/tofy_pi_runtime_env.sh latest 80gb
-cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --pi-agent-env --go-timeout-sec 6
+cargo run --release -- --eval-code-assistant "$TOFY_WORLD_ENCODER_MODEL" "$TOFY_ENCODER_VOCAB" "$TOFY_WORLD_MODEL" eval/code_assistant_go_hard.jsonl 384 "$TOFY_PROFILE_DIM" "$TOFY_PROFILE_MAX_SEQ" "$TOFY_PROFILE_LAYERS" "$TOFY_PROFILE_HEADS" "$TOFY_PROFILE_BRIDGE_DIM" "$TOFY_PROFILE_CONTEXT_SLOTS" --high-world-model "$TOFY_HIGH_WORLD_MODEL" --code-decoder "$JEPA_CANDLE_DECODER" --code-decoder-vocab "$JEPA_CANDLE_DECODER_VOCAB" --direct-greedy --go-timeout-sec 6
 ```
 
 The eval writes:

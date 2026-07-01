@@ -78,9 +78,8 @@ pub struct CandleCrossAttnDecoder {
 }
 
 impl TreeCoderConfig {
-    fn from_env(kind: DecoderKind, action: &str, max_new_tokens: usize) -> Self {
-        let action_is_code = action.trim().eq_ignore_ascii_case("code");
-        let default_enabled = kind == DecoderKind::CodeSpecialist && action_is_code;
+    fn from_env(_kind: DecoderKind, _action: &str, max_new_tokens: usize) -> Self {
+        let default_enabled = false;
         let enabled = runtime_env_bool_any(
             &["TOFY_DECODER_TREECODER", "JEPA_DECODER_TREECODER"],
             default_enabled,
@@ -419,7 +418,7 @@ impl CandleCrossAttnDecoder {
             Self::load_metadata_config(&checkpoint_path, &vocab, kind, planner_dim, context_slots)?;
         let vocab_size = vocab.id_to_token.len();
         let default_repeat_penalty = if kind == DecoderKind::CodeSpecialist {
-            1.12
+            1.0
         } else {
             1.08
         };
@@ -428,16 +427,8 @@ impl CandleCrossAttnDecoder {
         } else {
             96
         };
-        let default_top_k = if kind == DecoderKind::CodeSpecialist {
-            40
-        } else {
-            0
-        };
-        let default_top_p = if kind == DecoderKind::CodeSpecialist {
-            0.92
-        } else {
-            1.0
-        };
+        let default_top_k = 0;
+        let default_top_p = 1.0;
         let adapter = DecoderConditioningAdapter::new_with_compress_rate(
             VarBuilder::from_varmap(&varmap, checkpoint_dtype, &device)
                 .pp("decoder_conditioning_adapter"),
@@ -531,7 +522,7 @@ impl CandleCrossAttnDecoder {
                 let temp = std::env::var("JEPA_DECODER_TEMP")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.35);
+                    .unwrap_or(0.0);
                 Self::new(
                     checkpoint_path,
                     vocab_path,

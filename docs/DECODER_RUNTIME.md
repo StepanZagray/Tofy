@@ -41,11 +41,14 @@ If a decoder vocab env var is not set explicitly, Tofy looks for a sibling `.voc
 
 Additional Candle decoding controls:
 
-- **`JEPA_DECODER_REPEAT_PENALTY`** — Repetition penalty applied over recent generated/prompt tokens. Default: code `1.12`, text `1.08`.
+- **`JEPA_DECODER_REPEAT_PENALTY`** — Repetition penalty applied over recent generated/prompt tokens. Default: code `1.0` (disabled), text `1.08`.
 - **`JEPA_DECODER_REPEAT_LAST_N`** — Number of recent tokens to consider for repetition penalty. Default: code `160`, text `96`.
-- **`JEPA_DECODER_TOP_K`** — Keep only the top-k logits before sampling. Default: code `40`, text `0`.
-- **`JEPA_DECODER_TOP_P`** — Nucleus sampling cutoff. Default: code `0.92`, text `1.0`.
+- **`JEPA_DECODER_TOP_K`** — Keep only the top-k logits before sampling. Default: `0` (disabled).
+- **`JEPA_DECODER_TOP_P`** — Nucleus sampling cutoff. Default: `1.0` (disabled).
 - **`JEPA_CANDLE_DECODER_CTX`** — Maximum prompt tokens kept by the Candle runtime before generation.
+
+Code decoding defaults to greedy generation (`JEPA_DECODER_TEMP=0`) with TreeCoder disabled. Set
+`TOFY_DECODER_TREECODER=1` or non-zero sampling controls explicitly for search experiments.
 - **`TOFY_DECODER_CONDITION_BUDGET`** / **`JEPA_DECODER_CONDITION_BUDGET`** — Keep only the most recent N context-conditioning slots before the decoder conditioning adapter. `0` keeps the shape but zeros conditioning, which is useful for ablations.
 - **`TOFY_DECODER_CROSS_ATTN_SCHEDULE`** — Controls which decoder layers use context/state cross-attention. Supported values: `all`, `every-2nd`, `every-3rd`, `last-only`.
 - **`TOFY_DECODER_CSA_TOPK`** — Number of compressed long-range blocks kept per query by the on-device DSA-style top-k mask in compressed sparse self-attention. Standalone default: `8`; pipeline default: `16`.
