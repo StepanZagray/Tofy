@@ -90,12 +90,12 @@
     "world_batch": 64,
     "world_warmup_batch": 128,
     "high_world_batch": 128,
-    "code_decoder_batch": 32,
-    "go_feedback_batch": 32,
+    "code_decoder_batch": 16,
+    "go_feedback_batch": 16,
     "latent_grad_accum": 16,
     "world_grad_accum": 8,
     "high_world_grad_accum": 4,
-    "code_decoder_grad_accum": 2,
-    "go_feedback_grad_accum": 2
+    "code_decoder_grad_accum": 4,
+    "go_feedback_grad_accum": 4
   }
 }
