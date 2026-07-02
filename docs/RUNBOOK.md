@@ -220,15 +220,14 @@ This is the default large local/cloud profile. It uses `DIM=1024`,
 `BRIDGE_DIM=1024`, `LAYERS=16`, `HEADS=16`, decoder width `1024`, decoder layers
 `12`, decoder FF width `4096`, and `NUM_LATENT_TOKENS=128`. Current 80 GB batches are encoder `8x16`
 (`128` effective), world `64x8` (`512` effective) with the encoder frozen,
-high-world `128x4` (`512` effective), decoder `16x4` (`64` effective), and Go
-feedback `16x4` (`64` effective).
-The profile uses a small decoder microbatch so activation memory can hold the
-much wider decoder. Do not raise the decoder microbatch just because VRAM is
-available; probe throughput first.
-After the GPU is saturated, bigger decoder microbatches mostly buy fewer
-optimizer steps per token and higher activation memory pressure. It defaults to
-latent `24000`, world `25000`, high-world `18000`, code decoder `240000`, and
-Go feedback `60000`. Decoder micro-batches are `32x8` (`256` effective).
+high-world `128x4` (`512` effective), decoder `32x2` (`64` effective), and Go
+feedback `32x2` (`64` effective).
+Do not raise the decoder microbatch just because VRAM is available; probe
+throughput first. After the GPU is saturated, bigger decoder microbatches mostly
+buy fewer optimizer steps per token and higher activation memory pressure. It defaults to
+latent `24000`, world `25000`, high-world `18000`, code decoder `20000`, and
+Go feedback `10000`. Decoder micro-batches are `32x2` (`64` effective), and the
+base decoder runs for `20000` steps (about ten passes over the verified corpus).
 
 Decoder token caches include the target crop policy in their manifests. A cache without
 `target_crop: "completion_head_v1"` is rejected and must be rebuilt; this prevents an older

@@ -69,8 +69,8 @@
     "latent_steps": 24000,
     "world_steps": 25000,
     "high_world_steps": 18000,
-    "code_decoder_steps": 240000,
-    "go_feedback_steps": 60000,
+    "code_decoder_steps": 20000,
+    "go_feedback_steps": 10000,
     "dim": 1024,
     "latent_max_seq": 384,
     "world_max_seq": 384,
@@ -95,7 +95,7 @@
     "latent_grad_accum": 16,
     "world_grad_accum": 8,
     "high_world_grad_accum": 4,
-    "code_decoder_grad_accum": 8,
-    "go_feedback_grad_accum": 8
+    "code_decoder_grad_accum": 2,
+    "go_feedback_grad_accum": 2
   }
 }
