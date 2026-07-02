@@ -430,6 +430,7 @@ fn run_prepare_cache(
         false,
         force,
         false,
+        false,
     )?;
     prepare_go_feedback_decoder_token_cache(&prepare_cache_paths(&defaults), &defaults)?;
     println!("Data/cache preparation complete.");
@@ -481,8 +482,16 @@ fn run_pipeline(cfg: PipelineConfig) -> Result<()> {
         context_defaults.decoder_prompt_tokens
     );
 
+    let reuse_encoder_data = skip_trained_stage(&cfg, "latent") && paths.latent_model.exists();
     let reuse_world_data = skip_trained_stage(&cfg, "world") && paths.world_model.exists();
-    prepare_data(&paths, &defaults, cfg.resume, false, reuse_world_data)?;
+    prepare_data(
+        &paths,
+        &defaults,
+        cfg.resume,
+        false,
+        reuse_encoder_data,
+        reuse_world_data,
+    )?;
     configure_encoder_vocab_env(&paths, &cfg)?;
     train_encoder(&paths, &cfg, &defaults)?;
     train_world(&paths, &cfg, &defaults)?;
@@ -810,6 +819,7 @@ fn prepare_data(
     defaults: &ProfileDefaults,
     resume: bool,
     force_cache: bool,
+    reuse_encoder_data: bool,
     reuse_world_data: bool,
 ) -> Result<()> {
     println!("== Stage 1/6: data prep + vocab/token cache ==");
@@ -833,15 +843,20 @@ fn prepare_data(
 
     thread::scope(|scope| -> Result<()> {
         let encoder_inputs_for_corpus = encoder_inputs.clone();
-        let encoder_corpus_handle = scope.spawn(move || {
-            let mut encoder_args = vec![
-                "--prepare-encoder-corpus".to_string(),
-                "--output".to_string(),
-                ENCODER_DATA.to_string(),
-            ];
-            encoder_args.extend(encoder_inputs_for_corpus);
-            run_prepare_vec(encoder_args)
-        });
+        let encoder_corpus_handle = if reuse_encoder_data {
+            println!("Reusing existing encoder data because the trained latent stage is skipped.");
+            None
+        } else {
+            Some(scope.spawn(move || {
+                let mut encoder_args = vec![
+                    "--prepare-encoder-corpus".to_string(),
+                    "--output".to_string(),
+                    ENCODER_DATA.to_string(),
+                ];
+                encoder_args.extend(encoder_inputs_for_corpus);
+                run_prepare_vec(encoder_args)
+            }))
+        };
 
         prepare_go_task_data()?;
 
@@ -874,7 +889,9 @@ fn prepare_data(
             join_result(handle, "go repair tasks")?;
         }
 
-        join_result(encoder_corpus_handle, "encoder corpus")?;
+        if let Some(handle) = encoder_corpus_handle {
+            join_result(handle, "encoder corpus")?;
+        }
 
         let (world_args, code_mix_args, go_feedback_mix_args) = build_stage1_mix_args();
         let mut mix_jobs = vec![PrepareMixJob::new(
