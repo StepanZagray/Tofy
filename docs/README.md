@@ -1,30 +1,50 @@
 # Documentation index
 
-All docs live in this directory. Start with [RUNBOOK.md](RUNBOOK.md) for copy-paste commands from setup to inference.
+Start here for the **current veclab + Qwen bridge experiment**:
 
 | Doc | Purpose |
 |-----|--------|
-| [RUNBOOK.md](RUNBOOK.md) | End-to-end: clone -> HF CLI -> data -> `train 8gb|48gb|80gb` (or per-stage flags) -> default Go eval -> serve. Includes TensorBoard. |
-| [OPENCODE.md](OPENCODE.md) | Run Tofy in OpenCode; auth and provider config; code-specialist and text-generalist decoders. |
-| [ARCHITECTURE_AND_CAPACITY.md](ARCHITECTURE_AND_CAPACITY.md) | Current context-compressor architecture, cross-action awareness, capacity, and multi-step replies. |
-| [CODE_DATA.md](CODE_DATA.md) | Code training data: CLI `--prepare-*` generators, Go code pairs, pair formats. |
-| [DATA_FORMATS.md](DATA_FORMATS.md) | Data formats for LeJEPA/context-state/decoder training; hub caching; prepared-cache HF upload/restore; expert/technical data. |
-| [DECODER_RUNTIME.md](DECODER_RUNTIME.md) | Decoder backends (GGUF/llama.cpp, Candle code/text decoders) and env vars. |
-| [OOM_TESTING.md](OOM_TESTING.md) | Sustained CUDA OOM probes for batch/VRAM decisions. |
-| [RUNPOD_CURL.md](RUNPOD_CURL.md) | Cloud training pod launch, bootstrap, 80 GB training, resume, Go feedback data, and artifact recovery. |
-| [RESULTS.md](RESULTS.md) | Best metrics and commands (updated when runs improve). |
+| [RUNPOD.md](RUNPOD.md) | **Cloud training:** pod setup, Qwen download, `train minimal`, resume, artifact recovery |
+| [VECLAB_DATA_SPEC.md](VECLAB_DATA_SPEC.md) | Fictional Go library corpus generator and split rules |
+| [BRIDGE_EXPERIMENT_FIXES_SPEC.md](BRIDGE_EXPERIMENT_FIXES_SPEC.md) | Implementation fixes and experiment ladder |
+| [TRAINING_INFRA_FIXES_SPEC.md](TRAINING_INFRA_FIXES_SPEC.md) | Training-loop bugs, observability |
+| [QWEN_KNOWLEDGE_INJECTION_SPEC.md](QWEN_KNOWLEDGE_INJECTION_SPEC.md) | Original experiment design (partially superseded by fixes spec) |
+| [RESULTS.md](RESULTS.md) | Best metrics and commands |
 
-Root [../README.md](../README.md) has quick start, argument order, and project structure.
+## Canonical commands (local or pod)
 
-## Current Source Layout
+```bash
+# Full pipeline (minimal profile, 48 GB-class GPU)
+export TOFY_QWEN_DIR=models/qwen3-1.7b-base
+cargo run --release -- train minimal
 
-Recent refactors split command parsing and runtime code more explicitly:
+# Prepare encoder vocab cache only (optional handoff)
+cargo run --release -- prepare cache minimal
 
-- [`src/main.rs`](../src/main.rs) is now a thin command-dispatch entrypoint.
-- [`src/cli.rs`](../src/cli.rs) owns shared CLI helpers such as hub-path resolution and usage text.
-- [`src/lib.rs`](../src/lib.rs) owns the crate module tree and top-level command dispatch; [`src/main.rs`](../src/main.rs) only initializes logging and forwards CLI args.
-- [`src/config/latent.rs`](../src/config/latent.rs) and [`src/config/world.rs`](../src/config/world.rs) hold typed configs for latent, world, decoder, eval, and serve commands.
-- [`src/tasks/latent.rs`](../src/tasks/latent.rs) owns latent training and JEPA evaluation.
-- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) owns the canonical full `train <8gb|48gb|80gb>` multi-stage pipeline (data prep through decoder training and hard Go eval selection).
-- [`src/tasks/world.rs`](../src/tasks/world.rs) owns world/high-world/orchestrator/decoder training plus agent runtime.
-- [`src/tasks/world_support.rs`](../src/tasks/world_support.rs) holds shared world/decoder metrics, masking, and evaluation helpers extracted from `world.rs` for readability.
+# Generate veclab corpus only
+cargo run --release -- --prepare-veclab --seed 20260705 --out data/fictional
+```
+
+Profiles: `minimal`, `48gb`, `80gb` in `config/model_profiles.json`.
+
+Pipeline stages: veclab prep → encoder → world knowledge → Qwen bridge → veclab eval.
+
+## Source layout (current)
+
+- [`src/tasks/pipeline.rs`](../src/tasks/pipeline.rs) — `train` / `prepare cache`
+- [`src/tasks/knowledge.rs`](../src/tasks/knowledge.rs) — `--train-world-knowledge`
+- [`src/tasks/bridge.rs`](../src/tasks/bridge.rs) — `--train-bridge`, `--eval-bridge`
+- [`src/tasks/prepare_veclab.rs`](../src/tasks/prepare_veclab.rs) — `--prepare-veclab`
+- [`src/model/decoders/qwen3_bridge.rs`](../src/model/decoders/qwen3_bridge.rs) — gated cross-attn on Qwen3
+
+## Older docs (pre-veclab refactor)
+
+These still describe the removed Candle code/text decoder + `--serve` stack.
+Use only for historical context:
+
+- [RUNBOOK.md](RUNBOOK.md) — being updated incrementally
+- [DECODER_RUNTIME.md](DECODER_RUNTIME.md) — obsolete (GGUF/Candle decoders)
+- [ARCHITECTURE_AND_CAPACITY.md](ARCHITECTURE_AND_CAPACITY.md) — concepts still useful; pipeline section stale
+- [CODE_DATA.md](CODE_DATA.md), [OPENCODE.md](OPENCODE.md) — old Go POC data path
+
+Root [../README.md](../README.md) quick start is also stale; prefer this index + RUNPOD.md.

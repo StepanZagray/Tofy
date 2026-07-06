@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -14,8 +16,7 @@ use crate::data::{
     build_vocab_from_pair_file, build_vocab_from_raw_world_file_with_mode,
     build_vocab_from_raw_world_file_with_mode_action_filter, encode_line_with_vocab_mode,
     encode_raw_world_line_with_vocab_mode, encode_text_with_vocab_mode, tokenizer_spec,
-    tokenizer_spec_signature, TokenizationMode, TokenizerSpec, ACTION_CODE,
-    DEFAULT_MIN_TOKENS_PER_LINE,
+    tokenizer_spec_signature, TokenizationMode, TokenizerSpec, DEFAULT_MIN_TOKENS_PER_LINE,
 };
 use crate::model::vocab::vocab_signature;
 use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
@@ -83,15 +84,11 @@ struct TokenManifest {
 struct PrepareCacheConfig {
     encoder_data: PathBuf,
     world_data: PathBuf,
-    code_data: PathBuf,
     encoder_vocab_path: PathBuf,
-    code_vocab_path: PathBuf,
     cache_dir: PathBuf,
     encoder_max_vocab: usize,
-    code_max_vocab: usize,
     encoder_max_seq: usize,
     world_max_seq: usize,
-    code_max_seq: usize,
     force: bool,
     require_hit: bool,
 }
@@ -143,16 +140,14 @@ pub fn try_run_prepare_pipeline_cache(args: &[String]) -> Result<bool> {
 
 impl PrepareCacheConfig {
     fn from_args(args: &[String]) -> Result<Self> {
-        if args.len() < 3 {
+        if args.is_empty() {
             bail!(
-                "usage: --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] [--encoder-max-vocab N] [--code-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--code-max-seq N] [--force] [--require-hit]"
+                "usage: --prepare-pipeline-cache <encoder_pairs> <world_pairs> [encoder_vocab_out] [cache_dir] [--encoder-max-vocab N] [--encoder-max-seq N] [--world-max-seq N] [--force] [--require-hit]"
             );
         }
         let mut encoder_max_vocab = 8_000usize;
-        let mut code_max_vocab = 16_000usize;
         let mut encoder_max_seq = 256usize;
         let mut world_max_seq = 256usize;
-        let mut code_max_seq = 192usize;
         let mut force = false;
         let mut require_hit = false;
         let mut positional = Vec::new();
@@ -163,10 +158,6 @@ impl PrepareCacheConfig {
                     encoder_max_vocab = parse_next_usize(args, i, "--encoder-max-vocab")?;
                     i += 2;
                 }
-                "--code-max-vocab" => {
-                    code_max_vocab = parse_next_usize(args, i, "--code-max-vocab")?;
-                    i += 2;
-                }
                 "--encoder-max-seq" => {
                     encoder_max_seq = parse_next_usize(args, i, "--encoder-max-seq")?;
                     i += 2;
@@ -175,9 +166,8 @@ impl PrepareCacheConfig {
                     world_max_seq = parse_next_usize(args, i, "--world-max-seq")?;
                     i += 2;
                 }
-                "--code-max-seq" => {
-                    code_max_seq = parse_next_usize(args, i, "--code-max-seq")?;
-                    i += 2;
+                "--code-max-vocab" | "--code-max-seq" => {
+                    bail!("code decoder cache flags are no longer supported");
                 }
                 "--force" => {
                     force = true;
@@ -197,33 +187,29 @@ impl PrepareCacheConfig {
         if force && require_hit {
             bail!("--force cannot be combined with --require-hit");
         }
+        if positional.len() < 2 {
+            bail!(
+                "usage: --prepare-pipeline-cache <encoder_pairs> <world_pairs> [encoder_vocab_out] [cache_dir]"
+            );
+        }
         let encoder_data = PathBuf::from(&positional[0]);
         let world_data = PathBuf::from(&positional[1]);
-        let code_data = PathBuf::from(&positional[2]);
         let encoder_vocab_path = positional
-            .get(3)
+            .get(2)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("local_models/vocabs/vocab_encoder_8000_default.txt"));
-        let code_vocab_path = positional
-            .get(4)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("local_models/vocabs/vocab_code_16000_codeaware.txt"));
         let cache_dir = positional
-            .get(5)
+            .get(3)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("data/cache"));
         Ok(Self {
             encoder_data,
             world_data,
-            code_data,
             encoder_vocab_path,
-            code_vocab_path,
             cache_dir,
             encoder_max_vocab,
-            code_max_vocab,
             encoder_max_seq,
             world_max_seq,
-            code_max_seq,
             force,
             require_hit,
         })
@@ -248,70 +234,36 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
     if let Some(parent) = config.encoder_vocab_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = config.code_vocab_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     println!("Preparing pipeline vocab/token cache");
     println!("cache dir: {}", config.cache_dir.display());
 
-    let (encoder_source, world_source, code_source) = thread::scope(|scope| -> Result<_> {
+    let (encoder_source, world_source) = thread::scope(|scope| -> Result<_> {
         let encoder = scope.spawn(|| source_fingerprint(&config.encoder_data));
         let world = scope.spawn(|| source_fingerprint(&config.world_data));
-        let code = scope.spawn(|| source_fingerprint(&config.code_data));
         Ok((
             join_result(encoder, "encoder source fingerprint")?,
             join_result(world, "world source fingerprint")?,
-            join_result(code, "code source fingerprint")?,
         ))
     })?;
 
     let encoder_vocab_manifest = config.cache_dir.join("encoder_vocab.manifest.json");
-    let code_vocab_manifest = config.cache_dir.join("code_decoder_vocab.manifest.json");
-    let (encoder_vocab, code_vocab) = thread::scope(|scope| -> Result<_> {
-        let encoder = scope.spawn(|| {
-            ensure_vocab_cache(VocabCacheSpec {
-                kind: "encoder",
-                data_path: &config.encoder_data,
-                source: &encoder_source,
-                mode: TokenizationMode::Default,
-                max_vocab: config.encoder_max_vocab,
-                action_filter: None,
-                vocab_path: &config.encoder_vocab_path,
-                manifest_path: &encoder_vocab_manifest,
-                force: config.force,
-                require_hit: config.require_hit,
-            })
-        });
-        let code = scope.spawn(|| {
-            ensure_vocab_cache(VocabCacheSpec {
-                kind: "code_decoder",
-                data_path: &config.code_data,
-                source: &code_source,
-                mode: TokenizationMode::CodeAware,
-                max_vocab: config.code_max_vocab,
-                action_filter: Some(ACTION_CODE),
-                vocab_path: &config.code_vocab_path,
-                manifest_path: &code_vocab_manifest,
-                force: config.force,
-                require_hit: config.require_hit,
-            })
-        });
-        Ok((
-            join_result(encoder, "encoder vocab cache")?,
-            join_result(code, "code decoder vocab cache")?,
-        ))
+    let encoder_vocab = ensure_vocab_cache(VocabCacheSpec {
+        kind: "encoder",
+        data_path: &config.encoder_data,
+        source: &encoder_source,
+        mode: TokenizationMode::Default,
+        max_vocab: config.encoder_max_vocab,
+        action_filter: None,
+        vocab_path: &config.encoder_vocab_path,
+        manifest_path: &encoder_vocab_manifest,
+        force: config.force,
+        require_hit: config.require_hit,
     })?;
 
     let encoder_tokens = config.cache_dir.join("encoder.tokens.bin");
     let encoder_tokens_manifest = config.cache_dir.join("encoder_tokens.manifest.json");
     let world_tokens = config.cache_dir.join("world.tokens.bin");
     let world_tokens_manifest = config.cache_dir.join("world_tokens.manifest.json");
-    let code_tokens = config.cache_dir.join("code_decoder.tokens.bin");
-    let code_tokens_manifest = config.cache_dir.join("code_decoder_tokens.manifest.json");
-    let dual_tokens = config.cache_dir.join("code_decoder_dual.tokens.bin");
-    let dual_tokens_manifest = config
-        .cache_dir
-        .join("code_decoder_dual_tokens.manifest.json");
     thread::scope(|scope| -> Result<()> {
         let encoder = scope.spawn(|| {
             ensure_sequence_token_cache(
@@ -347,45 +299,8 @@ fn prepare_pipeline_cache(config: &PrepareCacheConfig) -> Result<()> {
                 &encoder_vocab,
             )
         });
-        let code = scope.spawn(|| {
-            ensure_world_token_cache(
-                TokenCacheSpec {
-                    kind: "code_decoder",
-                    data_path: &config.code_data,
-                    source: &code_source,
-                    mode: TokenizationMode::CodeAware,
-                    max_seq: config.code_max_seq,
-                    action_filter: Some(ACTION_CODE),
-                    token_cache_path: &code_tokens,
-                    manifest_path: &code_tokens_manifest,
-                    force: config.force,
-                    require_hit: config.require_hit,
-                },
-                &code_vocab,
-            )
-        });
-        let dual = scope.spawn(|| {
-            ensure_dual_world_token_cache(
-                TokenCacheSpec {
-                    kind: "code_decoder_dual",
-                    data_path: &config.code_data,
-                    source: &code_source,
-                    mode: TokenizationMode::CodeAware,
-                    max_seq: config.code_max_seq,
-                    action_filter: Some(ACTION_CODE),
-                    token_cache_path: &dual_tokens,
-                    manifest_path: &dual_tokens_manifest,
-                    force: config.force,
-                    require_hit: config.require_hit,
-                },
-                &encoder_vocab,
-                &code_vocab,
-            )
-        });
         join_result(encoder, "encoder token cache")?;
         join_result(world, "world token cache")?;
-        join_result(code, "code decoder token cache")?;
-        join_result(dual, "dual code decoder token cache")?;
         Ok(())
     })?;
     println!("Pipeline cache ready.");

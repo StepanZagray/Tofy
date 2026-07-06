@@ -7,8 +7,7 @@ use super::encoders::EncoderFeatures;
 
 const ATTENTION_MASK_VALUE: f32 = -1.0e4;
 
-/// Context compressor: resamples encoder hidden states into a fixed set of private task-state slots.
-/// These slots are used by the action classifier/router and action-state transition, not directly by the decoders.
+/// Resamples encoder states into stable knowledge slots consumed by the Qwen adapter.
 pub struct ContextCompressor {
     slot_embed: nn::Embedding,
     cross_attn: CrossAttention,
@@ -16,7 +15,9 @@ pub struct ContextCompressor {
     ln2: nn::LayerNorm,
     ff1: nn::Linear,
     ff2: nn::Linear,
+    extra_blocks: Vec<CompressorBlock>,
     proj: nn::Linear,
+    output_norm: nn::RmsNorm,
     pool_proj: nn::Linear,
     memory_ln: nn::LayerNorm,
     memory_score: nn::Linear,
@@ -25,6 +26,36 @@ pub struct ContextCompressor {
     memory_importance: nn::Linear,
     num_slots: usize,
     in_dim: usize,
+}
+
+struct CompressorBlock {
+    cross_attn: CrossAttention,
+    ln1: nn::LayerNorm,
+    ln2: nn::LayerNorm,
+    ff1: nn::Linear,
+    ff2: nn::Linear,
+}
+
+impl CompressorBlock {
+    fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
+        let ff_hidden = (dim * 4).max(256);
+        Ok(Self {
+            cross_attn: CrossAttention::new(vb.pp("cross_attn"), dim, dim, 8)?,
+            ln1: nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?,
+            ln2: nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?,
+            ff1: nn::linear(dim, ff_hidden, vb.pp("ff1"))?,
+            ff2: nn::linear(ff_hidden, dim, vb.pp("ff2"))?,
+        })
+    }
+
+    fn forward(&self, slots: &Tensor, memory: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let attended = self
+            .cross_attn
+            .forward_masked(&self.ln1.forward(slots)?, memory, mask)?;
+        let slots = (slots + attended)?;
+        let ff = self.ff1.forward(&self.ln2.forward(&slots)?)?.gelu()?;
+        (slots + self.ff2.forward(&ff)?).map_err(Into::into)
+    }
 }
 
 impl ContextCompressor {
@@ -41,7 +72,20 @@ impl ContextCompressor {
         let ff_hidden = (in_dim * 4).max(256);
         let ff1 = nn::linear(in_dim, ff_hidden, vb.pp("ff1"))?;
         let ff2 = nn::linear(ff_hidden, in_dim, vb.pp("ff2"))?;
+        let depth = std::env::var("TOFY_CONTEXT_COMPRESSOR_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let mut extra_blocks = Vec::with_capacity(depth.saturating_sub(1));
+        for index in 1..depth {
+            extra_blocks.push(CompressorBlock::new(
+                vb.pp(format!("blocks.{index}")),
+                in_dim,
+            )?);
+        }
         let proj = nn::linear(in_dim, planner_dim, vb.pp("proj"))?;
+        let output_norm = nn::rms_norm(planner_dim, 1e-6, vb.pp("output_norm"))?;
         let pool_proj = nn::linear(planner_dim, 1, vb.pp("pool_proj"))?;
         let memory_ln = nn::layer_norm(in_dim, 1e-5, vb.pp("memory_ln"))?;
         let memory_score = nn::linear(in_dim, 1, vb.pp("memory_score"))?;
@@ -55,7 +99,9 @@ impl ContextCompressor {
             ln2,
             ff1,
             ff2,
+            extra_blocks,
             proj,
+            output_norm,
             pool_proj,
             memory_ln,
             memory_score,
@@ -90,9 +136,12 @@ impl ContextCompressor {
 
         let normed = self.ln2.forward(&slots)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
-        let slots = (slots + self.ff2.forward(&ff)?)?;
+        let mut slots = (slots + self.ff2.forward(&ff)?)?;
+        for block in &self.extra_blocks {
+            slots = block.forward(&slots, &encoder_hidden, encoder_mask)?;
+        }
 
-        Ok(self.proj.forward(&slots)?)
+        Ok(self.output_norm.forward(&self.proj.forward(&slots)?)?)
     }
 
     /// Hybrid long-context path for segmented memory.
@@ -297,19 +346,6 @@ impl ContextCompressor {
             .unsqueeze(2)?
             .broadcast_as((batch, slots, dim))?;
         Ok(context_slots.broadcast_mul(&weights)?.sum(1)?)
-    }
-
-    pub fn fold_slots(
-        &self,
-        prev_slots: &Tensor,
-        next_slots: &Tensor,
-        retain: f64,
-    ) -> Result<Tensor> {
-        let retain = retain.clamp(0.0, 1.0);
-        prev_slots
-            .affine(retain, 0.0)?
-            .broadcast_add(&next_slots.affine(1.0 - retain, 0.0)?)
-            .map_err(Into::into)
     }
 
     fn slot_queries(&self, batch: usize, device: &candle_core::Device) -> Result<Tensor> {

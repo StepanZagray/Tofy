@@ -1425,6 +1425,28 @@ impl CrossAttention {
         })
     }
 
+    pub fn new_no_bias(
+        vb: VarBuilder<'_>,
+        decoder_dim: usize,
+        world_dim: usize,
+        num_heads: usize,
+    ) -> Result<Self> {
+        assert!(
+            decoder_dim.is_multiple_of(num_heads),
+            "decoder_dim must be divisible by num_heads"
+        );
+        let head_dim = decoder_dim / num_heads;
+        Ok(Self {
+            num_heads,
+            head_dim,
+            scale: (head_dim as f64).sqrt(),
+            q_proj: nn::linear_no_bias(decoder_dim, decoder_dim, vb.pp("q_proj"))?,
+            k_proj: nn::linear_no_bias(world_dim, decoder_dim, vb.pp("k_proj"))?,
+            v_proj: nn::linear_no_bias(world_dim, decoder_dim, vb.pp("v_proj"))?,
+            out_proj: nn::linear_no_bias(decoder_dim, decoder_dim, vb.pp("out_proj"))?,
+        })
+    }
+
     fn add_key_padding_bias(
         &self,
         scores: Tensor,

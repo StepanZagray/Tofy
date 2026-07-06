@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${TOFY_REPO_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 MODE="${1:-train}"
-PROFILE="${PROFILE:-80gb}"
+PROFILE="${PROFILE:-minimal}"
 RESUME_TARGET="${RESUME_TARGET:-latest}"
 SESSION="${TMUX_SESSION:-tofy-${MODE}}"
 
@@ -27,6 +27,10 @@ fi
 
 cd "$REPO_DIR"
 source "$HOME/.cargo/env"
+if [[ -f /workspace/tofy-runpod.env ]]; then
+  # shellcheck disable=SC1091
+  source /workspace/tofy-runpod.env
+fi
 
 if [[ "${SKIP_GIT_PULL:-0}" != "1" && -d .git ]]; then
   git fetch origin

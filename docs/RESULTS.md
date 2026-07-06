@@ -4,6 +4,37 @@ Update the **Best So Far** section when a run improves on a reported metric. Rec
 
 ## Best So Far
 
+The Qwen knowledge-injection ladder has no completed runs yet. Record floor, RAG ceiling,
+latent-channel, knowledge-in-weights, static-prefix, LoRA, and latent-ablation metrics here.
+World training uses `--train-world-knowledge`; bridge training uses `--train-bridge`.
+Set `TOFY_STATIC_SOFT_PREFIX=true` for the equal-slot static-prefix control.
+
+| Run | Regime | Trainable parameters | Seen pass | Held-out pass |
+|---|---|---:|---:|---:|
+| World conditioned | context/weights | emitted as `trainable_params` by `--train-bridge` | pending | pending |
+| Static prefix | prefix | emitted as `trainable_params` with `TOFY_STATIC_SOFT_PREFIX=true` | pending | pending |
+| LoRA r=16 | none | pending baseline run | pending | pending |
+
+Before training, run the contamination floor with
+`TOFY_EVAL_MODE=floor ... --eval-bridge ... eval/veclab_eval.jsonl`; record the
+exact command and verify near-zero held-out pass rate here. The generator itself is
+deterministic: `cargo run --release -- --prepare-veclab --seed 20260705 --out data/fictional`.
+
+**VecLab corpus (seed 20260705):** `data/fictional/MANIFEST.json` SHA-256
+`veclab_encoder_mix.txt` = `450c4a7518f1f9f926d25e9a794eaeb1bc1f9002754009e46ab060dbe03ab9eb`;
+200 functions, 600 eval cases, 0 held-out gold rows upstream (`--print-split-stats`).
+**Step-0 zero-shot floor (RTX 5060 smoke, Qwen3-1.7B-Base BF16):** held-out
+suite pass `0/5` (`0.0000`), compile rate `0/5` (`0.0000`); failures were four
+`must_call_violation` and one `compile_error`. Report:
+`runs/bridge_eval/5060_floor_heldout5/report.json`. Exact command:
+
+```bash
+TOFY_EVAL_MODE=floor TOFY_EVAL_TASK_OFFSET=300 TOFY_EVAL_MAX_TASKS=5 TOFY_ENCODER_DIM=640 TOFY_ENCODER_LAYERS=7 TOFY_ENCODER_HEADS=8 TOFY_BRIDGE_DIM=640 TOFY_NUM_LATENT_TOKENS=64 TOFY_ADAPTER_OUTPUT_SLOTS=64 TOFY_BRIDGE_MAX_SEQ=64 cargo run --release -- --eval-bridge local_models/Qwen3-1.7B-Base local_models/smoke/bridge.safetensors local_models/smoke/encoder.safetensors local_models/smoke/encoder.vocab.txt local_models/smoke/world.safetensors eval/veclab_eval.jsonl runs/bridge_eval/5060_floor_heldout5/report.json
+```
+
+This is a five-task contamination smoke check, not a statistically powered full-suite result.
+The required near-zero floor was confirmed.
+
 These best metrics were produced before the strict LeJEPA default rewrite. Treat them as legacy baselines until a strict run reports better metrics with its exact command.
 
 - **World transition selection score:** `0.0041821287` at step `17000/60000` on `data/world_mix_pairs.txt` validation stream, logged peak VRAM `7280/8151 MB` — legacy pre-CLI run with `DIM=640`, `LAYERS=7`, `HEADS=8`, `WORLD_BATCH=128`, `WORLD_GRAD_ACCUM=1`, `TOFY_TRAIN_DTYPE=bf16`. This is not the current default 8 GB schedule.

@@ -803,6 +803,7 @@ impl PairStream {
     }
 
     fn read_next_tokens(&mut self) -> Result<Vec<String>> {
+        let mut full_passes_without_row = 0usize;
         loop {
             if let Some(text) = self.pending_texts.pop_front() {
                 if let Some(tokens) = split_line_with_min_tokens(&text, self.min_tokens) {
@@ -815,6 +816,18 @@ impl PairStream {
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
                 self.reset()?;
+                if self.path_index == 0 {
+                    full_passes_without_row += 1;
+                    if full_passes_without_row >= 2 {
+                        bail!(
+                            "pair stream produced no usable rows after two passes (paths={:?}, split_modulus={:?}, split_remainder={}, exclude_matches={})",
+                            self.paths,
+                            self.split_modulus,
+                            self.split_remainder,
+                            self.exclude_split_matches
+                        );
+                    }
+                }
                 continue;
             }
             if self.source_manifest {
@@ -917,6 +930,7 @@ impl CachedPairStream {
     }
 
     fn read_next_pair(&mut self) -> Result<Pair> {
+        let mut full_passes_without_row = 0usize;
         loop {
             match read_token_cache_record(&mut self.reader)? {
                 Some((tokens, _right, _action)) if !tokens.is_empty() => {
@@ -936,7 +950,19 @@ impl CachedPairStream {
                     return Ok(Pair { tokens });
                 }
                 Some(_) => continue,
-                None => self.reset()?,
+                None => {
+                    self.reset()?;
+                    full_passes_without_row += 1;
+                    if full_passes_without_row >= 2 {
+                        bail!(
+                            "cached pair stream {:?} produced no usable rows after two passes (split_modulus={:?}, split_remainder={}, exclude_matches={})",
+                            self.path,
+                            self.split_modulus,
+                            self.split_remainder,
+                            self.exclude_split_matches
+                        );
+                    }
+                }
             }
         }
     }
@@ -1108,11 +1134,22 @@ impl CachedWorldStream {
     }
 
     fn read_next_example(&mut self) -> Result<WorldExample> {
+        let mut full_passes_without_row = 0usize;
         loop {
             let Some((state_tokens, next_tokens, action_label)) =
                 read_token_cache_record(&mut self.reader)?
             else {
                 self.reset()?;
+                full_passes_without_row += 1;
+                if full_passes_without_row >= 2 {
+                    bail!(
+                        "cached world stream {:?} produced no usable rows after two passes (split_modulus={:?}, split_remainder={}, exclude_matches={})",
+                        self.path,
+                        self.split_modulus,
+                        self.split_remainder,
+                        self.exclude_split_matches
+                    );
+                }
                 continue;
             };
             let row_idx = self.row_index;
@@ -1260,11 +1297,22 @@ impl CachedDecoderStream {
     }
 
     fn read_next_example(&mut self) -> Result<CachedDecoderExample> {
+        let mut full_passes_without_row = 0usize;
         loop {
             let Some((enc_state, enc_next, dec_state, dec_next, action_label)) =
                 read_dual_token_cache_record(&mut self.reader)?
             else {
                 self.reset()?;
+                full_passes_without_row += 1;
+                if full_passes_without_row >= 2 {
+                    bail!(
+                        "cached decoder stream {:?} produced no usable rows after two passes (split_modulus={:?}, split_remainder={}, exclude_matches={})",
+                        self.path,
+                        self.split_modulus,
+                        self.split_remainder,
+                        self.exclude_split_matches
+                    );
+                }
                 continue;
             };
             if enc_state.is_empty()
@@ -1519,10 +1567,21 @@ impl RawWorldStream {
     }
 
     fn read_next_example(&mut self) -> Result<RawWorldExample> {
+        let mut full_passes_without_row = 0usize;
         loop {
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
                 self.reset()?;
+                full_passes_without_row += 1;
+                if full_passes_without_row >= 2 {
+                    bail!(
+                        "raw world stream {:?} produced no usable rows after two passes (split_modulus={:?}, split_remainder={}, exclude_matches={})",
+                        self.path,
+                        self.split_modulus,
+                        self.split_remainder,
+                        self.exclude_split_matches
+                    );
+                }
                 continue;
             }
             let line = line.trim();
@@ -3407,5 +3466,50 @@ mod tests {
 
         assert_eq!(row.action_label, ACTION_TEXT_REPLY);
         assert_eq!(row.next_text, "This is prose.");
+    }
+
+    #[test]
+    fn empty_cached_pair_stream_returns_error() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "tofy-empty-cache-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::write(&path, TOKEN_CACHE_MAGIC)?;
+        let mut stream = CachedPairStream::with_shuffle(&path, 1)?;
+        let error = match stream.next_batch(1) {
+            Ok(_) => panic!("empty cache must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("two passes"));
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn impossible_cached_pair_split_returns_error() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "tofy-impossible-split-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut bytes = TOKEN_CACHE_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, bytes)?;
+        let mut stream = CachedPairStream::with_split(&path, 1, Some(2), 1, false)?;
+        let error = match stream.next_batch(1) {
+            Ok(_) => panic!("impossible split must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("two passes"));
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 }

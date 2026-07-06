@@ -156,10 +156,9 @@ World/context compressor knobs:
 Decoder training knobs:
 
 - Decoder training uses only matched world conditioning by default.
-- `TOFY_DECODER_NEGATIVE_FORWARDS=1` or `--conditioning-negative-forwards` enables extra negative-conditioning decoder forwards for the conditioning-margin loss and optional ablation metrics.
 - `TOFY_DECODER_CONDITIONING_LOSS_WEIGHT=<float>` or `--conditioning-loss-weight <float>` sets the conditioning-margin weight used only when negative forwards are enabled, default `0.10`
 - `TOFY_DECODER_CONDITIONING_MARGIN=<float>` sets the conditioning-loss margin, default `0.10`
-- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all|none` controls which negative-conditioning forwards are used for the training margin after `TOFY_DECODER_NEGATIVE_FORWARDS=1`; pipeline default `hard`, which uses another batch row
+- `TOFY_DECODER_CONDITIONING_NEGATIVES=zero,shuffle,hard|all|none` controls negative-conditioning forwards for the bridge margin; pipeline default `hard` uses another batch row.
 - `TOFY_DECODER_ABLATION_METRICS=1` logs zero/shuffle/hard negative-conditioning losses when negative forwards are enabled.
 - `TOFY_DECODER_PROMPT_DROPOUT=<float>` randomly masks prompt tokens during decoder training so the decoder must use world conditioning; pipeline default `0.12`
 - `TOFY_DECODER_CLIP_NORM=<float>` sets decoder global-norm clipping, default `1.0`; the canonical base code-decoder pretrain stage uses `0.30` when this is unset
@@ -343,7 +342,7 @@ Stage aliases: `encoder` maps to `latent`, `decoder` maps to `decoder_code`,
 and `go-feedback` maps to `decoder_code_go_feedback`.
 
 ```bash
-cargo run --release -- --train-world runs/latent/manual_run/model.safetensors runs/latent/manual_run/model.vocab.txt data/world_mix_pairs.txt 60000 64 640 256 7 8 640 64 --grad-accum 2 --output runs/world/manual_run/model.safetensors --resume
+cargo run --release -- --train-world-knowledge runs/latent/manual_run/model.safetensors runs/latent/manual_run/model.vocab.txt data/fictional/veclab_world_train.txt 60000 64 640 384 7 8 640 64 --grad-accum 2 --output runs/world/manual_run/model.safetensors --resume
 ```
 
 Train the integrated macro-action state transition:
@@ -517,7 +516,7 @@ cargo run --release -- --prepare-world-mix --output data/world_mix_pairs.txt --t
 
 ```bash
 TOFY_SIGREG_SLICES=1024 \
-cargo run --release -- --train-world local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/world_mix_pairs.txt 40000 32 768 256 9 8 256 64 --lambda 0.2 --action-loss-weight 0
+cargo run --release -- --train-world-knowledge local_models/model_latent_<size>.safetensors local_models/vocabs/vocab_encoder.txt data/fictional/veclab_world_train.txt 40000 32 768 384 9 8 640 64 --lambda 0.2
 ```
 
 Output:
@@ -789,7 +788,7 @@ Then open the local URL printed by TensorBoard in your browser, usually `http://
 
 Typical flow:
 
-1. Start a training command such as `--latent`, `--train-world`, or `--train-decoder`.
+1. Start a training command such as `--latent`, `--train-world-knowledge`, or `--train-bridge`.
 2. In another terminal, run `tensorboard --logdir runs/`.
 3. Open the Scalars tab to watch useful tags such as `loss/total`, `loss/pred`, `loss/sigreg`, `loss/trans`, `loss/objective`, `loss/token_nll`, `metrics/pred_cosine`, `metrics/trans_cosine`, `metrics/perplexity`, and `memory/used_mb`.
 4. For encoder runs, pay special attention to `loss/pred_token`, `loss/pred_chunk`, `loss/pred_global`, `metrics/chunk_cosine`, and `metrics/global_cosine`. Those tell you whether the encoder is learning local detail, mid-level structure, and whole-sequence semantics instead of only improving one pooled number.

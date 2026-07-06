@@ -924,8 +924,11 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
         opt.set_learning_rate(scheduled_lr);
-        let grad_norm =
-            util::clip_accumulated_gradients(&mut accumulated_grads, &train_vars, clip_norm)?;
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
 
         if step % config.log_every == 0 {
@@ -963,7 +966,9 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 step,
             );
             tb.add_scalar("schedule/lr", scheduled_lr as f32, step);
-            tb.add_scalar("metrics/grad_norm", grad_norm as f32, step);
+            if let Some(grad_norm) = grad_norm {
+                tb.add_scalar("metrics/grad_norm", util::scalar_f32(&grad_norm)?, step);
+            }
             let mut memory_note = String::new();
             if let Some(vram) = vram_tracker.sample() {
                 tb.add_scalar("memory/used_mb", vram.used_mb, step);

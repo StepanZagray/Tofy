@@ -34,62 +34,39 @@ pub fn resolve_data_path(data_arg: &str) -> Result<ResolvedDataPath> {
 
 pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
-    eprintln!("  Training (learn from data):");
+    eprintln!("  Training pipeline:");
     eprintln!(
-        "    {program} train <8gb|48gb|80gb> [--until decoder|decoder-cache|full] [--resume [latest|run_id|runs/path]] [--skip-trained STAGE[,STAGE...]] [--with-code-eval] [--build-conditioned-cache] [--from-conditioned-cache]"
+        "    {program} train <minimal|48gb|80gb> [--until full] [--resume [latest|run_id|runs/path]] [--skip-trained STAGE[,STAGE...]]"
     );
     eprintln!(
-        "      Go eval selection runs by default; --with-code-eval is accepted for old scripts."
+        "    {program} prepare cache <minimal|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]"
     );
-    eprintln!("    {program} prepare cache <8gb|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]  # build full local pod cache");
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
     );
     eprintln!(
         "    {program} --latent-from-checkpoint <encoder_checkpoint.safetensors> <data_path> [steps] ..."
     );
-    eprintln!("  Evaluation (JEPA-native):");
+    eprintln!("  Evaluation:");
     eprintln!(
         "    {program} --eval-jepa <model_path> <vocab_path> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads]"
     );
-    eprintln!("  World model agent:");
     eprintln!(
-        "    {program} --prepare-ultrachat [output_path] [context_window] [min_tokens] [max_rows]"
+        "    {program} --eval-bridge <qwen_dir> <bridge.safetensors> <encoder.safetensors> <vocab.txt> <world.safetensors> <suite.jsonl> [report.json]"
+    );
+    eprintln!("    {program} --check-bridge-logit-parity <qwen_dir> [prompt]");
+    eprintln!("  Data prep:");
+    eprintln!(
+        "    {program} --prepare-veclab | --print-split-stats | --prepare-encoder-corpus | --prepare-pipeline-cache ..."
     );
     eprintln!(
-        "    {program} --prepare-pipeline-cache <encoder_pairs> <world_pairs> <code_pairs> [encoder_vocab_out] [code_vocab_out] [cache_dir] ..."
+        "    {program} --train-world-knowledge <encoder_model.safetensors> <encoder_vocab.txt> <data_path> [steps] ..."
     );
     eprintln!(
-        "    {program} --prepare-encoder-corpus|--prepare-github-top-code|--prepare-go-function-tasks|--prepare-go-algorithm-tasks|--prepare-go-semantics-tasks|--prepare-go-repair-tasks|--prepare-go-model-feedback-pairs|--prepare-world-mix|--prepare-code-poc-mix ..."
+        "    {program} --train-bridge <qwen_dir> <encoder.safetensors> <encoder_vocab.txt> <world.safetensors> <tasks.txt> [steps] [batch] [output]"
     );
-    eprintln!(
-        "    {program} --prepare-expert-pairs|--prepare-casual-conversation|--generate-code-eval-suite|--convert-jsonl-context-response-to-tsv ..."
-    );
+    eprintln!("    {program} --train-channel-probe <qwen_dir> <bridge> <encoder> <vocab> <world> <seen_tasks> <heldout_tasks> <output> [steps]");
     eprintln!(
         "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile 48gb|80gb] ..."
-    );
-    eprintln!(
-        "    {program} --train-world <encoder_model.safetensors> <encoder_vocab.txt> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lambda <float>] [--lr <float>] [--grad-accum <int>] [--output <path>] [--resume]"
-    );
-    eprintln!(
-        "    {program} --train-high-world <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--macro-min-len N] [--macro-max-len N] [--output <path>] [--resume]"
-    );
-    eprintln!(
-        "    {program} --train-orchestrator <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--lr <float>] [--grad-accum <int>] [--freeze-planner] [--output <path>] [--resume]"
-    );
-    eprintln!(
-        "    {program} --train-decoder <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:id> [steps] ... [--decoder-kind <text|code>] [--decoder-vocab <path>] [--decoder-max-vocab <int>] [--lr <float>] [--conditioning-loss-weight <float>] [--conditioning-negative-forwards] [--init-decoder <path>] [--decoder-output <path>] [--build-conditioned-cache] [--from-conditioned-cache] [--resume]"
-    );
-    eprintln!(
-        "    {program} --eval-world <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <data_path|hub:dataset_id> [eval_steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots]"
-    );
-    eprintln!(
-        "    {program} --eval-code-assistant <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> <suite.jsonl> [max_new_tokens] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--code-decoder <path>] [--code-decoder-vocab <path>] [--pi-agent-env] [--ablate-conditioning]"
-    );
-    eprintln!(
-        "    {program} --eval-decoder-only <decoder.safetensors> <decoder_vocab.txt> <suite.jsonl> [max_new_tokens] [planner_dim] [num_planner_slots] [--candidates <int>]"
-    );
-    eprintln!(
-        "    {program} --serve <encoder_model.safetensors> <encoder_vocab.txt> <world_model.safetensors> [bind] [dim] [max_seq] [num_layers] [num_heads] [planner_dim] [num_planner_slots] [--high-world-model <override>] [--debug]"
     );
 }

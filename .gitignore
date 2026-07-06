@@ -1,6 +1,8 @@
 # Rust
 /target/
 *.rlib
+# Local scratch (nested clones, experiments)
+.tmp/
 # Local secrets
 .env
 
@@ -19,8 +21,10 @@ vocab_*.txt
 
 # Data files
 data/*.txt
+data/*.tsv
 !data/.gitkeep
 data/cache/
+data/fictional/
 runs/
 
 # Python

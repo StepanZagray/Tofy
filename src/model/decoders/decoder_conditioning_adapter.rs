@@ -4,24 +4,50 @@ use candle_nn::{self as nn, ops, Module, VarBuilder};
 
 use crate::model::attention::CrossAttention;
 
-use super::DecoderKind;
-
 /// Decoder-specific adapter: turns private context slots into generation-facing conditioning slots.
-/// This is the explicit bridge between context compressor and a concrete decoder family.
 pub struct DecoderConditioningAdapter {
     query_embed: nn::Embedding,
-    action_embed: nn::Embedding,
     cross_attn: CrossAttention,
     ln1: nn::LayerNorm,
     ln2: nn::LayerNorm,
     ff1: nn::Linear,
     ff2: nn::Linear,
+    extra_blocks: Vec<AdapterBlock>,
     index_proj: nn::Linear,
     gate_proj: nn::Linear,
     proj: nn::Linear,
+    output_norm: nn::RmsNorm,
     num_output_slots: usize,
     planner_dim: usize,
     compress_rate: usize,
+}
+
+struct AdapterBlock {
+    cross_attn: CrossAttention,
+    ln1: nn::LayerNorm,
+    ln2: nn::LayerNorm,
+    ff1: nn::Linear,
+    ff2: nn::Linear,
+}
+
+impl AdapterBlock {
+    fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
+        let hidden = (dim * 4).max(256);
+        Ok(Self {
+            cross_attn: CrossAttention::new(vb.pp("cross_attn"), dim, dim, 8)?,
+            ln1: nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?,
+            ln2: nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?,
+            ff1: nn::linear(dim, hidden, vb.pp("ff1"))?,
+            ff2: nn::linear(hidden, dim, vb.pp("ff2"))?,
+        })
+    }
+
+    fn forward(&self, slots: &Tensor, memory: &Tensor) -> Result<Tensor> {
+        let attended = self.cross_attn.forward(&self.ln1.forward(slots)?, memory)?;
+        let slots = (slots + attended)?;
+        let ff = self.ff1.forward(&self.ln2.forward(&slots)?)?.gelu()?;
+        (slots + self.ff2.forward(&ff)?).map_err(Into::into)
+    }
 }
 
 impl DecoderConditioningAdapter {
@@ -50,42 +76,44 @@ impl DecoderConditioningAdapter {
             anyhow::bail!("decoder adapter compress_rate must be non-zero");
         }
         let query_embed = nn::embedding(num_output_slots, planner_dim, vb.pp("query_embed"))?;
-        let action_embed = nn::embedding(
-            crate::model::action_classifier_head::NUM_ACTIONS,
-            planner_dim,
-            vb.pp("action_embed"),
-        )?;
         let cross_attn = CrossAttention::new(vb.pp("cross_attn"), planner_dim, planner_dim, 8)?;
         let ln1 = nn::layer_norm(planner_dim, 1e-5, vb.pp("ln1"))?;
         let ln2 = nn::layer_norm(planner_dim, 1e-5, vb.pp("ln2"))?;
         let ff_hidden = (planner_dim * 4).max(256);
         let ff1 = nn::linear(planner_dim, ff_hidden, vb.pp("ff1"))?;
         let ff2 = nn::linear(ff_hidden, planner_dim, vb.pp("ff2"))?;
+        let depth = std::env::var("TOFY_ADAPTER_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let mut extra_blocks = Vec::with_capacity(depth.saturating_sub(1));
+        for index in 1..depth {
+            extra_blocks.push(AdapterBlock::new(
+                vb.pp(format!("blocks.{index}")),
+                planner_dim,
+            )?);
+        }
         let index_proj = nn::linear(planner_dim, 1, vb.pp("index_proj"))?;
         let gate_proj = nn::linear(planner_dim, planner_dim, vb.pp("gate_proj"))?;
         let proj = nn::linear(planner_dim, model_dim, vb.pp("proj"))?;
+        let output_norm = nn::rms_norm(model_dim, 1e-6, vb.pp("output_norm"))?;
         Ok(Self {
             query_embed,
-            action_embed,
             cross_attn,
             ln1,
             ln2,
             ff1,
             ff2,
+            extra_blocks,
             index_proj,
             gate_proj,
             proj,
+            output_norm,
             num_output_slots,
             planner_dim,
             compress_rate,
         })
-    }
-
-    pub fn output_slots_for(kind: DecoderKind, context_slots: usize) -> usize {
-        match kind {
-            DecoderKind::TextGeneralist => context_slots.clamp(4, 8),
-            DecoderKind::CodeSpecialist => context_slots.clamp(16, 64),
-        }
     }
 
     pub fn compress_rate(&self) -> usize {
@@ -94,41 +122,14 @@ impl DecoderConditioningAdapter {
 
     /// Input: context slots [B, S, planner_dim]. Output: decoder conditioning slots [B, A, model_dim].
     pub fn forward(&self, context_slots: &Tensor) -> Result<Tensor> {
-        self.forward_with_action(context_slots, 0)
-    }
-
-    /// Builds action-aware local decoder-plan slots from global/planned context slots.
-    ///
-    /// The world/planner state is good at broad routing; this adapter specializes it into
-    /// short-horizon memory that the next decoder call can cross-attend to.
-    pub fn forward_with_action(&self, context_slots: &Tensor, action_id: u32) -> Result<Tensor> {
         let batch = context_slots.dim(0)?;
-        self.forward_with_actions(context_slots, &vec![action_id; batch])
-    }
-
-    pub fn forward_with_actions(
-        &self,
-        context_slots: &Tensor,
-        action_ids: &[u32],
-    ) -> Result<Tensor> {
-        let (batch, _, _) = context_slots.dims3()?;
-        if action_ids.len() != batch {
-            anyhow::bail!(
-                "decoder conditioning action count {} does not match batch {}",
-                action_ids.len(),
-                batch
-            );
-        }
         let memory = compressed_context_compressor(
             context_slots,
             self.num_output_slots,
             self.compress_rate,
         )?;
-        let action_ids = Tensor::from_vec(action_ids.to_vec(), (batch,), context_slots.device())?;
-        let action_state = self.action_embed.forward(&action_ids)?;
-        let action_memory = memory.broadcast_add(&action_state.unsqueeze(1)?)?;
-        let salience = ops::softmax(&self.index_proj.forward(&action_memory)?, D::Minus2)?;
-        let salience_memory = action_memory.broadcast_mul(&salience)?;
+        let salience = ops::softmax(&self.index_proj.forward(&memory)?, D::Minus2)?;
+        let salience_memory = memory.broadcast_mul(&salience)?;
         let global_memory = salience_memory.sum(1)?;
         let memory_gate = self
             .gate_proj
@@ -148,20 +149,22 @@ impl DecoderConditioningAdapter {
             self.planner_dim,
         ))?;
 
-        let action_queries = queries.broadcast_add(&action_state.unsqueeze(1)?)?;
-        let gated_queries = action_queries.broadcast_add(&global_memory.unsqueeze(1)?)?;
+        let gated_queries = queries.broadcast_add(&global_memory.unsqueeze(1)?)?;
         let normed = self.ln1.forward(&gated_queries)?;
         let attended = self
             .cross_attn
-            .forward(&normed, &action_memory)?
+            .forward(&normed, &memory)?
             .broadcast_mul(&memory_gate)?;
-        let slots = (action_queries + attended)?;
+        let slots = (queries + attended)?;
 
         let normed = self.ln2.forward(&slots)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
-        let slots = (slots + self.ff2.forward(&ff)?)?;
+        let mut slots = (slots + self.ff2.forward(&ff)?)?;
+        for block in &self.extra_blocks {
+            slots = block.forward(&slots, &memory)?;
+        }
 
-        Ok(self.proj.forward(&slots)?)
+        Ok(self.output_norm.forward(&self.proj.forward(&slots)?)?)
     }
 }
 

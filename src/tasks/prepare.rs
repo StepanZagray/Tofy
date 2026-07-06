@@ -4392,7 +4392,7 @@ fn probe_base_env(args: &OomProbeArgs, stage_name: &str) -> HashMap<String, Stri
     env.insert("TOFY_CONTEXT_HYBRID_MEMORY".to_string(), "1".to_string());
     env.insert(
         "TOFY_CONTEXT_HYBRID_EXACT_TAIL".to_string(),
-        crate::tasks::world::default_context_hybrid_exact_tail(args.max_seq, 1).to_string(),
+        crate::tasks::world_context::default_context_hybrid_exact_tail(args.max_seq, 1).to_string(),
     );
     env.insert(
         "TOFY_CONTEXT_HYBRID_BLOCK_SIZE".to_string(),
@@ -4559,7 +4559,7 @@ fn world_probe_cmd(
 ) -> Vec<String> {
     vec![
         args.binary.to_string_lossy().to_string(),
-        "--train-world".to_string(),
+        "--train-world-knowledge".to_string(),
         latent.to_string_lossy().to_string(),
         vocab.to_string_lossy().to_string(),
         data_path.to_string_lossy().to_string(),
