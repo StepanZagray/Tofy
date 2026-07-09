@@ -6,7 +6,7 @@
     "dim": 640,
     "latent_max_seq": 256,
     "world_max_seq": 384,
-    "bridge_max_seq": 512,
+    "bridge_max_seq": 256,
     "layers": 7,
     "heads": 8,
     "max_vocab": 8000,
@@ -16,10 +16,10 @@
     "latent_warmup_batch": 16,
     "world_batch": 32,
     "world_warmup_batch": 32,
-    "bridge_batch": 4,
+    "bridge_batch": 1,
     "latent_grad_accum": 4,
     "world_grad_accum": 8,
-    "bridge_grad_accum": 32
+    "bridge_grad_accum": 128
   },
   "48gb": {
     "latent_steps": 16000,

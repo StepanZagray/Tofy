@@ -445,6 +445,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     );
     set_env_default_owned("TOFY_WORLD_MAX_SEQ", defaults.world_max_seq.to_string());
     set_env_default_owned("TOFY_BRIDGE_MAX_SEQ", defaults.bridge_max_seq.to_string());
+    if cfg.profile == MemoryProfile::Minimal {
+        set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "none");
+    }
     set_env_default_owned(
         "TOFY_BRIDGE_GRAD_ACCUM",
         defaults.bridge_grad_accum.to_string(),
