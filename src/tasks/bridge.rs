@@ -197,8 +197,10 @@ pub(crate) fn qwen_weight_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 fn qwen_batch(
     tokenizer: &Tokenizer,
     rows: &[VeclabTaskRow],
+    max_seq: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    let max_seq = max_seq.max(2);
     let encoded = rows
         .iter()
         .map(|row| {
@@ -212,6 +214,10 @@ fn qwen_batch(
             let prompt_len = ids.len();
             ids.extend_from_slice(completion.get_ids());
             ids.push(qwen_eos_id(tokenizer)?);
+            if ids.len() > max_seq {
+                ids.truncate(max_seq);
+            }
+            let prompt_len = prompt_len.min(ids.len().saturating_sub(1));
             Ok((ids, prompt_len))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -544,7 +550,7 @@ fn val_losses(
         )?;
         adapter.forward(&slots)?
     };
-    let (input, labels, mask) = qwen_batch(tokenizer, rows, device)?;
+    let (input, labels, mask) = qwen_batch(tokenizer, rows, max_seq, device)?;
     let matched = token_loss(model, &input, &labels, &mask, &cond)?;
     let zero = token_loss(model, &input, &labels, &mask, &cond.zeros_like()?)?;
     Ok((util::scalar_f32(&matched)?, util::scalar_f32(&zero)?))
@@ -947,7 +953,7 @@ fn train(args: BridgeArgs) -> Result<()> {
             if StdRng::seed_from_u64(dropout_seed).random::<f64>() < dropout {
                 cond = cond.zeros_like()?;
             }
-            let (input, labels, mask) = qwen_batch(&tokenizer, &batch_rows, &device)?;
+            let (input, labels, mask) = qwen_batch(&tokenizer, &batch_rows, max_seq, &device)?;
             let function_ids = batch_rows
                 .iter()
                 .map(|row| row.function_id)
@@ -1115,7 +1121,8 @@ fn train(args: BridgeArgs) -> Result<()> {
                 let (norm_mean, cond_std) = conditioning_health(&telemetry_cond)?;
                 tb.add_scalar("cond/norm_mean", norm_mean, step);
                 tb.add_scalar("cond/std", cond_std, step);
-                let (telemetry_input, _, _) = qwen_batch(&tokenizer, telemetry_rows, &device)?;
+                let (telemetry_input, _, _) =
+                    qwen_batch(&tokenizer, telemetry_rows, max_seq, &device)?;
                 for (site, mean, max) in qwen.gate_statistics(&telemetry_input, &telemetry_cond)? {
                     tb.add_scalar(&format!("gate/site_{site}_mean"), mean, step);
                     tb.add_scalar(&format!("gate/site_{site}_max"), max, step);
