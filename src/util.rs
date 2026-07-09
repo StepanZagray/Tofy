@@ -1405,6 +1405,41 @@ pub fn optimizer_step_from_accumulated<O: Optimizer>(
     Ok(())
 }
 
+pub fn accumulated_gradient_count(accumulated: &Option<GradStore>, train_vars: &[Var]) -> usize {
+    accumulated
+        .as_ref()
+        .map(|grads| {
+            train_vars
+                .iter()
+                .filter(|var| grads.get(var).is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Differentiable LayerNorm for training. Candle 0.10's fused normalization
+/// kernels are forward-only and therefore sever autograd.
+pub fn layer_norm_diff(norm: &candle_nn::LayerNorm, x: &Tensor) -> Result<Tensor> {
+    let x_dtype = x.dtype();
+    let internal_dtype = match x_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        dtype => dtype,
+    };
+    let hidden = x.dim(candle_core::D::Minus1)?;
+    let mut x = x.to_dtype(internal_dtype)?;
+    if norm.remove_mean() {
+        let mean = (x.sum_keepdim(candle_core::D::Minus1)? / hidden as f64)?;
+        x = x.broadcast_sub(&mean)?;
+    }
+    let variance = (x.sqr()?.sum_keepdim(candle_core::D::Minus1)? / hidden as f64)?;
+    let normalized = x.broadcast_div(&(variance + norm.eps())?.sqrt()?)?;
+    let output = normalized.to_dtype(x_dtype)?.broadcast_mul(norm.weight())?;
+    match norm.bias() {
+        Some(bias) => output.broadcast_add(bias).map_err(Into::into),
+        None => Ok(output),
+    }
+}
+
 /// Linear-warmup + cosine-decay learning-rate schedule shared by the training
 /// stages. Controlled by `TOFY_LR_SCHEDULE` (`cosine` default, `constant` to
 /// opt out), `TOFY_LR_WARMUP_STEPS`, and `TOFY_LR_MIN_RATIO`.

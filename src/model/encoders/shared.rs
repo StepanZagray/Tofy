@@ -4,6 +4,7 @@ use candle_nn::{self as nn, VarBuilder};
 
 use super::super::attention::{positional_encoding, LocalTransformerBlock, TransformerBlock};
 use super::pooling::MultiQueryPool;
+use crate::util;
 
 const DEFAULT_CHUNK_SIZE: usize = 16;
 const DEFAULT_LOCAL_WINDOW: usize = 16;
@@ -64,6 +65,9 @@ pub(crate) struct EncoderBackbone {
     token_ln_final: nn::LayerNorm,
     chunk_ln_final: nn::LayerNorm,
     global_ln_final: nn::LayerNorm,
+    token_projection: nn::Linear,
+    chunk_projection: nn::Linear,
+    global_projection: nn::Linear,
     pool: MultiQueryPool,
     dim: usize,
     chunk_size: usize,
@@ -108,6 +112,11 @@ impl EncoderBackbone {
         let token_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("token_ln_final"))?;
         let chunk_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("chunk_ln_final"))?;
         let global_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("global_ln_final"))?;
+        // LeWorldModel projects after the encoder's final normalization so
+        // SIGReg can control latent scale and covariance.
+        let token_projection = nn::linear(dim, dim, vb.pp("token_projection"))?;
+        let chunk_projection = nn::linear(dim, dim, vb.pp("chunk_projection"))?;
+        let global_projection = nn::linear(dim, dim, vb.pp("global_projection"))?;
         let pool = MultiQueryPool::new(vb.pp("pool"), dim, num_heads, NUM_POOL_QUERIES)?;
         Ok(Self {
             embed,
@@ -118,6 +127,9 @@ impl EncoderBackbone {
             token_ln_final,
             chunk_ln_final,
             global_ln_final,
+            token_projection,
+            chunk_projection,
+            global_projection,
             pool,
             dim,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -210,14 +222,20 @@ impl EncoderBackbone {
             .narrow(1, 0, seq_len)?;
         let token_context = self.token_context_proj.forward(&chunk_context)?;
         let token_states = self
-            .token_ln_final
-            .forward(&token_states.broadcast_add(&token_context)?)?
+            .token_projection
+            .forward(&util::layer_norm_diff(
+                &self.token_ln_final,
+                &token_states.broadcast_add(&token_context)?,
+            )?)?
             .broadcast_mul(&token_mask_3d)?;
         let chunk_states = self
-            .chunk_ln_final
-            .forward(&chunk_states)?
+            .chunk_projection
+            .forward(&util::layer_norm_diff(&self.chunk_ln_final, &chunk_states)?)?
             .broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
-        let global_states = self.global_ln_final.forward(&global_states)?;
+        let global_states = self.global_projection.forward(&util::layer_norm_diff(
+            &self.global_ln_final,
+            &global_states,
+        )?)?;
         let pool_memory = Tensor::cat(
             &[
                 token_states.clone(),

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{tasks, util};
 
-const WORLD_TEXT_DATA: &str = "data/fictional/veclab_knowledge.txt";
+const WORLD_TEXT_DATA: &str = "data/fictional/veclab_knowledge_train.txt";
 const ENCODER_DATA: &str = "data/fictional/veclab_encoder_mix.txt";
 const EVAL_SUITE: &str = "eval/veclab_eval.jsonl";
 const VECLAB_TASKS: &str = "data/fictional/veclab_tasks_train.txt";
@@ -87,7 +87,8 @@ struct PipelinePaths {
     latent_model: PathBuf,
     world_model: PathBuf,
     world_encoder_model: PathBuf,
-    bridge_model: PathBuf,
+    bridge_context_model: PathBuf,
+    bridge_weights_model: PathBuf,
     encoder_cache_vocab: PathBuf,
 }
 
@@ -115,7 +116,8 @@ struct PipelineMeta<'a> {
     latent_model: String,
     world_model: String,
     world_encoder_model: String,
-    bridge_model: String,
+    bridge_context_model: String,
+    bridge_weights_model: String,
     encoder_data: &'a str,
     world_data: &'a str,
     eval_suite: &'a str,
@@ -599,7 +601,8 @@ fn resolve_pipeline_paths(
     let latent_model = latent_stage_dir.join("model.safetensors");
     let world_model = world_stage_dir.join("model.safetensors");
     let world_encoder_model = world_stage_dir.join("model.encoder.safetensors");
-    let bridge_model = bridge_stage_dir.join("model.safetensors");
+    let bridge_context_model = bridge_stage_dir.join("context.safetensors");
+    let bridge_weights_model = bridge_stage_dir.join("weights.safetensors");
     let encoder_cache_vocab =
         vocab_dir().join(format!("vocab_encoder_{}_default.txt", defaults.max_vocab));
 
@@ -613,7 +616,8 @@ fn resolve_pipeline_paths(
         latent_model,
         world_model,
         world_encoder_model,
-        bridge_model,
+        bridge_context_model,
+        bridge_weights_model,
         encoder_cache_vocab,
     })
 }
@@ -631,7 +635,8 @@ fn prepare_cache_paths(defaults: &ProfileDefaults) -> PipelinePaths {
         latent_model: run_root.join("latent/model.safetensors"),
         world_model: run_root.join("world/model.safetensors"),
         world_encoder_model: run_root.join("world/model.encoder.safetensors"),
-        bridge_model: run_root.join("bridge/model.safetensors"),
+        bridge_context_model: run_root.join("bridge/context.safetensors"),
+        bridge_weights_model: run_root.join("bridge/weights.safetensors"),
         encoder_cache_vocab,
         run_root,
     }
@@ -810,56 +815,203 @@ fn train_bridge(
     cfg: &PipelineConfig,
     defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 4/5: Qwen bridge ==");
-    if stage_complete(cfg, &paths.bridge_model, "bridge", defaults.bridge_steps)? {
-        println!(
-            "Skipping bridge; resume state already reached {} steps.",
-            defaults.bridge_steps
-        );
-        return Ok(());
-    }
+    println!("== Stage 4/5: Qwen context and weights bridges ==");
     let qwen_dir = std::env::var("TOFY_QWEN_DIR")
         .context("TOFY_QWEN_DIR must point to the Qwen3-1.7B-Base model directory")?;
-    let args = vec![
-        "jepa_ai".to_string(),
-        "--train-bridge".to_string(),
-        qwen_dir,
-        paths.world_encoder_model.to_string_lossy().to_string(),
-        matched_encoder_vocab(paths).to_string_lossy().to_string(),
-        paths.world_model.to_string_lossy().to_string(),
-        VECLAB_TASKS.to_string(),
-        defaults.bridge_steps.to_string(),
-        defaults.bridge_batch.to_string(),
-        paths.bridge_model.to_string_lossy().to_string(),
-    ];
-    with_stage("bridge", || tasks::bridge::try_run_train_bridge(&args))?;
-    ensure_file(&paths.bridge_model)?;
+    let old_regime = std::env::var_os("TOFY_BRIDGE_REGIME");
+    for (stage, regime, output) in [
+        ("bridge_context", "context", &paths.bridge_context_model),
+        ("bridge_weights", "weights", &paths.bridge_weights_model),
+    ] {
+        std::env::set_var("TOFY_BRIDGE_REGIME", regime);
+        if stage_complete(cfg, output, stage, defaults.bridge_steps)? {
+            println!(
+                "Skipping {stage}; resume state reached {} steps.",
+                defaults.bridge_steps
+            );
+            continue;
+        }
+        let args = vec![
+            "jepa_ai".to_string(),
+            "--train-bridge".to_string(),
+            qwen_dir.clone(),
+            paths.world_encoder_model.to_string_lossy().to_string(),
+            matched_encoder_vocab(paths).to_string_lossy().to_string(),
+            paths.world_model.to_string_lossy().to_string(),
+            VECLAB_TASKS.to_string(),
+            defaults.bridge_steps.to_string(),
+            defaults.bridge_batch.to_string(),
+            output.to_string_lossy().to_string(),
+        ];
+        with_stage(stage, || {
+            tasks::bridge::try_run_train_bridge(&append_resume(args, cfg.resume))
+        })?;
+        ensure_file(output)?;
+    }
+    match old_regime {
+        Some(value) => std::env::set_var("TOFY_BRIDGE_REGIME", value),
+        None => std::env::remove_var("TOFY_BRIDGE_REGIME"),
+    }
     Ok(())
 }
 
 fn final_eval(
     paths: &PipelinePaths,
-    _cfg: &PipelineConfig,
-    _defaults: &ProfileDefaults,
+    cfg: &PipelineConfig,
+    defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 5/5: Go eval suite ==");
+    println!("== Stage 5/5: experimental ladder and controls ==");
     let qwen_dir = std::env::var("TOFY_QWEN_DIR")?;
-    let args = vec![
+    let old_mode = std::env::var_os("TOFY_EVAL_MODE");
+    let old_regime = std::env::var_os("TOFY_BRIDGE_REGIME");
+    let old_static = std::env::var_os("TOFY_STATIC_SOFT_PREFIX");
+    let old_lora = std::env::var_os("TOFY_QWEN_LORA_RANK");
+    std::env::remove_var("TOFY_STATIC_SOFT_PREFIX");
+    std::env::remove_var("TOFY_QWEN_LORA_RANK");
+    for (name, mode, regime, bridge_model) in [
+        ("floor", "floor", "weights", &paths.bridge_weights_model),
+        ("rag_ceiling", "rag", "weights", &paths.bridge_weights_model),
+        (
+            "latent_channel",
+            "bridge",
+            "context",
+            &paths.bridge_context_model,
+        ),
+        (
+            "knowledge_in_weights",
+            "bridge",
+            "weights",
+            &paths.bridge_weights_model,
+        ),
+    ] {
+        std::env::set_var("TOFY_EVAL_MODE", mode);
+        std::env::set_var("TOFY_BRIDGE_REGIME", regime);
+        let args = vec![
+            "jepa_ai".to_string(),
+            "--eval-bridge".to_string(),
+            qwen_dir.clone(),
+            bridge_model.to_string_lossy().to_string(),
+            paths.world_encoder_model.to_string_lossy().to_string(),
+            matched_encoder_vocab(paths).to_string_lossy().to_string(),
+            paths.world_model.to_string_lossy().to_string(),
+            EVAL_SUITE.to_string(),
+            paths
+                .eval_stage_dir
+                .join(format!("{name}.json"))
+                .to_string_lossy()
+                .to_string(),
+        ];
+        with_stage(&format!("eval_{name}"), || {
+            tasks::eval::try_run_code_eval(&args)
+        })?;
+    }
+
+    let lora_data = paths.eval_stage_dir.join("lora_train.txt");
+    let mut lora_rows = fs::read_to_string(WORLD_TEXT_DATA)?;
+    lora_rows.push_str(&fs::read_to_string(VECLAB_TASKS)?);
+    write_text_atomic(&lora_data, &lora_rows)?;
+    for (name, static_prefix, lora_rank) in [
+        ("static_prefix", true, None),
+        ("lora_r16", false, Some(16)),
+        ("lora_r512", false, Some(512)),
+    ] {
+        if static_prefix {
+            std::env::set_var("TOFY_STATIC_SOFT_PREFIX", "true");
+        } else {
+            std::env::remove_var("TOFY_STATIC_SOFT_PREFIX");
+        }
+        match lora_rank {
+            Some(rank) => std::env::set_var("TOFY_QWEN_LORA_RANK", rank.to_string()),
+            None => std::env::remove_var("TOFY_QWEN_LORA_RANK"),
+        }
+        std::env::set_var("TOFY_BRIDGE_REGIME", "weights");
+        let model = paths.eval_stage_dir.join(format!("{name}.safetensors"));
+        if !stage_complete(cfg, &model, name, defaults.bridge_steps)? {
+            let train_args = vec![
+                "jepa_ai".to_string(),
+                "--train-bridge".to_string(),
+                qwen_dir.clone(),
+                paths.world_encoder_model.to_string_lossy().to_string(),
+                matched_encoder_vocab(paths).to_string_lossy().to_string(),
+                paths.world_model.to_string_lossy().to_string(),
+                if lora_rank.is_some() {
+                    lora_data.to_string_lossy().to_string()
+                } else {
+                    VECLAB_TASKS.to_string()
+                },
+                defaults.bridge_steps.to_string(),
+                defaults.bridge_batch.to_string(),
+                model.to_string_lossy().to_string(),
+            ];
+            with_stage(name, || {
+                tasks::bridge::try_run_train_bridge(&append_resume(train_args, cfg.resume))
+            })?;
+        }
+        std::env::set_var(
+            "TOFY_EVAL_MODE",
+            if lora_rank.is_some() {
+                "unconditioned"
+            } else {
+                "bridge"
+            },
+        );
+        let eval_args = vec![
+            "jepa_ai".to_string(),
+            "--eval-bridge".to_string(),
+            qwen_dir.clone(),
+            model.to_string_lossy().to_string(),
+            paths.world_encoder_model.to_string_lossy().to_string(),
+            matched_encoder_vocab(paths).to_string_lossy().to_string(),
+            paths.world_model.to_string_lossy().to_string(),
+            EVAL_SUITE.to_string(),
+            paths
+                .eval_stage_dir
+                .join(format!("{name}.json"))
+                .to_string_lossy()
+                .to_string(),
+        ];
+        with_stage(&format!("eval_{name}"), || {
+            tasks::eval::try_run_code_eval(&eval_args)
+        })?;
+    }
+
+    std::env::remove_var("TOFY_STATIC_SOFT_PREFIX");
+    std::env::remove_var("TOFY_QWEN_LORA_RANK");
+    std::env::set_var("TOFY_BRIDGE_REGIME", "weights");
+    let probe_output = paths.eval_stage_dir.join("channel_probe.safetensors");
+    let probe_args = vec![
         "jepa_ai".to_string(),
-        "--eval-bridge".to_string(),
+        "--train-channel-probe".to_string(),
         qwen_dir,
-        paths.bridge_model.to_string_lossy().to_string(),
+        paths.bridge_weights_model.to_string_lossy().to_string(),
         paths.world_encoder_model.to_string_lossy().to_string(),
         matched_encoder_vocab(paths).to_string_lossy().to_string(),
         paths.world_model.to_string_lossy().to_string(),
-        EVAL_SUITE.to_string(),
-        paths
-            .eval_stage_dir
-            .join("report.json")
-            .to_string_lossy()
-            .to_string(),
+        VECLAB_TASKS.to_string(),
+        "data/fictional/veclab_tasks_heldout.txt".to_string(),
+        probe_output.to_string_lossy().to_string(),
+        "1000".to_string(),
     ];
-    with_stage("eval", || tasks::eval::try_run_code_eval(&args))
+    if !probe_output.exists() {
+        with_stage("channel_probe", || tasks::probe::try_run(&probe_args))?;
+    }
+    match old_mode {
+        Some(value) => std::env::set_var("TOFY_EVAL_MODE", value),
+        None => std::env::remove_var("TOFY_EVAL_MODE"),
+    }
+    match old_regime {
+        Some(value) => std::env::set_var("TOFY_BRIDGE_REGIME", value),
+        None => std::env::remove_var("TOFY_BRIDGE_REGIME"),
+    }
+    match old_static {
+        Some(value) => std::env::set_var("TOFY_STATIC_SOFT_PREFIX", value),
+        None => std::env::remove_var("TOFY_STATIC_SOFT_PREFIX"),
+    }
+    match old_lora {
+        Some(value) => std::env::set_var("TOFY_QWEN_LORA_RANK", value),
+        None => std::env::remove_var("TOFY_QWEN_LORA_RANK"),
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1439,7 +1591,9 @@ fn canonical_skip_stage(stage: &str) -> String {
 
 fn skip_trained_stage(cfg: &PipelineConfig, stage: &str) -> bool {
     let stage = canonical_skip_stage(stage);
-    cfg.skip_trained_stages.iter().any(|skip| skip == &stage)
+    cfg.skip_trained_stages
+        .iter()
+        .any(|skip| skip == &stage || (skip == "bridge" && stage.starts_with("bridge_")))
 }
 
 fn resolve_run_root(selector: &str) -> Result<PathBuf> {
@@ -1524,7 +1678,8 @@ fn write_meta(
         latent_model: paths.latent_model.to_string_lossy().to_string(),
         world_model: paths.world_model.to_string_lossy().to_string(),
         world_encoder_model: paths.world_encoder_model.to_string_lossy().to_string(),
-        bridge_model: paths.bridge_model.to_string_lossy().to_string(),
+        bridge_context_model: paths.bridge_context_model.to_string_lossy().to_string(),
+        bridge_weights_model: paths.bridge_weights_model.to_string_lossy().to_string(),
         encoder_data: ENCODER_DATA,
         world_data: WORLD_TEXT_DATA,
         eval_suite: EVAL_SUITE,

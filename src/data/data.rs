@@ -3338,7 +3338,7 @@ mod tests {
         assert_eq!(input.to_vec2::<u32>()?[0], vec![12, 13, 14, 20, 21, 0]);
         assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 20, 21, 22, 0]);
         assert_eq!(
-            mask.to_vec2::<f32>()?[0],
+            crate::util::vec2_f32(&mask)?[0],
             vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0]
         );
         Ok(())
@@ -3356,7 +3356,7 @@ mod tests {
         let (_input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
 
         assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 0, 0, 0, 0]);
-        assert_eq!(mask.to_vec2::<f32>()?[0], vec![0.0; 6]);
+        assert_eq!(crate::util::vec2_f32(&mask)?[0], vec![0.0; 6]);
         Ok(())
     }
 
@@ -3374,7 +3374,7 @@ mod tests {
         assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
         assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
         assert_eq!(
-            mask.to_vec2::<f32>()?[0],
+            crate::util::vec2_f32(&mask)?[0],
             vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         );
         Ok(())
@@ -3391,7 +3391,7 @@ mod tests {
         assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
         assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
         assert_eq!(
-            mask.to_vec2::<f32>()?[0],
+            crate::util::vec2_f32(&mask)?[0],
             vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         );
         Ok(())
@@ -3411,7 +3411,7 @@ mod tests {
         assert_eq!(input.to_vec2::<u32>()?[0], vec![10, 11, 20, 21, 0, 0]);
         assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 20, 21, 22, 0, 0]);
         assert_eq!(
-            mask.to_vec2::<f32>()?[0],
+            crate::util::vec2_f32(&mask)?[0],
             vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
         );
         Ok(())

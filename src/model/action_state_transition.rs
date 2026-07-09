@@ -24,11 +24,14 @@ impl TransitionBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln1.forward(x)?;
+        let normed = crate::util::layer_norm_diff(&self.ln1, x)?;
         let x = (x + self.attn.forward(&normed)?)?;
-        let ff = self
-            .ff2
-            .forward(&self.ff1.forward(&self.ln2.forward(&x)?)?.gelu()?)?;
+        let ff = self.ff2.forward(
+            &self
+                .ff1
+                .forward(&crate::util::layer_norm_diff(&self.ln2, &x)?)?
+                .gelu()?,
+        )?;
         Ok((x + ff)?)
     }
 }
@@ -69,7 +72,7 @@ impl ActionStateTransition {
             hidden = block.forward(&hidden)?;
         }
         self.delta_proj
-            .forward(&self.delta_ln.forward(&hidden)?)?
+            .forward(&crate::util::layer_norm_diff(&self.delta_ln, &hidden)?)?
             .tanh()
             .map_err(Into::into)
     }
@@ -106,6 +109,24 @@ mod tests {
         let state = Tensor::zeros((2, 3, 16), DType::F32, &device)?;
         let out = transition.forward(&state)?;
         assert_eq!(out.dims(), state.dims());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_prediction_loss_reaches_transition_parameters() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let transition =
+            ActionStateTransition::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), 16)?;
+        let state = Tensor::randn(0f32, 1f32, (2, 3, 16), &device)?;
+        let target = Tensor::randn(0f32, 1f32, (2, 3, 16), &device)?;
+        let loss = crate::model::prediction_loss(&transition.forward(&state)?, &target)?;
+        let grads = loss.backward()?;
+        let variables = varmap.all_vars();
+        assert!(!variables.is_empty());
+        assert!(variables
+            .iter()
+            .all(|variable| grads.get(variable).is_some()));
         Ok(())
     }
 }

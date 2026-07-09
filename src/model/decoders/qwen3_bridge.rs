@@ -7,12 +7,15 @@ use candle_transformers::models::qwen3::Config;
 use candle_transformers::utils::repeat_kv;
 
 use crate::model::attention::{AttentionKvCache, CrossAttention};
+use crate::util;
 
 struct SelfAttention {
     q: nn::Linear,
     k: nn::Linear,
     v: nn::Linear,
     o: nn::Linear,
+    q_lora: Option<Lora>,
+    v_lora: Option<Lora>,
     q_norm: nn::RmsNorm,
     k_norm: nn::RmsNorm,
     heads: usize,
@@ -20,6 +23,32 @@ struct SelfAttention {
     head_dim: usize,
     rope_sin: Tensor,
     rope_cos: Tensor,
+}
+
+struct Lora {
+    a: nn::Linear,
+    b: nn::Linear,
+    scale: f64,
+}
+
+impl Lora {
+    fn new(input: usize, output: usize, rank: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(Self {
+            a: nn::linear_no_bias(input, rank, vb.pp("a"))?,
+            b: nn::Linear::new(
+                vb.get_with_hints((output, rank), "b.weight", nn::Init::Const(0.0))?,
+                None,
+            ),
+            scale: 16.0 / rank as f64,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.b
+            .forward(&self.a.forward(x)?)?
+            .affine(self.scale, 0.0)
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Clone)]
@@ -35,7 +64,12 @@ pub struct Qwen3BridgeCache {
 }
 
 impl SelfAttention {
-    fn new(cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(
+        cfg: &Config,
+        vb: VarBuilder<'_>,
+        lora_vb: Option<VarBuilder<'_>>,
+        lora_rank: usize,
+    ) -> Result<Self> {
         let linear = |input, output, vb| {
             if cfg.attention_bias {
                 nn::linear(input, output, vb)
@@ -74,6 +108,28 @@ impl SelfAttention {
                 cfg.hidden_size,
                 vb.pp("o_proj"),
             )?,
+            q_lora: lora_vb
+                .as_ref()
+                .map(|vb| {
+                    Lora::new(
+                        cfg.hidden_size,
+                        cfg.num_attention_heads * cfg.head_dim,
+                        lora_rank,
+                        vb.pp("q"),
+                    )
+                })
+                .transpose()?,
+            v_lora: lora_vb
+                .as_ref()
+                .map(|vb| {
+                    Lora::new(
+                        cfg.hidden_size,
+                        cfg.num_key_value_heads * cfg.head_dim,
+                        lora_rank,
+                        vb.pp("v"),
+                    )
+                })
+                .transpose()?,
             q_norm: nn::rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?,
             k_norm: nn::rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?,
             heads: cfg.num_attention_heads,
@@ -86,12 +142,15 @@ impl SelfAttention {
 
     fn forward(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (batch, seq, _) = x.dims3()?;
+        let q_proj = self.q.forward(x)?;
+        let q_proj = match &self.q_lora {
+            Some(lora) => q_proj.broadcast_add(&lora.forward(x)?)?,
+            None => q_proj,
+        };
         let q = self
             .q_norm
-            .forward(
-                &self
-                    .q
-                    .forward(x)?
+            .forward_diff(
+                &q_proj
                     .reshape((batch, seq, self.heads, self.head_dim))?
                     .transpose(1, 2)?
                     .flatten(0, 2)?,
@@ -99,7 +158,7 @@ impl SelfAttention {
             .reshape((batch, self.heads, seq, self.head_dim))?;
         let k = self
             .k_norm
-            .forward(
+            .forward_diff(
                 &self
                     .k
                     .forward(x)?
@@ -108,9 +167,12 @@ impl SelfAttention {
                     .flatten(0, 2)?,
             )?
             .reshape((batch, self.kv_heads, seq, self.head_dim))?;
-        let v = self
-            .v
-            .forward(x)?
+        let v_proj = self.v.forward(x)?;
+        let v_proj = match &self.v_lora {
+            Some(lora) => v_proj.broadcast_add(&lora.forward(x)?)?,
+            None => v_proj,
+        };
+        let v = v_proj
             .reshape((batch, seq, self.kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let sin = self.rope_sin.narrow(0, 0, seq)?;
@@ -141,12 +203,15 @@ impl SelfAttention {
         position: usize,
     ) -> Result<(Tensor, LayerKvCache)> {
         let (batch, seq, _) = x.dims3()?;
+        let q_proj = self.q.forward(x)?;
+        let q_proj = match &self.q_lora {
+            Some(lora) => q_proj.broadcast_add(&lora.forward(x)?)?,
+            None => q_proj,
+        };
         let q = self
             .q_norm
             .forward(
-                &self
-                    .q
-                    .forward(x)?
+                &q_proj
                     .reshape((batch, seq, self.heads, self.head_dim))?
                     .transpose(1, 2)?
                     .flatten(0, 2)?,
@@ -163,9 +228,12 @@ impl SelfAttention {
                     .flatten(0, 2)?,
             )?
             .reshape((batch, self.kv_heads, seq, self.head_dim))?;
-        let v = self
-            .v
-            .forward(x)?
+        let v_proj = self.v.forward(x)?;
+        let v_proj = match &self.v_lora {
+            Some(lora) => v_proj.broadcast_add(&lora.forward(x)?)?,
+            None => v_proj,
+        };
+        let v = v_proj
             .reshape((batch, seq, self.kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let sin = self.rope_sin.narrow(0, position, seq)?;
@@ -262,7 +330,7 @@ impl CrossSite {
     }
 
     fn forward(&self, x: &Tensor, conditioning: &Tensor) -> Result<Tensor> {
-        let normed = self.norm.forward(x)?;
+        let normed = self.norm.forward_diff(x)?;
         let gate = nn::ops::sigmoid(&self.gate.forward(&normed)?)?;
         let update = self
             .attention
@@ -276,7 +344,7 @@ impl CrossSite {
         x: &Tensor,
         conditioning: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let normed = self.norm.forward(x)?;
+        let normed = self.norm.forward_diff(x)?;
         let gate = nn::ops::sigmoid(&self.gate.forward(&normed)?)?;
         let update = self
             .attention
@@ -290,7 +358,7 @@ impl CrossSite {
     }
 
     fn forward_precomputed(&self, x: &Tensor, conditioning: &AttentionKvCache) -> Result<Tensor> {
-        let normed = self.norm.forward(x)?;
+        let normed = self.norm.forward_diff(x)?;
         let gate = nn::ops::sigmoid(&self.gate.forward(&normed)?)?;
         let update = self
             .attention
@@ -338,6 +406,10 @@ impl Qwen3Bridge {
         if every == 0 {
             bail!("TOFY_QWEN_CROSS_EVERY must be non-zero");
         }
+        let lora_rank = std::env::var("TOFY_QWEN_LORA_RANK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
         let tokens = nn::embedding(
             cfg.vocab_size,
             cfg.hidden_size,
@@ -347,7 +419,12 @@ impl Qwen3Bridge {
         for index in 0..cfg.num_hidden_layers {
             let vb = base_vb.pp(format!("model.layers.{index}"));
             layers.push(Layer {
-                attention: SelfAttention::new(cfg, vb.pp("self_attn"))?,
+                attention: SelfAttention::new(
+                    cfg,
+                    vb.pp("self_attn"),
+                    (lora_rank > 0).then(|| train_vb.pp(format!("lora_layers.{index}"))),
+                    lora_rank,
+                )?,
                 mlp: Mlp::new(cfg, vb.pp("mlp"))?,
                 input_norm: nn::rms_norm(
                     cfg.hidden_size,
@@ -359,7 +436,7 @@ impl Qwen3Bridge {
                     cfg.rms_norm_eps,
                     vb.pp("post_attention_layernorm"),
                 )?,
-                cross: if (index + 1) % every == 0 {
+                cross: if lora_rank == 0 && (index + 1) % every == 0 {
                     Some(CrossSite::new(
                         cfg.hidden_size,
                         cfg.rms_norm_eps,
@@ -395,15 +472,15 @@ impl Qwen3Bridge {
         for layer in &self.layers {
             let update = layer
                 .attention
-                .forward(&layer.input_norm.forward(&x)?, &mask)?;
+                .forward(&layer.input_norm.forward_diff(&x)?, &mask)?;
             x = (x + update)?;
             if let Some(cross) = &layer.cross {
                 x = cross.forward(&x, conditioning)?;
             }
-            let update = layer.mlp.forward(&layer.post_norm.forward(&x)?)?;
+            let update = layer.mlp.forward(&layer.post_norm.forward_diff(&x)?)?;
             x = (x + update)?;
         }
-        let hidden = self.norm.forward(&x)?;
+        let hidden = self.norm.forward_diff(&x)?;
         match &self.lm_head {
             Some(head) => head.forward(&hidden).map_err(Into::into),
             None => tied_lm_head(&hidden, self.tokens.embeddings()),
@@ -428,19 +505,19 @@ impl Qwen3Bridge {
         for layer in &self.layers {
             let update = layer
                 .attention
-                .forward(&layer.input_norm.forward(&x)?, &mask)?;
+                .forward(&layer.input_norm.forward_diff(&x)?, &mask)?;
             x = (x + update)?;
             if let Some(cross) = &layer.cross {
                 let (next, mean, max) = cross.forward_with_gate_stats(&x, conditioning)?;
                 x = next;
                 stats.push((
                     site_index,
-                    mean.to_dtype(DType::F32)?.to_scalar::<f32>()?,
-                    max.to_dtype(DType::F32)?.to_scalar::<f32>()?,
+                    util::scalar_f32(&mean)?,
+                    util::scalar_f32(&max)?,
                 ));
                 site_index += 1;
             }
-            let update = layer.mlp.forward(&layer.post_norm.forward(&x)?)?;
+            let update = layer.mlp.forward(&layer.post_norm.forward_diff(&x)?)?;
             x = (x + update)?;
         }
         Ok(stats)
@@ -533,8 +610,25 @@ mod tests {
             let grad = gradients
                 .get(var)
                 .with_context(|| format!("missing gradient for {name}"))?;
-            let magnitude = grad.abs()?.sum_all()?.to_scalar::<f32>()?;
+            let magnitude = util::scalar_f32(&grad.abs()?.sum_all()?)?;
             assert!(magnitude > 0.0, "zero gradient for {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lora_projection_receives_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let vars = VarMap::new();
+        let lora = Lora::new(8, 8, 2, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        let input = Tensor::randn(0f32, 1f32, (2, 3, 8), &device)?;
+        let grads = lora.forward(&input)?.sqr()?.sum_all()?.backward()?;
+        let data = vars
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("varmap lock poisoned"))?;
+        for (name, var) in data.iter() {
+            assert!(grads.get(var).is_some(), "missing LoRA gradient for {name}");
         }
         Ok(())
     }
@@ -561,8 +655,12 @@ mod tests {
             use_sliding_window: false,
             hidden_act: Activation::Silu,
         };
-        let attention =
-            SelfAttention::new(&cfg, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        let attention = SelfAttention::new(
+            &cfg,
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+            None,
+            0,
+        )?;
         let x = Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?;
         let mask = Tensor::from_vec(
             (0..4)
@@ -574,7 +672,7 @@ mod tests {
         let full = attention.forward(&x, &mask)?.narrow(1, 3, 1)?;
         let (_, cache) = attention.forward_cached(&x.narrow(1, 0, 3)?, None, 0)?;
         let (cached, _) = attention.forward_cached(&x.narrow(1, 3, 1)?, Some(&cache), 3)?;
-        let error = (&full - &cached)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let error = util::scalar_f32(&(&full - &cached)?.abs()?.max_all()?)?;
         assert!(error < 1e-5, "cached attention max error {error}");
         Ok(())
     }

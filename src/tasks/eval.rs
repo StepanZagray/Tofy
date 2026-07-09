@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::tasks::bridge::BridgeRuntime;
 use crate::tasks::prepare_veclab::MODULE_PATH;
 use crate::tasks::veclab::{load_docs_map, VeclabTaskRow};
-use crate::tasks::world_support::batch_shuffled_conditioning_latent;
+use crate::tasks::world_support::different_group_conditioning_latent;
 
 #[derive(Clone, Deserialize)]
 struct EvalTask {
@@ -101,7 +101,10 @@ fn load_suite(path: &Path) -> Result<Vec<EvalTask>> {
 fn strip_fence(text: &str) -> String {
     let text = text.trim();
     if !text.starts_with("```") {
-        return text.to_string();
+        return text
+            .find("package solution")
+            .map(|start| text[start..].trim().to_string())
+            .unwrap_or_else(|| text.to_string());
     }
     let body = text.split_once('\n').map(|(_, body)| body).unwrap_or("");
     body.rsplit_once("```")
@@ -238,14 +241,19 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         .collect::<Vec<_>>();
     let cond_parts = rows
         .chunks(8)
-        .map(|chunk| runtime.conditioning(chunk))
+        .map(|chunk| runtime.conditioning(chunk).map(|tensor| tensor.detach()))
         .collect::<Result<Vec<_>>>()?;
     let cond_refs = cond_parts.iter().collect::<Vec<_>>();
     let all_cond = candle_core::Tensor::cat(&cond_refs, 0)?;
-    let shuffled = batch_shuffled_conditioning_latent(&all_cond)?;
+    let function_ids = rows.iter().map(|row| row.function_id).collect::<Vec<_>>();
+    let shuffled = different_group_conditioning_latent(&all_cond, &function_ids, 7)?;
+    let swapped = different_group_conditioning_latent(&all_cond, &function_ids, 1)?;
     let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
-    if !matches!(eval_mode.as_str(), "bridge" | "floor" | "rag") {
-        bail!("TOFY_EVAL_MODE must be bridge, floor, or rag");
+    if !matches!(
+        eval_mode.as_str(),
+        "bridge" | "floor" | "rag" | "unconditioned"
+    ) {
+        bail!("TOFY_EVAL_MODE must be bridge, floor, rag, or unconditioned");
     }
     let mut totals: BTreeMap<(String, String), Metrics> = BTreeMap::new();
     let failure_code_limit = std::env::var("TOFY_EVAL_FAILURE_CODE_LIMIT")
@@ -256,14 +264,14 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     let mut task_results = Vec::new();
     for (index, task) in tasks.iter().enumerate() {
         let matched = all_cond.narrow(0, index, 1)?;
-        let conditions = if eval_mode == "floor" {
-            vec![("zeroed", matched.zeros_like()?)]
+        let conditions = if eval_mode != "bridge" {
+            vec![("base", matched.zeros_like()?)]
         } else {
             vec![
                 ("matched", matched.clone()),
                 ("zeroed", matched.zeros_like()?),
                 ("shuffled", shuffled.narrow(0, index, 1)?),
-                ("swapped", all_cond.narrow(0, (index + 1) % tasks.len(), 1)?),
+                ("swapped", swapped.narrow(0, index, 1)?),
             ]
         };
         for (condition, cond) in conditions {

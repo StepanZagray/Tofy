@@ -6,14 +6,21 @@ Update the **Best So Far** section when a run improves on a reported metric. Rec
 
 The Qwen knowledge-injection ladder has no completed runs yet. Record floor, RAG ceiling,
 latent-channel, knowledge-in-weights, static-prefix, LoRA, and latent-ablation metrics here.
-World training uses `--train-world-knowledge`; bridge training uses `--train-bridge`.
+World training uses `--train-world-knowledge` with explicit per-function
+paraphrase train/validation splits; bridge training uses `--train-bridge` and
+produces separate context and weights checkpoints.
 Set `TOFY_STATIC_SOFT_PREFIX=true` for the equal-slot static-prefix control.
+Set `TOFY_QWEN_LORA_RANK=16` for the Q/V LoRA control. The pipeline gives this
+control the same fictional documentation plus seen gold tasks. `train ... --until full`
+runs all controls, the all-function held-out-paraphrase channel probe, and
+floor/RAG/latent/weights evaluations.
 
 | Run | Regime | Trainable parameters | Seen pass | Held-out pass |
 |---|---|---:|---:|---:|
 | World conditioned | context/weights | emitted as `trainable_params` by `--train-bridge` | pending | pending |
 | Static prefix | prefix | emitted as `trainable_params` with `TOFY_STATIC_SOFT_PREFIX=true` | pending | pending |
-| LoRA r=16 | none | pending baseline run | pending | pending |
+| LoRA r=16 | Q/V LoRA | emitted as `trainable_params` with `TOFY_QWEN_LORA_RANK=16` | pending | pending |
+| LoRA r=512 | Q/V LoRA capacity control | emitted as `trainable_params` with `TOFY_QWEN_LORA_RANK=512` | pending | pending |
 
 Before training, run the contamination floor with
 `TOFY_EVAL_MODE=floor ... --eval-bridge ... eval/veclab_eval.jsonl`; record the
@@ -22,6 +29,8 @@ deterministic: `cargo run --release -- --prepare-veclab --seed 20260705 --out da
 
 **VecLab corpus (seed 20260705):** `data/fictional/MANIFEST.json` SHA-256
 `veclab_encoder_mix.txt` = `450c4a7518f1f9f926d25e9a794eaeb1bc1f9002754009e46ab060dbe03ab9eb`;
+`veclab_knowledge_train.txt` = `4b14e7c862180350939b0bb46870b54500cae10c644969f108e3a8f98b66f502`;
+`veclab_knowledge_val.txt` = `7983e7eb977cf94ccf33aa03b1ec29bd16c7768bba728895bc1a7860cfefa7a9`;
 200 functions, 600 eval cases, 0 held-out gold rows upstream (`--print-split-stats`).
 **Step-0 zero-shot floor (RTX 5060 smoke, Qwen3-1.7B-Base BF16):** held-out
 suite pass `0/5` (`0.0000`), compile rate `0/5` (`0.0000`); failures were four
@@ -45,6 +54,15 @@ These best metrics were produced before the strict LeJEPA default rewrite. Treat
 ## Observed Baseline Runs
 
 These were existing TensorBoard runs in `runs/` before the current training-code fixes. They are useful as a baseline, but they do not have the exact launch commands recorded, so they are not listed under **Best So Far**.
+
+- `runs/code_poc_1783369888` (`train minimal --until full`) is invalid. Candle
+  0.10's fused LayerNorm/RMSNorm kernels are forward-only; normalization at the
+  adapter output, Qwen output, compressor output, and reconstruction head severed
+  autograd. Consequently all bridge optimizer moments and gates remained at zero,
+  the encoder collapsed under normalized-MSE/stop-gradient training, and world
+  association stayed at batch-32 chance (`3.125%`). Do not compare its metrics to
+  corrected runs or resume its checkpoints; corrected encoder checkpoints add
+  post-normalization projection parameters.
 
 - `runs/world/1775175560`: raw `metrics/action_acc` stayed near 1.0 while `metrics/code_rate` stayed near 0 and `metrics/pred_code_rate` stayed at 0. This indicates majority-class router collapse, not healthy routing.
 - `runs/latent/1775164725`: `loss/pred_token` worsened while `metrics/chunk_cosine` and `metrics/global_cosine` stayed near 1.0, which suggests the masking/task balance was too easy and the multiscale metrics were flattering.

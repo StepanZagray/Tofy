@@ -3,6 +3,7 @@ use candle_core::{Tensor, D};
 use candle_nn::{self as nn, ops, Module, VarBuilder};
 
 use crate::model::attention::CrossAttention;
+use crate::util;
 
 /// Decoder-specific adapter: turns private context slots into generation-facing conditioning slots.
 pub struct DecoderConditioningAdapter {
@@ -43,9 +44,14 @@ impl AdapterBlock {
     }
 
     fn forward(&self, slots: &Tensor, memory: &Tensor) -> Result<Tensor> {
-        let attended = self.cross_attn.forward(&self.ln1.forward(slots)?, memory)?;
+        let attended = self
+            .cross_attn
+            .forward(&util::layer_norm_diff(&self.ln1, slots)?, memory)?;
         let slots = (slots + attended)?;
-        let ff = self.ff1.forward(&self.ln2.forward(&slots)?)?.gelu()?;
+        let ff = self
+            .ff1
+            .forward(&util::layer_norm_diff(&self.ln2, &slots)?)?
+            .gelu()?;
         (slots + self.ff2.forward(&ff)?).map_err(Into::into)
     }
 }
@@ -127,7 +133,8 @@ impl DecoderConditioningAdapter {
             context_slots,
             self.num_output_slots,
             self.compress_rate,
-        )?;
+        )?
+        .contiguous()?;
         let salience = ops::softmax(&self.index_proj.forward(&memory)?, D::Minus2)?;
         let salience_memory = memory.broadcast_mul(&salience)?;
         let global_memory = salience_memory.sum(1)?;
@@ -150,21 +157,21 @@ impl DecoderConditioningAdapter {
         ))?;
 
         let gated_queries = queries.broadcast_add(&global_memory.unsqueeze(1)?)?;
-        let normed = self.ln1.forward(&gated_queries)?;
+        let normed = util::layer_norm_diff(&self.ln1, &gated_queries)?;
         let attended = self
             .cross_attn
             .forward(&normed, &memory)?
             .broadcast_mul(&memory_gate)?;
         let slots = (queries + attended)?;
 
-        let normed = self.ln2.forward(&slots)?;
+        let normed = util::layer_norm_diff(&self.ln2, &slots)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
         let mut slots = (slots + self.ff2.forward(&ff)?)?;
         for block in &self.extra_blocks {
             slots = block.forward(&slots, &memory)?;
         }
 
-        Ok(self.output_norm.forward(&self.proj.forward(&slots)?)?)
+        Ok(self.output_norm.forward_diff(&self.proj.forward(&slots)?)?)
     }
 }
 

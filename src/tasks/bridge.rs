@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{VarBuilder, VarMap};
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -11,7 +11,8 @@ use tokenizers::Tokenizer;
 use crate::data::{encode_world_examples, RawWorldExample};
 use crate::model::decoders::{Qwen3Bridge, Qwen3Config};
 use crate::model::{
-    load_vocab_from_file, ContextCompressor, DecoderConditioningAdapter, OnlineEncoder,
+    load_vocab_from_file, ActionStateTransition, ContextCompressor, DecoderConditioningAdapter,
+    OnlineEncoder,
 };
 use crate::tasks::veclab::{
     attach_docs, load_docs_map, load_task_rows, VeclabTaskRow, SEEN_FUNCTION_MAX,
@@ -19,9 +20,7 @@ use crate::tasks::veclab::{
 use crate::tasks::world_context::{
     context_slots_from_world_pair_sequences, env_bool, env_f64, env_usize,
 };
-use crate::tasks::world_support::{
-    batch_shuffled_conditioning_latent, hard_mismatched_conditioning_latent, masked_cross_entropy,
-};
+use crate::tasks::world_support::{different_group_conditioning_latent, masked_cross_entropy};
 use crate::util;
 
 #[derive(Clone, Copy, Debug)]
@@ -204,7 +203,7 @@ fn qwen_batch(
         .iter()
         .map(|row| {
             let prompt = tokenizer
-                .encode(row.task.clone(), false)
+                .encode(qwen_prompt(&row.task, &row.completion), false)
                 .map_err(anyhow::Error::msg)?;
             let completion = tokenizer
                 .encode(row.completion.clone(), false)
@@ -212,6 +211,7 @@ fn qwen_batch(
             let mut ids = prompt.get_ids().to_vec();
             let prompt_len = ids.len();
             ids.extend_from_slice(completion.get_ids());
+            ids.push(qwen_eos_id(tokenizer)?);
             Ok((ids, prompt_len))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -239,6 +239,23 @@ fn qwen_batch(
         Tensor::from_vec(labels, (encoded.len(), max_len - 1), device)?,
         Tensor::from_vec(mask, (encoded.len(), max_len - 1), device)?,
     ))
+}
+
+fn qwen_eos_id(tokenizer: &Tokenizer) -> Result<u32> {
+    tokenizer
+        .token_to_id("<|endoftext|>")
+        .or_else(|| tokenizer.token_to_id("<|im_end|>"))
+        .context("Qwen tokenizer is missing an EOS token")
+}
+
+fn qwen_prompt(task: &str, completion: &str) -> String {
+    if completion.trim_start().starts_with("package solution") || completion.is_empty() {
+        format!(
+            "{task}\n\nReturn only complete Go source code. Start with `package solution`; do not use Markdown fences or explanatory prose."
+        )
+    } else {
+        format!("{task}\n\nReturn the relevant reference documentation only.")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -282,11 +299,13 @@ fn world_rows(rows: &[VeclabTaskRow], regime: BridgeRegime) -> Vec<RawWorldExamp
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn state_conditioning(
     rows: &[VeclabTaskRow],
     regime: BridgeRegime,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
     vocab: &crate::model::Vocab,
     max_seq: usize,
     device: &Device,
@@ -310,7 +329,10 @@ pub(crate) fn state_conditioning(
                 || !input.state_text.contains(&row.completion)),
         "conditioning state must exclude gold completions"
     );
-    Ok(state_slots)
+    match regime {
+        BridgeRegime::Context => Ok(state_slots),
+        BridgeRegime::Weights => transition.forward(&state_slots),
+    }
 }
 
 pub(crate) struct BridgeRuntime {
@@ -318,6 +340,7 @@ pub(crate) struct BridgeRuntime {
     pub model: Qwen3Bridge,
     pub encoder: OnlineEncoder,
     pub compressor: ContextCompressor,
+    pub transition: ActionStateTransition,
     pub adapter: DecoderConditioningAdapter,
     static_prefix: Option<candle_nn::Embedding>,
     pub vocab: crate::model::Vocab,
@@ -390,6 +413,10 @@ impl BridgeRuntime {
             planner_dim,
             slots,
         )?;
+        let transition = ActionStateTransition::new(
+            VarBuilder::from_varmap(&world_map, dtype, &device).pp("action_state_transition"),
+            planner_dim,
+        )?;
         let unfrozen = bridge_path.with_extension("world.safetensors");
         util::load_varmap_checked(
             &mut world_map,
@@ -404,6 +431,7 @@ impl BridgeRuntime {
             model,
             encoder,
             compressor,
+            transition,
             adapter,
             static_prefix,
             vocab,
@@ -416,11 +444,21 @@ impl BridgeRuntime {
     }
 
     pub fn conditioning(&self, rows: &[VeclabTaskRow]) -> Result<Tensor> {
+        if std::env::var("TOFY_QWEN_LORA_RANK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+            > 0
+        {
+            return Tensor::zeros((rows.len(), 1, self.hidden_size), DType::F32, &self.device)
+                .map_err(Into::into);
+        }
         let slots = state_conditioning(
             rows,
             self.regime,
             &self.encoder,
             &self.compressor,
+            &self.transition,
             &self.vocab,
             self.max_seq,
             &self.device,
@@ -439,14 +477,11 @@ impl BridgeRuntime {
     pub fn generate(&self, prompt: &str, conditioning: &Tensor, max_new: usize) -> Result<String> {
         let encoded = self
             .tokenizer
-            .encode(prompt, false)
+            .encode(qwen_prompt(prompt, ""), false)
             .map_err(anyhow::Error::msg)?;
         let mut ids = encoded.get_ids().to_vec();
         let prompt_len = ids.len();
-        let eos = self
-            .tokenizer
-            .token_to_id("<|endoftext|>")
-            .or_else(|| self.tokenizer.token_to_id("<|im_end|>"));
+        let eos = Some(qwen_eos_id(&self.tokenizer)?);
         let mut cache = self.model.new_cache();
         let mut next_input = ids.clone();
         for _ in 0..max_new {
@@ -481,6 +516,7 @@ fn val_losses(
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
     vocab: &crate::model::Vocab,
     adapter: &DecoderConditioningAdapter,
     static_prefix: Option<&candle_nn::Embedding>,
@@ -490,13 +526,22 @@ fn val_losses(
     output_slots: usize,
     hidden_size: usize,
 ) -> Result<(f32, f32)> {
-    let slots = state_conditioning(rows, regime, encoder, compressor, vocab, max_seq, device)?;
-    let cond = if let Some(prefix) = static_prefix {
+    let lora_mode = std::env::var("TOFY_QWEN_LORA_RANK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        > 0;
+    let cond = if lora_mode {
+        Tensor::zeros((rows.len(), 1, hidden_size), DType::F32, device)?
+    } else if let Some(prefix) = static_prefix {
         let ids = Tensor::arange(0u32, output_slots as u32, device)?.unsqueeze(0)?;
         prefix
             .forward(&ids)?
             .broadcast_as((rows.len(), output_slots, hidden_size))?
     } else {
+        let slots = state_conditioning(
+            rows, regime, encoder, compressor, transition, vocab, max_seq, device,
+        )?;
         adapter.forward(&slots)?
     };
     let (input, labels, mask) = qwen_batch(tokenizer, rows, device)?;
@@ -513,6 +558,7 @@ fn full_val_losses(
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
+    transition: &ActionStateTransition,
     vocab: &crate::model::Vocab,
     adapter: &DecoderConditioningAdapter,
     static_prefix: Option<&candle_nn::Embedding>,
@@ -531,6 +577,7 @@ fn full_val_losses(
             tokenizer,
             encoder,
             compressor,
+            transition,
             vocab,
             adapter,
             static_prefix,
@@ -637,8 +684,8 @@ pub fn try_run_logit_parity(args: &[String]) -> Result<bool> {
         .squeeze(1)?
         .to_dtype(DType::F32)?;
     let abs_error = full.broadcast_sub(&cached)?.abs()?;
-    let max_abs_error = abs_error.max_all()?.to_scalar::<f32>()?;
-    let mean_abs_error = abs_error.mean_all()?.to_scalar::<f32>()?;
+    let max_abs_error = util::scalar_f32(&abs_error.max_all()?)?;
+    let mean_abs_error = util::scalar_f32(&abs_error.mean_all()?)?;
     let full_argmax = full
         .argmax(candle_core::D::Minus1)?
         .squeeze(0)?
@@ -706,6 +753,10 @@ fn train(args: BridgeArgs) -> Result<()> {
         planner_dim,
         slots,
     )?;
+    let transition = ActionStateTransition::new(
+        VarBuilder::from_varmap(&world_map, dtype, &device).pp("action_state_transition"),
+        planner_dim,
+    )?;
     util::load_varmap_checked(&mut world_map, &args.world)?;
     let output_slots = env_usize("TOFY_ADAPTER_OUTPUT_SLOTS", 64);
     let adapter = DecoderConditioningAdapter::new(
@@ -725,8 +776,16 @@ fn train(args: BridgeArgs) -> Result<()> {
     };
 
     let unfreeze_world = env_bool("TOFY_KNOWLEDGE_UNFREEZE_WORLD", false);
+    let lora_mode = std::env::var("TOFY_QWEN_LORA_RANK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        > 0;
     let lr = env_f64("TOFY_BRIDGE_LR", 2e-4);
     let mut named_vars = util::named_train_vars(&train_vars)?;
+    if static_prefix.is_some() || lora_mode {
+        named_vars.retain(|entry| !entry.name.starts_with("adapter."));
+    }
     if unfreeze_world {
         named_vars.extend(util::named_train_vars(&world_map)?);
     }
@@ -743,12 +802,18 @@ fn train(args: BridgeArgs) -> Result<()> {
         "Bridge conditioning={} trainable_params={trainable_params}",
         if static_prefix.is_some() {
             "static_prefix"
+        } else if lora_mode {
+            "lora"
         } else {
             "world"
         }
     );
     let mut optimizer = util::TrainOptimizer::new_lr_named(named_vars, lr)?;
-    let negatives = ConditioningNegatives::from_env();
+    let negatives = if lora_mode {
+        ConditioningNegatives::none()
+    } else {
+        ConditioningNegatives::from_env()
+    };
     let margin = env_f64("TOFY_DECODER_CONDITIONING_MARGIN", 0.2);
     let margin_weight = env_f64("TOFY_DECODER_CONDITIONING_MARGIN_WEIGHT", 0.25);
     let dropout = env_f64("TOFY_CONDITIONING_DROPOUT", 0.1).clamp(0.0, 1.0);
@@ -757,7 +822,10 @@ fn train(args: BridgeArgs) -> Result<()> {
     let docs = load_docs_map(Path::new("data/fictional/veclab_docs.txt")).unwrap_or_default();
     let mut seen: Vec<_> = all_rows
         .into_iter()
-        .filter(|row| row.function_id <= SEEN_FUNCTION_MAX)
+        .filter(|row| {
+            row.function_id <= SEEN_FUNCTION_MAX
+                || (lora_mode && !row.completion.trim_start().starts_with("package solution"))
+        })
         .collect();
     attach_docs(&mut seen, &docs);
     let (val_rows, train_rows): (Vec<_>, Vec<_>) = seen
@@ -815,10 +883,17 @@ fn train(args: BridgeArgs) -> Result<()> {
     } else {
         0
     };
-    let mut best_ce = if args.resume {
+    let min_val_gap = env_f64("TOFY_BRIDGE_MIN_VAL_GAP", 0.02).max(0.0) as f32;
+    let requires_conditioning_gap = !lora_mode && static_prefix.is_none();
+    let mut best_score = if args.resume {
         resume_state.best_metric
     } else {
         f32::INFINITY
+    };
+    let mut best_gap = if args.resume {
+        resume_state.best_aux_metric
+    } else {
+        f32::NEG_INFINITY
     };
     let mut sampler = BridgeSampler::at_sample(
         train_rows.len(),
@@ -839,22 +914,15 @@ fn train(args: BridgeArgs) -> Result<()> {
         let mut zero_margin_sum = 0.0f32;
         let mut shuffle_margin_sum = 0.0f32;
         let mut hard_margin_sum = 0.0f32;
-        for _ in 0..grad_accum {
+        for micro_step in 0..grad_accum {
             let indices = sampler.next_batch(args.batch);
             let batch_rows = indices
                 .into_iter()
                 .map(|index| train_rows[index].clone())
                 .collect::<Vec<_>>();
-            let state_slots = state_conditioning(
-                &batch_rows,
-                regime,
-                &encoder,
-                &compressor,
-                &encoder_vocab,
-                max_seq,
-                &device,
-            )?;
-            let mut cond = if let Some(prefix) = &static_prefix {
+            let mut cond = if lora_mode {
+                Tensor::zeros((batch_rows.len(), 1, cfg.hidden_size), dtype, &device)?
+            } else if let Some(prefix) = &static_prefix {
                 let ids = Tensor::arange(0u32, output_slots as u32, &device)?.unsqueeze(0)?;
                 prefix.forward(&ids)?.broadcast_as((
                     batch_rows.len(),
@@ -862,12 +930,28 @@ fn train(args: BridgeArgs) -> Result<()> {
                     cfg.hidden_size,
                 ))?
             } else {
+                let state_slots = state_conditioning(
+                    &batch_rows,
+                    regime,
+                    &encoder,
+                    &compressor,
+                    &transition,
+                    &encoder_vocab,
+                    max_seq,
+                    &device,
+                )?;
                 adapter.forward(&state_slots)?
             };
-            if rand::random::<f64>() < dropout {
+            let dropout_seed =
+                args.seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ micro_step as u64;
+            if StdRng::seed_from_u64(dropout_seed).random::<f64>() < dropout {
                 cond = cond.zeros_like()?;
             }
             let (input, labels, mask) = qwen_batch(&tokenizer, &batch_rows, &device)?;
+            let function_ids = batch_rows
+                .iter()
+                .map(|row| row.function_id)
+                .collect::<Vec<_>>();
             let positive = token_loss(&qwen, &input, &labels, &mask, &cond)?;
             let mut margin_loss: Option<Tensor> = None;
             if negatives.zero {
@@ -894,7 +978,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                         &input,
                         &labels,
                         &mask,
-                        &batch_shuffled_conditioning_latent(&cond)?,
+                        &different_group_conditioning_latent(&cond, &function_ids, 7)?,
                     )?,
                     margin,
                 )?;
@@ -915,7 +999,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                         &input,
                         &labels,
                         &mask,
-                        &hard_mismatched_conditioning_latent(&cond)?,
+                        &different_group_conditioning_latent(&cond, &function_ids, 1)?,
                     )?,
                     margin,
                 )?;
@@ -942,8 +1026,31 @@ fn train(args: BridgeArgs) -> Result<()> {
                 grad_accum,
             )?;
         }
+        let gradient_count = util::accumulated_gradient_count(&accumulated, &optimizer_vars);
+        if gradient_count == 0 {
+            bail!(
+                "bridge backward produced no optimizer gradients at step {step}; refusing a no-op optimizer step"
+            );
+        }
         let grad_norm =
             util::clip_accumulated_gradients_device(&mut accumulated, &optimizer_vars, clip_norm)?;
+        if step == start_step + 1 {
+            if let Some(norm) = grad_norm.as_ref() {
+                let norm = util::scalar_f32(norm)?;
+                if !norm.is_finite() || norm <= 0.0 {
+                    bail!("bridge gradient norm is invalid at first step: {norm}");
+                }
+                println!(
+                    "Bridge gradient preflight passed: gradients={gradient_count}/{} global_norm={norm:.6}",
+                    optimizer_vars.len()
+                );
+            } else {
+                println!(
+                    "Bridge gradient preflight passed: gradients={gradient_count}/{}",
+                    optimizer_vars.len()
+                );
+            }
+        }
         util::optimizer_step_from_accumulated(&mut optimizer, &mut accumulated)?;
         if step % log_every == 0 {
             let divisor = grad_accum as f32;
@@ -970,6 +1077,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                 &tokenizer,
                 &encoder,
                 &compressor,
+                &transition,
                 &encoder_vocab,
                 &adapter,
                 static_prefix.as_ref(),
@@ -982,33 +1090,36 @@ fn train(args: BridgeArgs) -> Result<()> {
             tb.add_scalar("val/ce_matched", matched, step);
             tb.add_scalar("val/ce_zeroed", zero, step);
             tb.add_scalar("val/gap", zero - matched, step);
-            let telemetry_rows = &val_rows[..val_rows.len().min(args.batch.max(1))];
-            let slots = state_conditioning(
-                telemetry_rows,
-                regime,
-                &encoder,
-                &compressor,
-                &encoder_vocab,
-                max_seq,
-                &device,
-            )?;
-            let telemetry_cond = if let Some(prefix) = &static_prefix {
-                let ids = Tensor::arange(0u32, output_slots as u32, &device)?.unsqueeze(0)?;
-                prefix.forward(&ids)?.broadcast_as((
-                    telemetry_rows.len(),
-                    output_slots,
-                    cfg.hidden_size,
-                ))?
-            } else {
-                adapter.forward(&slots)?
-            };
-            let (norm_mean, cond_std) = conditioning_health(&telemetry_cond)?;
-            tb.add_scalar("cond/norm_mean", norm_mean, step);
-            tb.add_scalar("cond/std", cond_std, step);
-            let (telemetry_input, _, _) = qwen_batch(&tokenizer, telemetry_rows, &device)?;
-            for (site, mean, max) in qwen.gate_statistics(&telemetry_input, &telemetry_cond)? {
-                tb.add_scalar(&format!("gate/site_{site}_mean"), mean, step);
-                tb.add_scalar(&format!("gate/site_{site}_max"), max, step);
+            if !lora_mode {
+                let telemetry_rows = &val_rows[..val_rows.len().min(args.batch.max(1))];
+                let slots = state_conditioning(
+                    telemetry_rows,
+                    regime,
+                    &encoder,
+                    &compressor,
+                    &transition,
+                    &encoder_vocab,
+                    max_seq,
+                    &device,
+                )?;
+                let telemetry_cond = if let Some(prefix) = &static_prefix {
+                    let ids = Tensor::arange(0u32, output_slots as u32, &device)?.unsqueeze(0)?;
+                    prefix.forward(&ids)?.broadcast_as((
+                        telemetry_rows.len(),
+                        output_slots,
+                        cfg.hidden_size,
+                    ))?
+                } else {
+                    adapter.forward(&slots)?
+                };
+                let (norm_mean, cond_std) = conditioning_health(&telemetry_cond)?;
+                tb.add_scalar("cond/norm_mean", norm_mean, step);
+                tb.add_scalar("cond/std", cond_std, step);
+                let (telemetry_input, _, _) = qwen_batch(&tokenizer, telemetry_rows, &device)?;
+                for (site, mean, max) in qwen.gate_statistics(&telemetry_input, &telemetry_cond)? {
+                    tb.add_scalar(&format!("gate/site_{site}_mean"), mean, step);
+                    tb.add_scalar(&format!("gate/site_{site}_max"), max, step);
+                }
             }
             tb.flush();
             println!("bridge val step={step} val_ce_matched={matched:.4} val_ce_zeroed={zero:.4} gap={:.4}", zero - matched);
@@ -1019,8 +1130,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                     &latest_path.with_extension("world.safetensors"),
                 )?;
             }
-            if matched < best_ce {
-                best_ce = matched;
+            let gap = zero - matched;
+            let eligible = !requires_conditioning_gap || gap >= min_val_gap;
+            let selection_score = matched;
+            tb.add_scalar("val/selection_score", selection_score, step);
+            if eligible && selection_score < best_score {
+                best_score = selection_score;
+                best_gap = gap;
                 util::save_varmap_atomic(&train_vars, &best_path)?;
                 util::save_varmap_atomic(&train_vars, &args.output)?;
                 if unfreeze_world {
@@ -1036,18 +1152,23 @@ fn train(args: BridgeArgs) -> Result<()> {
                 &util::TrainingResumeState {
                     stage: resume_stage.clone(),
                     step,
-                    best_metric: best_ce,
-                    best_aux_metric: zero,
-                    saved_checkpoint: best_ce.is_finite(),
+                    best_metric: best_score,
+                    best_aux_metric: best_gap,
+                    saved_checkpoint: best_score.is_finite(),
                 },
             )?;
         }
     }
     println!(
-        "Best bridge saved to {} (val_ce={best_ce:.4}); latest={}",
+        "Best bridge saved to {} (selection_score={best_score:.4}, val_gap={best_gap:.4}); latest={}",
         args.output.display(),
         latest_path.display()
     );
+    if requires_conditioning_gap && best_gap < min_val_gap {
+        bail!(
+            "no bridge checkpoint reached the required conditioning gap: selected={best_gap:.4}, required={min_val_gap:.4}"
+        );
+    }
     tb.finish()?;
     Ok(())
 }
@@ -1065,6 +1186,7 @@ pub fn try_run_eval_bridge(args: &[String]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::Optimizer;
 
     #[test]
     fn conditioning_text_never_contains_completion() {
@@ -1090,5 +1212,96 @@ mod tests {
 
         let mut resumed = BridgeSampler::at_sample(16, 7, 4);
         assert_eq!(sampler.next_batch(2), resumed.next_batch(2));
+    }
+
+    #[test]
+    fn full_bridge_cuda_bf16_updates_trainables() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let dtype = DType::BF16;
+        let cfg = Qwen3Config {
+            vocab_size: 32,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 4,
+            num_attention_heads: 2,
+            head_dim: 4,
+            attention_bias: false,
+            num_key_value_heads: 1,
+            max_position_embeddings: 32,
+            sliding_window: None,
+            max_window_layers: 0,
+            tie_word_embeddings: true,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: candle_nn::Activation::Silu,
+        };
+
+        // Materialize a base checkpoint, then rebuild it as detached tensors
+        // to match the production frozen-Qwen graph.
+        let base_vars = VarMap::new();
+        let throwaway_train_vars = VarMap::new();
+        let _ = Qwen3Bridge::new(
+            &cfg,
+            VarBuilder::from_varmap(&base_vars, dtype, &device),
+            VarBuilder::from_varmap(&throwaway_train_vars, dtype, &device),
+        )?;
+        let frozen = util::frozen_tensors_from_varmap(&base_vars)?;
+
+        let train_vars = VarMap::new();
+        let train_vb = VarBuilder::from_varmap(&train_vars, dtype, &device);
+        let model = Qwen3Bridge::new(
+            &cfg,
+            VarBuilder::from_tensors(frozen, dtype, &device),
+            train_vb.pp("qwen_bridge"),
+        )?;
+        let adapter = DecoderConditioningAdapter::new_with_compress_rate(
+            train_vb.pp("adapter"),
+            8,
+            cfg.hidden_size,
+            2,
+            1,
+        )?;
+        let state_slots = Tensor::randn(0f32, 1f32, (2, 4, 8), &device)?.to_dtype(dtype)?;
+        let cond = adapter.forward(&state_slots)?;
+        let input = Tensor::from_vec(vec![1u32, 2, 3, 4, 5, 6, 7, 8], (2, 4), &device)?;
+        let labels = Tensor::from_vec(vec![2u32, 3, 4, 6, 7, 8], (2, 3), &device)?;
+        let mask = Tensor::ones((2, 3), DType::F32, &device)?;
+        let loss = token_loss(&model, &input, &labels, &mask, &cond)?;
+        assert!(cond.track_op() && loss.track_op());
+        let grads = loss.backward()?;
+        let named = util::named_train_vars(&train_vars)?;
+        let grad_count = named
+            .iter()
+            .filter(|entry| grads.get(&entry.var).is_some())
+            .count();
+        assert_eq!(
+            grad_count,
+            named.len(),
+            "some full-bridge gradients are missing"
+        );
+        let gate = named
+            .iter()
+            .find(|entry| entry.name.ends_with("gate.bias"))
+            .context("missing bridge gate bias")?
+            .var
+            .clone();
+        let gate_grad = grads
+            .get(&gate)
+            .context("missing bridge gate gradient")?
+            .to_dtype(DType::F32)?
+            .abs()?
+            .sum_all()?;
+        let gate_grad = util::scalar_f32(&gate_grad)?;
+        assert!(gate_grad.is_finite() && gate_grad > 0.0);
+
+        let before = util::vec1_f32(gate.as_tensor())?;
+        let mut optimizer = util::ResumableAdamW::new_lr_named(named, 0.1)?;
+        optimizer.step(&grads)?;
+        let after = util::vec1_f32(gate.as_tensor())?;
+        assert_ne!(before, after, "optimizer did not update the bridge gate");
+        Ok(())
     }
 }

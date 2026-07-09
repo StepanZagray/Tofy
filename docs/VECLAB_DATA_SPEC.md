@@ -70,6 +70,8 @@ probe parse IDs).
 | `data/fictional/veclab/` | — | Go module (impl + tests) | eval only, never trained on |
 | `data/fictional/veclab_docs.txt` | 200 | `[fn:NNN] <signature line>` TAB `<full doc section>` | knowledge stage (recon reads `next`) |
 | `data/fictional/veclab_knowledge.txt` | ~8,000 | `[fn:NNN] <task or query paraphrase>` TAB `<doc section>` | knowledge stage (assoc: state↔doc InfoNCE; recon on doc) |
+| `data/fictional/veclab_knowledge_train.txt` | 7,600 | same | world train split: 38 paraphrases for every function |
+| `data/fictional/veclab_knowledge_val.txt` | 400 | same | world validation split: 2 unseen paraphrases for every function |
 | `data/fictional/veclab_tasks_train.txt` | ~4,000 | `[fn:NNN] <task instruction>` TAB `<gold Go solution>` | bridge training, fns 1–100 ONLY |
 | `data/fictional/veclab_tasks_heldout.txt` | ~4,000 | same | never trained on; source for eval + probe eval |
 | `data/fictional/veclab_encoder_mix.txt` | ~20,000 | doc sections + task texts (no gold solutions for fns 101–200) | encoder continue-pretrain |
@@ -88,14 +90,14 @@ generated from the hidden reference.
 
 ## 5. Row-type details (matching current training code)
 
-- **Knowledge rows** (`veclab_knowledge.txt`): `state` = a task-like query
+- **Knowledge rows** (`veclab_knowledge_{train,val}.txt`): `state` = a task-like query
   ("how do I get the alternating top-k sum...", or an actual task
   instruction), `next` = the relevant doc section. `knowledge.rs` computes
-  InfoNCE between state slots and doc slots **in-batch** — therefore the
-  generator MUST interleave rows so that any window of `world_batch` (32)
-  consecutive rows contains at most one row per function ID; duplicate IDs in
-  a batch are false negatives that corrupt the association loss. Enforce by
-  round-robin sharding over function IDs at write time.
+  raw latent MSE plus SIGReg, with reconstruction and InfoNCE as
+  knowledge-specific auxiliaries. Training also assembles batches with unique
+  function IDs, so paraphrases of one document are never treated as negatives.
+  Validation holds out paraphrases, not function identities: every one of the
+  200 functions occurs in both splits.
 - **Task rows** (`veclab_tasks_*.txt`): `state` = task instruction only
   (docs are injected at bridge time in the `context` regime, not baked into
   the file — this keeps one file serving both regimes). `next` = gold

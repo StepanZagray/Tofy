@@ -12,7 +12,7 @@ use std::process::Command;
 
 use crate::tasks::prepare::escape_pair_field;
 
-pub const GENERATOR_VERSION: &str = "1.0.0";
+pub const GENERATOR_VERSION: &str = "1.1.0";
 pub const DEFAULT_SEED: u64 = 20260705;
 pub const FUNCTION_COUNT: usize = 200;
 pub const SEEN_FUNCTION_MAX: usize = 100;
@@ -1335,10 +1335,17 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
         }
     }
     let mut knowledge = String::new();
+    let mut knowledge_train = String::new();
+    let mut knowledge_val = String::new();
     for round in 0..KNOWLEDGE_ROWS_PER_FUNCTION {
         for shard in &knowledge_shards {
             if let Some(row) = shard.get(round) {
                 knowledge.push_str(row);
+                if round % 20 == 0 {
+                    knowledge_val.push_str(row);
+                } else {
+                    knowledge_train.push_str(row);
+                }
             }
         }
     }
@@ -1432,6 +1439,11 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
 
     fs::write(data_dir.join("veclab_docs.txt"), &docs_rows)?;
     fs::write(data_dir.join("veclab_knowledge.txt"), &knowledge)?;
+    fs::write(
+        data_dir.join("veclab_knowledge_train.txt"),
+        &knowledge_train,
+    )?;
+    fs::write(data_dir.join("veclab_knowledge_val.txt"), &knowledge_val)?;
     fs::write(data_dir.join("veclab_tasks_train.txt"), &train)?;
     fs::write(data_dir.join("veclab_tasks_heldout.txt"), &heldout)?;
     fs::write(data_dir.join("veclab_encoder_mix.txt"), &encoder_mix)?;
@@ -1460,6 +1472,11 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
     let files = [
         ("veclab_docs.txt", docs_rows.lines().count()),
         ("veclab_knowledge.txt", knowledge.lines().count()),
+        (
+            "veclab_knowledge_train.txt",
+            knowledge_train.lines().count(),
+        ),
+        ("veclab_knowledge_val.txt", knowledge_val.lines().count()),
         ("veclab_tasks_train.txt", train.lines().count()),
         ("veclab_tasks_heldout.txt", heldout.lines().count()),
         ("veclab_encoder_mix.txt", encoder_mix.lines().count()),
@@ -1641,13 +1658,17 @@ pub fn print_split_stats(data_dir: &Path) -> Result<()> {
     let docs = fs::read_to_string(data_dir.join("veclab_docs.txt"))?;
     let encoder = fs::read_to_string(data_dir.join("veclab_encoder_mix.txt"))?;
     let knowledge = fs::read_to_string(data_dir.join("veclab_knowledge.txt"))?;
+    let knowledge_train = fs::read_to_string(data_dir.join("veclab_knowledge_train.txt"))?;
+    let knowledge_val = fs::read_to_string(data_dir.join("veclab_knowledge_val.txt"))?;
     let train_leak = heldout_gold_in(&train).len();
     let encoder_leak = heldout_gold_in(&encoder).len();
     let knowledge_leak = heldout_gold_in(&knowledge).len();
     println!(
-        "veclab split stats: docs_rows={} knowledge_rows={} task_train_rows={} task_heldout_rows={} encoder_rows={} heldout_gold_upstream={}",
+        "veclab split stats: docs_rows={} knowledge_rows={} knowledge_train_rows={} knowledge_val_rows={} task_train_rows={} task_heldout_rows={} encoder_rows={} heldout_gold_upstream={}",
         docs.lines().filter(|line| !line.trim().is_empty()).count(),
         knowledge.lines().filter(|line| !line.trim().is_empty()).count(),
+        knowledge_train.lines().filter(|line| !line.trim().is_empty()).count(),
+        knowledge_val.lines().filter(|line| !line.trim().is_empty()).count(),
         train.lines().count(),
         heldout.lines().count(),
         encoder.lines().filter(|line| !line.trim().is_empty()).count(),
@@ -1697,5 +1718,22 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn knowledge_split_holds_out_paraphrases_for_every_function() {
+        let mut train_ids = HashSet::new();
+        let mut val_ids = HashSet::new();
+        for round in 0..KNOWLEDGE_ROWS_PER_FUNCTION {
+            for function_id in 1..=FUNCTION_COUNT {
+                if round % 20 == 0 {
+                    val_ids.insert(function_id);
+                } else {
+                    train_ids.insert(function_id);
+                }
+            }
+        }
+        assert_eq!(train_ids.len(), FUNCTION_COUNT);
+        assert_eq!(val_ids.len(), FUNCTION_COUNT);
     }
 }

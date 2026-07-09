@@ -3,6 +3,7 @@ use candle_core::{Module, Tensor, D};
 use candle_nn::{self as nn, VarBuilder};
 
 use crate::model::attention::CrossAttention;
+use crate::util;
 
 struct ReconstructionBlock {
     norm: nn::LayerNorm,
@@ -24,8 +25,13 @@ impl ReconstructionBlock {
     }
 
     fn forward(&self, x: &Tensor, slots: &Tensor) -> Result<Tensor> {
-        let x = (x + self.attention.forward(&self.norm.forward(x)?, slots)?)?;
-        let ff = self.ff1.forward(&self.ff_norm.forward(&x)?)?.gelu()?;
+        let x = (x + self
+            .attention
+            .forward(&util::layer_norm_diff(&self.norm, x)?, slots)?)?;
+        let ff = self
+            .ff1
+            .forward(&util::layer_norm_diff(&self.ff_norm, &x)?)?
+            .gelu()?;
         (x + self.ff2.forward(&ff)?).map_err(Into::into)
     }
 }
@@ -68,7 +74,7 @@ impl KnowledgeReconstructionHead {
             x = block.forward(&x, &memory)?;
         }
         self.output
-            .forward(&self.output_norm.forward(&x)?)
+            .forward(&self.output_norm.forward_diff(&x)?)
             .map_err(Into::into)
     }
 }
@@ -80,8 +86,14 @@ pub fn association_loss(task_slots: &Tensor, doc_slots: &Tensor) -> Result<Tenso
 }
 
 fn association_logits(task_slots: &Tensor, doc_slots: &Tensor) -> Result<Tensor> {
-    let task = task_slots.mean(D::Minus2)?;
-    let docs = doc_slots.mean(D::Minus2)?;
+    let (batch, slots, dim) = task_slots.dims3()?;
+    if doc_slots.dims3()? != (batch, slots, dim) {
+        anyhow::bail!("association tensors must have identical [batch, slots, dim] shapes");
+    }
+    // Preserve slot identity. Mean pooling erased most of the compressor's
+    // structured signal and left retrieval at chance.
+    let task = task_slots.reshape((batch, slots * dim))?;
+    let docs = doc_slots.reshape((batch, slots * dim))?;
     let task_norm = task
         .sqr()?
         .sum_keepdim(D::Minus1)?

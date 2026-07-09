@@ -49,11 +49,16 @@ impl CompressorBlock {
     }
 
     fn forward(&self, slots: &Tensor, memory: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let attended = self
-            .cross_attn
-            .forward_masked(&self.ln1.forward(slots)?, memory, mask)?;
+        let attended = self.cross_attn.forward_masked(
+            &crate::util::layer_norm_diff(&self.ln1, slots)?,
+            memory,
+            mask,
+        )?;
         let slots = (slots + attended)?;
-        let ff = self.ff1.forward(&self.ln2.forward(&slots)?)?.gelu()?;
+        let ff = self
+            .ff1
+            .forward(&crate::util::layer_norm_diff(&self.ln2, &slots)?)?
+            .gelu()?;
         (slots + self.ff2.forward(&ff)?).map_err(Into::into)
     }
 }
@@ -128,20 +133,20 @@ impl ContextCompressor {
         let (batch, _, _) = encoder_hidden.dims3()?;
         let queries = self.slot_queries(batch, encoder_hidden.device())?;
 
-        let normed = self.ln1.forward(&queries)?;
+        let normed = crate::util::layer_norm_diff(&self.ln1, &queries)?;
         let attended = self
             .cross_attn
             .forward_masked(&normed, &encoder_hidden, encoder_mask)?;
         let slots = (queries + attended)?;
 
-        let normed = self.ln2.forward(&slots)?;
+        let normed = crate::util::layer_norm_diff(&self.ln2, &slots)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
         let mut slots = (slots + self.ff2.forward(&ff)?)?;
         for block in &self.extra_blocks {
             slots = block.forward(&slots, &encoder_hidden, encoder_mask)?;
         }
 
-        Ok(self.output_norm.forward(&self.proj.forward(&slots)?)?)
+        Ok(self.output_norm.forward_diff(&self.proj.forward(&slots)?)?)
     }
 
     /// Hybrid long-context path for segmented memory.
@@ -259,7 +264,7 @@ impl ContextCompressor {
                 .broadcast_mul(&weights)?
                 .sum(1)?
                 .broadcast_div(&denom)?;
-            let normed = self.memory_ln.forward(&block)?;
+            let normed = crate::util::layer_norm_diff(&self.memory_ln, &block)?;
             let score = self.memory_score.forward(&normed)?.squeeze(2)?;
             let score_bias = block_mask
                 .affine(-ATTENTION_MASK_VALUE as f64, ATTENTION_MASK_VALUE as f64)?
@@ -302,7 +307,7 @@ impl ContextCompressor {
         let old_mask = old_mask.contiguous()?;
         let (batch, old_len, dim) = old_memory.dims3()?;
         let keep = keep.min(old_len).max(1);
-        let normed = self.memory_ln.forward(&old_memory)?;
+        let normed = crate::util::layer_norm_diff(&self.memory_ln, &old_memory)?;
         let scores = self
             .memory_importance
             .forward(&normed)?

@@ -3,6 +3,7 @@ use candle_core::Tensor;
 use candle_nn::{self as nn, Module, VarBuilder};
 
 use crate::model::attention::CrossAttention;
+use crate::util;
 
 pub struct MultiQueryPool {
     query_embed: nn::Embedding,
@@ -54,12 +55,12 @@ impl MultiQueryPool {
             self.num_queries,
             self.dim,
         ))?;
-        let normed = self.ln1.forward(&queries)?;
+        let normed = util::layer_norm_diff(&self.ln1, &queries)?;
         let attended = self
             .cross_attn
             .forward_masked(&normed, memory, memory_mask)?;
         let pooled = (queries + attended)?;
-        let normed = self.ln2.forward(&pooled)?;
+        let normed = util::layer_norm_diff(&self.ln2, &pooled)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
         Ok((pooled + self.ff2.forward(&ff)?)?)
     }

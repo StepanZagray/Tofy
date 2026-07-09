@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use serde::Deserialize;
 use std::fs::{self, File};
@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use crate::cli::resolve_data_path;
 use crate::config::WorldTrainConfig;
 use crate::data::{
-    count_raw_world_rows, count_raw_world_rows_split, encode_world_examples, CachedWorldStream,
-    RawWorldStream, TokenizationMode, WorldExample, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    count_raw_world_rows, encode_world_examples, CachedWorldStream, RawWorldStream,
+    TokenizationMode, WorldExample, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::vocab::vocab_signature;
 use crate::model::{
     association_loss, association_top1_accuracy, flatten_latent_slots, load_vocab_from_file,
-    sigreg_epps_pulley, ActionStateTransition, ContextCompressor, KnowledgeReconstructionHead,
-    OnlineEncoder,
+    prediction_loss, sigreg_epps_pulley, ActionStateTransition, ContextCompressor,
+    KnowledgeReconstructionHead, OnlineEncoder,
 };
 use crate::tasks::world_context::{
     context_slots_from_world_pair_batch, env_bool, env_f64, env_usize,
@@ -24,8 +24,6 @@ use crate::tasks::world_context::{
 use crate::tasks::world_support::masked_cross_entropy;
 use crate::util;
 
-const HELDOUT_SPLIT_MODULUS: usize = 20;
-const HELDOUT_SPLIT_REMAINDER: usize = 0;
 const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
 
 type WorldConfig = WorldTrainConfig;
@@ -55,7 +53,10 @@ fn reconstruction_targets_with_mode(
         // A stochastic half-token objective is the masked-doc reconstruction signal.
         for index in 0..tokens.len() {
             mask[start + index] = if if stochastic {
-                rand::random::<f32>() < 0.5
+                let value = u64::from(tokens[index])
+                    ^ (row as u64).wrapping_mul(0x9E37_79B9)
+                    ^ (index as u64).wrapping_mul(0x85EB_CA6B);
+                value.count_ones().is_multiple_of(2)
             } else {
                 (row + index) % 2 == 0
             } {
@@ -76,11 +77,41 @@ fn reconstruction_targets_with_mode(
 
 struct WorldLogSnapshot {
     loss_val: f32,
+    prediction_val: f32,
     recon_val: f32,
     assoc_val: f32,
     sigreg_val: f32,
     assoc_top1: f32,
     duplicate_fn_in_batch: usize,
+}
+
+fn weighted_f32_loss(loss: &Tensor, weight: f64) -> Result<Tensor> {
+    loss.to_dtype(DType::F32)?
+        .affine(weight, 0.0)
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+struct WorldLossWeights {
+    prediction: f64,
+    reconstruction: f64,
+    association: f64,
+    sigreg: f64,
+}
+
+fn combine_world_losses(
+    prediction: &Tensor,
+    reconstruction: &Tensor,
+    association: &Tensor,
+    sigreg: &Tensor,
+    weights: WorldLossWeights,
+) -> Result<Tensor> {
+    weighted_f32_loss(prediction, weights.prediction)?
+        .broadcast_add(&weighted_f32_loss(reconstruction, weights.reconstruction)?)?
+        .broadcast_add(&weighted_f32_loss(association, weights.association)?)?
+        .broadcast_add(&weighted_f32_loss(sigreg, weights.sigreg)?)?
+        .to_dtype(DType::F32)
+        .map_err(Into::into)
 }
 
 fn duplicate_function_ids(batch: &[WorldExample], vocab: &crate::model::Vocab) -> usize {
@@ -94,6 +125,51 @@ fn duplicate_function_ids(batch: &[WorldExample], vocab: &crate::model::Vocab) -
         }
     }
     0
+}
+
+fn validation_path(train_path: &Path) -> Option<PathBuf> {
+    let name = train_path.file_name()?.to_str()?;
+    let val_name = name.replace("_train.txt", "_val.txt");
+    (val_name != name).then(|| train_path.with_file_name(val_name))
+}
+
+fn next_unique_batch(
+    batch_size: usize,
+    mut raw_stream: Option<&mut RawWorldStream>,
+    mut cached_stream: Option<&mut CachedWorldStream>,
+    vocab: &crate::model::Vocab,
+) -> Result<Vec<WorldExample>> {
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut function_ids = std::collections::HashSet::new();
+    let max_attempts = batch_size.saturating_mul(32).max(32);
+    let mut attempts = 0usize;
+    while attempts < max_attempts {
+        let request = (batch_size - batch.len()).max(1);
+        let examples = if let Some(stream) = cached_stream.as_deref_mut() {
+            stream.next_batch(request)?
+        } else {
+            let raw = raw_stream
+                .as_deref_mut()
+                .context("raw world stream unavailable")?
+                .next_batch(request)?;
+            encode_world_examples(&raw, vocab)
+        };
+        attempts += examples.len();
+        for example in examples {
+            let text = vocab.decode_ids_lossy(&example.state_tokens);
+            let function_id = crate::tasks::veclab::parse_fn_tag(&text)
+                .context("world knowledge row is missing a decodable [fn:NNN] tag")?;
+            if function_ids.insert(function_id) {
+                batch.push(example);
+                if batch.len() == batch_size {
+                    return Ok(batch);
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not assemble a world batch of {batch_size} unique function IDs after {max_attempts} rows"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,7 +186,7 @@ fn world_validation_metric(
     config: &WorldConfig,
     context_segments: usize,
     recent_full_segments: usize,
-    use_transition: bool,
+    prediction_weight: f64,
     recon_weight: f64,
     assoc_weight: f64,
     sigreg_slices: usize,
@@ -122,6 +198,7 @@ fn world_validation_metric(
     }
     let mut total = WorldLogSnapshot {
         loss_val: 0.0,
+        prediction_val: 0.0,
         recon_val: 0.0,
         assoc_val: 0.0,
         sigreg_val: 0.0,
@@ -129,18 +206,13 @@ fn world_validation_metric(
         duplicate_fn_in_batch: 0,
     };
     for _ in 0..batches.max(1) {
-        let batch = if let Some(stream) = cached_stream.as_mut() {
-            stream.next_batch(batch_size)?
-        } else {
-            encode_world_examples(
-                &raw_stream
-                    .as_mut()
-                    .expect("validation stream checked")
-                    .next_batch(batch_size)?,
-                vocab,
-            )
-        };
-        let (mut state_slots, mut next_slots) = context_slots_from_world_pair_batch(
+        let batch = next_unique_batch(
+            batch_size,
+            raw_stream.as_mut(),
+            cached_stream.as_mut(),
+            vocab,
+        )?;
+        let (state_slots, next_slots) = context_slots_from_world_pair_batch(
             encoder,
             compressor,
             &batch,
@@ -151,20 +223,18 @@ fn world_validation_metric(
             true,
             device,
         )?;
-        if use_transition {
-            state_slots = transition.forward(&state_slots)?;
-            next_slots = transition.forward(&next_slots)?;
-        }
+        let predicted_slots = transition.forward(&state_slots)?;
+        let prediction = prediction_loss(&predicted_slots, &next_slots)?;
         let (labels, mask) =
             reconstruction_targets_with_mode(&batch, vocab.pad_id, config.max_seq, false, device)?;
         let recon = masked_cross_entropy(
-            &reconstruction.forward(&next_slots, config.max_seq)?,
+            &reconstruction.forward(&predicted_slots, config.max_seq)?,
             &labels,
             &mask,
         )?;
-        let assoc = association_loss(&state_slots, &next_slots)?;
+        let assoc = association_loss(&predicted_slots, &next_slots)?;
         let sigreg = sigreg_epps_pulley(
-            &flatten_latent_slots(&state_slots)?,
+            &flatten_latent_slots(&predicted_slots)?,
             sigreg_slices,
             sigreg_points,
         )?
@@ -177,19 +247,29 @@ fn world_validation_metric(
             )?
             .affine(0.5, 0.0)?,
         )?;
-        let loss = recon
-            .affine(recon_weight, 0.0)?
-            .broadcast_add(&assoc.affine(assoc_weight, 0.0)?)?
-            .broadcast_add(&sigreg.affine(config.lambda, 0.0)?)?;
+        let loss = combine_world_losses(
+            &prediction,
+            &recon,
+            &assoc,
+            &sigreg,
+            WorldLossWeights {
+                prediction: prediction_weight,
+                reconstruction: recon_weight,
+                association: assoc_weight,
+                sigreg: config.lambda,
+            },
+        )?;
         total.loss_val += util::scalar_f32(&loss)?;
+        total.prediction_val += util::scalar_f32(&prediction)?;
         total.recon_val += util::scalar_f32(&recon)?;
         total.assoc_val += util::scalar_f32(&assoc)?;
         total.sigreg_val += util::scalar_f32(&sigreg)?;
-        total.assoc_top1 += association_top1_accuracy(&state_slots, &next_slots)?;
+        total.assoc_top1 += association_top1_accuracy(&predicted_slots, &next_slots)?;
         total.duplicate_fn_in_batch += duplicate_function_ids(&batch, vocab);
     }
     let scale = 1.0 / batches.max(1) as f32;
     total.loss_val *= scale;
+    total.prediction_val *= scale;
     total.recon_val *= scale;
     total.assoc_val *= scale;
     total.sigreg_val *= scale;
@@ -378,32 +458,19 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     }
     let encoder_vocab_sig = vocab_signature(&encoder_vocab);
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
-    let row_count = count_raw_world_rows(&config.data_path)?;
-    let val_row_count = count_raw_world_rows_split(
-        &config.data_path,
-        Some(HELDOUT_SPLIT_MODULUS),
-        HELDOUT_SPLIT_REMAINDER,
-    )
-    .unwrap_or(0);
-    let train_row_count = row_count.saturating_sub(val_row_count);
+    let train_row_count = count_raw_world_rows(&config.data_path)?;
+    let val_path = validation_path(&config.data_path)
+        .filter(|path| path.exists())
+        .context("world knowledge training requires a sibling *_val.txt split")?;
+    let val_row_count = count_raw_world_rows(&val_path)?;
     let mut world_stream = RawWorldStream::with_split(
         &config.data_path,
         DEFAULT_STREAM_SHUFFLE_BUFFER,
-        Some(HELDOUT_SPLIT_MODULUS),
-        HELDOUT_SPLIT_REMAINDER,
-        true,
+        None,
+        0,
+        false,
     )?;
-    let mut val_stream = if val_row_count > 0 {
-        Some(RawWorldStream::with_split(
-            &config.data_path,
-            1,
-            Some(HELDOUT_SPLIT_MODULUS),
-            HELDOUT_SPLIT_REMAINDER,
-            false,
-        )?)
-    } else {
-        None
-    };
+    let mut val_stream = Some(RawWorldStream::with_split(&val_path, 1, None, 0, false)?);
     let world_cache_path =
         compatible_world_cache_path(&config.data_path, config.max_seq, &encoder_vocab_sig)?;
     let mut cached_world_stream = if let Some(cache_path) = world_cache_path.as_ref() {
@@ -411,29 +478,15 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         Some(CachedWorldStream::with_split(
             cache_path,
             DEFAULT_STREAM_SHUFFLE_BUFFER,
-            Some(HELDOUT_SPLIT_MODULUS),
-            HELDOUT_SPLIT_REMAINDER,
-            true,
+            None,
+            0,
+            false,
         )?)
     } else {
         println!("Token cache: no world cache found; using raw tokenization stream");
         None
     };
-    let mut cached_val_stream = if val_row_count > 0 {
-        if let Some(cache_path) = world_cache_path.as_ref() {
-            Some(CachedWorldStream::with_split(
-                cache_path,
-                1,
-                Some(HELDOUT_SPLIT_MODULUS),
-                HELDOUT_SPLIT_REMAINDER,
-                false,
-            )?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mut cached_val_stream = None;
     let vocab_size = encoder_vocab.id_to_token.len();
 
     let mut encoder_varmap = VarMap::new();
@@ -549,7 +602,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         }
     }
 
-    let use_transition = env_bool("TOFY_KNOWLEDGE_USE_TRANSITION", false);
+    let prediction_weight = env_f64("TOFY_WORLD_PREDICTION_LOSS_WEIGHT", 1.0).max(0.0);
     let recon_weight = env_f64("TOFY_WORLD_RECON_LOSS_WEIGHT", 0.5).max(0.0);
     let assoc_weight = env_f64("TOFY_WORLD_ASSOC_LOSS_WEIGHT", 0.5).max(0.0);
 
@@ -581,13 +634,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let grad_accum_steps = world_grad_accum_for_step(step, &config);
 
         for micro_step in 0..grad_accum_steps {
-            let batch = if let Some(ref mut cached_stream) = cached_world_stream {
-                cached_stream.next_batch(batch_size)?
-            } else {
-                let raw_batch = world_stream.next_batch(batch_size)?;
-                encode_world_examples(&raw_batch, &encoder_vocab)
-            };
-            let (mut state_slots, mut next_slots) = context_slots_from_world_pair_batch(
+            let batch = next_unique_batch(
+                batch_size,
+                Some(&mut world_stream),
+                cached_world_stream.as_mut(),
+                &encoder_vocab,
+            )?;
+            let (state_slots, next_slots) = context_slots_from_world_pair_batch(
                 &encoder,
                 &context_compressor,
                 &batch,
@@ -598,17 +651,17 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 !config.train_encoder,
                 &device,
             )?;
-            if use_transition {
-                state_slots = transition.forward(&state_slots)?;
-                next_slots = transition.forward(&next_slots)?;
-            }
+            let predicted_slots = transition.forward(&state_slots)?;
+            let prediction = prediction_loss(&predicted_slots, &next_slots)?;
             let (labels, recon_mask) =
                 reconstruction_targets(&batch, encoder_vocab.pad_id, config.max_seq, &device)?;
-            let recon_logits = reconstruction.forward(&next_slots, config.max_seq)?;
+            // Weights-mode inference supplies this task-derived prediction.
+            // Reconstruction therefore supervises the same latent consumed by Qwen.
+            let recon_logits = reconstruction.forward(&predicted_slots, config.max_seq)?;
             let reconstruction_loss = masked_cross_entropy(&recon_logits, &labels, &recon_mask)?;
-            let association = association_loss(&state_slots, &next_slots)?;
+            let association = association_loss(&predicted_slots, &next_slots)?;
             let state_sigreg = sigreg_epps_pulley(
-                &flatten_latent_slots(&state_slots)?,
+                &flatten_latent_slots(&predicted_slots)?,
                 sigreg_slices,
                 sigreg_points,
             )?;
@@ -620,10 +673,18 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let sigreg_loss = state_sigreg
                 .affine(0.5, 0.0)?
                 .broadcast_add(&next_sigreg.affine(0.5, 0.0)?)?;
-            let loss = reconstruction_loss
-                .affine(recon_weight, 0.0)?
-                .broadcast_add(&association.affine(assoc_weight, 0.0)?)?
-                .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
+            let loss = combine_world_losses(
+                &prediction,
+                &reconstruction_loss,
+                &association,
+                &sigreg_loss,
+                WorldLossWeights {
+                    prediction: prediction_weight,
+                    reconstruction: recon_weight,
+                    association: assoc_weight,
+                    sigreg: config.lambda,
+                },
+            )?;
 
             util::accumulate_scaled_gradients(
                 &mut accumulated_grads,
@@ -637,10 +698,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 let sigreg_val = util::scalar_f32(&sigreg_loss)?;
                 log_snapshot = Some(WorldLogSnapshot {
                     loss_val,
+                    prediction_val: util::scalar_f32(&prediction)?,
                     recon_val: util::scalar_f32(&reconstruction_loss)?,
                     assoc_val: util::scalar_f32(&association)?,
                     sigreg_val,
-                    assoc_top1: association_top1_accuracy(&state_slots, &next_slots)?,
+                    assoc_top1: association_top1_accuracy(&predicted_slots, &next_slots)?,
                     duplicate_fn_in_batch: duplicate_function_ids(&batch, &encoder_vocab),
                 });
             }
@@ -660,6 +722,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         if step % config.log_every == 0 {
             let snap = log_snapshot.context("world grad accumulation produced no log snapshot")?;
             tb.add_scalar("loss/total", snap.loss_val, step);
+            tb.add_scalar("loss/prediction", snap.prediction_val, step);
             tb.add_scalar("loss/reconstruction", snap.recon_val, step);
             tb.add_scalar("loss/association", snap.assoc_val, step);
             tb.add_scalar("loss/sigreg", snap.sigreg_val, step);
@@ -683,7 +746,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 &config,
                 context_segments,
                 recent_full_segments,
-                use_transition,
+                prediction_weight,
                 recon_weight,
                 assoc_weight,
                 sigreg_slices,
@@ -692,6 +755,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             )?;
             let val_selection = validation.as_ref().map(|val| {
                 tb.add_scalar("val/total", val.loss_val, step);
+                tb.add_scalar("val/prediction", val.prediction_val, step);
                 tb.add_scalar("val/reconstruction", val.recon_val, step);
                 tb.add_scalar("val/association", val.assoc_val, step);
                 tb.add_scalar("val/sigreg", val.sigreg_val, step);
@@ -701,10 +765,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     val.duplicate_fn_in_batch as f32,
                     step,
                 );
-                val.recon_val + val.assoc_val + 0.2 * val.sigreg_val
+                val.loss_val
             });
-            let selection_metric =
-                val_selection.unwrap_or(snap.recon_val + snap.assoc_val + 0.2 * snap.sigreg_val);
+            let selection_metric = val_selection.unwrap_or(snap.loss_val);
 
             if selection_metric < best_metric {
                 best_metric = selection_metric;
@@ -774,4 +837,36 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     tb.finish()?;
     println!("World model saved to {:?}", model_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_loss_combiner_accepts_mixed_precision_scalars() -> Result<()> {
+        let device = Device::Cpu;
+        let prediction = Tensor::new(1.0f32, &device)?;
+        let reconstruction = Tensor::new(2.0f32, &device)?.to_dtype(DType::BF16)?;
+        let association = Tensor::new(3.0f32, &device)?.to_dtype(DType::BF16)?;
+        let sigreg = Tensor::new(4.0f32, &device)?;
+
+        let loss = combine_world_losses(
+            &prediction,
+            &reconstruction,
+            &association,
+            &sigreg,
+            WorldLossWeights {
+                prediction: 1.0,
+                reconstruction: 0.5,
+                association: 0.25,
+                sigreg: 0.125,
+            },
+        )?;
+
+        assert_eq!(loss.dtype(), DType::F32);
+        let value = util::scalar_f32(&loss)?;
+        assert!((value - 3.25).abs() < 1e-5, "loss={value}");
+        Ok(())
+    }
 }

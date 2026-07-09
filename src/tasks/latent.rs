@@ -130,8 +130,6 @@ fn latent_forward(
     let all_view_features = encoder.forward_features(&all_view_ids)?;
     let [view_a_features, target_features, paired_view_targets] =
         split_encoder_features(&all_view_features, batch_size)?;
-    let target_features = target_features.detached();
-    let paired_view_targets = paired_view_targets.detached();
     let context_hidden = view_a_features.token_states.clone();
     let target_hidden = target_features.token_states.clone();
     let (b, t, d) = context_hidden.dims3()?;
@@ -184,7 +182,14 @@ fn latent_forward(
     // the Epps-Pulley statistic toward zero-mass dimensions.
     let total_valid: usize = batch.valid_lens.iter().map(|&len| len.min(t)).sum();
     let valid_token_states = if total_valid == 0 || total_valid == b * t {
-        pred_token_flat.clone()
+        Tensor::cat(
+            &[
+                &pred_token_flat,
+                &target_flat,
+                &paired_view_targets.token_states.reshape((b * t, d))?,
+            ],
+            0,
+        )?
     } else {
         let mut valid_linear = Vec::with_capacity(total_valid);
         for (row, &len) in batch.valid_lens.iter().enumerate() {
@@ -194,7 +199,17 @@ fn latent_forward(
         }
         let valid_count = valid_linear.len();
         let valid_indices = Tensor::from_vec(valid_linear, (valid_count,), device)?;
-        pred_token_flat.index_select(&valid_indices, 0)?
+        Tensor::cat(
+            &[
+                &pred_token_flat.index_select(&valid_indices, 0)?,
+                &target_flat.index_select(&valid_indices, 0)?,
+                &paired_view_targets
+                    .token_states
+                    .reshape((b * t, d))?
+                    .index_select(&valid_indices, 0)?,
+            ],
+            0,
+        )?
     };
 
     Ok(LatentForward {
@@ -892,8 +907,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
                     let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
                     let target_count = batch.target_count;
-                    let target_frac =
-                        target_count as f32 / (batch_size * config.max_seq).max(1) as f32;
+                    let valid_tokens = batch.valid_lens.iter().sum::<usize>().max(1);
+                    let target_frac = target_count as f32 / valid_tokens as f32;
                     log_snapshot = Some(LatentLogSnapshot {
                         loss_val: util::scalar_f32(&loss)?,
                         pred_val: util::scalar_f32(&forward.pred_loss)?,

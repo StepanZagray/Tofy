@@ -1302,23 +1302,23 @@ impl TransformerBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Pre-norm architecture (more stable training)
         // Self-attention with residual
-        let normed = self.ln1.forward(x)?;
+        let normed = util::layer_norm_diff(&self.ln1, x)?;
         let attn_out = self.attn.forward(&normed)?;
         let x = (x + attn_out)?;
 
         // Feed-forward with residual
-        let normed = self.ln2.forward(&x)?;
+        let normed = util::layer_norm_diff(&self.ln2, &x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
 
     pub fn forward_masked(&self, x: &Tensor, key_padding_mask: &Tensor) -> Result<Tensor> {
-        let normed = self.ln1.forward(x)?;
+        let normed = util::layer_norm_diff(&self.ln1, x)?;
         let attn_out = self.attn.forward_self_masked(&normed, key_padding_mask)?;
         let x = (x + attn_out)?;
 
-        let normed = self.ln2.forward(&x)?;
+        let normed = util::layer_norm_diff(&self.ln2, &x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)
@@ -1357,11 +1357,11 @@ impl LocalTransformerBlock {
     }
 
     pub fn forward_with_window(&self, x: &Tensor, window: usize) -> Result<Tensor> {
-        let normed = self.ln1.forward(x)?;
+        let normed = util::layer_norm_diff(&self.ln1, x)?;
         let attn_out = self.attn.forward_local(&normed, window.max(1))?;
         let x = (x + attn_out)?;
 
-        let normed = self.ln2.forward(&x)?;
+        let normed = util::layer_norm_diff(&self.ln2, &x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)
@@ -1373,13 +1373,13 @@ impl LocalTransformerBlock {
         window: usize,
         key_padding_mask: &Tensor,
     ) -> Result<Tensor> {
-        let normed = self.ln1.forward(x)?;
+        let normed = util::layer_norm_diff(&self.ln1, x)?;
         let attn_out = self
             .attn
             .forward_local_masked(&normed, window.max(1), key_padding_mask)?;
         let x = (x + attn_out)?;
 
-        let normed = self.ln2.forward(&x)?;
+        let normed = util::layer_norm_diff(&self.ln2, &x)?;
         let ff_out = self.ff1.forward(&normed)?.gelu()?;
         let ff_out = self.ff2.forward(&ff_out)?;
         Ok((x + ff_out)?)
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     fn assert_close(a: &Tensor, b: &Tensor, tol: f32, label: &str) -> Result<()> {
-        let max_diff = a.broadcast_sub(b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let max_diff = util::scalar_f32(&a.broadcast_sub(b)?.abs()?.max_all()?)?;
         assert!(max_diff < tol, "{label} mismatch: {max_diff}");
         Ok(())
     }
@@ -1895,9 +1895,8 @@ mod tests {
             prefix_len: 2,
         };
 
-        let bias = cache_causal_bias(&cache, 4, 2, &device)?
-            .reshape((2, 4))?
-            .to_vec2::<f32>()?;
+        let bias = cache_causal_bias(&cache, 4, 2, &device)?.reshape((2, 4))?;
+        let bias = util::vec2_f32(&bias)?;
 
         assert_eq!(bias[0], vec![0.0, 0.0, 0.0, ATTENTION_MASK_VALUE]);
         assert_eq!(bias[1], vec![0.0, 0.0, 0.0, 0.0]);
@@ -1907,9 +1906,8 @@ mod tests {
     #[test]
     fn compressed_cache_block_bias_masks_blocks_ending_after_query() -> Result<()> {
         let device = Device::Cpu;
-        let bias = compressed_cache_block_bias(4, 2, &[3, 5, 6], &device)?
-            .reshape((2, 3))?
-            .to_vec2::<f32>()?;
+        let bias = compressed_cache_block_bias(4, 2, &[3, 5, 6], &device)?.reshape((2, 3))?;
+        let bias = util::vec2_f32(&bias)?;
 
         assert_eq!(bias[0], vec![0.0, 0.0, ATTENTION_MASK_VALUE]);
         assert_eq!(bias[1], vec![0.0, 0.0, 0.0]);
@@ -1919,9 +1917,9 @@ mod tests {
     #[test]
     fn compressed_local_block_bias_excludes_exact_window_overlap() -> Result<()> {
         let device = Device::Cpu;
-        let bias = compressed_local_block_bias(4, 2, 3, &[1, 2, 3, 4, 5], &device)?
-            .reshape((2, 5))?
-            .to_vec2::<f32>()?;
+        let bias =
+            compressed_local_block_bias(4, 2, 3, &[1, 2, 3, 4, 5], &device)?.reshape((2, 5))?;
+        let bias = util::vec2_f32(&bias)?;
 
         assert_eq!(
             bias[0],
@@ -1946,9 +1944,8 @@ mod tests {
         let scores = Tensor::from_vec(vec![0.1f32, 0.5, -1.0, 0.4, 0.3], (1, 1, 1, 5), &device)?;
         let causal_bias = Tensor::zeros((1, 1, 1, 5), DType::F32, &device)?;
 
-        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 2, &device)?
-            .reshape((5,))?
-            .to_vec1::<f32>()?;
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 2, &device)?.reshape((5,))?;
+        let bias = util::vec1_f32(&bias)?;
 
         assert_eq!(
             bias,
@@ -1973,9 +1970,8 @@ mod tests {
             &device,
         )?;
 
-        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?
-            .reshape((3,))?
-            .to_vec1::<f32>()?;
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?.reshape((3,))?;
+        let bias = util::vec1_f32(&bias)?;
 
         assert_eq!(bias, vec![ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE, 0.0]);
         Ok(())
@@ -1994,9 +1990,8 @@ mod tests {
         )?;
         let causal_bias = Tensor::zeros((1, 2, 1, 3), DType::F32, &device)?;
 
-        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?
-            .reshape((2, 3))?
-            .to_vec2::<f32>()?;
+        let bias = dsa_topk_bias_from_scores(&scores, &causal_bias, 1, &device)?.reshape((2, 3))?;
+        let bias = util::vec2_f32(&bias)?;
 
         assert_eq!(
             bias,
@@ -2027,7 +2022,7 @@ mod tests {
             compressed_causal_blocks_from(&k, &v, 2, 6, 2)?.expect("compressed blocks");
 
         assert_eq!(block_ends, vec![4, 6]);
-        let compressed = compressed_k.reshape((2, 1))?.to_vec2::<f32>()?;
+        let compressed = util::vec2_f32(&compressed_k.reshape((2, 1))?)?;
         assert_eq!(compressed, vec![vec![2.5], vec![4.5]]);
         Ok(())
     }
@@ -2045,8 +2040,8 @@ mod tests {
             .compressed_k
             .as_ref()
             .expect("compressed k")
-            .reshape((2, 1))?
-            .to_vec2::<f32>()?;
+            .reshape((2, 1))?;
+        let compressed = util::vec2_f32(&compressed)?;
         assert_eq!(compressed, vec![vec![1.0], vec![3.0]]);
 
         let new_k = Tensor::from_vec(vec![6.0f32], (1, 1, 1, 1), &device)?;
@@ -2059,8 +2054,8 @@ mod tests {
             .compressed_k
             .as_ref()
             .expect("compressed k")
-            .reshape((2, 1))?
-            .to_vec2::<f32>()?;
+            .reshape((2, 1))?;
+        let compressed = util::vec2_f32(&compressed)?;
         assert_eq!(compressed, vec![vec![1.0], vec![3.5]]);
 
         let new_k = Tensor::from_vec(vec![7.0f32], (1, 1, 1, 1), &device)?;
@@ -2073,8 +2068,8 @@ mod tests {
             .compressed_k
             .as_ref()
             .expect("compressed k")
-            .reshape((2, 1))?
-            .to_vec2::<f32>()?;
+            .reshape((2, 1))?;
+        let compressed = util::vec2_f32(&compressed)?;
         assert_eq!(compressed, vec![vec![1.0], vec![4.0]]);
 
         let new_k = Tensor::from_vec(vec![8.0f32], (1, 1, 1, 1), &device)?;
@@ -2087,8 +2082,8 @@ mod tests {
             .compressed_k
             .as_ref()
             .expect("compressed k")
-            .reshape((3, 1))?
-            .to_vec2::<f32>()?;
+            .reshape((3, 1))?;
+        let compressed = util::vec2_f32(&compressed)?;
         assert_eq!(compressed, vec![vec![1.0], vec![4.0], vec![6.0]]);
         Ok(())
     }

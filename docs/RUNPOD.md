@@ -177,7 +177,7 @@ Pipeline stages (automatic):
 
 1. veclab data + encoder vocab cache  
 2. encoder (LeJEPA on `data/fictional/veclab_encoder_mix.txt`)  
-3. world knowledge (`--train-world-knowledge` on `veclab_knowledge.txt`)  
+3. world knowledge (`--train-world-knowledge` on `veclab_knowledge_train.txt`, validating on the sibling `veclab_knowledge_val.txt`)
 4. Qwen bridge (`--train-bridge` on `veclab_tasks_train.txt`)  
 5. veclab eval (`--eval-bridge` on `eval/veclab_eval.jsonl`)
 

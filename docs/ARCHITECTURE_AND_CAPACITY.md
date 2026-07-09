@@ -28,7 +28,12 @@ This means the codebase now separates:
 
 more cleanly than the earlier single-file entrypoint approach.
 
-Training defaults follow the LeJEPA/LeWorldModel direction: encoder training uses online masked-view prediction plus SIGReg without EMA target updates, stop-gradient teacher targets, contrastive loss, or predictor heads; world training uses action-conditioned next-latent prediction plus SIGReg without router/inverse auxiliary losses. The autoregressive decoders remain downstream code/text emitters, not the world model.
+Training defaults follow the LeWorldModel direction: encoder training and the
+world predictor use raw embedding MSE with gradients through both views plus
+SIGReg, without EMA or stop-gradient targets. The world predictor maps query
+slots to document slots; reconstruction and association are knowledge-specific
+auxiliaries. This is static associative latent prediction, not action-conditioned
+temporal dynamics. The autoregressive decoder remains a downstream code emitter.
 
 ## How Context Works
 

@@ -2,26 +2,10 @@ use anyhow::Result;
 use candle_core::Tensor;
 use rand::{RngExt, SeedableRng};
 
-fn l2_normalize_last_dim(x: &Tensor) -> Result<Tensor> {
-    let dims = x.dims();
-    let Some(&dim) = dims.last() else {
-        anyhow::bail!("normalization tensor must have at least one dimension");
-    };
-    let rows = dims[..dims.len().saturating_sub(1)]
-        .iter()
-        .product::<usize>()
-        .max(1);
-    let x = x.reshape((rows, dim))?;
-    let norm = x.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
-    x.broadcast_div(&norm.unsqueeze(1)?)
-        .and_then(|normalized| normalized.reshape(dims))
-        .map_err(Into::into)
-}
-
 pub fn prediction_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
-    let pred_norm = l2_normalize_last_dim(pred)?;
-    let target_norm = l2_normalize_last_dim(target)?;
-    Ok(pred_norm.broadcast_sub(&target_norm)?.sqr()?.mean_all()?)
+    let pred = pred.to_dtype(candle_core::DType::F32)?;
+    let target = target.to_dtype(candle_core::DType::F32)?;
+    Ok(pred.broadcast_sub(&target)?.sqr()?.mean_all()?)
 }
 
 pub fn mean_cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -37,12 +21,13 @@ pub fn mean_cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         .iter()
         .product::<usize>()
         .max(1);
-    let a = a.reshape((rows, dim))?;
-    let b = b.reshape((rows, dim))?;
+    let a = a.reshape((rows, dim))?.to_dtype(candle_core::DType::F32)?;
+    let b = b.reshape((rows, dim))?.to_dtype(candle_core::DType::F32)?;
     let dot = a.broadcast_mul(&b)?.sum(1)?;
     let a_norm = a.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
     let b_norm = b.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, 1e10)?;
     dot.broadcast_div(&a_norm.broadcast_mul(&b_norm)?)?
+        .clamp(-1.0, 1.0)?
         .mean_all()
         .map_err(Into::into)
 }
@@ -68,7 +53,9 @@ const SIGREG_PROJECTION_SEED: u64 = 0x5147_5253_4947_4552;
 pub fn sigreg_epps_pulley(x: &Tensor, num_slices: usize, num_points: usize) -> Result<Tensor> {
     let (_, dim) = x.dims2()?;
     let device = x.device();
-    let work_dtype = x.dtype();
+    // The Epps-Pulley statistic is sensitive to BF16 rounding in the tails.
+    let work_dtype = candle_core::DType::F32;
+    let x = x.to_dtype(work_dtype)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(SIGREG_PROJECTION_SEED);
 
     let mut proj = vec![0f32; dim * num_slices];
@@ -115,14 +102,14 @@ mod tests {
     use candle_core::Device;
 
     #[test]
-    fn prediction_loss_is_invariant_to_vector_scale() -> Result<()> {
+    fn prediction_loss_penalizes_vector_scale_error() -> Result<()> {
         let device = Device::Cpu;
         let target = Tensor::from_vec(vec![3.0f32, 4.0], (1, 2), &device)?;
         let pred = Tensor::from_vec(vec![6.0f32, 8.0], (1, 2), &device)?;
         let loss = prediction_loss(&pred, &target)?.to_vec0::<f32>()?;
         assert!(
-            loss < 1e-5,
-            "normalized loss should be near zero, got {loss}"
+            (loss - 12.5).abs() < 1e-5,
+            "raw embedding MSE should be 12.5, got {loss}"
         );
         Ok(())
     }
