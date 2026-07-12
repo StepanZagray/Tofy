@@ -18,6 +18,7 @@ use crate::model::{
     prediction_loss, sigreg_epps_pulley, ActionStateTransition, ContextCompressor,
     KnowledgeReconstructionHead, OnlineEncoder,
 };
+use crate::tasks::veclab::model_visible_task;
 use crate::tasks::world_context::{
     context_slots_from_world_pair_batch, env_bool, env_f64, env_usize,
 };
@@ -114,19 +115,6 @@ fn combine_world_losses(
         .map_err(Into::into)
 }
 
-fn duplicate_function_ids(batch: &[WorldExample], vocab: &crate::model::Vocab) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    for example in batch {
-        let text = vocab.decode_ids_lossy(&example.state_tokens);
-        if let Some(id) = crate::tasks::veclab::parse_fn_tag(&text) {
-            if !seen.insert(id) {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
 fn validation_path(train_path: &Path) -> Option<PathBuf> {
     let name = train_path.file_name()?.to_str()?;
     let val_name = name.replace("_train.txt", "_val.txt");
@@ -155,11 +143,12 @@ fn next_unique_batch(
             encode_world_examples(&raw, vocab)
         };
         attempts += examples.len();
-        for example in examples {
+        for mut example in examples {
             let text = vocab.decode_ids_lossy(&example.state_tokens);
             let function_id = crate::tasks::veclab::parse_fn_tag(&text)
                 .context("world knowledge row is missing a decodable [fn:NNN] tag")?;
             if function_ids.insert(function_id) {
+                example.state_tokens = vocab.encode_boundless(model_visible_task(&text));
                 batch.push(example);
                 if batch.len() == batch_size {
                     return Ok(batch);
@@ -265,7 +254,6 @@ fn world_validation_metric(
         total.assoc_val += util::scalar_f32(&assoc)?;
         total.sigreg_val += util::scalar_f32(&sigreg)?;
         total.assoc_top1 += association_top1_accuracy(&predicted_slots, &next_slots)?;
-        total.duplicate_fn_in_batch += duplicate_function_ids(&batch, vocab);
     }
     let scale = 1.0 / batches.max(1) as f32;
     total.loss_val *= scale;
@@ -603,8 +591,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     }
 
     let prediction_weight = env_f64("TOFY_WORLD_PREDICTION_LOSS_WEIGHT", 1.0).max(0.0);
-    let recon_weight = env_f64("TOFY_WORLD_RECON_LOSS_WEIGHT", 0.5).max(0.0);
-    let assoc_weight = env_f64("TOFY_WORLD_ASSOC_LOSS_WEIGHT", 0.5).max(0.0);
+    let recon_weight = env_f64("TOFY_WORLD_RECON_LOSS_WEIGHT", 0.25).max(0.0);
+    let assoc_weight = env_f64("TOFY_WORLD_ASSOC_LOSS_WEIGHT", 1.0).max(0.0);
 
     println!("Training world knowledge model (reconstruction + association + SIGReg)");
     println!("Rows: train {} | val {}", train_row_count, val_row_count);
@@ -703,7 +691,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     assoc_val: util::scalar_f32(&association)?,
                     sigreg_val,
                     assoc_top1: association_top1_accuracy(&predicted_slots, &next_slots)?,
-                    duplicate_fn_in_batch: duplicate_function_ids(&batch, &encoder_vocab),
+                    duplicate_fn_in_batch: 0,
                 });
             }
         }

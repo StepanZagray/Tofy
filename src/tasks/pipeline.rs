@@ -445,9 +445,10 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     );
     set_env_default_owned("TOFY_WORLD_MAX_SEQ", defaults.world_max_seq.to_string());
     set_env_default_owned("TOFY_BRIDGE_MAX_SEQ", defaults.bridge_max_seq.to_string());
-    if cfg.profile == MemoryProfile::Minimal {
-        set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "none");
-    }
+    set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "hard");
+    set_env_default("TOFY_BRIDGE_MIN_SEMANTIC_GAP", "0.02");
+    set_env_default("TOFY_WORLD_RECON_LOSS_WEIGHT", "0.25");
+    set_env_default("TOFY_WORLD_ASSOC_LOSS_WEIGHT", "1.0");
     set_env_default_owned(
         "TOFY_BRIDGE_GRAD_ACCUM",
         defaults.bridge_grad_accum.to_string(),
@@ -822,11 +823,26 @@ fn train_bridge(
     let qwen_dir = std::env::var("TOFY_QWEN_DIR")
         .context("TOFY_QWEN_DIR must point to the Qwen3-1.7B-Base model directory")?;
     let old_regime = std::env::var_os("TOFY_BRIDGE_REGIME");
+    let old_unfreeze = std::env::var_os("TOFY_KNOWLEDGE_UNFREEZE_WORLD");
+    let old_bridge_lr = std::env::var_os("TOFY_BRIDGE_LR");
     for (stage, regime, output) in [
         ("bridge_context", "context", &paths.bridge_context_model),
         ("bridge_weights", "weights", &paths.bridge_weights_model),
     ] {
         std::env::set_var("TOFY_BRIDGE_REGIME", regime);
+        if old_unfreeze.is_none() {
+            std::env::set_var(
+                "TOFY_KNOWLEDGE_UNFREEZE_WORLD",
+                if regime == "weights" { "true" } else { "false" },
+            );
+        }
+        if old_bridge_lr.is_none() {
+            if regime == "weights" {
+                std::env::set_var("TOFY_BRIDGE_LR", "1e-4");
+            } else {
+                std::env::remove_var("TOFY_BRIDGE_LR");
+            }
+        }
         if stage_complete(cfg, output, stage, defaults.bridge_steps)? {
             println!(
                 "Skipping {stage}; resume state reached {} steps.",
@@ -850,12 +866,43 @@ fn train_bridge(
             tasks::bridge::try_run_train_bridge(&append_resume(args, cfg.resume))
         })?;
         ensure_file(output)?;
+        if regime == "weights"
+            && std::env::var("TOFY_KNOWLEDGE_UNFREEZE_WORLD")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            ensure_file(output.with_extension("world.safetensors"))?;
+        }
     }
     match old_regime {
         Some(value) => std::env::set_var("TOFY_BRIDGE_REGIME", value),
         None => std::env::remove_var("TOFY_BRIDGE_REGIME"),
     }
+    match old_unfreeze {
+        Some(value) => std::env::set_var("TOFY_KNOWLEDGE_UNFREEZE_WORLD", value),
+        None => std::env::remove_var("TOFY_KNOWLEDGE_UNFREEZE_WORLD"),
+    }
+    match old_bridge_lr {
+        Some(value) => std::env::set_var("TOFY_BRIDGE_LR", value),
+        None => std::env::remove_var("TOFY_BRIDGE_LR"),
+    }
     Ok(())
+}
+
+fn eval_ladder_includes(name: &str) -> bool {
+    let ladder = std::env::var("TOFY_EVAL_LADDER").unwrap_or_else(|_| "full".into());
+    match ladder.as_str() {
+        "full" => true,
+        "bridge" | "world" | "world_bridge" => {
+            matches!(name, "latent_channel" | "knowledge_in_weights")
+        }
+        other => {
+            other
+                .split(',')
+                .map(str::trim)
+                .any(|part| part == name)
+        }
+    }
 }
 
 fn final_eval(
@@ -863,7 +910,10 @@ fn final_eval(
     cfg: &PipelineConfig,
     defaults: &ProfileDefaults,
 ) -> Result<()> {
-    println!("== Stage 5/5: experimental ladder and controls ==");
+    let ladder = std::env::var("TOFY_EVAL_LADDER").unwrap_or_else(|_| "full".into());
+    println!(
+        "== Stage 5/5: experimental ladder and controls (TOFY_EVAL_LADDER={ladder}) =="
+    );
     let qwen_dir = std::env::var("TOFY_QWEN_DIR")?;
     let old_mode = std::env::var_os("TOFY_EVAL_MODE");
     let old_regime = std::env::var_os("TOFY_BRIDGE_REGIME");
@@ -887,6 +937,10 @@ fn final_eval(
             &paths.bridge_weights_model,
         ),
     ] {
+        if !eval_ladder_includes(name) {
+            println!("Skipping eval_{name}; not in TOFY_EVAL_LADDER.");
+            continue;
+        }
         std::env::set_var("TOFY_EVAL_MODE", mode);
         std::env::set_var("TOFY_BRIDGE_REGIME", regime);
         let args = vec![
@@ -909,6 +963,29 @@ fn final_eval(
         })?;
     }
 
+    if !eval_ladder_includes("static_prefix")
+        && !eval_ladder_includes("lora_r16")
+        && !eval_ladder_includes("lora_r512")
+    {
+        match old_mode {
+            Some(value) => std::env::set_var("TOFY_EVAL_MODE", value),
+            None => std::env::remove_var("TOFY_EVAL_MODE"),
+        }
+        match old_regime {
+            Some(value) => std::env::set_var("TOFY_BRIDGE_REGIME", value),
+            None => std::env::remove_var("TOFY_BRIDGE_REGIME"),
+        }
+        match old_static {
+            Some(value) => std::env::set_var("TOFY_STATIC_SOFT_PREFIX", value),
+            None => std::env::remove_var("TOFY_STATIC_SOFT_PREFIX"),
+        }
+        match old_lora {
+            Some(value) => std::env::set_var("TOFY_QWEN_LORA_RANK", value),
+            None => std::env::remove_var("TOFY_QWEN_LORA_RANK"),
+        }
+        return Ok(());
+    }
+
     let lora_data = paths.eval_stage_dir.join("lora_train.txt");
     let mut lora_rows = fs::read_to_string(WORLD_TEXT_DATA)?;
     lora_rows.push_str(&fs::read_to_string(VECLAB_TASKS)?);
@@ -918,6 +995,10 @@ fn final_eval(
         ("lora_r16", false, Some(16)),
         ("lora_r512", false, Some(512)),
     ] {
+        if !eval_ladder_includes(name) {
+            println!("Skipping {name}; not in TOFY_EVAL_LADDER.");
+            continue;
+        }
         if static_prefix {
             std::env::set_var("TOFY_STATIC_SOFT_PREFIX", "true");
         } else {
@@ -981,6 +1062,25 @@ fn final_eval(
     std::env::remove_var("TOFY_STATIC_SOFT_PREFIX");
     std::env::remove_var("TOFY_QWEN_LORA_RANK");
     std::env::set_var("TOFY_BRIDGE_REGIME", "weights");
+    if !eval_ladder_includes("channel_probe") {
+        match old_mode {
+            Some(value) => std::env::set_var("TOFY_EVAL_MODE", value),
+            None => std::env::remove_var("TOFY_EVAL_MODE"),
+        }
+        match old_regime {
+            Some(value) => std::env::set_var("TOFY_BRIDGE_REGIME", value),
+            None => std::env::remove_var("TOFY_BRIDGE_REGIME"),
+        }
+        match old_static {
+            Some(value) => std::env::set_var("TOFY_STATIC_SOFT_PREFIX", value),
+            None => std::env::remove_var("TOFY_STATIC_SOFT_PREFIX"),
+        }
+        match old_lora {
+            Some(value) => std::env::set_var("TOFY_QWEN_LORA_RANK", value),
+            None => std::env::remove_var("TOFY_QWEN_LORA_RANK"),
+        }
+        return Ok(());
+    }
     let probe_output = paths.eval_stage_dir.join("channel_probe.safetensors");
     let probe_args = vec![
         "jepa_ai".to_string(),
@@ -1856,7 +1956,7 @@ mod profile_tests {
         let profiles: ModelProfiles =
             serde_json::from_str(include_str!("../../config/model_profiles.json"))?;
         assert_eq!(profiles.minimal.bridge_dim, 640);
-        assert_eq!(profiles.minimal.bridge_max_seq, 512);
+        assert_eq!(profiles.minimal.bridge_max_seq, 256);
         assert!(profiles.minimal.bridge_grad_accum > 0);
         Ok(())
     }

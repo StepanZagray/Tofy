@@ -264,6 +264,9 @@ Update `docs/RESULTS.md` when a run beats prior metrics.
 | `TOFY_REQUIRE_PREPARED_CACHE` | no | Set `0` for veclab (pipeline builds vocab in stage 1) |
 | `TOFY_TRAIN_DTYPE` | no | Default `bf16` on GPU |
 | `TOFY_BRIDGE_REGIME` | no | `context` (Step 2) or `weights` (Step 3); see bridge spec |
+| `TOFY_DECODER_CONDITIONING_NEGATIVES` | no | `hard`; uses a true different-function row even at batch one |
+| `TOFY_BRIDGE_MIN_SEMANTIC_GAP` | no | Minimum `wrong_ce - matched_ce` for world-bridge checkpoint eligibility; default `0.02` |
+| `TOFY_KNOWLEDGE_UNFREEZE_WORLD` | no | Pipeline default: false for context, true for practical weights-mode joint alignment |
 
 ## 13. Legacy scripts (do not use for veclab)
 

@@ -1,6 +1,7 @@
 # Spec: Knowledge Injection from World Model into Frozen Qwen3-1.7B-Base
 
-Status: experiment design; implementation changes are tracked by `BRIDGE_EXPERIMENT_FIXES_SPEC.md`.
+Status: implemented experiment design; the July 2026 causal-control repair is
+described below.
 Scope: world-model side + conditioning bridge. Nothing in the current model is
 considered load-bearing: any code that does not serve the experiment may be
 changed or deleted (see section 7). The custom `CodeDecoder` is replaced by
@@ -185,8 +186,9 @@ training.
 | 4. Baselines | soft prefix; LoRA | same | <1 day |
 | 5. Eval + ablations | — | eval suites | hours |
 
-Everything fits trivially: Qwen 1.7B bf16 ≈ 3.4 GB, world stack < 1 GB,
-trainable params ~25M.
+Everything fits on the target accelerators: Qwen 1.7B bf16 ≈ 3.4 GB and
+the measured bridge has 124.2M trainable parameters. Optimizer and activation
+memory, rather than frozen Qwen weights, set the L40S batch-one limit.
 
 ## 6. Additional improvements (ordered by expected impact)
 
@@ -207,6 +209,55 @@ trainable params ~25M.
    distills context knowledge into world weights.
 10. Conditioning dropout (10% zero-latent batches) so the margin loss has an
     honest zero-conditioned reference inside the bridge training too.
+
+## 6.1 July 2026 causal-control repair
+
+Run `code_poc_1783547471` proved that a nonzero learned intervention can turn
+on code-following behavior in frozen Qwen, but matched conditioning did not beat
+shuffled conditioning. The repaired implementation makes that shortcut
+ineligible for checkpoint selection:
+
+- `[fn:NNN]` remains sampling metadata but is stripped before encoder/Qwen input.
+- `minimal` uses a real wrong-function negative. Batch-one negatives are fetched
+  from another function instead of degenerating to zeros.
+- Positive and wrong-condition gradients are accumulated sequentially, keeping
+  only one Qwen activation graph resident on the L40S.
+- Validation reports matched, zeroed, and two wrong-function CEs. A world bridge
+  is checkpoint-eligible only when `wrong_ce - matched_ce >=
+  TOFY_BRIDGE_MIN_SEMANTIC_GAP` (default `0.02`).
+- Eval reports paired matched-only/control-only counts and matched advantage.
+- World association is symmetric task-to-doc/doc-to-task InfoNCE; reconstruction
+  weight is reduced to `0.25`, association weight raised to `1.0`, and the
+  L40S-safe world schedule extended to 20k steps because the prior validation
+  metric was still improving at 12k.
+- The context bridge keeps the world frozen. The practical weights bridge trains
+  world+bridge jointly at `1e-4` and saves an atomic matching world sidecar.
+
+Old world checkpoints trained with model-visible function tags and old bridge
+checkpoints trained with `TOFY_DECODER_CONDITIONING_NEGATIVES=none` must not be
+resumed into this objective; start a new run root.
+
+## 6.2 2026 research disposition
+
+- [LeWorldModel](https://arxiv.org/abs/2603.19312) supports end-to-end encoder /
+  predictor alignment with prediction plus Gaussian regularization. This motivates
+  joint weights-mode alignment and preserving LeJEPA prediction + SIGReg.
+- [When Does LeJEPA Learn a World Model?](https://arxiv.org/abs/2605.26379)
+  motivates Gaussian latents and explicit identifiability checks; its guarantees
+  do not replace task-specific causal controls for text knowledge.
+- [Fast LeWorldModel](https://arxiv.org/abs/2606.26217) uses action-prefix
+  prediction to reduce rollout error. It is relevant when this experiment gains
+  multi-step latent rollouts, not to the present one-step knowledge lookup.
+- [Qwen3.6](https://github.com/QwenLM/Qwen3.6) emphasizes hybrid gated-delta/MoE
+  efficiency, scaled agentic RL, and thinking-context preservation. Its public
+  repository still lists the detailed user guide/paper as forthcoming; these
+  large-model mechanisms are not transplanted into the Qwen3-1.7B control.
+- [DeepSeek-V4](https://www.deepseek.com/en/transparency/) and
+  [GLM-5.2](https://z.ai/blog/glm-5.2) target trillion-scale MoE, sparse million-
+  token attention, MTP/speculative decoding, and long-horizon agentic RL. Those
+  are serving/post-training scale techniques, not remedies for the measured
+  wrong-latent invariance. The applicable shared lesson is to optimize and score
+  the actual end behavior with hard controls rather than proxy loss alone.
 
 ## 7. Cleanup: delete everything that does not serve the experiment
 

@@ -4,8 +4,9 @@ Update the **Best So Far** section when a run improves on a reported metric. Rec
 
 ## Best So Far
 
-The Qwen knowledge-injection ladder has no completed runs yet. Record floor, RAG ceiling,
-latent-channel, knowledge-in-weights, static-prefix, LoRA, and latent-ablation metrics here.
+The first Qwen knowledge-injection ladder completed on `code_poc_1783547471`,
+but its causal controls invalidate the world-knowledge claim. It remains the
+baseline that the repaired semantic-negative run must beat.
 World training uses `--train-world-knowledge` with explicit per-function
 paraphrase train/validation splits; bridge training uses `--train-bridge` and
 produces separate context and weights checkpoints.
@@ -17,7 +18,8 @@ floor/RAG/latent/weights evaluations.
 
 | Run | Regime | Trainable parameters | Seen pass | Held-out pass |
 |---|---|---:|---:|---:|
-| World conditioned | context/weights | emitted as `trainable_params` by `--train-bridge` | pending | pending |
+| `code_poc_1783547471` | context | 124,159,368 | 0.7033 | 0.2767 |
+| `code_poc_1783547471` | weights | 124,159,368 | 0.2833 | 0.0600 |
 | Static prefix | prefix | emitted as `trainable_params` with `TOFY_STATIC_SOFT_PREFIX=true` | pending | pending |
 | LoRA r=16 | Q/V LoRA | emitted as `trainable_params` with `TOFY_QWEN_LORA_RANK=16` | pending | pending |
 | LoRA r=512 | Q/V LoRA capacity control | emitted as `trainable_params` with `TOFY_QWEN_LORA_RANK=512` | pending | pending |
@@ -44,7 +46,34 @@ TOFY_EVAL_MODE=floor TOFY_EVAL_TASK_OFFSET=300 TOFY_EVAL_MAX_TASKS=5 TOFY_ENCODE
 This is a five-task contamination smoke check, not a statistically powered full-suite result.
 The required near-zero floor was confirmed.
 
-These best metrics were produced before the strict LeJEPA default rewrite. Treat them as legacy baselines until a strict run reports better metrics with its exact command.
+### `code_poc_1783547471` full causal evaluation (invalidated baseline)
+
+The 600-task base and RAG controls both scored `0.0000` seen/held-out pass.
+Context matched scored `0.7033` seen and `0.2767` held-out, but shuffled scored
+`0.7267` and `0.2833`. On held-out paired outcomes, matched-only was `0/300`
+and shuffled-only `2/300`; all 83 matched passes were explicit-name tasks and
+implicit held-out pass was `0/200`. Weights matched scored `0.2833` seen and
+`0.0600` held-out; held-out matched-only and shuffled-only were both `1/300`.
+Zeroed conditioning scored `0.0000`, proving that the bridge turns behavior on
+but not that it transmits the correct task knowledge. These checkpoints used
+`TOFY_DECODER_CONDITIONING_NEGATIVES=none`; their world stage also saw function
+metadata. Start the repaired experiment from a new run root rather than resuming.
+
+Exact context evaluation command:
+
+```bash
+TOFY_TRAIN_DTYPE=bf16 TOFY_ENCODER_DIM=640 TOFY_ENCODER_LAYERS=7 TOFY_ENCODER_HEADS=8 TOFY_BRIDGE_DIM=640 TOFY_NUM_LATENT_TOKENS=64 TOFY_BRIDGE_MAX_SEQ=256 TOFY_EVAL_MODE=bridge TOFY_BRIDGE_REGIME=context ./target/release/jepa_ai --eval-bridge /workspace/Tofy/models/qwen3-1.7b-base runs/code_poc_1783547471/bridge/context.best.safetensors runs/code_poc_1783547471/world/model.encoder.safetensors runs/code_poc_1783547471/latent/model.vocab.txt runs/code_poc_1783547471/world/model.safetensors eval/veclab_eval.jsonl runs/code_poc_1783547471/eval/latent_channel.json
+```
+
+Exact weights evaluation command:
+
+```bash
+TOFY_TRAIN_DTYPE=bf16 TOFY_ENCODER_DIM=640 TOFY_ENCODER_LAYERS=7 TOFY_ENCODER_HEADS=8 TOFY_BRIDGE_DIM=640 TOFY_NUM_LATENT_TOKENS=64 TOFY_BRIDGE_MAX_SEQ=256 TOFY_EVAL_MODE=bridge TOFY_BRIDGE_REGIME=weights ./target/release/jepa_ai --eval-bridge /workspace/Tofy/models/qwen3-1.7b-base runs/code_poc_1783547471/bridge/weights.best.safetensors runs/code_poc_1783547471/world/model.encoder.safetensors runs/code_poc_1783547471/latent/model.vocab.txt runs/code_poc_1783547471/world/model.safetensors eval/veclab_eval.jsonl runs/code_poc_1783547471/eval/knowledge_in_weights.json
+```
+
+The legacy metrics below were produced before the strict LeJEPA default rewrite.
+Treat them as legacy baselines until a strict run reports better metrics with
+its exact command.
 
 - **World transition selection score:** `0.0041821287` at step `17000/60000` on `data/world_mix_pairs.txt` validation stream, logged peak VRAM `7280/8151 MB` — legacy pre-CLI run with `DIM=640`, `LAYERS=7`, `HEADS=8`, `WORLD_BATCH=128`, `WORLD_GRAD_ACCUM=1`, `TOFY_TRAIN_DTYPE=bf16`. This is not the current default 8 GB schedule.
 - **World training throughput:** `1.2209 steps/s` (`0.8191 s/step`) over logged steps `18000 -> 21000` on `data/world_mix_pairs.txt`, batch `128x1`, from `runs/code_poc_2026-04-21_21-50-54/world/events.out.tfevents.1776804849.zephyrus.25746.0`. This is about `1.98x` faster than `0.6170 steps/s` (`1.6208 s/step`) from `runs/code_poc_2026-04-20_22-32-35/world/events.out.tfevents.1776732255.zephyrus.86212.0` with the same world shape. Command: legacy pre-CLI resume run whose world stage invoked `target/release/jepa_ai --train-world local_models/model_latent_39.53M.safetensors local_models/model_latent_39.53M.vocab.txt data/world_mix_pairs.txt 60000 128 640 256 7 8 640 64 --lambda 0.2 --lr 2e-4 --grad-accum 1 --action-loss-weight 1.0 --router-warmup 5000 --resume`, with default token-cache prefetch enabled (`TOFY_CACHE_PREFETCH_BATCHES` unset, default `2`; `TOFY_TOKEN_CACHE_READER_MB` unset, default `8`).

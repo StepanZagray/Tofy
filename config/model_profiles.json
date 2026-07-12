@@ -1,8 +1,8 @@
 {
   "minimal": {
     "latent_steps": 20000,
-    "world_steps": 12000,
-    "bridge_steps": 15000,
+    "world_steps": 20000,
+    "bridge_steps": 20000,
     "dim": 640,
     "latent_max_seq": 256,
     "world_max_seq": 384,

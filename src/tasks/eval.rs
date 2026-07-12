@@ -82,12 +82,69 @@ struct TaskResult {
     generated_code: Option<String>,
 }
 
+#[derive(Default, Serialize)]
+struct PairedCausalMetrics {
+    tasks: usize,
+    both_pass: usize,
+    matched_only: usize,
+    control_only: usize,
+    neither_pass: usize,
+    matched_advantage: f64,
+}
+
 #[derive(Serialize)]
 struct EvalReport {
     regime: String,
     bridge_model: String,
     results: BTreeMap<String, BTreeMap<String, Rates>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    paired_causal_controls: BTreeMap<String, BTreeMap<String, PairedCausalMetrics>>,
     task_results: Vec<TaskResult>,
+}
+
+fn paired_causal_controls(
+    task_results: &[TaskResult],
+) -> BTreeMap<String, BTreeMap<String, PairedCausalMetrics>> {
+    let mut outcomes: BTreeMap<(String, String), BTreeMap<String, bool>> = BTreeMap::new();
+    for result in task_results {
+        outcomes
+            .entry((result.subset.clone(), result.id.clone()))
+            .or_default()
+            .insert(
+                result.condition.clone(),
+                matches!(result.category, FailureCategory::Pass),
+            );
+    }
+    let mut controls: BTreeMap<String, BTreeMap<String, PairedCausalMetrics>> = BTreeMap::new();
+    for ((subset, _), conditions) in outcomes {
+        let Some(&matched) = conditions.get("matched") else {
+            continue;
+        };
+        for control in ["shuffled", "swapped", "zeroed"] {
+            let Some(&control_pass) = conditions.get(control) else {
+                continue;
+            };
+            let metrics = controls
+                .entry(subset.clone())
+                .or_default()
+                .entry(control.to_string())
+                .or_default();
+            metrics.tasks += 1;
+            match (matched, control_pass) {
+                (true, true) => metrics.both_pass += 1,
+                (true, false) => metrics.matched_only += 1,
+                (false, true) => metrics.control_only += 1,
+                (false, false) => metrics.neither_pass += 1,
+            }
+        }
+    }
+    for subset in controls.values_mut() {
+        for metrics in subset.values_mut() {
+            metrics.matched_advantage = (metrics.matched_only as f64 - metrics.control_only as f64)
+                / metrics.tasks.max(1) as f64;
+        }
+    }
+    controls
 }
 
 fn load_suite(path: &Path) -> Result<Vec<EvalTask>> {
@@ -323,6 +380,7 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
             .or_default()
             .insert(condition, rate(&metrics));
     }
+    let paired_causal_controls = paired_causal_controls(&task_results);
     let report = EvalReport {
         regime: if eval_mode == "bridge" {
             std::env::var("TOFY_BRIDGE_REGIME").unwrap_or_else(|_| "weights".into())
@@ -331,6 +389,7 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         },
         bridge_model: args[3].clone(),
         results,
+        paired_causal_controls,
         task_results,
     };
     let default_report = PathBuf::from(format!(
@@ -376,5 +435,27 @@ mod tests {
             serde_json::to_string(&FailureCategory::Timeout).unwrap(),
             "\"timeout\""
         );
+    }
+
+    #[test]
+    fn paired_controls_report_matched_advantage() {
+        let row = |id: &str, condition: &str, category| TaskResult {
+            id: id.into(),
+            subset: "heldout".into(),
+            condition: condition.into(),
+            category,
+            generated_code: None,
+        };
+        let metrics = paired_causal_controls(&[
+            row("a", "matched", FailureCategory::Pass),
+            row("a", "shuffled", FailureCategory::MustCallViolation),
+            row("b", "matched", FailureCategory::MustCallViolation),
+            row("b", "shuffled", FailureCategory::Pass),
+        ]);
+        let shuffled = &metrics["heldout"]["shuffled"];
+        assert_eq!(shuffled.tasks, 2);
+        assert_eq!(shuffled.matched_only, 1);
+        assert_eq!(shuffled.control_only, 1);
+        assert_eq!(shuffled.matched_advantage, 0.0);
     }
 }

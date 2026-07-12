@@ -82,7 +82,12 @@ impl KnowledgeReconstructionHead {
 pub fn association_loss(task_slots: &Tensor, doc_slots: &Tensor) -> Result<Tensor> {
     let logits = association_logits(task_slots, doc_slots)?;
     let labels = Tensor::arange(0u32, logits.dim(0)? as u32, logits.device())?;
-    nn::loss::cross_entropy(&logits, &labels).map_err(Into::into)
+    let task_to_doc = nn::loss::cross_entropy(&logits, &labels)?;
+    let doc_to_task = nn::loss::cross_entropy(&logits.t()?, &labels)?;
+    task_to_doc
+        .broadcast_add(&doc_to_task)?
+        .affine(0.5, 0.0)
+        .map_err(Into::into)
 }
 
 fn association_logits(task_slots: &Tensor, doc_slots: &Tensor) -> Result<Tensor> {

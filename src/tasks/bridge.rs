@@ -15,12 +15,13 @@ use crate::model::{
     OnlineEncoder,
 };
 use crate::tasks::veclab::{
-    attach_docs, load_docs_map, load_task_rows, VeclabTaskRow, SEEN_FUNCTION_MAX,
+    attach_docs, load_docs_map, load_task_rows, model_visible_task, VeclabTaskRow,
+    SEEN_FUNCTION_MAX,
 };
 use crate::tasks::world_context::{
     context_slots_from_world_pair_sequences, env_bool, env_f64, env_usize,
 };
-use crate::tasks::world_support::{different_group_conditioning_latent, masked_cross_entropy};
+use crate::tasks::world_support::masked_cross_entropy;
 use crate::util;
 
 #[derive(Clone, Copy, Debug)]
@@ -59,22 +60,6 @@ impl ConditioningNegatives {
             }
         }
         out
-    }
-}
-
-pub(crate) fn add_conditioning_margin_loss(
-    existing: Option<Tensor>,
-    positive: &Tensor,
-    negative: &Tensor,
-    margin: f64,
-) -> Result<Tensor> {
-    let value = positive
-        .broadcast_sub(negative)?
-        .affine(1.0, margin)?
-        .relu()?;
-    match existing {
-        Some(loss) => loss.broadcast_add(&value).map_err(Into::into),
-        None => Ok(value),
     }
 }
 
@@ -182,6 +167,28 @@ impl BridgeSampler {
     }
 }
 
+fn mismatched_rows(
+    pool: &[VeclabTaskRow],
+    positives: &[VeclabTaskRow],
+    offset: usize,
+) -> Result<Vec<VeclabTaskRow>> {
+    if pool.len() < 2 {
+        bail!("mismatched conditioning requires at least two rows");
+    }
+    positives
+        .iter()
+        .enumerate()
+        .map(|(index, positive)| {
+            let start = (offset.max(1) + index) % pool.len();
+            (0..pool.len())
+                .map(|delta| &pool[(start + delta) % pool.len()])
+                .find(|candidate| candidate.function_id != positive.function_id)
+                .cloned()
+                .context("mismatched conditioning requires at least two function groups")
+        })
+        .collect()
+}
+
 pub(crate) fn qwen_weight_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|v| v.path()))
@@ -205,7 +212,10 @@ fn qwen_batch(
         .iter()
         .map(|row| {
             let prompt = tokenizer
-                .encode(qwen_prompt(&row.task, &row.completion), false)
+                .encode(
+                    qwen_prompt(model_visible_task(&row.task), &row.completion),
+                    false,
+                )
                 .map_err(anyhow::Error::msg)?;
             let completion = tokenizer
                 .encode(row.completion.clone(), false)
@@ -295,9 +305,10 @@ fn world_rows(rows: &[VeclabTaskRow], regime: BridgeRegime) -> Vec<RawWorldExamp
             state_text: match regime {
                 BridgeRegime::Context => format!(
                     "Relevant veclab documentation:\n{}\n\nTask:\n{}",
-                    row.docs, row.task
+                    row.docs,
+                    model_visible_task(&row.task)
                 ),
-                BridgeRegime::Weights => row.task.clone(),
+                BridgeRegime::Weights => model_visible_task(&row.task).to_string(),
             },
             next_text: row.completion.clone(),
             action_label: 0,
@@ -483,7 +494,7 @@ impl BridgeRuntime {
     pub fn generate(&self, prompt: &str, conditioning: &Tensor, max_new: usize) -> Result<String> {
         let encoded = self
             .tokenizer
-            .encode(qwen_prompt(prompt, ""), false)
+            .encode(qwen_prompt(model_visible_task(prompt), ""), false)
             .map_err(anyhow::Error::msg)?;
         let mut ids = encoded.get_ids().to_vec();
         let prompt_len = ids.len();
@@ -515,9 +526,17 @@ impl BridgeRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BridgeValLosses {
+    matched: f32,
+    zeroed: f32,
+    wrong: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn val_losses(
     rows: &[VeclabTaskRow],
+    wrong_rows: [&[VeclabTaskRow]; 2],
     regime: BridgeRegime,
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
@@ -531,7 +550,7 @@ fn val_losses(
     device: &Device,
     output_slots: usize,
     hidden_size: usize,
-) -> Result<(f32, f32)> {
+) -> Result<BridgeValLosses> {
     let lora_mode = std::env::var("TOFY_QWEN_LORA_RANK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -551,9 +570,37 @@ fn val_losses(
         adapter.forward(&slots)?
     };
     let (input, labels, mask) = qwen_batch(tokenizer, rows, max_seq, device)?;
-    let matched = token_loss(model, &input, &labels, &mask, &cond)?;
-    let zero = token_loss(model, &input, &labels, &mask, &cond.zeros_like()?)?;
-    Ok((util::scalar_f32(&matched)?, util::scalar_f32(&zero)?))
+    let matched = util::scalar_f32(&token_loss(model, &input, &labels, &mask, &cond)?)?;
+    let zeroed = util::scalar_f32(&token_loss(
+        model,
+        &input,
+        &labels,
+        &mask,
+        &cond.zeros_like()?,
+    )?)?;
+    let mut wrong = f32::INFINITY;
+    for wrong_rows in wrong_rows {
+        let wrong_cond = if lora_mode || static_prefix.is_some() {
+            cond.clone()
+        } else {
+            let slots = state_conditioning(
+                wrong_rows, regime, encoder, compressor, transition, vocab, max_seq, device,
+            )?;
+            adapter.forward(&slots)?
+        };
+        wrong = wrong.min(util::scalar_f32(&token_loss(
+            model,
+            &input,
+            &labels,
+            &mask,
+            &wrong_cond,
+        )?)?);
+    }
+    Ok(BridgeValLosses {
+        matched,
+        zeroed,
+        wrong,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,12 +620,16 @@ fn full_val_losses(
     device: &Device,
     output_slots: usize,
     hidden_size: usize,
-) -> Result<(f32, f32)> {
+) -> Result<BridgeValLosses> {
     let mut matched = 0.0;
-    let mut zero = 0.0;
+    let mut zeroed = 0.0;
+    let mut wrong = 0.0;
     for chunk in rows.chunks(batch_size.max(1)) {
-        let (chunk_matched, chunk_zero) = val_losses(
+        let wrong_a = mismatched_rows(rows, chunk, 1)?;
+        let wrong_b = mismatched_rows(rows, chunk, 7)?;
+        let losses = val_losses(
             chunk,
+            [&wrong_a, &wrong_b],
             regime,
             tokenizer,
             encoder,
@@ -593,10 +644,16 @@ fn full_val_losses(
             output_slots,
             hidden_size,
         )?;
-        matched += chunk_matched * chunk.len() as f32;
-        zero += chunk_zero * chunk.len() as f32;
+        matched += losses.matched * chunk.len() as f32;
+        zeroed += losses.zeroed * chunk.len() as f32;
+        wrong += losses.wrong * chunk.len() as f32;
     }
-    Ok((matched / rows.len() as f32, zero / rows.len() as f32))
+    let count = rows.len() as f32;
+    Ok(BridgeValLosses {
+        matched: matched / count,
+        zeroed: zeroed / count,
+        wrong: wrong / count,
+    })
 }
 
 fn token_loss(
@@ -874,7 +931,13 @@ fn train(args: BridgeArgs) -> Result<()> {
             util::load_varmap_checked(&mut train_vars, &latest_path)?;
         }
         let latest_world = latest_path.with_extension("world.safetensors");
-        if unfreeze_world && latest_world.exists() {
+        if unfreeze_world && latest_path.exists() {
+            if !latest_world.exists() {
+                bail!(
+                    "joint world/bridge resume requires matching world sidecar: {}",
+                    latest_world.display()
+                );
+            }
             util::load_varmap_checked(&mut world_map, &latest_world)?;
         }
         if optimizer_path.exists() {
@@ -889,14 +952,14 @@ fn train(args: BridgeArgs) -> Result<()> {
     } else {
         0
     };
-    let min_val_gap = env_f64("TOFY_BRIDGE_MIN_VAL_GAP", 0.02).max(0.0) as f32;
-    let requires_conditioning_gap = !lora_mode && static_prefix.is_none();
+    let min_semantic_gap = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_GAP", 0.02).max(0.0) as f32;
+    let requires_semantic_gap = !lora_mode && static_prefix.is_none();
     let mut best_score = if args.resume {
         resume_state.best_metric
     } else {
         f32::INFINITY
     };
-    let mut best_gap = if args.resume {
+    let mut best_semantic_gap = if args.resume {
         resume_state.best_aux_metric
     } else {
         f32::NEG_INFINITY
@@ -950,87 +1013,110 @@ fn train(args: BridgeArgs) -> Result<()> {
             };
             let dropout_seed =
                 args.seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ micro_step as u64;
-            if StdRng::seed_from_u64(dropout_seed).random::<f64>() < dropout {
+            let conditioning_dropped =
+                micro_step > 0 && StdRng::seed_from_u64(dropout_seed).random::<f64>() < dropout;
+            if conditioning_dropped {
                 cond = cond.zeros_like()?;
             }
             let (input, labels, mask) = qwen_batch(&tokenizer, &batch_rows, max_seq, &device)?;
-            let function_ids = batch_rows
-                .iter()
-                .map(|row| row.function_id)
-                .collect::<Vec<_>>();
+            let semantic_negatives = !conditioning_dropped && !lora_mode && static_prefix.is_none();
+            let mut negative_values = Vec::new();
+            if negatives.zero && !conditioning_dropped {
+                let value = util::scalar_f32(&token_loss(
+                    &qwen,
+                    &input,
+                    &labels,
+                    &mask,
+                    &cond.zeros_like()?,
+                )?)?;
+                negative_values.push((None, value, "zero"));
+            }
+            for (enabled, offset, name) in [
+                (negatives.shuffle, 7usize, "shuffle"),
+                (negatives.hard, 1usize, "hard"),
+            ] {
+                if !enabled || !semantic_negatives {
+                    continue;
+                }
+                let wrong_rows = mismatched_rows(&train_rows, &batch_rows, offset)?;
+                let wrong_slots = state_conditioning(
+                    &wrong_rows,
+                    regime,
+                    &encoder,
+                    &compressor,
+                    &transition,
+                    &encoder_vocab,
+                    max_seq,
+                    &device,
+                )?;
+                let wrong_cond = adapter.forward(&wrong_slots)?.detach();
+                let value =
+                    util::scalar_f32(&token_loss(&qwen, &input, &labels, &mask, &wrong_cond)?)?;
+                negative_values.push((Some(offset), value, name));
+            }
+
             let positive = token_loss(&qwen, &input, &labels, &mask, &cond)?;
-            let mut margin_loss: Option<Tensor> = None;
-            if negatives.zero {
-                let value = add_conditioning_margin_loss(
-                    None,
-                    &positive,
-                    &token_loss(&qwen, &input, &labels, &mask, &cond.zeros_like()?)?,
-                    margin,
-                )?;
-                if step % log_every == 0 {
-                    zero_margin_sum += util::scalar_f32(&value)?;
-                }
-                margin_loss = Some(match margin_loss {
-                    Some(total) => total.broadcast_add(&value)?,
-                    None => value,
-                });
-            }
-            if negatives.shuffle {
-                let value = add_conditioning_margin_loss(
-                    None,
-                    &positive,
-                    &token_loss(
-                        &qwen,
-                        &input,
-                        &labels,
-                        &mask,
-                        &different_group_conditioning_latent(&cond, &function_ids, 7)?,
-                    )?,
-                    margin,
-                )?;
-                if step % log_every == 0 {
-                    shuffle_margin_sum += util::scalar_f32(&value)?;
-                }
-                margin_loss = Some(match margin_loss {
-                    Some(total) => total.broadcast_add(&value)?,
-                    None => value,
-                });
-            }
-            if negatives.hard {
-                let value = add_conditioning_margin_loss(
-                    None,
-                    &positive,
-                    &token_loss(
-                        &qwen,
-                        &input,
-                        &labels,
-                        &mask,
-                        &different_group_conditioning_latent(&cond, &function_ids, 1)?,
-                    )?,
-                    margin,
-                )?;
-                if step % log_every == 0 {
-                    hard_margin_sum += util::scalar_f32(&value)?;
-                }
-                margin_loss = Some(match margin_loss {
-                    Some(total) => total.broadcast_add(&value)?,
-                    None => value,
-                });
-            }
-            let loss = match margin_loss {
-                Some(value) => positive.broadcast_add(&value.affine(margin_weight, 0.0)?)?,
-                None => positive.clone(),
-            };
-            if step % log_every == 0 {
-                loss_sum += util::scalar_f32(&loss)?;
-                positive_sum += util::scalar_f32(&positive)?;
-            }
+            let positive_value = util::scalar_f32(&positive)?;
+            let active = negative_values
+                .iter()
+                .map(|(offset, negative, name)| {
+                    let margin_value = (positive_value - negative + margin as f32).max(0.0);
+                    (*offset, *name, margin_value)
+                })
+                .collect::<Vec<_>>();
+            let active_count = active.iter().filter(|(_, _, value)| *value > 0.0).count();
+            let positive_weight = 1.0 + margin_weight * active_count as f64;
+            let weighted_positive = positive.affine(positive_weight, 0.0)?;
             util::accumulate_scaled_gradients(
                 &mut accumulated,
                 &optimizer_vars,
-                &loss,
+                &weighted_positive,
                 grad_accum,
             )?;
+
+            for (offset, _, margin_value) in &active {
+                if *margin_value <= 0.0 {
+                    continue;
+                }
+                let wrong_cond = match offset {
+                    None => cond.zeros_like()?,
+                    Some(offset) => {
+                        let wrong_rows = mismatched_rows(&train_rows, &batch_rows, *offset)?;
+                        let wrong_slots = state_conditioning(
+                            &wrong_rows,
+                            regime,
+                            &encoder,
+                            &compressor,
+                            &transition,
+                            &encoder_vocab,
+                            max_seq,
+                            &device,
+                        )?;
+                        adapter.forward(&wrong_slots)?
+                    }
+                };
+                let negative = token_loss(&qwen, &input, &labels, &mask, &wrong_cond)?;
+                let weighted_negative = negative.affine(-margin_weight, 0.0)?;
+                util::accumulate_scaled_gradients(
+                    &mut accumulated,
+                    &optimizer_vars,
+                    &weighted_negative,
+                    grad_accum,
+                )?;
+            }
+            if step % log_every == 0 {
+                let margin_total = active.iter().map(|(_, _, value)| *value).sum::<f32>();
+                loss_sum += positive_value + margin_weight as f32 * margin_total;
+                positive_sum += positive_value;
+                for (_, name, value) in &active {
+                    match *name {
+                        "zero" => zero_margin_sum += *value,
+                        "shuffle" => shuffle_margin_sum += *value,
+                        "hard" => hard_margin_sum += *value,
+                        _ => unreachable!(),
+                    }
+                }
+            }
         }
         let gradient_count = util::accumulated_gradient_count(&accumulated, &optimizer_vars);
         if gradient_count == 0 {
@@ -1076,7 +1162,7 @@ fn train(args: BridgeArgs) -> Result<()> {
             );
         }
         if step % val_every == 0 || step == args.steps {
-            let (matched, zero) = full_val_losses(
+            let losses = full_val_losses(
                 &val_rows,
                 args.batch,
                 regime,
@@ -1093,9 +1179,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                 output_slots,
                 cfg.hidden_size,
             )?;
-            tb.add_scalar("val/ce_matched", matched, step);
-            tb.add_scalar("val/ce_zeroed", zero, step);
-            tb.add_scalar("val/gap", zero - matched, step);
+            let zero_gap = losses.zeroed - losses.matched;
+            let semantic_gap = losses.wrong - losses.matched;
+            tb.add_scalar("val/ce_matched", losses.matched, step);
+            tb.add_scalar("val/ce_zeroed", losses.zeroed, step);
+            tb.add_scalar("val/ce_wrong", losses.wrong, step);
+            tb.add_scalar("val/zero_gap", zero_gap, step);
+            tb.add_scalar("val/semantic_gap", semantic_gap, step);
             if !lora_mode {
                 let telemetry_rows = &val_rows[..val_rows.len().min(args.batch.max(1))];
                 let slots = state_conditioning(
@@ -1129,7 +1219,10 @@ fn train(args: BridgeArgs) -> Result<()> {
                 }
             }
             tb.flush();
-            println!("bridge val step={step} val_ce_matched={matched:.4} val_ce_zeroed={zero:.4} gap={:.4}", zero - matched);
+            println!(
+                "bridge val step={step} val_ce_matched={:.4} val_ce_zeroed={:.4} val_ce_wrong={:.4} zero_gap={zero_gap:.4} semantic_gap={semantic_gap:.4}",
+                losses.matched, losses.zeroed, losses.wrong
+            );
             util::save_varmap_atomic(&train_vars, &latest_path)?;
             if unfreeze_world {
                 util::save_varmap_atomic(
@@ -1137,19 +1230,22 @@ fn train(args: BridgeArgs) -> Result<()> {
                     &latest_path.with_extension("world.safetensors"),
                 )?;
             }
-            let gap = zero - matched;
-            let eligible = !requires_conditioning_gap || gap >= min_val_gap;
-            let selection_score = matched;
+            let eligible = !requires_semantic_gap || semantic_gap >= min_semantic_gap;
+            let selection_score = losses.matched;
             tb.add_scalar("val/selection_score", selection_score, step);
             if eligible && selection_score < best_score {
                 best_score = selection_score;
-                best_gap = gap;
+                best_semantic_gap = semantic_gap;
                 util::save_varmap_atomic(&train_vars, &best_path)?;
                 util::save_varmap_atomic(&train_vars, &args.output)?;
                 if unfreeze_world {
                     util::save_varmap_atomic(
                         &world_map,
                         &args.output.with_extension("world.safetensors"),
+                    )?;
+                    util::save_varmap_atomic(
+                        &world_map,
+                        &best_path.with_extension("world.safetensors"),
                     )?;
                 }
             }
@@ -1160,20 +1256,20 @@ fn train(args: BridgeArgs) -> Result<()> {
                     stage: resume_stage.clone(),
                     step,
                     best_metric: best_score,
-                    best_aux_metric: best_gap,
+                    best_aux_metric: best_semantic_gap,
                     saved_checkpoint: best_score.is_finite(),
                 },
             )?;
         }
     }
     println!(
-        "Best bridge saved to {} (selection_score={best_score:.4}, val_gap={best_gap:.4}); latest={}",
+        "Best bridge saved to {} (selection_score={best_score:.4}, semantic_gap={best_semantic_gap:.4}); latest={}",
         args.output.display(),
         latest_path.display()
     );
-    if requires_conditioning_gap && best_gap < min_val_gap {
+    if requires_semantic_gap && best_semantic_gap < min_semantic_gap {
         bail!(
-            "no bridge checkpoint reached the required conditioning gap: selected={best_gap:.4}, required={min_val_gap:.4}"
+            "no bridge checkpoint reached the required semantic conditioning gap: selected={best_semantic_gap:.4}, required={min_semantic_gap:.4}"
         );
     }
     tb.finish()?;
@@ -1198,7 +1294,7 @@ mod tests {
     #[test]
     fn conditioning_text_never_contains_completion() {
         let row = VeclabTaskRow {
-            task: "TASK_SENTINEL".into(),
+            task: "[fn:001] TASK_SENTINEL".into(),
             completion: "GOLD_COMPLETION_SENTINEL".into(),
             function_id: 1,
             docs: "DOC_SENTINEL".into(),
@@ -1206,8 +1302,25 @@ mod tests {
         for regime in [BridgeRegime::Context, BridgeRegime::Weights] {
             let world = world_rows(std::slice::from_ref(&row), regime);
             assert!(world[0].state_text.contains("TASK_SENTINEL"));
+            assert!(!world[0].state_text.contains("[fn:001]"));
             assert!(!world[0].state_text.contains("GOLD_COMPLETION_SENTINEL"));
         }
+    }
+
+    #[test]
+    fn batch_one_mismatch_uses_another_function() -> Result<()> {
+        let rows = (1..=3)
+            .map(|function_id| VeclabTaskRow {
+                task: format!("[fn:{function_id:03}] task"),
+                completion: "completion".into(),
+                function_id,
+                docs: format!("docs {function_id}"),
+            })
+            .collect::<Vec<_>>();
+        let wrong = mismatched_rows(&rows, &rows[..1], 1)?;
+        assert_eq!(wrong.len(), 1);
+        assert_ne!(wrong[0].function_id, rows[0].function_id);
+        Ok(())
     }
 
     #[test]

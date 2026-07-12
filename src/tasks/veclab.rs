@@ -23,6 +23,17 @@ pub fn parse_fn_tag(text: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
+/// Removes corpus bookkeeping that must never become a model-visible shortcut.
+pub fn model_visible_task(text: &str) -> &str {
+    let text = text.trim();
+    let Some(rest) = text.strip_prefix("[fn:") else {
+        return text;
+    };
+    rest.find(']')
+        .map(|end| rest[end + 1..].trim_start())
+        .unwrap_or(text)
+}
+
 impl VeclabTaskRow {
     pub fn parse(line: &str) -> Result<Option<Self>> {
         let line = line.trim();
@@ -208,5 +219,14 @@ mod tests {
     fn parse_fn_tag_handles_padding() {
         assert_eq!(parse_fn_tag("[fn:007] query"), Some(7));
         assert_eq!(parse_fn_tag("no tag"), None);
+    }
+
+    #[test]
+    fn model_visible_task_strips_only_leading_metadata() {
+        assert_eq!(
+            model_visible_task("[fn:007] Write Solve and mention [fn:008]"),
+            "Write Solve and mention [fn:008]"
+        );
+        assert_eq!(model_visible_task("Write Solve"), "Write Solve");
     }
 }
