@@ -1,7 +1,7 @@
 # Spec: `veclab` Data Generation for the World-Model Knowledge Experiment
 
-Status: actionable spec for the corpus generator (P1.2 in
-`docs/BRIDGE_EXPERIMENT_FIXES_SPEC.md`).
+Status: implemented corpus-generator specification. The current causal-control
+requirements are in [QWEN_KNOWLEDGE_INJECTION_SPEC.md](QWEN_KNOWLEDGE_INJECTION_SPEC.md#61-july-2026-causal-control-repair).
 Consumers: encoder continue-pretrain, `--train-world-knowledge`
 (`src/tasks/knowledge.rs`), `--train-bridge` (`src/tasks/bridge.rs`), eval.
 
@@ -61,9 +61,9 @@ storing.
 
 All TSV files follow `docs/DATA_FORMATS.md` conventions
 (`state<TAB>next`, newlines escaped). Every row carries the function ID as a
-leading inline tag in the state field: `[fn:NNN]` (stripped by no consumer;
-it is ordinary text to the models, but lets split filters and the channel
-probe parse IDs).
+leading inline tag in the state field: `[fn:NNN]`. It is sampling metadata:
+the bridge strips it before encoder and Qwen input, while split filters and the
+channel probe can still parse it from the source row.
 
 | File | Rows | Format | Used by |
 |---|---|---|---|
@@ -163,9 +163,8 @@ present in training files → 300 seen + 300 held-out cases.
 
 ## 10. Implementation
 
-- New task: `cargo run --release -- --prepare-veclab --seed N --out data/fictional`
-  implemented in `src/tasks/prepare_veclab.rs` (new file; do not grow
-  `prepare.rs`).
+- Task: `cargo run --release -- --prepare-veclab --seed N --out data/fictional`,
+  implemented in `src/tasks/veclab.rs`.
 - Function semantics as a small AST enum; three renderers: Go impl, doc
   text, test vectors (evaluate the AST on generated inputs in Rust to get
   expected outputs — avoids needing Go at doc-gen time; `go test` then

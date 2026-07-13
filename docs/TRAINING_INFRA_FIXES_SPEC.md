@@ -1,7 +1,7 @@
 # Spec: Training-Loop and Infra Fixes (Bridge + Knowledge + Latent Stages)
 
 Status: actionable change list, all findings verified against the working
-tree. Complements `docs/BRIDGE_EXPERIMENT_FIXES_SPEC.md` (P0 items there —
+tree. Complements the [Qwen knowledge-injection specification](QWEN_KNOWLEDGE_INJECTION_SPEC.md) (P0 items there —
 regime split, function split, world-weight saving — have landed; this spec
 covers the next layer: training-loop correctness, resumability, and eval
 plumbing).
@@ -33,7 +33,7 @@ indices in a test with a tiny corpus).
 
 `src/tasks/bridge.rs:700-703` returns `Ok(false)` — the advertised command
 falls through to usage/error. This is the last missing piece of the ladder
-(P1.3 in BRIDGE_EXPERIMENT_FIXES_SPEC).
+(P1.3 in the Qwen knowledge-injection specification).
 
 Change: implement per that spec — load `eval/veclab_eval.jsonl`, build
 prompts per regime (Step-1 RAG mode pastes docs into the prompt with

@@ -1,6 +1,7 @@
 # Decoder runtime and environment variables
 
-Decoder backends and env vars for `--serve`. The server picks the decoder by action (code vs text) after routing from context compressor. See [RUNBOOK.md](RUNBOOK.md) for serve commands and [OPENCODE.md](OPENCODE.md) for OpenCode setup.
+Historical decoder backends and environment variables for the retired `--serve`
+stack. See [RUNBOOK.md](RUNBOOK.md) for the legacy serve commands.
 
 ## Backends
 

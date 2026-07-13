@@ -275,5 +275,6 @@ Update `docs/RESULTS.md` when a run beats prior metrics.
 | `scripts/runpod_restore_cache_build.sh` | Old 80 GB Go/code-decoder HF cache |
 | `scripts/runpod_go_eval.sh` | Old Candle code-decoder eval |
 
-See `docs/VECLAB_DATA_SPEC.md` and `docs/BRIDGE_EXPERIMENT_FIXES_SPEC.md` for
-experiment design.
+See [VECLAB_DATA_SPEC.md](VECLAB_DATA_SPEC.md) and the
+[Qwen knowledge-injection specification](QWEN_KNOWLEDGE_INJECTION_SPEC.md#61-july-2026-causal-control-repair)
+for experiment design and causal controls.
