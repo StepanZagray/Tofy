@@ -266,6 +266,13 @@ Update `docs/RESULTS.md` when a run beats prior metrics.
 | `TOFY_BRIDGE_REGIME` | no | `context` (Step 2) or `weights` (Step 3); see bridge spec |
 | `TOFY_DECODER_CONDITIONING_NEGATIVES` | no | `hard`; uses a true different-function row even at batch one |
 | `TOFY_BRIDGE_MIN_SEMANTIC_GAP` | no | Minimum `wrong_ce - matched_ce` for world-bridge checkpoint eligibility; default `0.02` |
+| `TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS` | no | Default `true`; training/validation reveal only the shared `func Solve` signature, forcing behavior to come from the state |
+| `TOFY_BRIDGE_TRAIN_FUNCTION_MAX` | no | Default `80`; functions `1..80` are bridge training groups |
+| `TOFY_BRIDGE_VALIDATION_FUNCTION_MAX` | no | Default `100`; functions `81..100` are function-disjoint bridge validation groups |
+| `TOFY_DECODER_CONDITIONING_UNLIKELIHOOD_WEIGHT` | no | Default `0.25`; penalizes target tokens under a wrong state without CE-max saturation |
+| `TOFY_DECODER_CONDITIONING_SEPARATION_WEIGHT` | no | Default `0.05`; enforces state-dependent adapter outputs for hard negatives |
+| `TOFY_DECODER_CONDITIONING_MIN_DISTANCE` | no | Default `0.1`; squared-distance hinge used by the separation loss |
+| `TOFY_BRIDGE_SEMANTIC_WARMUP` / `TOFY_BRIDGE_SEMANTIC_PATIENCE` | no | Defaults `400` / `1200`; stop an unqualified context run after no meaningful semantic-gap progress |
 | `TOFY_KNOWLEDGE_UNFREEZE_WORLD` | no | Pipeline default: false for context, true for practical weights-mode joint alignment |
 
 ## 13. Legacy scripts (do not use for veclab)

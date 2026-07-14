@@ -447,6 +447,15 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default_owned("TOFY_BRIDGE_MAX_SEQ", defaults.bridge_max_seq.to_string());
     set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "hard");
     set_env_default("TOFY_BRIDGE_MIN_SEMANTIC_GAP", "0.02");
+    set_env_default("TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS", "true");
+    set_env_default("TOFY_BRIDGE_TRAIN_FUNCTION_MAX", "80");
+    set_env_default("TOFY_BRIDGE_VALIDATION_FUNCTION_MAX", "100");
+    set_env_default("TOFY_DECODER_CONDITIONING_UNLIKELIHOOD_WEIGHT", "0.25");
+    set_env_default("TOFY_DECODER_CONDITIONING_SEPARATION_WEIGHT", "0.05");
+    set_env_default("TOFY_DECODER_CONDITIONING_MIN_DISTANCE", "0.1");
+    set_env_default("TOFY_BRIDGE_SEMANTIC_WARMUP", "400");
+    set_env_default("TOFY_BRIDGE_SEMANTIC_PATIENCE", "1200");
+    set_env_default("TOFY_BRIDGE_MIN_SEMANTIC_PROGRESS", "0.002");
     set_env_default("TOFY_WORLD_RECON_LOSS_WEIGHT", "0.25");
     set_env_default("TOFY_WORLD_ASSOC_LOSS_WEIGHT", "1.0");
     set_env_default_owned(
@@ -862,9 +871,21 @@ fn train_bridge(
             defaults.bridge_batch.to_string(),
             output.to_string_lossy().to_string(),
         ];
-        with_stage(stage, || {
+        let bridge_result = with_stage(stage, || {
             tasks::bridge::try_run_train_bridge(&append_resume(args, cfg.resume))
-        })?;
+        });
+        if let Err(error) = bridge_result {
+            // Context is a causal-channel control. If it has already proven
+            // wrong-latent invariance, keep its diagnostic latest checkpoint
+            // and continue to the distinct joint world/weights test.
+            if regime == "context" && error.to_string().contains("semantic conditioning plateau") {
+                println!(
+                    "Context bridge stopped for semantic plateau; continuing to weights bridge: {error:#}"
+                );
+                continue;
+            }
+            return Err(error);
+        }
         ensure_file(output)?;
         if regime == "weights"
             && std::env::var("TOFY_KNOWLEDGE_UNFREEZE_WORLD")
@@ -896,12 +917,7 @@ fn eval_ladder_includes(name: &str) -> bool {
         "bridge" | "world" | "world_bridge" => {
             matches!(name, "latent_channel" | "knowledge_in_weights")
         }
-        other => {
-            other
-                .split(',')
-                .map(str::trim)
-                .any(|part| part == name)
-        }
+        other => other.split(',').map(str::trim).any(|part| part == name),
     }
 }
 
@@ -911,9 +927,7 @@ fn final_eval(
     defaults: &ProfileDefaults,
 ) -> Result<()> {
     let ladder = std::env::var("TOFY_EVAL_LADDER").unwrap_or_else(|_| "full".into());
-    println!(
-        "== Stage 5/5: experimental ladder and controls (TOFY_EVAL_LADDER={ladder}) =="
-    );
+    println!("== Stage 5/5: experimental ladder and controls (TOFY_EVAL_LADDER={ladder}) ==");
     let qwen_dir = std::env::var("TOFY_QWEN_DIR")?;
     let old_mode = std::env::var_os("TOFY_EVAL_MODE");
     let old_regime = std::env::var_os("TOFY_BRIDGE_REGIME");
@@ -939,6 +953,13 @@ fn final_eval(
     ] {
         if !eval_ladder_includes(name) {
             println!("Skipping eval_{name}; not in TOFY_EVAL_LADDER.");
+            continue;
+        }
+        if !bridge_model.exists() {
+            println!(
+                "Skipping eval_{name}; no qualifying bridge checkpoint at {}.",
+                bridge_model.display()
+            );
             continue;
         }
         std::env::set_var("TOFY_EVAL_MODE", mode);

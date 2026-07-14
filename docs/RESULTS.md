@@ -46,6 +46,24 @@ TOFY_EVAL_MODE=floor TOFY_EVAL_TASK_OFFSET=300 TOFY_EVAL_MAX_TASKS=5 TOFY_ENCODE
 This is a five-task contamination smoke check, not a statistically powered full-suite result.
 The required near-zero floor was confirmed.
 
+### `code_poc_1783869616` repaired causal attempt (superseded, not a result)
+
+The world stage was manually stopped at `17,000/20,000` after its selection
+metric plateaued; its best observed selection score was `0.123667315` near step
+14k. The first context bridge reached roughly step 3,700 before being stopped
+because matched and wrong-state validation CE remained effectively equal while
+zeroed CE differed--another generic nonzero-prefix collapse. It produced no
+checkpoint meeting the required `wrong_ce - matched_ce >= 0.02` semantic gap,
+so it must not be evaluated or added to **Best So Far**. The corrective
+counterfactual/centred-adapter objective is intentionally started from a new
+run root, not resumed from these incompatible bridge weights.
+
+Command used for the discarded context attempt:
+
+```bash
+./target/release/jepa_ai train minimal --resume runs/code_poc_1783869616 --skip-trained world
+```
+
 ### `code_poc_1783547471` full causal evaluation (invalidated baseline)
 
 The 600-task base and RAG controls both scored `0.0000` seen/held-out pass.

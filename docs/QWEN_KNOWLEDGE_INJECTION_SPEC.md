@@ -237,6 +237,38 @@ Old world checkpoints trained with model-visible function tags and old bridge
 checkpoints trained with `TOFY_DECODER_CONDITIONING_NEGATIVES=none` must not be
 resumed into this objective; start a new run root.
 
+### 6.1.1 Causal-channel hardening
+
+The first repaired context run still reached almost identical matched and wrong
+validation CE: zero conditioning changed generic code-following behavior, but
+a wrong nonzero state did not change the answer. The bridge now applies the
+following stricter intervention, which is required before interpreting a pass
+rate as knowledge injection:
+
+- The adapter is centred at its all-zero world state and does not emit its
+  learned query bank as a prefix. Consequently `adapter(0) = 0`; queries can
+  select state information but cannot turn on a task-independent coding mode.
+- The bridge prompt exposes only the `func Solve(...)` signature by default
+  (`TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS=true`). Matched and wrong states with
+  the same signature therefore receive precisely the same visible request.
+- Hard negatives preferentially use a different function with that same public
+  signature. The optimisation combines the existing CE margin with target-token
+  unlikelihood under a wrong state and a minimum adapter-output separation.
+  This retains gradients after wrong-state CE has saturated.
+- Bridge selection is now function-disjoint: functions 1--80 train and 81--100
+  validate (`TOFY_BRIDGE_TRAIN_FUNCTION_MAX=80`,
+  `TOFY_BRIDGE_VALIDATION_FUNCTION_MAX=100`). This replaces the old row-wise
+  split, which allowed paraphrases of each function in both partitions.
+- If no semantic-gap progress is observed after the warm-up, the context stage
+  stops after `TOFY_BRIDGE_SEMANTIC_PATIENCE` (default 1200 steps) and the
+  pipeline proceeds to the separately evaluated weights regime. A checkpoint
+  is still never emitted as qualifying unless it reaches the 0.02 gap.
+
+These changes test the actual claim--the state, rather than a generic nonzero
+prefix or visible task text, controls Qwen's output. They intentionally make
+the context bridge harder to optimize; a failed causal gate is an experiment
+result, not a reason to report its natural-prompt compile score.
+
 ## 6.2 2026 research disposition
 
 - [LeWorldModel](https://arxiv.org/abs/2603.19312) supports end-to-end encoder /

@@ -128,6 +128,20 @@ impl DecoderConditioningAdapter {
 
     /// Input: context slots [B, S, planner_dim]. Output: decoder conditioning slots [B, A, model_dim].
     pub fn forward(&self, context_slots: &Tensor) -> Result<Tensor> {
+        // A learned query bank is useful for reading a variable-length state, but
+        // it must never become a static soft prompt.  Centering removes every
+        // query/bias-only path: adapter(0) is exactly zero, and non-zero decoder
+        // conditioning has to be explained by the supplied world slots.
+        let output = self.forward_uncentered(context_slots)?;
+        // The baseline defines the zero point but carries no learning signal;
+        // detaching it avoids retaining a second adapter graph per microbatch.
+        let baseline = self
+            .forward_uncentered(&context_slots.zeros_like()?)?
+            .detach();
+        output.broadcast_sub(&baseline).map_err(Into::into)
+    }
+
+    fn forward_uncentered(&self, context_slots: &Tensor) -> Result<Tensor> {
         let batch = context_slots.dim(0)?;
         let memory = compressed_context_compressor(
             context_slots,
@@ -162,7 +176,11 @@ impl DecoderConditioningAdapter {
             .cross_attn
             .forward(&normed, &memory)?
             .broadcast_mul(&memory_gate)?;
-        let slots = (queries + attended)?;
+        // Queries select what to read, but are not themselves emitted as a
+        // conditioning prefix.  Otherwise `queries` alone can enable a generic
+        // code mode for every world state, which is exactly the collapse caught
+        // by matched-vs-wrong causal controls.
+        let slots = attended;
 
         let normed = util::layer_norm_diff(&self.ln2, &slots)?;
         let ff = self.ff1.forward(&normed)?.gelu()?;
@@ -210,4 +228,29 @@ fn compressed_context_compressor(
     let mut refs = compressed.iter().collect::<Vec<_>>();
     refs.push(&recent_memory);
     Tensor::cat(&refs, 1).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::VarMap;
+
+    #[test]
+    fn zero_world_slots_emit_zero_conditioning() -> Result<()> {
+        let device = Device::Cpu;
+        let vars = VarMap::new();
+        let adapter = DecoderConditioningAdapter::new_with_compress_rate(
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+            8,
+            8,
+            4,
+            1,
+        )?;
+        let zero = Tensor::zeros((2, 4, 8), DType::F32, &device)?;
+        let output = adapter.forward(&zero)?;
+        let max = crate::util::scalar_f32(&output.abs()?.max_all()?)?;
+        assert!(max <= 1e-6, "adapter(0) must be zero, got {max}");
+        Ok(())
+    }
 }

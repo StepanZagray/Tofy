@@ -21,7 +21,7 @@ use crate::tasks::veclab::{
 use crate::tasks::world_context::{
     context_slots_from_world_pair_sequences, env_bool, env_f64, env_usize,
 };
-use crate::tasks::world_support::masked_cross_entropy;
+use crate::tasks::world_support::{masked_cross_entropy, masked_unlikelihood};
 use crate::util;
 
 #[derive(Clone, Copy, Debug)]
@@ -180,13 +180,54 @@ fn mismatched_rows(
         .enumerate()
         .map(|(index, positive)| {
             let start = (offset.max(1) + index) % pool.len();
+            // Match the public Go signature first.  With counterfactual bridge
+            // prompts this gives the decoder exactly the same visible request
+            // under the matched and wrong world states, so a generic code
+            // prefix cannot satisfy the negative objective.
             (0..pool.len())
                 .map(|delta| &pool[(start + delta) % pool.len()])
-                .find(|candidate| candidate.function_id != positive.function_id)
+                .find(|candidate| {
+                    candidate.function_id != positive.function_id
+                        && same_bridge_signature(candidate, positive)
+                })
+                .or_else(|| {
+                    (0..pool.len())
+                        .map(|delta| &pool[(start + delta) % pool.len()])
+                        .find(|candidate| candidate.function_id != positive.function_id)
+                })
                 .cloned()
                 .context("mismatched conditioning requires at least two function groups")
         })
         .collect()
+}
+
+fn solve_signature(completion: &str) -> Option<&str> {
+    completion
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("func Solve("))
+        .map(|line| {
+            line.split_once('{')
+                .map_or(line, |(signature, _)| signature)
+                .trim_end()
+        })
+}
+
+fn same_bridge_signature(left: &VeclabTaskRow, right: &VeclabTaskRow) -> bool {
+    matches!(
+        (solve_signature(&left.completion), solve_signature(&right.completion)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+fn bridge_prompt_task(row: &VeclabTaskRow) -> String {
+    if !env_bool("TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS", true) {
+        return model_visible_task(&row.task).to_string();
+    }
+    let signature = solve_signature(&row.completion).unwrap_or("func Solve()");
+    format!(
+        "Implement exactly this Go entry point. The required behavior is supplied only by the latent world state.\n\n{signature}"
+    )
 }
 
 pub(crate) fn qwen_weight_paths(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -213,7 +254,7 @@ fn qwen_batch(
         .map(|row| {
             let prompt = tokenizer
                 .encode(
-                    qwen_prompt(model_visible_task(&row.task), &row.completion),
+                    qwen_prompt(&bridge_prompt_task(row), &row.completion),
                     false,
                 )
                 .map_err(anyhow::Error::msg)?;
@@ -272,6 +313,40 @@ fn qwen_prompt(task: &str, completion: &str) -> String {
     } else {
         format!("{task}\n\nReturn the relevant reference documentation only.")
     }
+}
+
+fn split_bridge_rows(
+    rows: Vec<VeclabTaskRow>,
+    lora_mode: bool,
+) -> Result<(Vec<VeclabTaskRow>, Vec<VeclabTaskRow>)> {
+    let train_function_max = env_usize(
+        "TOFY_BRIDGE_TRAIN_FUNCTION_MAX",
+        SEEN_FUNCTION_MAX.saturating_sub(20),
+    );
+    let validation_function_max =
+        env_usize("TOFY_BRIDGE_VALIDATION_FUNCTION_MAX", SEEN_FUNCTION_MAX);
+    if train_function_max == 0 || train_function_max >= validation_function_max {
+        bail!(
+            "bridge function split must satisfy 0 < TOFY_BRIDGE_TRAIN_FUNCTION_MAX < TOFY_BRIDGE_VALIDATION_FUNCTION_MAX"
+        );
+    }
+    let mut train = Vec::new();
+    let mut validation = Vec::new();
+    for row in rows {
+        if row.function_id <= train_function_max {
+            train.push(row);
+        } else if row.function_id <= validation_function_max {
+            validation.push(row);
+        } else if lora_mode && !row.completion.trim_start().starts_with("package solution") {
+            // Documentation-only LoRA controls can retain their full corpus;
+            // causal bridge validation never consumes these rows.
+            train.push(row);
+        }
+    }
+    if train.is_empty() || validation.is_empty() {
+        bail!("bridge function-disjoint split produced an empty partition");
+    }
+    Ok((train, validation))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -667,6 +742,34 @@ fn token_loss(
     masked_cross_entropy(&logits.narrow(1, 0, logits.dim(1)? - 1)?, labels, mask)
 }
 
+fn token_objectives(
+    model: &Qwen3Bridge,
+    input: &Tensor,
+    labels: &Tensor,
+    mask: &Tensor,
+    cond: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let logits = model.forward(input, cond)?;
+    let logits = logits.narrow(1, 0, logits.dim(1)? - 1)?;
+    Ok((
+        masked_cross_entropy(&logits, labels, mask)?,
+        masked_unlikelihood(&logits, labels, mask)?,
+    ))
+}
+
+fn conditioning_separation_loss(
+    matched: &Tensor,
+    wrong: &Tensor,
+    min_distance: f64,
+) -> Result<Tensor> {
+    let distance = matched.broadcast_sub(wrong)?.sqr()?.mean_all()?;
+    Tensor::new(min_distance as f32, matched.device())?
+        .to_dtype(distance.dtype())?
+        .broadcast_sub(&distance)?
+        .relu()
+        .map_err(Into::into)
+}
+
 fn conditioning_health(conditioning: &Tensor) -> Result<(f32, f32)> {
     let (batch, slots, dim) = conditioning.dims3()?;
     let flat = conditioning.reshape((batch * slots, dim))?;
@@ -879,6 +982,10 @@ fn train(args: BridgeArgs) -> Result<()> {
     };
     let margin = env_f64("TOFY_DECODER_CONDITIONING_MARGIN", 0.2);
     let margin_weight = env_f64("TOFY_DECODER_CONDITIONING_MARGIN_WEIGHT", 0.25);
+    let unlikelihood_weight =
+        env_f64("TOFY_DECODER_CONDITIONING_UNLIKELIHOOD_WEIGHT", 0.25).max(0.0);
+    let separation_weight = env_f64("TOFY_DECODER_CONDITIONING_SEPARATION_WEIGHT", 0.05).max(0.0);
+    let separation_min_distance = env_f64("TOFY_DECODER_CONDITIONING_MIN_DISTANCE", 0.1).max(0.0);
     let dropout = env_f64("TOFY_CONDITIONING_DROPOUT", 0.1).clamp(0.0, 1.0);
     let regime = BridgeRegime::from_env()?;
     let all_rows = load_task_rows(&args.data)?;
@@ -891,23 +998,19 @@ fn train(args: BridgeArgs) -> Result<()> {
         })
         .collect();
     attach_docs(&mut seen, &docs);
-    let (val_rows, train_rows): (Vec<_>, Vec<_>) = seen
-        .into_iter()
-        .enumerate()
-        .partition(|(index, _)| index % 20 == 0);
-    let train_rows = train_rows
-        .into_iter()
-        .map(|(_, row)| row)
-        .collect::<Vec<_>>();
-    let val_rows = val_rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
-    if train_rows.is_empty() || val_rows.is_empty() {
-        bail!("bridge needs non-empty seen train and validation rows");
-    }
+    let (train_rows, val_rows) = split_bridge_rows(seen, lora_mode)?;
+    let train_function_max = env_usize(
+        "TOFY_BRIDGE_TRAIN_FUNCTION_MAX",
+        SEEN_FUNCTION_MAX.saturating_sub(20),
+    );
+    let validation_function_max =
+        env_usize("TOFY_BRIDGE_VALIDATION_FUNCTION_MAX", SEEN_FUNCTION_MAX);
     println!(
-        "Bridge regime={} train_rows={} val_rows={} heldout_task_rows=0",
+        "Bridge regime={} train_rows={} val_rows={} function_split=train:1-{train_function_max} val:{}-{validation_function_max} heldout_task_rows=0",
         regime.as_str(),
         train_rows.len(),
-        val_rows.len()
+        val_rows.len(),
+        train_function_max + 1,
     );
     if std::env::var("TOFY_PRINT_SPLIT_STATS")
         .ok()
@@ -964,6 +1067,11 @@ fn train(args: BridgeArgs) -> Result<()> {
     } else {
         f32::NEG_INFINITY
     };
+    let semantic_patience = env_usize("TOFY_BRIDGE_SEMANTIC_PATIENCE", 1_200);
+    let semantic_warmup = env_usize("TOFY_BRIDGE_SEMANTIC_WARMUP", 400);
+    let semantic_progress = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_PROGRESS", 0.002).max(0.0) as f32;
+    let mut best_observed_semantic_gap = f32::NEG_INFINITY;
+    let mut last_semantic_progress_step = start_step;
     let mut sampler = BridgeSampler::at_sample(
         train_rows.len(),
         args.seed,
@@ -983,6 +1091,8 @@ fn train(args: BridgeArgs) -> Result<()> {
         let mut zero_margin_sum = 0.0f32;
         let mut shuffle_margin_sum = 0.0f32;
         let mut hard_margin_sum = 0.0f32;
+        let mut wrong_unlikelihood_sum = 0.0f32;
+        let mut conditioning_separation_sum = 0.0f32;
         for micro_step in 0..grad_accum {
             let indices = sampler.next_batch(args.batch);
             let batch_rows = indices
@@ -1074,6 +1184,8 @@ fn train(args: BridgeArgs) -> Result<()> {
                 grad_accum,
             )?;
 
+            let mut unlikelihood_value = 0.0f32;
+            let mut separation_value = 0.0f32;
             for (offset, _, margin_value) in &active {
                 if *margin_value <= 0.0 {
                     continue;
@@ -1095,7 +1207,8 @@ fn train(args: BridgeArgs) -> Result<()> {
                         adapter.forward(&wrong_slots)?
                     }
                 };
-                let negative = token_loss(&qwen, &input, &labels, &mask, &wrong_cond)?;
+                let (negative, wrong_unlikelihood) =
+                    token_objectives(&qwen, &input, &labels, &mask, &wrong_cond)?;
                 let weighted_negative = negative.affine(-margin_weight, 0.0)?;
                 util::accumulate_scaled_gradients(
                     &mut accumulated,
@@ -1103,11 +1216,43 @@ fn train(args: BridgeArgs) -> Result<()> {
                     &weighted_negative,
                     grad_accum,
                 )?;
+                if unlikelihood_weight > 0.0 {
+                    let weighted_unlikelihood =
+                        wrong_unlikelihood.affine(unlikelihood_weight, 0.0)?;
+                    util::accumulate_scaled_gradients(
+                        &mut accumulated,
+                        &optimizer_vars,
+                        &weighted_unlikelihood,
+                        grad_accum,
+                    )?;
+                    if step % log_every == 0 {
+                        unlikelihood_value += util::scalar_f32(&wrong_unlikelihood)?;
+                    }
+                }
+                if offset.is_some() && separation_weight > 0.0 {
+                    let separation =
+                        conditioning_separation_loss(&cond, &wrong_cond, separation_min_distance)?;
+                    let weighted_separation = separation.affine(separation_weight, 0.0)?;
+                    util::accumulate_scaled_gradients(
+                        &mut accumulated,
+                        &optimizer_vars,
+                        &weighted_separation,
+                        grad_accum,
+                    )?;
+                    if step % log_every == 0 {
+                        separation_value += util::scalar_f32(&separation)?;
+                    }
+                }
             }
             if step % log_every == 0 {
                 let margin_total = active.iter().map(|(_, _, value)| *value).sum::<f32>();
-                loss_sum += positive_value + margin_weight as f32 * margin_total;
+                loss_sum += positive_value
+                    + margin_weight as f32 * margin_total
+                    + unlikelihood_weight as f32 * unlikelihood_value
+                    + separation_weight as f32 * separation_value;
                 positive_sum += positive_value;
+                wrong_unlikelihood_sum += unlikelihood_value;
+                conditioning_separation_sum += separation_value;
                 for (_, name, value) in &active {
                     match *name {
                         "zero" => zero_margin_sum += *value,
@@ -1151,6 +1296,16 @@ fn train(args: BridgeArgs) -> Result<()> {
             tb.add_scalar("loss/margin_zero", zero_margin_sum / divisor, step);
             tb.add_scalar("loss/margin_shuffle", shuffle_margin_sum / divisor, step);
             tb.add_scalar("loss/margin_hard", hard_margin_sum / divisor, step);
+            tb.add_scalar(
+                "loss/wrong_unlikelihood",
+                wrong_unlikelihood_sum / divisor,
+                step,
+            );
+            tb.add_scalar(
+                "loss/conditioning_separation",
+                conditioning_separation_sum / divisor,
+                step,
+            );
             tb.add_scalar("schedule/lr", lr as f32, step);
             if let Some(norm) = grad_norm {
                 tb.add_scalar("grad/global_norm", util::scalar_f32(&norm)?, step);
@@ -1181,6 +1336,12 @@ fn train(args: BridgeArgs) -> Result<()> {
             )?;
             let zero_gap = losses.zeroed - losses.matched;
             let semantic_gap = losses.wrong - losses.matched;
+            if semantic_gap >= min_semantic_gap
+                || semantic_gap >= best_observed_semantic_gap + semantic_progress
+            {
+                best_observed_semantic_gap = best_observed_semantic_gap.max(semantic_gap);
+                last_semantic_progress_step = step;
+            }
             tb.add_scalar("val/ce_matched", losses.matched, step);
             tb.add_scalar("val/ce_zeroed", losses.zeroed, step);
             tb.add_scalar("val/ce_wrong", losses.wrong, step);
@@ -1260,6 +1421,16 @@ fn train(args: BridgeArgs) -> Result<()> {
                     saved_checkpoint: best_score.is_finite(),
                 },
             )?;
+            if requires_semantic_gap
+                && semantic_patience > 0
+                && step >= semantic_warmup
+                && step.saturating_sub(last_semantic_progress_step) >= semantic_patience
+                && best_observed_semantic_gap < min_semantic_gap
+            {
+                bail!(
+                    "semantic conditioning plateau at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, patience={semantic_patience}"
+                );
+            }
         }
     }
     println!(
@@ -1320,6 +1491,47 @@ mod tests {
         let wrong = mismatched_rows(&rows, &rows[..1], 1)?;
         assert_eq!(wrong.len(), 1);
         assert_ne!(wrong[0].function_id, rows[0].function_id);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_mismatch_keeps_the_counterfactual_prompt_fixed() -> Result<()> {
+        let rows = ["Alpha", "Beta", "Gamma"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| VeclabTaskRow {
+                task: format!("[fn:{:03}] visible task {name}", index + 1),
+                completion: format!(
+                    "package solution\n\nfunc Solve(xs []float64, k int) float64 {{ return veclab.{name}(xs, k) }}"
+                ),
+                function_id: index + 1,
+                docs: format!("docs {name}"),
+            })
+            .collect::<Vec<_>>();
+        let wrong = mismatched_rows(&rows, &rows[..1], 1)?;
+        assert_ne!(wrong[0].function_id, rows[0].function_id);
+        assert!(same_bridge_signature(&wrong[0], &rows[0]));
+        assert_eq!(bridge_prompt_task(&wrong[0]), bridge_prompt_task(&rows[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_validation_is_function_disjoint() -> Result<()> {
+        let rows = (1..=100)
+            .flat_map(|function_id| {
+                (0..2).map(move |_| VeclabTaskRow {
+                    task: format!("[fn:{function_id:03}] task"),
+                    completion: "package solution\nfunc Solve() {}".into(),
+                    function_id,
+                    docs: String::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (train, validation) = split_bridge_rows(rows, false)?;
+        assert!(train.iter().all(|row| row.function_id <= 80));
+        assert!(validation
+            .iter()
+            .all(|row| (81..=100).contains(&row.function_id)));
         Ok(())
     }
 
@@ -1389,7 +1601,9 @@ mod tests {
         let input = Tensor::from_vec(vec![1u32, 2, 3, 4, 5, 6, 7, 8], (2, 4), &device)?;
         let labels = Tensor::from_vec(vec![2u32, 3, 4, 6, 7, 8], (2, 3), &device)?;
         let mask = Tensor::ones((2, 3), DType::F32, &device)?;
-        let loss = token_loss(&model, &input, &labels, &mask, &cond)?;
+        let (cross_entropy, unlikelihood) =
+            token_objectives(&model, &input, &labels, &mask, &cond)?;
+        let loss = cross_entropy.broadcast_add(&unlikelihood)?;
         assert!(cond.track_op() && loss.track_op());
         let grads = loss.backward()?;
         let named = util::named_train_vars(&train_vars)?;
