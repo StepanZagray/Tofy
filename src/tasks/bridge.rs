@@ -770,6 +770,16 @@ fn conditioning_separation_loss(
         .map_err(Into::into)
 }
 
+fn semantic_gap_improved(
+    semantic_gap: f32,
+    best_semantic_gap: f32,
+    minimum_gap: f32,
+    minimum_progress: f32,
+) -> bool {
+    semantic_gap >= minimum_gap
+        && (!best_semantic_gap.is_finite() || semantic_gap >= best_semantic_gap + minimum_progress)
+}
+
 fn conditioning_health(conditioning: &Tensor) -> Result<(f32, f32)> {
     let (batch, slots, dim) = conditioning.dims3()?;
     let flat = conditioning.reshape((batch * slots, dim))?;
@@ -947,7 +957,10 @@ fn train(args: BridgeArgs) -> Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0)
         > 0;
-    let lr = env_f64("TOFY_BRIDGE_LR", 2e-4);
+    // The bridge contains many Qwen cross-site trainables.  The former 2e-4
+    // reached a causal gap quickly but then degraded matched CE; 1e-4 keeps
+    // the same effective batch while avoiding that overshoot.
+    let lr = env_f64("TOFY_BRIDGE_LR", 1e-4);
     let mut named_vars = util::named_train_vars(&train_vars)?;
     if static_prefix.is_some() || lora_mode {
         named_vars.retain(|entry| !entry.name.starts_with("adapter."));
@@ -1336,10 +1349,13 @@ fn train(args: BridgeArgs) -> Result<()> {
             )?;
             let zero_gap = losses.zeroed - losses.matched;
             let semantic_gap = losses.wrong - losses.matched;
-            if semantic_gap >= min_semantic_gap
-                || semantic_gap >= best_observed_semantic_gap + semantic_progress
-            {
-                best_observed_semantic_gap = best_observed_semantic_gap.max(semantic_gap);
+            if semantic_gap_improved(
+                semantic_gap,
+                best_observed_semantic_gap,
+                min_semantic_gap,
+                semantic_progress,
+            ) {
+                best_observed_semantic_gap = semantic_gap;
                 last_semantic_progress_step = step;
             }
             tb.add_scalar("val/ce_matched", losses.matched, step);
@@ -1425,10 +1441,9 @@ fn train(args: BridgeArgs) -> Result<()> {
                 && semantic_patience > 0
                 && step >= semantic_warmup
                 && step.saturating_sub(last_semantic_progress_step) >= semantic_patience
-                && best_observed_semantic_gap < min_semantic_gap
             {
                 bail!(
-                    "semantic conditioning plateau at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, patience={semantic_patience}"
+                    "semantic conditioning plateau at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
                 );
             }
         }
@@ -1533,6 +1548,20 @@ mod tests {
             .iter()
             .all(|row| (81..=100).contains(&row.function_id)));
         Ok(())
+    }
+
+    #[test]
+    fn semantic_plateau_requires_a_new_qualified_best() {
+        assert!(semantic_gap_improved(0.03, f32::NEG_INFINITY, 0.02, 0.002));
+        assert!(!semantic_gap_improved(0.031, 0.03, 0.02, 0.002));
+        assert!(semantic_gap_improved(0.032, 0.03, 0.02, 0.002));
+        assert!(!semantic_gap_improved(0.10, 0.11, 0.02, 0.002));
+        assert!(!semantic_gap_improved(
+            0.019,
+            f32::NEG_INFINITY,
+            0.02,
+            0.002
+        ));
     }
 
     #[test]

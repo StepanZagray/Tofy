@@ -262,7 +262,9 @@ rate as knowledge injection:
 - If no semantic-gap progress is observed after the warm-up, the context stage
   stops after `TOFY_BRIDGE_SEMANTIC_PATIENCE` (default 1200 steps) and the
   pipeline proceeds to the separately evaluated weights regime. A checkpoint
-  is still never emitted as qualifying unless it reaches the 0.02 gap.
+  is still never emitted as qualifying unless it reaches the 0.02 gap. Progress
+  means a new qualified historical best, not a later noisy value merely above
+  the threshold.
 
 These changes test the actual claim--the state, rather than a generic nonzero
 prefix or visible task text, controls Qwen's output. They intentionally make
