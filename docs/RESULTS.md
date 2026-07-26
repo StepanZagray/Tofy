@@ -235,9 +235,16 @@ full-batch Epps-Pulley evaluation, including unequal valid lengths.
 
 The revised minimal pairs are encoder `16/8` (128 independent sequences, 384
 three-view rows), world `8/32` (256 independent examples), and bridge `8/16`
-(128 examples). These are pending sustained qualification on the H100; no
-new best metric is claimed until the replacement run logs real training
-steps.
+(128 examples). Commit `0ba8e75` implemented the correction and was deployed
+through Git as pod HEAD `09e3b5a` (the latter adds only preflight records).
+Fresh run `code_poc_1785100782` passed the direct-documentation RAG preflight:
+seen `104/300` (`0.3467`) and held-out `123/300` (`0.4100`). It then launched
+the encoder at physical batch `16`, accumulation `8`, effective batch `128`;
+`adaptive_batches.json` records the first attempt as running. An early health
+check after roughly 85 seconds of encoder work showed `29,621 / 81,559 MiB`,
+100% GPU utilization, and no OOM/error signature in
+`/workspace/tofy-train-minimal-pooled.log`. This is startup evidence, not a
+sustained qualification or a new best model metric.
 
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
@@ -593,3 +600,7 @@ These were existing TensorBoard runs in `runs/` before the current training-code
 - Bridge eval `1785098478`: regime `rag`; report `runs/code_poc_1785098309/eval/rag_preflight_seen.json`.
 
 - Bridge eval `1785098580`: regime `rag`; report `runs/code_poc_1785098309/eval/rag_preflight_heldout.json`.
+
+- Bridge eval `1785100929`: regime `rag`; report `runs/code_poc_1785100782/eval/rag_preflight_seen.json`.
+
+- Bridge eval `1785101027`: regime `rag`; report `runs/code_poc_1785100782/eval/rag_preflight_heldout.json`.
