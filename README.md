@@ -21,10 +21,12 @@ cargo run --release -- train minimal
 
 `minimal` targets the 96 GiB RTX PRO 6000 Blackwell pod. It uses 20,000
 encoder, world, and bridge steps. Physical batch/accumulation pairs are
-`16/4`, `8/32`, and `8/16` respectively, preserving effective batches `64`,
-`256`, and `128`. The encoder pair completed a production run; the reduced
-world and bridge pairs have short fit checks and still require a sustained
-hardware qualification. Smaller GPUs require a fresh capacity qualification.
+`16/8`, `8/32`, and `8/16` respectively, giving effective batches `128`,
+`256`, and `128`. Encoder and world SIGReg statistics are pooled over the full
+effective batch with memory-bounded replay, rather than being estimated
+separately on each physical microbatch. These revised training paths require a
+sustained hardware qualification. Smaller GPUs require a fresh capacity
+qualification.
 `minimal` is the only supported profile; its exact shape is in
 [`config/model_profiles.json`](config/model_profiles.json).
 
@@ -51,7 +53,7 @@ The pipeline writes all artifacts below `runs/code_poc_<timestamp>/`:
 
 For the `minimal` profile, training automatically recovers from a confirmed
 CUDA allocation OOM. It halves the physical batch and doubles gradient
-accumulation (`16/4 → 8/8 → 4/16`, for example), so the effective batch and
+accumulation (`16/8 → 8/16 → 4/32`, for example), so the effective batch and
 optimizer-step schedule stay unchanged. Each attempted and selected pair is
 atomically recorded in `adaptive_batches.json` in the run root. A retry resumes
 from the latest complete checkpoint tuple when one exists, otherwise it

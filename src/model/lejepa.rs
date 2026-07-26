@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use candle_core::{Tensor, D};
+use candle_core::{Tensor, Var, D};
 use rand::{RngExt, SeedableRng};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,6 +78,185 @@ pub fn flatten_latent_slots(latent_slots: &Tensor) -> Result<Tensor> {
     latent_slots
         .reshape((batch * slots, dim))
         .map_err(Into::into)
+}
+
+pub struct SigRegLinearization {
+    pub value: f32,
+    pub input_gradient: Tensor,
+}
+
+/// Turn a detached pooled SIGReg objective into its exact input gradient while
+/// bounding the autograd workspace by `position_chunk`.
+///
+/// The returned gradient can be dotted with one replayed live microbatch at a
+/// time. Backpropagating those dot products supplies the exact chain-rule
+/// gradient to the shared encoder without retaining the full effective
+/// batch's encoder activations or SIGReg graph.
+pub fn sigreg_epps_pulley_linearization_chunked_seeded(
+    pooled: &Tensor,
+    num_slices: usize,
+    num_points: usize,
+    position_chunk: usize,
+    seed: u64,
+) -> Result<SigRegLinearization> {
+    let (batch, positions, dim) = pooled.dims3()?;
+    let position_chunk = position_chunk.max(1);
+    let mut value = 0.0f32;
+    let mut gradient_chunks = Vec::new();
+    let mut start = 0usize;
+    while start < positions {
+        let len = (positions - start).min(position_chunk);
+        let chunk = pooled.narrow(1, start, len)?.detach();
+        let variable = Var::from_tensor(&chunk)?;
+        let weight = len as f64 / positions as f64;
+        let loss = sigreg_epps_pulley_seeded(variable.as_tensor(), num_slices, num_points, seed)?
+            .affine(weight, 0.0)?;
+        value += loss.to_vec0::<f32>()?;
+        let gradients = loss.backward()?;
+        gradient_chunks.push(
+            gradients
+                .get(&variable)
+                .context("missing pooled SIGReg input gradient")?
+                .detach()
+                .to_dtype(candle_core::DType::F32)?,
+        );
+        start += len;
+    }
+    let gradient_refs = gradient_chunks.iter().collect::<Vec<_>>();
+    let input_gradient = Tensor::cat(&gradient_refs, 1)?;
+    if input_gradient.dims3()? != (batch, positions, dim) {
+        anyhow::bail!("pooled SIGReg linearization produced an invalid gradient shape");
+    }
+    Ok(SigRegLinearization {
+        value,
+        input_gradient,
+    })
+}
+
+fn variable_length_denominator(
+    valid_lens: &[usize],
+    start: usize,
+    len: usize,
+    minimum_samples: usize,
+) -> usize {
+    (start..start + len)
+        .map(|position| {
+            let count = valid_lens
+                .iter()
+                .filter(|&&valid_len| valid_len > position)
+                .count();
+            if count >= minimum_samples {
+                count
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+pub fn sigreg_epps_pulley_variable_length_linearization_chunked_seeded(
+    pooled: &Tensor,
+    valid_lens: &[usize],
+    num_slices: usize,
+    num_points: usize,
+    position_chunk: usize,
+    minimum_samples: usize,
+    seed: u64,
+) -> Result<SigRegLinearization> {
+    let (batch, positions, dim) = pooled.dims3()?;
+    if valid_lens.len() != batch {
+        anyhow::bail!(
+            "SIGReg valid_lens has {} rows for a batch of {batch}",
+            valid_lens.len()
+        );
+    }
+    if valid_lens.iter().any(|&len| len > positions) {
+        anyhow::bail!("SIGReg valid length exceeds the {positions}-position tensor");
+    }
+    let minimum_samples = minimum_samples.max(2);
+    let total_denominator = variable_length_denominator(valid_lens, 0, positions, minimum_samples);
+    if total_denominator == 0 {
+        anyhow::bail!("variable-length SIGReg has no position with enough valid samples");
+    }
+
+    let position_chunk = position_chunk.max(1);
+    let mut value = 0.0f32;
+    let mut gradient_chunks = Vec::new();
+    let mut start = 0usize;
+    while start < positions {
+        let len = (positions - start).min(position_chunk);
+        let chunk_denominator =
+            variable_length_denominator(valid_lens, start, len, minimum_samples);
+        if chunk_denominator == 0 {
+            gradient_chunks.push(Tensor::zeros(
+                (batch, len, dim),
+                candle_core::DType::F32,
+                pooled.device(),
+            )?);
+            start += len;
+            continue;
+        }
+        let chunk_valid_lens = valid_lens
+            .iter()
+            .map(|&valid_len| valid_len.saturating_sub(start).min(len))
+            .collect::<Vec<_>>();
+        let chunk = pooled.narrow(1, start, len)?.detach();
+        let variable = Var::from_tensor(&chunk)?;
+        let weight = chunk_denominator as f64 / total_denominator as f64;
+        let loss = sigreg_epps_pulley_variable_length_seeded(
+            variable.as_tensor(),
+            &chunk_valid_lens,
+            num_slices,
+            num_points,
+            len,
+            minimum_samples,
+            seed,
+        )?
+        .affine(weight, 0.0)?;
+        value += loss.to_vec0::<f32>()?;
+        let gradients = loss.backward()?;
+        gradient_chunks.push(
+            gradients
+                .get(&variable)
+                .context("missing pooled variable-length SIGReg input gradient")?
+                .detach()
+                .to_dtype(candle_core::DType::F32)?,
+        );
+        start += len;
+    }
+    let gradient_refs = gradient_chunks.iter().collect::<Vec<_>>();
+    let input_gradient = Tensor::cat(&gradient_refs, 1)?;
+    Ok(SigRegLinearization {
+        value,
+        input_gradient,
+    })
+}
+
+pub fn sigreg_linear_surrogate(
+    live_microbatch: &Tensor,
+    pooled_input_gradient: &Tensor,
+    row_offset: usize,
+) -> Result<Tensor> {
+    let live_dims = live_microbatch.dims();
+    let pooled_dims = pooled_input_gradient.dims();
+    if live_dims.len() != pooled_dims.len() || live_dims[1..] != pooled_dims[1..] {
+        anyhow::bail!(
+            "SIGReg surrogate live shape {live_dims:?} is incompatible with pooled gradient {pooled_dims:?}"
+        );
+    }
+    let rows = live_dims[0];
+    if row_offset.saturating_add(rows) > pooled_dims[0] {
+        anyhow::bail!(
+            "SIGReg surrogate rows {row_offset}..{} exceed pooled batch {}",
+            row_offset + rows,
+            pooled_dims[0]
+        );
+    }
+    let live = live_microbatch.to_dtype(candle_core::DType::F32)?;
+    let gradient = pooled_input_gradient
+        .narrow(0, row_offset, rows)?
+        .to_dtype(candle_core::DType::F32)?;
+    live.broadcast_mul(&gradient)?.sum_all().map_err(Into::into)
 }
 
 const SIGREG_PROJECTION_SEED: u64 = 0x5147_5253_4947_4552;
@@ -389,7 +568,7 @@ pub fn sigreg_epps_pulley_chunked_seeded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, Var};
 
     #[test]
     fn prediction_loss_penalizes_vector_scale_error() -> Result<()> {
@@ -472,6 +651,99 @@ mod tests {
         )?
         .to_vec0::<f32>()?;
         assert!(masked.is_finite() && masked >= 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_linearization_matches_full_sigreg_value_and_gradient() -> Result<()> {
+        let device = Device::Cpu;
+        let values = (0..48)
+            .map(|index| index as f32 / 17.0 - 1.2)
+            .collect::<Vec<_>>();
+        let variable = Var::new(values.as_slice(), &device)?;
+        let pooled = variable.as_tensor().reshape((6, 4, 2))?;
+        let full_loss = sigreg_epps_pulley_seeded(&pooled, 16, 9, 29)?;
+        let full_value = full_loss.to_vec0::<f32>()?;
+        let full_gradient = full_loss
+            .backward()?
+            .get(&variable)
+            .context("missing full SIGReg gradient")?
+            .to_vec1::<f32>()?;
+
+        let linearization =
+            sigreg_epps_pulley_linearization_chunked_seeded(&pooled.detach(), 16, 9, 2, 29)?;
+        let linearized_gradient = linearization
+            .input_gradient
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(
+            (full_value - linearization.value).abs() < 1e-5,
+            "{full_value} vs {}",
+            linearization.value
+        );
+        for (expected, actual) in full_gradient.iter().zip(&linearized_gradient) {
+            assert!((expected - actual).abs() < 1e-5, "{expected} vs {actual}");
+        }
+        let surrogate_gradient =
+            sigreg_linear_surrogate(&pooled, &linearization.input_gradient, 0)?
+                .backward()?
+                .get(&variable)
+                .context("missing linear SIGReg surrogate gradient")?
+                .to_vec1::<f32>()?;
+        for (expected, actual) in full_gradient.iter().zip(&surrogate_gradient) {
+            assert!((expected - actual).abs() < 1e-5, "{expected} vs {actual}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn variable_length_linearization_matches_full_sigreg_gradient() -> Result<()> {
+        let device = Device::Cpu;
+        let values = (0..40)
+            .map(|index| (index as f32 * 0.37).sin())
+            .collect::<Vec<_>>();
+        let variable = Var::new(values.as_slice(), &device)?;
+        let pooled = variable.as_tensor().reshape((5, 4, 2))?;
+        let valid_lens = [4usize, 3, 4, 2, 1];
+        let full_loss =
+            sigreg_epps_pulley_variable_length_seeded(&pooled, &valid_lens, 16, 9, 2, 2, 31)?;
+        let full_value = full_loss.to_vec0::<f32>()?;
+        let full_gradient = full_loss
+            .backward()?
+            .get(&variable)
+            .context("missing full variable-length SIGReg gradient")?
+            .to_vec1::<f32>()?;
+
+        let linearization = sigreg_epps_pulley_variable_length_linearization_chunked_seeded(
+            &pooled.detach(),
+            &valid_lens,
+            16,
+            9,
+            1,
+            2,
+            31,
+        )?;
+        let linearized_gradient = linearization
+            .input_gradient
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(
+            (full_value - linearization.value).abs() < 1e-5,
+            "{full_value} vs {}",
+            linearization.value
+        );
+        for (expected, actual) in full_gradient.iter().zip(&linearized_gradient) {
+            assert!((expected - actual).abs() < 1e-5, "{expected} vs {actual}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sigreg_surrogate_accepts_bf16_live_states_and_gradients() -> Result<()> {
+        let live = Tensor::ones((2, 3, 4), candle_core::DType::BF16, &Device::Cpu)?;
+        let gradient = Tensor::ones((4, 3, 4), candle_core::DType::BF16, &Device::Cpu)?;
+        let value = sigreg_linear_surrogate(&live, &gradient, 2)?.to_vec0::<f32>()?;
+        assert_eq!(value, 24.0);
         Ok(())
     }
 

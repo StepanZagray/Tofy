@@ -18,8 +18,10 @@ use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::{vocab_signature, Pair, Vocab};
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
-    save_vocab_to_file, sigreg_epps_pulley, sigreg_epps_pulley_variable_length, tensor_rms,
-    OnlineEncoder,
+    save_vocab_to_file, sigreg_epps_pulley, sigreg_epps_pulley_linearization_chunked_seeded,
+    sigreg_epps_pulley_variable_length,
+    sigreg_epps_pulley_variable_length_linearization_chunked_seeded, sigreg_linear_surrogate,
+    tensor_rms, OnlineEncoder,
 };
 use crate::util;
 
@@ -118,6 +120,57 @@ struct LatentForward {
     regularized_global_states: Tensor,
     token_valid_lens: Vec<usize>,
     chunk_valid_lens: Vec<usize>,
+}
+
+struct LatentSigRegBatch {
+    token_states: Tensor,
+    chunk_states: Tensor,
+    global_states: Tensor,
+    token_valid_lens: Vec<usize>,
+    chunk_valid_lens: Vec<usize>,
+}
+
+impl LatentSigRegBatch {
+    fn detached_from(forward: &LatentForward) -> Self {
+        Self {
+            token_states: forward.valid_token_states.detach(),
+            chunk_states: forward.regularized_chunk_states.detach(),
+            global_states: forward.regularized_global_states.detach(),
+            token_valid_lens: forward.token_valid_lens.clone(),
+            chunk_valid_lens: forward.chunk_valid_lens.clone(),
+        }
+    }
+}
+
+fn latent_sigreg_forward(
+    encoder: &OnlineEncoder,
+    batch: &AugmentedJepaBatch,
+) -> Result<LatentSigRegBatch> {
+    let all_view_ids = Tensor::cat(
+        &[&batch.view_a_ids, &batch.target_ids, &batch.view_b_ids],
+        0,
+    )?;
+    let features = encoder.forward_features(&all_view_ids)?;
+    let (_, token_positions, _) = features.token_states.dims3()?;
+    let (_, chunk_positions, _) = features.chunk_states.dims3()?;
+    let chunk_size = encoder.chunk_size_for_seq_len(token_positions).max(1);
+    let base_token_valid_lens = batch
+        .valid_lens
+        .iter()
+        .copied()
+        .map(|len| len.min(token_positions))
+        .collect::<Vec<_>>();
+    let base_chunk_valid_lens = base_token_valid_lens
+        .iter()
+        .map(|&len| len.div_ceil(chunk_size).min(chunk_positions))
+        .collect::<Vec<_>>();
+    Ok(LatentSigRegBatch {
+        token_states: features.token_states,
+        chunk_states: features.chunk_states,
+        global_states: features.global_states,
+        token_valid_lens: base_token_valid_lens.repeat(3),
+        chunk_valid_lens: base_chunk_valid_lens.repeat(3),
+    })
 }
 
 /// Shared three-view forward pass + multiscale prediction losses used by both
@@ -904,6 +957,21 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         .unwrap_or(1.0);
     let val_batches = env_usize("TOFY_LATENT_VAL_BATCHES", 4);
     tb.add_scalar("config/clip_norm", clip_norm as f32, 0);
+    println!(
+        "Latent SIGReg pools all gradient-accumulation microbatches: {} independent examples, {} three-view rows per optimizer step",
+        config.batch_size * config.grad_accum_steps,
+        config.batch_size * config.grad_accum_steps * 3
+    );
+    tb.add_scalar(
+        "config/sigreg_independent_samples",
+        (config.batch_size * config.grad_accum_steps) as f32,
+        0,
+    );
+    tb.add_scalar(
+        "config/sigreg_view_rows",
+        (config.batch_size * config.grad_accum_steps * 3) as f32,
+        0,
+    );
     if start_step >= config.steps {
         println!(
             "Latent resume checkpoint already reached step {}/{}; skipping training.",
@@ -929,98 +997,162 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             );
         }
 
+        let curriculum = latent_curriculum(step, config.steps, &config);
+        let mut microbatches = Vec::with_capacity(grad_accum_steps);
+        let mut cached_sigreg = Vec::with_capacity(grad_accum_steps);
         for _micro_step in 0..grad_accum_steps {
-            let micro_grads = {
-                let curriculum = latent_curriculum(step, config.steps, &config);
-                let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
-                    let batch_pairs = cached_stream.next_batch(batch_size)?;
-                    make_augmented_jepa_batch_from_pairs(
-                        &batch_pairs,
-                        &vocab,
-                        &curriculum,
-                        &device,
-                    )?
-                } else {
-                    let batch_tokens = pair_stream.next_batch(batch_size)?;
-                    make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
-                };
-
-                let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
-                let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
-                let token_sigreg = sigreg_epps_pulley_variable_length(
-                    &forward.valid_token_states,
-                    &forward.token_valid_lens,
-                    sigreg_slices,
-                    sigreg_points,
-                    sigreg_position_chunk,
-                    6,
-                )?;
-                let chunk_sigreg = sigreg_epps_pulley_variable_length(
-                    &forward.regularized_chunk_states,
-                    &forward.chunk_valid_lens,
-                    sigreg_slices,
-                    sigreg_points,
-                    sigreg_position_chunk,
-                    6,
-                )?;
-                let global_sigreg = sigreg_epps_pulley(
-                    &forward.regularized_global_states,
-                    sigreg_slices,
-                    sigreg_points,
-                )?;
-                let sigreg_loss = token_sigreg
-                    .affine(0.70, 0.0)?
-                    .broadcast_add(&chunk_sigreg.affine(0.20, 0.0)?)?
-                    .broadcast_add(&global_sigreg.affine(0.10, 0.0)?)?;
-                let loss = forward
-                    .pred_loss
-                    .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
-
-                let should_capture_log = step % config.log_every == 0;
-                if should_capture_log {
-                    let pred_cos = util::scalar_f32(&mean_cosine_similarity(
-                        &forward.context_targets,
-                        &forward.target_targets,
-                    )?)?;
-                    let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
-                        &forward.pred_chunks_masked,
-                        &forward.target_chunks_masked,
-                    )?)?;
-                    let global_cos = util::scalar_f32(&mean_cosine_similarity(
-                        &forward.pred_global_flat,
-                        &forward.target_global_flat,
-                    )?)?;
-                    let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
-                    let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
-                    let target_count = batch.target_count;
-                    let valid_tokens = batch.valid_lens.iter().sum::<usize>().max(1);
-                    let target_frac = target_count as f32 / valid_tokens as f32;
-                    log_snapshots.push(LatentLogSnapshot {
-                        loss_val: util::scalar_f32(&loss)?,
-                        pred_val: util::scalar_f32(&forward.pred_loss)?,
-                        token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
-                        chunk_pred_val: util::scalar_f32(&forward.chunk_pred_loss)?,
-                        global_pred_val: util::scalar_f32(&forward.global_pred_loss)?,
-                        sigreg_val: util::scalar_f32(&sigreg_loss)?,
-                        pred_cos,
-                        chunk_cos,
-                        global_cos,
-                        context_rms,
-                        target_rms,
-                        target_count,
-                        target_frac,
-                        code_fraction: batch.code_fraction,
-                        active_seq: curriculum.active_seq,
-                        max_spans_per_sample: curriculum.max_spans_per_sample,
-                        min_masked_ratio: curriculum.min_masked_ratio as f32,
-                        max_masked_ratio: curriculum.max_masked_ratio as f32,
-                        reg_weight: config.lambda as f32,
-                    });
-                }
-
-                util::scaled_gradients(&loss, grad_accum_steps)?
+            let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
+                let batch_pairs = cached_stream.next_batch(batch_size)?;
+                make_augmented_jepa_batch_from_pairs(&batch_pairs, &vocab, &curriculum, &device)?
+            } else {
+                let batch_tokens = pair_stream.next_batch(batch_size)?;
+                make_augmented_jepa_batch(&batch_tokens, &vocab, &curriculum, &device)?
             };
-            util::accumulate_gradients(&mut accumulated_grads, &train_vars, micro_grads)?;
+            let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
+            cached_sigreg.push(LatentSigRegBatch::detached_from(&forward));
+
+            if step % config.log_every == 0 {
+                let pred_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &forward.context_targets,
+                    &forward.target_targets,
+                )?)?;
+                let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &forward.pred_chunks_masked,
+                    &forward.target_chunks_masked,
+                )?)?;
+                let global_cos = util::scalar_f32(&mean_cosine_similarity(
+                    &forward.pred_global_flat,
+                    &forward.target_global_flat,
+                )?)?;
+                let context_rms = util::scalar_f32(&tensor_rms(&forward.pred_token_flat)?)?;
+                let target_rms = util::scalar_f32(&tensor_rms(&forward.target_flat)?)?;
+                let target_count = batch.target_count;
+                let valid_tokens = batch.valid_lens.iter().sum::<usize>().max(1);
+                let target_frac = target_count as f32 / valid_tokens as f32;
+                let pred_val = util::scalar_f32(&forward.pred_loss)?;
+                log_snapshots.push(LatentLogSnapshot {
+                    loss_val: pred_val,
+                    pred_val,
+                    token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
+                    chunk_pred_val: util::scalar_f32(&forward.chunk_pred_loss)?,
+                    global_pred_val: util::scalar_f32(&forward.global_pred_loss)?,
+                    sigreg_val: 0.0,
+                    pred_cos,
+                    chunk_cos,
+                    global_cos,
+                    context_rms,
+                    target_rms,
+                    target_count,
+                    target_frac,
+                    code_fraction: batch.code_fraction,
+                    active_seq: curriculum.active_seq,
+                    max_spans_per_sample: curriculum.max_spans_per_sample,
+                    min_masked_ratio: curriculum.min_masked_ratio as f32,
+                    max_masked_ratio: curriculum.max_masked_ratio as f32,
+                    reg_weight: config.lambda as f32,
+                });
+            }
+
+            let prediction_grads = util::scaled_gradients(&forward.pred_loss, grad_accum_steps)?;
+            util::accumulate_gradients(&mut accumulated_grads, &train_vars, prediction_grads)?;
+            microbatches.push(batch);
+        }
+
+        let cached_tokens = cached_sigreg
+            .iter()
+            .map(|batch| batch.token_states.clone())
+            .collect::<Vec<_>>();
+        let cached_chunks = cached_sigreg
+            .iter()
+            .map(|batch| batch.chunk_states.clone())
+            .collect::<Vec<_>>();
+        let cached_globals = cached_sigreg
+            .iter()
+            .map(|batch| batch.global_states.clone())
+            .collect::<Vec<_>>();
+        let pooled_token_valid_lens = cached_sigreg
+            .iter()
+            .flat_map(|batch| batch.token_valid_lens.iter().copied())
+            .collect::<Vec<_>>();
+        let pooled_chunk_valid_lens = cached_sigreg
+            .iter()
+            .flat_map(|batch| batch.chunk_valid_lens.iter().copied())
+            .collect::<Vec<_>>();
+        let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+        let step_seed = (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let token_linearization = {
+            let refs = cached_tokens.iter().collect::<Vec<_>>();
+            let pooled = Tensor::cat(&refs, 0)?;
+            sigreg_epps_pulley_variable_length_linearization_chunked_seeded(
+                &pooled,
+                &pooled_token_valid_lens,
+                sigreg_slices,
+                sigreg_points,
+                sigreg_position_chunk,
+                6,
+                step_seed ^ 0x544f_4b45_4e00_0001,
+            )?
+        };
+        let chunk_linearization = {
+            let refs = cached_chunks.iter().collect::<Vec<_>>();
+            let pooled = Tensor::cat(&refs, 0)?;
+            sigreg_epps_pulley_variable_length_linearization_chunked_seeded(
+                &pooled,
+                &pooled_chunk_valid_lens,
+                sigreg_slices,
+                sigreg_points,
+                sigreg_position_chunk,
+                6,
+                step_seed ^ 0x4348_554e_4b00_0002,
+            )?
+        };
+        let global_linearization = {
+            let refs = cached_globals.iter().collect::<Vec<_>>();
+            let pooled = Tensor::cat(&refs, 0)?;
+            sigreg_epps_pulley_linearization_chunked_seeded(
+                &pooled,
+                sigreg_slices,
+                sigreg_points,
+                sigreg_position_chunk,
+                step_seed ^ 0x474c_4f42_414c_0003,
+            )?
+        };
+        let pooled_sigreg_value = 0.70 * token_linearization.value
+            + 0.20 * chunk_linearization.value
+            + 0.10 * global_linearization.value;
+        let token_rows = cached_tokens[0].dim(0)?;
+        let chunk_rows = cached_chunks[0].dim(0)?;
+        let global_rows = cached_globals[0].dim(0)?;
+        for (micro_step, batch) in microbatches.iter().enumerate() {
+            let live = latent_sigreg_forward(&encoder, batch)?;
+            let token_surrogate = sigreg_linear_surrogate(
+                &live.token_states,
+                &token_linearization.input_gradient,
+                micro_step * token_rows,
+            )?;
+            let chunk_surrogate = sigreg_linear_surrogate(
+                &live.chunk_states,
+                &chunk_linearization.input_gradient,
+                micro_step * chunk_rows,
+            )?;
+            let global_surrogate = sigreg_linear_surrogate(
+                &live.global_states,
+                &global_linearization.input_gradient,
+                micro_step * global_rows,
+            )?;
+            let sigreg_surrogate = token_surrogate
+                .affine(0.70, 0.0)?
+                .broadcast_add(&chunk_surrogate.affine(0.20, 0.0)?)?
+                .broadcast_add(&global_surrogate.affine(0.10, 0.0)?)?
+                .affine(config.lambda, 0.0)?;
+            let sigreg_grads = util::scaled_gradients(&sigreg_surrogate, 1)?;
+            util::accumulate_gradients(&mut accumulated_grads, &train_vars, sigreg_grads)?;
+        }
+        if step % config.log_every == 0 {
+            for snapshot in &mut log_snapshots {
+                snapshot.sigreg_val = pooled_sigreg_value;
+                snapshot.loss_val = snapshot.pred_val + config.lambda as f32 * pooled_sigreg_value;
+            }
         }
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);

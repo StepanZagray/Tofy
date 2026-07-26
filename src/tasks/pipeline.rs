@@ -4413,7 +4413,27 @@ mod profile_tests {
         let profiles: ModelProfiles = serde_json::from_str(text)?;
         assert_eq!(profiles.minimal.bridge_dim, 640);
         assert_eq!(profiles.minimal.bridge_max_seq, 256);
-        assert!(profiles.minimal.bridge_grad_accum > 0);
+        assert_eq!(
+            (
+                profiles.minimal.latent_batch,
+                profiles.minimal.latent_grad_accum
+            ),
+            (16, 8)
+        );
+        assert_eq!(
+            (
+                profiles.minimal.world_batch,
+                profiles.minimal.world_grad_accum
+            ),
+            (8, 32)
+        );
+        assert_eq!(
+            (
+                profiles.minimal.bridge_batch,
+                profiles.minimal.bridge_grad_accum
+            ),
+            (8, 16)
+        );
         let value: Value = serde_json::from_str(text)?;
         assert_eq!(
             value.as_object().map(|object| object.len()),

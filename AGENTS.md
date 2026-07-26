@@ -33,6 +33,12 @@
 - To connect on the first try, use the Connect-tab user/host and allocate a TTY:
   `ssh -tt <pod-user>@ssh.runpod.io -i ~/.ssh/id_ed25519`
 - After connecting, run inspection commands inside the session instead of using one-shot `ssh ... 'command'`.
+- Deploy repository changes to RunPod through a reviewed Git commit: push
+  locally, then fetch/pull or check out that exact commit on the pod. Do not
+  send repository files directly with `scp`, `rsync`, tar-over-SSH, terminal
+  pastes, or similar mechanisms unless Git transfer is genuinely impossible
+  or a non-repository artifact is strictly required. State the necessity
+  before using an exception.
 
 ## Results Tracking
 - Keep `docs/RESULTS.md` up to date.

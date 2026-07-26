@@ -204,6 +204,41 @@ five-step observation above and bridge `8/16` only a one-step fit check. Those
 two pairs must be sustained-qualified on the target pod before being called
 fully qualified.
 
+### Effective-batch SIGReg correction and H100 restart (2026-07-26)
+
+The first clean H100 80 GiB launch at commit `d872574` created
+`code_poc_1785098309`. Its direct-documentation RAG preflight passed both
+splits, and encoder training reached step 400 before being stopped
+deliberately. At step 400 it reported total loss `0.6118`, prediction loss
+`0.1535`, held-out prediction loss `0.1495`, and SIGReg `2.2919`, with a peak
+of `44,725 / 81,559 MiB`. Exact launch:
+
+```bash
+TOFY_RUNPOD_TMUX_CHILD=1 SKIP_GIT_PULL=1 TOFY_REQUIRE_PREPARED_CACHE=0 LOG_PATH=/workspace/tofy-train-minimal.log TOFY_REPO_DIR=/workspace/Tofy scripts/runpod_train.sh train
+```
+
+This run is not a model-quality result and must not be resumed. Inspection
+showed that gradient accumulation averaged independent physical-microbatch
+SIGReg losses; it did not expose the Epps-Pulley statistic to the optimizer's
+effective batch. The encoder therefore used only 16 independent sequences
+(48 correlated three-view rows) per SIGReg estimate despite reporting an
+effective optimizer batch of 64. The world stage had the same defect.
+
+The replacement training path computes one seeded SIGReg objective over the
+entire effective batch. It first linearizes the pooled detached objective in
+position-bounded chunks, then replays one live physical microbatch at a time
+and backpropagates its exact chain-rule contribution. Prediction gradients
+remain averaged over accumulation; pooled SIGReg is applied once and is not
+divided by accumulation. World validation now pools its validation batches as
+well. CPU property tests compare pooled values and gradients against direct
+full-batch Epps-Pulley evaluation, including unequal valid lengths.
+
+The revised minimal pairs are encoder `16/8` (128 independent sequences, 384
+three-view rows), world `8/32` (256 independent examples), and bridge `8/16`
+(128 examples). These are pending sustained qualification on the H100; no
+new best metric is claimed until the replacement run logs real training
+steps.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The

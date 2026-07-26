@@ -15,7 +15,8 @@ use crate::data::{
 use crate::model::vocab::vocab_signature;
 use crate::model::{
     association_top1_accuracy, load_vocab_from_file, prediction_loss,
-    sigreg_epps_pulley_chunked_seeded, ContextCompressor, LeWorldModel, OnlineEncoder,
+    sigreg_epps_pulley_chunked_seeded, sigreg_epps_pulley_linearization_chunked_seeded,
+    sigreg_linear_surrogate, ContextCompressor, LeWorldModel, OnlineEncoder,
 };
 use crate::tasks::veclab::model_visible_task;
 use crate::tasks::world_context::{
@@ -24,6 +25,10 @@ use crate::tasks::world_context::{
 use crate::util;
 
 const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
+const WORLD_ENCODER_RUNNING_STATS: [&str; 2] = [
+    "encoder_projector.norm.running_mean",
+    "encoder_projector.norm.running_var",
+];
 
 type WorldConfig = WorldTrainConfig;
 
@@ -33,6 +38,40 @@ struct WorldLogSnapshot {
     sigreg_val: f32,
     assoc_top1: f32,
     duplicate_fn_in_batch: usize,
+}
+
+fn snapshot_world_encoder_running_stats(world_varmap: &VarMap) -> Result<Vec<Tensor>> {
+    let vars = world_varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("world VarMap lock poisoned"))?;
+    WORLD_ENCODER_RUNNING_STATS
+        .iter()
+        .map(|name| {
+            vars.get(*name)
+                .with_context(|| format!("missing world BatchNorm buffer {name}"))?
+                .as_tensor()
+                .detach()
+                .copy()
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn restore_world_encoder_running_stats(
+    world_varmap: &mut VarMap,
+    snapshot: &[Tensor],
+) -> Result<()> {
+    if snapshot.len() != WORLD_ENCODER_RUNNING_STATS.len() {
+        bail!(
+            "world BatchNorm snapshot has {} tensors, expected {}",
+            snapshot.len(),
+            WORLD_ENCODER_RUNNING_STATS.len()
+        );
+    }
+    world_varmap
+        .set(WORLD_ENCODER_RUNNING_STATS.iter().zip(snapshot.iter()))
+        .map_err(Into::into)
 }
 
 fn leworld_loss(prediction: &Tensor, sigreg: &Tensor, lambda: f64) -> Result<Tensor> {
@@ -129,7 +168,8 @@ fn world_validation_metric(
         assoc_top1: 0.0,
         duplicate_fn_in_batch: 0,
     };
-    for batch_index in 0..batches.max(1) {
+    let mut sigreg_batches = Vec::with_capacity(batches.max(1));
+    for _batch_index in 0..batches.max(1) {
         let batch = next_unique_batch(
             batch_size,
             raw_stream.as_mut(),
@@ -152,24 +192,27 @@ fn world_validation_metric(
         let predicted_slots = world.predict(&state_slots, &actions, false)?;
         let prediction = prediction_loss(&predicted_slots, &next_slots)?;
         let encoded_observations = world_sigreg_embeddings(&state_slots, &next_slots)?;
-        let sigreg = sigreg_epps_pulley_chunked_seeded(
-            &encoded_observations,
-            sigreg_slices,
-            sigreg_points,
-            env_usize("TOFY_SIGREG_POSITION_CHUNK", 8),
-            0x5641_4c49_4441_5445u64.wrapping_add(batch_index as u64),
-        )?;
-        let loss = leworld_loss(&prediction, &sigreg, config.lambda)?;
-        total.loss_val += util::scalar_f32(&loss)?;
+        sigreg_batches.push(encoded_observations.detach());
         total.prediction_val += util::scalar_f32(&prediction)?;
-        total.sigreg_val += util::scalar_f32(&sigreg)?;
         total.assoc_top1 += association_top1_accuracy(&predicted_slots, &next_slots)?;
     }
     let scale = 1.0 / batches.max(1) as f32;
-    total.loss_val *= scale;
     total.prediction_val *= scale;
-    total.sigreg_val *= scale;
     total.assoc_top1 *= scale;
+    let sigreg_refs = sigreg_batches.iter().collect::<Vec<_>>();
+    let pooled_sigreg = sigreg_epps_pulley_chunked_seeded(
+        &Tensor::cat(&sigreg_refs, 0)?,
+        sigreg_slices,
+        sigreg_points,
+        env_usize("TOFY_SIGREG_POSITION_CHUNK", 8),
+        0x5641_4c49_4441_5445,
+    )?;
+    total.sigreg_val = util::scalar_f32(&pooled_sigreg)?;
+    total.loss_val = util::scalar_f32(&leworld_loss(
+        &Tensor::new(total.prediction_val, device)?,
+        &pooled_sigreg,
+        config.lambda,
+    )?)?;
     Ok(Some(total))
 }
 
@@ -517,6 +560,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
     println!("Training LeWorldModel (next-embedding MSE + SIGReg, end-to-end)");
     println!("Rows: train {} | val {}", train_row_count, val_row_count);
+    println!(
+        "World SIGReg pools all gradient-accumulation microbatches: {} independent examples per optimizer step",
+        config.batch_size * config.grad_accum_steps
+    );
 
     let mut best_metric = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
@@ -550,8 +597,13 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         let mut log_snapshot = None;
         let batch_size = world_batch_size_for_step(step, &config);
         let grad_accum_steps = world_grad_accum_for_step(step, &config);
+        let mut microbatches = Vec::with_capacity(grad_accum_steps);
+        let mut cached_sigreg = Vec::with_capacity(grad_accum_steps);
+        let capture_log = step % config.log_every == 0;
+        let mut prediction_sum = 0.0f32;
+        let mut association_sum = 0.0f32;
 
-        for micro_step in 0..grad_accum_steps {
+        for _micro_step in 0..grad_accum_steps {
             let batch = next_unique_batch(
                 batch_size,
                 Some(&mut world_stream),
@@ -574,34 +626,82 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let predicted_slots = world.predict(&state_slots, &actions, true)?;
             let prediction = prediction_loss(&predicted_slots, &next_slots)?;
             let encoded_observations = world_sigreg_embeddings(&state_slots, &next_slots)?;
-            let sigreg_loss = sigreg_epps_pulley_chunked_seeded(
-                &encoded_observations,
+            cached_sigreg.push(encoded_observations.detach());
+            util::accumulate_scaled_gradients(
+                &mut accumulated_grads,
+                &train_vars,
+                &prediction,
+                grad_accum_steps,
+            )?;
+
+            if capture_log {
+                prediction_sum += util::scalar_f32(&prediction)?;
+                association_sum += association_top1_accuracy(&predicted_slots, &next_slots)?;
+            }
+            microbatches.push(batch);
+        }
+        if capture_log {
+            let divisor = grad_accum_steps as f32;
+            let prediction_val = prediction_sum / divisor;
+            log_snapshot = Some(WorldLogSnapshot {
+                loss_val: prediction_val,
+                prediction_val,
+                sigreg_val: 0.0,
+                assoc_top1: association_sum / divisor,
+                duplicate_fn_in_batch: 0,
+            });
+        }
+
+        let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+        let sigreg_seed = (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x574f_524c_4400_0001;
+        let pooled_sigreg = {
+            let refs = cached_sigreg.iter().collect::<Vec<_>>();
+            let pooled = Tensor::cat(&refs, 0)?;
+            sigreg_epps_pulley_linearization_chunked_seeded(
+                &pooled,
                 sigreg_slices,
                 sigreg_points,
-                env_usize("TOFY_SIGREG_POSITION_CHUNK", 8),
-                (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ micro_step as u64,
+                sigreg_position_chunk,
+                sigreg_seed,
+            )?
+        };
+        // Replay must use training batch statistics so its gradients match the
+        // first pass, but it must not advance persistent BatchNorm statistics
+        // a second time.
+        let encoder_running_stats = snapshot_world_encoder_running_stats(&world_varmap)?;
+        let sigreg_rows = cached_sigreg[0].dim(0)?;
+        for (micro_step, batch) in microbatches.iter().enumerate() {
+            let (raw_state, raw_next) = context_slots_from_world_pair_batch(
+                &encoder,
+                &context_compressor,
+                batch,
+                encoder_vocab.pad_id,
+                config.max_seq,
+                context_segments,
+                recent_full_segments,
+                !config.train_encoder,
+                &device,
             )?;
-            let loss = leworld_loss(&prediction, &sigreg_loss, config.lambda)?;
-
-            util::accumulate_scaled_gradients(&mut accumulated_grads, &train_vars, &loss, 1)?;
-
-            if step % config.log_every == 0 && micro_step + 1 == grad_accum_steps {
-                let loss_val = util::scalar_f32(&loss)?;
-                let sigreg_val = util::scalar_f32(&sigreg_loss)?;
-                log_snapshot = Some(WorldLogSnapshot {
-                    loss_val,
-                    prediction_val: util::scalar_f32(&prediction)?,
-                    sigreg_val,
-                    assoc_top1: association_top1_accuracy(&predicted_slots, &next_slots)?,
-                    duplicate_fn_in_batch: 0,
-                });
-            }
+            let (state_slots, next_slots) = world.encode_pair(&raw_state, &raw_next, true)?;
+            let live_observations = world_sigreg_embeddings(&state_slots, &next_slots)?;
+            let sigreg_surrogate = sigreg_linear_surrogate(
+                &live_observations,
+                &pooled_sigreg.input_gradient,
+                micro_step * sigreg_rows,
+            )?;
+            util::accumulate_scaled_gradients(
+                &mut accumulated_grads,
+                &train_vars,
+                &sigreg_surrogate.affine(config.lambda, 0.0)?,
+                1,
+            )?;
         }
-        util::scale_accumulated_gradients(
-            &mut accumulated_grads,
-            &train_vars,
-            1.0 / grad_accum_steps as f64,
-        )?;
+        restore_world_encoder_running_stats(&mut world_varmap, &encoder_running_stats)?;
+        if let Some(snapshot) = log_snapshot.as_mut() {
+            snapshot.sigreg_val = pooled_sigreg.value;
+            snapshot.loss_val =
+                snapshot.prediction_val + config.lambda as f32 * pooled_sigreg.value;
+        }
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
         opt.set_learning_rate(scheduled_lr);
@@ -797,6 +897,8 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::LeWorldModel;
+    use candle_nn::VarBuilder;
 
     #[test]
     fn leworld_loss_accepts_mixed_precision_scalars() -> Result<()> {
@@ -808,6 +910,32 @@ mod tests {
         assert_eq!(loss.dtype(), DType::F32);
         let value = util::scalar_f32(&loss)?;
         assert!((value - 1.5).abs() < 1e-5, "loss={value}");
+        Ok(())
+    }
+
+    #[test]
+    fn world_sigreg_replay_does_not_persist_batch_norm_updates() -> Result<()> {
+        let device = Device::Cpu;
+        let mut varmap = VarMap::new();
+        let world = LeWorldModel::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), 16)?;
+        let raw_state = Tensor::randn(0f32, 1f32, (2, 3, 16), &device)?;
+        let raw_next = Tensor::randn(2f32, 1f32, (2, 3, 16), &device)?;
+
+        world.encode_pair(&raw_state, &raw_next, true)?;
+        let after_prediction = snapshot_world_encoder_running_stats(&varmap)?;
+        world.encode_pair(&raw_state, &raw_next, true)?;
+        let after_replay = snapshot_world_encoder_running_stats(&varmap)?;
+        assert_ne!(
+            after_prediction[0].to_vec1::<f32>()?,
+            after_replay[0].to_vec1::<f32>()?,
+            "the test replay must exercise a BatchNorm running-stat update"
+        );
+
+        restore_world_encoder_running_stats(&mut varmap, &after_prediction)?;
+        let restored = snapshot_world_encoder_running_stats(&varmap)?;
+        for (expected, actual) in after_prediction.iter().zip(restored.iter()) {
+            assert_eq!(expected.to_vec1::<f32>()?, actual.to_vec1::<f32>()?);
+        }
         Ok(())
     }
 }
