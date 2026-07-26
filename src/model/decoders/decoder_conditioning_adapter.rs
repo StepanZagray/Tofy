@@ -2,58 +2,17 @@ use anyhow::Result;
 use candle_core::{Tensor, D};
 use candle_nn::{self as nn, ops, Module, VarBuilder};
 
-use crate::model::attention::CrossAttention;
-use crate::util;
+use crate::model::latent_resampler::LatentResampler;
 
 /// Decoder-specific adapter: turns private context slots into generation-facing conditioning slots.
 pub struct DecoderConditioningAdapter {
-    query_embed: nn::Embedding,
-    cross_attn: CrossAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
-    extra_blocks: Vec<AdapterBlock>,
+    resampler: LatentResampler,
     index_proj: nn::Linear,
     gate_proj: nn::Linear,
     proj: nn::Linear,
     output_norm: nn::RmsNorm,
     num_output_slots: usize,
-    planner_dim: usize,
     compress_rate: usize,
-}
-
-struct AdapterBlock {
-    cross_attn: CrossAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
-}
-
-impl AdapterBlock {
-    fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
-        let hidden = (dim * 4).max(256);
-        Ok(Self {
-            cross_attn: CrossAttention::new(vb.pp("cross_attn"), dim, dim, 8)?,
-            ln1: nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?,
-            ln2: nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?,
-            ff1: nn::linear(dim, hidden, vb.pp("ff1"))?,
-            ff2: nn::linear(hidden, dim, vb.pp("ff2"))?,
-        })
-    }
-
-    fn forward(&self, slots: &Tensor, memory: &Tensor) -> Result<Tensor> {
-        let attended = self
-            .cross_attn
-            .forward(&util::layer_norm_diff(&self.ln1, slots)?, memory)?;
-        let slots = (slots + attended)?;
-        let ff = self
-            .ff1
-            .forward(&util::layer_norm_diff(&self.ln2, &slots)?)?
-            .gelu()?;
-        (slots + self.ff2.forward(&ff)?).map_err(Into::into)
-    }
 }
 
 impl DecoderConditioningAdapter {
@@ -81,43 +40,29 @@ impl DecoderConditioningAdapter {
         if compress_rate == 0 {
             anyhow::bail!("decoder adapter compress_rate must be non-zero");
         }
-        let query_embed = nn::embedding(num_output_slots, planner_dim, vb.pp("query_embed"))?;
-        let cross_attn = CrossAttention::new(vb.pp("cross_attn"), planner_dim, planner_dim, 8)?;
-        let ln1 = nn::layer_norm(planner_dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(planner_dim, 1e-5, vb.pp("ln2"))?;
-        let ff_hidden = (planner_dim * 4).max(256);
-        let ff1 = nn::linear(planner_dim, ff_hidden, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_hidden, planner_dim, vb.pp("ff2"))?;
         let depth = std::env::var("TOFY_ADAPTER_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(3)
             .max(1);
-        let mut extra_blocks = Vec::with_capacity(depth.saturating_sub(1));
-        for index in 1..depth {
-            extra_blocks.push(AdapterBlock::new(
-                vb.pp(format!("blocks.{index}")),
-                planner_dim,
-            )?);
-        }
+        let resampler = LatentResampler::new(
+            vb.pp("resampler"),
+            planner_dim,
+            adapter_heads(planner_dim),
+            num_output_slots,
+            depth,
+        )?;
         let index_proj = nn::linear(planner_dim, 1, vb.pp("index_proj"))?;
         let gate_proj = nn::linear(planner_dim, planner_dim, vb.pp("gate_proj"))?;
         let proj = nn::linear(planner_dim, model_dim, vb.pp("proj"))?;
         let output_norm = nn::rms_norm(model_dim, 1e-6, vb.pp("output_norm"))?;
         Ok(Self {
-            query_embed,
-            cross_attn,
-            ln1,
-            ln2,
-            ff1,
-            ff2,
-            extra_blocks,
+            resampler,
             index_proj,
             gate_proj,
             proj,
             output_norm,
             num_output_slots,
-            planner_dim,
             compress_rate,
         })
     }
@@ -133,11 +78,10 @@ impl DecoderConditioningAdapter {
         // query/bias-only path: adapter(0) is exactly zero, and non-zero decoder
         // conditioning has to be explained by the supplied world slots.
         let output = self.forward_uncentered(context_slots)?;
-        // The baseline defines the zero point but carries no learning signal;
-        // detaching it avoids retaining a second adapter graph per microbatch.
-        let baseline = self
-            .forward_uncentered(&context_slots.zeros_like()?)?
-            .detach();
+        // Keep the baseline attached. Detaching it would produce a biased
+        // straight-through gradient for query/bias-only paths that cancel in
+        // the actual forward function.
+        let baseline = self.forward_uncentered(&context_slots.zeros_like()?)?;
         output.broadcast_sub(&baseline).map_err(Into::into)
     }
 
@@ -158,39 +102,23 @@ impl DecoderConditioningAdapter {
             .and_then(|gate| ops::sigmoid(&gate))?
             .unsqueeze(1)?;
 
-        let query_ids: Vec<u32> = (0..self.num_output_slots as u32).collect();
-        let query_ids = Tensor::from_vec(
-            query_ids,
-            (1, self.num_output_slots),
-            context_slots.device(),
-        )?;
-        let queries = self.query_embed.forward(&query_ids)?.broadcast_as((
-            batch,
-            self.num_output_slots,
-            self.planner_dim,
-        ))?;
-
-        let gated_queries = queries.broadcast_add(&global_memory.unsqueeze(1)?)?;
-        let normed = util::layer_norm_diff(&self.ln1, &gated_queries)?;
-        let attended = self
-            .cross_attn
-            .forward(&normed, &memory)?
+        let queries = self
+            .resampler
+            .queries(batch, context_slots.device())?
+            .broadcast_add(&global_memory.unsqueeze(1)?)?;
+        let slots = self
+            .resampler
+            .forward_from_queries(&queries, &memory, None)?
             .broadcast_mul(&memory_gate)?;
-        // Queries select what to read, but are not themselves emitted as a
-        // conditioning prefix.  Otherwise `queries` alone can enable a generic
-        // code mode for every world state, which is exactly the collapse caught
-        // by matched-vs-wrong causal controls.
-        let slots = attended;
-
-        let normed = util::layer_norm_diff(&self.ln2, &slots)?;
-        let ff = self.ff1.forward(&normed)?.gelu()?;
-        let mut slots = (slots + self.ff2.forward(&ff)?)?;
-        for block in &self.extra_blocks {
-            slots = block.forward(&slots, &memory)?;
-        }
-
         Ok(self.output_norm.forward_diff(&self.proj.forward(&slots)?)?)
     }
+}
+
+fn adapter_heads(dim: usize) -> usize {
+    [16, 8, 4, 2]
+        .into_iter()
+        .find(|heads| dim.is_multiple_of(*heads))
+        .unwrap_or(1)
 }
 
 fn compressed_context_compressor(

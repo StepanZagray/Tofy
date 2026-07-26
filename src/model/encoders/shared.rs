@@ -2,9 +2,8 @@ use anyhow::Result;
 use candle_core::{Module, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
-use super::super::attention::{positional_encoding, LocalTransformerBlock, TransformerBlock};
+use super::super::attention::{CrossAttention, LocalTransformerBlock, TransformerBlock};
 use super::pooling::MultiQueryPool;
-use crate::util;
 
 const DEFAULT_CHUNK_SIZE: usize = 16;
 const DEFAULT_LOCAL_WINDOW: usize = 16;
@@ -58,19 +57,52 @@ impl EncoderFeatures {
 
 pub(crate) struct EncoderBackbone {
     embed: nn::Embedding,
-    local_blocks: Vec<LocalTransformerBlock>,
+    pre_local_blocks: Vec<LocalTransformerBlock>,
     global_blocks: Vec<TransformerBlock>,
+    refine_local_blocks: Vec<LocalTransformerBlock>,
     global_token_embed: nn::Embedding,
-    token_context_proj: nn::Linear,
-    token_ln_final: nn::LayerNorm,
-    chunk_ln_final: nn::LayerNorm,
-    global_ln_final: nn::LayerNorm,
+    chunk_score_norm: nn::RmsNorm,
+    chunk_score: nn::Linear,
+    feedback_query_norm: nn::RmsNorm,
+    feedback_memory_norm: nn::RmsNorm,
+    feedback: CrossAttention,
+    chunk_merge: nn::Linear,
+    token_ln_final: nn::RmsNorm,
+    chunk_ln_final: nn::RmsNorm,
+    global_ln_final: nn::RmsNorm,
     token_projection: nn::Linear,
     chunk_projection: nn::Linear,
     global_projection: nn::Linear,
+    predictor_norm: nn::RmsNorm,
+    predictor_gate: nn::Linear,
+    predictor_up: nn::Linear,
+    predictor_down: nn::Linear,
     pool: MultiQueryPool,
-    dim: usize,
     chunk_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EncoderDepthPlan {
+    pre_local: usize,
+    global: usize,
+    refine_local: usize,
+}
+
+impl EncoderDepthPlan {
+    fn new(total: usize) -> Result<Self> {
+        if total == 0 {
+            anyhow::bail!("encoder must contain at least one transformer block");
+        }
+        let global = if total >= 2 { (total / 3).max(1) } else { 0 };
+        let refine_local = if total >= 3 { (total / 3).max(1) } else { 0 };
+        let pre_local = total - global - refine_local;
+        debug_assert_eq!(pre_local + global + refine_local, total);
+        Ok(Self {
+            pre_local,
+            global,
+            refine_local,
+        })
+    }
 }
 
 impl EncoderBackbone {
@@ -82,13 +114,12 @@ impl EncoderBackbone {
         num_heads: usize,
     ) -> Result<Self> {
         let embed = nn::embedding(vocab_size, dim, vb.pp("embed"))?;
-        let num_local_layers = ((num_layers * 2) / 3).max(1);
-        let num_global_layers = (num_layers - num_local_layers).max(1);
+        let plan = EncoderDepthPlan::new(num_layers)?;
 
-        let mut local_blocks = Vec::with_capacity(num_local_layers);
-        for i in 0..num_local_layers {
-            local_blocks.push(LocalTransformerBlock::new(
-                vb.pp(format!("local_block_{}", i)),
+        let mut pre_local_blocks = Vec::with_capacity(plan.pre_local);
+        for i in 0..plan.pre_local {
+            pre_local_blocks.push(LocalTransformerBlock::new(
+                vb.pp(format!("pre_local_block_{i}")),
                 dim,
                 num_heads,
                 dim * 4,
@@ -96,48 +127,115 @@ impl EncoderBackbone {
             )?);
         }
 
-        let mut global_blocks = Vec::with_capacity(num_global_layers);
-        for i in 0..num_global_layers {
+        let mut global_blocks = Vec::with_capacity(plan.global);
+        for i in 0..plan.global {
             global_blocks.push(TransformerBlock::new(
-                vb.pp(format!("global_block_{}", i)),
+                vb.pp(format!("global_block_{i}")),
                 dim,
                 num_heads,
                 dim * 4,
             )?);
         }
+        let mut refine_local_blocks = Vec::with_capacity(plan.refine_local);
+        for i in 0..plan.refine_local {
+            refine_local_blocks.push(LocalTransformerBlock::new(
+                vb.pp(format!("refine_local_block_{i}")),
+                dim,
+                num_heads,
+                dim * 4,
+                DEFAULT_LOCAL_WINDOW,
+            )?);
+        }
 
         let global_token_embed =
             nn::embedding(NUM_GLOBAL_TOKENS, dim, vb.pp("global_token_embed"))?;
-        let token_context_proj = nn::linear(dim, dim, vb.pp("token_context_proj"))?;
-        let token_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("token_ln_final"))?;
-        let chunk_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("chunk_ln_final"))?;
-        let global_ln_final = nn::layer_norm(dim, 1e-5, vb.pp("global_ln_final"))?;
+        let chunk_score_norm = nn::rms_norm(dim, 1e-6, vb.pp("chunk_score_norm"))?;
+        let chunk_score = nn::linear_no_bias(dim, 1, vb.pp("chunk_score"))?;
+        let feedback_query_norm = nn::rms_norm(dim, 1e-6, vb.pp("feedback_query_norm"))?;
+        let feedback_memory_norm = nn::rms_norm(dim, 1e-6, vb.pp("feedback_memory_norm"))?;
+        let feedback = CrossAttention::new(vb.pp("feedback"), dim, dim, num_heads)?;
+        let chunk_merge = nn::linear(dim * 2, dim, vb.pp("chunk_merge"))?;
+        let token_ln_final = nn::rms_norm(dim, 1e-6, vb.pp("token_ln_final"))?;
+        let chunk_ln_final = nn::rms_norm(dim, 1e-6, vb.pp("chunk_ln_final"))?;
+        let global_ln_final = nn::rms_norm(dim, 1e-6, vb.pp("global_ln_final"))?;
         // LeWorldModel projects after the encoder's final normalization so
         // SIGReg can control latent scale and covariance.
         let token_projection = nn::linear(dim, dim, vb.pp("token_projection"))?;
         let chunk_projection = nn::linear(dim, dim, vb.pp("chunk_projection"))?;
         let global_projection = nn::linear(dim, dim, vb.pp("global_projection"))?;
+        let predictor_dim = ((dim * 8) / 3).max(dim);
+        let predictor_norm = nn::rms_norm(dim, 1e-6, vb.pp("predictor_norm"))?;
+        let predictor_gate = nn::linear_no_bias(dim, predictor_dim, vb.pp("predictor_gate"))?;
+        let predictor_up = nn::linear_no_bias(dim, predictor_dim, vb.pp("predictor_up"))?;
+        let predictor_down = nn::linear_no_bias(predictor_dim, dim, vb.pp("predictor_down"))?;
         let pool = MultiQueryPool::new(vb.pp("pool"), dim, num_heads, NUM_POOL_QUERIES)?;
         Ok(Self {
             embed,
-            local_blocks,
+            pre_local_blocks,
             global_blocks,
+            refine_local_blocks,
             global_token_embed,
-            token_context_proj,
+            chunk_score_norm,
+            chunk_score,
+            feedback_query_norm,
+            feedback_memory_norm,
+            feedback,
+            chunk_merge,
             token_ln_final,
             chunk_ln_final,
             global_ln_final,
             token_projection,
             chunk_projection,
             global_projection,
+            predictor_norm,
+            predictor_gate,
+            predictor_up,
+            predictor_down,
             pool,
-            dim,
             chunk_size: DEFAULT_CHUNK_SIZE,
         })
     }
 
     pub(crate) fn chunk_size_for_seq_len(&self, seq_len: usize) -> usize {
         self.effective_chunk_size(seq_len)
+    }
+
+    pub(crate) fn attention_work_summary(&self, seq_len: usize) -> String {
+        let chunk_size = self.effective_chunk_size(seq_len);
+        let local_window = chunk_size.clamp(DEFAULT_LOCAL_WINDOW, MAX_LOCAL_WINDOW);
+        let local_keys = seq_len.min(local_window.saturating_mul(2).saturating_sub(1));
+        let local_pairs_per_layer = seq_len.saturating_mul(local_keys);
+        let chunks = seq_len.div_ceil(chunk_size);
+        let global_positions = chunks + NUM_GLOBAL_TOKENS;
+        let pre_local_pairs = self
+            .pre_local_blocks
+            .len()
+            .saturating_mul(local_pairs_per_layer);
+        let global_pairs = self
+            .global_blocks
+            .len()
+            .saturating_mul(global_positions.saturating_mul(global_positions));
+        let feedback_pairs = seq_len.saturating_mul(global_positions);
+        let refine_pairs = self
+            .refine_local_blocks
+            .len()
+            .saturating_mul(local_pairs_per_layer);
+        format!(
+            "Encoder depth parameters: pre-local/global/refine={}/{}/{} blocks; attention-score work upper bound at seq={seq_len}: pre-local={pre_local_pairs} global={global_pairs} feedback={feedback_pairs} refine={refine_pairs} pairs",
+            self.pre_local_blocks.len(),
+            self.global_blocks.len(),
+            self.refine_local_blocks.len(),
+        )
+    }
+
+    pub(crate) fn predict_states(&self, states: &Tensor) -> Result<Tensor> {
+        let normed = self.predictor_norm.forward_diff(states)?;
+        let hidden = self
+            .predictor_gate
+            .forward(&normed)?
+            .silu()?
+            .broadcast_mul(&self.predictor_up.forward(&normed)?)?;
+        self.predictor_down.forward(&hidden).map_err(Into::into)
     }
 
     fn effective_chunk_size(&self, seq_len: usize) -> usize {
@@ -147,30 +245,24 @@ impl EncoderBackbone {
         target_chunk.min(seq_len).max(1)
     }
 
-    pub(crate) fn forward_features(&self, x: &Tensor) -> Result<EncoderFeatures> {
-        let (_, seq_len) = x.dims2()?;
-        let mut token_states = self.embed.forward(x)?;
-        let token_mask = x.ne(PAD_TOKEN_ID)?.to_dtype(token_states.dtype())?;
-        let token_mask_3d = token_mask.unsqueeze(2)?;
-        let pe =
-            positional_encoding(seq_len, self.dim, x.device())?.to_dtype(token_states.dtype())?;
-        token_states = token_states.broadcast_add(&pe)?;
-        token_states = token_states.broadcast_mul(&token_mask_3d)?;
-        let chunk_size = self.effective_chunk_size(seq_len);
-        let local_window = chunk_size.clamp(DEFAULT_LOCAL_WINDOW, MAX_LOCAL_WINDOW);
-        for block in &self.local_blocks {
-            token_states =
-                block.forward_with_window_masked(&token_states, local_window, &token_mask)?;
-            token_states = token_states.broadcast_mul(&token_mask_3d)?;
-        }
-
-        let (batch, _, dim) = token_states.dims3()?;
+    fn pool_chunks(
+        &self,
+        token_states: &Tensor,
+        token_mask: &Tensor,
+        chunk_size: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, seq_len, dim) = token_states.dims3()?;
         let num_chunks = seq_len.div_ceil(chunk_size);
         let padded_len = num_chunks * chunk_size;
-        let (chunk_source, chunk_token_mask) = if padded_len > seq_len {
+        let (source, padded_mask) = if padded_len > seq_len {
             let pad_len = padded_len - seq_len;
-            let state_pad = Tensor::zeros((batch, pad_len, dim), token_states.dtype(), x.device())?;
-            let mask_pad = Tensor::zeros((batch, pad_len), token_mask.dtype(), x.device())?;
+            let state_pad = Tensor::zeros(
+                (batch, pad_len, dim),
+                token_states.dtype(),
+                token_states.device(),
+            )?;
+            let mask_pad =
+                Tensor::zeros((batch, pad_len), token_mask.dtype(), token_states.device())?;
             (
                 Tensor::cat(&[token_states.clone(), state_pad], 1)?,
                 Tensor::cat(&[token_mask.clone(), mask_pad], 1)?,
@@ -178,23 +270,40 @@ impl EncoderBackbone {
         } else {
             (token_states.clone(), token_mask.clone())
         };
-        let chunk_mask = chunk_token_mask.reshape((batch, num_chunks, chunk_size))?;
-        let chunk_weights = chunk_mask.unsqueeze(3)?.to_dtype(token_states.dtype())?;
-        let chunk_denom = chunk_mask
-            .sum(2)?
-            .clamp(1.0, f64::INFINITY)?
-            .unsqueeze(2)?
-            .to_dtype(token_states.dtype())?;
+        let source = source.reshape((batch, num_chunks, chunk_size, dim))?;
+        let chunk_mask = padded_mask.reshape((batch, num_chunks, chunk_size))?;
+        let score = self
+            .chunk_score
+            .forward(&self.chunk_score_norm.forward_diff(&source)?)?
+            .squeeze(3)?;
+        let bias = chunk_mask.to_dtype(score.dtype())?.affine(1.0e4, -1.0e4)?;
+        let weights = nn::ops::softmax(&score.broadcast_add(&bias)?, 2)?.unsqueeze(3)?;
         let valid_chunks = chunk_mask.sum(2)?.clamp(0.0, 1.0)?;
-        let mut chunk_states = chunk_source
-            .reshape((batch, num_chunks, chunk_size, dim))?
-            .broadcast_mul(&chunk_weights)?
+        let chunks = source
+            .broadcast_mul(&weights)?
             .sum(2)?
-            .broadcast_div(&chunk_denom)?;
-        let chunk_pe = positional_encoding(num_chunks, self.dim, x.device())?
-            .to_dtype(chunk_states.dtype())?;
-        chunk_states = chunk_states.broadcast_add(&chunk_pe)?;
-        chunk_states = chunk_states.broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
+            .broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
+        Ok((chunks, valid_chunks))
+    }
+
+    pub(crate) fn forward_features(&self, x: &Tensor) -> Result<EncoderFeatures> {
+        let (_, seq_len) = x.dims2()?;
+        let mut token_states = self.embed.forward(x)?;
+        let token_mask = x.ne(PAD_TOKEN_ID)?.to_dtype(token_states.dtype())?;
+        let token_mask_3d = token_mask.unsqueeze(2)?;
+        token_states = token_states.broadcast_mul(&token_mask_3d)?;
+        let chunk_size = self.effective_chunk_size(seq_len);
+        let local_window = chunk_size.clamp(DEFAULT_LOCAL_WINDOW, MAX_LOCAL_WINDOW);
+        for block in &self.pre_local_blocks {
+            token_states =
+                block.forward_with_window_masked(&token_states, local_window, &token_mask)?;
+            token_states = token_states.broadcast_mul(&token_mask_3d)?;
+        }
+
+        let (batch, _, dim) = token_states.dims3()?;
+        let num_chunks = seq_len.div_ceil(chunk_size);
+        let (chunk_states, valid_chunks) =
+            self.pool_chunks(&token_states, &token_mask, chunk_size)?;
         let global_ids: Vec<u32> = (0..NUM_GLOBAL_TOKENS as u32).collect();
         let global_ids = Tensor::from_vec(global_ids, (1, NUM_GLOBAL_TOKENS), x.device())?;
         let global_states = self
@@ -215,27 +324,39 @@ impl EncoderBackbone {
             .broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
         let global_states = global_seq.narrow(1, num_chunks, NUM_GLOBAL_TOKENS)?;
 
-        let chunk_context = chunk_states
-            .unsqueeze(2)?
-            .broadcast_as((batch, num_chunks, chunk_size, dim))?
-            .reshape((batch, padded_len, dim))?
-            .narrow(1, 0, seq_len)?;
-        let token_context = self.token_context_proj.forward(&chunk_context)?;
+        // Every token can now read all updated chunks and global registers,
+        // rather than receiving only a repeated copy of its own chunk.
+        let feedback_memory = Tensor::cat(&[&chunk_states, &global_states], 1)?;
+        let feedback_mask = Tensor::cat(&[&valid_chunks, &global_token_mask], 1)?;
+        let token_context = self.feedback.forward_masked(
+            &self.feedback_query_norm.forward_diff(&token_states)?,
+            &self.feedback_memory_norm.forward_diff(&feedback_memory)?,
+            Some(&feedback_mask),
+        )?;
+        token_states = token_states.broadcast_add(&token_context)?;
+        token_states = token_states.broadcast_mul(&token_mask_3d)?;
+        for block in &self.refine_local_blocks {
+            token_states =
+                block.forward_with_window_masked(&token_states, local_window, &token_mask)?;
+            token_states = token_states.broadcast_mul(&token_mask_3d)?;
+        }
+        let (refined_chunks, _) = self.pool_chunks(&token_states, &token_mask, chunk_size)?;
+        let chunk_states = self
+            .chunk_merge
+            .forward(&Tensor::cat(&[chunk_states, refined_chunks], 2)?)?
+            .broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
+
         let token_states = self
             .token_projection
-            .forward(&util::layer_norm_diff(
-                &self.token_ln_final,
-                &token_states.broadcast_add(&token_context)?,
-            )?)?
+            .forward(&self.token_ln_final.forward_diff(&token_states)?)?
             .broadcast_mul(&token_mask_3d)?;
         let chunk_states = self
             .chunk_projection
-            .forward(&util::layer_norm_diff(&self.chunk_ln_final, &chunk_states)?)?
+            .forward(&self.chunk_ln_final.forward_diff(&chunk_states)?)?
             .broadcast_mul(&valid_chunks.unsqueeze(2)?)?;
-        let global_states = self.global_projection.forward(&util::layer_norm_diff(
-            &self.global_ln_final,
-            &global_states,
-        )?)?;
+        let global_states = self
+            .global_projection
+            .forward(&self.global_ln_final.forward_diff(&global_states)?)?;
         let pool_memory = Tensor::cat(
             &[
                 token_states.clone(),
@@ -304,6 +425,27 @@ mod tests {
             features.chunk_states.dim(1)? > 1,
             "prime-length inputs should not collapse to one chunk"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn depth_plan_is_exact_and_reserves_post_global_refinement() -> Result<()> {
+        assert_eq!(
+            EncoderDepthPlan::new(7)?,
+            EncoderDepthPlan {
+                pre_local: 3,
+                global: 2,
+                refine_local: 2,
+            }
+        );
+        for depth in 1..16 {
+            let plan = EncoderDepthPlan::new(depth)?;
+            assert_eq!(plan.pre_local + plan.global + plan.refine_local, depth);
+            if depth >= 3 {
+                assert!(plan.global > 0);
+                assert!(plan.refine_local > 0);
+            }
+        }
         Ok(())
     }
 }

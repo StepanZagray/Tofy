@@ -23,21 +23,11 @@ use crate::model::{load_vocab_from_file, save_vocab_to_file, Vocab};
 
 const CACHE_VERSION: u32 = 8;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
-const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const NO_ACTION: u32 = u32::MAX;
 const PROGRESS_EVERY_LINES: usize = 500_000;
 const DEFAULT_TOKEN_CACHE_ENCODE_CHUNK_LINES: usize = 16_384;
 const DEFAULT_TOKEN_CACHE_RAW_CHARS_PER_TOKEN: usize = 24;
 const DEFAULT_TOKEN_CACHE_RAW_CHAR_CAP: usize = 64 * 1024;
-const DECODER_TARGET_CROP_POLICY: &str = "completion_head_v1";
-
-struct DualWorldCacheRow {
-    encoder_state_tokens: Vec<u32>,
-    encoder_next_tokens: Vec<u32>,
-    decoder_state_tokens: Vec<u32>,
-    decoder_next_tokens: Vec<u32>,
-    action_label: u32,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -123,10 +113,6 @@ struct TokenCacheSpec<'a> {
     require_hit: bool,
 }
 
-fn target_crop_policy(kind: &str) -> Option<&'static str> {
-    matches!(kind, "code_decoder" | "code_decoder_dual").then_some(DECODER_TARGET_CROP_POLICY)
-}
-
 pub fn try_run_prepare_pipeline_cache(args: &[String]) -> Result<bool> {
     if args.len() < 2
         || (args[1] != "--prepare-pipeline-cache" && args[1] != "prepare-pipeline-cache")
@@ -165,9 +151,6 @@ impl PrepareCacheConfig {
                 "--world-max-seq" => {
                     world_max_seq = parse_next_usize(args, i, "--world-max-seq")?;
                     i += 2;
-                }
-                "--code-max-vocab" | "--code-max-seq" => {
-                    bail!("code decoder cache flags are no longer supported");
                 }
                 "--force" => {
                     force = true;
@@ -338,7 +321,7 @@ fn ensure_vocab_cache(spec: VocabCacheSpec<'_>) -> Result<Vocab> {
 
     if spec.require_hit {
         bail!(
-            "{} vocab cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            "{} vocab cache miss while --require-hit is active; run `cargo run --release -- prepare cache minimal --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
             spec.kind
         );
     }
@@ -407,7 +390,7 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
 
     if spec.require_hit {
         bail!(
-            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache minimal --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
             spec.kind
         );
     }
@@ -434,6 +417,9 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
         raw_cap
     );
     let mut rows = 0usize;
+    let mut cached_tokens = 0usize;
+    let mut min_cached_tokens = usize::MAX;
+    let mut max_cached_tokens = 0usize;
     let mut raw_lines = 0usize;
     let mut next_progress = PROGRESS_EVERY_LINES;
     for input_path in input_paths {
@@ -474,10 +460,20 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
                         encoded_rows.push(ids);
                     }
                     encoded_rows
+                        .into_iter()
+                        // A masked-prediction row needs at least one visible
+                        // token after masking. One-token records produce an
+                        // all-mask context and a mathematically impossible
+                        // target, so never persist them in an encoder cache.
+                        .filter(|ids| ids.len() >= 2)
+                        .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
             for ids in &encoded {
                 write_token_record(&mut writer, ids, &[], NO_ACTION)?;
+                cached_tokens += ids.len();
+                min_cached_tokens = min_cached_tokens.min(ids.len());
+                max_cached_tokens = max_cached_tokens.max(ids.len());
             }
             rows += encoded.len();
             while raw_lines >= next_progress {
@@ -490,6 +486,13 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
         }
     }
     writer.flush()?;
+    if rows == 0 {
+        let _ = fs::remove_file(&tmp_path);
+        bail!(
+            "{} token cache contains no usable sequences with at least 2 tokens",
+            spec.kind
+        );
+    }
     fs::rename(&tmp_path, spec.token_cache_path)?;
     write_json_atomic(
         spec.manifest_path,
@@ -501,7 +504,7 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
-            target_crop: target_crop_policy(spec.kind).map(str::to_string),
+            target_crop: None,
             action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -509,7 +512,14 @@ fn ensure_sequence_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Resul
             rows,
         },
     )?;
-    println!("{} token cache saved: {} rows", spec.kind, rows);
+    println!(
+        "{} token cache saved: {} rows, token fertility min={} mean={:.2} max={}",
+        spec.kind,
+        rows,
+        min_cached_tokens,
+        cached_tokens as f64 / rows as f64,
+        max_cached_tokens
+    );
     Ok(())
 }
 
@@ -526,7 +536,7 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
 
     if spec.require_hit {
         bail!(
-            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache minimal --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
             spec.kind
         );
     }
@@ -552,6 +562,13 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
     );
     let mut rows = 0usize;
     let mut raw_lines = 0usize;
+    let mut raw_nonempty_lines = 0usize;
+    let mut state_tokens = 0usize;
+    let mut next_tokens = 0usize;
+    let mut min_state_tokens = usize::MAX;
+    let mut min_next_tokens = usize::MAX;
+    let mut max_state_tokens = 0usize;
+    let mut max_next_tokens = 0usize;
     let mut next_progress = PROGRESS_EVERY_LINES;
     loop {
         let chunk = read_line_chunk(&mut lines, chunk_lines)?;
@@ -559,6 +576,7 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
             break;
         }
         raw_lines += chunk.len();
+        raw_nonempty_lines += chunk.iter().filter(|line| !line.trim().is_empty()).count();
         let encoded = chunk
             .par_iter()
             .filter_map(|line| {
@@ -571,7 +589,7 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
                     return None;
                 }
                 truncate_ids_tail(&mut example.state_tokens, spec.max_seq);
-                truncate_decoder_next_ids(&mut example.next_tokens, spec.max_seq);
+                truncate_ids_tail(&mut example.next_tokens, spec.max_seq);
                 Some(example)
             })
             .collect::<Vec<_>>();
@@ -582,6 +600,12 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
                 &example.next_tokens,
                 example.action_label,
             )?;
+            state_tokens += example.state_tokens.len();
+            next_tokens += example.next_tokens.len();
+            min_state_tokens = min_state_tokens.min(example.state_tokens.len());
+            min_next_tokens = min_next_tokens.min(example.next_tokens.len());
+            max_state_tokens = max_state_tokens.max(example.state_tokens.len());
+            max_next_tokens = max_next_tokens.max(example.next_tokens.len());
         }
         rows += encoded.len();
         while raw_lines >= next_progress {
@@ -593,133 +617,22 @@ fn ensure_world_token_cache(spec: TokenCacheSpec<'_>, vocab: &Vocab) -> Result<(
         }
     }
     writer.flush()?;
-    fs::rename(&tmp_path, spec.token_cache_path)?;
-    write_json_atomic(
-        spec.manifest_path,
-        &TokenManifest {
-            version: CACHE_VERSION,
-            kind: spec.kind.to_string(),
-            source: spec.source.clone(),
-            tokenizer: spec.mode.as_str().to_string(),
-            tokenizer_spec: tokenizer_spec(spec.mode),
-            tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
-            max_seq: spec.max_seq,
-            target_crop: target_crop_policy(spec.kind).map(str::to_string),
-            action_filter: spec.action_filter,
-            vocab_path: String::new(),
-            vocab_signature: vocab_sig,
-            token_cache_path: path_string(spec.token_cache_path),
-            rows,
-        },
-    )?;
-    println!("{} token cache saved: {} rows", spec.kind, rows);
-    Ok(())
-}
-
-fn ensure_dual_world_token_cache(
-    spec: TokenCacheSpec<'_>,
-    encoder_vocab: &Vocab,
-    decoder_vocab: &Vocab,
-) -> Result<()> {
-    let vocab_sig = format!(
-        "{}+{}",
-        vocab_signature(encoder_vocab),
-        vocab_signature(decoder_vocab)
-    );
-    if token_cache_is_valid(&spec, &vocab_sig) {
-        println!(
-            "{} token cache hit: {}",
-            spec.kind,
-            spec.token_cache_path.display()
-        );
-        return Ok(());
-    }
-
-    if spec.require_hit {
+    if rows == 0 {
+        let _ = fs::remove_file(&tmp_path);
         bail!(
-            "{} token cache miss while --require-hit is active; run `cargo run --release -- prepare cache <profile> --auto-hf-upload --hf-dataset <repo>` locally and restore that archive before training on the pod",
+            "{} token cache contains no usable state/target pairs",
             spec.kind
         );
     }
-
-    println!(
-        "{} token cache miss: encoding {} to {}",
-        spec.kind,
-        spec.data_path.display(),
-        spec.token_cache_path.display()
-    );
-    let tmp_path = tmp_path_for(spec.token_cache_path);
-    let mut writer = BufWriter::new(File::create(&tmp_path)?);
-    writer.write_all(DUAL_TOKEN_CACHE_MAGIC)?;
-    let mut lines = BufReader::new(File::open(spec.data_path)?).lines();
-    let chunk_lines = token_cache_encode_chunk_lines();
-    let raw_caps = token_cache_raw_world_caps(spec.max_seq);
-    println!(
-        "{} token cache parallel encode: chunk_lines={} rayon_threads={} raw_side_char_cap={}",
-        spec.kind,
-        chunk_lines,
-        rayon::current_num_threads(),
-        raw_caps.world_side
-    );
-    let mut rows = 0usize;
-    let mut raw_lines = 0usize;
-    let mut next_progress = PROGRESS_EVERY_LINES;
-    loop {
-        let chunk = read_line_chunk(&mut lines, chunk_lines)?;
-        if chunk.is_empty() {
-            break;
-        }
-        raw_lines += chunk.len();
-        let encoded = chunk
-            .par_iter()
-            .filter_map(|line| {
-                let capped = cap_raw_world_line(line, raw_caps.world_side);
-                let mut encoder_example = encode_raw_world_line_with_vocab_mode(
-                    &capped,
-                    encoder_vocab,
-                    TokenizationMode::Default,
-                )?;
-                let mut decoder_example =
-                    encode_raw_world_line_with_vocab_mode(&capped, decoder_vocab, spec.mode)?;
-                if spec
-                    .action_filter
-                    .is_some_and(|wanted| decoder_example.action_label != wanted)
-                {
-                    return None;
-                }
-                truncate_ids_tail(&mut encoder_example.state_tokens, spec.max_seq);
-                truncate_ids_tail(&mut encoder_example.next_tokens, spec.max_seq);
-                truncate_ids_tail(&mut decoder_example.state_tokens, spec.max_seq);
-                truncate_decoder_next_ids(&mut decoder_example.next_tokens, spec.max_seq);
-                Some(DualWorldCacheRow {
-                    encoder_state_tokens: encoder_example.state_tokens,
-                    encoder_next_tokens: encoder_example.next_tokens,
-                    decoder_state_tokens: decoder_example.state_tokens,
-                    decoder_next_tokens: decoder_example.next_tokens,
-                    action_label: decoder_example.action_label,
-                })
-            })
-            .collect::<Vec<_>>();
-        for row in &encoded {
-            write_dual_token_record(
-                &mut writer,
-                &row.encoder_state_tokens,
-                &row.encoder_next_tokens,
-                &row.decoder_state_tokens,
-                &row.decoder_next_tokens,
-                row.action_label,
-            )?;
-        }
-        rows += encoded.len();
-        while raw_lines >= next_progress {
-            println!(
-                "{} token cache progress: {raw_lines} raw lines, {rows} rows",
-                spec.kind
-            );
-            next_progress += PROGRESS_EVERY_LINES;
-        }
+    if spec.action_filter.is_none() && rows != raw_nonempty_lines {
+        let _ = fs::remove_file(&tmp_path);
+        bail!(
+            "{} token cache rejected {} of {} non-empty source rows",
+            spec.kind,
+            raw_nonempty_lines.saturating_sub(rows),
+            raw_nonempty_lines
+        );
     }
-    writer.flush()?;
     fs::rename(&tmp_path, spec.token_cache_path)?;
     write_json_atomic(
         spec.manifest_path,
@@ -731,7 +644,7 @@ fn ensure_dual_world_token_cache(
             tokenizer_spec: tokenizer_spec(spec.mode),
             tokenizer_spec_signature: tokenizer_spec_signature(spec.mode),
             max_seq: spec.max_seq,
-            target_crop: target_crop_policy(spec.kind).map(str::to_string),
+            target_crop: None,
             action_filter: spec.action_filter,
             vocab_path: String::new(),
             vocab_signature: vocab_sig,
@@ -739,7 +652,17 @@ fn ensure_dual_world_token_cache(
             rows,
         },
     )?;
-    println!("{} token cache saved: {} rows", spec.kind, rows);
+    println!(
+        "{} token cache saved: {} rows, state tokens min={} mean={:.2} max={}, target tokens min={} mean={:.2} max={}",
+        spec.kind,
+        rows,
+        min_state_tokens,
+        state_tokens as f64 / rows as f64,
+        max_state_tokens,
+        min_next_tokens,
+        next_tokens as f64 / rows as f64,
+        max_next_tokens
+    );
     Ok(())
 }
 
@@ -756,7 +679,7 @@ fn token_cache_is_valid(spec: &TokenCacheSpec<'_>, vocab_signature: &str) -> boo
         && manifest.tokenizer == spec.mode.as_str()
         && manifest.tokenizer_spec_signature == tokenizer_spec_signature(spec.mode)
         && manifest.max_seq >= spec.max_seq
-        && manifest.target_crop.as_deref() == target_crop_policy(spec.kind)
+        && manifest.target_crop.is_none()
         && manifest.action_filter == spec.action_filter
         && manifest.vocab_signature == vocab_signature
         && manifest.token_cache_path == path_string(spec.token_cache_path)
@@ -796,22 +719,6 @@ fn write_token_record<W: Write>(
     Ok(())
 }
 
-fn write_dual_token_record<W: Write>(
-    writer: &mut W,
-    encoder_left_ids: &[u32],
-    encoder_right_ids: &[u32],
-    decoder_left_ids: &[u32],
-    decoder_right_ids: &[u32],
-    action: u32,
-) -> Result<()> {
-    write_ids(writer, encoder_left_ids)?;
-    write_ids(writer, encoder_right_ids)?;
-    write_ids(writer, decoder_left_ids)?;
-    write_ids(writer, decoder_right_ids)?;
-    writer.write_all(&action.to_le_bytes())?;
-    Ok(())
-}
-
 fn write_ids<W: Write>(writer: &mut W, ids: &[u32]) -> Result<()> {
     writer.write_all(&(ids.len() as u32).to_le_bytes())?;
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(ids));
@@ -826,14 +733,6 @@ fn truncate_ids_tail(ids: &mut Vec<u32>, max_seq: usize) {
     if max_seq > 0 && ids.len() > max_seq {
         let start = ids.len() - max_seq;
         ids.drain(..start);
-    }
-}
-
-fn truncate_decoder_next_ids(ids: &mut Vec<u32>, max_seq: usize) {
-    // Decoder targets retain their autoregressive beginning: imports, declarations, and exact
-    // signatures must be learned before the model can generate a valid body.
-    if max_seq > 0 {
-        ids.truncate(max_seq);
     }
 }
 
@@ -981,22 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn decoder_target_truncation_keeps_completion_head() {
-        let mut ids = vec![10, 11, 12, 13, 14];
-        truncate_decoder_next_ids(&mut ids, 3);
-        assert_eq!(ids, vec![10, 11, 12]);
-    }
-
-    #[test]
-    fn decoder_cache_requires_explicit_head_crop_policy() {
-        assert_eq!(
-            target_crop_policy("code_decoder_dual"),
-            Some(DECODER_TARGET_CROP_POLICY)
-        );
-        assert_eq!(target_crop_policy("world"), None);
-    }
-
-    #[test]
     fn raw_world_cache_cap_keeps_state_and_target_tail() {
         let capped = cap_raw_world_line("abcdef\tuvwxyz\tcode", 3);
         assert_eq!(capped, "def\txyz\tcode");
@@ -1011,7 +894,7 @@ mod tests {
         let manifest = dir.join("sources.txt");
         let token_cache = dir.join("encoder.tokens.bin");
         let token_manifest = dir.join("encoder_tokens.manifest.json");
-        fs::write(&pairs, "left\tright\n")?;
+        fs::write(&pairs, "left side\tright side\n")?;
         fs::write(&plain, "plain text\n")?;
         fs::write(
             &manifest,
@@ -1023,7 +906,7 @@ mod tests {
         )?;
 
         let mut vocab = Vocab::new();
-        for ch in "leftrighplain tx".chars() {
+        for ch in "leftrighplain txsd".chars() {
             vocab.add_token(&ch.to_string());
         }
         let source = source_fingerprint(&manifest)?;
@@ -1049,7 +932,7 @@ mod tests {
             decoded.push(vocab.decode_ids_lossy(&pair.tokens));
         }
         decoded.sort();
-        assert_eq!(decoded, vec!["left", "plain text", "right"]);
+        assert_eq!(decoded, vec!["left side", "plain text", "right side"]);
 
         fs::remove_dir_all(&dir)?;
         Ok(())

@@ -36,10 +36,10 @@ pub fn print_usage(program: &str) {
     eprintln!("usage (choose one):");
     eprintln!("  Training pipeline:");
     eprintln!(
-        "    {program} train <minimal|48gb|80gb> [--until full] [--resume [latest|run_id|runs/path]] [--skip-trained STAGE[,STAGE...]]"
+        "    {program} train minimal [--until full] [--resume [latest|run_id|runs/path]] [--skip-trained STAGE[,STAGE...]]"
     );
     eprintln!(
-        "    {program} prepare cache <minimal|48gb|80gb> [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]"
+        "    {program} prepare cache minimal [--force] [--auto-hf-upload --hf-dataset <org/dataset-name>]"
     );
     eprintln!(
         "    {program} --latent <data_path|hub:dataset_id> [steps] [batch] [dim] [max_seq] [num_layers] [num_heads] [max_vocab] [max_spans] [max_span_len] [max_masked_ratio] [lambda] [--grad-accum <int>] [--output <path>] [--resume]"
@@ -67,6 +67,6 @@ pub fn print_usage(program: &str) {
     );
     eprintln!("    {program} --train-channel-probe <qwen_dir> <bridge> <encoder> <vocab> <world> <seen_tasks> <heldout_tasks> <output> [steps]");
     eprintln!(
-        "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile 48gb|80gb] ..."
+        "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile minimal] ..."
     );
 }

@@ -35,26 +35,6 @@ fn stable_split_hash_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> usi
     hash as usize
 }
 
-fn stable_token_pair_split_hash(left: &[u32], right: &[u32], action: u32) -> usize {
-    let mut hash = 0xcbf29ce484222325u64;
-    for ids in [left, right] {
-        for id in ids {
-            for byte in id.to_le_bytes() {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let action = action.to_le_bytes();
-    for byte in action {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash as usize
-}
-
 fn split_keeps(
     hash: usize,
     modulus: Option<usize>,
@@ -75,7 +55,6 @@ fn split_keeps(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenizationMode {
     Default,
-    CodeAware,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,47 +78,26 @@ impl TokenizationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::CodeAware => "code-aware",
         }
     }
 }
 
-pub const CODE_EOS_TOKEN: &str = "<eos_code>";
-pub const CODE_CONTROL_TOKENS: &[&str] = &[
-    "<fim_prefix>",
-    "<fim_suffix>",
-    "<fim_middle>",
-    CODE_EOS_TOKEN,
-];
-
-const TOKENIZER_SPEC_VERSION: u32 = 8;
+const TOKENIZER_SPEC_VERSION: u32 = 9;
 
 pub fn tokenizer_spec(mode: TokenizationMode) -> TokenizerSpec {
-    let code_aware = mode == TokenizationMode::CodeAware;
     TokenizerSpec {
         version: TOKENIZER_SPEC_VERSION,
         mode: mode.as_str().to_string(),
         normalization: "identity_utf8".to_string(),
-        pretokenizer: if code_aware {
-            "code_lexical_v1".to_string()
-        } else {
-            "none".to_string()
-        },
-        code_control_tokens: if code_aware {
-            CODE_CONTROL_TOKENS
-                .iter()
-                .map(|token| token.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        },
+        pretokenizer: "lexical_v1".to_string(),
+        code_control_tokens: Vec::new(),
         byte_fallback: true,
         reserved_byte_tokens: true,
         subword_identifier_fallback: false,
         byte_token_format: "<byte:XX>".to_string(),
         byte_native: true,
-        adaptive_boundaries: code_aware,
-        boundaryless_bpe: !code_aware,
+        adaptive_boundaries: true,
+        boundaryless_bpe: false,
     }
 }
 
@@ -181,65 +139,32 @@ fn tokenize_text(text: &str) -> Vec<String> {
     text.chars().map(|ch| ch.to_string()).collect()
 }
 
-fn code_aware_chunks(text: &str) -> Vec<String> {
+/// Lexical boundaries keep frequency-based BPE from memorizing a repetitive
+/// template (or an entire training example) as one token. Identifiers remain
+/// intact chunks so fictional API names can still become single vocabulary
+/// entries, while merges cannot cross words, whitespace, or punctuation.
+fn default_lexical_chunks(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
-        let mut chunk = String::new();
-        chunk.push(ch);
-        if ch.is_ascii_whitespace() {
-            while let Some(next) = chars.peek().copied() {
-                if !next.is_ascii_whitespace() {
-                    break;
-                }
-                chunk.push(next);
-                chars.next();
+        let mut chunk = String::from(ch);
+        if ch.is_whitespace() {
+            while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                chunk.push(chars.next().expect("peeked whitespace"));
             }
-        } else if ch == '_' || ch.is_ascii_alphabetic() {
-            while let Some(next) = chars.peek().copied() {
-                if !(next == '_' || next.is_ascii_alphanumeric()) {
-                    break;
-                }
-                chunk.push(next);
-                chars.next();
+        } else if ch == '_' || ch.is_alphabetic() {
+            while chars
+                .peek()
+                .is_some_and(|next| *next == '_' || next.is_alphanumeric())
+            {
+                chunk.push(chars.next().expect("peeked identifier character"));
             }
-        } else if ch.is_ascii_digit() {
-            while let Some(next) = chars.peek().copied() {
-                if !(next == '_' || next == '.' || next.is_ascii_alphanumeric()) {
-                    break;
-                }
-                chunk.push(next);
-                chars.next();
-            }
-        } else if ch == '"' || ch == '\'' || ch == '`' {
-            let quote = ch;
-            let mut escaped = false;
-            for next in chars.by_ref() {
-                chunk.push(next);
-                if quote != '`' && escaped {
-                    escaped = false;
-                    continue;
-                }
-                if quote != '`' && next == '\\' {
-                    escaped = true;
-                    continue;
-                }
-                if next == quote {
-                    break;
-                }
-            }
-        } else if ch.is_ascii_punctuation() {
-            while let Some(next) = chars.peek().copied() {
-                if !next.is_ascii_punctuation()
-                    || next == '_'
-                    || next == '"'
-                    || next == '\''
-                    || next == '`'
-                {
-                    break;
-                }
-                chunk.push(next);
-                chars.next();
+        } else if ch.is_numeric() {
+            while chars
+                .peek()
+                .is_some_and(|next| *next == '_' || *next == '.' || next.is_alphanumeric())
+            {
+                chunk.push(chars.next().expect("peeked numeric character"));
             }
         }
         chunks.push(chunk);
@@ -247,11 +172,8 @@ fn code_aware_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
-pub fn tokenize_with_mode(text: &str, mode: TokenizationMode) -> Vec<String> {
-    match mode {
-        TokenizationMode::Default => tokenize_text(text),
-        TokenizationMode::CodeAware => code_aware_chunks(text),
-    }
+pub fn tokenize_with_mode(text: &str, _mode: TokenizationMode) -> Vec<String> {
+    tokenize_text(text)
 }
 
 pub fn split_line(line: &str) -> Option<Vec<String>> {
@@ -599,7 +521,6 @@ pub fn encode_raw_world_line_with_vocab_mode(
 pub const DEFAULT_MIN_TOKENS_PER_LINE: usize = 2;
 pub const DEFAULT_STREAM_SHUFFLE_BUFFER: usize = 1024;
 const TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_TOKEN_CACHE_V2\n";
-const DUAL_TOKEN_CACHE_MAGIC: &[u8] = b"TOFY_DUAL_TOKEN_CACHE_V2\n";
 const DEFAULT_TOKEN_CACHE_READER_MB: usize = 32;
 const DEFAULT_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 8;
 const MAX_TOKEN_CACHE_PREFETCH_CHUNKS: usize = 32;
@@ -632,13 +553,6 @@ impl VocabSampleBudget {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unlimited".to_string());
         format!("rows={rows}, text_bytes={bytes}")
-    }
-}
-
-fn code_vocab_sample_budget() -> VocabSampleBudget {
-    VocabSampleBudget {
-        max_rows: env_usize("TOFY_CODE_VOCAB_SAMPLE_ROWS").filter(|&value| value > 0),
-        max_text_bytes: env_usize("TOFY_CODE_VOCAB_SAMPLE_BYTES").filter(|&value| value > 0),
     }
 }
 
@@ -933,7 +847,7 @@ impl CachedPairStream {
         let mut full_passes_without_row = 0usize;
         loop {
             match read_token_cache_record(&mut self.reader)? {
-                Some((tokens, _right, _action)) if !tokens.is_empty() => {
+                Some((tokens, _right, _action)) if tokens.len() >= 2 => {
                     let row_idx = self.row_index;
                     self.row_index += 1;
                     if let Some(modulus) = self.split_modulus {
@@ -1074,24 +988,6 @@ pub struct CachedWorldStream {
     row_index: usize,
     prefetch_rx: Option<PrefetchRx<WorldExample>>,
     prefetch_stash: VecDeque<WorldExample>,
-}
-
-#[derive(Clone)]
-pub struct CachedDecoderExample {
-    pub encoder: WorldExample,
-    pub decoder: WorldExample,
-}
-
-pub struct CachedDecoderStream {
-    path: PathBuf,
-    reader: BufReader<File>,
-    shuffle_buffer_size: usize,
-    shuffle_buffer: Vec<CachedDecoderExample>,
-    split_modulus: Option<usize>,
-    split_remainder: usize,
-    exclude_split_matches: bool,
-    prefetch_rx: Option<PrefetchRx<CachedDecoderExample>>,
-    prefetch_stash: VecDeque<CachedDecoderExample>,
 }
 
 impl CachedWorldStream {
@@ -1259,176 +1155,6 @@ impl CachedWorldStream {
     }
 }
 
-impl CachedDecoderStream {
-    pub fn with_split(
-        path: &PathBuf,
-        shuffle_buffer_size: usize,
-        split_modulus: Option<usize>,
-        split_remainder: usize,
-        exclude_split_matches: bool,
-    ) -> Result<Self> {
-        let mut stream = Self {
-            path: path.clone(),
-            reader: token_cache_reader(path)?,
-            shuffle_buffer_size: shuffle_buffer_size.max(1),
-            shuffle_buffer: Vec::new(),
-            split_modulus,
-            split_remainder,
-            exclude_split_matches,
-            prefetch_rx: None,
-            prefetch_stash: VecDeque::new(),
-        };
-        stream.read_magic()?;
-        Ok(stream)
-    }
-
-    fn read_magic(&mut self) -> Result<()> {
-        let mut magic = vec![0u8; DUAL_TOKEN_CACHE_MAGIC.len()];
-        self.reader.read_exact(&mut magic)?;
-        if magic != DUAL_TOKEN_CACHE_MAGIC {
-            bail!("invalid dual token cache magic in {:?}", self.path);
-        }
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        self.reader = token_cache_reader(&self.path)?;
-        self.read_magic()
-    }
-
-    fn read_next_example(&mut self) -> Result<CachedDecoderExample> {
-        let mut full_passes_without_row = 0usize;
-        loop {
-            let Some((enc_state, enc_next, dec_state, dec_next, action_label)) =
-                read_dual_token_cache_record(&mut self.reader)?
-            else {
-                self.reset()?;
-                full_passes_without_row += 1;
-                if full_passes_without_row >= 2 {
-                    bail!(
-                        "cached decoder stream {:?} produced no usable rows after two passes (split_modulus={:?}, split_remainder={}, exclude_matches={})",
-                        self.path,
-                        self.split_modulus,
-                        self.split_remainder,
-                        self.exclude_split_matches
-                    );
-                }
-                continue;
-            };
-            if enc_state.is_empty()
-                || enc_next.is_empty()
-                || dec_state.is_empty()
-                || dec_next.is_empty()
-            {
-                continue;
-            }
-            let split_hash = stable_token_pair_split_hash(&dec_state, &dec_next, action_label);
-            if !split_keeps(
-                split_hash,
-                self.split_modulus,
-                self.split_remainder,
-                self.exclude_split_matches,
-            ) {
-                continue;
-            }
-            return Ok(CachedDecoderExample {
-                encoder: WorldExample {
-                    state_tokens: enc_state,
-                    next_tokens: enc_next,
-                    action_label,
-                },
-                decoder: WorldExample {
-                    state_tokens: dec_state,
-                    next_tokens: dec_next,
-                    action_label,
-                },
-            });
-        }
-    }
-
-    fn refill_shuffle_buffer(&mut self) -> Result<()> {
-        while self.shuffle_buffer.len() < self.shuffle_buffer_size {
-            let example = self.read_next_example()?;
-            self.shuffle_buffer.push(example);
-        }
-        Ok(())
-    }
-
-    fn next_example(&mut self) -> Result<CachedDecoderExample> {
-        if self.shuffle_buffer_size <= 1 {
-            return self.read_next_example();
-        }
-        self.refill_shuffle_buffer()?;
-        let idx = rng().random_range(0..self.shuffle_buffer.len());
-        Ok(self.shuffle_buffer.swap_remove(idx))
-    }
-
-    fn next_batch_direct(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
-        let mut batch = Vec::with_capacity(batch_size);
-        for _ in 0..batch_size {
-            batch.push(self.next_example()?);
-        }
-        Ok(batch)
-    }
-
-    fn start_prefetch(&mut self, batch_size: usize) -> Result<()> {
-        if self.prefetch_rx.is_some() {
-            return Ok(());
-        }
-        let prefetch_chunks = token_cache_prefetch_chunks();
-        if prefetch_chunks == 0 {
-            return Ok(());
-        }
-        let path = self.path.clone();
-        let shuffle_buffer_size = self.shuffle_buffer_size;
-        let split_modulus = self.split_modulus;
-        let split_remainder = self.split_remainder;
-        let exclude_split_matches = self.exclude_split_matches;
-        let chunk_size = token_cache_prefetch_chunk_size(batch_size);
-        let (tx, rx) = sync_channel(prefetch_chunks);
-        thread::Builder::new()
-            .name("tofy-cache-prefetch-decoder".to_string())
-            .spawn(move || {
-                let mut stream = match CachedDecoderStream::with_split(
-                    &path,
-                    shuffle_buffer_size,
-                    split_modulus,
-                    split_remainder,
-                    exclude_split_matches,
-                ) {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        let _ = tx.send(Err(err));
-                        return;
-                    }
-                };
-                loop {
-                    let result = stream.next_batch_direct(chunk_size);
-                    let should_continue = result.is_ok();
-                    if tx.send(result).is_err() || !should_continue {
-                        break;
-                    }
-                }
-            })?;
-        println!(
-            "Token cache prefetch: decoder chunks={} chunk_size={} reader_mb={}",
-            prefetch_chunks,
-            chunk_size,
-            token_cache_reader_capacity() / (1024 * 1024)
-        );
-        self.prefetch_rx = Some(rx);
-        Ok(())
-    }
-
-    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<CachedDecoderExample>> {
-        self.start_prefetch(batch_size)?;
-        if let Some(rx) = &self.prefetch_rx {
-            return recv_prefetched_batch(rx, &mut self.prefetch_stash, batch_size, "decoder");
-        }
-        self.next_batch_direct(batch_size)
-    }
-}
-
 fn read_u32_le<R: Read>(reader: &mut R) -> Result<Option<u32>> {
     let mut buf = [0u8; 4];
     let mut read = 0usize;
@@ -1482,27 +1208,6 @@ fn read_token_cache_record<R: Read>(reader: &mut R) -> Result<Option<TokenCacheR
         bail!("truncated token cache action");
     };
     Ok(Some((left, right, action)))
-}
-
-type DualTokenCacheRecord = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, u32);
-
-fn read_dual_token_cache_record<R: Read>(reader: &mut R) -> Result<Option<DualTokenCacheRecord>> {
-    let Some(enc_left) = read_ids(reader)? else {
-        return Ok(None);
-    };
-    let Some(enc_right) = read_ids(reader)? else {
-        bail!("truncated dual token cache encoder right sequence");
-    };
-    let Some(dec_left) = read_ids(reader)? else {
-        bail!("truncated dual token cache decoder left sequence");
-    };
-    let Some(dec_right) = read_ids(reader)? else {
-        bail!("truncated dual token cache decoder right sequence");
-    };
-    let Some(action) = read_u32_le(reader)? else {
-        bail!("truncated dual token cache action");
-    };
-    Ok(Some((enc_left, enc_right, dec_left, dec_right, action)))
 }
 
 impl RawWorldStream {
@@ -1803,7 +1508,7 @@ pub fn build_vocab_from_pair_file(
         bail!("no usable lines found in {:?}", path);
     }
 
-    let (vocab, total_tokens) = train_boundless_bpe_from_texts(&texts, max_vocab)?;
+    let (vocab, total_tokens) = train_default_bpe_from_texts(&texts, max_vocab)?;
     let stats = VocabStats {
         total_tokens,
         covered_tokens: total_tokens,
@@ -2203,10 +1908,17 @@ fn select_masked_positions(
     };
     let min_ratio = (cfg.min_masked_ratio * ratio_multiplier).clamp(0.08, 0.9);
     let max_ratio = (cfg.max_masked_ratio * ratio_multiplier).clamp(min_ratio, 0.9);
+    // Prediction requires at least one visible token. Capping at len - 1 is
+    // essential for short records; otherwise ceil(ratio * len) can mask the
+    // complete sequence even when the input passed the two-token cache gate.
+    let max_predictable = valid_positions.len().saturating_sub(1);
+    if max_predictable == 0 {
+        return Vec::new();
+    }
     let min_masked = (valid_positions.len() as f64 * min_ratio).ceil() as usize;
-    let min_masked = min_masked.max(1).min(valid_positions.len());
+    let min_masked = min_masked.max(1).min(max_predictable);
     let max_masked = (valid_positions.len() as f64 * max_ratio).ceil() as usize;
-    let max_masked = max_masked.max(min_masked).min(valid_positions.len());
+    let max_masked = max_masked.max(min_masked).min(max_predictable);
     let target_masked = if min_masked >= max_masked {
         max_masked
     } else {
@@ -2322,7 +2034,7 @@ fn build_masked_view_pair(
     let prepared_tokens = prepare_segmented_context_tokens(tokens, cfg, rng);
     let code_like = is_code_like_tokens(&prepared_tokens);
     let mut target_ids = vocab.encode(&prepared_tokens);
-    let valid_len = target_ids.len().clamp(1, cfg.max_seq);
+    let valid_len = target_ids.len().min(cfg.max_seq);
     pad_or_truncate(&mut target_ids, cfg.max_seq, vocab.pad_id);
     let token_strs: Vec<&str> = prepared_tokens.iter().map(String::as_str).collect();
     let pools = masking_pools(&token_strs, code_like);
@@ -2349,7 +2061,7 @@ fn build_masked_view_pair_from_ids(
     let prepared_ids = prepare_segmented_context_ids(ids, cfg, rng);
     let code_like = is_code_like_ids(&prepared_ids, vocab);
     let mut target_ids = prepared_ids.clone();
-    let valid_len = target_ids.len().clamp(1, cfg.max_seq);
+    let valid_len = target_ids.len().min(cfg.max_seq);
     pad_or_truncate(&mut target_ids, cfg.max_seq, vocab.pad_id);
     let token_strs: Vec<&str> = prepared_ids
         .iter()
@@ -2391,6 +2103,9 @@ pub fn make_augmented_jepa_batch(
             (pair, target_linear)
         })
         .collect::<Vec<_>>();
+    if rows.iter().any(|(pair, _)| pair.valid_len < 2) {
+        bail!("JEPA batch contains a sequence shorter than two encoded tokens");
+    }
 
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
@@ -2448,6 +2163,9 @@ pub fn make_augmented_jepa_batch_from_pairs(
             (view_pair, target_linear)
         })
         .collect::<Vec<_>>();
+    if rows.iter().any(|(pair, _)| pair.valid_len < 2) {
+        bail!("JEPA batch contains a sequence shorter than two encoded tokens");
+    }
 
     let mut view_a_buf = Vec::with_capacity(batch_size * cfg.max_seq);
     let mut view_b_buf = Vec::with_capacity(batch_size * cfg.max_seq);
@@ -2606,54 +2324,11 @@ pub fn tokenize_for_inference_mode(text: &str, mode: TokenizationMode) -> Vec<St
     tokenize_with_mode(text, mode)
 }
 
-pub fn encode_text_with_vocab_mode(text: &str, vocab: &Vocab, mode: TokenizationMode) -> Vec<u32> {
-    match mode {
-        TokenizationMode::Default => vocab.encode_boundless(text),
-        TokenizationMode::CodeAware => encode_code_aware_text(text, vocab),
-    }
-}
-
-fn encode_code_aware_text(text: &str, vocab: &Vocab) -> Vec<u32> {
-    let mut ids = Vec::new();
-    let mut start = 0usize;
-    while start < text.len() {
-        if let Some(token) = CODE_CONTROL_TOKENS
-            .iter()
-            .copied()
-            .find(|token| text[start..].starts_with(token))
-        {
-            if let Some(&id) = vocab.token_to_id.get(token) {
-                ids.push(id);
-                start += token.len();
-                continue;
-            }
-        }
-        let next_special = CODE_CONTROL_TOKENS
-            .iter()
-            .filter_map(|token| text[start..].find(token).map(|idx| start + idx))
-            .filter(|&idx| idx > start)
-            .min()
-            .unwrap_or(text.len());
-        let end = if next_special > start {
-            next_special
-        } else {
-            start
-                + text[start..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(1)
-        };
-        for chunk in code_aware_chunks(&text[start..end]) {
-            if let Some(&id) = vocab.token_to_id.get(&chunk) {
-                ids.push(id);
-            } else {
-                ids.extend(vocab.encode_boundless(&chunk));
-            }
-        }
-        start = end;
-    }
-    ids
+pub fn encode_text_with_vocab_mode(text: &str, vocab: &Vocab, _mode: TokenizationMode) -> Vec<u32> {
+    default_lexical_chunks(text)
+        .into_iter()
+        .flat_map(|chunk| vocab.encode_boundless(&chunk))
+        .collect()
 }
 
 pub fn encode_world_examples(rows: &[RawWorldExample], vocab: &Vocab) -> Vec<WorldExample> {
@@ -2745,11 +2420,6 @@ where
 
     let mut vocab = Vocab::new();
     vocab.ensure_byte_tokens();
-    if label == "code-aware" {
-        for token in CODE_CONTROL_TOKENS {
-            vocab.add_token(token);
-        }
-    }
     for (token, _) in chars {
         if vocab.id_to_token.len() >= max_vocab {
             break;
@@ -2855,12 +2525,8 @@ where
     Ok((vocab, total_tokens))
 }
 
-fn train_boundless_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
-    train_bpe_from_texts_by_chunker(texts, max_vocab, "boundless", |text| vec![text.to_string()])
-}
-
-fn train_code_aware_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
-    train_bpe_from_texts_by_chunker(texts, max_vocab, "code-aware", code_aware_chunks)
+fn train_default_bpe_from_texts(texts: &[String], max_vocab: usize) -> Result<(Vocab, usize)> {
+    train_bpe_from_texts_by_chunker(texts, max_vocab, "lexical", default_lexical_chunks)
 }
 
 pub fn build_vocab_from_raw_world_file_with_mode(
@@ -2880,17 +2546,7 @@ pub fn build_vocab_from_raw_world_file_with_mode_action_filter(
     let reader = BufReader::new(File::open(path)?);
     let mut row_count = 0usize;
     let mut texts = Vec::new();
-    let budget = if mode == TokenizationMode::CodeAware {
-        let configured = code_vocab_sample_budget();
-        println!(
-            "code-aware vocab sampling budget for {}: {}",
-            path.display(),
-            configured.describe()
-        );
-        configured
-    } else {
-        VocabSampleBudget::default()
-    };
+    let budget = VocabSampleBudget::default();
     let mut sampled_text_bytes = 0usize;
     let chunk_lines = vocab_scan_chunk_lines();
     println!(
@@ -2958,11 +2614,7 @@ pub fn build_vocab_from_raw_world_file_with_mode_action_filter(
     if row_count == 0 {
         bail!("cannot build vocab from empty raw world file {:?}", path);
     }
-    let (vocab, total_tokens) = if mode == TokenizationMode::CodeAware {
-        train_code_aware_bpe_from_texts(&texts, max_vocab)?
-    } else {
-        train_boundless_bpe_from_texts(&texts, max_vocab)?
-    };
+    let (vocab, total_tokens) = train_default_bpe_from_texts(&texts, max_vocab)?;
     let vocab_len = vocab.id_to_token.len();
     Ok((
         vocab,
@@ -3060,174 +2712,6 @@ fn encode_sequence_tail(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32
     encode_sequence(&tokens[start..], max_seq, pad_id)
 }
 
-fn encode_sequence_head(tokens: &[u32], max_seq: usize, pad_id: u32) -> (Vec<u32>, usize) {
-    let len = tokens.len().min(max_seq);
-    let mut out = Vec::with_capacity(max_seq);
-    out.extend(tokens.iter().take(len).copied());
-    out.extend(std::iter::repeat_n(pad_id, max_seq.saturating_sub(len)));
-    (out, len)
-}
-
-/// Build decoder teacher-forcing batch from world batch.
-/// input[b] = state[b, 0..state_len] ++ next[b, 0..next_len-1], padded to decoder_len.
-/// target[b] = <pad> for prompt-only positions, then next[b, 0..next_len], padded to decoder_len.
-/// loss_mask[b] = 1.0 only for target continuation positions (the `next` side), 0.0 elsewhere.
-///
-/// This intentionally avoids training the decoder to reproduce the prompt/state tokens.
-/// The prompt is context only; the supervised target is the continuation.
-/// decoder_len = 2 * max_seq.
-pub fn make_decoder_batch(
-    state_ids: &Tensor,
-    next_ids: &Tensor,
-    state_lens: &[usize],
-    next_lens: &[usize],
-    max_seq: usize,
-    pad_id: u32,
-    device: &Device,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let (batch_size, _) = state_ids.dims2()?;
-    let decoder_len = 2 * max_seq;
-    let state_v = state_ids.to_vec2::<u32>()?;
-    let next_v = next_ids.to_vec2::<u32>()?;
-
-    let mut input_buf = Vec::with_capacity(batch_size * decoder_len);
-    let mut target_buf = Vec::with_capacity(batch_size * decoder_len);
-    let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
-
-    for b in 0..batch_size {
-        let raw_sl = state_lens.get(b).copied().unwrap_or(1).min(max_seq);
-        let nl = next_lens.get(b).copied().unwrap_or(1).min(max_seq);
-        let prompt_len = if raw_sl == 0 && max_seq > 0 {
-            1
-        } else {
-            raw_sl
-        };
-
-        if raw_sl == 0 && prompt_len > 0 {
-            input_buf.push(pad_id);
-        } else {
-            input_buf.extend(state_v[b].iter().take(raw_sl).copied());
-        }
-        input_buf.extend(next_v[b].iter().take(nl.saturating_sub(1)).copied());
-        let input_len = prompt_len + nl.saturating_sub(1);
-        for _ in input_len..decoder_len {
-            input_buf.push(pad_id);
-        }
-
-        target_buf.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
-        target_buf.extend(next_v[b].iter().take(nl).copied());
-        let target_len = prompt_len.saturating_sub(1) + nl;
-        for _ in target_len..decoder_len {
-            target_buf.push(pad_id);
-        }
-
-        mask_buf.extend(std::iter::repeat_n(0.0f32, prompt_len.saturating_sub(1)));
-        mask_buf.extend(std::iter::repeat_n(1.0f32, nl));
-        mask_buf.extend(std::iter::repeat_n(
-            0.0f32,
-            decoder_len.saturating_sub(target_len),
-        ));
-    }
-
-    let input_ids = Tensor::from_vec(input_buf, (batch_size, decoder_len), device)?;
-    let target_ids = Tensor::from_vec(target_buf, (batch_size, decoder_len), device)?;
-    let loss_mask = Tensor::from_vec(mask_buf, (batch_size, decoder_len), device)?;
-    Ok((input_ids, target_ids, loss_mask))
-}
-
-/// Build decoder teacher-forcing tensors directly from CPU token rows.
-///
-/// Long prompts keep their tail so late constraints remain visible. Long completions keep their
-/// head because autoregressive generation must learn imports, declarations, and exact signatures
-/// before it can produce a valid body.
-pub fn make_decoder_batch_from_slice(
-    rows: &[WorldExample],
-    max_seq: usize,
-    pad_id: u32,
-    device: &Device,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    make_decoder_batch_from_slice_with_prompt_dropout(rows, max_seq, pad_id, pad_id, 0.0, device)
-}
-
-pub fn make_decoder_batch_from_slice_with_prompt_dropout(
-    rows: &[WorldExample],
-    max_seq: usize,
-    pad_id: u32,
-    drop_id: u32,
-    prompt_dropout: f64,
-    device: &Device,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let batch_size = rows.len();
-    let decoder_len = 2 * max_seq;
-    let prompt_dropout = prompt_dropout.clamp(0.0, 1.0);
-    let row_buffers = rows
-        .par_iter()
-        .map(|row| {
-            let mut rng = rng();
-            let (state_seq, state_len) = encode_sequence_tail(&row.state_tokens, max_seq, pad_id);
-            let (next_seq, next_len) = encode_sequence_head(&row.next_tokens, max_seq, pad_id);
-            let raw_sl = state_len.min(max_seq);
-            let nl = next_len.min(max_seq);
-            let prompt_len = if raw_sl == 0 && max_seq > 0 {
-                1
-            } else {
-                raw_sl
-            };
-
-            let mut input = Vec::with_capacity(decoder_len);
-            if raw_sl == 0 && prompt_len > 0 {
-                input.push(pad_id);
-            } else {
-                input.extend(state_seq.iter().take(raw_sl).map(|token| {
-                    if prompt_dropout > 0.0 && *token != pad_id && rng.random_bool(prompt_dropout) {
-                        drop_id
-                    } else {
-                        *token
-                    }
-                }));
-            }
-            input.extend(next_seq.iter().take(nl.saturating_sub(1)).copied());
-            let input_len = prompt_len + nl.saturating_sub(1);
-            input.extend(std::iter::repeat_n(
-                pad_id,
-                decoder_len.saturating_sub(input_len),
-            ));
-
-            let mut target = Vec::with_capacity(decoder_len);
-            target.extend(std::iter::repeat_n(pad_id, prompt_len.saturating_sub(1)));
-            target.extend(next_seq.iter().take(nl).copied());
-            let target_len = prompt_len.saturating_sub(1) + nl;
-            target.extend(std::iter::repeat_n(
-                pad_id,
-                decoder_len.saturating_sub(target_len),
-            ));
-
-            let mut mask = Vec::with_capacity(decoder_len);
-            mask.extend(std::iter::repeat_n(0.0f32, prompt_len.saturating_sub(1)));
-            mask.extend(std::iter::repeat_n(1.0f32, nl));
-            mask.extend(std::iter::repeat_n(
-                0.0f32,
-                decoder_len.saturating_sub(target_len),
-            ));
-            (input, target, mask)
-        })
-        .collect::<Vec<_>>();
-
-    let mut input_buf = Vec::with_capacity(batch_size * decoder_len);
-    let mut target_buf = Vec::with_capacity(batch_size * decoder_len);
-    let mut mask_buf = Vec::with_capacity(batch_size * decoder_len);
-    for (input, target, mask) in row_buffers {
-        input_buf.extend(input);
-        target_buf.extend(target);
-        mask_buf.extend(mask);
-    }
-
-    let input_ids = Tensor::from_vec(input_buf, (batch_size, decoder_len), device)?;
-    let target_ids = Tensor::from_vec(target_buf, (batch_size, decoder_len), device)?;
-    let loss_mask = Tensor::from_vec(mask_buf, (batch_size, decoder_len), device)?;
-    Ok((input_ids, target_ids, loss_mask))
-}
-
 #[allow(clippy::type_complexity)]
 pub fn make_world_batch_from_slice(
     rows: &[WorldExample],
@@ -3278,22 +2762,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_decoder_rows_always_share_the_same_split() {
-        let left = [10, 11, 12];
-        let right = [20, 21, 22];
-        let first = stable_token_pair_split_hash(&left, &right, ACTION_CODE);
-        let repeated = stable_token_pair_split_hash(&left, &right, ACTION_CODE);
-        let changed = stable_token_pair_split_hash(&left, &[20, 21, 23], ACTION_CODE);
-
-        assert_eq!(first, repeated);
-        assert_ne!(first, changed);
-        assert_ne!(
-            split_keeps(first, Some(20), 0, true),
-            split_keeps(first, Some(20), 0, false)
-        );
-    }
-
-    #[test]
     fn pair_source_manifest_counts_and_streams_both_pair_sides() -> Result<()> {
         let dir = unique_temp_dir("tofy-pair-source-manifest");
         fs::create_dir_all(&dir)?;
@@ -3321,99 +2789,6 @@ mod tests {
         assert_eq!(got, ["hello", "world", "plain text"]);
 
         fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn decoder_batch_keeps_tail_of_long_prompt() -> Result<()> {
-        let device = Device::Cpu;
-        let row = WorldExample {
-            state_tokens: vec![10, 11, 12, 13, 14],
-            next_tokens: vec![20, 21, 22],
-            action_label: ACTION_CODE,
-        };
-
-        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
-
-        assert_eq!(input.to_vec2::<u32>()?[0], vec![12, 13, 14, 20, 21, 0]);
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 20, 21, 22, 0]);
-        assert_eq!(
-            crate::util::vec2_f32(&mask)?[0],
-            vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn decoder_batch_does_not_train_on_empty_target_pad() -> Result<()> {
-        let device = Device::Cpu;
-        let row = WorldExample {
-            state_tokens: vec![10, 11],
-            next_tokens: Vec::new(),
-            action_label: ACTION_CODE,
-        };
-
-        let (_input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
-
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 0, 0, 0, 0, 0]);
-        assert_eq!(crate::util::vec2_f32(&mask)?[0], vec![0.0; 6]);
-        Ok(())
-    }
-
-    #[test]
-    fn decoder_batch_seeds_empty_prompt_without_self_copy() -> Result<()> {
-        let device = Device::Cpu;
-        let row = WorldExample {
-            state_tokens: Vec::new(),
-            next_tokens: vec![20, 21],
-            action_label: ACTION_CODE,
-        };
-
-        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
-
-        assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
-        assert_eq!(
-            crate::util::vec2_f32(&mask)?[0],
-            vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn tensor_decoder_batch_seeds_empty_prompt_without_self_copy() -> Result<()> {
-        let device = Device::Cpu;
-        let state = Tensor::from_vec(vec![0u32, 0, 0], (1, 3), &device)?;
-        let next = Tensor::from_vec(vec![20u32, 21, 0], (1, 3), &device)?;
-
-        let (input, target, mask) = make_decoder_batch(&state, &next, &[0], &[2], 3, 0, &device)?;
-
-        assert_eq!(input.to_vec2::<u32>()?[0], vec![0, 20, 0, 0, 0, 0]);
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![20, 21, 0, 0, 0, 0]);
-        assert_eq!(
-            crate::util::vec2_f32(&mask)?[0],
-            vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn decoder_batch_keeps_head_of_long_target() -> Result<()> {
-        let device = Device::Cpu;
-        let row = WorldExample {
-            state_tokens: vec![10, 11],
-            next_tokens: vec![20, 21, 22, 23, 24],
-            action_label: ACTION_CODE,
-        };
-
-        let (input, target, mask) = make_decoder_batch_from_slice(&[row], 3, 0, &device)?;
-
-        assert_eq!(input.to_vec2::<u32>()?[0], vec![10, 11, 20, 21, 0, 0]);
-        assert_eq!(target.to_vec2::<u32>()?[0], vec![0, 20, 21, 22, 0, 0]);
-        assert_eq!(
-            crate::util::vec2_f32(&mask)?[0],
-            vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
-        );
         Ok(())
     }
 
@@ -3447,6 +2822,43 @@ mod tests {
         .expect("pair should tokenize");
 
         assert!(tokens.concat().contains("completion_tail"));
+    }
+
+    #[test]
+    fn default_bpe_cannot_merge_a_repetitive_template_across_lexical_boundaries() -> Result<()> {
+        let template = "Write func Solve using veclab.Mextrenstel for the input.".to_string();
+        let texts = vec![template.clone(); 32];
+        let (vocab, _) = train_default_bpe_from_texts(&texts, 800)?;
+        let encoded = encode_text_with_vocab_mode(&template, &vocab, TokenizationMode::Default);
+
+        assert!(encoded.len() >= 8, "template collapsed to {encoded:?}");
+        assert!(vocab.id_to_token.iter().all(|token| {
+            let has_whitespace = token.chars().any(char::is_whitespace);
+            let has_non_whitespace = token.chars().any(|ch| !ch.is_whitespace());
+            !(has_whitespace && has_non_whitespace)
+        }));
+        assert_eq!(vocab.decode_ids_lossy(&encoded), template);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_pair_stream_skips_single_token_rows() -> Result<()> {
+        let path = unique_temp_dir("tofy-short-cache").with_extension("bin");
+        let mut bytes = TOKEN_CACHE_MAGIC.to_vec();
+        for ids in [&[7u32][..], &[8u32, 9][..]] {
+            bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        fs::write(&path, bytes)?;
+
+        let mut stream = CachedPairStream::with_shuffle(&path, 1)?;
+        assert_eq!(stream.next_batch(1)?[0].tokens, vec![8, 9]);
+        fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]

@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use candle_core::{DType, Module, Tensor, D};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::tasks::bridge::BridgeRuntime;
@@ -125,8 +126,27 @@ pub fn try_run(args: &[String]) -> Result<bool> {
     let seen_accuracy = evaluate(&runtime, &probe, &seen_validation, batch)?;
     let heldout_accuracy = evaluate(&runtime, &probe, &heldout_validation, batch)?;
     util::save_varmap_atomic(&vars, &output)?;
+    let report_path = output.with_extension("json");
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "arm": "channel_probe",
+        "bridge_model": args[3],
+        "steps": steps,
+        "batch": batch,
+        "seen_validation_tasks": seen_validation.len(),
+        "heldout_validation_tasks": heldout_validation.len(),
+        "seen_accuracy": seen_accuracy,
+        "heldout_accuracy": heldout_accuracy,
+    });
+    let temporary_report = PathBuf::from(format!("{}.tmp", report_path.to_string_lossy()));
+    fs::write(
+        &temporary_report,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    fs::rename(temporary_report, &report_path)?;
     println!(
-        "channel_probe held-out-paraphrase seen_accuracy={seen_accuracy:.4} heldout_accuracy={heldout_accuracy:.4}"
+        "channel_probe held-out-paraphrase seen_accuracy={seen_accuracy:.4} heldout_accuracy={heldout_accuracy:.4} report={}",
+        report_path.display()
     );
     Ok(true)
 }

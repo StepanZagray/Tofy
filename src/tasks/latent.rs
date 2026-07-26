@@ -10,15 +10,16 @@ use crate::cli::resolve_data_path;
 use crate::config::{LatentEvalConfig, LatentTrainConfig};
 use crate::data::{
     build_vocab_from_pair_file, count_pairs_with_vocab, make_augmented_jepa_batch,
-    make_augmented_jepa_batch_from_pairs, make_jepa_batch_from_pairs, prepare_ultrachat_pairs,
-    tokenizer_spec_signature, AugmentedJepaBatch, CachedPairStream, CurriculumDenoisingConfig,
-    PairStream, TokenizationMode, DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
+    make_augmented_jepa_batch_from_pairs, prepare_ultrachat_pairs, tokenizer_spec_signature,
+    AugmentedJepaBatch, CachedPairStream, CurriculumDenoisingConfig, PairStream, TokenizationMode,
+    DEFAULT_MIN_TOKENS_PER_LINE, DEFAULT_STREAM_SHUFFLE_BUFFER,
 };
 use crate::model::encoders::EncoderFeatures;
 use crate::model::vocab::{vocab_signature, Pair, Vocab};
 use crate::model::{
     flatten_latent_slots, load_vocab_from_file, mean_cosine_similarity, prediction_loss,
-    save_vocab_to_file, sigreg_epps_pulley, tensor_rms, OnlineEncoder,
+    save_vocab_to_file, sigreg_epps_pulley, sigreg_epps_pulley_variable_length, tensor_rms,
+    OnlineEncoder,
 };
 use crate::util;
 
@@ -113,6 +114,10 @@ struct LatentForward {
     pred_global_flat: Tensor,
     target_global_flat: Tensor,
     valid_token_states: Tensor,
+    regularized_chunk_states: Tensor,
+    regularized_global_states: Tensor,
+    token_valid_lens: Vec<usize>,
+    chunk_valid_lens: Vec<usize>,
 }
 
 /// Shared three-view forward pass + multiscale prediction losses used by both
@@ -130,7 +135,7 @@ fn latent_forward(
     let all_view_features = encoder.forward_features(&all_view_ids)?;
     let [view_a_features, target_features, paired_view_targets] =
         split_encoder_features(&all_view_features, batch_size)?;
-    let context_hidden = view_a_features.token_states.clone();
+    let context_hidden = encoder.predict_states(&view_a_features.token_states)?;
     let target_hidden = target_features.token_states.clone();
     let (b, t, d) = context_hidden.dims3()?;
     let pred_token_flat = context_hidden.reshape((b * t, d))?;
@@ -157,11 +162,11 @@ fn latent_forward(
     masked_chunks.dedup();
     let masked_chunk_count = masked_chunks.len();
     let masked_chunk_indices = Tensor::from_vec(masked_chunks, (masked_chunk_count,), device)?;
-    let pred_chunks_masked = view_a_features
-        .chunk_states
+    let predicted_chunks = encoder.predict_states(&view_a_features.chunk_states)?;
+    let pred_chunks_masked = predicted_chunks
         .reshape((b * num_chunks, chunk_dim))?
         .index_select(&masked_chunk_indices, 0)?;
-    let target_chunks_masked = paired_view_targets
+    let target_chunks_masked = target_features
         .chunk_states
         .reshape((b * num_chunks, chunk_dim))?
         .index_select(&masked_chunk_indices, 0)?;
@@ -169,48 +174,59 @@ fn latent_forward(
 
     // Compare global latent tokens per slot instead of collapsing them into
     // one batch-mean vector.
-    let pred_global_flat = flatten_latent_slots(&view_a_features.global_states)?;
-    let target_global_flat = flatten_latent_slots(&paired_view_targets.global_states)?;
+    let predicted_global = encoder.predict_states(&view_a_features.global_states)?;
+    let pred_global_flat = flatten_latent_slots(&predicted_global)?;
+    let target_global_flat = flatten_latent_slots(&target_features.global_states)?;
     let global_pred_loss = prediction_loss(&pred_global_flat, &target_global_flat)?;
 
     let pred_loss = token_pred_loss
-        .affine(0.82, 0.0)?
-        .broadcast_add(&chunk_pred_loss.affine(0.12, 0.0)?)?
-        .broadcast_add(&global_pred_loss.affine(0.06, 0.0)?)?;
+        .affine(0.70, 0.0)?
+        .broadcast_add(&chunk_pred_loss.affine(0.20, 0.0)?)?
+        .broadcast_add(&global_pred_loss.affine(0.10, 0.0)?)?;
 
-    // SIGReg should only see real (non-pad) token rows; zeroed pad rows bias
-    // the Epps-Pulley statistic toward zero-mass dimensions.
-    let total_valid: usize = batch.valid_lens.iter().map(|&len| len.min(t)).sum();
-    let valid_token_states = if total_valid == 0 || total_valid == b * t {
-        Tensor::cat(
-            &[
-                &pred_token_flat,
-                &target_flat,
-                &paired_view_targets.token_states.reshape((b * t, d))?,
-            ],
-            0,
-        )?
-    } else {
-        let mut valid_linear = Vec::with_capacity(total_valid);
-        for (row, &len) in batch.valid_lens.iter().enumerate() {
-            for pos in 0..len.min(t) {
-                valid_linear.push((row * t + pos) as u32);
-            }
-        }
-        let valid_count = valid_linear.len();
-        let valid_indices = Tensor::from_vec(valid_linear, (valid_count,), device)?;
-        Tensor::cat(
-            &[
-                &pred_token_flat.index_select(&valid_indices, 0)?,
-                &target_flat.index_select(&valid_indices, 0)?,
-                &paired_view_targets
-                    .token_states
-                    .reshape((b * t, d))?
-                    .index_select(&valid_indices, 0)?,
-            ],
-            0,
-        )?
-    };
+    // Preserve latent position: SIGReg tests each position over independent
+    // examples. Flattening slots into the sample axis lets different slot
+    // distributions cancel one another and no longer implements that test.
+    // Keep every real position and provide explicit row lengths to SIGReg.
+    // Truncating to the shortest sequence would systematically discard the
+    // long-context tail; treating padded chunks as samples would bias the
+    // empirical characteristic function toward a point mass.
+    let base_token_valid_lens = batch
+        .valid_lens
+        .iter()
+        .copied()
+        .map(|len| len.min(t))
+        .collect::<Vec<_>>();
+    let base_chunk_valid_lens = base_token_valid_lens
+        .iter()
+        .map(|&len| len.div_ceil(chunk_size).min(num_chunks))
+        .collect::<Vec<_>>();
+    let token_valid_lens = base_token_valid_lens.repeat(3);
+    let chunk_valid_lens = base_chunk_valid_lens.repeat(3);
+    let valid_token_states = Tensor::cat(
+        &[
+            &view_a_features.token_states,
+            &target_features.token_states,
+            &paired_view_targets.token_states,
+        ],
+        0,
+    )?;
+    let regularized_chunk_states = Tensor::cat(
+        &[
+            &view_a_features.chunk_states,
+            &target_features.chunk_states,
+            &paired_view_targets.chunk_states,
+        ],
+        0,
+    )?;
+    let regularized_global_states = Tensor::cat(
+        &[
+            &view_a_features.global_states,
+            &target_features.global_states,
+            &paired_view_targets.global_states,
+        ],
+        0,
+    )?;
 
     Ok(LatentForward {
         pred_loss,
@@ -226,6 +242,10 @@ fn latent_forward(
         pred_global_flat,
         target_global_flat,
         valid_token_states,
+        regularized_chunk_states,
+        regularized_global_states,
+        token_valid_lens,
+        chunk_valid_lens,
     })
 }
 
@@ -419,6 +439,7 @@ fn latent_curriculum(
     }
 }
 
+#[derive(Clone, Copy)]
 struct LatentLogSnapshot {
     loss_val: f32,
     pred_val: f32,
@@ -439,6 +460,41 @@ struct LatentLogSnapshot {
     min_masked_ratio: f32,
     max_masked_ratio: f32,
     reg_weight: f32,
+}
+
+fn mean_latent_log_snapshot(snapshots: &[LatentLogSnapshot]) -> Result<LatentLogSnapshot> {
+    let last = *snapshots
+        .last()
+        .context("latent grad accumulation produced no log snapshot")?;
+    let count = snapshots.len() as f32;
+    let mean =
+        |field: fn(&LatentLogSnapshot) -> f32| snapshots.iter().map(field).sum::<f32>() / count;
+    Ok(LatentLogSnapshot {
+        loss_val: mean(|row| row.loss_val),
+        pred_val: mean(|row| row.pred_val),
+        token_pred_val: mean(|row| row.token_pred_val),
+        chunk_pred_val: mean(|row| row.chunk_pred_val),
+        global_pred_val: mean(|row| row.global_pred_val),
+        sigreg_val: mean(|row| row.sigreg_val),
+        pred_cos: mean(|row| row.pred_cos),
+        chunk_cos: mean(|row| row.chunk_cos),
+        global_cos: mean(|row| row.global_cos),
+        context_rms: mean(|row| row.context_rms),
+        target_rms: mean(|row| row.target_rms),
+        target_count: (snapshots
+            .iter()
+            .map(|row| row.target_count as f32)
+            .sum::<f32>()
+            / count)
+            .round() as usize,
+        target_frac: mean(|row| row.target_frac),
+        code_fraction: mean(|row| row.code_fraction),
+        active_seq: last.active_seq,
+        max_spans_per_sample: last.max_spans_per_sample,
+        min_masked_ratio: last.min_masked_ratio,
+        max_masked_ratio: last.max_masked_ratio,
+        reg_weight: last.reg_weight,
+    })
 }
 
 pub fn try_run_prepare_ultrachat(args: &[String]) -> Result<bool> {
@@ -515,16 +571,9 @@ pub fn try_run_eval(args: &[String]) -> Result<bool> {
 }
 
 fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
-    let device = match Device::new_cuda(0) {
-        Ok(d) => {
-            tracing::info!("using device: CUDA(0)");
-            d
-        }
-        Err(e) => {
-            tracing::warn!("CUDA not available: {}", e);
-            Device::Cpu
-        }
-    };
+    let device =
+        Device::new_cuda(0).context("latent training requires an available CUDA device 0")?;
+    tracing::info!("using device: CUDA(0)");
     let min_tokens = if config.is_paragraph_data {
         Some(1)
     } else {
@@ -540,7 +589,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             config.data_path, vocab_path
         );
         let vocab = load_vocab_from_file(&vocab_path)?;
-        (vocab, None, 0)
+        let pair_count = count_pairs_with_vocab(&config.data_path)?;
+        (vocab, None, pair_count)
     } else {
         println!(
             "Preparing latent training input from {:?}: scanning dataset and building encoder vocab...",
@@ -627,10 +677,6 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     let vocab_size = vocab.id_to_token.len();
     let seq_len = config.max_seq;
 
-    let embed_params = vocab_size * config.dim;
-    let block_params =
-        config.num_layers * (4 * config.dim * config.dim + 8 * config.dim * config.dim);
-    let latent_params = embed_params + block_params;
     println!("Training (LeJEPA latent pretraining for code + text)");
     if let Some(ref p) = config.init_encoder_path {
         println!("Encoder init: {:?}", p);
@@ -654,11 +700,6 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     } else {
         println!("Vocab coverage: cached vocab loaded; coverage scan skipped.");
     }
-    println!(
-        "Estimated parameters: ~{}",
-        util::format_params(latent_params)
-    );
-
     let mut varmap = VarMap::new();
     let train_dtype = util::resolve_train_dtype(&device, config.train_dtype);
     let vb = VarBuilder::from_varmap(&varmap, train_dtype, &device);
@@ -671,6 +712,16 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         config.num_heads,
     )?;
     util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+    let latent_params = varmap
+        .all_vars()
+        .iter()
+        .map(|var| var.elem_count())
+        .sum::<usize>();
+    println!(
+        "Exact trainable parameters: {}",
+        util::format_params(latent_params)
+    );
+    println!("{}", encoder.attention_work_summary(seq_len));
 
     let _ =
         fs::create_dir_all("local_models").and_then(|_| fs::create_dir_all("local_models/vocabs"));
@@ -700,21 +751,36 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     let resume_state_path =
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
-    if config.resume && train_checkpoint_path.exists() {
-        util::load_varmap_checked(&mut varmap, &train_checkpoint_path)?;
-        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
-        println!("Resuming latent weights from {:?}", train_checkpoint_path);
-    } else if config.resume && model_path.exists() {
-        util::load_varmap_checked(&mut varmap, &model_path)?;
-        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
-        println!(
-            "Resuming latent weights from best export {:?} without optimizer state",
-            model_path
-        );
-    } else if let Some(ref init_path) = config.init_encoder_path {
-        util::load_varmap_checked(&mut varmap, init_path)?;
-        util::cast_varmap_dtype(&mut varmap, train_dtype)?;
-        println!("Initialized latent weights from {:?}", init_path);
+    let mut resume_metadata = util::ResumeCheckpointMetadata::default();
+    if config.resume {
+        let loaded_state = util::load_resume_state(&resume_state_path, &resume_stage)?;
+        resume_metadata = util::load_resume_checkpoint_metadata(&resume_state_path)?;
+        util::validate_resume_checkpoint_tuple(
+            loaded_state.as_ref(),
+            &resume_metadata,
+            &[&train_checkpoint_path],
+            &optimizer_checkpoint_path,
+        )?;
+        if let Some(state) = loaded_state {
+            resume_state = state;
+        }
+        if resume_state.step > 0 {
+            util::load_varmap_checked(&mut varmap, &train_checkpoint_path)?;
+            util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+            println!("Resuming latent weights from {:?}", train_checkpoint_path);
+        } else if model_path.exists() {
+            bail!(
+                "cannot --resume latent training from best export {} without a complete train/optimizer/resume tuple",
+                model_path.display()
+            );
+        }
+    }
+    if resume_state.step == 0 {
+        if let Some(ref init_path) = config.init_encoder_path {
+            util::load_varmap_checked(&mut varmap, init_path)?;
+            util::cast_varmap_dtype(&mut varmap, train_dtype)?;
+            println!("Initialized latent weights from {:?}", init_path);
+        }
     }
 
     let named_train_vars = util::named_train_vars(&varmap)?;
@@ -723,28 +789,25 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         .map(|entry| entry.var.clone())
         .collect::<Vec<_>>();
     let mut opt = util::TrainOptimizer::new_lr_named(named_train_vars, config.lr)?;
-    if config.resume {
-        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
-            resume_state = state;
-        }
-        if optimizer_checkpoint_path.exists() {
-            opt.load_state(&optimizer_checkpoint_path)?;
-            if resume_state.step == 0 {
-                resume_state.step = opt.step_t();
-            }
-            println!(
-                "Resuming latent optimizer from {:?} at step {}",
-                optimizer_checkpoint_path, resume_state.step
+    if config.resume && resume_state.step > 0 {
+        opt.load_state(&optimizer_checkpoint_path)?;
+        if opt.step_t() != resume_state.step {
+            bail!(
+                "latent optimizer loaded at step {}, expected {}",
+                opt.step_t(),
+                resume_state.step
             );
         }
+        println!(
+            "Resuming latent optimizer from {:?} at step {}",
+            optimizer_checkpoint_path, resume_state.step
+        );
     }
+    resume_metadata.validate_and_set_batch_schedule(config.batch_size, config.grad_accum_steps)?;
     let mut best_pred = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
-    let start_step = if config.resume {
-        resume_state.step.min(config.steps)
-    } else {
-        0
-    };
+    let start_step = if config.resume { resume_state.step } else { 0 };
+    let mut completed_step = start_step;
 
     let run_dir = util::create_run_dir("latent")?;
     let mut tb = util::AsyncSummaryWriter::new(&run_dir);
@@ -849,9 +912,9 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     }
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
-        let mut log_snapshot = None;
         let batch_size = latent_batch_size_for_step(step, &config);
         let grad_accum_steps = latent_grad_accum_for_step(step, &config);
+        let mut log_snapshots = Vec::with_capacity(grad_accum_steps);
         if config.batch_warmup_steps > 0
             && step == config.batch_warmup_steps + 1
             && (config.batch_warmup_value != config.batch_size
@@ -866,7 +929,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             );
         }
 
-        for micro_step in 0..grad_accum_steps {
+        for _micro_step in 0..grad_accum_steps {
             let micro_grads = {
                 let curriculum = latent_curriculum(step, config.steps, &config);
                 let batch = if let Some(ref mut cached_stream) = cached_pair_stream {
@@ -883,14 +946,37 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 };
 
                 let forward = latent_forward(&encoder, &batch, batch_size, &device)?;
-                let sigreg_loss =
-                    sigreg_epps_pulley(&forward.valid_token_states, sigreg_slices, sigreg_points)?;
+                let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+                let token_sigreg = sigreg_epps_pulley_variable_length(
+                    &forward.valid_token_states,
+                    &forward.token_valid_lens,
+                    sigreg_slices,
+                    sigreg_points,
+                    sigreg_position_chunk,
+                    6,
+                )?;
+                let chunk_sigreg = sigreg_epps_pulley_variable_length(
+                    &forward.regularized_chunk_states,
+                    &forward.chunk_valid_lens,
+                    sigreg_slices,
+                    sigreg_points,
+                    sigreg_position_chunk,
+                    6,
+                )?;
+                let global_sigreg = sigreg_epps_pulley(
+                    &forward.regularized_global_states,
+                    sigreg_slices,
+                    sigreg_points,
+                )?;
+                let sigreg_loss = token_sigreg
+                    .affine(0.70, 0.0)?
+                    .broadcast_add(&chunk_sigreg.affine(0.20, 0.0)?)?
+                    .broadcast_add(&global_sigreg.affine(0.10, 0.0)?)?;
                 let loss = forward
                     .pred_loss
                     .broadcast_add(&sigreg_loss.affine(config.lambda, 0.0)?)?;
 
-                let should_capture_log =
-                    step % config.log_every == 0 && micro_step + 1 == grad_accum_steps;
+                let should_capture_log = step % config.log_every == 0;
                 if should_capture_log {
                     let pred_cos = util::scalar_f32(&mean_cosine_similarity(
                         &forward.context_targets,
@@ -909,7 +995,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     let target_count = batch.target_count;
                     let valid_tokens = batch.valid_lens.iter().sum::<usize>().max(1);
                     let target_frac = target_count as f32 / valid_tokens as f32;
-                    log_snapshot = Some(LatentLogSnapshot {
+                    log_snapshots.push(LatentLogSnapshot {
                         loss_val: util::scalar_f32(&loss)?,
                         pred_val: util::scalar_f32(&forward.pred_loss)?,
                         token_pred_val: util::scalar_f32(&forward.token_pred_loss)?,
@@ -945,10 +1031,10 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             clip_norm,
         )?;
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
+        completed_step = step;
 
         if step % config.log_every == 0 {
-            let snapshot =
-                log_snapshot.context("latent grad accumulation produced no log snapshot")?;
+            let snapshot = mean_latent_log_snapshot(&log_snapshots)?;
 
             tb.add_scalar("loss/total", snapshot.loss_val, step);
             tb.add_scalar("loss/pred", snapshot.pred_val, step);
@@ -1068,14 +1154,29 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 best_metric: best_pred,
                 best_aux_metric: best_pred,
                 saved_checkpoint,
+                terminal: None,
             };
+            let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
+            resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
             util::save_checkpoint_job(
                 checkpoint_writer.as_ref(),
                 format!("latent step {step}"),
                 vec![
-                    util::varmap_checkpoint_artifact(&varmap, &train_checkpoint_path)?,
-                    util::optimizer_checkpoint_artifact(&opt, &optimizer_checkpoint_path)?,
-                    util::resume_checkpoint_artifact(&checkpoint_resume_state, &resume_state_path)?,
+                    util::varmap_checkpoint_artifact(
+                        &varmap,
+                        &train_checkpoint_path,
+                        &checkpoint_id,
+                    )?,
+                    util::optimizer_checkpoint_artifact(
+                        &opt,
+                        &optimizer_checkpoint_path,
+                        &checkpoint_id,
+                    )?,
+                    util::resume_checkpoint_artifact(
+                        &checkpoint_resume_state,
+                        &resume_metadata,
+                        &resume_state_path,
+                    )?,
                 ],
             )?;
         }
@@ -1087,21 +1188,29 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
 
     if !saved_checkpoint {
         util::save_varmap_atomic(&varmap, &model_path)?;
+        saved_checkpoint = true;
         println!(
             "No checkpoint was saved during logging; saved final encoder weights to {:?}",
             model_path
         );
     }
-    util::save_varmap_atomic(&varmap, &train_checkpoint_path)?;
-    opt.save_state(&optimizer_checkpoint_path)?;
+    let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, completed_step);
+    resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+    util::save_varmap_resume_checkpoint_atomic(&varmap, &train_checkpoint_path, &checkpoint_id)?;
+    util::save_optimizer_resume_checkpoint_atomic(
+        &opt,
+        &optimizer_checkpoint_path,
+        &checkpoint_id,
+    )?;
     resume_state = util::TrainingResumeState {
         stage: resume_stage.clone(),
-        step: config.steps,
+        step: completed_step,
         best_metric: best_pred,
         best_aux_metric: best_pred,
         saved_checkpoint,
+        terminal: Some(util::TrainingTerminal::TargetReached),
     };
-    util::save_resume_state(&resume_state_path, &resume_state)?;
+    util::save_resume_state_with_metadata(&resume_state_path, &resume_state, &resume_metadata)?;
     tb.flush();
     tb.finish()?;
     let _ = vram_tracker.write_summary(&run_dir, "latent");
@@ -1131,10 +1240,8 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
 }
 
 fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
-    let device = match Device::new_cuda(0) {
-        Ok(d) => d,
-        Err(_) => Device::Cpu,
-    };
+    let device =
+        Device::new_cuda(0).context("JEPA evaluation requires an available CUDA device 0")?;
     let runtime_dtype = util::resolve_runtime_dtype(&device);
 
     let vocab = load_vocab_from_file(&config.vocab_path)?;
@@ -1156,20 +1263,23 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
     util::load_varmap_checked(&mut varmap, &config.model_path)?;
     util::cast_varmap_dtype(&mut varmap, runtime_dtype)?;
 
+    let total_params = varmap
+        .all_vars()
+        .iter()
+        .map(|var| var.elem_count())
+        .sum::<usize>();
     let embed_params = vocab_size * config.dim;
-    let block_params =
-        config.num_layers * (4 * config.dim * config.dim + 8 * config.dim * config.dim);
-    let total_params = embed_params + block_params;
+    let non_embedding_params = total_params.saturating_sub(embed_params);
 
     println!("LeJEPA evaluation");
     println!("model: {:?}", config.model_path);
     println!("data: {:?}", data_path);
     println!("pairs: {}", pair_count);
     println!(
-        "model size: ~{} [embed {} + blocks {}]",
+        "model size: {} [embed {} + hierarchy/predictor {}]",
         util::format_params(total_params),
         util::format_params(embed_params),
-        util::format_params(block_params),
+        util::format_params(non_embedding_params),
     );
     println!(
         "eval config: steps={} batch={} dim={} max_seq={} layers={} heads={}",
@@ -1199,6 +1309,23 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
     const EVAL_MAX_SPANS: usize = 3;
     const EVAL_MAX_SPAN_LEN: usize = 32;
     const EVAL_MAX_MASKED_RATIO: f64 = 0.25;
+    let eval_curriculum = CurriculumDenoisingConfig {
+        max_seq: config.max_seq,
+        active_seq: config.max_seq,
+        max_spans_per_sample: EVAL_MAX_SPANS,
+        max_span_len: EVAL_MAX_SPAN_LEN,
+        min_masked_ratio: 0.10,
+        max_masked_ratio: EVAL_MAX_MASKED_RATIO,
+        code_span_multiplier: 1.70,
+        identifier_focus_prob: 0.86,
+        block_focus_prob: 0.42,
+        comment_focus_prob: 0.28,
+        text_boundary_focus_prob: 0.44,
+        code_masked_ratio_multiplier: 1.30,
+        context_segments: 1,
+        recent_full_segments: 1,
+        history_ratio: 0.0,
+    };
     for _ in 0..config.eval_steps {
         let batch_tokens = pair_stream.next_batch(config.batch_size)?;
         let batch_pairs = batch_tokens
@@ -1207,45 +1334,49 @@ fn run_eval_jepa(config: LatentEvalConfig) -> Result<()> {
                 tokens: vocab.encode(tokens),
             })
             .collect::<Vec<_>>();
-        let (context_ids, target_ids, target_linear_indices) = make_jepa_batch_from_pairs(
-            &batch_pairs,
-            config.max_seq,
-            vocab.pad_id,
-            vocab.mask_id,
-            EVAL_MAX_SPANS,
-            EVAL_MAX_SPAN_LEN,
-            EVAL_MAX_MASKED_RATIO,
-            &device,
-        )?;
-
-        let context_features = encoder.forward_features(&context_ids)?;
-        let target_features = encoder.forward_features(&target_ids)?.detached();
-        let online_hidden = context_features.token_states;
-        let target_hidden = target_features.token_states;
-        let (b, t, d) = online_hidden.dims3()?;
-        let online_flat = online_hidden.reshape((b * t, d))?;
-        let target_flat = target_hidden.reshape((b * t, d))?;
-
-        let online_at_targets = online_flat.index_select(&target_linear_indices, 0)?;
-        let target_latents = target_flat.index_select(&target_linear_indices, 0)?;
-        let pred_loss = util::scalar_f32(&prediction_loss(&online_at_targets, &target_latents)?)?;
+        let batch =
+            make_augmented_jepa_batch_from_pairs(&batch_pairs, &vocab, &eval_curriculum, &device)?;
+        let forward = latent_forward(&encoder, &batch, config.batch_size, &device)?;
+        let online_at_targets = forward.context_targets.clone();
+        let target_latents = forward.target_targets.clone();
+        let pred_loss = util::scalar_f32(&forward.pred_loss)?;
         // Use the same SIGReg budget as training so eval values are comparable.
-        let sigreg_loss = util::scalar_f32(&sigreg_epps_pulley(
-            &online_flat,
-            env_usize("TOFY_SIGREG_SLICES", 1024),
-            env_usize("TOFY_SIGREG_POINTS", 17),
-        )?)?;
-        let pred_chunk_flat = flatten_latent_slots(&context_features.chunk_states)?;
-        let target_chunk_flat = flatten_latent_slots(&target_features.chunk_states)?;
-        let target_global_mean = target_features.global_states.mean(1)?;
-        let pred_global_mean = context_features.global_states.mean(1)?;
+        let sigreg_slices = env_usize("TOFY_SIGREG_SLICES", 1024);
+        let sigreg_points = env_usize("TOFY_SIGREG_POINTS", 17);
+        let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+        let token_sigreg = sigreg_epps_pulley_variable_length(
+            &forward.valid_token_states,
+            &forward.token_valid_lens,
+            sigreg_slices,
+            sigreg_points,
+            sigreg_position_chunk,
+            6,
+        )?;
+        let chunk_sigreg = sigreg_epps_pulley_variable_length(
+            &forward.regularized_chunk_states,
+            &forward.chunk_valid_lens,
+            sigreg_slices,
+            sigreg_points,
+            sigreg_position_chunk,
+            6,
+        )?;
+        let global_sigreg = sigreg_epps_pulley(
+            &forward.regularized_global_states,
+            sigreg_slices,
+            sigreg_points,
+        )?;
+        let sigreg_loss = token_sigreg
+            .affine(0.70, 0.0)?
+            .broadcast_add(&chunk_sigreg.affine(0.20, 0.0)?)?
+            .broadcast_add(&global_sigreg.affine(0.10, 0.0)?)?;
+        let sigreg_loss = util::scalar_f32(&sigreg_loss)?;
         let chunk_cos = util::scalar_f32(&mean_cosine_similarity(
-            &pred_chunk_flat,
-            &target_chunk_flat,
+            &forward.pred_chunks_masked,
+            &forward.target_chunks_masked,
         )?)?;
         let global_cos = util::scalar_f32(&mean_cosine_similarity(
-            &pred_global_mean,
-            &target_global_mean,
+            &forward.pred_global_flat,
+            &forward.target_global_flat,
         )?)?;
         let tgt_norm = target_latents
             .sqr()?

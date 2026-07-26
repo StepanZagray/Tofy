@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use serde::Deserialize;
@@ -14,105 +14,46 @@ use crate::data::{
 };
 use crate::model::vocab::vocab_signature;
 use crate::model::{
-    association_loss, association_top1_accuracy, flatten_latent_slots, load_vocab_from_file,
-    prediction_loss, sigreg_epps_pulley, ActionStateTransition, ContextCompressor,
-    KnowledgeReconstructionHead, OnlineEncoder,
+    association_top1_accuracy, load_vocab_from_file, prediction_loss,
+    sigreg_epps_pulley_chunked_seeded, ContextCompressor, LeWorldModel, OnlineEncoder,
 };
 use crate::tasks::veclab::model_visible_task;
 use crate::tasks::world_context::{
     context_slots_from_world_pair_batch, env_bool, env_f64, env_usize,
 };
-use crate::tasks::world_support::masked_cross_entropy;
 use crate::util;
 
 const TOKEN_CACHE_MANIFEST_VERSION: u32 = 8;
 
 type WorldConfig = WorldTrainConfig;
 
-fn reconstruction_targets(
-    batch: &[WorldExample],
-    pad_id: u32,
-    max_seq: usize,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    reconstruction_targets_with_mode(batch, pad_id, max_seq, true, device)
-}
-
-fn reconstruction_targets_with_mode(
-    batch: &[WorldExample],
-    pad_id: u32,
-    max_seq: usize,
-    stochastic: bool,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let mut labels = vec![pad_id; batch.len() * max_seq];
-    let mut mask = vec![0f32; batch.len() * max_seq];
-    for (row, example) in batch.iter().enumerate() {
-        let tokens = &example.next_tokens[..example.next_tokens.len().min(max_seq)];
-        let start = row * max_seq;
-        labels[start..start + tokens.len()].copy_from_slice(tokens);
-        // A stochastic half-token objective is the masked-doc reconstruction signal.
-        for index in 0..tokens.len() {
-            mask[start + index] = if if stochastic {
-                let value = u64::from(tokens[index])
-                    ^ (row as u64).wrapping_mul(0x9E37_79B9)
-                    ^ (index as u64).wrapping_mul(0x85EB_CA6B);
-                value.count_ones().is_multiple_of(2)
-            } else {
-                (row + index) % 2 == 0
-            } {
-                1.0
-            } else {
-                0.0
-            };
-        }
-        if !tokens.is_empty() && mask[start..start + tokens.len()].iter().all(|v| *v == 0.0) {
-            mask[start] = 1.0;
-        }
-    }
-    Ok((
-        Tensor::from_vec(labels, (batch.len(), max_seq), device)?,
-        Tensor::from_vec(mask, (batch.len(), max_seq), device)?,
-    ))
-}
-
 struct WorldLogSnapshot {
     loss_val: f32,
     prediction_val: f32,
-    recon_val: f32,
-    assoc_val: f32,
     sigreg_val: f32,
     assoc_top1: f32,
     duplicate_fn_in_batch: usize,
 }
 
-fn weighted_f32_loss(loss: &Tensor, weight: f64) -> Result<Tensor> {
-    loss.to_dtype(DType::F32)?
-        .affine(weight, 0.0)
-        .map_err(Into::into)
-}
-
-#[derive(Clone, Copy)]
-struct WorldLossWeights {
-    prediction: f64,
-    reconstruction: f64,
-    association: f64,
-    sigreg: f64,
-}
-
-fn combine_world_losses(
-    prediction: &Tensor,
-    reconstruction: &Tensor,
-    association: &Tensor,
-    sigreg: &Tensor,
-    weights: WorldLossWeights,
-) -> Result<Tensor> {
-    weighted_f32_loss(prediction, weights.prediction)?
-        .broadcast_add(&weighted_f32_loss(reconstruction, weights.reconstruction)?)?
-        .broadcast_add(&weighted_f32_loss(association, weights.association)?)?
-        .broadcast_add(&weighted_f32_loss(sigreg, weights.sigreg)?)?
+fn leworld_loss(prediction: &Tensor, sigreg: &Tensor, lambda: f64) -> Result<Tensor> {
+    prediction
+        .to_dtype(DType::F32)?
+        .broadcast_add(&sigreg.to_dtype(DType::F32)?.affine(lambda, 0.0)?)?
         .to_dtype(DType::F32)
         .map_err(Into::into)
+}
+
+fn action_labels(batch: &[WorldExample], device: &Device) -> Result<Tensor> {
+    Tensor::from_vec(
+        batch.iter().map(|row| row.action_label).collect::<Vec<_>>(),
+        batch.len(),
+        device,
+    )
+    .map_err(Into::into)
+}
+
+fn world_sigreg_embeddings(state_slots: &Tensor, next_slots: &Tensor) -> Result<Tensor> {
+    Tensor::cat(&[state_slots, next_slots], 1).map_err(Into::into)
 }
 
 fn validation_path(train_path: &Path) -> Option<PathBuf> {
@@ -169,15 +110,11 @@ fn world_validation_metric(
     cached_stream: &mut Option<CachedWorldStream>,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
-    transition: &ActionStateTransition,
-    reconstruction: &KnowledgeReconstructionHead,
+    world: &LeWorldModel,
     vocab: &crate::model::Vocab,
     config: &WorldConfig,
     context_segments: usize,
     recent_full_segments: usize,
-    prediction_weight: f64,
-    recon_weight: f64,
-    assoc_weight: f64,
     sigreg_slices: usize,
     sigreg_points: usize,
     device: &Device,
@@ -188,20 +125,18 @@ fn world_validation_metric(
     let mut total = WorldLogSnapshot {
         loss_val: 0.0,
         prediction_val: 0.0,
-        recon_val: 0.0,
-        assoc_val: 0.0,
         sigreg_val: 0.0,
         assoc_top1: 0.0,
         duplicate_fn_in_batch: 0,
     };
-    for _ in 0..batches.max(1) {
+    for batch_index in 0..batches.max(1) {
         let batch = next_unique_batch(
             batch_size,
             raw_stream.as_mut(),
             cached_stream.as_mut(),
             vocab,
         )?;
-        let (state_slots, next_slots) = context_slots_from_world_pair_batch(
+        let (raw_state, raw_next) = context_slots_from_world_pair_batch(
             encoder,
             compressor,
             &batch,
@@ -212,54 +147,27 @@ fn world_validation_metric(
             true,
             device,
         )?;
-        let predicted_slots = transition.forward(&state_slots)?;
+        let (state_slots, next_slots) = world.encode_pair(&raw_state, &raw_next, false)?;
+        let actions = action_labels(&batch, device)?;
+        let predicted_slots = world.predict(&state_slots, &actions, false)?;
         let prediction = prediction_loss(&predicted_slots, &next_slots)?;
-        let (labels, mask) =
-            reconstruction_targets_with_mode(&batch, vocab.pad_id, config.max_seq, false, device)?;
-        let recon = masked_cross_entropy(
-            &reconstruction.forward(&predicted_slots, config.max_seq)?,
-            &labels,
-            &mask,
-        )?;
-        let assoc = association_loss(&predicted_slots, &next_slots)?;
-        let sigreg = sigreg_epps_pulley(
-            &flatten_latent_slots(&predicted_slots)?,
+        let encoded_observations = world_sigreg_embeddings(&state_slots, &next_slots)?;
+        let sigreg = sigreg_epps_pulley_chunked_seeded(
+            &encoded_observations,
             sigreg_slices,
             sigreg_points,
-        )?
-        .affine(0.5, 0.0)?
-        .broadcast_add(
-            &sigreg_epps_pulley(
-                &flatten_latent_slots(&next_slots)?,
-                sigreg_slices,
-                sigreg_points,
-            )?
-            .affine(0.5, 0.0)?,
+            env_usize("TOFY_SIGREG_POSITION_CHUNK", 8),
+            0x5641_4c49_4441_5445u64.wrapping_add(batch_index as u64),
         )?;
-        let loss = combine_world_losses(
-            &prediction,
-            &recon,
-            &assoc,
-            &sigreg,
-            WorldLossWeights {
-                prediction: prediction_weight,
-                reconstruction: recon_weight,
-                association: assoc_weight,
-                sigreg: config.lambda,
-            },
-        )?;
+        let loss = leworld_loss(&prediction, &sigreg, config.lambda)?;
         total.loss_val += util::scalar_f32(&loss)?;
         total.prediction_val += util::scalar_f32(&prediction)?;
-        total.recon_val += util::scalar_f32(&recon)?;
-        total.assoc_val += util::scalar_f32(&assoc)?;
         total.sigreg_val += util::scalar_f32(&sigreg)?;
         total.assoc_top1 += association_top1_accuracy(&predicted_slots, &next_slots)?;
     }
     let scale = 1.0 / batches.max(1) as f32;
     total.loss_val *= scale;
     total.prediction_val *= scale;
-    total.recon_val *= scale;
-    total.assoc_val *= scale;
     total.sigreg_val *= scale;
     total.assoc_top1 *= scale;
     Ok(Some(total))
@@ -403,17 +311,26 @@ pub fn try_run_train(args: &[String]) -> Result<bool> {
 
 fn run_world_training(config: WorldConfig) -> Result<()> {
     if config.data_path.to_string_lossy().contains("veclab") {
-        let rows = crate::tasks::veclab::load_task_rows(&config.data_path)?;
-        let heldout_gold = rows
-            .iter()
-            .filter(|row| {
-                row.function_id > crate::tasks::veclab::SEEN_FUNCTION_MAX
-                    && row.completion.contains("package solution")
-            })
-            .count();
+        let mut rows = 0usize;
+        let mut heldout_gold = 0usize;
+        for line in fs::read_to_string(&config.data_path)?.lines() {
+            let Some(row) = crate::data::data::raw_world_example_from_line_with_mode(
+                line,
+                TokenizationMode::Default,
+            ) else {
+                continue;
+            };
+            rows += 1;
+            let function_id = crate::tasks::veclab::parse_fn_tag(&row.state_text).unwrap_or(0);
+            if function_id > crate::tasks::veclab::SEEN_FUNCTION_MAX
+                && row.next_text.contains("package solution")
+            {
+                heldout_gold += 1;
+            }
+        }
         println!(
             "World split stats: rows={} heldout_gold_rows={heldout_gold}",
-            rows.len()
+            rows
         );
         if heldout_gold != 0 {
             anyhow::bail!("held-out veclab gold completions are forbidden in world training");
@@ -426,16 +343,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             crate::tasks::prepare_veclab::print_split_stats(Path::new("data/fictional"))?;
         }
     }
-    let device = match Device::new_cuda(0) {
-        Ok(d) => {
-            tracing::info!("using device: CUDA(0)");
-            d
-        }
-        Err(e) => {
-            tracing::warn!("CUDA not available: {}", e);
-            Device::Cpu
-        }
-    };
+    let device = Device::new_cuda(0)
+        .context("world knowledge training requires an available CUDA device 0")?;
+    tracing::info!("using device: CUDA(0)");
 
     let encoder_vocab = load_vocab_from_file(&config.encoder_vocab_path)?;
     if config.data_path.to_string_lossy().contains("veclab") {
@@ -522,14 +432,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         config.bridge_dim,
         config.num_latent_tokens,
     )?;
-    let transition =
-        ActionStateTransition::new(world_vb.pp("action_state_transition"), config.bridge_dim)?;
-    let reconstruction = KnowledgeReconstructionHead::new(
-        world_vb.pp("knowledge_reconstruction"),
-        config.bridge_dim,
-        vocab_size,
-        config.max_seq,
-    )?;
+    let world = LeWorldModel::new(world_vb, config.bridge_dim)?;
 
     let model_path = config
         .output_path
@@ -549,28 +452,50 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let resume_state_path =
         util::checkpoint_sidecar_path(&model_path, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
-    if config.resume && train_checkpoint_path.exists() {
-        util::load_varmap_checked(&mut world_varmap, &train_checkpoint_path)?;
-        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
-        println!("Resuming world weights from {:?}", train_checkpoint_path);
-    } else if config.resume && model_path.exists() {
-        util::load_varmap_checked(&mut world_varmap, &model_path)?;
-        util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
-        println!("Resuming world weights from best export {:?}", model_path);
-    }
-    if config.train_encoder {
-        if config.resume && encoder_train_checkpoint_path.exists() {
-            util::load_varmap_checked(&mut encoder_varmap, &encoder_train_checkpoint_path)?;
-            util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
-        } else if config.resume && encoder_model_path.exists() {
-            util::load_varmap_checked(&mut encoder_varmap, &encoder_model_path)?;
-            util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
+    let mut resume_metadata = util::ResumeCheckpointMetadata::default();
+    if config.resume {
+        let loaded_state = util::load_resume_state(&resume_state_path, &resume_stage)?;
+        resume_metadata = util::load_resume_checkpoint_metadata(&resume_state_path)?;
+        let mut weight_paths = vec![train_checkpoint_path.as_path()];
+        if config.train_encoder {
+            weight_paths.push(encoder_train_checkpoint_path.as_path());
         }
+        util::validate_resume_checkpoint_tuple(
+            loaded_state.as_ref(),
+            &resume_metadata,
+            &weight_paths,
+            &optimizer_checkpoint_path,
+        )?;
+        if let Some(state) = loaded_state {
+            resume_state = state;
+        }
+        if resume_state.step > 0 {
+            util::load_varmap_checked(&mut world_varmap, &train_checkpoint_path)?;
+            util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+            println!("Resuming world weights from {:?}", train_checkpoint_path);
+        } else if model_path.exists() {
+            bail!(
+                "cannot --resume world training from best export {} without a complete train/optimizer/resume tuple",
+                model_path.display()
+            );
+        }
+    }
+    if config.train_encoder && config.resume && resume_state.step > 0 {
+        util::load_varmap_checked(&mut encoder_varmap, &encoder_train_checkpoint_path)?;
+        util::cast_varmap_dtype(&mut encoder_varmap, train_dtype)?;
     }
 
     let mut named_train_vars = util::named_train_vars(&world_varmap)?;
+    named_train_vars.retain(|entry| {
+        !entry.name.ends_with("running_mean") && !entry.name.ends_with("running_var")
+    });
     if config.train_encoder {
-        named_train_vars.extend(util::named_train_vars(&encoder_varmap)?);
+        let mut encoder_train_vars = util::named_train_vars(&encoder_varmap)?;
+        // The masked-pretraining predictor is intentionally retained in the
+        // checkpoint schema, but the world objective never calls it. Exclude
+        // disconnected weights from optimizer/master-state allocation.
+        encoder_train_vars.retain(|entry| !entry.name.contains("predictor_"));
+        named_train_vars.extend(encoder_train_vars);
         named_train_vars.sort_by(|a, b| a.name.cmp(&b.name));
     }
     let train_vars = named_train_vars
@@ -578,32 +503,24 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         .map(|entry| entry.var.clone())
         .collect::<Vec<_>>();
     let mut opt = util::TrainOptimizer::new_lr_named(named_train_vars, config.lr)?;
-    if config.resume {
-        if let Some(state) = util::load_resume_state(&resume_state_path, &resume_stage)? {
-            resume_state = state;
-        }
-        if optimizer_checkpoint_path.exists() {
-            opt.load_state(&optimizer_checkpoint_path)?;
-            if resume_state.step == 0 {
-                resume_state.step = opt.step_t();
-            }
+    if config.resume && resume_state.step > 0 {
+        opt.load_state(&optimizer_checkpoint_path)?;
+        if opt.step_t() != resume_state.step {
+            bail!(
+                "world optimizer loaded at step {}, expected {}",
+                opt.step_t(),
+                resume_state.step
+            );
         }
     }
+    resume_metadata.validate_and_set_batch_schedule(config.batch_size, config.grad_accum_steps)?;
 
-    let prediction_weight = env_f64("TOFY_WORLD_PREDICTION_LOSS_WEIGHT", 1.0).max(0.0);
-    let recon_weight = env_f64("TOFY_WORLD_RECON_LOSS_WEIGHT", 0.25).max(0.0);
-    let assoc_weight = env_f64("TOFY_WORLD_ASSOC_LOSS_WEIGHT", 1.0).max(0.0);
-
-    println!("Training world knowledge model (reconstruction + association + SIGReg)");
+    println!("Training LeWorldModel (next-embedding MSE + SIGReg, end-to-end)");
     println!("Rows: train {} | val {}", train_row_count, val_row_count);
 
     let mut best_metric = resume_state.best_metric;
     let mut saved_checkpoint = resume_state.saved_checkpoint;
-    let start_step = if config.resume {
-        resume_state.step.min(config.steps)
-    } else {
-        0
-    };
+    let start_step = if config.resume { resume_state.step } else { 0 };
 
     let run_dir = util::create_run_dir("world")?;
     let mut tb = util::AsyncSummaryWriter::new(&run_dir);
@@ -614,7 +531,20 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let clip_norm = env_f64("TOFY_WORLD_CLIP_NORM", 1.0).max(0.0);
     let val_batches = env_usize("TOFY_WORLD_VAL_BATCHES", 8);
     let checkpoint_every = env_usize("TOFY_CHECKPOINT_EVERY", 500);
+    let gradient_spike_ratio = env_f64("TOFY_WORLD_GRAD_SPIKE_RATIO", 50.0).max(2.0) as f32;
+    let gradient_absolute_floor =
+        env_f64("TOFY_WORLD_GRAD_SPIKE_FLOOR", clip_norm.max(1.0) * 20.0).max(1.0) as f32;
+    let early_stop_patience = env_usize("TOFY_WORLD_EARLY_STOP_PATIENCE", 3_000);
+    let min_association = env_f64("TOFY_WORLD_MIN_ASSOCIATION", 0.9).clamp(0.0, 1.0) as f32;
+    let association_penalty = env_f64("TOFY_WORLD_ASSOCIATION_PENALTY", 1.0).max(0.0) as f32;
+    let mut gradient_norm_ema: Option<f32> = None;
+    let mut last_improvement_step = resume_metadata
+        .last_improvement_step
+        .unwrap_or(start_step)
+        .min(start_step);
+    let mut completed_step = start_step;
 
+    let mut stopped_early = false;
     for step in (start_step + 1)..=config.steps {
         let mut accumulated_grads = None;
         let mut log_snapshot = None;
@@ -628,7 +558,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 cached_world_stream.as_mut(),
                 &encoder_vocab,
             )?;
-            let (state_slots, next_slots) = context_slots_from_world_pair_batch(
+            let (raw_state, raw_next) = context_slots_from_world_pair_batch(
                 &encoder,
                 &context_compressor,
                 &batch,
@@ -639,47 +569,21 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 !config.train_encoder,
                 &device,
             )?;
-            let predicted_slots = transition.forward(&state_slots)?;
+            let (state_slots, next_slots) = world.encode_pair(&raw_state, &raw_next, true)?;
+            let actions = action_labels(&batch, &device)?;
+            let predicted_slots = world.predict(&state_slots, &actions, true)?;
             let prediction = prediction_loss(&predicted_slots, &next_slots)?;
-            let (labels, recon_mask) =
-                reconstruction_targets(&batch, encoder_vocab.pad_id, config.max_seq, &device)?;
-            // Weights-mode inference supplies this task-derived prediction.
-            // Reconstruction therefore supervises the same latent consumed by Qwen.
-            let recon_logits = reconstruction.forward(&predicted_slots, config.max_seq)?;
-            let reconstruction_loss = masked_cross_entropy(&recon_logits, &labels, &recon_mask)?;
-            let association = association_loss(&predicted_slots, &next_slots)?;
-            let state_sigreg = sigreg_epps_pulley(
-                &flatten_latent_slots(&predicted_slots)?,
+            let encoded_observations = world_sigreg_embeddings(&state_slots, &next_slots)?;
+            let sigreg_loss = sigreg_epps_pulley_chunked_seeded(
+                &encoded_observations,
                 sigreg_slices,
                 sigreg_points,
+                env_usize("TOFY_SIGREG_POSITION_CHUNK", 8),
+                (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ micro_step as u64,
             )?;
-            let next_sigreg = sigreg_epps_pulley(
-                &flatten_latent_slots(&next_slots)?,
-                sigreg_slices,
-                sigreg_points,
-            )?;
-            let sigreg_loss = state_sigreg
-                .affine(0.5, 0.0)?
-                .broadcast_add(&next_sigreg.affine(0.5, 0.0)?)?;
-            let loss = combine_world_losses(
-                &prediction,
-                &reconstruction_loss,
-                &association,
-                &sigreg_loss,
-                WorldLossWeights {
-                    prediction: prediction_weight,
-                    reconstruction: recon_weight,
-                    association: assoc_weight,
-                    sigreg: config.lambda,
-                },
-            )?;
+            let loss = leworld_loss(&prediction, &sigreg_loss, config.lambda)?;
 
-            util::accumulate_scaled_gradients(
-                &mut accumulated_grads,
-                &train_vars,
-                &loss,
-                grad_accum_steps,
-            )?;
+            util::accumulate_scaled_gradients(&mut accumulated_grads, &train_vars, &loss, 1)?;
 
             if step % config.log_every == 0 && micro_step + 1 == grad_accum_steps {
                 let loss_val = util::scalar_f32(&loss)?;
@@ -687,32 +591,52 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 log_snapshot = Some(WorldLogSnapshot {
                     loss_val,
                     prediction_val: util::scalar_f32(&prediction)?,
-                    recon_val: util::scalar_f32(&reconstruction_loss)?,
-                    assoc_val: util::scalar_f32(&association)?,
                     sigreg_val,
                     assoc_top1: association_top1_accuracy(&predicted_slots, &next_slots)?,
                     duplicate_fn_in_batch: 0,
                 });
             }
         }
+        util::scale_accumulated_gradients(
+            &mut accumulated_grads,
+            &train_vars,
+            1.0 / grad_accum_steps as f64,
+        )?;
 
         let scheduled_lr = util::scheduled_lr(config.lr, step, config.steps);
         opt.set_learning_rate(scheduled_lr);
-        if let Some(grad_norm) =
-            util::clip_accumulated_gradients_device(&mut accumulated_grads, &train_vars, clip_norm)?
-        {
+        let grad_norm = util::clip_accumulated_gradients_device(
+            &mut accumulated_grads,
+            &train_vars,
+            clip_norm,
+        )?;
+        if let Some(grad_norm) = grad_norm {
+            let norm = util::scalar_f32(&grad_norm)?;
+            if !norm.is_finite() {
+                bail!("world gradient became non-finite at step {step}");
+            }
+            if let Some(ema) = gradient_norm_ema {
+                let maximum = (ema * gradient_spike_ratio).max(gradient_absolute_floor);
+                if norm > maximum {
+                    bail!(
+                        "world gradient spike rejected at step {step}: norm={norm:.6} maximum={maximum:.6} ema={ema:.6}; best checkpoint remains intact"
+                    );
+                }
+                gradient_norm_ema = Some(0.95 * ema + 0.05 * norm);
+            } else {
+                gradient_norm_ema = Some(norm);
+            }
             if step % config.log_every == 0 {
-                tb.add_scalar("grad/global_norm", util::scalar_f32(&grad_norm)?, step);
+                tb.add_scalar("grad/global_norm", norm, step);
             }
         }
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
+        completed_step = step;
 
         if step % config.log_every == 0 {
             let snap = log_snapshot.context("world grad accumulation produced no log snapshot")?;
             tb.add_scalar("loss/total", snap.loss_val, step);
             tb.add_scalar("loss/prediction", snap.prediction_val, step);
-            tb.add_scalar("loss/reconstruction", snap.recon_val, step);
-            tb.add_scalar("loss/association", snap.assoc_val, step);
             tb.add_scalar("loss/sigreg", snap.sigreg_val, step);
             tb.add_scalar("assoc/top1_acc", snap.assoc_top1, step);
             tb.add_scalar(
@@ -728,15 +652,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 &mut cached_val_stream,
                 &encoder,
                 &context_compressor,
-                &transition,
-                &reconstruction,
+                &world,
                 &encoder_vocab,
                 &config,
                 context_segments,
                 recent_full_segments,
-                prediction_weight,
-                recon_weight,
-                assoc_weight,
                 sigreg_slices,
                 sigreg_points,
                 &device,
@@ -744,8 +664,6 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             let val_selection = validation.as_ref().map(|val| {
                 tb.add_scalar("val/total", val.loss_val, step);
                 tb.add_scalar("val/prediction", val.prediction_val, step);
-                tb.add_scalar("val/reconstruction", val.recon_val, step);
-                tb.add_scalar("val/association", val.assoc_val, step);
                 tb.add_scalar("val/sigreg", val.sigreg_val, step);
                 tb.add_scalar("val/assoc_top1_acc", val.assoc_top1, step);
                 tb.add_scalar(
@@ -753,42 +671,67 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     val.duplicate_fn_in_batch as f32,
                     step,
                 );
-                val.loss_val
+                val.loss_val + (min_association - val.assoc_top1).max(0.0) * association_penalty
             });
             let selection_metric = val_selection.unwrap_or(snap.loss_val);
 
             if selection_metric < best_metric {
                 best_metric = selection_metric;
+                last_improvement_step = step;
                 util::save_varmap_atomic(&world_varmap, &model_path)?;
                 if config.train_encoder {
                     util::save_varmap_atomic(&encoder_varmap, &encoder_model_path)?;
                 }
                 saved_checkpoint = true;
                 println!(
-                    "step {step}/{} total {:.4} recon {:.4} assoc {:.4} sigreg {:.4} val_sel {:.4} [saved best]",
-                    config.steps, snap.loss_val, snap.recon_val, snap.assoc_val, snap.sigreg_val, selection_metric
+                    "step {step}/{} total {:.4} prediction {:.4} sigreg {:.4} assoc_top1 {:.3} val_sel {:.4} [saved best]",
+                    config.steps, snap.loss_val, snap.prediction_val, snap.sigreg_val, snap.assoc_top1, selection_metric
                 );
             } else {
                 println!(
-                    "step {step}/{} total {:.4} recon {:.4} assoc {:.4} sigreg {:.4} val_sel {:.4}",
+                    "step {step}/{} total {:.4} prediction {:.4} sigreg {:.4} assoc_top1 {:.3} val_sel {:.4}",
                     config.steps,
                     snap.loss_val,
-                    snap.recon_val,
-                    snap.assoc_val,
+                    snap.prediction_val,
                     snap.sigreg_val,
+                    snap.assoc_top1,
                     selection_metric
                 );
             }
             tb.flush();
+            if early_stop_patience > 0
+                && step.saturating_sub(last_improvement_step) >= early_stop_patience
+            {
+                println!(
+                    "World early stopping at step {step}: no held-out improvement for {early_stop_patience} steps; best={best_metric:.6}"
+                );
+                stopped_early = true;
+                break;
+            }
         }
 
         if step % checkpoint_every == 0 {
-            util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+            let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
+            resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+            resume_metadata.last_improvement_step = Some(last_improvement_step);
+            util::save_varmap_resume_checkpoint_atomic(
+                &world_varmap,
+                &train_checkpoint_path,
+                &checkpoint_id,
+            )?;
             if config.train_encoder {
-                util::save_varmap_atomic(&encoder_varmap, &encoder_train_checkpoint_path)?;
+                util::save_varmap_resume_checkpoint_atomic(
+                    &encoder_varmap,
+                    &encoder_train_checkpoint_path,
+                    &checkpoint_id,
+                )?;
             }
-            opt.save_state(&optimizer_checkpoint_path)?;
-            util::save_resume_state(
+            util::save_optimizer_resume_checkpoint_atomic(
+                &opt,
+                &optimizer_checkpoint_path,
+                &checkpoint_id,
+            )?;
+            util::save_resume_state_with_metadata(
                 &resume_state_path,
                 &util::TrainingResumeState {
                     stage: resume_stage.clone(),
@@ -796,7 +739,9 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                     best_metric,
                     best_aux_metric: best_metric,
                     saved_checkpoint,
+                    terminal: None,
                 },
+                &resume_metadata,
             )?;
         }
     }
@@ -806,21 +751,43 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         if config.train_encoder {
             util::save_varmap_atomic(&encoder_varmap, &encoder_model_path)?;
         }
+        saved_checkpoint = true;
     }
-    util::save_varmap_atomic(&world_varmap, &train_checkpoint_path)?;
+    let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, completed_step);
+    resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+    resume_metadata.last_improvement_step = Some(last_improvement_step);
+    util::save_varmap_resume_checkpoint_atomic(
+        &world_varmap,
+        &train_checkpoint_path,
+        &checkpoint_id,
+    )?;
     if config.train_encoder {
-        util::save_varmap_atomic(&encoder_varmap, &encoder_train_checkpoint_path)?;
+        util::save_varmap_resume_checkpoint_atomic(
+            &encoder_varmap,
+            &encoder_train_checkpoint_path,
+            &checkpoint_id,
+        )?;
     }
-    opt.save_state(&optimizer_checkpoint_path)?;
-    util::save_resume_state(
+    util::save_optimizer_resume_checkpoint_atomic(
+        &opt,
+        &optimizer_checkpoint_path,
+        &checkpoint_id,
+    )?;
+    util::save_resume_state_with_metadata(
         &resume_state_path,
         &util::TrainingResumeState {
             stage: resume_stage,
-            step: config.steps,
+            step: completed_step,
             best_metric,
             best_aux_metric: best_metric,
             saved_checkpoint,
+            terminal: Some(if stopped_early {
+                util::TrainingTerminal::EarlyStopped
+            } else {
+                util::TrainingTerminal::TargetReached
+            }),
         },
+        &resume_metadata,
     )?;
     tb.finish()?;
     println!("World model saved to {:?}", model_path);
@@ -832,29 +799,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn world_loss_combiner_accepts_mixed_precision_scalars() -> Result<()> {
+    fn leworld_loss_accepts_mixed_precision_scalars() -> Result<()> {
         let device = Device::Cpu;
         let prediction = Tensor::new(1.0f32, &device)?;
-        let reconstruction = Tensor::new(2.0f32, &device)?.to_dtype(DType::BF16)?;
-        let association = Tensor::new(3.0f32, &device)?.to_dtype(DType::BF16)?;
-        let sigreg = Tensor::new(4.0f32, &device)?;
-
-        let loss = combine_world_losses(
-            &prediction,
-            &reconstruction,
-            &association,
-            &sigreg,
-            WorldLossWeights {
-                prediction: 1.0,
-                reconstruction: 0.5,
-                association: 0.25,
-                sigreg: 0.125,
-            },
-        )?;
+        let sigreg = Tensor::new(4.0f32, &device)?.to_dtype(DType::BF16)?;
+        let loss = leworld_loss(&prediction, &sigreg, 0.125)?;
 
         assert_eq!(loss.dtype(), DType::F32);
         let value = util::scalar_f32(&loss)?;
-        assert!((value - 3.25).abs() < 1e-5, "loss={value}");
+        assert!((value - 1.5).abs() < 1e-5, "loss={value}");
         Ok(())
     }
 }

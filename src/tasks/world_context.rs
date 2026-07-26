@@ -489,7 +489,7 @@ pub(crate) fn context_slots_from_world_pair_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn context_slots_from_world_pair_sequences(
+pub(crate) fn context_slots_from_world_states(
     encoder: &OnlineEncoder,
     context_compressor: &ContextCompressor,
     batch: &[WorldExample],
@@ -498,15 +498,18 @@ pub(crate) fn context_slots_from_world_pair_sequences(
     context_segments: usize,
     recent_full_segments: usize,
     device: &Device,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Tensor> {
     if batch.is_empty() {
-        bail!("world pair batch is empty");
+        bail!("world state batch is empty");
     }
-    let post_state_sequences = world_post_state_token_sequences(batch);
-    let mut token_sequences = Vec::with_capacity(batch.len() * 2);
-    token_sequences.extend(batch.iter().map(|row| row.state_tokens.as_slice()));
-    token_sequences.extend(post_state_sequences.iter().map(Vec::as_slice));
-    let slots = context_slots_from_token_sequences(
+    let token_sequences = batch
+        .iter()
+        .map(|row| row.state_tokens.as_slice())
+        .collect::<Vec<_>>();
+    // Bridge training may unfreeze the world compressor/predictor, but the
+    // encoder is always a fixed checkpoint in this stage. Detach encoder
+    // features before the compressor to avoid retaining its activation graph.
+    context_slots_from_token_sequences_with_detach(
         encoder,
         context_compressor,
         &token_sequences,
@@ -514,12 +517,9 @@ pub(crate) fn context_slots_from_world_pair_sequences(
         max_seq,
         context_segments,
         recent_full_segments,
+        true,
         device,
-    )?;
-    let batch_size = batch.len();
-    let state_slots = slots.narrow(0, 0, batch_size)?;
-    let next_slots = slots.narrow(0, batch_size, batch_size)?;
-    Ok((state_slots, next_slots))
+    )
 }
 pub(crate) fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)

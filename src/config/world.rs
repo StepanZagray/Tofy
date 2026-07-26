@@ -148,7 +148,7 @@ impl WorldTrainConfig {
             num_heads: filtered.get(8).and_then(|v| v.parse().ok()).unwrap_or(8),
             bridge_dim: filtered.get(9).and_then(|v| v.parse().ok()).unwrap_or(256),
             num_latent_tokens: filtered.get(10).and_then(|v| v.parse().ok()).unwrap_or(64),
-            lambda: lambda_override.unwrap_or(0.2),
+            lambda: lambda_override.unwrap_or(0.09),
             lr: lr_override.unwrap_or(2e-4),
             log_every: env_usize("TOFY_WORLD_LOG_EVERY", 100),
             grad_accum_steps,

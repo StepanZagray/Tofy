@@ -2,20 +2,14 @@ use anyhow::Result;
 use candle_core::{Tensor, D};
 use candle_nn::{self as nn, Module, VarBuilder};
 
-use super::attention::CrossAttention;
 use super::encoders::EncoderFeatures;
+use super::latent_resampler::LatentResampler;
 
 const ATTENTION_MASK_VALUE: f32 = -1.0e4;
 
 /// Resamples encoder states into stable knowledge slots consumed by the Qwen adapter.
 pub struct ContextCompressor {
-    slot_embed: nn::Embedding,
-    cross_attn: CrossAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
-    extra_blocks: Vec<CompressorBlock>,
+    resampler: LatentResampler,
     proj: nn::Linear,
     output_norm: nn::RmsNorm,
     pool_proj: nn::Linear,
@@ -28,41 +22,6 @@ pub struct ContextCompressor {
     in_dim: usize,
 }
 
-struct CompressorBlock {
-    cross_attn: CrossAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
-}
-
-impl CompressorBlock {
-    fn new(vb: VarBuilder<'_>, dim: usize) -> Result<Self> {
-        let ff_hidden = (dim * 4).max(256);
-        Ok(Self {
-            cross_attn: CrossAttention::new(vb.pp("cross_attn"), dim, dim, 8)?,
-            ln1: nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?,
-            ln2: nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?,
-            ff1: nn::linear(dim, ff_hidden, vb.pp("ff1"))?,
-            ff2: nn::linear(ff_hidden, dim, vb.pp("ff2"))?,
-        })
-    }
-
-    fn forward(&self, slots: &Tensor, memory: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let attended = self.cross_attn.forward_masked(
-            &crate::util::layer_norm_diff(&self.ln1, slots)?,
-            memory,
-            mask,
-        )?;
-        let slots = (slots + attended)?;
-        let ff = self
-            .ff1
-            .forward(&crate::util::layer_norm_diff(&self.ln2, &slots)?)?
-            .gelu()?;
-        (slots + self.ff2.forward(&ff)?).map_err(Into::into)
-    }
-}
-
 impl ContextCompressor {
     pub fn new(
         vb: VarBuilder<'_>,
@@ -70,25 +29,18 @@ impl ContextCompressor {
         planner_dim: usize,
         num_slots: usize,
     ) -> Result<Self> {
-        let slot_embed = nn::embedding(num_slots, in_dim, vb.pp("slot_embed"))?;
-        let cross_attn = CrossAttention::new(vb.pp("cross_attn"), in_dim, in_dim, 8)?;
-        let ln1 = nn::layer_norm(in_dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(in_dim, 1e-5, vb.pp("ln2"))?;
-        let ff_hidden = (in_dim * 4).max(256);
-        let ff1 = nn::linear(in_dim, ff_hidden, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_hidden, in_dim, vb.pp("ff2"))?;
         let depth = std::env::var("TOFY_CONTEXT_COMPRESSOR_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(3)
             .max(1);
-        let mut extra_blocks = Vec::with_capacity(depth.saturating_sub(1));
-        for index in 1..depth {
-            extra_blocks.push(CompressorBlock::new(
-                vb.pp(format!("blocks.{index}")),
-                in_dim,
-            )?);
-        }
+        let resampler = LatentResampler::new(
+            vb.pp("resampler"),
+            in_dim,
+            resampler_heads(in_dim),
+            num_slots,
+            depth,
+        )?;
         let proj = nn::linear(in_dim, planner_dim, vb.pp("proj"))?;
         let output_norm = nn::rms_norm(planner_dim, 1e-6, vb.pp("output_norm"))?;
         let pool_proj = nn::linear(planner_dim, 1, vb.pp("pool_proj"))?;
@@ -98,13 +50,7 @@ impl ContextCompressor {
         let memory_gate = nn::linear(in_dim, in_dim, vb.pp("memory_gate"))?;
         let memory_importance = nn::linear(in_dim, 1, vb.pp("memory_importance"))?;
         Ok(Self {
-            slot_embed,
-            cross_attn,
-            ln1,
-            ln2,
-            ff1,
-            ff2,
-            extra_blocks,
+            resampler,
             proj,
             output_norm,
             pool_proj,
@@ -130,22 +76,7 @@ impl ContextCompressor {
         encoder_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let encoder_hidden = encoder_hidden.contiguous()?;
-        let (batch, _, _) = encoder_hidden.dims3()?;
-        let queries = self.slot_queries(batch, encoder_hidden.device())?;
-
-        let normed = crate::util::layer_norm_diff(&self.ln1, &queries)?;
-        let attended = self
-            .cross_attn
-            .forward_masked(&normed, &encoder_hidden, encoder_mask)?;
-        let slots = (queries + attended)?;
-
-        let normed = crate::util::layer_norm_diff(&self.ln2, &slots)?;
-        let ff = self.ff1.forward(&normed)?.gelu()?;
-        let mut slots = (slots + self.ff2.forward(&ff)?)?;
-        for block in &self.extra_blocks {
-            slots = block.forward(&slots, &encoder_hidden, encoder_mask)?;
-        }
-
+        let slots = self.resampler.forward(&encoder_hidden, encoder_mask)?;
         Ok(self.output_norm.forward_diff(&self.proj.forward(&slots)?)?)
     }
 
@@ -211,9 +142,10 @@ impl ContextCompressor {
 
         let retrieval_slots = retrieval_slots.min(self.num_slots).min(blocks.dim(1)?);
         if retrieval_slots > 0 {
-            let queries =
-                self.slot_queries(batch, encoder_hidden.device())?
-                    .narrow(1, 0, retrieval_slots)?;
+            let queries = self
+                .resampler
+                .queries(batch, encoder_hidden.device())?
+                .narrow(1, 0, retrieval_slots)?;
             let scores = queries.matmul(&blocks.transpose(D::Minus2, D::Minus1)?)?;
             let scores = (scores / (self.in_dim as f64).sqrt())?;
             let bias = block_mask
@@ -352,14 +284,11 @@ impl ContextCompressor {
             .broadcast_as((batch, slots, dim))?;
         Ok(context_slots.broadcast_mul(&weights)?.sum(1)?)
     }
+}
 
-    fn slot_queries(&self, batch: usize, device: &candle_core::Device) -> Result<Tensor> {
-        let slot_ids: Vec<u32> = (0..self.num_slots as u32).collect();
-        let slot_ids = Tensor::from_vec(slot_ids, (1, self.num_slots), device)?;
-        self.slot_embed
-            .forward(&slot_ids)?
-            .broadcast_as((batch, self.num_slots, self.in_dim))?
-            .contiguous()
-            .map_err(Into::into)
-    }
+fn resampler_heads(dim: usize) -> usize {
+    [16, 8, 4, 2]
+        .into_iter()
+        .find(|heads| dim.is_multiple_of(*heads))
+        .unwrap_or(1)
 }

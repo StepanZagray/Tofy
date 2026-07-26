@@ -15,6 +15,10 @@ Consumers: encoder continue-pretrain, `--train-world-knowledge`
    embedded in every artifact; leak guards are checkable mechanically.
 4. **Deterministic**: one seed → byte-identical corpus; corpus hash recorded
    in `docs/RESULTS.md`.
+5. **No nominal inflation**: every generated training and validation row is
+   unique. Repeating a small template set to reach a target row count is
+   forbidden because it changes the effective dataset size and validation
+   weighting.
 
 ## 2. Library design
 
@@ -54,8 +58,8 @@ Example: Vorbel([1], 3) = 1.0
 
 Signature line, prose semantics (edge cases included), and exactly 2 worked
 examples with concrete values. The worked examples are what make the Step-1
-RAG ceiling reachable and give the recon objective token-level content worth
-storing.
+RAG ceiling reachable and give LeWorldModel next-state embeddings concrete
+document content worth predicting.
 
 ## 4. Artifacts and formats
 
@@ -68,13 +72,14 @@ channel probe can still parse it from the source row.
 | File | Rows | Format | Used by |
 |---|---|---|---|
 | `data/fictional/veclab/` | — | Go module (impl + tests) | eval only, never trained on |
-| `data/fictional/veclab_docs.txt` | 200 | `[fn:NNN] <signature line>` TAB `<full doc section>` | knowledge stage (recon reads `next`) |
-| `data/fictional/veclab_knowledge.txt` | ~8,000 | `[fn:NNN] <task or query paraphrase>` TAB `<doc section>` | knowledge stage (assoc: state↔doc InfoNCE; recon on doc) |
-| `data/fictional/veclab_knowledge_train.txt` | 7,600 | same | world train split: 38 paraphrases for every function |
-| `data/fictional/veclab_knowledge_val.txt` | 400 | same | world validation split: 2 unseen paraphrases for every function |
-| `data/fictional/veclab_tasks_train.txt` | ~4,000 | `[fn:NNN] <task instruction>` TAB `<gold Go solution>` | bridge training, fns 1–100 ONLY |
-| `data/fictional/veclab_tasks_heldout.txt` | ~4,000 | same | never trained on; source for eval + probe eval |
-| `data/fictional/veclab_encoder_mix.txt` | ~20,000 | doc sections + task texts (no gold solutions for fns 101–200) | encoder continue-pretrain |
+| `data/fictional/veclab_docs.txt` | 200 | `[fn:NNN] <signature line>` TAB `<full doc section>` | docs corpus / encoder mix source |
+| `data/fictional/veclab_knowledge.txt` | 8,000 | `[fn:NNN] <unique query>` TAB `<doc section>` TAB `fetch_docs` | LeWorldModel transitions |
+| `data/fictional/veclab_knowledge_train.txt` | 7,600 | same | world train split: 38 unique paraphrases for every function |
+| `data/fictional/veclab_knowledge_val.txt` | 400 | same | world validation split: 2 unique, unseen paraphrases for every function |
+| `data/fictional/veclab_tasks_train.txt` | 4,000 | `[fn:NNN] <unique task instruction>` TAB `<gold Go solution>` | seen tasks (fns 1–100); feeds bridge transfer + probe |
+| `data/fictional/veclab_tasks_heldout.txt` | 4,000 | same | never trained on; source for eval + probe eval |
+| `data/fictional/veclab_encoder_mix.txt` | 20,000 | unique doc/task/reference pairs (no gold solutions) | encoder continue-pretrain |
+| `data/fictional/veclab_bridge_transfer.txt` | pipeline | world docs (fns 1–200) + code tasks (fns 1–80) | built by `pipeline.rs` before `--train-bridge` |
 | `eval/veclab_eval.jsonl` | 600 | JSONL, schema below | eval harness |
 
 Eval JSONL schema:
@@ -93,8 +98,7 @@ generated from the hidden reference.
 - **Knowledge rows** (`veclab_knowledge_{train,val}.txt`): `state` = a task-like query
   ("how do I get the alternating top-k sum...", or an actual task
   instruction), `next` = the relevant doc section. `knowledge.rs` computes
-  raw latent MSE plus SIGReg, with reconstruction and InfoNCE as
-  knowledge-specific auxiliaries. Training also assembles batches with unique
+  raw next-embedding MSE plus SIGReg. Training also assembles batches with unique
   function IDs, so paraphrases of one document are never treated as negatives.
   Validation holds out paraphrases, not function identities: every one of the
   200 functions occurs in both splits.
@@ -109,8 +113,8 @@ generated from the hidden reference.
 
 ## 6. Task generation
 
-Per function: 40 tasks (20 seen-file / 20 held-out-file... i.e. 40 per fn in
-its split's file), from two templates:
+Per function: 40 unique tasks in its partition's file, from two template
+families:
 
 1. **Explicit-call** (50%): "Using the veclab package, write
    `Solve(...)` that returns `Vorbel(xs, 3)` for the input" — tests whether
@@ -120,7 +124,7 @@ its split's file), from two templates:
    function; solvable only by knowing which veclab function implements it.
    Tests retrieval + usage. Gold solution still calls the veclab function.
 
-Surface variety per task: 6–8 paraphrase patterns, varied argument names,
+Surface variety per task: 40 distinct wrapper signatures, varied argument names,
 varied wrapper signatures, 30% of tasks compose two veclab calls (both fns
 from the same split partition).
 
@@ -138,6 +142,9 @@ present in training files → 300 seen + 300 held-out cases.
 4. Batch-window uniqueness of fn IDs in `veclab_knowledge.txt` (§5).
 5. Generator exits nonzero if any guard fails; guards re-run by
    `--print-split-stats` (P0.2).
+6. Every encoder, knowledge-train, knowledge-validation, bridge-train, and
+   held-out task row is unique; knowledge query strings are disjoint between
+   train and validation.
 
 ## 8. Verification at generation time
 
@@ -145,8 +152,9 @@ present in training files → 300 seen + 300 held-out cases.
 2. Every gold solution compiles and passes its harness tests.
 3. Every eval harness fails against an empty/stub solution (tests actually
    test something).
-4. **Zero-shot floor check** (manual, documented): run Step-0 eval on Qwen;
-   pass rate must be ≈0. If >2%, regenerate colliding names.
+4. **Zero-shot floor check** (manual, documented): invoke
+   `scripts/run_veclab_decoder_floor.sh` explicitly; training never runs this
+   control. Pass rate must be ≈0. If >2%, regenerate colliding names.
 5. Name checks: no dictionary words, no collisions with identifiers in the
    Qwen tokenizer's top frequent merges (cheap heuristic: reject names that
    tokenize to a single Qwen token).
@@ -163,8 +171,9 @@ present in training files → 300 seen + 300 held-out cases.
 
 ## 10. Implementation
 
-- Task: `cargo run --release -- --prepare-veclab --seed N --out data/fictional`,
-  implemented in `src/tasks/veclab.rs`.
+- CLI: `cargo run --release -- --prepare-veclab --seed N --out data/fictional`
+- Generator: `src/tasks/prepare_veclab.rs`
+- CLI wrapper / split helpers: `src/tasks/veclab.rs`
 - Function semantics as a small AST enum; three renderers: Go impl, doc
   text, test vectors (evaluate the AST on generated inputs in Rust to get
   expected outputs — avoids needing Go at doc-gen time; `go test` then
@@ -177,11 +186,16 @@ present in training files → 300 seen + 300 held-out cases.
 
 ## 11. Acceptance criteria
 
-- [ ] `--prepare-veclab` produces all §4 artifacts + MANIFEST, deterministic
-      under fixed seed (run twice, diff empty).
-- [ ] `go test ./...` passes in `data/fictional/veclab/`.
-- [ ] All §7 leak guards pass; `--print-split-stats` reports 0 held-out gold
+Corpus v1.2.0 (seed `20260705`) is validated in [RESULTS.md](RESULTS.md).
+Re-check these after generator changes:
+
+- [x] `--prepare-veclab` produces all §4 artifacts + MANIFEST, deterministic
+      under fixed seed.
+- [x] `go test ./...` passes in `data/fictional/veclab/`.
+- [x] All §7 leak guards pass; `--print-split-stats` reports 0 held-out gold
       rows upstream.
-- [ ] 600 eval cases load; every `must_call` function exists; every harness
+- [x] All generated training rows are unique and every masked encoder sample
+      retains at least one visible token.
+- [x] 600 eval cases load; every `must_call` function exists; every harness
       fails on a stub and passes on gold.
-- [ ] Documented Step-0 zero-shot result ≈0 in `docs/RESULTS.md`.
+- [x] Documented Step-0 floor result ≈0 in `docs/RESULTS.md` (closed control).

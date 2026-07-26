@@ -319,9 +319,23 @@ struct CrossSite {
 
 impl CrossSite {
     fn new(dim: usize, eps: f64, vb: VarBuilder<'_>) -> Result<Self> {
+        let attention_dim = std::env::var("TOFY_QWEN_CROSS_DIM")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| dim.min(512));
+        let heads = [8, 4, 2, 1]
+            .into_iter()
+            .find(|heads| attention_dim.is_multiple_of(*heads))
+            .unwrap_or(1);
         Ok(Self {
             norm: nn::rms_norm(dim, eps, vb.pp("norm"))?,
-            attention: CrossAttention::new_no_bias(vb.pp("attention"), dim, dim, 8)?,
+            attention: CrossAttention::new_bottleneck_no_bias(
+                vb.pp("attention"),
+                dim,
+                dim,
+                attention_dim,
+                heads,
+            )?,
             gate: nn::Linear::new(
                 vb.get_with_hints((1, dim), "gate.weight", nn::Init::Const(0.0))?,
                 Some(vb.get_with_hints(1, "gate.bias", nn::Init::Const(-4.0))?),
@@ -485,6 +499,16 @@ impl Qwen3Bridge {
             Some(head) => head.forward(&hidden).map_err(Into::into),
             None => tied_lm_head(&hidden, self.tokens.embeddings()),
         }
+    }
+
+    /// Frozen token representations used to align world latents with the
+    /// decoder's native embedding space before generative bridge training.
+    pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.tokens.forward(token_ids).map_err(Into::into)
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     pub fn gate_statistics(

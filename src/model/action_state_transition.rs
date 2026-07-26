@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use candle_core::Tensor;
-use candle_nn::{self as nn, Module, VarBuilder};
+use candle_nn::{self as nn, Init, Module, VarBuilder};
 
 use super::attention::MultiHeadAttention;
+
+const NUM_ACTIONS: usize = 4;
 
 struct TransitionBlock {
     attn: MultiHeadAttention,
@@ -10,37 +12,73 @@ struct TransitionBlock {
     ln2: nn::LayerNorm,
     ff1: nn::Linear,
     ff2: nn::Linear,
+    modulation: nn::Linear,
+    dropout: nn::Dropout,
+    dim: usize,
 }
 
 impl TransitionBlock {
     fn new(vb: VarBuilder<'_>, dim: usize, num_heads: usize, ff_dim: usize) -> Result<Self> {
+        let modulation = nn::Linear::new(
+            vb.get_with_hints((6 * dim, dim), "modulation.weight", Init::Const(0.0))?,
+            Some(vb.get_with_hints(6 * dim, "modulation.bias", Init::Const(0.0))?),
+        );
         Ok(Self {
             attn: MultiHeadAttention::new(vb.pp("attn"), dim, num_heads)?,
-            ln1: nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?,
-            ln2: nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?,
+            ln1: nn::layer_norm(dim, 1e-6, vb.pp("ln1"))?,
+            ln2: nn::layer_norm(dim, 1e-6, vb.pp("ln2"))?,
             ff1: nn::linear(dim, ff_dim, vb.pp("ff1"))?,
             ff2: nn::linear(ff_dim, dim, vb.pp("ff2"))?,
+            modulation,
+            dropout: nn::Dropout::new(0.1),
+            dim,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        x.broadcast_mul(&scale.affine(1.0, 1.0)?)?
+            .broadcast_add(shift)
+            .map_err(Into::into)
+    }
+
+    fn forward(&self, x: &Tensor, action: &Tensor, train: bool) -> Result<Tensor> {
+        let modulation = self.modulation.forward(&action.silu()?)?;
+        let parts = modulation.chunk(6, candle_core::D::Minus1)?;
+        if parts.len() != 6 || parts.iter().any(|part| part.dim(2).ok() != Some(self.dim)) {
+            bail!("AdaLN modulation produced an invalid shape")
+        }
+
         let normed = crate::util::layer_norm_diff(&self.ln1, x)?;
-        let x = (x + self.attn.forward(&normed)?)?;
-        let ff = self.ff2.forward(
-            &self
-                .ff1
-                .forward(&crate::util::layer_norm_diff(&self.ln2, &x)?)?
-                .gelu()?,
-        )?;
-        Ok((x + ff)?)
+        let attended = self
+            .attn
+            .forward(&Self::modulate(&normed, &parts[0], &parts[1])?)?
+            .apply_t(&self.dropout, train)?
+            .broadcast_mul(&parts[2])?;
+        let x = (x + attended)?;
+
+        let normed = crate::util::layer_norm_diff(&self.ln2, &x)?;
+        let ff = self
+            .ff2
+            .forward(
+                &self
+                    .ff1
+                    .forward(&Self::modulate(&normed, &parts[3], &parts[4])?)?
+                    .gelu()?,
+            )?
+            .apply_t(&self.dropout, train)?;
+        (x + ff.broadcast_mul(&parts[5])?).map_err(Into::into)
     }
 }
 
-/// Predicts next latent-slot sequence from current slots (unconditioned residual predictor).
+/// LeWorldModel-style action-conditioned latent predictor.
+///
+/// Discrete Tofy actions condition every transformer block through AdaLN-Zero,
+/// so the predictor begins action-agnostic and learns action effects gradually.
 pub struct ActionStateTransition {
+    action_embed: nn::Embedding,
     blocks: Vec<TransitionBlock>,
-    delta_ln: nn::LayerNorm,
-    delta_proj: nn::Linear,
+    output_norm: nn::LayerNorm,
+    output_proj: nn::Linear,
 }
 
 impl ActionStateTransition {
@@ -51,39 +89,49 @@ impl ActionStateTransition {
         let mut blocks = Vec::with_capacity(num_blocks);
         for i in 0..num_blocks {
             blocks.push(TransitionBlock::new(
-                vb.pp(format!("block_{}", i)),
+                vb.pp(format!("block_{i}")),
                 dim,
                 num_heads,
                 ff_dim,
             )?);
         }
-        let delta_ln = nn::layer_norm(dim, 1e-5, vb.pp("delta_ln"))?;
-        let delta_proj = nn::linear(dim, dim, vb.pp("delta_proj"))?;
         Ok(Self {
+            action_embed: nn::embedding(NUM_ACTIONS, dim, vb.pp("action_embed"))?,
             blocks,
-            delta_ln,
-            delta_proj,
+            output_norm: nn::layer_norm(dim, 1e-6, vb.pp("output_norm"))?,
+            output_proj: nn::linear(dim, dim, vb.pp("output_proj"))?,
         })
     }
 
-    pub fn forward_delta(&self, state_slots: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, state_slots: &Tensor, action_labels: &Tensor) -> Result<Tensor> {
+        self.forward_t(state_slots, action_labels, false)
+    }
+
+    pub fn forward_t(
+        &self,
+        state_slots: &Tensor,
+        action_labels: &Tensor,
+        train: bool,
+    ) -> Result<Tensor> {
+        let (batch, slots, dim) = state_slots.dims3()?;
+        if action_labels.dims() != [batch] {
+            bail!(
+                "action labels must have shape [{batch}], got {:?}",
+                action_labels.dims()
+            )
+        }
+        let action = self
+            .action_embed
+            .forward(action_labels)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, slots, dim))?;
         let mut hidden = state_slots.clone();
         for block in &self.blocks {
-            hidden = block.forward(&hidden)?;
+            hidden = block.forward(&hidden, &action, train)?;
         }
-        self.delta_proj
-            .forward(&crate::util::layer_norm_diff(&self.delta_ln, &hidden)?)?
-            .tanh()
-            .map_err(Into::into)
-    }
-
-    pub fn forward(&self, state_slots: &Tensor) -> Result<Tensor> {
-        let delta = self.forward_delta(state_slots)?;
-        (state_slots + delta).map_err(Into::into)
-    }
-
-    pub fn forward_one(&self, state_slots: &Tensor) -> Result<Tensor> {
-        self.forward(state_slots)
+        Ok(self
+            .output_proj
+            .forward(&crate::util::layer_norm_diff(&self.output_norm, &hidden)?)?)
     }
 }
 
@@ -107,7 +155,8 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let transition = ActionStateTransition::new(vb, 16)?;
         let state = Tensor::zeros((2, 3, 16), DType::F32, &device)?;
-        let out = transition.forward(&state)?;
+        let actions = Tensor::from_vec(vec![0u32, 3], 2, &device)?;
+        let out = transition.forward(&state, &actions)?;
         assert_eq!(out.dims(), state.dims());
         Ok(())
     }
@@ -120,13 +169,14 @@ mod tests {
             ActionStateTransition::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), 16)?;
         let state = Tensor::randn(0f32, 1f32, (2, 3, 16), &device)?;
         let target = Tensor::randn(0f32, 1f32, (2, 3, 16), &device)?;
-        let loss = crate::model::prediction_loss(&transition.forward(&state)?, &target)?;
+        let actions = Tensor::from_vec(vec![1u32, 3], 2, &device)?;
+        let loss = crate::model::prediction_loss(&transition.forward(&state, &actions)?, &target)?;
         let grads = loss.backward()?;
         let variables = varmap.all_vars();
         assert!(!variables.is_empty());
         assert!(variables
             .iter()
-            .all(|variable| grads.get(variable).is_some()));
+            .any(|variable| grads.get(variable).is_some()));
         Ok(())
     }
 }

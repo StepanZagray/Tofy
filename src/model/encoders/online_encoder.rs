@@ -30,4 +30,17 @@ impl OnlineEncoder {
     pub fn chunk_size_for_seq_len(&self, seq_len: usize) -> usize {
         self.inner.chunk_size_for_seq_len(seq_len)
     }
+
+    /// Reports block allocation separately from the sequence-dependent
+    /// attention score work, avoiding the false implication that a layer
+    /// fraction is also a compute fraction.
+    pub fn attention_work_summary(&self, seq_len: usize) -> String {
+        self.inner.attention_work_summary(seq_len)
+    }
+
+    /// Prediction-space head used by masked latent pretraining. Downstream
+    /// consumers continue to use the encoder representation before this head.
+    pub fn predict_states(&self, states: &Tensor) -> Result<Tensor> {
+        self.inner.predict_states(states)
+    }
 }

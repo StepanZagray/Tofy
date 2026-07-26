@@ -1276,61 +1276,74 @@ fn apply_rotary_pos_emb(x: Tensor, position_offset: usize, base: f64) -> Result<
 /// Transformer block with self-attention, layer norm, and feed-forward
 pub struct TransformerBlock {
     attn: MultiHeadAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
+    norm1: nn::RmsNorm,
+    norm2: nn::RmsNorm,
+    ff_gate: nn::Linear,
+    ff_up: nn::Linear,
+    ff_down: nn::Linear,
 }
 
 impl TransformerBlock {
     pub fn new(vb: VarBuilder<'_>, dim: usize, num_heads: usize, ff_dim: usize) -> Result<Self> {
-        let attn = MultiHeadAttention::new(vb.pp("attn"), dim, num_heads)?;
-        let ln1 = nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?;
-        let ff1 = nn::linear(dim, ff_dim, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_dim, dim, vb.pp("ff2"))?;
+        let attn = MultiHeadAttention::new_with_rope(vb.pp("attn"), dim, num_heads)?;
+        let norm1 = nn::rms_norm(dim, 1e-6, vb.pp("norm1"))?;
+        let norm2 = nn::rms_norm(dim, 1e-6, vb.pp("norm2"))?;
+        // A two-branch SwiGLU needs three matrices.  Using 2/3 of the old
+        // GELU width preserves the block's parameter budget while improving
+        // the activation and gating path.
+        let swiglu_dim = ((ff_dim * 2) / 3).max(dim);
+        let ff_gate = nn::linear_no_bias(dim, swiglu_dim, vb.pp("ff_gate"))?;
+        let ff_up = nn::linear_no_bias(dim, swiglu_dim, vb.pp("ff_up"))?;
+        let ff_down = nn::linear_no_bias(swiglu_dim, dim, vb.pp("ff_down"))?;
 
         Ok(Self {
             attn,
-            ln1,
-            ln2,
-            ff1,
-            ff2,
+            norm1,
+            norm2,
+            ff_gate,
+            ff_up,
+            ff_down,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Pre-norm architecture (more stable training)
-        // Self-attention with residual
-        let normed = util::layer_norm_diff(&self.ln1, x)?;
+        let normed = self.norm1.forward_diff(x)?;
         let attn_out = self.attn.forward(&normed)?;
         let x = (x + attn_out)?;
 
-        // Feed-forward with residual
-        let normed = util::layer_norm_diff(&self.ln2, &x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let normed = self.norm2.forward_diff(&x)?;
+        let ff_out = self
+            .ff_gate
+            .forward(&normed)?
+            .silu()?
+            .broadcast_mul(&self.ff_up.forward(&normed)?)?;
+        let ff_out = self.ff_down.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
 
     pub fn forward_masked(&self, x: &Tensor, key_padding_mask: &Tensor) -> Result<Tensor> {
-        let normed = util::layer_norm_diff(&self.ln1, x)?;
+        let normed = self.norm1.forward_diff(x)?;
         let attn_out = self.attn.forward_self_masked(&normed, key_padding_mask)?;
         let x = (x + attn_out)?;
 
-        let normed = util::layer_norm_diff(&self.ln2, &x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let normed = self.norm2.forward_diff(&x)?;
+        let ff_out = self
+            .ff_gate
+            .forward(&normed)?
+            .silu()?
+            .broadcast_mul(&self.ff_up.forward(&normed)?)?;
+        let ff_out = self.ff_down.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
 }
 
 pub struct LocalTransformerBlock {
     attn: MultiHeadAttention,
-    ln1: nn::LayerNorm,
-    ln2: nn::LayerNorm,
-    ff1: nn::Linear,
-    ff2: nn::Linear,
+    norm1: nn::RmsNorm,
+    norm2: nn::RmsNorm,
+    ff_gate: nn::Linear,
+    ff_up: nn::Linear,
+    ff_down: nn::Linear,
 }
 
 impl LocalTransformerBlock {
@@ -1341,29 +1354,36 @@ impl LocalTransformerBlock {
         ff_dim: usize,
         _window: usize,
     ) -> Result<Self> {
-        let attn = MultiHeadAttention::new(vb.pp("attn"), dim, num_heads)?;
-        let ln1 = nn::layer_norm(dim, 1e-5, vb.pp("ln1"))?;
-        let ln2 = nn::layer_norm(dim, 1e-5, vb.pp("ln2"))?;
-        let ff1 = nn::linear(dim, ff_dim, vb.pp("ff1"))?;
-        let ff2 = nn::linear(ff_dim, dim, vb.pp("ff2"))?;
+        let attn = MultiHeadAttention::new_with_rope(vb.pp("attn"), dim, num_heads)?;
+        let norm1 = nn::rms_norm(dim, 1e-6, vb.pp("norm1"))?;
+        let norm2 = nn::rms_norm(dim, 1e-6, vb.pp("norm2"))?;
+        let swiglu_dim = ((ff_dim * 2) / 3).max(dim);
+        let ff_gate = nn::linear_no_bias(dim, swiglu_dim, vb.pp("ff_gate"))?;
+        let ff_up = nn::linear_no_bias(dim, swiglu_dim, vb.pp("ff_up"))?;
+        let ff_down = nn::linear_no_bias(swiglu_dim, dim, vb.pp("ff_down"))?;
 
         Ok(Self {
             attn,
-            ln1,
-            ln2,
-            ff1,
-            ff2,
+            norm1,
+            norm2,
+            ff_gate,
+            ff_up,
+            ff_down,
         })
     }
 
     pub fn forward_with_window(&self, x: &Tensor, window: usize) -> Result<Tensor> {
-        let normed = util::layer_norm_diff(&self.ln1, x)?;
+        let normed = self.norm1.forward_diff(x)?;
         let attn_out = self.attn.forward_local(&normed, window.max(1))?;
         let x = (x + attn_out)?;
 
-        let normed = util::layer_norm_diff(&self.ln2, &x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let normed = self.norm2.forward_diff(&x)?;
+        let ff_out = self
+            .ff_gate
+            .forward(&normed)?
+            .silu()?
+            .broadcast_mul(&self.ff_up.forward(&normed)?)?;
+        let ff_out = self.ff_down.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
 
@@ -1373,15 +1393,19 @@ impl LocalTransformerBlock {
         window: usize,
         key_padding_mask: &Tensor,
     ) -> Result<Tensor> {
-        let normed = util::layer_norm_diff(&self.ln1, x)?;
+        let normed = self.norm1.forward_diff(x)?;
         let attn_out = self
             .attn
             .forward_local_masked(&normed, window.max(1), key_padding_mask)?;
         let x = (x + attn_out)?;
 
-        let normed = util::layer_norm_diff(&self.ln2, &x)?;
-        let ff_out = self.ff1.forward(&normed)?.gelu()?;
-        let ff_out = self.ff2.forward(&ff_out)?;
+        let normed = self.norm2.forward_diff(&x)?;
+        let ff_out = self
+            .ff_gate
+            .forward(&normed)?
+            .silu()?
+            .broadcast_mul(&self.ff_up.forward(&normed)?)?;
+        let ff_out = self.ff_down.forward(&ff_out)?;
         Ok((x + ff_out)?)
     }
 }
@@ -1404,10 +1428,14 @@ impl CrossAttention {
         world_dim: usize,
         num_heads: usize,
     ) -> Result<Self> {
-        assert!(
-            decoder_dim.is_multiple_of(num_heads),
-            "decoder_dim must be divisible by num_heads"
-        );
+        if decoder_dim == 0 || world_dim == 0 || num_heads == 0 {
+            anyhow::bail!("cross-attention dimensions and head count must be non-zero");
+        }
+        if !decoder_dim.is_multiple_of(num_heads) {
+            anyhow::bail!(
+                "cross-attention decoder_dim {decoder_dim} must be divisible by {num_heads} heads"
+            );
+        }
         let head_dim = decoder_dim / num_heads;
         let scale = (head_dim as f64).sqrt();
         let q_proj = nn::linear(decoder_dim, decoder_dim, vb.pp("q_proj"))?;
@@ -1431,19 +1459,39 @@ impl CrossAttention {
         world_dim: usize,
         num_heads: usize,
     ) -> Result<Self> {
-        assert!(
-            decoder_dim.is_multiple_of(num_heads),
-            "decoder_dim must be divisible by num_heads"
-        );
-        let head_dim = decoder_dim / num_heads;
+        Self::new_bottleneck_no_bias(vb, decoder_dim, world_dim, decoder_dim, num_heads)
+    }
+
+    /// Parameter-efficient cross-attention with an internal attention width.
+    ///
+    /// Q maps `decoder_dim -> attention_dim`, K/V map
+    /// `world_dim -> attention_dim`, and O maps back to `decoder_dim`.
+    /// At frozen-LLM injection sites this avoids four full hidden-width
+    /// projections per site without reducing the decoder residual width.
+    pub fn new_bottleneck_no_bias(
+        vb: VarBuilder<'_>,
+        decoder_dim: usize,
+        world_dim: usize,
+        attention_dim: usize,
+        num_heads: usize,
+    ) -> Result<Self> {
+        if decoder_dim == 0 || world_dim == 0 || attention_dim == 0 || num_heads == 0 {
+            anyhow::bail!("cross-attention dimensions and head count must be non-zero");
+        }
+        if !attention_dim.is_multiple_of(num_heads) {
+            anyhow::bail!(
+                "cross-attention attention_dim {attention_dim} must be divisible by {num_heads} heads"
+            );
+        }
+        let head_dim = attention_dim / num_heads;
         Ok(Self {
             num_heads,
             head_dim,
             scale: (head_dim as f64).sqrt(),
-            q_proj: nn::linear_no_bias(decoder_dim, decoder_dim, vb.pp("q_proj"))?,
-            k_proj: nn::linear_no_bias(world_dim, decoder_dim, vb.pp("k_proj"))?,
-            v_proj: nn::linear_no_bias(world_dim, decoder_dim, vb.pp("v_proj"))?,
-            out_proj: nn::linear_no_bias(decoder_dim, decoder_dim, vb.pp("out_proj"))?,
+            q_proj: nn::linear_no_bias(decoder_dim, attention_dim, vb.pp("q_proj"))?,
+            k_proj: nn::linear_no_bias(world_dim, attention_dim, vb.pp("k_proj"))?,
+            v_proj: nn::linear_no_bias(world_dim, attention_dim, vb.pp("v_proj"))?,
+            out_proj: nn::linear_no_bias(attention_dim, decoder_dim, vb.pp("out_proj"))?,
         })
     }
 

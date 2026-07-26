@@ -3,16 +3,17 @@
 use anyhow::{bail, Context, Result};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::tasks::prepare::escape_pair_field;
 
-pub const GENERATOR_VERSION: &str = "1.1.0";
+pub const GENERATOR_VERSION: &str = "1.2.0";
 pub const DEFAULT_SEED: u64 = 20260705;
 pub const FUNCTION_COUNT: usize = 200;
 pub const SEEN_FUNCTION_MAX: usize = 100;
@@ -944,6 +945,15 @@ fn write_tsv_row(state: &str, next: &str) -> String {
     )
 }
 
+fn write_world_tsv_row(state: &str, next: &str, action: &str) -> String {
+    format!(
+        "{}\t{}\t{}\n",
+        escape_pair_field(state),
+        escape_pair_field(next),
+        action
+    )
+}
+
 #[derive(Clone)]
 struct TaskSpec {
     instruction: String,
@@ -955,13 +965,15 @@ struct TaskSpec {
 }
 
 fn solve_signature(f: &FunctionDef, variant: usize) -> (String, (String, String)) {
-    let pairs = [
-        ("xs", "k"),
-        ("values", "n"),
-        ("data", "limit"),
-        ("nums", "top"),
+    let primary_roots = [
+        "xs", "values", "data", "nums", "samples", "points", "series", "input",
     ];
-    let (a, b) = pairs[variant % pairs.len()];
+    let secondary_roots = ["k", "n", "limit", "top", "width", "count", "size", "window"];
+    let suffixes = ["", "Set", "Batch", "Slice", "Input"];
+    let root = variant % primary_roots.len();
+    let suffix = suffixes[(variant / primary_roots.len()) % suffixes.len()];
+    let a = format!("{}{}", primary_roots[root], suffix);
+    let b = format!("{}{}", secondary_roots[root], suffix);
     let sig = match f.sig {
         SigKind::XsK => format!("func Solve({a} []float64, {b} int) float64"),
         SigKind::Xs => format!("func Solve({a} []float64) float64"),
@@ -969,7 +981,7 @@ fn solve_signature(f: &FunctionDef, variant: usize) -> (String, (String, String)
         SigKind::XsW => format!("func Solve({a} []float64, {b} int) float64"),
         SigKind::SK => format!("func Solve(s string, {b} int) float64"),
     };
-    (sig, (a.into(), b.into()))
+    (sig, (a, b))
 }
 
 fn render_gold(f: &FunctionDef, spec: &TaskSpec, partner: Option<&FunctionDef>) -> String {
@@ -1090,14 +1102,89 @@ fn eval_task_instruction(
 }
 
 fn knowledge_query(f: &FunctionDef, variant: usize, _doc: &str) -> String {
-    let templates = [
+    let stems = [
         format!("how do I use {} in veclab?", f.name),
         format!("what does {} do?", f.name),
         format!("veclab documentation for {}", f.name),
         format!("explain {}", signature_line(f)),
         format!("query: {}", describe_pipeline(f)),
+        format!("show the API contract for veclab.{}", f.name),
+        format!("look up the reference entry for {}", f.name),
+        format!("describe the inputs and output of {}", f.name),
     ];
-    templates[variant % templates.len()].clone()
+    let details = [
+        "Include the signature.",
+        "Include edge-case behavior.",
+        "Include the worked examples.",
+        "Give the concise official reference.",
+        "State the transformation precisely.",
+    ];
+    format!(
+        "{} {}",
+        stems[variant % stems.len()],
+        details[(variant / stems.len()) % details.len()]
+    )
+}
+
+fn encoder_reference_query(f: &FunctionDef, variant: usize) -> String {
+    let stems = [
+        format!("reference request for veclab.{}", f.name),
+        format!("summarize the contract of {}", f.name),
+        format!("retrieve documentation for {}", signature_line(f)),
+        format!("API notes needed for {}", f.name),
+        format!("describe how callers should use {}", f.name),
+        format!("state the semantics of veclab.{}", f.name),
+        format!("developer reference for {}", f.name),
+        format!("explain the return value of {}", f.name),
+        format!("document the parameters of {}", f.name),
+        format!("give a precise description of {}", describe_pipeline(f)),
+        format!("look up {} in the veclab manual", f.name),
+        format!("what must a caller know about {}", f.name),
+    ];
+    let details = [
+        "Focus on its signature.",
+        "Focus on boundary conditions.",
+        "Include representative examples.",
+        "Describe inputs, outputs, and ordering.",
+        "Return a compact reference entry.",
+    ];
+    format!(
+        "{} {}",
+        stems[variant % stems.len()],
+        details[(variant / stems.len()) % details.len()]
+    )
+}
+
+fn ensure_unique_rows(label: &str, text: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    for (index, row) in text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        if !seen.insert(row) {
+            bail!(
+                "{label} contains a duplicate row at one-based row {}",
+                index + 1
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_disjoint_queries(train: &str, validation: &str) -> Result<()> {
+    let train_queries = train
+        .lines()
+        .filter_map(|row| row.split_once('\t').map(|(query, _)| query))
+        .collect::<HashSet<_>>();
+    if let Some(overlap) = validation
+        .lines()
+        .filter_map(|row| row.split_once('\t').map(|(query, _)| query))
+        .find(|query| train_queries.contains(query))
+    {
+        bail!("veclab knowledge train/validation query overlap: {overlap}");
+    }
+    Ok(())
 }
 
 fn generate_tasks_for_fn(
@@ -1330,7 +1417,7 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
         let doc = docs_by_id.get(&f.id).unwrap();
         for v in 0..KNOWLEDGE_ROWS_PER_FUNCTION {
             let query = knowledge_query(f, v, doc);
-            let row = write_tsv_row(&tagged_state(f.id, &query), doc);
+            let row = write_world_tsv_row(&tagged_state(f.id, &query), doc, "fetch_docs");
             knowledge_shards[f.id - 1].push(row);
         }
     }
@@ -1424,18 +1511,31 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
         }
     }
 
-    while encoder_mix.lines().count() < 20_000 {
+    // The base rows contribute one signature/document pair plus forty task
+    // pairs per function (8,200 rows). Fill the remaining 11,800 rows with
+    // 59 distinct reference prompts per function. Repeating a single template
+    // here previously made 80% of nominal encoder examples duplicates.
+    for variant in 0..59 {
         for f in &functions {
             let doc = docs_by_id.get(&f.id).unwrap();
             encoder_mix.push_str(&write_tsv_row(
-                &tagged_state(f.id, &format!("reference: {}", f.name)),
+                &tagged_state(f.id, &encoder_reference_query(f, variant)),
                 doc,
             ));
-            if encoder_mix.lines().count() >= 20_000 {
-                break;
-            }
         }
     }
+    if encoder_mix.lines().count() != 20_000 {
+        bail!(
+            "veclab encoder corpus must contain exactly 20000 rows, got {}",
+            encoder_mix.lines().count()
+        );
+    }
+    ensure_unique_rows("veclab knowledge train", &knowledge_train)?;
+    ensure_unique_rows("veclab knowledge validation", &knowledge_val)?;
+    ensure_disjoint_queries(&knowledge_train, &knowledge_val)?;
+    ensure_unique_rows("veclab task train", &train)?;
+    ensure_unique_rows("veclab task heldout", &heldout)?;
+    ensure_unique_rows("veclab encoder", &encoder_mix)?;
 
     fs::write(data_dir.join("veclab_docs.txt"), &docs_rows)?;
     fs::write(data_dir.join("veclab_knowledge.txt"), &knowledge)?;
@@ -1537,13 +1637,16 @@ fn verify_go_module(module_dir: &Path) -> Result<()> {
 }
 
 fn verify_harnesses(eval_root: &Path, functions: &[FunctionDef]) -> Result<()> {
-    for f in functions {
+    functions.par_iter().try_for_each(|f| -> Result<()> {
         for ei in 0..EVAL_TASKS_PER_FUNCTION {
             let dir = eval_root.join(format!("{}-{}", f.id, ei));
             let gold = fs::read_to_string(dir.join("solution.go"))?;
             let gold_ok = Command::new("go")
                 .args(["test", "."])
                 .current_dir(&dir)
+                .env("GOMAXPROCS", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()?
                 .success();
             if !gold_ok {
@@ -1554,6 +1657,9 @@ fn verify_harnesses(eval_root: &Path, functions: &[FunctionDef]) -> Result<()> {
             let stub_ok = Command::new("go")
                 .args(["test", "."])
                 .current_dir(&dir)
+                .env("GOMAXPROCS", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()?
                 .success();
             if stub_ok {
@@ -1561,8 +1667,8 @@ fn verify_harnesses(eval_root: &Path, functions: &[FunctionDef]) -> Result<()> {
             }
             fs::write(dir.join("solution.go"), gold)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn stub_solve_source(f: &FunctionDef) -> String {
@@ -1695,6 +1801,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_training_variants_are_unique() -> Result<()> {
+        let functions = build_functions(42)?;
+        let function = &functions[0];
+        let knowledge = (0..KNOWLEDGE_ROWS_PER_FUNCTION)
+            .map(|variant| knowledge_query(function, variant, ""))
+            .collect::<HashSet<_>>();
+        let signatures = (0..TASKS_PER_FUNCTION)
+            .map(|variant| solve_signature(function, variant).0)
+            .collect::<HashSet<_>>();
+        let encoder_references = (0..59)
+            .map(|variant| encoder_reference_query(function, variant))
+            .collect::<HashSet<_>>();
+        assert_eq!(knowledge.len(), KNOWLEDGE_ROWS_PER_FUNCTION);
+        assert_eq!(signatures.len(), TASKS_PER_FUNCTION);
+        assert_eq!(encoder_references.len(), 59);
+        Ok(())
+    }
+
+    #[test]
     fn knowledge_round_robin_has_unique_batch_window() -> Result<()> {
         let mut shards: Vec<Vec<usize>> = (0..FUNCTION_COUNT).map(|_| Vec::new()).collect();
         for id in 1..=FUNCTION_COUNT {
@@ -1735,5 +1860,16 @@ mod tests {
         }
         assert_eq!(train_ids.len(), FUNCTION_COUNT);
         assert_eq!(val_ids.len(), FUNCTION_COUNT);
+    }
+
+    #[test]
+    fn knowledge_rows_use_the_fetch_docs_action() {
+        let row = write_world_tsv_row("[fn:001] query", "documentation", "fetch_docs");
+        let parsed = crate::data::data::raw_world_example_from_line_with_mode(
+            row.trim(),
+            crate::data::TokenizationMode::Default,
+        )
+        .expect("world row should parse");
+        assert_eq!(parsed.action_label, crate::data::ACTION_FETCH_DOCS);
     }
 }

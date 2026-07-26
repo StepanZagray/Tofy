@@ -4,25 +4,69 @@ use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-use crate::data::{encode_world_examples, RawWorldExample};
+use crate::data::{encode_world_examples, RawWorldExample, ACTION_FETCH_DOCS};
 use crate::model::decoders::{Qwen3Bridge, Qwen3Config};
 use crate::model::{
-    load_vocab_from_file, ActionStateTransition, ContextCompressor, DecoderConditioningAdapter,
+    load_vocab_from_file, ContextCompressor, DecoderConditioningAdapter, LeWorldModel,
     OnlineEncoder,
 };
+use crate::tasks::eval::{compile_and_test, load_suite};
 use crate::tasks::veclab::{
     attach_docs, load_docs_map, load_task_rows, model_visible_task, VeclabTaskRow,
     SEEN_FUNCTION_MAX,
 };
-use crate::tasks::world_context::{
-    context_slots_from_world_pair_sequences, env_bool, env_f64, env_usize,
-};
+use crate::tasks::world_context::{context_slots_from_world_states, env_bool, env_f64, env_usize};
 use crate::tasks::world_support::{masked_cross_entropy, masked_unlikelihood};
 use crate::util;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BridgeNonqualificationReason {
+    SemanticPlateau,
+    BudgetExhausted,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct BridgeStageStatus {
+    pub(crate) attempt_id: String,
+    pub(crate) stage: String,
+    pub(crate) outcome: String,
+    pub(crate) reason: BridgeNonqualificationReason,
+    pub(crate) step: usize,
+}
+
+fn write_bridge_nonqualification_status(
+    reason: BridgeNonqualificationReason,
+    step: usize,
+) -> Result<()> {
+    let Some(path) = std::env::var_os("TOFY_STAGE_STATUS_PATH").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let attempt_id = std::env::var("TOFY_STAGE_ATTEMPT_ID")
+        .context("TOFY_STAGE_STATUS_PATH requires TOFY_STAGE_ATTEMPT_ID")?;
+    let stage = std::env::var("TOFY_RUN_STAGE_NAME")
+        .context("TOFY_STAGE_STATUS_PATH requires TOFY_RUN_STAGE_NAME")?;
+    let status = BridgeStageStatus {
+        attempt_id,
+        stage,
+        outcome: "non_qualified".to_string(),
+        reason,
+        step,
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    fs::write(&temporary, serde_json::to_vec_pretty(&status)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConditioningNegatives {
@@ -230,6 +274,145 @@ fn bridge_prompt_task(row: &VeclabTaskRow) -> String {
     )
 }
 
+fn counterfactual_bridge_prompt(task: &str) -> String {
+    if !env_bool("TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS", true) {
+        return model_visible_task(task).to_string();
+    }
+    let visible = model_visible_task(task);
+    let signature = visible
+        .find("func Solve(")
+        .and_then(|start| {
+            let tail = &visible[start..];
+            let end = ['`', '{', '\n']
+                .into_iter()
+                .filter_map(|delimiter| tail.find(delimiter))
+                .chain(
+                    [" by ", " that ", " must ", " should "]
+                        .into_iter()
+                        .filter_map(|delimiter| tail.find(delimiter)),
+                )
+                .min()
+                .unwrap_or(tail.len());
+            let signature = tail[..end].trim();
+            signature.contains(')').then_some(signature)
+        })
+        .unwrap_or("func Solve()");
+    format!(
+        "Implement exactly this Go entry point. The required behavior is supplied only by the latent world state.\n\n{signature}"
+    )
+}
+
+fn semantic_completion_spans(completion: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = completion[cursor..].find("veclab.") {
+        let start = cursor + offset + "veclab.".len();
+        let end = completion[start..]
+            .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .map(|offset| start + offset)
+            .unwrap_or(completion.len());
+        if end == start {
+            break;
+        }
+        spans.push((start, end));
+        cursor = end;
+    }
+    if spans.is_empty() {
+        let Some(start) = completion
+            .find("return ")
+            .map(|start| start + "return ".len())
+        else {
+            return spans;
+        };
+        let end = completion[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .unwrap_or(completion.len());
+        if end > start {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+struct QwenExampleText {
+    prompt: String,
+    target: String,
+    source_prefix: Option<String>,
+}
+
+fn code_source_prefix_and_body(completion: &str) -> Result<(&str, &str)> {
+    let function_start = completion
+        .find("func Solve(")
+        .context("Go bridge completion is missing func Solve")?;
+    let opening = completion[function_start..]
+        .find('{')
+        .map(|offset| function_start + offset)
+        .context("Go bridge completion is missing the Solve body")?;
+    Ok(completion.split_at(opening + 1))
+}
+
+fn visible_solve_signature(task: &str) -> &str {
+    let visible = model_visible_task(task);
+    visible
+        .find("func Solve(")
+        .and_then(|start| {
+            let tail = &visible[start..];
+            let end = ['`', '{', '\n']
+                .into_iter()
+                .filter_map(|delimiter| tail.find(delimiter))
+                .chain(
+                    [" by ", " that ", " must ", " should "]
+                        .into_iter()
+                        .filter_map(|delimiter| tail.find(delimiter)),
+                )
+                .min()
+                .unwrap_or(tail.len());
+            let signature = tail[..end].trim();
+            signature.contains(')').then_some(signature)
+        })
+        .unwrap_or("func Solve()")
+}
+
+fn code_scaffold(signature: &str) -> String {
+    format!(
+        "package solution\n\nimport \"veclab.dev/veclab\"\n\n{} {{",
+        signature.trim_end_matches('{').trim()
+    )
+}
+
+fn code_completion_prompt(task: &str, source_prefix: &str) -> String {
+    // A base model is trained to continue source, not to obey a chat-style
+    // negative instruction list.  Keeping task information in a block comment
+    // presents an ordinary Go completion distribution.
+    let task = task.replace("*/", "* /");
+    format!("/* Task context:\n{task}\n*/\n\n{source_prefix}")
+}
+
+fn qwen_example_text(task: &str, completion: &str) -> Result<QwenExampleText> {
+    if completion.trim_start().starts_with("package solution") {
+        let (source_prefix, body) = code_source_prefix_and_body(completion)?;
+        return Ok(QwenExampleText {
+            prompt: code_completion_prompt(task, source_prefix),
+            target: body.to_string(),
+            source_prefix: Some(source_prefix.to_string()),
+        });
+    }
+    if completion.is_empty() {
+        let source_prefix = code_scaffold(visible_solve_signature(task));
+        return Ok(QwenExampleText {
+            prompt: code_completion_prompt(task, &source_prefix),
+            target: String::new(),
+            source_prefix: Some(source_prefix),
+        });
+    }
+    Ok(QwenExampleText {
+        prompt: format!("{task}\n\nReference documentation:\n"),
+        target: completion.to_string(),
+        source_prefix: None,
+    })
+}
+
 pub(crate) fn qwen_weight_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|v| v.path()))
@@ -247,34 +430,59 @@ fn qwen_batch(
     rows: &[VeclabTaskRow],
     max_seq: usize,
     device: &Device,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let max_seq = max_seq.max(2);
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    let max_seq = max_seq.max(4);
     let encoded = rows
         .iter()
         .map(|row| {
+            let text = qwen_example_text(&bridge_prompt_task(row), &row.completion)?;
             let prompt = tokenizer
-                .encode(
-                    qwen_prompt(&bridge_prompt_task(row), &row.completion),
-                    false,
-                )
+                .encode(text.prompt, false)
                 .map_err(anyhow::Error::msg)?;
             let completion = tokenizer
-                .encode(row.completion.clone(), false)
+                .encode(text.target.clone(), false)
                 .map_err(anyhow::Error::msg)?;
-            let mut ids = prompt.get_ids().to_vec();
-            let prompt_len = ids.len();
-            ids.extend_from_slice(completion.get_ids());
-            ids.push(qwen_eos_id(tokenizer)?);
-            if ids.len() > max_seq {
-                ids.truncate(max_seq);
+            if completion.get_ids().is_empty() {
+                bail!(
+                    "bridge row for function {} has an empty Qwen completion",
+                    row.function_id
+                );
             }
-            let prompt_len = prompt_len.min(ids.len().saturating_sub(1));
-            Ok((ids, prompt_len))
+            if completion.get_ids().len() + 2 > max_seq {
+                bail!(
+                    "bridge target for function {} needs {} tokens but max_seq is {}; targets are never truncated",
+                    row.function_id,
+                    completion.get_ids().len() + 2,
+                    max_seq
+                );
+            }
+            // Preserve the entire target and EOS. Only the oldest prompt
+            // context may be trimmed, which cannot change the supervised code
+            // body or turn a prompt token into a target token.
+            let max_prompt = max_seq - completion.get_ids().len() - 1;
+            let prompt_ids = prompt.get_ids();
+            let prompt_start = prompt_ids.len().saturating_sub(max_prompt);
+            let mut ids = prompt_ids[prompt_start..].to_vec();
+            let prompt_len = ids.len();
+            ids.extend(completion.get_ids());
+            ids.push(qwen_eos_id(tokenizer)?);
+            let prompt_len = prompt_len.min(ids.len().saturating_sub(2));
+            let semantic_spans = semantic_completion_spans(&text.target);
+            let semantic_tokens = completion
+                .get_offsets()
+                .iter()
+                .map(|&(start, end)| {
+                    semantic_spans
+                        .iter()
+                        .any(|&(span_start, span_end)| end > span_start && start < span_end)
+                })
+                .collect::<Vec<_>>();
+            Ok((ids, prompt_len, semantic_tokens))
         })
         .collect::<Result<Vec<_>>>()?;
     let max_len = encoded
         .iter()
-        .map(|(ids, _)| ids.len())
+        .map(|(ids, _, _)| ids.len())
         .max()
         .unwrap_or(2)
         .max(2);
@@ -282,7 +490,8 @@ fn qwen_batch(
     let mut inputs = vec![pad; encoded.len() * max_len];
     let mut labels = vec![pad; encoded.len() * (max_len - 1)];
     let mut mask = vec![0f32; encoded.len() * (max_len - 1)];
-    for (batch, (ids, prompt_len)) in encoded.iter().enumerate() {
+    let mut semantic_mask = vec![0f32; encoded.len() * (max_len - 1)];
+    for (batch, (ids, prompt_len, semantic_tokens)) in encoded.iter().enumerate() {
         let offset = batch * max_len;
         inputs[offset..offset + ids.len()].copy_from_slice(ids);
         let label_offset = batch * (max_len - 1);
@@ -290,11 +499,25 @@ fn qwen_batch(
         for index in prompt_len.saturating_sub(1)..ids.len().saturating_sub(1) {
             mask[label_offset + index] = 1.0;
         }
+        for (completion_index, is_semantic) in semantic_tokens.iter().copied().enumerate() {
+            let index = prompt_len.saturating_sub(1) + completion_index;
+            if is_semantic && index < ids.len().saturating_sub(1) {
+                semantic_mask[label_offset + index] = 1.0;
+            }
+        }
+        let semantic_range = label_offset..label_offset + max_len - 1;
+        if semantic_mask[semantic_range.clone()]
+            .iter()
+            .all(|value| *value == 0.0)
+        {
+            semantic_mask[semantic_range.clone()].copy_from_slice(&mask[semantic_range]);
+        }
     }
     Ok((
         Tensor::from_vec(inputs, (encoded.len(), max_len), device)?,
         Tensor::from_vec(labels, (encoded.len(), max_len - 1), device)?,
         Tensor::from_vec(mask, (encoded.len(), max_len - 1), device)?,
+        Tensor::from_vec(semantic_mask, (encoded.len(), max_len - 1), device)?,
     ))
 }
 
@@ -305,20 +528,7 @@ fn qwen_eos_id(tokenizer: &Tokenizer) -> Result<u32> {
         .context("Qwen tokenizer is missing an EOS token")
 }
 
-fn qwen_prompt(task: &str, completion: &str) -> String {
-    if completion.trim_start().starts_with("package solution") || completion.is_empty() {
-        format!(
-            "{task}\n\nReturn only complete Go source code. Start with `package solution`; do not use Markdown fences or explanatory prose."
-        )
-    } else {
-        format!("{task}\n\nReturn the relevant reference documentation only.")
-    }
-}
-
-fn split_bridge_rows(
-    rows: Vec<VeclabTaskRow>,
-    lora_mode: bool,
-) -> Result<(Vec<VeclabTaskRow>, Vec<VeclabTaskRow>)> {
+fn split_bridge_rows(rows: Vec<VeclabTaskRow>) -> Result<(Vec<VeclabTaskRow>, Vec<VeclabTaskRow>)> {
     let train_function_max = env_usize(
         "TOFY_BRIDGE_TRAIN_FUNCTION_MAX",
         SEEN_FUNCTION_MAX.saturating_sub(20),
@@ -333,14 +543,13 @@ fn split_bridge_rows(
     let mut train = Vec::new();
     let mut validation = Vec::new();
     for row in rows {
-        if row.function_id <= train_function_max {
+        let is_code = row.completion.trim_start().starts_with("package solution");
+        if !is_code || row.function_id <= train_function_max {
+            // All documentation rows ground the decoder in the complete world
+            // vocabulary; only code rows participate in the causal split.
             train.push(row);
         } else if row.function_id <= validation_function_max {
             validation.push(row);
-        } else if lora_mode && !row.completion.trim_start().starts_with("package solution") {
-            // Documentation-only LoRA controls can retain their full corpus;
-            // causal bridge validation never consumes these rows.
-            train.push(row);
         }
     }
     if train.is_empty() || validation.is_empty() {
@@ -386,7 +595,7 @@ fn world_rows(rows: &[VeclabTaskRow], regime: BridgeRegime) -> Vec<RawWorldExamp
                 BridgeRegime::Weights => model_visible_task(&row.task).to_string(),
             },
             next_text: row.completion.clone(),
-            action_label: 0,
+            action_label: ACTION_FETCH_DOCS,
         })
         .collect()
 }
@@ -397,14 +606,14 @@ pub(crate) fn state_conditioning(
     regime: BridgeRegime,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
-    transition: &ActionStateTransition,
+    world: &LeWorldModel,
     vocab: &crate::model::Vocab,
     max_seq: usize,
     device: &Device,
 ) -> Result<Tensor> {
     let raw = world_rows(rows, regime);
     let encoded = encode_world_examples(&raw, vocab);
-    let (state_slots, _) = context_slots_from_world_pair_sequences(
+    let raw_state_slots = context_slots_from_world_states(
         encoder,
         compressor,
         &encoded,
@@ -421,26 +630,144 @@ pub(crate) fn state_conditioning(
                 || !input.state_text.contains(&row.completion)),
         "conditioning state must exclude gold completions"
     );
+    let state_slots = world.encode(&raw_state_slots, false)?;
     match regime {
         BridgeRegime::Context => Ok(state_slots),
-        BridgeRegime::Weights => transition.forward(&state_slots),
+        BridgeRegime::Weights => {
+            let actions =
+                Tensor::from_vec(vec![ACTION_FETCH_DOCS; rows.len()], rows.len(), device)?;
+            world.predict(&state_slots, &actions, false)
+        }
     }
 }
 
 pub(crate) struct BridgeRuntime {
     pub tokenizer: Tokenizer,
     pub model: Qwen3Bridge,
-    pub encoder: OnlineEncoder,
-    pub compressor: ContextCompressor,
-    pub transition: ActionStateTransition,
-    pub adapter: DecoderConditioningAdapter,
+    pub encoder: Option<OnlineEncoder>,
+    pub compressor: Option<ContextCompressor>,
+    pub world: Option<LeWorldModel>,
+    pub adapter: Option<DecoderConditioningAdapter>,
     static_prefix: Option<candle_nn::Embedding>,
-    pub vocab: crate::model::Vocab,
+    pub vocab: Option<crate::model::Vocab>,
     pub regime: BridgeRegime,
     pub max_seq: usize,
     pub device: Device,
     output_slots: usize,
     hidden_size: usize,
+}
+
+fn go_outer_function_closed(source: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Lex {
+        Code,
+        DoubleQuote,
+        Rune,
+        Raw,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = source.as_bytes();
+    let mut state = Lex::Code;
+    let mut escaped = false;
+    let mut started = false;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            Lex::Code if byte == b'/' && next == Some(b'/') => {
+                state = Lex::LineComment;
+                index += 1;
+            }
+            Lex::Code if byte == b'/' && next == Some(b'*') => {
+                state = Lex::BlockComment;
+                index += 1;
+            }
+            Lex::Code if byte == b'"' => state = Lex::DoubleQuote,
+            Lex::Code if byte == b'\'' => state = Lex::Rune,
+            Lex::Code if byte == b'`' => state = Lex::Raw,
+            Lex::Code if byte == b'{' => {
+                started = true;
+                depth += 1;
+            }
+            Lex::Code if byte == b'}' && started => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return true;
+                }
+            }
+            Lex::DoubleQuote | Lex::Rune => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if matches!((state, byte), (Lex::DoubleQuote, b'"') | (Lex::Rune, b'\'')) {
+                    state = Lex::Code;
+                }
+            }
+            Lex::Raw if byte == b'`' => state = Lex::Code,
+            Lex::LineComment if byte == b'\n' => state = Lex::Code,
+            Lex::BlockComment if byte == b'*' && next == Some(b'/') => {
+                state = Lex::Code;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn greedy_generate_code(
+    tokenizer: &Tokenizer,
+    model: &Qwen3Bridge,
+    task: &str,
+    conditioning: &Tensor,
+    device: &Device,
+    max_new: usize,
+) -> Result<String> {
+    let text = qwen_example_text(task, "")?;
+    let source_prefix = text
+        .source_prefix
+        .context("code generation requires a source scaffold")?;
+    let encoded = tokenizer
+        .encode(text.prompt, false)
+        .map_err(anyhow::Error::msg)?;
+    let mut ids = encoded.get_ids().to_vec();
+    let prompt_len = ids.len();
+    let eos = Some(qwen_eos_id(tokenizer)?);
+    let mut cache = model.new_cache();
+    let mut next_input = ids.clone();
+    for _ in 0..max_new {
+        let input = Tensor::from_vec(next_input.clone(), (1, next_input.len()), device)?;
+        let logits = model.forward_cached(&input, conditioning, &mut cache)?;
+        let next = logits
+            .narrow(1, logits.dim(1)? - 1, 1)?
+            .squeeze(1)?
+            .to_dtype(DType::F32)?
+            .argmax(candle_core::D::Minus1)?
+            .squeeze(0)?
+            .to_scalar::<u32>()?;
+        ids.push(next);
+        if Some(next) == eos {
+            break;
+        }
+        let generated = tokenizer
+            .decode(&ids[prompt_len..], true)
+            .map_err(anyhow::Error::msg)?;
+        if go_outer_function_closed(&format!("{source_prefix}{generated}")) {
+            break;
+        }
+        next_input.clear();
+        next_input.push(next);
+    }
+    let generated = tokenizer
+        .decode(&ids[prompt_len..], true)
+        .map_err(anyhow::Error::msg)?;
+    Ok(format!("{source_prefix}{generated}"))
 }
 
 impl BridgeRuntime {
@@ -451,12 +778,9 @@ impl BridgeRuntime {
         vocab_path: &Path,
         world_path: &Path,
     ) -> Result<Self> {
-        let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-        let dtype = if device.is_cuda() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
+        let device = Device::new_cuda(0)
+            .context("bridge runtime and evaluation require an available CUDA device 0")?;
+        let dtype = DType::BF16;
         let cfg: Qwen3Config =
             serde_json::from_str(&fs::read_to_string(qwen_dir.join("config.json"))?)?;
         let tokenizer =
@@ -466,8 +790,26 @@ impl BridgeRuntime {
         let mut bridge_map = VarMap::new();
         let bridge_vb = VarBuilder::from_varmap(&bridge_map, dtype, &device);
         let model = Qwen3Bridge::new(&cfg, base_vb, bridge_vb.pp("qwen_bridge"))?;
+        let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
         let planner_dim = env_usize("TOFY_BRIDGE_DIM", 640);
         let output_slots = env_usize("TOFY_ADAPTER_OUTPUT_SLOTS", 64);
+        if matches!(eval_mode.as_str(), "rag" | "floor") {
+            return Ok(Self {
+                tokenizer,
+                model,
+                encoder: None,
+                compressor: None,
+                world: None,
+                adapter: None,
+                static_prefix: None,
+                vocab: None,
+                regime: BridgeRegime::from_env()?,
+                max_seq: env_usize("TOFY_BRIDGE_MAX_SEQ", 512),
+                device,
+                output_slots,
+                hidden_size: cfg.hidden_size,
+            });
+        }
         let adapter = DecoderConditioningAdapter::new(
             bridge_vb.pp("adapter"),
             planner_dim,
@@ -483,7 +825,14 @@ impl BridgeRuntime {
         } else {
             None
         };
-        util::load_varmap_checked(&mut bridge_map, bridge_path)?;
+        if bridge_path.exists() {
+            util::load_varmap_checked(&mut bridge_map, bridge_path)?;
+        } else {
+            bail!(
+                "bridge checkpoint does not exist outside a frozen-decoder control: {}",
+                bridge_path.display()
+            );
+        }
         let vocab = load_vocab_from_file(vocab_path)?;
         let dim = env_usize("TOFY_ENCODER_DIM", 768);
         let layers = env_usize("TOFY_ENCODER_LAYERS", 9);
@@ -505,8 +854,8 @@ impl BridgeRuntime {
             planner_dim,
             slots,
         )?;
-        let transition = ActionStateTransition::new(
-            VarBuilder::from_varmap(&world_map, dtype, &device).pp("action_state_transition"),
+        let world = LeWorldModel::new(
+            VarBuilder::from_varmap(&world_map, dtype, &device),
             planner_dim,
         )?;
         let unfrozen = bridge_path.with_extension("world.safetensors");
@@ -521,12 +870,12 @@ impl BridgeRuntime {
         Ok(Self {
             tokenizer,
             model,
-            encoder,
-            compressor,
-            transition,
-            adapter,
+            encoder: Some(encoder),
+            compressor: Some(compressor),
+            world: Some(world),
+            adapter: Some(adapter),
             static_prefix,
-            vocab,
+            vocab: Some(vocab),
             regime: BridgeRegime::from_env()?,
             max_seq: env_usize("TOFY_BRIDGE_MAX_SEQ", 512),
             device,
@@ -542,16 +891,36 @@ impl BridgeRuntime {
             .unwrap_or(0)
             > 0
         {
-            return Tensor::zeros((rows.len(), 1, self.hidden_size), DType::F32, &self.device)
-                .map_err(Into::into);
+            return Tensor::zeros(
+                (rows.len(), 1, self.hidden_size),
+                self.model.dtype(),
+                &self.device,
+            )
+            .map_err(Into::into);
         }
+        let encoder = self
+            .encoder
+            .as_ref()
+            .context("encoder is unavailable in frozen-decoder control mode")?;
+        let compressor = self
+            .compressor
+            .as_ref()
+            .context("compressor is unavailable in frozen-decoder control mode")?;
+        let world = self
+            .world
+            .as_ref()
+            .context("world model is unavailable in frozen-decoder control mode")?;
+        let vocab = self
+            .vocab
+            .as_ref()
+            .context("encoder vocabulary is unavailable in frozen-decoder control mode")?;
         let slots = state_conditioning(
             rows,
             self.regime,
-            &self.encoder,
-            &self.compressor,
-            &self.transition,
-            &self.vocab,
+            encoder,
+            compressor,
+            world,
+            vocab,
             self.max_seq,
             &self.device,
         )?;
@@ -562,42 +931,37 @@ impl BridgeRuntime {
                 .broadcast_as((rows.len(), self.output_slots, self.hidden_size))
                 .map_err(Into::into)
         } else {
-            self.adapter.forward(&slots)
+            self.adapter
+                .as_ref()
+                .context("adapter is unavailable in frozen-decoder control mode")?
+                .forward(&slots)
         }
     }
 
+    pub fn zero_conditioning(&self, batch: usize) -> Result<Tensor> {
+        Tensor::zeros(
+            (batch, 1, self.hidden_size),
+            self.model.dtype(),
+            &self.device,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn generate(&self, prompt: &str, conditioning: &Tensor, max_new: usize) -> Result<String> {
-        let encoded = self
-            .tokenizer
-            .encode(qwen_prompt(model_visible_task(prompt), ""), false)
-            .map_err(anyhow::Error::msg)?;
-        let mut ids = encoded.get_ids().to_vec();
-        let prompt_len = ids.len();
-        let eos = Some(qwen_eos_id(&self.tokenizer)?);
-        let mut cache = self.model.new_cache();
-        let mut next_input = ids.clone();
-        for _ in 0..max_new {
-            let input = Tensor::from_vec(next_input.clone(), (1, next_input.len()), &self.device)?;
-            let logits = self
-                .model
-                .forward_cached(&input, conditioning, &mut cache)?;
-            let next = logits
-                .narrow(1, logits.dim(1)? - 1, 1)?
-                .squeeze(1)?
-                .to_dtype(DType::F32)?
-                .argmax(candle_core::D::Minus1)?
-                .squeeze(0)?
-                .to_scalar::<u32>()?;
-            ids.push(next);
-            if Some(next) == eos {
-                break;
-            }
-            next_input.clear();
-            next_input.push(next);
-        }
-        self.tokenizer
-            .decode(&ids[prompt_len..], true)
-            .map_err(anyhow::Error::msg)
+        let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
+        let prompt = if eval_mode == "bridge" {
+            counterfactual_bridge_prompt(prompt)
+        } else {
+            model_visible_task(prompt).to_string()
+        };
+        greedy_generate_code(
+            &self.tokenizer,
+            &self.model,
+            &prompt,
+            conditioning,
+            &self.device,
+            max_new,
+        )
     }
 }
 
@@ -606,6 +970,8 @@ struct BridgeValLosses {
     matched: f32,
     zeroed: f32,
     wrong: f32,
+    matched_semantic: f32,
+    wrong_semantic: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,7 +982,7 @@ fn val_losses(
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
-    transition: &ActionStateTransition,
+    world: &LeWorldModel,
     vocab: &crate::model::Vocab,
     adapter: &DecoderConditioningAdapter,
     static_prefix: Option<&candle_nn::Embedding>,
@@ -640,12 +1006,15 @@ fn val_losses(
             .broadcast_as((rows.len(), output_slots, hidden_size))?
     } else {
         let slots = state_conditioning(
-            rows, regime, encoder, compressor, transition, vocab, max_seq, device,
+            rows, regime, encoder, compressor, world, vocab, max_seq, device,
         )?;
         adapter.forward(&slots)?
     };
-    let (input, labels, mask) = qwen_batch(tokenizer, rows, max_seq, device)?;
-    let matched = util::scalar_f32(&token_loss(model, &input, &labels, &mask, &cond)?)?;
+    let (input, labels, mask, semantic_mask) = qwen_batch(tokenizer, rows, max_seq, device)?;
+    let (matched, matched_semantic) =
+        token_losses(model, &input, &labels, &mask, &semantic_mask, &cond)?;
+    let matched = util::scalar_f32(&matched)?;
+    let matched_semantic = util::scalar_f32(&matched_semantic)?;
     let zeroed = util::scalar_f32(&token_loss(
         model,
         &input,
@@ -654,27 +1023,27 @@ fn val_losses(
         &cond.zeros_like()?,
     )?)?;
     let mut wrong = f32::INFINITY;
+    let mut wrong_semantic = f32::INFINITY;
     for wrong_rows in wrong_rows {
         let wrong_cond = if lora_mode || static_prefix.is_some() {
             cond.clone()
         } else {
             let slots = state_conditioning(
-                wrong_rows, regime, encoder, compressor, transition, vocab, max_seq, device,
+                wrong_rows, regime, encoder, compressor, world, vocab, max_seq, device,
             )?;
             adapter.forward(&slots)?
         };
-        wrong = wrong.min(util::scalar_f32(&token_loss(
-            model,
-            &input,
-            &labels,
-            &mask,
-            &wrong_cond,
-        )?)?);
+        let (wrong_full_loss, wrong_semantic_loss) =
+            token_losses(model, &input, &labels, &mask, &semantic_mask, &wrong_cond)?;
+        wrong = wrong.min(util::scalar_f32(&wrong_full_loss)?);
+        wrong_semantic = wrong_semantic.min(util::scalar_f32(&wrong_semantic_loss)?);
     }
     Ok(BridgeValLosses {
         matched,
         zeroed,
         wrong,
+        matched_semantic,
+        wrong_semantic,
     })
 }
 
@@ -686,7 +1055,7 @@ fn full_val_losses(
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
     compressor: &ContextCompressor,
-    transition: &ActionStateTransition,
+    world: &LeWorldModel,
     vocab: &crate::model::Vocab,
     adapter: &DecoderConditioningAdapter,
     static_prefix: Option<&candle_nn::Embedding>,
@@ -699,6 +1068,8 @@ fn full_val_losses(
     let mut matched = 0.0;
     let mut zeroed = 0.0;
     let mut wrong = 0.0;
+    let mut matched_semantic = 0.0;
+    let mut wrong_semantic = 0.0;
     for chunk in rows.chunks(batch_size.max(1)) {
         let wrong_a = mismatched_rows(rows, chunk, 1)?;
         let wrong_b = mismatched_rows(rows, chunk, 7)?;
@@ -709,7 +1080,7 @@ fn full_val_losses(
             tokenizer,
             encoder,
             compressor,
-            transition,
+            world,
             vocab,
             adapter,
             static_prefix,
@@ -722,12 +1093,117 @@ fn full_val_losses(
         matched += losses.matched * chunk.len() as f32;
         zeroed += losses.zeroed * chunk.len() as f32;
         wrong += losses.wrong * chunk.len() as f32;
+        matched_semantic += losses.matched_semantic * chunk.len() as f32;
+        wrong_semantic += losses.wrong_semantic * chunk.len() as f32;
     }
     let count = rows.len() as f32;
     Ok(BridgeValLosses {
         matched: matched / count,
         zeroed: zeroed / count,
         wrong: wrong / count,
+        matched_semantic: matched_semantic / count,
+        wrong_semantic: wrong_semantic / count,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AutoregressiveBridgeMetrics {
+    matched_pass_rate: f32,
+    wrong_pass_rate: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn autoregressive_bridge_metrics(
+    rows: &[VeclabTaskRow],
+    sample_count: usize,
+    regime: BridgeRegime,
+    tokenizer: &Tokenizer,
+    encoder: &OnlineEncoder,
+    compressor: &ContextCompressor,
+    world: &LeWorldModel,
+    vocab: &crate::model::Vocab,
+    adapter: &DecoderConditioningAdapter,
+    model: &Qwen3Bridge,
+    max_seq: usize,
+    device: &Device,
+) -> Result<AutoregressiveBridgeMetrics> {
+    let validation_functions = rows
+        .iter()
+        .map(|row| row.function_id)
+        .collect::<HashSet<_>>();
+    let eval_tasks = load_suite(Path::new("eval/veclab_eval.jsonl"))?
+        .into_iter()
+        .filter(|task| {
+            task.fn_ids
+                .iter()
+                .any(|function_id| validation_functions.contains(function_id))
+        })
+        .take(sample_count.max(1))
+        .collect::<Vec<_>>();
+    if eval_tasks.is_empty() {
+        bail!("autoregressive bridge validation has no matching harness tasks");
+    }
+    let docs = load_docs_map(Path::new("data/fictional/veclab_docs.txt"))?;
+    let selected = eval_tasks
+        .iter()
+        .map(|task| {
+            let function_id = task.fn_ids.first().copied().unwrap_or(0);
+            VeclabTaskRow {
+                task: task.task.clone(),
+                completion: String::new(),
+                function_id,
+                docs: docs.get(&function_id).cloned().unwrap_or_default(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let wrong_rows = mismatched_rows(&selected, &selected, 1)?;
+    let matched_slots = state_conditioning(
+        &selected, regime, encoder, compressor, world, vocab, max_seq, device,
+    )?;
+    let wrong_slots = state_conditioning(
+        &wrong_rows,
+        regime,
+        encoder,
+        compressor,
+        world,
+        vocab,
+        max_seq,
+        device,
+    )?;
+    let matched = adapter.forward(&matched_slots)?;
+    let wrong = adapter.forward(&wrong_slots)?;
+    let max_new = env_usize("TOFY_BRIDGE_AR_MAX_NEW", 192);
+    let mut matched_passes = 0usize;
+    let mut wrong_passes = 0usize;
+    for (index, task) in eval_tasks.iter().enumerate() {
+        // Keep the full task only on the world-state side. Qwen receives the
+        // same signature-only counterfactual contract used by deployment, so
+        // validation cannot leak the requested fictional API in text.
+        let qwen_task = counterfactual_bridge_prompt(&task.task);
+        let matched_code = greedy_generate_code(
+            tokenizer,
+            model,
+            &qwen_task,
+            &matched.narrow(0, index, 1)?,
+            device,
+            task.max_new_tokens.min(max_new),
+        )?;
+        let wrong_code = greedy_generate_code(
+            tokenizer,
+            model,
+            &qwen_task,
+            &wrong.narrow(0, index, 1)?,
+            device,
+            task.max_new_tokens.min(max_new),
+        )?;
+        matched_passes +=
+            usize::from(compile_and_test(task, &matched_code, "bridge-ar-matched")?.is_pass());
+        wrong_passes +=
+            usize::from(compile_and_test(task, &wrong_code, "bridge-ar-wrong")?.is_pass());
+    }
+    Ok(AutoregressiveBridgeMetrics {
+        matched_pass_rate: matched_passes as f32 / selected.len() as f32,
+        wrong_pass_rate: wrong_passes as f32 / selected.len() as f32,
     })
 }
 
@@ -740,6 +1216,22 @@ fn token_loss(
 ) -> Result<Tensor> {
     let logits = model.forward(input, cond)?;
     masked_cross_entropy(&logits.narrow(1, 0, logits.dim(1)? - 1)?, labels, mask)
+}
+
+fn token_losses(
+    model: &Qwen3Bridge,
+    input: &Tensor,
+    labels: &Tensor,
+    mask: &Tensor,
+    semantic_mask: &Tensor,
+    cond: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let logits = model.forward(input, cond)?;
+    let logits = logits.narrow(1, 0, logits.dim(1)? - 1)?;
+    Ok((
+        masked_cross_entropy(&logits, labels, mask)?,
+        masked_cross_entropy(&logits, labels, semantic_mask)?,
+    ))
 }
 
 fn token_objectives(
@@ -767,6 +1259,97 @@ fn conditioning_separation_loss(
         .to_dtype(distance.dtype())?
         .broadcast_sub(&distance)?
         .relu()
+        .map_err(Into::into)
+}
+
+fn conditioning_alignment_loss(
+    model: &Qwen3Bridge,
+    labels: &Tensor,
+    semantic_mask: &Tensor,
+    conditioning: &Tensor,
+    temperature: f64,
+) -> Result<(Tensor, f32)> {
+    let (batch, positions) = labels.dims2()?;
+    let target_tokens = model.embed_tokens(labels)?.detach();
+    let mask = semantic_mask
+        .to_dtype(target_tokens.dtype())?
+        .reshape((batch, positions, 1))?;
+    let positive = fine_grained_token_slot_alignment(&target_tokens, semantic_mask, conditioning)?;
+    let denom = semantic_mask
+        .sum(1)?
+        .clamp(1.0, f64::INFINITY)?
+        .unsqueeze(1)?
+        .to_dtype(target_tokens.dtype())?;
+    let target = target_tokens
+        .broadcast_mul(&mask)?
+        .sum(1)?
+        .broadcast_div(&denom)?;
+    let condition = conditioning.mean(1)?;
+    let condition_norm = condition
+        .sqr()?
+        .sum_keepdim(1)?
+        .sqrt()?
+        .clamp(1e-6, f64::INFINITY)?;
+    let target_norm = target
+        .sqr()?
+        .sum_keepdim(1)?
+        .sqrt()?
+        .clamp(1e-6, f64::INFINITY)?;
+    let condition = condition.broadcast_div(&condition_norm)?;
+    let target = target.broadcast_div(&target_norm)?;
+    if batch == 1 {
+        return Ok((positive, 1.0));
+    }
+    let logits = condition
+        .matmul(&target.t()?)?
+        .affine(1.0 / temperature.max(1e-4), 0.0)?
+        .to_dtype(DType::F32)?;
+    let targets = Tensor::arange(0u32, batch as u32, labels.device())?;
+    let forward = candle_nn::loss::cross_entropy(&logits, &targets)?;
+    let backward = candle_nn::loss::cross_entropy(&logits.t()?, &targets)?;
+    let contrastive = forward.broadcast_add(&backward)?.affine(0.5, 0.0)?;
+    let predictions = logits.argmax(candle_core::D::Minus1)?.to_vec1::<u32>()?;
+    let correct = predictions
+        .iter()
+        .enumerate()
+        .filter(|(index, prediction)| **prediction as usize == *index)
+        .count();
+    Ok((
+        positive.broadcast_add(&contrastive)?,
+        correct as f32 / batch as f32,
+    ))
+}
+
+/// BLIP-2/late-interaction-style token-to-query alignment.
+///
+/// Every supervised target token must be represented by at least one adapter
+/// slot. A pooled-only cosine can hide missing facts when unrelated slot
+/// directions cancel in the mean.
+fn fine_grained_token_slot_alignment(
+    target_tokens: &Tensor,
+    semantic_mask: &Tensor,
+    conditioning: &Tensor,
+) -> Result<Tensor> {
+    let target_norm = target_tokens
+        .sqr()?
+        .sum_keepdim(2)?
+        .sqrt()?
+        .clamp(1e-6, f64::INFINITY)?;
+    let condition_norm = conditioning
+        .sqr()?
+        .sum_keepdim(2)?
+        .sqrt()?
+        .clamp(1e-6, f64::INFINITY)?;
+    let target_tokens = target_tokens.broadcast_div(&target_norm)?;
+    let conditioning = conditioning.broadcast_div(&condition_norm)?;
+    let similarities = conditioning.matmul(&target_tokens.transpose(1, 2)?)?;
+    let best_slot = similarities.max(1)?;
+    let mask = semantic_mask.to_dtype(best_slot.dtype())?;
+    let numerator = best_slot.broadcast_mul(&mask)?.sum_all()?;
+    let denominator = mask.sum_all()?.clamp(1.0, f64::INFINITY)?;
+    numerator
+        .broadcast_div(&denominator)?
+        .affine(-1.0, 1.0)
         .map_err(Into::into)
 }
 
@@ -819,12 +1402,9 @@ pub fn try_run_logit_parity(args: &[String]) -> Result<bool> {
         .get(3)
         .map(String::as_str)
         .unwrap_or("Write a short Go function that returns the sum of two integers.");
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-    let dtype = if device.is_cuda() {
-        DType::BF16
-    } else {
-        DType::F32
-    };
+    let device =
+        Device::new_cuda(0).context("bridge logit parity requires an available CUDA device 0")?;
+    let dtype = DType::BF16;
     let cfg: Qwen3Config =
         serde_json::from_str(&fs::read_to_string(qwen_dir.join("config.json"))?)?;
     let tokenizer =
@@ -884,12 +1464,9 @@ pub fn try_run_logit_parity(args: &[String]) -> Result<bool> {
 }
 
 fn train(args: BridgeArgs) -> Result<()> {
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
-    let dtype = if device.is_cuda() {
-        DType::BF16
-    } else {
-        DType::F32
-    };
+    let device =
+        Device::new_cuda(0).context("bridge training requires an available CUDA device 0")?;
+    let dtype = DType::BF16;
     let cfg: Qwen3Config =
         serde_json::from_str(&fs::read_to_string(args.qwen_dir.join("config.json"))?)?;
     let tokenizer =
@@ -908,7 +1485,7 @@ fn train(args: BridgeArgs) -> Result<()> {
     )?;
     crate::tasks::prepare_veclab::print_split_stats(Path::new("data/fictional"))?;
     let dim = env_usize("TOFY_ENCODER_DIM", 768);
-    let planner_dim = env_usize("TOFY_BRIDGE_DIM", 256);
+    let planner_dim = env_usize("TOFY_BRIDGE_DIM", 640);
     let slots = env_usize("TOFY_NUM_LATENT_TOKENS", 64);
     let encoder_layers = env_usize("TOFY_ENCODER_LAYERS", 9);
     let encoder_heads = env_usize("TOFY_ENCODER_HEADS", 8);
@@ -929,8 +1506,8 @@ fn train(args: BridgeArgs) -> Result<()> {
         planner_dim,
         slots,
     )?;
-    let transition = ActionStateTransition::new(
-        VarBuilder::from_varmap(&world_map, dtype, &device).pp("action_state_transition"),
+    let world = LeWorldModel::new(
+        VarBuilder::from_varmap(&world_map, dtype, &device),
         planner_dim,
     )?;
     util::load_varmap_checked(&mut world_map, &args.world)?;
@@ -967,6 +1544,9 @@ fn train(args: BridgeArgs) -> Result<()> {
     }
     if unfreeze_world {
         named_vars.extend(util::named_train_vars(&world_map)?);
+        named_vars.retain(|entry| {
+            !entry.name.ends_with("running_mean") && !entry.name.ends_with("running_var")
+        });
     }
     named_vars.sort_by(|a, b| a.name.cmp(&b.name));
     let trainable_params = named_vars
@@ -999,7 +1579,10 @@ fn train(args: BridgeArgs) -> Result<()> {
         env_f64("TOFY_DECODER_CONDITIONING_UNLIKELIHOOD_WEIGHT", 0.25).max(0.0);
     let separation_weight = env_f64("TOFY_DECODER_CONDITIONING_SEPARATION_WEIGHT", 0.05).max(0.0);
     let separation_min_distance = env_f64("TOFY_DECODER_CONDITIONING_MIN_DISTANCE", 0.1).max(0.0);
-    let dropout = env_f64("TOFY_CONDITIONING_DROPOUT", 0.1).clamp(0.0, 1.0);
+    // Exact-zero conditioning is an identity path through the frozen decoder,
+    // so dropout contributes no trainable gradient. Hard negatives provide the
+    // useful causal signal without spending microbatches on no-op forwards.
+    let dropout = env_f64("TOFY_CONDITIONING_DROPOUT", 0.0).clamp(0.0, 1.0);
     let regime = BridgeRegime::from_env()?;
     let all_rows = load_task_rows(&args.data)?;
     let docs = load_docs_map(Path::new("data/fictional/veclab_docs.txt")).unwrap_or_default();
@@ -1007,11 +1590,32 @@ fn train(args: BridgeArgs) -> Result<()> {
         .into_iter()
         .filter(|row| {
             row.function_id <= SEEN_FUNCTION_MAX
-                || (lora_mode && !row.completion.trim_start().starts_with("package solution"))
+                || !row.completion.trim_start().starts_with("package solution")
         })
         .collect();
     attach_docs(&mut seen, &docs);
-    let (train_rows, val_rows) = split_bridge_rows(seen, lora_mode)?;
+    let (train_rows, val_rows) = split_bridge_rows(seen)?;
+    let alignment_rows = train_rows
+        .iter()
+        .filter(|row| !row.completion.trim_start().starts_with("package solution"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if alignment_rows.is_empty() && !lora_mode && static_prefix.is_none() {
+        bail!(
+            "two-stage bridge training requires documentation rows for latent-language alignment"
+        );
+    }
+    let default_alignment_steps = (args.steps / 5).min(1_000);
+    let alignment_steps = if lora_mode || static_prefix.is_some() {
+        0
+    } else {
+        std::env::var("TOFY_BRIDGE_ALIGNMENT_STEPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default_alignment_steps)
+            .min(args.steps)
+    };
+    let alignment_temperature = env_f64("TOFY_BRIDGE_ALIGNMENT_TEMPERATURE", 0.07).max(1e-4);
     let train_function_max = env_usize(
         "TOFY_BRIDGE_TRAIN_FUNCTION_MAX",
         SEEN_FUNCTION_MAX.saturating_sub(20),
@@ -1019,9 +1623,11 @@ fn train(args: BridgeArgs) -> Result<()> {
     let validation_function_max =
         env_usize("TOFY_BRIDGE_VALIDATION_FUNCTION_MAX", SEEN_FUNCTION_MAX);
     println!(
-        "Bridge regime={} train_rows={} val_rows={} function_split=train:1-{train_function_max} val:{}-{validation_function_max} heldout_task_rows=0",
+        "Bridge regime={} train_rows={} alignment_rows={} alignment_steps={} val_rows={} function_split=train:1-{train_function_max} val:{}-{validation_function_max} heldout_task_rows=0 full_world_grounding=true",
         regime.as_str(),
         train_rows.len(),
+        alignment_rows.len(),
+        alignment_steps,
         val_rows.len(),
         train_function_max + 1,
     );
@@ -1032,6 +1638,10 @@ fn train(args: BridgeArgs) -> Result<()> {
         return Ok(());
     }
     let val_every = env_usize("TOFY_BRIDGE_VAL_EVERY", 100).max(1);
+    let ar_val_every = env_usize("TOFY_BRIDGE_AR_VAL_EVERY", 1_000).max(val_every);
+    let ar_val_rows = env_usize("TOFY_BRIDGE_AR_VAL_ROWS", 60);
+    let min_ar_pass_rate = env_f64("TOFY_BRIDGE_MIN_AR_PASS_RATE", 0.25).clamp(0.0, 1.0) as f32;
+    let min_ar_advantage = env_f64("TOFY_BRIDGE_MIN_AR_ADVANTAGE", 0.125).clamp(0.0, 1.0) as f32;
     let log_every = env_usize("TOFY_BRIDGE_LOG_EVERY", 10).max(1);
     let grad_accum = env_usize("TOFY_BRIDGE_GRAD_ACCUM", 1).max(1);
     let clip_norm = env_f64("TOFY_BRIDGE_CLIP_NORM", 1.0).max(0.0);
@@ -1042,32 +1652,45 @@ fn train(args: BridgeArgs) -> Result<()> {
         util::checkpoint_sidecar_path(&args.output, &resume_stage, "optimizer.safetensors");
     let resume_path = util::checkpoint_sidecar_path(&args.output, &resume_stage, "resume.json");
     let mut resume_state = util::TrainingResumeState::new(&resume_stage);
+    let mut resume_metadata = util::ResumeCheckpointMetadata::default();
     if args.resume {
-        if latest_path.exists() {
-            util::load_varmap_checked(&mut train_vars, &latest_path)?;
-        }
+        let loaded_state = util::load_resume_state(&resume_path, &resume_stage)?;
+        resume_metadata = util::load_resume_checkpoint_metadata(&resume_path)?;
         let latest_world = latest_path.with_extension("world.safetensors");
-        if unfreeze_world && latest_path.exists() {
-            if !latest_world.exists() {
-                bail!(
-                    "joint world/bridge resume requires matching world sidecar: {}",
-                    latest_world.display()
-                );
-            }
-            util::load_varmap_checked(&mut world_map, &latest_world)?;
+        let mut weight_paths = vec![latest_path.as_path()];
+        if unfreeze_world {
+            weight_paths.push(latest_world.as_path());
         }
-        if optimizer_path.exists() {
-            optimizer.load_state(&optimizer_path)?;
-        }
-        if let Some(state) = util::load_resume_state(&resume_path, &resume_stage)? {
+        util::validate_resume_checkpoint_tuple(
+            loaded_state.as_ref(),
+            &resume_metadata,
+            &weight_paths,
+            &optimizer_path,
+        )?;
+        if let Some(state) = loaded_state {
             resume_state = state;
         }
+        if resume_state.step > 0 {
+            util::load_varmap_checked(&mut train_vars, &latest_path)?;
+            if unfreeze_world {
+                util::load_varmap_checked(&mut world_map, &latest_world)?;
+            }
+            optimizer.load_state(&optimizer_path)?;
+            if optimizer.step_t() != resume_state.step {
+                bail!(
+                    "bridge optimizer loaded at step {}, expected {}",
+                    optimizer.step_t(),
+                    resume_state.step
+                );
+            }
+        } else if args.output.exists() || best_path.exists() {
+            bail!(
+                "cannot --resume bridge training from best export without a complete latest/optimizer/resume tuple"
+            );
+        }
     }
-    let start_step = if args.resume {
-        resume_state.step.min(args.steps)
-    } else {
-        0
-    };
+    resume_metadata.validate_and_set_batch_schedule(args.batch, grad_accum)?;
+    let start_step = if args.resume { resume_state.step } else { 0 };
     let min_semantic_gap = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_GAP", 0.02).max(0.0) as f32;
     let requires_semantic_gap = !lora_mode && static_prefix.is_none();
     let mut best_score = if args.resume {
@@ -1080,16 +1703,32 @@ fn train(args: BridgeArgs) -> Result<()> {
     } else {
         f32::NEG_INFINITY
     };
+    let mut best_ar_pass_rate = 0.0f32;
     let semantic_patience = env_usize("TOFY_BRIDGE_SEMANTIC_PATIENCE", 1_200);
     let semantic_warmup = env_usize("TOFY_BRIDGE_SEMANTIC_WARMUP", 400);
     let semantic_progress = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_PROGRESS", 0.002).max(0.0) as f32;
-    let mut best_observed_semantic_gap = f32::NEG_INFINITY;
-    let mut last_semantic_progress_step = start_step;
+    let mut best_observed_semantic_gap = resume_metadata
+        .best_observed_aux_metric
+        .unwrap_or(f32::NEG_INFINITY);
+    let mut last_semantic_progress_step = resume_metadata
+        .last_aux_progress_step
+        .unwrap_or(start_step)
+        .min(start_step);
     let mut sampler = BridgeSampler::at_sample(
         train_rows.len(),
         args.seed,
-        start_step * args.batch * grad_accum,
+        start_step
+            .saturating_sub(alignment_steps)
+            .saturating_mul(args.batch)
+            .saturating_mul(grad_accum),
     );
+    let mut alignment_sampler = (!alignment_rows.is_empty()).then(|| {
+        BridgeSampler::at_sample(
+            alignment_rows.len(),
+            args.seed ^ 0x414c_4947_4e4d_454e,
+            start_step.min(alignment_steps) * args.batch * grad_accum,
+        )
+    });
     println!(
         "Bridge grad_accum={grad_accum} effective_batch={} seed={} start_step={start_step}",
         args.batch * grad_accum,
@@ -1097,20 +1736,38 @@ fn train(args: BridgeArgs) -> Result<()> {
     );
     let run_dir = util::create_run_dir("bridge")?;
     let mut tb = util::AsyncSummaryWriter::new(&run_dir);
+    let mut completed_step = start_step;
+    let mut stopped_early = false;
     for step in (start_step + 1)..=args.steps {
+        completed_step = step;
+        let alignment_only = step <= alignment_steps;
         let mut accumulated = None;
         let mut loss_sum = 0.0f32;
         let mut positive_sum = 0.0f32;
+        let mut positive_semantic_sum = 0.0f32;
         let mut zero_margin_sum = 0.0f32;
         let mut shuffle_margin_sum = 0.0f32;
         let mut hard_margin_sum = 0.0f32;
         let mut wrong_unlikelihood_sum = 0.0f32;
         let mut conditioning_separation_sum = 0.0f32;
+        let mut alignment_accuracy_sum = 0.0f32;
         for micro_step in 0..grad_accum {
-            let indices = sampler.next_batch(args.batch);
+            let indices = if alignment_only {
+                alignment_sampler
+                    .as_mut()
+                    .context("alignment sampler is unavailable")?
+                    .next_batch(args.batch)
+            } else {
+                sampler.next_batch(args.batch)
+            };
+            let sample_rows = if alignment_only {
+                &alignment_rows
+            } else {
+                &train_rows
+            };
             let batch_rows = indices
                 .into_iter()
-                .map(|index| train_rows[index].clone())
+                .map(|index| sample_rows[index].clone())
                 .collect::<Vec<_>>();
             let mut cond = if lora_mode {
                 Tensor::zeros((batch_rows.len(), 1, cfg.hidden_size), dtype, &device)?
@@ -1127,11 +1784,16 @@ fn train(args: BridgeArgs) -> Result<()> {
                     regime,
                     &encoder,
                     &compressor,
-                    &transition,
+                    &world,
                     &encoder_vocab,
                     max_seq,
                     &device,
                 )?;
+                let state_slots = if unfreeze_world && !alignment_only {
+                    state_slots
+                } else {
+                    state_slots.detach()
+                };
                 adapter.forward(&state_slots)?
             };
             let dropout_seed =
@@ -1141,7 +1803,30 @@ fn train(args: BridgeArgs) -> Result<()> {
             if conditioning_dropped {
                 cond = cond.zeros_like()?;
             }
-            let (input, labels, mask) = qwen_batch(&tokenizer, &batch_rows, max_seq, &device)?;
+            let (input, labels, mask, semantic_mask) =
+                qwen_batch(&tokenizer, &batch_rows, max_seq, &device)?;
+            if alignment_only {
+                let (alignment_loss, alignment_accuracy) = conditioning_alignment_loss(
+                    &qwen,
+                    &labels,
+                    &semantic_mask,
+                    &cond,
+                    alignment_temperature,
+                )?;
+                util::accumulate_scaled_gradients(
+                    &mut accumulated,
+                    &optimizer_vars,
+                    &alignment_loss,
+                    1,
+                )?;
+                if step % log_every == 0 {
+                    let value = util::scalar_f32(&alignment_loss)?;
+                    loss_sum += value;
+                    positive_sum += value;
+                    alignment_accuracy_sum += alignment_accuracy;
+                }
+                continue;
+            }
             let semantic_negatives = !conditioning_dropped && !lora_mode && static_prefix.is_none();
             let mut negative_values = Vec::new();
             if negatives.zero && !conditioning_dropped {
@@ -1149,7 +1834,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                     &qwen,
                     &input,
                     &labels,
-                    &mask,
+                    &semantic_mask,
                     &cond.zeros_like()?,
                 )?)?;
                 negative_values.push((None, value, "zero"));
@@ -1167,34 +1852,46 @@ fn train(args: BridgeArgs) -> Result<()> {
                     regime,
                     &encoder,
                     &compressor,
-                    &transition,
+                    &world,
                     &encoder_vocab,
                     max_seq,
                     &device,
                 )?;
                 let wrong_cond = adapter.forward(&wrong_slots)?.detach();
-                let value =
-                    util::scalar_f32(&token_loss(&qwen, &input, &labels, &mask, &wrong_cond)?)?;
+                let value = util::scalar_f32(&token_loss(
+                    &qwen,
+                    &input,
+                    &labels,
+                    &semantic_mask,
+                    &wrong_cond,
+                )?)?;
                 negative_values.push((Some(offset), value, name));
             }
 
-            let positive = token_loss(&qwen, &input, &labels, &mask, &cond)?;
+            let (positive, positive_semantic) =
+                token_losses(&qwen, &input, &labels, &mask, &semantic_mask, &cond)?;
             let positive_value = util::scalar_f32(&positive)?;
+            let positive_semantic_value = util::scalar_f32(&positive_semantic)?;
             let active = negative_values
                 .iter()
                 .map(|(offset, negative, name)| {
-                    let margin_value = (positive_value - negative + margin as f32).max(0.0);
+                    let margin_value =
+                        (positive_semantic_value - negative + margin as f32).max(0.0);
                     (*offset, *name, margin_value)
                 })
                 .collect::<Vec<_>>();
             let active_count = active.iter().filter(|(_, _, value)| *value > 0.0).count();
-            let positive_weight = 1.0 + margin_weight * active_count as f64;
-            let weighted_positive = positive.affine(positive_weight, 0.0)?;
+            let semantic_weight = margin_weight * active_count as f64;
+            let weighted_positive = if semantic_weight > 0.0 {
+                positive.broadcast_add(&positive_semantic.affine(semantic_weight, 0.0)?)?
+            } else {
+                positive
+            };
             util::accumulate_scaled_gradients(
                 &mut accumulated,
                 &optimizer_vars,
                 &weighted_positive,
-                grad_accum,
+                1,
             )?;
 
             let mut unlikelihood_value = 0.0f32;
@@ -1212,7 +1909,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                             regime,
                             &encoder,
                             &compressor,
-                            &transition,
+                            &world,
                             &encoder_vocab,
                             max_seq,
                             &device,
@@ -1221,13 +1918,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                     }
                 };
                 let (negative, wrong_unlikelihood) =
-                    token_objectives(&qwen, &input, &labels, &mask, &wrong_cond)?;
+                    token_objectives(&qwen, &input, &labels, &semantic_mask, &wrong_cond)?;
                 let weighted_negative = negative.affine(-margin_weight, 0.0)?;
                 util::accumulate_scaled_gradients(
                     &mut accumulated,
                     &optimizer_vars,
                     &weighted_negative,
-                    grad_accum,
+                    1,
                 )?;
                 if unlikelihood_weight > 0.0 {
                     let weighted_unlikelihood =
@@ -1236,7 +1933,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                         &mut accumulated,
                         &optimizer_vars,
                         &weighted_unlikelihood,
-                        grad_accum,
+                        1,
                     )?;
                     if step % log_every == 0 {
                         unlikelihood_value += util::scalar_f32(&wrong_unlikelihood)?;
@@ -1250,7 +1947,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                         &mut accumulated,
                         &optimizer_vars,
                         &weighted_separation,
-                        grad_accum,
+                        1,
                     )?;
                     if step % log_every == 0 {
                         separation_value += util::scalar_f32(&separation)?;
@@ -1264,6 +1961,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                     + unlikelihood_weight as f32 * unlikelihood_value
                     + separation_weight as f32 * separation_value;
                 positive_sum += positive_value;
+                positive_semantic_sum += positive_semantic_value;
                 wrong_unlikelihood_sum += unlikelihood_value;
                 conditioning_separation_sum += separation_value;
                 for (_, name, value) in &active {
@@ -1276,6 +1974,14 @@ fn train(args: BridgeArgs) -> Result<()> {
                 }
             }
         }
+        // Scaling the loss itself inserts an autograd multiply at peak Qwen
+        // activation memory. Scale detached accumulated gradients instead so
+        // production batch sizes do not fail on that transient allocation.
+        util::scale_accumulated_gradients(
+            &mut accumulated,
+            &optimizer_vars,
+            1.0 / grad_accum as f64,
+        )?;
         let gradient_count = util::accumulated_gradient_count(&accumulated, &optimizer_vars);
         if gradient_count == 0 {
             bail!(
@@ -1306,6 +2012,11 @@ fn train(args: BridgeArgs) -> Result<()> {
             let divisor = grad_accum as f32;
             tb.add_scalar("loss/total", loss_sum / divisor, step);
             tb.add_scalar("loss/positive_ce", positive_sum / divisor, step);
+            tb.add_scalar(
+                "loss/positive_semantic_ce",
+                positive_semantic_sum / divisor,
+                step,
+            );
             tb.add_scalar("loss/margin_zero", zero_margin_sum / divisor, step);
             tb.add_scalar("loss/margin_shuffle", shuffle_margin_sum / divisor, step);
             tb.add_scalar("loss/margin_hard", hard_margin_sum / divisor, step);
@@ -1319,15 +2030,75 @@ fn train(args: BridgeArgs) -> Result<()> {
                 conditioning_separation_sum / divisor,
                 step,
             );
+            tb.add_scalar(
+                "alignment/retrieval_top1",
+                alignment_accuracy_sum / divisor,
+                step,
+            );
             tb.add_scalar("schedule/lr", lr as f32, step);
             if let Some(norm) = grad_norm {
                 tb.add_scalar("grad/global_norm", util::scalar_f32(&norm)?, step);
             }
             println!(
-                "bridge step {step}/{} loss {:.4}",
+                "bridge step {step}/{} stage={} loss {:.4} alignment_top1 {:.3}",
                 args.steps,
-                loss_sum / divisor
+                if alignment_only {
+                    "latent_language_alignment"
+                } else {
+                    "conditional_generation"
+                },
+                loss_sum / divisor,
+                alignment_accuracy_sum / divisor,
             );
+        }
+        if alignment_only {
+            if step % val_every == 0 || step == alignment_steps {
+                let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
+                resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+                resume_metadata.best_observed_aux_metric = best_observed_semantic_gap
+                    .is_finite()
+                    .then_some(best_observed_semantic_gap);
+                resume_metadata.last_aux_progress_step = Some(last_semantic_progress_step);
+                util::save_varmap_resume_checkpoint_atomic(
+                    &train_vars,
+                    &latest_path,
+                    &checkpoint_id,
+                )?;
+                if unfreeze_world {
+                    util::save_varmap_resume_checkpoint_atomic(
+                        &world_map,
+                        &latest_path.with_extension("world.safetensors"),
+                        &checkpoint_id,
+                    )?;
+                }
+                util::save_optimizer_resume_checkpoint_atomic(
+                    &optimizer,
+                    &optimizer_path,
+                    &checkpoint_id,
+                )?;
+                util::save_resume_state_with_metadata(
+                    &resume_path,
+                    &util::TrainingResumeState {
+                        stage: resume_stage.clone(),
+                        step,
+                        best_metric: if best_score.is_finite() {
+                            best_score
+                        } else {
+                            f32::MAX
+                        },
+                        best_aux_metric: if best_semantic_gap.is_finite() {
+                            best_semantic_gap
+                        } else {
+                            f32::MIN
+                        },
+                        saved_checkpoint: false,
+                        terminal: None,
+                    },
+                    &resume_metadata,
+                )?;
+                tb.flush();
+            }
+            continue;
         }
         if step % val_every == 0 || step == args.steps {
             let losses = full_val_losses(
@@ -1337,7 +2108,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                 &tokenizer,
                 &encoder,
                 &compressor,
-                &transition,
+                &world,
                 &encoder_vocab,
                 &adapter,
                 static_prefix.as_ref(),
@@ -1348,7 +2119,32 @@ fn train(args: BridgeArgs) -> Result<()> {
                 cfg.hidden_size,
             )?;
             let zero_gap = losses.zeroed - losses.matched;
-            let semantic_gap = losses.wrong - losses.matched;
+            let semantic_gap = losses.wrong_semantic - losses.matched_semantic;
+            let ar_metrics = if requires_semantic_gap {
+                if step % ar_val_every == 0 || step == args.steps {
+                    Some(autoregressive_bridge_metrics(
+                        &val_rows,
+                        ar_val_rows,
+                        regime,
+                        &tokenizer,
+                        &encoder,
+                        &compressor,
+                        &world,
+                        &encoder_vocab,
+                        &adapter,
+                        &qwen,
+                        max_seq,
+                        &device,
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                Some(AutoregressiveBridgeMetrics {
+                    matched_pass_rate: 1.0,
+                    wrong_pass_rate: 0.0,
+                })
+            };
             if semantic_gap_improved(
                 semantic_gap,
                 best_observed_semantic_gap,
@@ -1361,8 +2157,19 @@ fn train(args: BridgeArgs) -> Result<()> {
             tb.add_scalar("val/ce_matched", losses.matched, step);
             tb.add_scalar("val/ce_zeroed", losses.zeroed, step);
             tb.add_scalar("val/ce_wrong", losses.wrong, step);
+            tb.add_scalar("val/semantic_ce_matched", losses.matched_semantic, step);
+            tb.add_scalar("val/semantic_ce_wrong", losses.wrong_semantic, step);
             tb.add_scalar("val/zero_gap", zero_gap, step);
             tb.add_scalar("val/semantic_gap", semantic_gap, step);
+            if let Some(ar) = ar_metrics {
+                tb.add_scalar("val/ar_matched_pass_rate", ar.matched_pass_rate, step);
+                tb.add_scalar("val/ar_wrong_pass_rate", ar.wrong_pass_rate, step);
+                tb.add_scalar(
+                    "val/ar_causal_advantage",
+                    ar.matched_pass_rate - ar.wrong_pass_rate,
+                    step,
+                );
+            }
             if !lora_mode {
                 let telemetry_rows = &val_rows[..val_rows.len().min(args.batch.max(1))];
                 let slots = state_conditioning(
@@ -1370,7 +2177,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                     regime,
                     &encoder,
                     &compressor,
-                    &transition,
+                    &world,
                     &encoder_vocab,
                     max_seq,
                     &device,
@@ -1388,7 +2195,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                 let (norm_mean, cond_std) = conditioning_health(&telemetry_cond)?;
                 tb.add_scalar("cond/norm_mean", norm_mean, step);
                 tb.add_scalar("cond/std", cond_std, step);
-                let (telemetry_input, _, _) =
+                let (telemetry_input, _, _, _) =
                     qwen_batch(&tokenizer, telemetry_rows, max_seq, &device)?;
                 for (site, mean, max) in qwen.gate_statistics(&telemetry_input, &telemetry_cond)? {
                     tb.add_scalar(&format!("gate/site_{site}_mean"), mean, step);
@@ -1397,37 +2204,64 @@ fn train(args: BridgeArgs) -> Result<()> {
             }
             tb.flush();
             println!(
-                "bridge val step={step} val_ce_matched={:.4} val_ce_zeroed={:.4} val_ce_wrong={:.4} zero_gap={zero_gap:.4} semantic_gap={semantic_gap:.4}",
-                losses.matched, losses.zeroed, losses.wrong
+                "bridge val step={step} val_ce_matched={:.4} val_ce_zeroed={:.4} val_ce_wrong={:.4} val_semantic_ce_matched={:.4} val_semantic_ce_wrong={:.4} zero_gap={zero_gap:.4} semantic_gap={semantic_gap:.4} ar={:?}",
+                losses.matched,
+                losses.zeroed,
+                losses.wrong,
+                losses.matched_semantic,
+                losses.wrong_semantic,
+                ar_metrics,
             );
-            util::save_varmap_atomic(&train_vars, &latest_path)?;
+            let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
+            resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+            resume_metadata.best_observed_aux_metric = best_observed_semantic_gap
+                .is_finite()
+                .then_some(best_observed_semantic_gap);
+            resume_metadata.last_aux_progress_step = Some(last_semantic_progress_step);
+            util::save_varmap_resume_checkpoint_atomic(&train_vars, &latest_path, &checkpoint_id)?;
             if unfreeze_world {
-                util::save_varmap_atomic(
+                util::save_varmap_resume_checkpoint_atomic(
                     &world_map,
                     &latest_path.with_extension("world.safetensors"),
+                    &checkpoint_id,
                 )?;
             }
-            let eligible = !requires_semantic_gap || semantic_gap >= min_semantic_gap;
-            let selection_score = losses.matched;
-            tb.add_scalar("val/selection_score", selection_score, step);
-            if eligible && selection_score < best_score {
-                best_score = selection_score;
-                best_semantic_gap = semantic_gap;
-                util::save_varmap_atomic(&train_vars, &best_path)?;
-                util::save_varmap_atomic(&train_vars, &args.output)?;
-                if unfreeze_world {
-                    util::save_varmap_atomic(
-                        &world_map,
-                        &args.output.with_extension("world.safetensors"),
-                    )?;
-                    util::save_varmap_atomic(
-                        &world_map,
-                        &best_path.with_extension("world.safetensors"),
-                    )?;
+            if let Some(ar) = ar_metrics {
+                let causal_advantage = ar.matched_pass_rate - ar.wrong_pass_rate;
+                let eligible = (!requires_semantic_gap || semantic_gap >= min_semantic_gap)
+                    && ar.matched_pass_rate >= min_ar_pass_rate
+                    && (!requires_semantic_gap || causal_advantage >= min_ar_advantage);
+                // A one-point change in compile-and-harness pass rate dominates
+                // any plausible teacher-forced CE movement. CE only breaks
+                // ties between checkpoints with the same deployment behavior.
+                let selection_score = (1.0 - ar.matched_pass_rate) * 100.0
+                    + ar.wrong_pass_rate * 25.0
+                    + losses.matched;
+                tb.add_scalar("val/selection_score", selection_score, step);
+                if eligible && selection_score < best_score {
+                    best_score = selection_score;
+                    best_semantic_gap = semantic_gap;
+                    best_ar_pass_rate = ar.matched_pass_rate;
+                    util::save_varmap_atomic(&train_vars, &best_path)?;
+                    util::save_varmap_atomic(&train_vars, &args.output)?;
+                    if unfreeze_world {
+                        util::save_varmap_atomic(
+                            &world_map,
+                            &args.output.with_extension("world.safetensors"),
+                        )?;
+                        util::save_varmap_atomic(
+                            &world_map,
+                            &best_path.with_extension("world.safetensors"),
+                        )?;
+                    }
                 }
             }
-            optimizer.save_state(&optimizer_path)?;
-            util::save_resume_state(
+            util::save_optimizer_resume_checkpoint_atomic(
+                &optimizer,
+                &optimizer_path,
+                &checkpoint_id,
+            )?;
+            util::save_resume_state_with_metadata(
                 &resume_path,
                 &util::TrainingResumeState {
                     stage: resume_stage.clone(),
@@ -1435,29 +2269,68 @@ fn train(args: BridgeArgs) -> Result<()> {
                     best_metric: best_score,
                     best_aux_metric: best_semantic_gap,
                     saved_checkpoint: best_score.is_finite(),
+                    terminal: None,
                 },
+                &resume_metadata,
             )?;
             if requires_semantic_gap
                 && semantic_patience > 0
                 && step >= semantic_warmup
                 && step.saturating_sub(last_semantic_progress_step) >= semantic_patience
             {
+                if best_semantic_gap >= min_semantic_gap {
+                    println!(
+                        "Bridge early stopping at step {step}: selected semantic_gap={best_semantic_gap:.4}, observed_best={best_observed_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
+                    );
+                    stopped_early = true;
+                    break;
+                }
+                write_bridge_nonqualification_status(
+                    BridgeNonqualificationReason::SemanticPlateau,
+                    step,
+                )?;
                 bail!(
-                    "semantic conditioning plateau at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
+                    "semantic conditioning plateau without a qualifying checkpoint at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
                 );
             }
         }
     }
+    if requires_semantic_gap && best_semantic_gap < min_semantic_gap {
+        tb.finish()?;
+        write_bridge_nonqualification_status(
+            BridgeNonqualificationReason::BudgetExhausted,
+            completed_step,
+        )?;
+        bail!(
+            "no bridge checkpoint passed the joint autoregressive/causal gate: selected_semantic_gap={best_semantic_gap:.4}, required_semantic_gap={min_semantic_gap:.4}, required_ar_pass_rate={min_ar_pass_rate:.4}, required_ar_advantage={min_ar_advantage:.4}; latest={}",
+            latest_path.display()
+        );
+    }
     println!(
-        "Best bridge saved to {} (selection_score={best_score:.4}, semantic_gap={best_semantic_gap:.4}); latest={}",
+        "Best bridge saved to {} (selection_score={best_score:.4}, ar_pass_rate={best_ar_pass_rate:.4}, semantic_gap={best_semantic_gap:.4}); latest={}",
         args.output.display(),
         latest_path.display()
     );
-    if requires_semantic_gap && best_semantic_gap < min_semantic_gap {
-        bail!(
-            "no bridge checkpoint reached the required semantic conditioning gap: selected={best_semantic_gap:.4}, required={min_semantic_gap:.4}"
-        );
-    }
+    resume_metadata.best_observed_aux_metric = best_observed_semantic_gap
+        .is_finite()
+        .then_some(best_observed_semantic_gap);
+    resume_metadata.last_aux_progress_step = Some(last_semantic_progress_step);
+    util::save_resume_state_with_metadata(
+        &resume_path,
+        &util::TrainingResumeState {
+            stage: resume_stage,
+            step: completed_step,
+            best_metric: best_score,
+            best_aux_metric: best_semantic_gap,
+            saved_checkpoint: true,
+            terminal: Some(if stopped_early {
+                util::TrainingTerminal::EarlyStopped
+            } else {
+                util::TrainingTerminal::TargetReached
+            }),
+        },
+        &resume_metadata,
+    )?;
     tb.finish()?;
     Ok(())
 }
@@ -1476,6 +2349,30 @@ pub fn try_run_eval_bridge(args: &[String]) -> Result<bool> {
 mod tests {
     use super::*;
     use candle_nn::Optimizer;
+
+    #[test]
+    fn fine_grained_alignment_requires_each_target_token_in_some_slot() -> Result<()> {
+        let device = Device::Cpu;
+        let target = Tensor::from_vec(vec![1f32, 0.0, 0.0, 1.0], (1, 2, 2), &device)?;
+        let mask = Tensor::ones((1, 2), DType::F32, &device)?;
+        let complete_slots = target.clone();
+        let collapsed_slots = Tensor::from_vec(vec![1f32, 0.0, 1.0, 0.0], (1, 2, 2), &device)?;
+
+        let complete = util::scalar_f32(&fine_grained_token_slot_alignment(
+            &target,
+            &mask,
+            &complete_slots,
+        )?)?;
+        let collapsed = util::scalar_f32(&fine_grained_token_slot_alignment(
+            &target,
+            &mask,
+            &collapsed_slots,
+        )?)?;
+
+        assert!(complete.abs() < 1e-6);
+        assert!(collapsed > complete + 0.4);
+        Ok(())
+    }
 
     #[test]
     fn conditioning_text_never_contains_completion() {
@@ -1531,6 +2428,58 @@ mod tests {
     }
 
     #[test]
+    fn semantic_completion_spans_target_api_identifiers() {
+        let completion = "package solution\n\nfunc Solve(xs []float64, k int) float64 {\n    return veclab.Alpha(xs, k) + veclab.Beta(xs, k)\n}\n";
+        let spans = semantic_completion_spans(completion);
+        assert_eq!(
+            spans
+                .into_iter()
+                .map(|(start, end)| &completion[start..end])
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta"]
+        );
+    }
+
+    #[test]
+    fn eval_counterfactual_prompt_keeps_only_the_signature() {
+        let prompt = counterfactual_bridge_prompt(
+            "Evaluation harness: `func Solve(values []float64, n int) float64` must call a hidden API.",
+        );
+        assert!(prompt.ends_with("func Solve(values []float64, n int) float64"));
+        assert!(!prompt.contains("hidden API"));
+    }
+
+    #[test]
+    fn code_examples_train_only_the_body_after_a_source_scaffold() -> Result<()> {
+        let completion = "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(xs []float64) float64 {\n    return veclab.Alpha(xs)\n}\n";
+        let text = qwen_example_text("func Solve(xs []float64) float64", completion)?;
+        assert!(text.prompt.contains("package solution"));
+        assert!(text.prompt.ends_with("func Solve(xs []float64) float64 {"));
+        assert_eq!(
+            text.source_prefix.as_deref(),
+            Some(&completion[..completion.find('{').unwrap() + 1])
+        );
+        assert_eq!(text.target, "\n    return veclab.Alpha(xs)\n}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn generation_stops_only_after_the_outer_go_body_closes() {
+        assert!(!go_outer_function_closed(
+            "package solution\nfunc Solve() string {\nreturn \"}\""
+        ));
+        assert!(!go_outer_function_closed(
+            "package solution\nfunc Solve() int {\nif true { return 1 }"
+        ));
+        assert!(go_outer_function_closed(
+            "package solution\nfunc Solve() int {\nif true { return 1 }\nreturn 0\n}"
+        ));
+        assert!(!go_outer_function_closed(
+            "package solution\nfunc Solve() string {\nreturn `}`"
+        ));
+    }
+
+    #[test]
     fn bridge_validation_is_function_disjoint() -> Result<()> {
         let rows = (1..=100)
             .flat_map(|function_id| {
@@ -1542,11 +2491,41 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let (train, validation) = split_bridge_rows(rows, false)?;
+        let (train, validation) = split_bridge_rows(rows)?;
         assert!(train.iter().all(|row| row.function_id <= 80));
         assert!(validation
             .iter()
             .all(|row| (81..=100).contains(&row.function_id)));
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_grounding_keeps_heldout_docs_but_not_heldout_code() -> Result<()> {
+        let rows = vec![
+            VeclabTaskRow {
+                task: "[fn:150] docs query".into(),
+                completion: "func Heldout() documentation".into(),
+                function_id: 150,
+                docs: String::new(),
+            },
+            VeclabTaskRow {
+                task: "[fn:150] code task".into(),
+                completion: "package solution\nfunc Solve() {}".into(),
+                function_id: 150,
+                docs: String::new(),
+            },
+            VeclabTaskRow {
+                task: "[fn:090] validation".into(),
+                completion: "package solution\nfunc Solve() {}".into(),
+                function_id: 90,
+                docs: String::new(),
+            },
+        ];
+        let (train, validation) = split_bridge_rows(rows)?;
+        assert_eq!(train.len(), 1);
+        assert_eq!(train[0].function_id, 150);
+        assert!(!train[0].completion.starts_with("package solution"));
+        assert_eq!(validation.len(), 1);
         Ok(())
     }
 

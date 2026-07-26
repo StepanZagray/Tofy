@@ -960,6 +960,71 @@ pub struct TrainingResumeState {
     pub best_metric: f32,
     pub best_aux_metric: f32,
     pub saved_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TrainingTerminal>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResumeCheckpointMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_improvement_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_observed_aux_metric: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_aux_progress_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_batch: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grad_accum: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_batch: Option<usize>,
+}
+
+impl ResumeCheckpointMetadata {
+    pub fn validate_and_set_batch_schedule(
+        &mut self,
+        physical_batch: usize,
+        grad_accum: usize,
+    ) -> Result<()> {
+        if physical_batch == 0 || grad_accum == 0 {
+            anyhow::bail!("physical batch and gradient accumulation must both be positive");
+        }
+        let effective_batch = physical_batch
+            .checked_mul(grad_accum)
+            .context("effective batch overflow")?;
+        match (self.physical_batch, self.grad_accum, self.effective_batch) {
+            (None, None, None) => {}
+            (Some(saved_batch), Some(saved_accum), Some(saved_effective)) => {
+                let recomputed = saved_batch
+                    .checked_mul(saved_accum)
+                    .context("saved effective batch overflow")?;
+                if recomputed != saved_effective {
+                    anyhow::bail!(
+                        "resume batch metadata is inconsistent: {saved_batch} * {saved_accum} != {saved_effective}"
+                    );
+                }
+                if saved_effective != effective_batch {
+                    anyhow::bail!(
+                        "resume would change effective batch from {saved_effective} to {effective_batch}"
+                    );
+                }
+            }
+            _ => anyhow::bail!("resume batch metadata is incomplete"),
+        }
+        self.physical_batch = Some(physical_batch);
+        self.grad_accum = Some(grad_accum);
+        self.effective_batch = Some(effective_batch);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingTerminal {
+    TargetReached,
+    EarlyStopped,
 }
 
 impl TrainingResumeState {
@@ -970,6 +1035,7 @@ impl TrainingResumeState {
             best_metric: f32::MAX,
             best_aux_metric: f32::MAX,
             saved_checkpoint: false,
+            terminal: None,
         }
     }
 }
@@ -1000,6 +1066,51 @@ pub fn save_varmap_atomic(varmap: &VarMap, path: &Path) -> Result<()> {
     Ok(())
 }
 
+const RESUME_CHECKPOINT_ID_TENSOR: &str = "__tofy_resume_checkpoint_id";
+
+pub fn new_resume_checkpoint_id(stage: &str, step: usize) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{stage}-{step}-{}-{nanos}", std::process::id())
+}
+
+fn insert_resume_checkpoint_id(
+    tensors: &mut HashMap<String, Tensor>,
+    checkpoint_id: &str,
+) -> Result<()> {
+    tensors.insert(
+        RESUME_CHECKPOINT_ID_TENSOR.to_string(),
+        Tensor::from_vec(
+            checkpoint_id.as_bytes().to_vec(),
+            checkpoint_id.len(),
+            &Device::Cpu,
+        )?,
+    );
+    Ok(())
+}
+
+pub fn save_varmap_resume_checkpoint_atomic(
+    varmap: &VarMap,
+    path: &Path,
+    checkpoint_id: &str,
+) -> Result<()> {
+    let mut tensors = varmap_tensor_snapshot(varmap)?;
+    insert_resume_checkpoint_id(&mut tensors, checkpoint_id)?;
+    save_tensor_map_atomic(&tensors, path)
+}
+
+pub fn save_optimizer_resume_checkpoint_atomic(
+    opt: &TrainOptimizer,
+    path: &Path,
+    checkpoint_id: &str,
+) -> Result<()> {
+    let mut tensors = opt.state_tensors_snapshot()?;
+    insert_resume_checkpoint_id(&mut tensors, checkpoint_id)?;
+    save_tensor_map_atomic(&tensors, path)
+}
+
 pub fn load_resume_state(path: &Path, expected_stage: &str) -> Result<Option<TrainingResumeState>> {
     if !path.exists() {
         return Ok(None);
@@ -1017,13 +1128,185 @@ pub fn load_resume_state(path: &Path, expected_stage: &str) -> Result<Option<Tra
     Ok(Some(state))
 }
 
+pub fn load_resume_checkpoint_metadata(path: &Path) -> Result<ResumeCheckpointMetadata> {
+    if !path.exists() {
+        return Ok(ResumeCheckpointMetadata::default());
+    }
+    let text = fs::read_to_string(path)?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parse resume checkpoint metadata from {:?}", path))
+}
+
 pub fn save_resume_state(path: &Path, state: &TrainingResumeState) -> Result<()> {
+    save_resume_state_with_metadata(path, state, &ResumeCheckpointMetadata::default())
+}
+
+pub fn save_resume_state_with_metadata(
+    path: &Path,
+    state: &TrainingResumeState,
+    metadata: &ResumeCheckpointMetadata,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-    fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
+    let mut value = serde_json::to_value(state)?;
+    let object = value
+        .as_object_mut()
+        .context("training resume state must serialize as a JSON object")?;
+    if let Some(checkpoint_id) = &metadata.checkpoint_id {
+        object.insert(
+            "checkpoint_id".to_string(),
+            serde_json::Value::String(checkpoint_id.clone()),
+        );
+    }
+    if let Some(step) = metadata.last_improvement_step {
+        object.insert("last_improvement_step".to_string(), step.into());
+    }
+    if let Some(metric) = metadata.best_observed_aux_metric {
+        object.insert(
+            "best_observed_aux_metric".to_string(),
+            serde_json::to_value(metric)?,
+        );
+    }
+    if let Some(step) = metadata.last_aux_progress_step {
+        object.insert("last_aux_progress_step".to_string(), step.into());
+    }
+    if let Some(batch) = metadata.physical_batch {
+        object.insert("physical_batch".to_string(), batch.into());
+    }
+    if let Some(grad_accum) = metadata.grad_accum {
+        object.insert("grad_accum".to_string(), grad_accum.into());
+    }
+    if let Some(effective_batch) = metadata.effective_batch {
+        object.insert("effective_batch".to_string(), effective_batch.into());
+    }
+    fs::write(&tmp_path, serde_json::to_string_pretty(&value)?)?;
     fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn safetensor_checkpoint_id(path: &Path) -> Result<Option<String>> {
+    use candle_core::safetensors::MmapedSafetensors;
+
+    let mapped = unsafe { MmapedSafetensors::new(path) }
+        .with_context(|| format!("read resume checkpoint {:?}", path))?;
+    let names = mapped
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    if !names.contains(RESUME_CHECKPOINT_ID_TENSOR) {
+        return Ok(None);
+    }
+    let bytes = mapped
+        .load(RESUME_CHECKPOINT_ID_TENSOR, &Device::Cpu)?
+        .to_dtype(DType::U8)?
+        .flatten_all()?
+        .to_vec1::<u8>()?;
+    Ok(Some(String::from_utf8(bytes).with_context(|| {
+        format!("invalid checkpoint identifier in {:?}", path)
+    })?))
+}
+
+fn optimizer_checkpoint_step(path: &Path) -> Result<Option<usize>> {
+    use candle_core::safetensors::MmapedSafetensors;
+
+    let mapped = unsafe { MmapedSafetensors::new(path) }
+        .with_context(|| format!("read optimizer checkpoint {:?}", path))?;
+    let names = mapped
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    if !names.contains("__step") {
+        return Ok(None);
+    }
+    let values = mapped
+        .load("__step", &Device::Cpu)?
+        .to_dtype(DType::I64)?
+        .flatten_all()?
+        .to_vec1::<i64>()?;
+    Ok(values.first().copied().map(|value| value.max(0) as usize))
+}
+
+pub fn validate_resume_checkpoint_tuple(
+    state: Option<&TrainingResumeState>,
+    metadata: &ResumeCheckpointMetadata,
+    weight_paths: &[&Path],
+    optimizer_path: &Path,
+) -> Result<()> {
+    let mut required = weight_paths.to_vec();
+    required.push(optimizer_path);
+    let present = required.iter().filter(|path| path.exists()).count();
+
+    let Some(state) = state else {
+        if present > 0 {
+            anyhow::bail!(
+                "resume checkpoint is incomplete: resume state is missing while {present}/{} tensor sidecars exist",
+                required.len()
+            );
+        }
+        return Ok(());
+    };
+    if state.step == 0 {
+        if present > 0 {
+            anyhow::bail!(
+                "resume checkpoint at step 0 must not reuse existing tensor sidecars ({present}/{} present)",
+                required.len()
+            );
+        }
+        return Ok(());
+    }
+    if present != required.len() {
+        let missing = required
+            .iter()
+            .filter(|path| !path.exists())
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "resume checkpoint tuple for step {} is incomplete; missing: {missing}",
+            state.step
+        );
+    }
+    let optimizer_step = optimizer_checkpoint_step(optimizer_path)?.context(format!(
+        "optimizer checkpoint {} has no step",
+        optimizer_path.display()
+    ))?;
+    if optimizer_step != state.step {
+        anyhow::bail!(
+            "resume checkpoint step mismatch: state={} optimizer={} ({})",
+            state.step,
+            optimizer_step,
+            optimizer_path.display()
+        );
+    }
+
+    match &metadata.checkpoint_id {
+        Some(expected) => {
+            for path in required {
+                let actual = safetensor_checkpoint_id(path)?.with_context(|| {
+                    format!(
+                        "resume checkpoint {} is missing checkpoint identifier {expected:?}",
+                        path.display()
+                    )
+                })?;
+                if actual != *expected {
+                    anyhow::bail!(
+                        "resume checkpoint generation mismatch: state={expected:?}, file={actual:?} ({})",
+                        path.display()
+                    );
+                }
+            }
+        }
+        None => {
+            anyhow::bail!(
+                "legacy resume checkpoint at step {} has no generation identifier; start a fresh run rather than risk pairing stale weights with newer optimizer state",
+                state.step
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1126,30 +1409,71 @@ pub enum CheckpointArtifact {
     },
 }
 
-pub fn varmap_checkpoint_artifact(varmap: &VarMap, path: &Path) -> Result<CheckpointArtifact> {
+pub fn varmap_checkpoint_artifact(
+    varmap: &VarMap,
+    path: &Path,
+    checkpoint_id: &str,
+) -> Result<CheckpointArtifact> {
+    let mut tensors = varmap_tensor_snapshot(varmap)?;
+    insert_resume_checkpoint_id(&mut tensors, checkpoint_id)?;
     Ok(CheckpointArtifact::TensorMap {
         path: path.to_path_buf(),
-        tensors: varmap_tensor_snapshot(varmap)?,
+        tensors,
     })
 }
 
 pub fn optimizer_checkpoint_artifact(
     opt: &TrainOptimizer,
     path: &Path,
+    checkpoint_id: &str,
 ) -> Result<CheckpointArtifact> {
+    let mut tensors = opt.state_tensors_snapshot()?;
+    insert_resume_checkpoint_id(&mut tensors, checkpoint_id)?;
     Ok(CheckpointArtifact::TensorMap {
         path: path.to_path_buf(),
-        tensors: opt.state_tensors_snapshot()?,
+        tensors,
     })
 }
 
 pub fn resume_checkpoint_artifact(
     state: &TrainingResumeState,
+    metadata: &ResumeCheckpointMetadata,
     path: &Path,
 ) -> Result<CheckpointArtifact> {
+    let mut value = serde_json::to_value(state)?;
+    let object = value
+        .as_object_mut()
+        .context("training resume state must serialize as a JSON object")?;
+    if let Some(checkpoint_id) = &metadata.checkpoint_id {
+        object.insert(
+            "checkpoint_id".to_string(),
+            serde_json::Value::String(checkpoint_id.clone()),
+        );
+    }
+    if let Some(step) = metadata.last_improvement_step {
+        object.insert("last_improvement_step".to_string(), step.into());
+    }
+    if let Some(metric) = metadata.best_observed_aux_metric {
+        object.insert(
+            "best_observed_aux_metric".to_string(),
+            serde_json::to_value(metric)?,
+        );
+    }
+    if let Some(step) = metadata.last_aux_progress_step {
+        object.insert("last_aux_progress_step".to_string(), step.into());
+    }
+    if let Some(batch) = metadata.physical_batch {
+        object.insert("physical_batch".to_string(), batch.into());
+    }
+    if let Some(grad_accum) = metadata.grad_accum {
+        object.insert("grad_accum".to_string(), grad_accum.into());
+    }
+    if let Some(effective_batch) = metadata.effective_batch {
+        object.insert("effective_batch".to_string(), effective_batch.into());
+    }
     Ok(CheckpointArtifact::Json {
         path: path.to_path_buf(),
-        text: serde_json::to_string_pretty(state)?,
+        text: serde_json::to_string_pretty(&value)?,
     })
 }
 
@@ -1395,6 +1719,25 @@ pub fn accumulate_gradients(
     Ok(())
 }
 
+pub fn scale_accumulated_gradients(
+    accumulated: &mut Option<GradStore>,
+    train_vars: &[Var],
+    scale: f64,
+) -> Result<()> {
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return Ok(());
+    }
+    let Some(grads) = accumulated.as_mut() else {
+        return Ok(());
+    };
+    for var in train_vars {
+        if let Some(grad) = grads.remove(var) {
+            grads.insert(var, grad.affine(scale, 0.0)?.detach());
+        }
+    }
+    Ok(())
+}
+
 pub fn optimizer_step_from_accumulated<O: Optimizer>(
     optimizer: &mut O,
     accumulated: &mut Option<GradStore>,
@@ -1516,7 +1859,10 @@ pub fn clip_accumulated_gradients_device(
     let mut total_sq: Option<Tensor> = None;
     for var in train_vars {
         if let Some(grad) = grads.get(var) {
-            let sq = grad.sqr()?.sum_all()?;
+            // Projector BatchNorm parameters intentionally stay in F32 while
+            // the rest of the model trains in BF16. Accumulate a common F32
+            // norm so mixed-precision parameter groups can be clipped together.
+            let sq = grad.to_dtype(DType::F32)?.sqr()?.sum_all()?;
             total_sq = Some(match total_sq {
                 Some(total) => total.broadcast_add(&sq)?,
                 None => sq,
@@ -1608,6 +1954,248 @@ impl VramTracker {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn legacy_resume_state_without_terminal_remains_readable() -> Result<()> {
+        let text = r#"{
+                "stage": "world",
+                "step": 100,
+                "best_metric": 0.25,
+                "best_aux_metric": 0.25,
+                "saved_checkpoint": true,
+                "last_improvement_step": 80
+            }"#;
+        let state: TrainingResumeState = serde_json::from_str(text)?;
+        let metadata: ResumeCheckpointMetadata = serde_json::from_str(text)?;
+        assert_eq!(state.terminal, None);
+        assert_eq!(metadata.checkpoint_id, None);
+        assert_eq!(metadata.last_improvement_step, Some(80));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_checkpoint_metadata_round_trips_in_state_file() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "tofy-resume-metadata-test-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let state = TrainingResumeState {
+            stage: "bridge".to_string(),
+            step: 25,
+            best_metric: 0.4,
+            best_aux_metric: 0.03,
+            saved_checkpoint: true,
+            terminal: None,
+        };
+        let metadata = ResumeCheckpointMetadata {
+            checkpoint_id: Some("bridge-25-test".to_string()),
+            last_improvement_step: None,
+            best_observed_aux_metric: Some(0.04),
+            last_aux_progress_step: Some(20),
+            physical_batch: Some(8),
+            grad_accum: Some(16),
+            effective_batch: Some(128),
+        };
+        save_resume_state_with_metadata(&path, &state, &metadata)?;
+        let loaded_state = load_resume_state(&path, "bridge")?.context("missing resume state")?;
+        let loaded_metadata = load_resume_checkpoint_metadata(&path)?;
+        assert_eq!(loaded_state.step, 25);
+        assert_eq!(
+            loaded_metadata.checkpoint_id.as_deref(),
+            Some("bridge-25-test")
+        );
+        assert_eq!(loaded_metadata.best_observed_aux_metric, Some(0.04));
+        assert_eq!(loaded_metadata.last_aux_progress_step, Some(20));
+        assert_eq!(loaded_metadata.physical_batch, Some(8));
+        assert_eq!(loaded_metadata.grad_accum, Some(16));
+        assert_eq!(loaded_metadata.effective_batch, Some(128));
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_batch_schedule_allows_only_equal_effective_batch() -> Result<()> {
+        let mut metadata = ResumeCheckpointMetadata::default();
+        metadata.validate_and_set_batch_schedule(16, 4)?;
+        metadata.validate_and_set_batch_schedule(8, 8)?;
+        assert_eq!(metadata.physical_batch, Some(8));
+        assert_eq!(metadata.grad_accum, Some(8));
+        assert_eq!(metadata.effective_batch, Some(64));
+        assert!(metadata.validate_and_set_batch_schedule(8, 4).is_err());
+
+        let mut incomplete = ResumeCheckpointMetadata {
+            physical_batch: Some(8),
+            ..ResumeCheckpointMetadata::default()
+        };
+        assert!(incomplete.validate_and_set_batch_schedule(8, 8).is_err());
+        assert!(ResumeCheckpointMetadata::default()
+            .validate_and_set_batch_schedule(usize::MAX, 2)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn async_resume_artifact_keeps_batch_schedule_metadata() -> Result<()> {
+        let state = TrainingResumeState {
+            stage: "latent".into(),
+            step: 100,
+            best_metric: 0.1,
+            best_aux_metric: 0.1,
+            saved_checkpoint: true,
+            terminal: None,
+        };
+        let mut metadata = ResumeCheckpointMetadata::default();
+        metadata.validate_and_set_batch_schedule(8, 8)?;
+        let artifact = resume_checkpoint_artifact(&state, &metadata, Path::new("resume.json"))?;
+        let CheckpointArtifact::Json { text, .. } = artifact else {
+            panic!("resume checkpoint artifact must be JSON");
+        };
+        let decoded: ResumeCheckpointMetadata = serde_json::from_str(&text)?;
+        assert_eq!(decoded.physical_batch, Some(8));
+        assert_eq!(decoded.grad_accum, Some(8));
+        assert_eq!(decoded.effective_batch, Some(64));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_partial_resume_tuple_fails_closed() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "tofy-resume-partial-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base)?;
+        let weight_path = base.join("train.safetensors");
+        save_tensor_map_atomic(
+            &HashMap::from([(
+                "weight".to_string(),
+                Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu)?,
+            )]),
+            &weight_path,
+        )?;
+        let state = TrainingResumeState {
+            stage: "world".to_string(),
+            step: 10,
+            best_metric: 0.5,
+            best_aux_metric: 0.5,
+            saved_checkpoint: true,
+            terminal: None,
+        };
+        let optimizer_path = base.join("optimizer.safetensors");
+        let err = validate_resume_checkpoint_tuple(
+            Some(&state),
+            &ResumeCheckpointMetadata::default(),
+            &[&weight_path],
+            &optimizer_path,
+        )
+        .expect_err("partial legacy resume must be rejected");
+        assert!(err.to_string().contains("incomplete"));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn complete_legacy_resume_tuple_fails_closed() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "tofy-resume-legacy-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base)?;
+        let weight_path = base.join("train.safetensors");
+        let optimizer_path = base.join("optimizer.safetensors");
+        save_tensor_map_atomic(
+            &HashMap::from([(
+                "weight".to_string(),
+                Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu)?,
+            )]),
+            &weight_path,
+        )?;
+        save_tensor_map_atomic(
+            &HashMap::from([(
+                "__step".to_string(),
+                Tensor::from_vec(vec![10i64], 1, &Device::Cpu)?,
+            )]),
+            &optimizer_path,
+        )?;
+        let state = TrainingResumeState {
+            stage: "world".to_string(),
+            step: 10,
+            best_metric: 0.5,
+            best_aux_metric: 0.5,
+            saved_checkpoint: true,
+            terminal: None,
+        };
+        let error = validate_resume_checkpoint_tuple(
+            Some(&state),
+            &ResumeCheckpointMetadata::default(),
+            &[&weight_path],
+            &optimizer_path,
+        )
+        .expect_err("legacy tuples without generation identity must be rejected");
+        assert!(error.to_string().contains("no generation identifier"));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_generation_must_match_every_tuple_member() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "tofy-resume-generation-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base)?;
+        let weight_path = base.join("train.safetensors");
+        let optimizer_path = base.join("optimizer.safetensors");
+        let mut weights = HashMap::from([(
+            "weight".to_string(),
+            Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu)?,
+        )]);
+        insert_resume_checkpoint_id(&mut weights, "generation-a")?;
+        save_tensor_map_atomic(&weights, &weight_path)?;
+        let mut optimizer = HashMap::from([(
+            "__step".to_string(),
+            Tensor::from_vec(vec![10i64], 1, &Device::Cpu)?,
+        )]);
+        insert_resume_checkpoint_id(&mut optimizer, "generation-b")?;
+        save_tensor_map_atomic(&optimizer, &optimizer_path)?;
+        let state = TrainingResumeState {
+            stage: "world".to_string(),
+            step: 10,
+            best_metric: 0.5,
+            best_aux_metric: 0.5,
+            saved_checkpoint: true,
+            terminal: None,
+        };
+        let metadata = ResumeCheckpointMetadata {
+            checkpoint_id: Some("generation-a".to_string()),
+            ..ResumeCheckpointMetadata::default()
+        };
+        let err = validate_resume_checkpoint_tuple(
+            Some(&state),
+            &metadata,
+            &[&weight_path],
+            &optimizer_path,
+        )
+        .expect_err("mixed checkpoint generations must be rejected");
+        assert!(err.to_string().contains("generation mismatch"));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
 
     #[test]
     fn mixed_precision_optimizer_keeps_f32_master_weights() -> Result<()> {
@@ -1728,6 +2316,21 @@ mod tests {
                 .to_vec2::<f32>()?
         };
         assert_eq!(head, vec![vec![0.5, 1.0, 1.5], vec![2.0, 2.5, 3.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn accumulated_gradients_can_be_scaled_after_backward() -> Result<()> {
+        let device = Device::Cpu;
+        let var = Var::from_tensor(&Tensor::new(2.0f32, &device)?)?;
+        let mut grads = Some(var.as_tensor().sqr()?.backward()?);
+        scale_accumulated_gradients(&mut grads, std::slice::from_ref(&var), 0.25)?;
+        let scaled = grads
+            .as_ref()
+            .and_then(|store| store.get(&var))
+            .context("missing scaled gradient")?
+            .to_scalar::<f32>()?;
+        assert_eq!(scaled, 1.0);
         Ok(())
     }
 

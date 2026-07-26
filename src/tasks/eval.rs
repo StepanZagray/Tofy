@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -17,17 +18,17 @@ use crate::tasks::veclab::{load_docs_map, VeclabTaskRow};
 use crate::tasks::world_support::different_group_conditioning_latent;
 
 #[derive(Clone, Deserialize)]
-struct EvalTask {
-    id: String,
+pub(crate) struct EvalTask {
+    pub(crate) id: String,
     #[serde(default)]
-    fn_ids: Vec<usize>,
-    subset: String,
-    task: String,
+    pub(crate) fn_ids: Vec<usize>,
+    pub(crate) subset: String,
+    pub(crate) task: String,
     #[serde(default)]
-    must_call: Vec<String>,
-    harness_dir: String,
+    pub(crate) must_call: Vec<String>,
+    pub(crate) harness_dir: String,
     #[serde(default = "default_max_new")]
-    max_new_tokens: usize,
+    pub(crate) max_new_tokens: usize,
 }
 
 fn default_max_new() -> usize {
@@ -46,13 +47,14 @@ struct Metrics {
 struct Rates {
     tasks: usize,
     compile_rate: f64,
+    passed: usize,
     suite_pass_rate: f64,
     failure_categories: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum FailureCategory {
+pub(crate) enum FailureCategory {
     CompileError,
     TestsFailed,
     MustCallViolation,
@@ -69,6 +71,10 @@ impl FailureCategory {
             Self::Timeout => "timeout",
             Self::Pass => "pass",
         }
+    }
+
+    pub(crate) fn is_pass(self) -> bool {
+        matches!(self, Self::Pass)
     }
 }
 
@@ -90,10 +96,18 @@ struct PairedCausalMetrics {
     control_only: usize,
     neither_pass: usize,
     matched_advantage: f64,
+    one_sided_p_value: f64,
 }
 
 #[derive(Serialize)]
 struct EvalReport {
+    schema_version: u32,
+    arm: String,
+    suite_path: String,
+    suite_sha256: String,
+    task_offset: usize,
+    task_limit: Option<usize>,
+    selected_task_ids: Vec<String>,
     regime: String,
     bridge_model: String,
     results: BTreeMap<String, BTreeMap<String, Rates>>,
@@ -142,12 +156,46 @@ fn paired_causal_controls(
         for metrics in subset.values_mut() {
             metrics.matched_advantage = (metrics.matched_only as f64 - metrics.control_only as f64)
                 / metrics.tasks.max(1) as f64;
+            metrics.one_sided_p_value =
+                exact_one_sided_sign_test(metrics.matched_only, metrics.control_only);
         }
     }
     controls
 }
 
-fn load_suite(path: &Path) -> Result<Vec<EvalTask>> {
+pub(crate) fn exact_one_sided_sign_test(matched_only: usize, control_only: usize) -> f64 {
+    let discordant = matched_only + control_only;
+    if discordant == 0 {
+        return 1.0;
+    }
+    let mut probability = 2f64.powi(-(discordant as i32));
+    let mut upper_tail = 0.0;
+    for successes in 0..=discordant {
+        if successes >= matched_only {
+            upper_tail += probability;
+        }
+        if successes < discordant {
+            probability *= (discordant - successes) as f64 / (successes + 1) as f64;
+        }
+    }
+    upper_tail.min(1.0)
+}
+
+fn optional_probability_env(name: &str) -> Result<Option<f64>> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = raw
+        .to_string_lossy()
+        .parse::<f64>()
+        .with_context(|| format!("{name} must be a probability in [0,1]"))?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("{name} must be a finite probability in [0,1], got {raw:?}");
+    }
+    Ok(Some(value))
+}
+
+pub(crate) fn load_suite(path: &Path) -> Result<Vec<EvalTask>> {
     fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -197,7 +245,57 @@ fn run_go_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<C
     }
 }
 
-fn compile_and_test(task: &EvalTask, code: &str, condition: &str) -> Result<FailureCategory> {
+fn executable_api_call(code: &str, required: &str) -> bool {
+    fn contains_exact_selector_call(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        qualifier: &str,
+        field: &str,
+    ) -> bool {
+        if node.kind() == "call_expression" {
+            let exact_selector = node
+                .child_by_field_name("function")
+                .filter(|function| function.kind() == "selector_expression")
+                .and_then(|function| {
+                    Some((
+                        function.child_by_field_name("operand")?,
+                        function.child_by_field_name("field")?,
+                    ))
+                })
+                .is_some_and(|(operand, selected)| {
+                    operand.kind() == "identifier"
+                        && operand.utf8_text(source).ok() == Some(qualifier)
+                        && selected.utf8_text(source).ok() == Some(field)
+                });
+            if exact_selector {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .any(|child| contains_exact_selector_call(child, source, qualifier, field));
+        found
+    }
+
+    let (qualifier, field) = required.rsplit_once('.').unwrap_or(("veclab", required));
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    parser.parse(code, None).is_some_and(|tree| {
+        contains_exact_selector_call(tree.root_node(), code.as_bytes(), qualifier, field)
+    })
+}
+
+pub(crate) fn compile_and_test(
+    task: &EvalTask,
+    code: &str,
+    condition: &str,
+) -> Result<FailureCategory> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let dir = std::env::temp_dir().join(format!("tofy-veclab-{}-{condition}-{stamp}", task.id));
     fs::create_dir_all(&dir)?;
@@ -220,7 +318,11 @@ fn compile_and_test(task: &EvalTask, code: &str, condition: &str) -> Result<Fail
             .and_then(|value| value.parse().ok())
             .unwrap_or(30),
     );
-    let category = if !task.must_call.iter().all(|name| code.contains(name)) {
+    let category = if !task
+        .must_call
+        .iter()
+        .all(|name| executable_api_call(code, name))
+    {
         FailureCategory::MustCallViolation
     } else {
         match run_go_with_timeout(&dir, &["build", "."], timeout)? {
@@ -242,6 +344,7 @@ fn rate(metrics: &Metrics) -> Rates {
     Rates {
         tasks: metrics.tasks,
         compile_rate: metrics.compiled as f64 / denom,
+        passed: metrics.passed,
         suite_pass_rate: metrics.passed as f64 / denom,
         failure_categories: metrics.categories.clone(),
     }
@@ -264,17 +367,30 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         Path::new(&args[5]),
         Path::new(&args[6]),
     )?;
-    let mut tasks = load_suite(Path::new(&args[7]))?;
-    if let Some(offset) = std::env::var("TOFY_EVAL_TASK_OFFSET")
+    let suite_path = Path::new(&args[7]);
+    let suite_bytes = fs::read(suite_path)
+        .with_context(|| format!("read evaluation suite {}", suite_path.display()))?;
+    let suite_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(&suite_bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut tasks = load_suite(suite_path)?;
+    let task_offset = std::env::var("TOFY_EVAL_TASK_OFFSET")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-    {
-        tasks = tasks.into_iter().skip(offset).collect();
+        .unwrap_or(0);
+    if task_offset > 0 {
+        tasks = tasks.into_iter().skip(task_offset).collect();
     }
-    if let Some(limit) = std::env::var("TOFY_EVAL_MAX_TASKS")
+    let task_limit = std::env::var("TOFY_EVAL_MAX_TASKS")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-    {
+        .and_then(|value| value.parse::<usize>().ok());
+    if let Some(limit) = task_limit {
         tasks.truncate(limit.max(1));
     }
     if tasks.is_empty() {
@@ -296,15 +412,6 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
             }
         })
         .collect::<Vec<_>>();
-    let cond_parts = rows
-        .chunks(8)
-        .map(|chunk| runtime.conditioning(chunk).map(|tensor| tensor.detach()))
-        .collect::<Result<Vec<_>>>()?;
-    let cond_refs = cond_parts.iter().collect::<Vec<_>>();
-    let all_cond = candle_core::Tensor::cat(&cond_refs, 0)?;
-    let function_ids = rows.iter().map(|row| row.function_id).collect::<Vec<_>>();
-    let shuffled = different_group_conditioning_latent(&all_cond, &function_ids, 7)?;
-    let swapped = different_group_conditioning_latent(&all_cond, &function_ids, 1)?;
     let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
     if !matches!(
         eval_mode.as_str(),
@@ -312,6 +419,19 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     ) {
         bail!("TOFY_EVAL_MODE must be bridge, floor, rag, or unconditioned");
     }
+    let all_cond = if eval_mode == "bridge" {
+        let cond_parts = rows
+            .chunks(8)
+            .map(|chunk| runtime.conditioning(chunk).map(|tensor| tensor.detach()))
+            .collect::<Result<Vec<_>>>()?;
+        let cond_refs = cond_parts.iter().collect::<Vec<_>>();
+        candle_core::Tensor::cat(&cond_refs, 0)?
+    } else {
+        runtime.zero_conditioning(rows.len())?
+    };
+    let function_ids = rows.iter().map(|row| row.function_id).collect::<Vec<_>>();
+    let shuffled = different_group_conditioning_latent(&all_cond, &function_ids, 7)?;
+    let swapped = different_group_conditioning_latent(&all_cond, &function_ids, 1)?;
     let mut totals: BTreeMap<(String, String), Metrics> = BTreeMap::new();
     let failure_code_limit = std::env::var("TOFY_EVAL_FAILURE_CODE_LIMIT")
         .ok()
@@ -382,10 +502,17 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     }
     let paired_causal_controls = paired_causal_controls(&task_results);
     let report = EvalReport {
+        schema_version: 2,
+        arm: std::env::var("TOFY_EVAL_ARM").unwrap_or_else(|_| eval_mode.clone()),
+        suite_path: suite_path.to_string_lossy().to_string(),
+        suite_sha256,
+        task_offset,
+        task_limit,
+        selected_task_ids: tasks.iter().map(|task| task.id.clone()).collect(),
         regime: if eval_mode == "bridge" {
             std::env::var("TOFY_BRIDGE_REGIME").unwrap_or_else(|_| "weights".into())
         } else {
-            eval_mode
+            eval_mode.clone()
         },
         bridge_model: args[3].clone(),
         results,
@@ -401,6 +528,75 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    println!("Evaluation report: {}", report_path.display());
+    if let Some(minimum) = optional_probability_env("TOFY_EVAL_MIN_PASS_RATE")? {
+        if eval_mode == "bridge" {
+            let rates = report
+                .results
+                .get("heldout")
+                .and_then(|conditions| conditions.get("matched"))
+                .context("gated bridge evaluation is missing heldout/matched results")?;
+            if rates.suite_pass_rate < minimum {
+                bail!(
+                    "held-out knowledge-transfer gate failed: matched_pass_rate={:.4} required={minimum:.4}; report={}",
+                    rates.suite_pass_rate,
+                    report_path.display()
+                );
+            }
+        } else {
+            for (subset, conditions) in &report.results {
+                for (condition, rates) in conditions {
+                    if rates.suite_pass_rate < minimum {
+                        bail!(
+                            "evaluation ceiling failed for subset={subset} condition={condition}: pass_rate={:.4} required={minimum:.4}; report={}",
+                            rates.suite_pass_rate,
+                            report_path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if eval_mode == "bridge" {
+        if let Some(minimum) = optional_probability_env("TOFY_EVAL_MIN_CAUSAL_ADVANTAGE")? {
+            let controls = report
+                .paired_causal_controls
+                .get("heldout")
+                .context("gated bridge evaluation is missing heldout causal controls")?;
+            for control in ["shuffled", "swapped", "zeroed"] {
+                let metrics = controls.get(control).with_context(|| {
+                    format!("gated bridge evaluation is missing heldout/{control}")
+                })?;
+                if metrics.matched_advantage < minimum {
+                    bail!(
+                        "held-out causal gate failed for {control}: matched_advantage={:.4} required={minimum:.4}; report={}",
+                        metrics.matched_advantage,
+                        report_path.display()
+                    );
+                }
+            }
+        }
+        if let Some(maximum) = optional_probability_env("TOFY_EVAL_MAX_CAUSAL_P_VALUE")? {
+            let controls = report
+                .paired_causal_controls
+                .get("heldout")
+                .context("statistically gated bridge evaluation is missing heldout controls")?;
+            for control in ["shuffled", "swapped", "zeroed"] {
+                let metrics = controls.get(control).with_context(|| {
+                    format!("statistically gated bridge evaluation is missing heldout/{control}")
+                })?;
+                if metrics.one_sided_p_value > maximum {
+                    bail!(
+                        "held-out paired causal significance gate failed for {control}: matched_only={} control_only={} one_sided_p={:.6} required_max={maximum:.6}; report={}",
+                        metrics.matched_only,
+                        metrics.control_only,
+                        metrics.one_sided_p_value,
+                        report_path.display()
+                    );
+                }
+            }
+        }
+    }
     let mut results_file = OpenOptions::new().append(true).open("docs/RESULTS.md")?;
     writeln!(
         results_file,
@@ -409,7 +605,6 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         report.regime,
         report_path.display()
     )?;
-    println!("Evaluation report: {}", report_path.display());
     Ok(true)
 }
 
@@ -438,6 +633,38 @@ mod tests {
     }
 
     #[test]
+    fn required_api_must_be_an_executable_call() {
+        assert!(executable_api_call(
+            "package solution\nfunc Solve() { _ = veclab.Vorbel(1) }",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\n// veclab.Vorbel(1)\nfunc Solve() {}",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\nfunc Solve() { _ = \"veclab.Vorbel(1)\" }",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\nfunc Solve() { _ = notveclab.Vorbel(1) }",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\nfunc Solve() { _ = veclab.VorbelExtra(1) }",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\nfunc Solve() { _ = holder.veclab.Vorbel(1) }",
+            "Vorbel"
+        ));
+        assert!(!executable_api_call(
+            "package solution\nfunc Solve() { _ = éveclab.Vorbel(1) }",
+            "Vorbel"
+        ));
+    }
+
+    #[test]
     fn paired_controls_report_matched_advantage() {
         let row = |id: &str, condition: &str, category| TaskResult {
             id: id.into(),
@@ -457,5 +684,16 @@ mod tests {
         assert_eq!(shuffled.matched_only, 1);
         assert_eq!(shuffled.control_only, 1);
         assert_eq!(shuffled.matched_advantage, 0.0);
+        assert_eq!(shuffled.one_sided_p_value, 0.75);
+    }
+
+    #[test]
+    fn exact_sign_test_supports_bonferroni_causal_gate() {
+        assert!((exact_one_sided_sign_test(6, 0) - 0.015625).abs() < 1e-12);
+        assert!((exact_one_sided_sign_test(5, 0) - 0.03125).abs() < 1e-12);
+        assert!(exact_one_sided_sign_test(7, 0) < 0.05 / 6.0);
+        assert!(exact_one_sided_sign_test(6, 0) > 0.05 / 6.0);
+        assert!(exact_one_sided_sign_test(6, 1) > 0.016_666_667);
+        assert_eq!(exact_one_sided_sign_test(0, 0), 1.0);
     }
 }
