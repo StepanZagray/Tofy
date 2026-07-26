@@ -589,3 +589,7 @@ These were existing TensorBoard runs in `runs/` before the current training-code
 - Bridge eval `1784803983`: regime `rag`; report `runs/local_rag_scaffold_seen10.json`.
 
 - Bridge eval `1784804077`: regime `rag`; report `runs/local_rag_scaffold_heldout10.json`.
+
+- Bridge eval `1785098478`: regime `rag`; report `runs/code_poc_1785098309/eval/rag_preflight_seen.json`.
+
+- Bridge eval `1785098580`: regime `rag`; report `runs/code_poc_1785098309/eval/rag_preflight_heldout.json`.
