@@ -787,6 +787,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_BRIDGE_SEMANTIC_WARMUP", "400");
     set_env_default("TOFY_BRIDGE_SEMANTIC_PATIENCE", "1200");
     set_env_default("TOFY_BRIDGE_MIN_SEMANTIC_PROGRESS", "0.002");
+    set_env_default("TOFY_LATENT_EARLY_STOP_PATIENCE", "3000");
+    set_env_default("TOFY_LATENT_EARLY_STOP_WARMUP", "2000");
+    set_env_default("TOFY_WORLD_EARLY_STOP_PATIENCE", "3000");
     set_env_default("TOFY_WORLD_RECON_LOSS_WEIGHT", "0.25");
     set_env_default("TOFY_WORLD_ASSOC_LOSS_WEIGHT", "1.0");
     set_env_default_owned(
@@ -3919,6 +3922,8 @@ fn immutable_training_env(defaults: &ProfileDefaults) -> BTreeMap<String, String
         "TOFY_LATENT_HISTORY_RATIO",
         "TOFY_LATENT_CLIP_NORM",
         "TOFY_LATENT_VAL_BATCHES",
+        "TOFY_LATENT_EARLY_STOP_PATIENCE",
+        "TOFY_LATENT_EARLY_STOP_WARMUP",
         "TOFY_WORLD_WARMUP_BATCH",
         "TOFY_WORLD_WARMUP_GRAD_ACCUM",
         "TOFY_WORLD_WARMUP_STEPS",
@@ -4805,6 +4810,41 @@ mod profile_tests {
         assert!(attempt.finished_unix.is_some());
         assert!(attempt.error.is_some());
         validate_adaptive_stage("world", &state.stages["world"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn latent_early_stop_completes_a_resume_stage() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-latent-terminal-{}-{}",
+            std::process::id(),
+            unix_timestamp()?
+        ));
+        fs::create_dir_all(&root)?;
+        let model = root.join("latent.safetensors");
+        fs::write(&model, b"checkpoint")?;
+        let state_path = util::checkpoint_sidecar_path(&model, "latent", "resume.json");
+        util::save_resume_state(
+            &state_path,
+            &util::TrainingResumeState {
+                stage: "latent".into(),
+                step: 8_200,
+                best_metric: 0.0113,
+                best_aux_metric: 0.0113,
+                saved_checkpoint: true,
+                terminal: Some(util::TrainingTerminal::EarlyStopped),
+            },
+        )?;
+        let cfg = PipelineConfig {
+            profile: MemoryProfile::Minimal,
+            until: PipelineUntil::Full,
+            resume: true,
+            resume_selector: Some(root.to_string_lossy().to_string()),
+            skip_trained_stages: Vec::new(),
+            with_code_eval: true,
+        };
+        assert!(stage_complete(&cfg, &model, "latent", 20_000, &[])?);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

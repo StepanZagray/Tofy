@@ -861,6 +861,13 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
     let mut saved_checkpoint = resume_state.saved_checkpoint;
     let start_step = if config.resume { resume_state.step } else { 0 };
     let mut completed_step = start_step;
+    let early_stop_patience = env_usize("TOFY_LATENT_EARLY_STOP_PATIENCE", 3_000);
+    let early_stop_warmup = env_usize("TOFY_LATENT_EARLY_STOP_WARMUP", 2_000);
+    let mut last_improvement_step = resume_metadata
+        .last_improvement_step
+        .unwrap_or(start_step)
+        .min(start_step);
+    let mut stopped_early = false;
 
     let run_dir = util::create_run_dir("latent")?;
     let mut tb = util::AsyncSummaryWriter::new(&run_dir);
@@ -1236,6 +1243,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
 
             if selection_metric < best_pred {
                 best_pred = selection_metric;
+                last_improvement_step = step;
                 util::save_varmap_atomic(&varmap, &model_path)?;
                 saved_checkpoint = true;
                 println!(
@@ -1280,16 +1288,32 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     memory_note,
                 );
             }
+            if util::plateau_early_stop_triggered(
+                step,
+                last_improvement_step,
+                early_stop_patience,
+                early_stop_warmup,
+            ) {
+                println!(
+                    "Latent early stopping at step {step}: no held-out improvement for {early_stop_patience} steps; best={best_pred:.6}"
+                );
+                stopped_early = true;
+            }
             let checkpoint_resume_state = util::TrainingResumeState {
                 stage: resume_stage.clone(),
                 step,
                 best_metric: best_pred,
                 best_aux_metric: best_pred,
                 saved_checkpoint,
-                terminal: None,
+                terminal: if stopped_early {
+                    Some(util::TrainingTerminal::EarlyStopped)
+                } else {
+                    None
+                },
             };
             let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
             resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
+            resume_metadata.last_improvement_step = Some(last_improvement_step);
             util::save_checkpoint_job(
                 checkpoint_writer.as_ref(),
                 format!("latent step {step}"),
@@ -1311,6 +1335,9 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                     )?,
                 ],
             )?;
+            if stopped_early {
+                break;
+            }
         }
     }
 
@@ -1334,13 +1361,18 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
         &optimizer_checkpoint_path,
         &checkpoint_id,
     )?;
+    resume_metadata.last_improvement_step = Some(last_improvement_step);
     resume_state = util::TrainingResumeState {
         stage: resume_stage.clone(),
         step: completed_step,
         best_metric: best_pred,
         best_aux_metric: best_pred,
         saved_checkpoint,
-        terminal: Some(util::TrainingTerminal::TargetReached),
+        terminal: Some(if stopped_early {
+            util::TrainingTerminal::EarlyStopped
+        } else {
+            util::TrainingTerminal::TargetReached
+        }),
     };
     util::save_resume_state_with_metadata(&resume_state_path, &resume_state, &resume_metadata)?;
     tb.flush();

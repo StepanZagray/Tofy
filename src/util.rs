@@ -953,6 +953,18 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Returns true when held-out selection has not improved for `patience` steps
+/// after the warmup window. Training stages call this from checkpoint logging
+/// only; it does not alter optimizer steps or loss computation.
+pub fn plateau_early_stop_triggered(
+    step: usize,
+    last_improvement_step: usize,
+    patience: usize,
+    warmup: usize,
+) -> bool {
+    patience > 0 && step >= warmup && step.saturating_sub(last_improvement_step) >= patience
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainingResumeState {
     pub stage: String,
@@ -1954,6 +1966,14 @@ impl VramTracker {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn plateau_early_stop_respects_warmup_and_patience() {
+        assert!(!plateau_early_stop_triggered(1_000, 500, 3_000, 2_000));
+        assert!(!plateau_early_stop_triggered(4_000, 1_500, 3_000, 2_000));
+        assert!(plateau_early_stop_triggered(4_500, 1_500, 3_000, 2_000));
+        assert!(!plateau_early_stop_triggered(10_000, 1_500, 0, 2_000));
+    }
 
     #[test]
     fn legacy_resume_state_without_terminal_remains_readable() -> Result<()> {
