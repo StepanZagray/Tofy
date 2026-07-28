@@ -125,7 +125,9 @@ pub fn sigreg_epps_pulley_linearization_chunked_seeded(
         let mut slice_start = 0usize;
         while slice_start < num_slices {
             let slice_len = (num_slices - slice_start).min(slice_chunk);
-            let projection_chunk = projection.narrow(1, slice_start, slice_len)?;
+            // CUDA matmul rejects the strided column view returned by narrow.
+            // Materialize only the active projection chunk contiguously.
+            let projection_chunk = projection.narrow(1, slice_start, slice_len)?.contiguous()?;
             let projected = pooled_chunk
                 .reshape((batch * position_len, dim))?
                 .matmul(&projection_chunk)?
@@ -167,7 +169,7 @@ pub fn sigreg_epps_pulley_linearization_chunked_seeded(
                 .to_vec0::<f32>()?;
             let slice_input_gradient = projected_gradient
                 .reshape((batch * position_len, slice_len))?
-                .matmul(&projection_chunk.t()?)?
+                .matmul(&projection_chunk.t()?.contiguous()?)?
                 .reshape((batch, position_len, dim))?;
             input_gradient = input_gradient
                 .broadcast_add(&slice_input_gradient)?

@@ -284,6 +284,13 @@ load into a model constructed with the exact mixed-dtype schema, so the
 redundant post-load cast was removed. The failed attempt performed no optimizer
 step and did not modify the checkpoint tuple.
 
+After that loader fix, the first analytical SIGReg CUDA call rejected the
+strided column view returned by slicing the projection matrix
+(`matmul is only supported for contiguous tensors`). The implementation now
+materializes only the active `640 x 128` projection chunk and its transpose as
+contiguous tensors. This does not change the calculation or its bounded
+workspace; the failed attempt occurred before the optimizer step.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The
