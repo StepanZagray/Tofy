@@ -291,6 +291,16 @@ materializes only the active `640 x 128` projection chunk and its transpose as
 contiguous tensors. This does not change the calculation or its bounded
 workspace; the failed attempt occurred before the optimizer step.
 
+Commit `e71171d` then completed eight consecutive H100 steps at `8/32`.
+Steps 2,001--2,008 averaged `21.147` seconds/step. A 30-second sample spanning
+complete steps observed peak VRAM `19,797 / 81,559 MiB`, peak utilization
+100%, mean utilization 75.1%, peak power 152.2 W, and mean power 145.4 W.
+The old `2/128` checkpoint cadence was approximately `32.124` seconds/step
+(500 steps between checkpoint timestamps), so the measured speedup is about
+1.52x. A subsequent `64/4` maximum-batch probe OOMed during the prediction
+backward before completing its first optimizer step. The checkpoint remains
+at step 2,000; `32/8` is the next candidate.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The
