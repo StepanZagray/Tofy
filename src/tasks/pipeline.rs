@@ -4432,7 +4432,7 @@ mod profile_tests {
                 profiles.minimal.world_batch,
                 profiles.minimal.world_grad_accum
             ),
-            (32, 8)
+            (16, 16)
         );
         assert_eq!(
             (

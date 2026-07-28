@@ -306,12 +306,12 @@ Steps 2,001--2,010 averaged `20.875` seconds/step. A 45-second sample spanning
 complete steps observed peak VRAM `51,285 / 81,559 MiB`, peak utilization
 99%, mean utilization 75.9%, peak power 155.0 W, and mean power 145.4 W
 (peak utilization across both sampling windows was 100%). This is about 1.54x
-faster than the old `2/128` checkpoint cadence and 1.3%
-faster than the analytical `8/32` measurement. Because `64/4` OOMs and the
-batch schedule requires power-of-two pairs, `32/8` is the largest stable
-physical batch on this H100 80 GiB. It is now the minimal profile default;
-the run continues in tmux `tofy-train`, log
-`/workspace/tofy-train-minimal-world-b32.log`.
+faster than the old `2/128` checkpoint cadence and 1.3% faster than the
+analytical `8/32` measurement. However, extended observation showed reserved
+VRAM rising monotonically to `70,101 MiB` by step 2,030 instead of plateauing.
+The run was stopped before a delayed OOM, so `32/8` is not sustained-qualified.
+The minimal profile now probes `16/16`, retaining effective batch 256 with
+more long-run allocator headroom.
 
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
