@@ -86,41 +86,96 @@ pub struct SigRegLinearization {
 }
 
 /// Turn a detached pooled SIGReg objective into its exact input gradient while
-/// bounding the autograd workspace by `position_chunk`.
+/// bounding workspace by `position_chunk * slice_chunk`.
 ///
 /// The returned gradient can be dotted with one replayed live microbatch at a
 /// time. Backpropagating those dot products supplies the exact chain-rule
 /// gradient to the shared encoder without retaining the full effective
-/// batch's encoder activations or SIGReg graph.
+/// batch's encoder activations. The Epps-Pulley derivative is evaluated
+/// analytically, so the detached statistic does not build an autograd graph.
 pub fn sigreg_epps_pulley_linearization_chunked_seeded(
     pooled: &Tensor,
     num_slices: usize,
     num_points: usize,
     position_chunk: usize,
+    slice_chunk: usize,
     seed: u64,
 ) -> Result<SigRegLinearization> {
     let (batch, positions, dim) = pooled.dims3()?;
+    if batch < 2 {
+        anyhow::bail!("SIGReg requires at least two batch samples");
+    }
+    let num_slices = num_slices.max(1);
     let position_chunk = position_chunk.max(1);
+    let slice_chunk = slice_chunk.max(1);
+    let projection = sigreg_projection(dim, num_slices, seed, pooled.device())?;
+    let knots = sigreg_knots(num_points);
+    let loss_scale = batch as f64 / (positions * num_slices) as f64;
+    let gradient_scale = 2.0f64 / (positions * num_slices) as f64;
     let mut value = 0.0f32;
     let mut gradient_chunks = Vec::new();
-    let mut start = 0usize;
-    while start < positions {
-        let len = (positions - start).min(position_chunk);
-        let chunk = pooled.narrow(1, start, len)?.detach();
-        let variable = Var::from_tensor(&chunk)?;
-        let weight = len as f64 / positions as f64;
-        let loss = sigreg_epps_pulley_seeded(variable.as_tensor(), num_slices, num_points, seed)?
-            .affine(weight, 0.0)?;
-        value += loss.to_vec0::<f32>()?;
-        let gradients = loss.backward()?;
-        gradient_chunks.push(
-            gradients
-                .get(&variable)
-                .context("missing pooled SIGReg input gradient")?
-                .detach()
-                .to_dtype(candle_core::DType::F32)?,
-        );
-        start += len;
+    let mut position_start = 0usize;
+    while position_start < positions {
+        let position_len = (positions - position_start).min(position_chunk);
+        let pooled_chunk = pooled
+            .narrow(1, position_start, position_len)?
+            .to_dtype(candle_core::DType::F32)?
+            .detach();
+        let mut input_gradient = Tensor::zeros_like(&pooled_chunk)?;
+        let mut slice_start = 0usize;
+        while slice_start < num_slices {
+            let slice_len = (num_slices - slice_start).min(slice_chunk);
+            let projection_chunk = projection.narrow(1, slice_start, slice_len)?;
+            let projected = pooled_chunk
+                .reshape((batch * position_len, dim))?
+                .matmul(&projection_chunk)?
+                .reshape((batch, position_len, slice_len))?
+                .detach();
+            let mut projected_gradient = Tensor::zeros_like(&projected)?;
+            let mut chunk_value: Option<Tensor> = None;
+            for &(t, normal_cf, integration_weight) in &knots {
+                let phase = projected.affine(f64::from(t), 0.0)?;
+                let cosine = phase.cos()?;
+                let sine = phase.sin()?;
+                let centered_cosine = cosine.mean(0)?.affine(1.0, -f64::from(normal_cf))?;
+                let mean_sine = sine.mean(0)?;
+                let knot_value = centered_cosine
+                    .sqr()?
+                    .broadcast_add(&mean_sine.sqr()?)?
+                    .sum_all()?
+                    .affine(loss_scale * f64::from(integration_weight), 0.0)?;
+                chunk_value = Some(
+                    match chunk_value {
+                        Some(total) => total.broadcast_add(&knot_value)?,
+                        None => knot_value,
+                    }
+                    .detach(),
+                );
+
+                let knot_gradient = sine
+                    .broadcast_mul(&centered_cosine.unsqueeze(0)?)?
+                    .affine(-1.0, 0.0)?
+                    .broadcast_add(&cosine.broadcast_mul(&mean_sine.unsqueeze(0)?)?)?
+                    .affine(
+                        gradient_scale * f64::from(integration_weight) * f64::from(t),
+                        0.0,
+                    )?;
+                projected_gradient = projected_gradient.broadcast_add(&knot_gradient)?.detach();
+            }
+            value += chunk_value
+                .context("SIGReg requires at least three integration points")?
+                .to_vec0::<f32>()?;
+            let slice_input_gradient = projected_gradient
+                .reshape((batch * position_len, slice_len))?
+                .matmul(&projection_chunk.t()?)?
+                .reshape((batch, position_len, dim))?;
+            input_gradient = input_gradient
+                .broadcast_add(&slice_input_gradient)?
+                .detach();
+            slice_start += slice_len;
+        }
+        gradient_chunks.push(input_gradient);
+        position_start += position_len;
     }
     let gradient_refs = gradient_chunks.iter().collect::<Vec<_>>();
     let input_gradient = Tensor::cat(&gradient_refs, 1)?;
@@ -268,6 +323,46 @@ fn standard_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
+fn sigreg_projection(
+    dim: usize,
+    num_slices: usize,
+    seed: u64,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut projection = vec![0f32; dim * num_slices];
+    for slice in 0..num_slices {
+        let mut norm = 0f32;
+        for d in 0..dim {
+            let value = standard_normal(&mut rng);
+            projection[d * num_slices + slice] = value;
+            norm += value * value;
+        }
+        let norm = norm.sqrt().max(1e-6);
+        for d in 0..dim {
+            projection[d * num_slices + slice] /= norm;
+        }
+    }
+    Tensor::from_vec(projection, (dim, num_slices), device).map_err(Into::into)
+}
+
+fn sigreg_knots(num_points: usize) -> Vec<(f32, f32, f32)> {
+    let knots = num_points.max(3);
+    let dt = 3.0f32 / (knots - 1) as f32;
+    (0..knots)
+        .map(|index| {
+            let t = index as f32 * dt;
+            let normal_cf = (-0.5 * t * t).exp();
+            let trapezoid = if index == 0 || index + 1 == knots {
+                dt
+            } else {
+                2.0 * dt
+            };
+            (t, normal_cf, trapezoid * normal_cf)
+        })
+        .collect()
+}
+
 /// Exact LeWorldModel SIGReg discretization.
 ///
 /// Rank-3 input is `[batch, positions, dim]`: every position is tested over
@@ -303,45 +398,24 @@ pub fn sigreg_epps_pulley_seeded(
         anyhow::bail!("SIGReg requires at least two batch samples")
     }
     let num_slices = num_slices.max(1);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-
-    let mut proj = vec![0f32; dim * num_slices];
-    for slice in 0..num_slices {
-        let mut norm = 0f32;
-        for d in 0..dim {
-            let v = standard_normal(&mut rng);
-            proj[d * num_slices + slice] = v;
-            norm += v * v;
-        }
-        let norm = norm.sqrt().max(1e-6);
-        for d in 0..dim {
-            proj[d * num_slices + slice] /= norm;
-        }
-    }
-    let proj = Tensor::from_vec(proj, (dim, num_slices), device)?.to_dtype(work_dtype)?;
+    let proj = sigreg_projection(dim, num_slices, seed, device)?.to_dtype(work_dtype)?;
     let projected = x
         .reshape((batch * positions, dim))?
         .matmul(&proj)?
         .reshape((batch, positions, num_slices))?
         .unsqueeze(3)?; // [B, P, M, 1]
 
-    let knots = num_points.max(3);
-    let dt = 3.0f32 / (knots - 1) as f32;
-    let mut knot_values = Vec::with_capacity(knots);
-    let mut normal_cf = Vec::with_capacity(knots);
-    let mut integration_weights = Vec::with_capacity(knots);
-    for i in 0..knots {
-        let t = i as f32 * dt;
-        let phi = (-0.5 * t * t).exp();
-        let trapezoid = if i == 0 || i + 1 == knots {
-            dt
-        } else {
-            2.0 * dt
-        };
-        knot_values.push(t);
-        normal_cf.push(phi);
-        integration_weights.push(trapezoid * phi);
-    }
+    let knots = sigreg_knots(num_points);
+    let knot_values = knots.iter().map(|&(t, _, _)| t).collect::<Vec<_>>();
+    let normal_cf = knots
+        .iter()
+        .map(|&(_, normal_cf, _)| normal_cf)
+        .collect::<Vec<_>>();
+    let integration_weights = knots
+        .iter()
+        .map(|&(_, _, weight)| weight)
+        .collect::<Vec<_>>();
+    let knots = knots.len();
     let knots_tensor = Tensor::from_vec(knot_values, (1, 1, 1, knots), device)?;
     let normal_cf = Tensor::from_vec(normal_cf, (knots,), device)?;
     let weights = Tensor::from_vec(integration_weights, (knots,), device)?;
@@ -671,7 +745,7 @@ mod tests {
             .to_vec1::<f32>()?;
 
         let linearization =
-            sigreg_epps_pulley_linearization_chunked_seeded(&pooled.detach(), 16, 9, 2, 29)?;
+            sigreg_epps_pulley_linearization_chunked_seeded(&pooled.detach(), 16, 9, 2, 5, 29)?;
         let linearized_gradient = linearization
             .input_gradient
             .flatten_all()?

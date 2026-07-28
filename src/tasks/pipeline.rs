@@ -766,6 +766,7 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default("TOFY_MUON_RMS_SCALE", "0.18");
     set_env_default("TOFY_SIGREG_SLICES", "1024");
     set_env_default("TOFY_SIGREG_POINTS", "17");
+    set_env_default("TOFY_SIGREG_SLICE_CHUNK", "128");
     set_env_default_owned("TOFY_ENCODER_DIM", defaults.dim.to_string());
     set_env_default_owned("TOFY_ENCODER_LAYERS", defaults.layers.to_string());
     set_env_default_owned("TOFY_ENCODER_HEADS", defaults.heads.to_string());
@@ -3906,6 +3907,7 @@ fn immutable_training_env(defaults: &ProfileDefaults) -> BTreeMap<String, String
         "TOFY_SIGREG_SLICES",
         "TOFY_SIGREG_POINTS",
         "TOFY_SIGREG_POSITION_CHUNK",
+        "TOFY_SIGREG_SLICE_CHUNK",
         "TOFY_LABEL_SMOOTHING",
         "TOFY_LR_SCHEDULE",
         "TOFY_LR_WARMUP_STEPS",

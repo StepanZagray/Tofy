@@ -246,6 +246,36 @@ check after roughly 85 seconds of encoder work showed `29,621 / 81,559 MiB`,
 `/workspace/tofy-train-minimal-pooled.log`. This is startup evidence, not a
 sustained qualification or a new best model metric.
 
+The encoder subsequently completed all 20,000 steps. Its final preflight on
+resume remained viable: seen evaluation `1785145737` passed `104/300`
+(`0.3467`), and held-out evaluation `1785145835` passed `123/300` (`0.4100`).
+
+World training exposed a separate peak in the pooled SIGReg linearization.
+The `8/32` attempt ran from Unix `1785145835` to `1785149978`, then OOMed
+inside `sigreg_epps_pulley_linearization_chunked_seeded` during
+`Tensor::backward`. Automatic recovery preserved effective batch 256 and
+retried `4/64`; it failed in the same call after running from `1785149978` to
+`1785157448`. The surviving `2/128` attempt reached a complete step-2,000
+checkpoint (`world-2000-676135-1785228114437820007`) with best validation
+selection `0.3346264`; a live sample showed `69,429 / 81,559 MiB`, 67% GPU
+utilization, and 130 W. This is checkpoint/fit evidence, not a qualified
+model-quality result.
+
+The old fixed-length linearizer built an autograd graph over
+`[batch, position_chunk, 1024 projections, 17 knots]` and differentiated the
+detached statistic. The replacement evaluates the same Epps-Pulley value and
+its analytical input derivative while streaming projection chunks (default
+128) and one knot at a time, then retains the existing live-microbatch replay
+for the exact encoder/world chain rule. With the defaults, the dominant
+temporary shrinks from 17,408 projection-knot elements per batch-position to
+128, while the effective batch, sampled projections, knots, objective, and
+optimizer schedule stay unchanged. The CPU parity test compares the value,
+analytical input gradient, and replay gradient against the original full
+autograd computation at `1e-5` tolerance. Full Rust tests, Clippy with
+warnings denied, release build, formatting, and `git diff --check` pass
+locally. An H100 `8/32` resume from step 2,000 remains required before this
+optimization is hardware-qualified.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The

@@ -211,6 +211,13 @@ projections, 17 knots). It trains the encoder, compressor, post-normalization
 projectors, and six-block AdaLN-Zero action-conditioned predictor jointly.
 Association top-1 is telemetry only.
 
+Fixed-length encoder/world SIGReg computes its detached statistic and exact
+input derivative in bounded chunks instead of retaining a Candle autograd
+graph. `TOFY_SIGREG_SLICE_CHUNK` controls the projection workspace (default
+`128`; reduce it on OOM without changing the objective). Set
+`TOFY_WORLD_HEALTH_LOG_EVERY=1` temporarily when qualifying a physical-batch
+change; it logs full optimizer-step time without running validation.
+
 World/bridge checkpoint structure changed with the LeWorldModel rewrite. Start a
 new run root; do not resume a pre-LeWorldModel world or bridge checkpoint.
 Tokenizer specification v9 also invalidates earlier encoder vocabularies and

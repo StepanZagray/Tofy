@@ -1086,6 +1086,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
             .flat_map(|batch| batch.chunk_valid_lens.iter().copied())
             .collect::<Vec<_>>();
         let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+        let sigreg_slice_chunk = env_usize("TOFY_SIGREG_SLICE_CHUNK", 128);
         let step_seed = (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let token_linearization = {
             let refs = cached_tokens.iter().collect::<Vec<_>>();
@@ -1121,6 +1122,7 @@ fn run_latent_training(config: LatentTrainConfig) -> Result<()> {
                 sigreg_slices,
                 sigreg_points,
                 sigreg_position_chunk,
+                sigreg_slice_chunk,
                 step_seed ^ 0x474c_4f42_414c_0003,
             )?
         };

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::cli::resolve_data_path;
 use crate::config::WorldTrainConfig;
@@ -578,6 +579,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
     let clip_norm = env_f64("TOFY_WORLD_CLIP_NORM", 1.0).max(0.0);
     let val_batches = env_usize("TOFY_WORLD_VAL_BATCHES", 8);
     let checkpoint_every = env_usize("TOFY_CHECKPOINT_EVERY", 500);
+    let health_log_every = env_usize("TOFY_WORLD_HEALTH_LOG_EVERY", 0);
     let gradient_spike_ratio = env_f64("TOFY_WORLD_GRAD_SPIKE_RATIO", 50.0).max(2.0) as f32;
     let gradient_absolute_floor =
         env_f64("TOFY_WORLD_GRAD_SPIKE_FLOOR", clip_norm.max(1.0) * 20.0).max(1.0) as f32;
@@ -593,6 +595,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
 
     let mut stopped_early = false;
     for step in (start_step + 1)..=config.steps {
+        let step_started = Instant::now();
         let mut accumulated_grads = None;
         let mut log_snapshot = None;
         let batch_size = world_batch_size_for_step(step, &config);
@@ -653,6 +656,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         }
 
         let sigreg_position_chunk = env_usize("TOFY_SIGREG_POSITION_CHUNK", 8);
+        let sigreg_slice_chunk = env_usize("TOFY_SIGREG_SLICE_CHUNK", 128);
         let sigreg_seed = (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x574f_524c_4400_0001;
         let pooled_sigreg = {
             let refs = cached_sigreg.iter().collect::<Vec<_>>();
@@ -662,6 +666,7 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
                 sigreg_slices,
                 sigreg_points,
                 sigreg_position_chunk,
+                sigreg_slice_chunk,
                 sigreg_seed,
             )?
         };
@@ -732,6 +737,14 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         }
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
         completed_step = step;
+        if health_log_every > 0 && step % health_log_every == 0 {
+            println!(
+                "World health: step {step}/{} physical_batch={batch_size} grad_accum={grad_accum_steps} effective_batch={} step_seconds={:.3}",
+                config.steps,
+                batch_size * grad_accum_steps,
+                step_started.elapsed().as_secs_f64()
+            );
+        }
 
         if step % config.log_every == 0 {
             let snap = log_snapshot.context("world grad accumulation produced no log snapshot")?;
