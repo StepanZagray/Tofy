@@ -321,6 +321,13 @@ timer under-reported completed GPU time. World training now synchronizes the
 CUDA device after every optimizer step, bounding in-flight workspace and
 making step timing and batch qualification reflect completed work.
 
+With that fence, `16/16` completed steps 2,001--2,009 at an average of about
+`20.46` seconds/step while two consecutive 55-second sampling windows held the
+same `23,925 MiB` peak. This confirms the monotonic growth was queued work, not
+live model state. The final capacity probe returns to `32/8`; `64/4` remains
+excluded because its OOM occurred during prediction backward, before the new
+optimizer fence.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The

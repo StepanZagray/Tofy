@@ -21,7 +21,7 @@ cargo run --release -- train minimal
 
 `minimal` is qualified on an 80 GiB H100 SXM pod. It uses 20,000 encoder,
 world, and bridge steps. Physical batch/accumulation pairs are
-`16/8`, `16/16`, and `8/16` respectively, giving effective batches `128`,
+`16/8`, `32/8`, and `8/16` respectively, giving effective batches `128`,
 `256`, and `128`. Encoder and world SIGReg statistics are pooled over the full
 effective batch with memory-bounded replay, rather than being estimated
 separately on each physical microbatch. These revised training paths require a
