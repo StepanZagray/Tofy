@@ -328,6 +328,16 @@ live model state. The final capacity probe returns to `32/8`; `64/4` remains
 excluded because its OOM occurred during prediction backward, before the new
 optimizer fence.
 
+The fenced `32/8` retry completed steps 2,001--2,009 at `21.611`
+seconds/step. Two consecutive 55-second windows held the same peak
+(`44,213 MiB` then `44,181 MiB`), confirming that in-flight memory is bounded.
+This is about 1.49x faster than the old `2/128` checkpoint cadence. Although
+the fenced `16/16` measurement was about 5.3% faster, project policy selects
+the largest stable physical batch before minimizing accumulation; therefore
+`32/8` is the qualified minimal-profile pair and `64/4` is the measured OOM
+boundary. Training continues in tmux `tofy-train`, log
+`/workspace/tofy-train-minimal-world-b32-sync.log`.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The
