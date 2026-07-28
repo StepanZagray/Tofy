@@ -276,6 +276,14 @@ warnings denied, release build, formatting, and `git diff --check` pass
 locally. An H100 `8/32` resume from step 2,000 remains required before this
 optimization is hardware-qualified.
 
+The first deployment also exposed a pre-training resume-loader bug: after the
+step-2,000 checkpoint loaded, a blanket BF16 cast tried to copy BF16 storage
+into the LeWorldModel projectors' intentionally F32 BatchNorm variables and
+failed with `dtype mismatch in copy_strided op`. World checkpoints already
+load into a model constructed with the exact mixed-dtype schema, so the
+redundant post-load cast was removed. The failed attempt performed no optimizer
+step and did not modify the checkpoint tuple.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The

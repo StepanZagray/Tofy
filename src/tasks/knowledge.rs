@@ -515,7 +515,11 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
         }
         if resume_state.step > 0 {
             util::load_varmap_checked(&mut world_varmap, &train_checkpoint_path)?;
-            util::cast_varmap_dtype(&mut world_varmap, train_dtype)?;
+            // The world projectors deliberately keep BatchNorm parameters and
+            // running statistics in F32 while the rest of the model uses the
+            // configured training dtype. VarMap::load targets the already
+            // constructed mixed-dtype variables; a blanket cast would attempt
+            // an invalid BF16 copy into those F32 variables on CUDA.
             println!("Resuming world weights from {:?}", train_checkpoint_path);
         } else if model_path.exists() {
             bail!(
