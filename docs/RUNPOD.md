@@ -21,7 +21,7 @@ On [RunPod](https://www.runpod.io/), create a GPU pod:
 
 | Goal | Suggested GPU | Profile |
 |------|---------------|---------|
-| Current experiment | RTX PRO 6000 Blackwell (96 GiB) | `minimal` |
+| Current experiment | H100 SXM (80 GiB) | `minimal` |
 
 Template: **RunPod PyTorch** or any CUDA image with Ubuntu. Attach a **network
 volume** only if you want checkpoints to survive pod termination; otherwise
@@ -178,7 +178,7 @@ cd /workspace/Tofy
 source /workspace/tofy-runpod.env
 export TOFY_QWEN_DIR=/workspace/Tofy/models/qwen3-1.7b-base
 
-# VecLab experiment — `minimal` targets RTX PRO 6000 96 GiB; see RESULTS for fit-check status
+# VecLab experiment — `minimal` is qualified on H100 SXM 80 GiB
 # TOFY_REQUIRE_PREPARED_CACHE must be 0 when the pipeline builds its own vocab
 TOFY_REQUIRE_PREPARED_CACHE=0 SKIP_GIT_PULL=1 scripts/runpod_train.sh train
 ```
