@@ -313,6 +313,14 @@ The run was stopped before a delayed OOM, so `32/8` is not sustained-qualified.
 The minimal profile now probes `16/16`, retaining effective batch 256 with
 more long-run allocator headroom.
 
+The initial `16/16` retry showed the same monotonic allocator growth, revealing
+that physical batch was not the root cause. Candle enqueues the hybrid
+Muon/AdamW update asynchronously; without a stream fence, optimizer
+temporaries from successive CPU iterations remained in flight and the health
+timer under-reported completed GPU time. World training now synchronizes the
+CUDA device after every optimizer step, bounding in-flight workspace and
+making step timing and batch qualification reflect completed work.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The

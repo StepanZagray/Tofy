@@ -740,6 +740,10 @@ fn run_world_training(config: WorldConfig) -> Result<()> {
             }
         }
         util::optimizer_step_from_accumulated(&mut opt, &mut accumulated_grads)?;
+        // Candle launches CUDA optimizer kernels asynchronously. Fence the
+        // step so temporary Muon/AdamW workspaces cannot accumulate across
+        // iterations and the health timer measures completed GPU work.
+        device.synchronize()?;
         completed_step = step;
         if health_log_every > 0 && step % health_log_every == 0 {
             println!(
