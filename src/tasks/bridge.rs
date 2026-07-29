@@ -1298,7 +1298,7 @@ fn conditioning_alignment_loss(
     let condition = condition.broadcast_div(&condition_norm)?;
     let target = target.broadcast_div(&target_norm)?;
     if batch == 1 {
-        return Ok((positive, 1.0));
+        return Ok((combine_alignment_losses(&positive, None)?, 1.0));
     }
     let logits = condition
         .matmul(&target.t()?)?
@@ -1315,9 +1315,19 @@ fn conditioning_alignment_loss(
         .filter(|(index, prediction)| **prediction as usize == *index)
         .count();
     Ok((
-        positive.broadcast_add(&contrastive)?,
+        combine_alignment_losses(&positive, Some(&contrastive))?,
         correct as f32 / batch as f32,
     ))
+}
+
+fn combine_alignment_losses(positive: &Tensor, contrastive: Option<&Tensor>) -> Result<Tensor> {
+    let positive = positive.to_dtype(DType::F32)?;
+    match contrastive {
+        Some(contrastive) => positive
+            .broadcast_add(&contrastive.to_dtype(DType::F32)?)
+            .map_err(Into::into),
+        None => Ok(positive),
+    }
 }
 
 /// BLIP-2/late-interaction-style token-to-query alignment.
@@ -2371,6 +2381,22 @@ mod tests {
 
         assert!(complete.abs() < 1e-6);
         assert!(collapsed > complete + 0.4);
+        Ok(())
+    }
+
+    #[test]
+    fn alignment_loss_combines_bf16_positive_and_f32_contrastive() -> Result<()> {
+        let device = Device::Cpu;
+        let positive = Tensor::new(0.25f32, &device)?.to_dtype(DType::BF16)?;
+        let contrastive = Tensor::new(0.75f32, &device)?;
+
+        let combined = combine_alignment_losses(&positive, Some(&contrastive))?;
+        assert_eq!(combined.dtype(), DType::F32);
+        assert!((util::scalar_f32(&combined)? - 1.0).abs() < 1e-6);
+
+        let positive_only = combine_alignment_losses(&positive, None)?;
+        assert_eq!(positive_only.dtype(), DType::F32);
+        assert!((util::scalar_f32(&positive_only)? - 0.25).abs() < 1e-6);
         Ok(())
     }
 
