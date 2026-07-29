@@ -338,6 +338,38 @@ the largest stable physical batch before minimizing accumulation; therefore
 boundary. Training continues in tmux `tofy-train`, log
 `/workspace/tofy-train-minimal-world-b32-sync.log`.
 
+### Minimal world completion and bridge dtype recovery (2026-07-29)
+
+Run `code_poc_1785100782` retained the completed encoder terminal state at
+step `12,800` (`latent-12800-436713-1785145334596674417`). World training at
+the qualified `32/8` pair then early-stopped normally at step `6,000`; its
+best validation selection was `0.111673`, last improved at step `3,000`, and
+the terminal checkpoint is `world-6000-1079907-1785316832126913927`.
+
+The first context-bridge attempt failed before its first optimizer step.
+`fine_grained_token_slot_alignment` returned a BF16 positive-alignment loss,
+while cross-entropy returned an F32 contrastive loss; Candle rejected their
+mixed-dtype addition. Commit `6736cbd` promotes both terms to F32 before
+combining them and keeps the batch-one path F32 as well. The regression test,
+full Rust test suite, Clippy with warnings denied, and release builds passed
+locally and on the H100 pod.
+
+The exact resume command reused the same run's already-passed RAG preflight,
+skipped the terminal encoder/world stages, and kept automatic effective-batch
+preserving OOM recovery enabled:
+
+```bash
+tmux new-session -d -s tofy-train -e TOFY_RUNPOD_TMUX_CHILD=1 -e SKIP_GIT_PULL=1 -e TOFY_REQUIRE_PREPARED_CACHE=0 -e TOFY_REQUIRE_RAG_CEILING=0 -e TOFY_ALLOW_RESUME_MISMATCH=1 -e TOFY_AUTO_BATCH_OOM_RECOVERY=true -e RESUME_TARGET=code_poc_1785100782 -e LOG_PATH=/workspace/tofy-train-minimal-bridge-f32.log -e TOFY_REPO_DIR=/workspace/Tofy 'bash scripts/runpod_train.sh resume'
+```
+
+Live H100 verification passed bridge gradient preflight (`75/124` trainable
+gradients, global norm `0.540029`) and reached step `50/20000` at physical
+batch `8`, accumulation `16`, without an OOM retry. Alignment loss improved
+from `2.9555` at step 10 to `2.5348` at step 50, while alignment top-1 rose
+from `0.312` to `0.984`; observed VRAM in this initial alignment phase was
+`7,338 / 81,559 MiB`. This confirms the dtype repair and live resume, not a
+qualified bridge-quality result.
+
 ### `code_poc_1784364765` decoder-transfer result (2026-07-21)
 
 The completed pod evaluations exposed a decoder-grounding bottleneck. The
