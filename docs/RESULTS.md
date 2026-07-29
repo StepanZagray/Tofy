@@ -363,10 +363,11 @@ tmux new-session -d -s tofy-train -e TOFY_RUNPOD_TMUX_CHILD=1 -e SKIP_GIT_PULL=1
 ```
 
 Live H100 verification passed bridge gradient preflight (`75/124` trainable
-gradients, global norm `0.540029`) and reached step `50/20000` at physical
+gradients, global norm `0.540029`) and reached a durable step-100 checkpoint
+(`bridge_context-100-1214485-1785343556449398087`) at physical
 batch `8`, accumulation `16`, without an OOM retry. Alignment loss improved
-from `2.9555` at step 10 to `2.5348` at step 50, while alignment top-1 rose
-from `0.312` to `0.984`; observed VRAM in this initial alignment phase was
+from `2.9555` at step 10 to `2.2015` at step 100, while alignment top-1 rose
+from `0.312` to `0.977`; observed VRAM in this initial alignment phase was
 `7,338 / 81,559 MiB`. This confirms the dtype repair and live resume, not a
 qualified bridge-quality result.
 
