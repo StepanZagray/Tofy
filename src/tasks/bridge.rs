@@ -5,7 +5,7 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -16,7 +16,7 @@ use crate::model::{
     load_vocab_from_file, ContextCompressor, DecoderConditioningAdapter, LeWorldModel,
     OnlineEncoder,
 };
-use crate::tasks::eval::{compile_and_test, load_suite};
+use crate::tasks::eval::{compile_and_test, load_suite, EvalTask};
 use crate::tasks::veclab::{
     attach_docs, load_docs_map, load_task_rows, model_visible_task, VeclabTaskRow,
     SEEN_FUNCTION_MAX,
@@ -257,11 +257,27 @@ fn solve_signature(completion: &str) -> Option<&str> {
         })
 }
 
+fn row_bridge_signature(row: &VeclabTaskRow) -> &str {
+    solve_signature(&row.completion).unwrap_or_else(|| visible_solve_signature(&row.task))
+}
+
 fn same_bridge_signature(left: &VeclabTaskRow, right: &VeclabTaskRow) -> bool {
-    matches!(
-        (solve_signature(&left.completion), solve_signature(&right.completion)),
-        (Some(left), Some(right)) if left == right
-    )
+    row_bridge_signature(left) == row_bridge_signature(right)
+}
+
+fn bridge_ar_harness<'a>(
+    harness_by_fn: &'a HashMap<usize, Vec<EvalTask>>,
+    row: &VeclabTaskRow,
+) -> Result<&'a EvalTask> {
+    let tasks = harness_by_fn
+        .get(&row.function_id)
+        .with_context(|| format!("no eval harness for function {}", row.function_id))?;
+    let signature = row_bridge_signature(row);
+    tasks
+        .iter()
+        .find(|task| visible_solve_signature(&task.task) == signature)
+        .or_else(|| tasks.first())
+        .with_context(|| format!("empty eval harness list for function {}", row.function_id))
 }
 
 fn bridge_prompt_task(row: &VeclabTaskRow) -> String {
@@ -1127,35 +1143,28 @@ fn autoregressive_bridge_metrics(
     max_seq: usize,
     device: &Device,
 ) -> Result<AutoregressiveBridgeMetrics> {
-    let validation_functions = rows
+    if rows.is_empty() {
+        bail!("autoregressive bridge validation requires at least one row");
+    }
+    // Reuse the same validation rows as teacher-forced CE. The old path rebuilt
+    // rows from eval/veclab_eval.jsonl, whose task phrasing never appears in
+    // bridge training and shifted the conditioning encoder off-manifold.
+    let selected: Vec<VeclabTaskRow> = rows.iter().take(sample_count.max(1)).cloned().collect();
+    let function_ids = selected
         .iter()
         .map(|row| row.function_id)
         .collect::<HashSet<_>>();
-    let eval_tasks = load_suite(Path::new("eval/veclab_eval.jsonl"))?
-        .into_iter()
-        .filter(|task| {
-            task.fn_ids
-                .iter()
-                .any(|function_id| validation_functions.contains(function_id))
-        })
-        .take(sample_count.max(1))
-        .collect::<Vec<_>>();
-    if eval_tasks.is_empty() {
-        bail!("autoregressive bridge validation has no matching harness tasks");
-    }
-    let docs = load_docs_map(Path::new("data/fictional/veclab_docs.txt"))?;
-    let selected = eval_tasks
-        .iter()
-        .map(|task| {
-            let function_id = task.fn_ids.first().copied().unwrap_or(0);
-            VeclabTaskRow {
-                task: task.task.clone(),
-                completion: String::new(),
-                function_id,
-                docs: docs.get(&function_id).cloned().unwrap_or_default(),
+    let mut harness_by_fn: HashMap<usize, Vec<EvalTask>> = HashMap::new();
+    for task in load_suite(Path::new("eval/veclab_eval.jsonl"))? {
+        if let Some(&fn_id) = task.fn_ids.first() {
+            if function_ids.contains(&fn_id) {
+                harness_by_fn.entry(fn_id).or_default().push(task);
             }
-        })
-        .collect::<Vec<_>>();
+        }
+    }
+    if harness_by_fn.len() < function_ids.len() {
+        bail!("autoregressive bridge validation is missing eval harness tasks");
+    }
     let wrong_rows = mismatched_rows(&selected, &selected, 1)?;
     let matched_slots = state_conditioning(
         &selected, regime, encoder, compressor, world, vocab, max_seq, device,
@@ -1176,18 +1185,19 @@ fn autoregressive_bridge_metrics(
     let mut matched_passes = 0usize;
     let mut wrong_passes = 0usize;
     let mut matched_categories: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for (index, task) in eval_tasks.iter().enumerate() {
+    for (index, row) in selected.iter().enumerate() {
+        let harness = bridge_ar_harness(&harness_by_fn, row)?;
         // Keep the full task only on the world-state side. Qwen receives the
         // same signature-only counterfactual contract used by deployment, so
         // validation cannot leak the requested fictional API in text.
-        let qwen_task = counterfactual_bridge_prompt(&task.task);
+        let qwen_task = counterfactual_bridge_prompt(&row.task);
         let matched_code = greedy_generate_code(
             tokenizer,
             model,
             &qwen_task,
             &matched.narrow(0, index, 1)?,
             device,
-            task.max_new_tokens.min(max_new),
+            harness.max_new_tokens.min(max_new),
         )?;
         let wrong_code = greedy_generate_code(
             tokenizer,
@@ -1195,15 +1205,15 @@ fn autoregressive_bridge_metrics(
             &qwen_task,
             &wrong.narrow(0, index, 1)?,
             device,
-            task.max_new_tokens.min(max_new),
+            harness.max_new_tokens.min(max_new),
         )?;
-        let matched_category = compile_and_test(task, &matched_code, "bridge-ar-matched")?;
+        let matched_category = compile_and_test(harness, &matched_code, "bridge-ar-matched")?;
         matched_passes += usize::from(matched_category.is_pass());
         *matched_categories
             .entry(matched_category.as_str())
             .or_insert(0) += 1;
         wrong_passes +=
-            usize::from(compile_and_test(task, &wrong_code, "bridge-ar-wrong")?.is_pass());
+            usize::from(compile_and_test(harness, &wrong_code, "bridge-ar-wrong")?.is_pass());
     }
     // A bare 0.0 pass rate cannot distinguish "named a function that does not
     // exist" from "compiled and returned the wrong value", and those point at
@@ -1387,6 +1397,10 @@ fn semantic_gap_improved(
 ) -> bool {
     semantic_gap >= minimum_gap
         && (!best_semantic_gap.is_finite() || semantic_gap >= best_semantic_gap + minimum_progress)
+}
+
+fn val_semantic_ce_improved(val_ce: f32, best_val_ce: f32, minimum_progress: f32) -> bool {
+    val_ce.is_finite() && (!best_val_ce.is_finite() || val_ce <= best_val_ce - minimum_progress)
 }
 
 /// `best_score` is minimized and `best_semantic_gap` is maximized, so an empty
@@ -1686,7 +1700,7 @@ fn train(args: BridgeArgs) -> Result<()> {
         return Ok(());
     }
     let val_every = env_usize("TOFY_BRIDGE_VAL_EVERY", 100).max(1);
-    let ar_val_every = env_usize("TOFY_BRIDGE_AR_VAL_EVERY", 1_000).max(val_every);
+    let ar_val_every = env_usize("TOFY_BRIDGE_AR_VAL_EVERY", 500).max(val_every);
     let ar_val_rows = env_usize("TOFY_BRIDGE_AR_VAL_ROWS", 60);
     let min_ar_pass_rate = env_f64("TOFY_BRIDGE_MIN_AR_PASS_RATE", 0.25).clamp(0.0, 1.0) as f32;
     let min_ar_advantage = env_f64("TOFY_BRIDGE_MIN_AR_ADVANTAGE", 0.125).clamp(0.0, 1.0) as f32;
@@ -1759,16 +1773,27 @@ fn train(args: BridgeArgs) -> Result<()> {
         f32::NEG_INFINITY
     };
     let mut best_ar_pass_rate = 0.0f32;
-    let semantic_patience = env_usize("TOFY_BRIDGE_SEMANTIC_PATIENCE", 1_200);
+    let _semantic_patience = env_usize("TOFY_BRIDGE_SEMANTIC_PATIENCE", 1_200);
     let semantic_warmup = env_usize("TOFY_BRIDGE_SEMANTIC_WARMUP", 400);
     let semantic_progress = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_PROGRESS", 0.002).max(0.0) as f32;
+    let val_semantic_patience = env_usize("TOFY_BRIDGE_VAL_SEMANTIC_PATIENCE", 1_200);
+    let val_semantic_progress =
+        env_f64("TOFY_BRIDGE_MIN_VAL_SEMANTIC_PROGRESS", 0.002).max(0.0) as f32;
     let mut best_observed_semantic_gap = resume_metadata
         .best_observed_aux_metric
         .unwrap_or(f32::NEG_INFINITY);
+    let mut best_observed_val_semantic_ce = f32::INFINITY;
+    let patience_origin = start_step.max(alignment_steps);
     let mut last_semantic_progress_step = resume_metadata
         .last_aux_progress_step
-        .unwrap_or(start_step)
-        .min(start_step);
+        .unwrap_or(patience_origin)
+        .min(start_step)
+        .max(alignment_steps);
+    let mut last_val_semantic_progress_step = resume_metadata
+        .last_improvement_step
+        .unwrap_or(patience_origin)
+        .min(start_step)
+        .max(alignment_steps);
     let mut sampler = BridgeSampler::at_sample(
         train_rows.len(),
         args.seed,
@@ -2194,11 +2219,16 @@ fn train(args: BridgeArgs) -> Result<()> {
                     None
                 }
             } else {
-                Some(AutoregressiveBridgeMetrics {
-                    matched_pass_rate: 1.0,
-                    wrong_pass_rate: 0.0,
-                })
+                None
             };
+            if val_semantic_ce_improved(
+                losses.matched_semantic,
+                best_observed_val_semantic_ce,
+                val_semantic_progress,
+            ) {
+                best_observed_val_semantic_ce = losses.matched_semantic;
+                last_val_semantic_progress_step = step;
+            }
             if semantic_gap_improved(
                 semantic_gap,
                 best_observed_semantic_gap,
@@ -2272,6 +2302,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                 .is_finite()
                 .then_some(best_observed_semantic_gap);
             resume_metadata.last_aux_progress_step = Some(last_semantic_progress_step);
+            resume_metadata.last_improvement_step = Some(last_val_semantic_progress_step);
             util::save_varmap_resume_checkpoint_atomic(&train_vars, &latest_path, &checkpoint_id)?;
             if unfreeze_world {
                 util::save_varmap_resume_checkpoint_atomic(
@@ -2327,13 +2358,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                 &resume_metadata,
             )?;
             if requires_semantic_gap
-                && semantic_patience > 0
+                && val_semantic_patience > 0
                 && step >= semantic_warmup
-                && step.saturating_sub(last_semantic_progress_step) >= semantic_patience
+                && step.saturating_sub(last_val_semantic_progress_step) >= val_semantic_patience
             {
-                if best_semantic_gap >= min_semantic_gap {
+                if best_score.is_finite() {
                     println!(
-                        "Bridge early stopping at step {step}: selected semantic_gap={best_semantic_gap:.4}, observed_best={best_observed_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
+                        "Bridge early stopping at step {step}: val_semantic_ce={best_observed_val_semantic_ce:.4}, improvement={val_semantic_progress:.4}, patience={val_semantic_patience}"
                     );
                     stopped_early = true;
                     break;
@@ -2343,7 +2374,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                     step,
                 )?;
                 bail!(
-                    "semantic conditioning plateau without a qualifying checkpoint at step {step}: best_gap={best_observed_semantic_gap:.4}, required={min_semantic_gap:.4}, improvement={semantic_progress:.4}, patience={semantic_patience}"
+                    "val semantic CE plateau without a qualifying checkpoint at step {step}: best_val_semantic_ce={best_observed_val_semantic_ce:.4}, improvement={val_semantic_progress:.4}, patience={val_semantic_patience}"
                 );
             }
         }
@@ -2634,6 +2665,36 @@ mod tests {
             0.02,
             0.002
         ));
+    }
+
+    #[test]
+    fn empty_completion_signature_matches_from_task_text() {
+        let rows = [
+            VeclabTaskRow {
+                task: "Write `func Solve(xs []float64, k int) float64` that returns veclab.Alpha(xs, k)."
+                    .into(),
+                completion: String::new(),
+                function_id: 1,
+                docs: String::new(),
+            },
+            VeclabTaskRow {
+                task: "Write `func Solve(xs []float64, k int) float64` that returns veclab.Beta(xs, k)."
+                    .into(),
+                completion:
+                    "package solution\n\nfunc Solve(xs []float64, k int) float64 { return veclab.Beta(xs, k) }"
+                        .into(),
+                function_id: 2,
+                docs: String::new(),
+            },
+        ];
+        assert!(same_bridge_signature(&rows[0], &rows[1]));
+    }
+
+    #[test]
+    fn val_semantic_ce_improvement_tracks_a_decrease() {
+        assert!(val_semantic_ce_improved(1.5, f32::INFINITY, 0.01));
+        assert!(!val_semantic_ce_improved(1.495, 1.5, 0.01));
+        assert!(val_semantic_ce_improved(1.48, 1.5, 0.01));
     }
 
     #[test]
