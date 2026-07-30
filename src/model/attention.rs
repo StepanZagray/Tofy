@@ -17,6 +17,20 @@ pub struct AttentionKvCache {
     pub prefix_len: usize,
 }
 
+impl AttentionKvCache {
+    pub(crate) fn detached(self) -> Self {
+        Self {
+            k: self.k.detach(),
+            v: self.v.detach(),
+            compressed_k: self.compressed_k.map(|tensor| tensor.detach()),
+            compressed_v: self.compressed_v.map(|tensor| tensor.detach()),
+            compressed_block_ends: self.compressed_block_ends,
+            token_count: self.token_count,
+            prefix_len: self.prefix_len,
+        }
+    }
+}
+
 fn attention_kv_cache(k: Tensor, v: Tensor) -> Result<AttentionKvCache> {
     attention_kv_cache_with_prefix(k, v, 0)
 }
@@ -748,7 +762,7 @@ impl MultiHeadAttention {
             .out_proj
             .forward(&out)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Ok((out, full_kv))
+        Ok((out, full_kv.detached()))
     }
 
     fn forward_causal_compressed_incremental(
@@ -807,7 +821,7 @@ impl MultiHeadAttention {
             .out_proj
             .forward(&out)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Ok((out, full_kv))
+        Ok((out, full_kv.detached()))
     }
 
     fn forward_local_windowed(

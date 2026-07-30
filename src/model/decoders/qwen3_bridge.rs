@@ -177,8 +177,10 @@ impl SelfAttention {
             .transpose(1, 2)?;
         let sin = self.rope_sin.narrow(0, 0, seq)?;
         let cos = self.rope_cos.narrow(0, 0, seq)?;
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        // Candle's fused RoPE and last-dimension softmax are forward-only.
+        // Keep this training path on differentiable tensor operations.
+        let q = candle_nn::rotary_emb::rope_slow(&q, &cos, &sin)?;
+        let k = candle_nn::rotary_emb::rope_slow(&k, &cos, &sin)?;
         let groups = self.heads / self.kv_heads;
         let k = repeat_kv(k, groups)?.contiguous()?;
         let v = repeat_kv(v, groups)?.contiguous()?;
@@ -186,7 +188,7 @@ impl SelfAttention {
             .matmul(&k.transpose(2, 3)?)?
             .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?
             .broadcast_add(mask)?;
-        let values = nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let values = nn::ops::softmax(&scores, candle_core::D::Minus1)?.matmul(&v)?;
         self.o
             .forward(
                 &values
@@ -282,7 +284,13 @@ impl SelfAttention {
             seq,
             self.heads * self.head_dim,
         ))?)?;
-        Ok((output, LayerKvCache { k, v }))
+        Ok((
+            output,
+            LayerKvCache {
+                k: k.detach(),
+                v: v.detach(),
+            },
+        ))
     }
 }
 
@@ -368,7 +376,7 @@ impl CrossSite {
     }
 
     fn project_conditioning(&self, conditioning: &Tensor) -> Result<AttentionKvCache> {
-        self.attention.project_kv(conditioning)
+        Ok(self.attention.project_kv(conditioning)?.detached())
     }
 
     fn forward_precomputed(&self, x: &Tensor, conditioning: &AttentionKvCache) -> Result<Tensor> {
@@ -602,6 +610,38 @@ mod tests {
     use anyhow::Context;
     use candle_nn::VarMap;
 
+    fn test_config() -> Config {
+        Config {
+            vocab_size: 16,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            head_dim: 4,
+            attention_bias: false,
+            num_key_value_heads: 1,
+            max_position_embeddings: 32,
+            sliding_window: None,
+            max_window_layers: 0,
+            tie_word_embeddings: true,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+        }
+    }
+
+    fn causal_mask(seq: usize, device: &Device) -> Result<Tensor> {
+        Tensor::from_vec(
+            (0..seq)
+                .flat_map(|i| (0..seq).map(move |j| if j <= i { 0f32 } else { f32::NEG_INFINITY }))
+                .collect::<Vec<_>>(),
+            (1, 1, seq, seq),
+            device,
+        )
+        .map_err(Into::into)
+    }
+
     #[test]
     fn zero_conditioning_is_exact_identity() -> Result<()> {
         let device = Device::Cpu;
@@ -658,27 +698,155 @@ mod tests {
     }
 
     #[test]
+    fn self_attention_lora_receives_gradients_through_attention() -> Result<()> {
+        let device = Device::Cpu;
+        let base_vars = VarMap::new();
+        let lora_vars = VarMap::new();
+        let attention = SelfAttention::new(
+            &test_config(),
+            VarBuilder::from_varmap(&base_vars, DType::F32, &device),
+            Some(VarBuilder::from_varmap(&lora_vars, DType::F32, &device)),
+            2,
+        )?;
+        let input = Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?;
+        let mask = causal_mask(4, &device)?;
+        let grads = attention
+            .forward(&input, &mask)?
+            .sqr()?
+            .sum_all()?
+            .backward()?;
+        let data = lora_vars
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("varmap lock poisoned"))?;
+        for name in ["q.b.weight", "v.b.weight"] {
+            let grad = grads
+                .get(data.get(name).with_context(|| format!("missing {name}"))?)
+                .with_context(|| format!("missing gradient for {name}"))?;
+            let magnitude = util::scalar_f32(&grad.abs()?.sum_all()?)?;
+            assert!(magnitude > 0.0, "zero gradient for {name}");
+        }
+        Ok(())
+    }
+
+    /// Guards the fused-kernel severing class of bug. Candle's `rotary_emb::rope`
+    /// and `ops::softmax_last_dim` return graph leaves, so with them the query
+    /// path carries no gradient at all: `q_proj`/`q_norm` would be missing from
+    /// the gradient store and the attention input would only be reached through
+    /// the value projection. Both properties are asserted here.
+    #[test]
+    fn self_attention_forward_keeps_the_query_path_differentiable() -> Result<()> {
+        let device = Device::Cpu;
+        let vars = VarMap::new();
+        let attention = SelfAttention::new(
+            &test_config(),
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+            None,
+            0,
+        )?;
+        let x = candle_core::Var::from_tensor(&Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?)?;
+        let mask = causal_mask(4, &device)?;
+        let grads = attention
+            .forward(x.as_tensor(), &mask)?
+            .sqr()?
+            .sum_all()?
+            .backward()?;
+        let input_grad = grads
+            .get(&x)
+            .context("gradient did not reach the attention input")?;
+        assert!(
+            util::scalar_f32(&input_grad.abs()?.sum_all()?)? > 0.0,
+            "zero gradient at the attention input"
+        );
+        let data = vars
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("varmap lock poisoned"))?;
+        // Reachable only through the attention scores, i.e. RoPE and the softmax.
+        for name in ["q_proj.weight", "q_norm.weight", "k_norm.weight"] {
+            let grad = grads
+                .get(data.get(name).with_context(|| format!("missing {name}"))?)
+                .with_context(|| format!("severed gradient path for {name}"))?;
+            let magnitude = util::scalar_f32(&grad.abs()?.sum_all()?)?;
+            assert!(magnitude > 0.0, "zero gradient for {name}");
+        }
+        Ok(())
+    }
+
+    /// End-to-end contract for bridge training: the loss taken through the full
+    /// training forward must differentiate the conditioning tensor and every
+    /// cross-site trainable. A severed forward silently reports zero here.
+    #[test]
+    fn training_forward_backpropagates_into_conditioning() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = test_config();
+        // The default `TOFY_QWEN_CROSS_EVERY` of 4 puts one cross site on the
+        // last layer; the test avoids setting the env var because it is
+        // process-global and other decoder tests run concurrently.
+        cfg.num_hidden_layers = 4;
+        let base_vars = VarMap::new();
+        let train_vars = VarMap::new();
+        let model = Qwen3Bridge::new(
+            &cfg,
+            VarBuilder::from_varmap(&base_vars, DType::F32, &device),
+            VarBuilder::from_varmap(&train_vars, DType::F32, &device),
+        )?;
+        assert!(
+            model.layers.iter().any(|layer| layer.cross.is_some()),
+            "test config produced no cross site"
+        );
+        let input = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device)?;
+        let conditioning =
+            candle_core::Var::from_tensor(&Tensor::randn(0f32, 1f32, (1, 3, 8), &device)?)?;
+        let grads = model
+            .forward(&input, conditioning.as_tensor())?
+            .sqr()?
+            .sum_all()?
+            .backward()?;
+        let conditioning_grad = grads
+            .get(&conditioning)
+            .context("gradient did not reach the conditioning input")?;
+        assert!(
+            util::scalar_f32(&conditioning_grad.abs()?.sum_all()?)? > 0.0,
+            "zero gradient at the conditioning input"
+        );
+        let data = train_vars
+            .data()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("varmap lock poisoned"))?;
+        assert!(!data.is_empty(), "no trainable variables were created");
+        for (name, var) in data.iter() {
+            let grad = grads
+                .get(var)
+                .with_context(|| format!("missing gradient for {name}"))?;
+            let magnitude = util::scalar_f32(&grad.abs()?.sum_all()?)?;
+            assert!(magnitude > 0.0, "zero gradient for {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_attention_detaches_kv_state() -> Result<()> {
+        let device = Device::Cpu;
+        let vars = VarMap::new();
+        let attention = SelfAttention::new(
+            &test_config(),
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+            None,
+            0,
+        )?;
+        let input = candle_core::Var::from_tensor(&Tensor::randn(0f32, 1f32, (1, 3, 8), &device)?)?;
+        let (_, cache) = attention.forward_cached(input.as_tensor(), None, 0)?;
+        let cache_grads = cache.k.sqr()?.sum_all()?.backward()?;
+        assert!(cache_grads.get(&input).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn cached_attention_matches_full_attention() -> Result<()> {
         let device = Device::Cpu;
         let vars = VarMap::new();
-        let cfg = Config {
-            vocab_size: 16,
-            hidden_size: 8,
-            intermediate_size: 16,
-            num_hidden_layers: 1,
-            num_attention_heads: 2,
-            head_dim: 4,
-            attention_bias: false,
-            num_key_value_heads: 1,
-            max_position_embeddings: 32,
-            sliding_window: None,
-            max_window_layers: 0,
-            tie_word_embeddings: true,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            use_sliding_window: false,
-            hidden_act: Activation::Silu,
-        };
+        let cfg = test_config();
         let attention = SelfAttention::new(
             &cfg,
             VarBuilder::from_varmap(&vars, DType::F32, &device),
@@ -686,13 +854,7 @@ mod tests {
             0,
         )?;
         let x = Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?;
-        let mask = Tensor::from_vec(
-            (0..4)
-                .flat_map(|i| (0..4).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
-                .collect::<Vec<_>>(),
-            (1, 1, 4, 4),
-            &device,
-        )?;
+        let mask = causal_mask(4, &device)?;
         let full = attention.forward(&x, &mask)?.narrow(1, 3, 1)?;
         let (_, cache) = attention.forward_cached(&x.narrow(1, 0, 3)?, None, 0)?;
         let (cached, _) = attention.forward_cached(&x.narrow(1, 3, 1)?, Some(&cache), 3)?;

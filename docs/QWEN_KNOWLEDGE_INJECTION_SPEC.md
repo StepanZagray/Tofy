@@ -193,7 +193,7 @@ multi-action claims require an excited dataset containing each action.
 
 Sole decoder path. Consumes `DecoderConditioningAdapter` slots.
 
-- Vendor `candle-transformers` `qwen3.rs` (v0.10.2 to match Cargo pins).
+- Vendor `candle-transformers` `qwen3.rs` (v0.11.0 to match Cargo pins).
 - Insert gated cross-attention after self-attention in every 4th layer
   (7 sites in 28 layers; sweepable `TOFY_QWEN_CROSS_EVERY`, default 4):
   `x = x + sigmoid(gate(x_norm)) * cross_attn(x_norm, cond_slots)`,

@@ -1709,24 +1709,19 @@ pub fn accumulate_gradients(
     train_vars: &[Var],
     mut grads: GradStore,
 ) -> Result<()> {
+    let mut incoming = GradStore::default();
+    for var in train_vars {
+        if let Some(grad) = grads.remove(var) {
+            incoming.insert(var, grad.detach());
+        }
+    }
+    if incoming.get_ids().next().is_none() {
+        return Ok(());
+    }
     if let Some(existing) = accumulated.as_mut() {
-        for var in train_vars {
-            if let Some(grad) = grads.remove(var) {
-                let grad = grad.detach();
-                if let Some(prev) = existing.remove(var) {
-                    existing.insert(var, prev.broadcast_add(&grad)?.detach());
-                } else {
-                    existing.insert(var, grad);
-                }
-            }
-        }
+        existing.extend(incoming)?;
     } else {
-        for var in train_vars {
-            if let Some(grad) = grads.remove(var) {
-                grads.insert(var, grad.detach());
-            }
-        }
-        *accumulated = Some(grads);
+        *accumulated = Some(incoming);
     }
     Ok(())
 }
@@ -1772,7 +1767,7 @@ pub fn accumulated_gradient_count(accumulated: &Option<GradStore>, train_vars: &
         .unwrap_or(0)
 }
 
-/// Differentiable LayerNorm for training. Candle 0.10's fused normalization
+/// Differentiable LayerNorm for training. Candle 0.11's fused normalization
 /// kernels are forward-only and therefore sever autograd.
 pub fn layer_norm_diff(norm: &candle_nn::LayerNorm, x: &Tensor) -> Result<Tensor> {
     let x_dtype = x.dtype();
@@ -2351,6 +2346,45 @@ mod tests {
             .context("missing scaled gradient")?
             .to_scalar::<f32>()?;
         assert_eq!(scaled, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn accumulated_gradients_extend_sums_only_trainable_variables() -> Result<()> {
+        let device = Device::Cpu;
+        let train = Var::from_tensor(&Tensor::new(2.0f32, &device)?)?;
+        let ignored = Var::from_tensor(&Tensor::new(3.0f32, &device)?)?;
+        let mut accumulated = None;
+
+        let first_loss = train
+            .as_tensor()
+            .sqr()?
+            .broadcast_add(&ignored.as_tensor().sqr()?)?;
+        accumulate_gradients(
+            &mut accumulated,
+            std::slice::from_ref(&train),
+            first_loss.backward()?,
+        )?;
+        let second_loss = train
+            .as_tensor()
+            .affine(2.0, 0.0)?
+            .sqr()?
+            .broadcast_add(&ignored.as_tensor().sqr()?)?;
+        accumulate_gradients(
+            &mut accumulated,
+            std::slice::from_ref(&train),
+            second_loss.backward()?,
+        )?;
+
+        let grads = accumulated.context("missing accumulated gradients")?;
+        assert_eq!(
+            grads
+                .get(&train)
+                .context("missing trainable gradient")?
+                .to_scalar::<f32>()?,
+            20.0
+        );
+        assert!(grads.get(&ignored).is_none());
         Ok(())
     }
 

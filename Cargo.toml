@@ -14,9 +14,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 rand = "0.10.1"
 rayon = "1.12.0"
-candle-core = { version = "=0.10.2", default-features = false }
-candle-nn = { version = "=0.10.2", default-features = false }
-candle-transformers = { version = "=0.10.2", default-features = false }
+candle-core = { version = "=0.11.0", default-features = false }
+candle-nn = { version = "=0.11.0", default-features = false }
+candle-transformers = { version = "=0.11.0", default-features = false }
 tokenizers = { version = "=0.22.2", default-features = false, features = [
     "onig",
 ] }
