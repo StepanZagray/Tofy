@@ -16,9 +16,9 @@
     "latent_warmup_batch": 16,
     "world_batch": 32,
     "world_warmup_batch": 32,
-    "bridge_batch": 64,
+    "bridge_batch": 128,
     "latent_grad_accum": 8,
     "world_grad_accum": 8,
-    "bridge_grad_accum": 2
+    "bridge_grad_accum": 1
   }
 }

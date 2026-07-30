@@ -4439,7 +4439,7 @@ mod profile_tests {
                 profiles.minimal.bridge_batch,
                 profiles.minimal.bridge_grad_accum
             ),
-            (64, 2)
+            (128, 1)
         );
         let value: Value = serde_json::from_str(text)?;
         assert_eq!(
