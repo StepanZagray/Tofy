@@ -1373,6 +1373,28 @@ fn semantic_gap_improved(
         && (!best_semantic_gap.is_finite() || semantic_gap >= best_semantic_gap + minimum_progress)
 }
 
+/// `best_score` is minimized and `best_semantic_gap` is maximized, so an empty
+/// selection has to persist a sentinel at each metric's own worst end. Storing
+/// one direction-agnostic sentinel makes a resumed run read "no checkpoint" as a
+/// perfect semantic gap and clear the release gate with nothing selected.
+fn bridge_selection_resume_state(
+    stage: &str,
+    step: usize,
+    best_score: f32,
+    best_semantic_gap: f32,
+    terminal: Option<util::TrainingTerminal>,
+) -> util::TrainingResumeState {
+    let selected = best_score.is_finite();
+    util::TrainingResumeState {
+        stage: stage.to_string(),
+        step,
+        best_metric: if selected { best_score } else { f32::MAX },
+        best_aux_metric: if selected { best_semantic_gap } else { f32::MIN },
+        saved_checkpoint: selected,
+        terminal,
+    }
+}
+
 fn conditioning_health(conditioning: &Tensor) -> Result<(f32, f32)> {
     let (batch, slots, dim) = conditioning.dims3()?;
     let flat = conditioning.reshape((batch * slots, dim))?;
@@ -1703,12 +1725,19 @@ fn train(args: BridgeArgs) -> Result<()> {
     let start_step = if args.resume { resume_state.step } else { 0 };
     let min_semantic_gap = env_f64("TOFY_BRIDGE_MIN_SEMANTIC_GAP", 0.02).max(0.0) as f32;
     let requires_semantic_gap = !lora_mode && static_prefix.is_none();
-    let mut best_score = if args.resume {
+    // Only inherit a selection that is still backed by an exported checkpoint.
+    // An empty selection persists sentinels, and trusting those would carry a
+    // fake best semantic gap into the release gate.
+    let resumed_selection = args.resume
+        && resume_state.saved_checkpoint
+        && resume_state.best_metric < f32::MAX
+        && best_path.exists();
+    let mut best_score = if resumed_selection {
         resume_state.best_metric
     } else {
         f32::INFINITY
     };
-    let mut best_semantic_gap = if args.resume {
+    let mut best_semantic_gap = if resumed_selection {
         resume_state.best_aux_metric
     } else {
         f32::NEG_INFINITY
@@ -2088,22 +2117,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                 )?;
                 util::save_resume_state_with_metadata(
                     &resume_path,
-                    &util::TrainingResumeState {
-                        stage: resume_stage.clone(),
+                    &bridge_selection_resume_state(
+                        &resume_stage,
                         step,
-                        best_metric: if best_score.is_finite() {
-                            best_score
-                        } else {
-                            f32::MAX
-                        },
-                        best_aux_metric: if best_semantic_gap.is_finite() {
-                            best_semantic_gap
-                        } else {
-                            f32::MIN
-                        },
-                        saved_checkpoint: false,
-                        terminal: None,
-                    },
+                        best_score,
+                        best_semantic_gap,
+                        None,
+                    ),
                     &resume_metadata,
                 )?;
                 tb.flush();
@@ -2273,14 +2293,13 @@ fn train(args: BridgeArgs) -> Result<()> {
             )?;
             util::save_resume_state_with_metadata(
                 &resume_path,
-                &util::TrainingResumeState {
-                    stage: resume_stage.clone(),
+                &bridge_selection_resume_state(
+                    &resume_stage,
                     step,
-                    best_metric: best_score,
-                    best_aux_metric: best_semantic_gap,
-                    saved_checkpoint: best_score.is_finite(),
-                    terminal: None,
-                },
+                    best_score,
+                    best_semantic_gap,
+                    None,
+                ),
                 &resume_metadata,
             )?;
             if requires_semantic_gap
@@ -2305,14 +2324,14 @@ fn train(args: BridgeArgs) -> Result<()> {
             }
         }
     }
-    if requires_semantic_gap && best_semantic_gap < min_semantic_gap {
+    if !best_score.is_finite() || (requires_semantic_gap && best_semantic_gap < min_semantic_gap) {
         tb.finish()?;
         write_bridge_nonqualification_status(
             BridgeNonqualificationReason::BudgetExhausted,
             completed_step,
         )?;
         bail!(
-            "no bridge checkpoint passed the joint autoregressive/causal gate: selected_semantic_gap={best_semantic_gap:.4}, required_semantic_gap={min_semantic_gap:.4}, required_ar_pass_rate={min_ar_pass_rate:.4}, required_ar_advantage={min_ar_advantage:.4}; latest={}",
+            "no bridge checkpoint passed the joint autoregressive/causal gate: selected_semantic_gap={best_semantic_gap:.4}, best_observed_semantic_gap={best_observed_semantic_gap:.4}, required_semantic_gap={min_semantic_gap:.4}, required_ar_pass_rate={min_ar_pass_rate:.4}, required_ar_advantage={min_ar_advantage:.4}; latest={}",
             latest_path.display()
         );
     }
@@ -2327,18 +2346,17 @@ fn train(args: BridgeArgs) -> Result<()> {
     resume_metadata.last_aux_progress_step = Some(last_semantic_progress_step);
     util::save_resume_state_with_metadata(
         &resume_path,
-        &util::TrainingResumeState {
-            stage: resume_stage,
-            step: completed_step,
-            best_metric: best_score,
-            best_aux_metric: best_semantic_gap,
-            saved_checkpoint: true,
-            terminal: Some(if stopped_early {
+        &bridge_selection_resume_state(
+            &resume_stage,
+            completed_step,
+            best_score,
+            best_semantic_gap,
+            Some(if stopped_early {
                 util::TrainingTerminal::EarlyStopped
             } else {
                 util::TrainingTerminal::TargetReached
             }),
-        },
+        ),
         &resume_metadata,
     )?;
     tb.finish()?;
@@ -2359,6 +2377,31 @@ pub fn try_run_eval_bridge(args: &[String]) -> Result<bool> {
 mod tests {
     use super::*;
     use candle_nn::Optimizer;
+
+    #[test]
+    fn empty_selection_never_persists_a_qualifying_semantic_gap() {
+        let state = bridge_selection_resume_state(
+            "bridge_context",
+            3_500,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            Some(util::TrainingTerminal::EarlyStopped),
+        );
+        assert!(!state.saved_checkpoint);
+        assert_eq!(state.best_metric, f32::MAX);
+        // The gap is maximized, so an empty selection must persist the low end;
+        // f32::MAX here would clear every `best_semantic_gap >= min` release gate.
+        assert_eq!(state.best_aux_metric, f32::MIN);
+        assert!(state.best_aux_metric < 0.02);
+    }
+
+    #[test]
+    fn selected_checkpoint_persists_its_own_metrics() {
+        let state = bridge_selection_resume_state("bridge_context", 900, 12.5, 0.31, None);
+        assert!(state.saved_checkpoint);
+        assert_eq!(state.best_metric, 12.5);
+        assert_eq!(state.best_aux_metric, 0.31);
+    }
 
     #[test]
     fn fine_grained_alignment_requires_each_target_token_in_some_slot() -> Result<()> {

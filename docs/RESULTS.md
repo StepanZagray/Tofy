@@ -10,6 +10,44 @@ and `--eval-bridge`.
 
 ## Best So Far
 
+### 2026-07-30 bridge_context run `code_poc_1785100782` — invalid, false success
+
+Pod `v2nto8bubwbodg-64411ff0` (1x H100 80GB). The stage reported
+`Bridge early stopping at step 3500` and `Best bridge saved to
+runs/code_poc_1785100782/bridge/context.safetensors`, then the pipeline died on
+`required file not found` for that same path. No checkpoint was ever exported;
+`bridge/` held only `context.latest.safetensors`. Do not treat any metric from
+this run as a result.
+
+Cause: `TrainingResumeState::new` seeds `best_aux_metric` with `f32::MAX`, and
+`--resume` on a run with no prior state loaded that sentinel into
+`best_semantic_gap`. The semantic gap is *maximized*, so `f32::MAX` read as a
+perfect gap and satisfied both release gates
+(`best_semantic_gap >= min_semantic_gap` and `best_semantic_gap <
+min_semantic_gap`). No checkpoint was ever eligible, because
+`ar.matched_pass_rate` stayed at `0.0000` at every autoregressive validation
+against `min_ar_pass_rate=0.25`. The persisted state then recorded
+`best_metric`/`best_aux_metric` of `3.4028235e38` with `saved_checkpoint: true`.
+Fixed by seeding the selection only from a resume state still backed by an
+exported checkpoint, persisting each sentinel at its own metric's worst end, and
+bailing when `best_score` is non-finite.
+
+Selected batch/accumulation pair: **physical batch 8, grad accum 16, effective
+batch 128**. `128/1`, `64/2`, `32/4`, and `16/8` all hit
+`CUDA_ERROR_OUT_OF_MEMORY` at step 1000. The first 1000 steps are the
+`latent_language_alignment` prologue, which runs zero Qwen decoder forwards and
+therefore fits far larger batches; `conditional_generation` runs three full Qwen
+forwards and backwards per micro-step, each retaining full-vocab
+(`151936`-wide) logit and `log_softmax` buffers. Batch capacity must be measured
+on the generative stage, not the prologue. `config/model_profiles.json` is
+restored to `bridge_batch: 8` / `bridge_grad_accum: 16`.
+
+Open blocker: the bridge reaches `val_ce_matched` `0.63`-`0.78` and
+`semantic_gap` `2.02`-`2.67`, but `matched_pass_rate` and `wrong_pass_rate` are
+both exactly `0.0` at every autoregressive check, so nothing can clear the joint
+gate. Teacher-forced conditioning is healthy while free-running generation
+produces no compiling, passing Go.
+
 ### 2026-07-23 rewrite baseline and failed-run preservation
 
 The old experiment is not a valid knowledge-transfer result. Its context

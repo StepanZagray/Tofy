@@ -4439,7 +4439,12 @@ mod profile_tests {
                 profiles.minimal.bridge_batch,
                 profiles.minimal.bridge_grad_accum
             ),
-            (128, 1)
+            // Measured ceiling on an 80 GiB H100: conditional_generation keeps
+            // several full-vocab logit/log-softmax buffers live per micro-step,
+            // and 16/8 OOMs where 8/16 holds. The alignment prologue runs no
+            // decoder forward, so it fits far larger batches and must not be
+            // used to pick this pair.
+            (8, 16)
         );
         let value: Value = serde_json::from_str(text)?;
         assert_eq!(
