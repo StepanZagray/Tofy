@@ -5,7 +5,7 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -1175,6 +1175,7 @@ fn autoregressive_bridge_metrics(
     let max_new = env_usize("TOFY_BRIDGE_AR_MAX_NEW", 192);
     let mut matched_passes = 0usize;
     let mut wrong_passes = 0usize;
+    let mut matched_categories: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (index, task) in eval_tasks.iter().enumerate() {
         // Keep the full task only on the world-state side. Qwen receives the
         // same signature-only counterfactual contract used by deployment, so
@@ -1196,11 +1197,26 @@ fn autoregressive_bridge_metrics(
             device,
             task.max_new_tokens.min(max_new),
         )?;
-        matched_passes +=
-            usize::from(compile_and_test(task, &matched_code, "bridge-ar-matched")?.is_pass());
+        let matched_category = compile_and_test(task, &matched_code, "bridge-ar-matched")?;
+        matched_passes += usize::from(matched_category.is_pass());
+        *matched_categories
+            .entry(matched_category.as_str())
+            .or_insert(0) += 1;
         wrong_passes +=
             usize::from(compile_and_test(task, &wrong_code, "bridge-ar-wrong")?.is_pass());
     }
+    // A bare 0.0 pass rate cannot distinguish "named a function that does not
+    // exist" from "compiled and returned the wrong value", and those point at
+    // different stages. Keep the breakdown next to the rate that summarizes it.
+    let breakdown = matched_categories
+        .iter()
+        .map(|(category, count)| format!("{category}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "bridge ar matched tasks={} breakdown: {breakdown}",
+        selected.len()
+    );
     Ok(AutoregressiveBridgeMetrics {
         matched_pass_rate: matched_passes as f32 / selected.len() as f32,
         wrong_pass_rate: wrong_passes as f32 / selected.len() as f32,
@@ -2069,26 +2085,34 @@ fn train(args: BridgeArgs) -> Result<()> {
                 conditioning_separation_sum / divisor,
                 step,
             );
-            tb.add_scalar(
-                "alignment/retrieval_top1",
-                alignment_accuracy_sum / divisor,
-                step,
-            );
+            // Only the alignment branch feeds this accumulator, so reporting it
+            // during conditional_generation prints a constant 0.000 that reads
+            // as total retrieval collapse.
+            if alignment_only {
+                tb.add_scalar(
+                    "alignment/retrieval_top1",
+                    alignment_accuracy_sum / divisor,
+                    step,
+                );
+            }
             tb.add_scalar("schedule/lr", lr as f32, step);
             if let Some(norm) = grad_norm {
                 tb.add_scalar("grad/global_norm", util::scalar_f32(&norm)?, step);
             }
-            println!(
-                "bridge step {step}/{} stage={} loss {:.4} alignment_top1 {:.3}",
-                args.steps,
-                if alignment_only {
-                    "latent_language_alignment"
-                } else {
-                    "conditional_generation"
-                },
-                loss_sum / divisor,
-                alignment_accuracy_sum / divisor,
-            );
+            if alignment_only {
+                println!(
+                    "bridge step {step}/{} stage=latent_language_alignment loss {:.4} alignment_top1 {:.3}",
+                    args.steps,
+                    loss_sum / divisor,
+                    alignment_accuracy_sum / divisor,
+                );
+            } else {
+                println!(
+                    "bridge step {step}/{} stage=conditional_generation loss {:.4}",
+                    args.steps,
+                    loss_sum / divisor,
+                );
+            }
         }
         if alignment_only {
             if step % val_every == 0 || step == alignment_steps {

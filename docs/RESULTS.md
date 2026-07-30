@@ -46,7 +46,29 @@ Open blocker: the bridge reaches `val_ce_matched` `0.63`-`0.78` and
 `semantic_gap` `2.02`-`2.67`, but `matched_pass_rate` and `wrong_pass_rate` are
 both exactly `0.0` at every autoregressive check, so nothing can clear the joint
 gate. Teacher-forced conditioning is healthy while free-running generation
-produces no compiling, passing Go.
+produces no compiling, passing Go. The harness stderr in the pod log shows two
+distinct failure modes, not one:
+
+- Undefined symbols — `veclab.Kivvex`, `veclab.Vorxarnstren`, `veclab.Vorvexwex`,
+  `veclab.Nurbmex`, `veclab.Moxsken`, `veclab.Moxprilm`, `veclab.Groldaxwelm`,
+  `veclab.Grammoxen`, `veclab.Daxt`, `veclab.Daxmox`. Greedy decoding emits
+  veclab-shaped names that are not in the package.
+- Compiled, ran, wrong answer — `main_test.go:9: got -5.3 want 2.7` and
+  `got 0.6333333333333337 want 3.3000000000000003`.
+
+Both are consistent with the adapter transmitting "call veclab" without the
+correct function identity for the validation window (functions 81-100), which
+the decoder only ever saw as docs, never as code. Train loss of `0.001`-`0.003`
+against `val_ce_matched` of `0.65+` is the memorization signature for that
+reading, but it is not yet proven.
+
+Two readouts were misleading and are now fixed:
+`autoregressive_bridge_metrics` collapsed `FailureCategory` to `is_pass()`, so
+the split above was only recoverable from raw `go` stderr; it now logs a
+per-category breakdown. `alignment_top1` was printed during
+`conditional_generation` from an accumulator only the alignment branch writes, so
+its constant `0.000` was structural, not retrieval collapse; it is now reported
+only for the stage that computes it.
 
 ### 2026-07-23 rewrite baseline and failed-run preservation
 

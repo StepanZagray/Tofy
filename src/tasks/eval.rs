@@ -63,7 +63,7 @@ pub(crate) enum FailureCategory {
 }
 
 impl FailureCategory {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CompileError => "compile_error",
             Self::TestsFailed => "tests_failed",
