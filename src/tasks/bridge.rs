@@ -83,7 +83,14 @@ impl BridgeDecodeConfig {
     pub fn from_env() -> Self {
         let temperature = env_f64("TOFY_BRIDGE_DECODE_TEMP", 0.0).max(0.0);
         let top_k = env_usize("TOFY_BRIDGE_DECODE_TOP_K", 0);
-        let samples = env_usize("TOFY_BRIDGE_DECODE_SAMPLES", 1).max(1);
+        // At temperature 0 decoding is deterministic, so extra draws are byte-identical
+        // copies. Collapsing to one keeps pass@k honest instead of reporting pass@8 for
+        // what is really pass@1 at eight times the cost.
+        let samples = if temperature > 0.0 {
+            env_usize("TOFY_BRIDGE_DECODE_SAMPLES", 1).max(1)
+        } else {
+            1
+        };
         let pass_at_k = env_usize("TOFY_BRIDGE_PASS_AT_K", samples).clamp(1, samples);
         let seed = std::env::var("TOFY_BRIDGE_DECODE_SEED")
             .ok()
@@ -99,7 +106,7 @@ impl BridgeDecodeConfig {
     }
 
     pub fn uses_sampling(self) -> bool {
-        self.temperature > 0.0 || self.samples > 1
+        self.temperature > 0.0
     }
 }
 
@@ -847,7 +854,7 @@ fn sample_token_from_logits(
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp = logits
         .iter()
-        .map(|value| (*value - max).exp())
+        .map(|value| ((f64::from(*value - max)) / temperature).exp() as f32)
         .collect::<Vec<_>>();
     let total = exp.iter().sum::<f32>().max(f32::MIN_POSITIVE);
     let draw = rng.random::<f32>() * total;

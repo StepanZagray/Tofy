@@ -110,10 +110,23 @@ struct PairedCausalMetrics {
     one_sided_p_value: f64,
 }
 
+/// Decode settings the pass@k numbers were produced under. Without these a report
+/// cannot be interpreted: pass@k is meaningless if k and the sampler are unknown.
+#[derive(Serialize)]
+struct DecodeReport {
+    temperature: f64,
+    top_k: usize,
+    samples: usize,
+    pass_at_k: usize,
+    seed: u64,
+    sampling: bool,
+}
+
 #[derive(Serialize)]
 struct EvalReport {
     schema_version: u32,
     arm: String,
+    decode: DecodeReport,
     suite_path: String,
     suite_sha256: String,
     task_offset: usize,
@@ -539,11 +552,12 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
                     });
                 }
             }
-            if sample_passed {
-                *pass_at_k_totals
-                    .entry((task.subset.clone(), condition.into()))
-                    .or_default() += 1;
-            }
+            // Record the tally for every subset/condition, not only where something
+            // passed: a genuine pass@k of 0 is the expected reading here and must be
+            // distinguishable from "pass@k was never computed".
+            *pass_at_k_totals
+                .entry((task.subset.clone(), condition.into()))
+                .or_default() += usize::from(sample_passed);
         }
     }
     let mut results: BTreeMap<String, BTreeMap<String, Rates>> = BTreeMap::new();
@@ -560,6 +574,14 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     let report = EvalReport {
         schema_version: 2,
         arm: std::env::var("TOFY_EVAL_ARM").unwrap_or_else(|_| eval_mode.clone()),
+        decode: DecodeReport {
+            temperature: decode.temperature,
+            top_k: decode.top_k,
+            samples: decode.samples,
+            pass_at_k: decode.pass_at_k,
+            seed: decode.seed,
+            sampling: decode.uses_sampling(),
+        },
         suite_path: suite_path.to_string_lossy().to_string(),
         suite_sha256,
         task_offset,
@@ -586,14 +608,15 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
     for (subset, conditions) in &report.results {
         for (condition, rates) in conditions {
-            if let (Some(pass_at_k), Some(rag_fraction)) = (rates.pass_at_k, rates.rag_fraction) {
-                println!(
-                    "eval {subset}/{condition}: pass_rate={:.4} pass@k={pass_at_k:.4} rag_ceiling={:.4} rag_fraction={rag_fraction:.4} pass@k_rag_fraction={:.4}",
-                    rates.suite_pass_rate,
-                    rates.rag_ceiling.unwrap_or(0.0),
-                    rates.pass_at_k_rag_fraction.unwrap_or(0.0),
-                );
-            }
+            println!(
+                "eval {subset}/{condition}: pass_rate={:.4} pass@{}={:.4} rag_ceiling={:.4} rag_fraction={:.4} pass@k_rag_fraction={:.4}",
+                rates.suite_pass_rate,
+                decode.pass_at_k,
+                rates.pass_at_k.unwrap_or(0.0),
+                rates.rag_ceiling.unwrap_or(0.0),
+                rates.rag_fraction.unwrap_or(0.0),
+                rates.pass_at_k_rag_fraction.unwrap_or(0.0),
+            );
         }
     }
     println!("Evaluation report: {}", report_path.display());

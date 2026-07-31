@@ -16,8 +16,22 @@ fn conditioning_l2(left: &Tensor, right: &Tensor) -> Result<f32> {
     Ok(util::scalar_f32(&delta)?.sqrt())
 }
 
-fn swap_docs_api(docs: &str, from: &str, to: &str) -> String {
-    docs.replace(&format!("veclab.{from}"), &format!("veclab.{to}"))
+/// Pull the veclab function name out of a doc entry. Docs are Go signatures of the
+/// form `func Mextrenstel(xs []float64, k int) float64`; they never contain a
+/// `veclab.`-qualified token, so keying off that prefix finds nothing.
+fn veclab_api_name(docs: &str) -> Option<String> {
+    let rest = docs.split("func ").nth(1)?;
+    let name = rest
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Rewrite an identifier everywhere it appears, qualified or bare.
+fn swap_api(text: &str, from: &str, to: &str) -> String {
+    text.replace(&format!("veclab.{from}"), &format!("veclab.{to}"))
         .replace(from, to)
 }
 
@@ -27,51 +41,57 @@ fn corruption_variants(
     docs: &BTreeMap<usize, String>,
 ) -> Vec<(String, VeclabTaskRow)> {
     let mut out = Vec::new();
-    let wrong = VeclabTaskRow {
-        function_id: alt_function_id,
-        docs: docs
-            .get(&alt_function_id)
-            .cloned()
-            .unwrap_or_else(|| row.docs.clone()),
-        ..row.clone()
+    let api = veclab_api_name(&row.docs);
+    let alt_api = docs.get(&alt_function_id).and_then(|doc| veclab_api_name(doc));
+
+    // The weights regime conditions on `row.task` alone and the context regime on
+    // docs + task, so every corruption has to rewrite the identifier in both fields.
+    // Mutating only `docs`/`function_id` leaves the weights-regime conditioning input
+    // byte-identical and every distance identically zero.
+    let alt_docs = docs
+        .get(&alt_function_id)
+        .cloned()
+        .unwrap_or_else(|| row.docs.clone());
+    let wrong_task = match (api.as_deref(), alt_api.as_deref()) {
+        (Some(from), Some(to)) if from != to => swap_api(&row.task, from, to),
+        _ => row.task.clone(),
     };
-    out.push(("wrong_function".into(), wrong));
-    if let Some(api) = row
-        .docs
-        .split_whitespace()
-        .find_map(|token| token.strip_prefix("veclab."))
-        .map(|name| name.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-    {
-        if let Some(alt_api) = docs
-            .get(&alt_function_id)
-            .and_then(|doc| {
-                doc.split_whitespace()
-                    .find_map(|token| token.strip_prefix("veclab."))
-                    .map(|name| name.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-            })
-            .filter(|name| name != &api)
-        {
-            out.push((
-                "docs_real_swap".into(),
-                VeclabTaskRow {
-                    docs: swap_docs_api(&row.docs, &api, &alt_api),
-                    ..row.clone()
-                },
-            ));
-        }
+    out.push((
+        "wrong_function".into(),
+        VeclabTaskRow {
+            function_id: alt_function_id,
+            docs: alt_docs,
+            task: wrong_task,
+            ..row.clone()
+        },
+    ));
+
+    let Some(api) = api else {
+        return out;
+    };
+    if let Some(alt_api) = alt_api.filter(|name| name != &api) {
         out.push((
-            "docs_fake_swap".into(),
+            "docs_real_swap".into(),
             VeclabTaskRow {
-                docs: swap_docs_api(&row.docs, &api, "NotARealFn"),
+                docs: swap_api(&row.docs, &api, &alt_api),
+                task: swap_api(&row.task, &api, &alt_api),
                 ..row.clone()
             },
         ));
     }
+    out.push((
+        "docs_fake_swap".into(),
+        VeclabTaskRow {
+            docs: swap_api(&row.docs, &api, "NotARealFn"),
+            task: swap_api(&row.task, &api, "NotARealFn"),
+            ..row.clone()
+        },
+    ));
     out
 }
 
 fn run_conditioning_corruption_probe(args: &[String]) -> Result<bool> {
-    if args.len() < 8 {
+    if args.len() < 9 {
         bail!("usage: --run-conditioning-corruption-probe <qwen_dir> <bridge> <encoder> <vocab> <world> <tasks> <report.json>");
     }
     let runtime = BridgeRuntime::load(
@@ -100,10 +120,22 @@ fn run_conditioning_corruption_probe(args: &[String]) -> Result<bool> {
         by_function.entry(row.function_id).or_insert(row);
     }
     let function_ids = by_function.keys().copied().collect::<Vec<_>>();
-    let selected = function_ids
+    // Function ids are ascending, so taking the first N lands entirely inside the seen
+    // range and leaves the held-out split empty. Draw from both so the report covers
+    // the splits it claims.
+    let (seen_ids, heldout_ids): (Vec<usize>, Vec<usize>) = function_ids
         .iter()
         .copied()
-        .take(sample_count)
+        .partition(|id| *id <= SEEN_FUNCTION_MAX);
+    let mut seen_quota = sample_count.div_ceil(2).min(seen_ids.len());
+    let heldout_quota = sample_count.saturating_sub(seen_quota).min(heldout_ids.len());
+    seen_quota = sample_count
+        .saturating_sub(heldout_quota)
+        .min(seen_ids.len());
+    let selected = seen_ids
+        .into_iter()
+        .take(seen_quota)
+        .chain(heldout_ids.into_iter().take(heldout_quota))
         .filter_map(|function_id| by_function.remove(&function_id))
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -133,6 +165,21 @@ fn run_conditioning_corruption_probe(args: &[String]) -> Result<bool> {
                 .or_default()
                 .push(distance);
         }
+    }
+    // An all-zero result means the corruption never reached the conditioning input, not
+    // that the channel is insensitive to it. Fail loudly rather than emit a report that
+    // reads like a finding.
+    if split_metrics
+        .values()
+        .flat_map(|variants| variants.values())
+        .flatten()
+        .all(|distance| *distance == 0.0)
+    {
+        bail!(
+            "conditioning corruption probe produced identically zero distances for every variant: \
+             the corrupted rows encode to the same conditioning input as the matched rows, so the \
+             probe is measuring nothing"
+        );
     }
     let mean = |values: &[f32]| {
         if values.is_empty() {
@@ -351,4 +398,55 @@ pub fn try_run(args: &[String]) -> Result<bool> {
         report_path.display()
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real shape of a `veclab_docs.txt` entry: a Go signature, with no
+    /// `veclab.`-qualified token anywhere.
+    const DOC_1: &str = "func Mextrenstel(xs []float64, k int) float64\nMextrenstel returns the sort by descending absolute value.";
+    const DOC_2: &str = "func Zarnmox(xs []float64, k int) float64\nZarnmox returns something else.";
+
+    #[test]
+    fn api_name_is_read_from_the_go_signature() {
+        assert_eq!(veclab_api_name(DOC_1).as_deref(), Some("Mextrenstel"));
+        assert_eq!(veclab_api_name(DOC_2).as_deref(), Some("Zarnmox"));
+        assert_eq!(veclab_api_name("no signature here"), None);
+    }
+
+    #[test]
+    fn corruption_rewrites_the_task_text_that_conditioning_actually_sees() {
+        let row = VeclabTaskRow {
+            task: "Evaluation harness: implement `func Solve(xs []float64, k int) float64` by delegating to veclab.Mextrenstel(xs, k)".into(),
+            completion: "package solution".into(),
+            function_id: 1,
+            docs: DOC_1.into(),
+        };
+        let docs = BTreeMap::from([(1usize, DOC_1.to_string()), (2usize, DOC_2.to_string())]);
+        let variants = corruption_variants(&row, 2, &docs);
+
+        let labels = variants
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["wrong_function", "docs_real_swap", "docs_fake_swap"]
+        );
+
+        // The weights regime conditions on `task` alone, so every variant must alter it.
+        for (label, corrupted) in &variants {
+            assert_ne!(
+                corrupted.task, row.task,
+                "{label} left the task text unchanged, so weights-regime conditioning is identical"
+            );
+            assert!(
+                !corrupted.task.contains("Mextrenstel"),
+                "{label} left the original identifier in the task text"
+            );
+        }
+        assert!(variants[2].1.task.contains("NotARealFn"));
+    }
 }
