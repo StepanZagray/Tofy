@@ -894,10 +894,13 @@ fn generate_code(
     for _ in 0..max_new {
         let input = Tensor::from_vec(next_input.clone(), (1, next_input.len()), device)?;
         let logits = model.forward_cached(&input, conditioning, &mut cache)?;
+        // forward_cached returns [batch, seq, vocab] and generation is always batch 1,
+        // so both leading dims have to go: sample_token_from_logits needs rank 1.
         let next = sample_token_from_logits(
             &logits
                 .narrow(1, logits.dim(1)? - 1, 1)?
-                .squeeze(1)?,
+                .squeeze(1)?
+                .squeeze(0)?,
             decode.temperature,
             decode.top_k,
             &mut rng,
@@ -3150,5 +3153,52 @@ mod tests {
     fn pass_rate_rag_fraction_normalizes_against_ceiling() {
         assert!((pass_rate_rag_fraction(0.07, 0.35) - 0.2).abs() < 1e-6);
         assert!((pass_rate_rag_fraction(0.0, 0.35)).abs() < 1e-6);
+    }
+
+    /// `forward_cached` emits [batch, seq, vocab]; the sampler consumes rank 1.
+    /// Dropping only the sequence dim leaves [1, vocab] and `to_vec1` fails at
+    /// runtime, which took down the RAG preflight before any bridge step ran.
+    #[test]
+    fn sampler_consumes_the_last_position_of_a_batched_logit_tensor() {
+        let device = Device::Cpu;
+        let vocab = 7usize;
+        let logits = Tensor::from_vec(
+            (0..(3 * vocab)).map(|v| v as f32).collect::<Vec<_>>(),
+            (1, 3, vocab),
+            &device,
+        )
+        .unwrap();
+        let last = logits
+            .narrow(1, logits.dim(1).unwrap() - 1, 1)
+            .unwrap()
+            .squeeze(1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap();
+        assert_eq!(last.rank(), 1);
+        let mut rng = StdRng::seed_from_u64(0);
+        // Greedy: the last row is 14..20, so the argmax is the final index.
+        let token = sample_token_from_logits(&last, 0.0, 0, &mut rng).unwrap();
+        assert_eq!(token, vocab as u32 - 1);
+    }
+
+    /// Temperature has to scale the logits, not merely switch sampling on.
+    #[test]
+    fn temperature_changes_the_sampled_distribution() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32, 1.0, 2.0], 3, &device).unwrap();
+        let draws = |temperature: f64| {
+            let mut rng = StdRng::seed_from_u64(7);
+            (0..400)
+                .filter(|_| sample_token_from_logits(&logits, temperature, 0, &mut rng).unwrap() == 2)
+                .count()
+        };
+        let cold = draws(0.1);
+        let hot = draws(4.0);
+        assert!(
+            cold > hot,
+            "a colder temperature must concentrate mass on the argmax: cold={cold} hot={hot}"
+        );
+        assert!(cold > 380, "temperature 0.1 should be nearly greedy, got {cold}");
     }
 }
