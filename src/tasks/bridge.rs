@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_nn::{Optimizer, VarBuilder, VarMap};
 use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,7 +22,9 @@ use crate::tasks::veclab::{
     SEEN_FUNCTION_MAX,
 };
 use crate::tasks::world_context::{context_slots_from_world_states, env_bool, env_f64, env_usize};
-use crate::tasks::world_support::{masked_cross_entropy, masked_unlikelihood};
+use crate::tasks::world_support::{
+    masked_cross_entropy, masked_cross_entropy_smoothed, masked_unlikelihood,
+};
 use crate::util;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1028,7 +1030,7 @@ fn val_losses(
     };
     let (input, labels, mask, semantic_mask) = qwen_batch(tokenizer, rows, max_seq, device)?;
     let (matched, matched_semantic) =
-        token_losses(model, &input, &labels, &mask, &semantic_mask, &cond)?;
+        token_losses(model, &input, &labels, &mask, &semantic_mask, &cond, 0.0)?;
     let matched = util::scalar_f32(&matched)?;
     let matched_semantic = util::scalar_f32(&matched_semantic)?;
     let zeroed = util::scalar_f32(&token_loss(
@@ -1050,7 +1052,7 @@ fn val_losses(
             adapter.forward(&slots)?
         };
         let (wrong_full_loss, wrong_semantic_loss) =
-            token_losses(model, &input, &labels, &mask, &semantic_mask, &wrong_cond)?;
+            token_losses(model, &input, &labels, &mask, &semantic_mask, &wrong_cond, 0.0)?;
         wrong = wrong.min(util::scalar_f32(&wrong_full_loss)?);
         wrong_semantic = wrong_semantic.min(util::scalar_f32(&wrong_semantic_loss)?);
     }
@@ -1128,10 +1130,39 @@ struct AutoregressiveBridgeMetrics {
     wrong_pass_rate: f32,
 }
 
+/// Round-robin across functions so the sample spans the whole split.
+///
+/// Validation rows arrive grouped by function and the corpus repeats rows
+/// verbatim, so taking a flat prefix drew 40 copies of function 81 plus 20 of
+/// function 82 and reported that as a 20-function transfer rate.
+fn stratified_ar_rows(rows: &[VeclabTaskRow], sample_count: usize) -> Vec<VeclabTaskRow> {
+    let mut by_function: BTreeMap<usize, Vec<&VeclabTaskRow>> = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        if seen.insert((row.function_id, row.task.as_str(), row.completion.as_str())) {
+            by_function.entry(row.function_id).or_default().push(row);
+        }
+    }
+    let mut selected = Vec::new();
+    let deepest = by_function.values().map(Vec::len).max().unwrap_or(0);
+    for depth in 0..deepest {
+        for group in by_function.values() {
+            if selected.len() == sample_count {
+                return selected;
+            }
+            if let Some(row) = group.get(depth) {
+                selected.push((*row).clone());
+            }
+        }
+    }
+    selected
+}
+
 #[allow(clippy::too_many_arguments)]
 fn autoregressive_bridge_metrics(
     rows: &[VeclabTaskRow],
     sample_count: usize,
+    label: &str,
     regime: BridgeRegime,
     tokenizer: &Tokenizer,
     encoder: &OnlineEncoder,
@@ -1149,7 +1180,7 @@ fn autoregressive_bridge_metrics(
     // Reuse the same validation rows as teacher-forced CE. The old path rebuilt
     // rows from eval/veclab_eval.jsonl, whose task phrasing never appears in
     // bridge training and shifted the conditioning encoder off-manifold.
-    let selected: Vec<VeclabTaskRow> = rows.iter().take(sample_count.max(1)).cloned().collect();
+    let selected = stratified_ar_rows(rows, sample_count.max(1));
     let function_ids = selected
         .iter()
         .map(|row| row.function_id)
@@ -1165,7 +1196,9 @@ fn autoregressive_bridge_metrics(
     if harness_by_fn.len() < function_ids.len() {
         bail!("autoregressive bridge validation is missing eval harness tasks");
     }
-    let wrong_rows = mismatched_rows(&selected, &selected, 1)?;
+    // Draw negatives from the full split, not the sample, so the mismatched
+    // control still has a signature-matched partner to choose from.
+    let wrong_rows = mismatched_rows(rows, &selected, 1)?;
     let matched_slots = state_conditioning(
         &selected, regime, encoder, compressor, world, vocab, max_seq, device,
     )?;
@@ -1185,6 +1218,7 @@ fn autoregressive_bridge_metrics(
     let mut matched_passes = 0usize;
     let mut wrong_passes = 0usize;
     let mut matched_categories: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut by_function: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
     for (index, row) in selected.iter().enumerate() {
         let harness = bridge_ar_harness(&harness_by_fn, row)?;
         // Keep the full task only on the world-state side. Qwen receives the
@@ -1212,6 +1246,9 @@ fn autoregressive_bridge_metrics(
         *matched_categories
             .entry(matched_category.as_str())
             .or_insert(0) += 1;
+        let tally = by_function.entry(row.function_id).or_insert((0, 0));
+        tally.0 += usize::from(matched_category.is_pass());
+        tally.1 += 1;
         wrong_passes +=
             usize::from(compile_and_test(harness, &wrong_code, "bridge-ar-wrong")?.is_pass());
     }
@@ -1223,9 +1260,17 @@ fn autoregressive_bridge_metrics(
         .map(|(category, count)| format!("{category}={count}"))
         .collect::<Vec<_>>()
         .join(" ");
+    // Report the function coverage next to the rate. A sample that collapses
+    // onto a few functions reads as a transfer result otherwise.
+    let per_function = by_function
+        .iter()
+        .map(|(function_id, (passed, total))| format!("{function_id}:{passed}/{total}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     println!(
-        "bridge ar matched tasks={} breakdown: {breakdown}",
-        selected.len()
+        "bridge ar {label} tasks={} functions={} breakdown: {breakdown} per_function: {per_function}",
+        selected.len(),
+        by_function.len()
     );
     Ok(AutoregressiveBridgeMetrics {
         matched_pass_rate: matched_passes as f32 / selected.len() as f32,
@@ -1244,6 +1289,8 @@ fn token_loss(
     masked_cross_entropy(&logits.narrow(1, 0, logits.dim(1)? - 1)?, labels, mask)
 }
 
+/// `smoothing` must stay 0.0 for validation so `val_ce_matched` remains
+/// comparable across runs; only the training objective is smoothed.
 fn token_losses(
     model: &Qwen3Bridge,
     input: &Tensor,
@@ -1251,11 +1298,12 @@ fn token_losses(
     mask: &Tensor,
     semantic_mask: &Tensor,
     cond: &Tensor,
+    smoothing: f64,
 ) -> Result<(Tensor, Tensor)> {
     let logits = model.forward(input, cond)?;
     let logits = logits.narrow(1, 0, logits.dim(1)? - 1)?;
     Ok((
-        masked_cross_entropy(&logits, labels, mask)?,
+        masked_cross_entropy_smoothed(&logits, labels, mask, smoothing)?,
         masked_cross_entropy(&logits, labels, semantic_mask)?,
     ))
 }
@@ -1662,6 +1710,11 @@ fn train(args: BridgeArgs) -> Result<()> {
         .filter(|row| !row.completion.trim_start().starts_with("package solution"))
         .cloned()
         .collect::<Vec<_>>();
+    let train_code_rows = train_rows
+        .iter()
+        .filter(|row| row.completion.trim_start().starts_with("package solution"))
+        .cloned()
+        .collect::<Vec<_>>();
     if alignment_rows.is_empty() && !lora_mode && static_prefix.is_none() {
         bail!(
             "two-stage bridge training requires documentation rows for latent-language alignment"
@@ -1702,6 +1755,11 @@ fn train(args: BridgeArgs) -> Result<()> {
     let val_every = env_usize("TOFY_BRIDGE_VAL_EVERY", 100).max(1);
     let ar_val_every = env_usize("TOFY_BRIDGE_AR_VAL_EVERY", 500).max(val_every);
     let ar_val_rows = env_usize("TOFY_BRIDGE_AR_VAL_ROWS", 60);
+    let ar_train_rows = env_usize("TOFY_BRIDGE_AR_TRAIN_ROWS", 60).min(train_code_rows.len());
+    // The pipeline has always recorded TOFY_LABEL_SMOOTHING in the run
+    // manifest, but nothing read it, so every run so far reported a smoothing
+    // it never applied.
+    let label_smoothing = env_f64("TOFY_LABEL_SMOOTHING", 0.0).clamp(0.0, 0.5);
     let min_ar_pass_rate = env_f64("TOFY_BRIDGE_MIN_AR_PASS_RATE", 0.25).clamp(0.0, 1.0) as f32;
     let min_ar_advantage = env_f64("TOFY_BRIDGE_MIN_AR_ADVANTAGE", 0.125).clamp(0.0, 1.0) as f32;
     let log_every = env_usize("TOFY_BRIDGE_LOG_EVERY", 10).max(1);
@@ -1949,7 +2007,7 @@ fn train(args: BridgeArgs) -> Result<()> {
             }
 
             let (positive, positive_semantic) =
-                token_losses(&qwen, &input, &labels, &mask, &semantic_mask, &cond)?;
+                token_losses(&qwen, &input, &labels, &mask, &semantic_mask, &cond, label_smoothing)?;
             let positive_value = util::scalar_f32(&positive)?;
             let positive_semantic_value = util::scalar_f32(&positive_semantic)?;
             let active = negative_values
@@ -2087,6 +2145,11 @@ fn train(args: BridgeArgs) -> Result<()> {
                 );
             }
         }
+        // Warmup + cosine decay, matching the latent and world stages. A flat
+        // 1e-4 across the whole budget let the decoder keep memorizing the
+        // training functions long after held-out CE had bottomed out.
+        let step_lr = util::scheduled_lr(lr, step, args.steps);
+        optimizer.set_learning_rate(step_lr);
         util::optimizer_step_from_accumulated(&mut optimizer, &mut accumulated)?;
         if step % log_every == 0 {
             let divisor = grad_accum as f32;
@@ -2120,7 +2183,7 @@ fn train(args: BridgeArgs) -> Result<()> {
                     step,
                 );
             }
-            tb.add_scalar("schedule/lr", lr as f32, step);
+            tb.add_scalar("schedule/lr", step_lr as f32, step);
             if let Some(norm) = grad_norm {
                 tb.add_scalar("grad/global_norm", util::scalar_f32(&norm)?, step);
             }
@@ -2201,9 +2264,31 @@ fn train(args: BridgeArgs) -> Result<()> {
             let semantic_gap = losses.wrong_semantic - losses.matched_semantic;
             let ar_metrics = if requires_semantic_gap {
                 if step % ar_val_every == 0 || step == args.steps {
+                    // The train-function rate is the control that separates "the
+                    // conditioning channel cannot carry function identity at all"
+                    // from "it carries it but does not generalize". Without it a
+                    // held-out rate of zero is unattributable.
+                    if ar_train_rows > 0 {
+                        autoregressive_bridge_metrics(
+                            &train_code_rows,
+                            ar_train_rows,
+                            "train",
+                            regime,
+                            &tokenizer,
+                            &encoder,
+                            &compressor,
+                            &world,
+                            &encoder_vocab,
+                            &adapter,
+                            &qwen,
+                            max_seq,
+                            &device,
+                        )?;
+                    }
                     Some(autoregressive_bridge_metrics(
                         &val_rows,
                         ar_val_rows,
+                        "matched",
                         regime,
                         &tokenizer,
                         &encoder,
@@ -2319,9 +2404,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                 // A one-point change in compile-and-harness pass rate dominates
                 // any plausible teacher-forced CE movement. CE only breaks
                 // ties between checkpoints with the same deployment behavior.
+                // Tie-break on the identifier-span CE, not the whole-completion
+                // CE. The latter is dominated by boilerplate the decoder always
+                // gets right, so it barely moved between checkpoints that
+                // differed sharply in whether they recovered the function name.
                 let selection_score = (1.0 - ar.matched_pass_rate) * 100.0
                     + ar.wrong_pass_rate * 25.0
-                    + losses.matched;
+                    + losses.matched_semantic;
                 tb.add_scalar("val/selection_score", selection_score, step);
                 if eligible && selection_score < best_score {
                     best_score = selection_score;
@@ -2621,6 +2710,36 @@ mod tests {
             .iter()
             .all(|row| (81..=100).contains(&row.function_id)));
         Ok(())
+    }
+
+    #[test]
+    fn stratified_ar_rows_spread_across_functions_and_drop_duplicates() {
+        // Validation rows arrive grouped by function and repeat verbatim. A
+        // flat prefix took 40 copies of one function and reported it as a
+        // 20-function transfer rate.
+        let mut rows = Vec::new();
+        for function_id in 81..=100 {
+            for variant in 0..40 {
+                rows.push(VeclabTaskRow {
+                    task: format!("[fn:{function_id}] variant {}", variant % 4),
+                    completion: "package solution\nfunc Solve() {}".into(),
+                    function_id,
+                    docs: String::new(),
+                });
+            }
+        }
+        let selected = stratified_ar_rows(&rows, 60);
+        assert_eq!(selected.len(), 60);
+        let functions = selected
+            .iter()
+            .map(|row| row.function_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(functions.len(), 20, "sample must span every val function");
+        let distinct = selected
+            .iter()
+            .map(|row| (row.function_id, row.task.as_str()))
+            .collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), 60, "duplicate rows must not be sampled");
     }
 
     #[test]

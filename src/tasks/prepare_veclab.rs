@@ -13,10 +13,13 @@ use std::process::{Command, Stdio};
 
 use crate::tasks::prepare::escape_pair_field;
 
-pub const GENERATOR_VERSION: &str = "1.2.0";
+pub const GENERATOR_VERSION: &str = "1.3.0";
 pub const DEFAULT_SEED: u64 = 20260705;
 pub const FUNCTION_COUNT: usize = 200;
 pub const SEEN_FUNCTION_MAX: usize = 100;
+/// Upper bound of the bridge stage's code-row training split (train:1-80,
+/// val:81-100); mirrors the `TOFY_BRIDGE_TRAIN_FUNCTION_MAX` default.
+pub const BRIDGE_TRAIN_FUNCTION_MAX: usize = 80;
 pub const TASKS_PER_FUNCTION: usize = 40;
 pub const EVAL_TASKS_PER_FUNCTION: usize = 3;
 pub const KNOWLEDGE_ROWS_PER_FUNCTION: usize = 40;
@@ -1155,19 +1158,26 @@ fn encoder_reference_query(f: &FunctionDef, variant: usize) -> String {
     )
 }
 
-fn ensure_unique_rows(label: &str, text: &str) -> Result<()> {
-    let mut seen = HashSet::new();
-    for (index, row) in text
+/// Rejects a corpus that repeats rows or that fails to reach its target size
+/// with unique rows (see docs/VECLAB_DATA_SPEC.md: padding with duplicates to
+/// hit a row target is forbidden).
+fn ensure_unique_rows(label: &str, text: &str, expected: usize) -> Result<()> {
+    let rows = text
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .enumerate()
-    {
-        if !seen.insert(row) {
-            bail!(
-                "{label} contains a duplicate row at one-based row {}",
-                index + 1
-            );
-        }
+        .collect::<Vec<_>>();
+    let unique = rows.iter().collect::<HashSet<_>>().len();
+    if unique != rows.len() {
+        bail!(
+            "{label} emitted {} rows but only {unique} are unique; expand the template space instead of repeating rows",
+            rows.len()
+        );
+    }
+    if rows.len() != expected {
+        bail!(
+            "{label} cannot reach its target of {expected} unique rows; got {}",
+            rows.len()
+        );
     }
     Ok(())
 }
@@ -1185,6 +1195,18 @@ fn ensure_disjoint_queries(train: &str, validation: &str) -> Result<()> {
         bail!("veclab knowledge train/validation query overlap: {overlap}");
     }
     Ok(())
+}
+
+/// Dual-call partners must stay inside one split, so functions are partitioned
+/// into bridge-train (1-80), bridge-validation (81-100) and held-out (101-200).
+fn partition_key(id: usize) -> usize {
+    if id <= BRIDGE_TRAIN_FUNCTION_MAX {
+        0
+    } else if id <= SEEN_FUNCTION_MAX {
+        1
+    } else {
+        2
+    }
 }
 
 fn generate_tasks_for_fn(
@@ -1207,9 +1229,7 @@ fn generate_tasks_for_fn(
         } else if rng.random::<u8>() % 100 < 30 {
             let same_partition = all
                 .iter()
-                .filter(|g| {
-                    (g.id <= SEEN_FUNCTION_MAX) == (f.id <= SEEN_FUNCTION_MAX) && g.id != f.id
-                })
+                .filter(|g| partition_key(g.id) == partition_key(f.id) && g.id != f.id)
                 .map(|g| g.id)
                 .collect::<Vec<_>>();
             if same_partition.is_empty() {
@@ -1524,18 +1544,31 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
             ));
         }
     }
-    if encoder_mix.lines().count() != 20_000 {
-        bail!(
-            "veclab encoder corpus must contain exactly 20000 rows, got {}",
-            encoder_mix.lines().count()
-        );
-    }
-    ensure_unique_rows("veclab knowledge train", &knowledge_train)?;
-    ensure_unique_rows("veclab knowledge validation", &knowledge_val)?;
+    let val_rounds = (0..KNOWLEDGE_ROWS_PER_FUNCTION)
+        .filter(|round| round % 20 == 0)
+        .count();
+    ensure_unique_rows(
+        "veclab knowledge train",
+        &knowledge_train,
+        (KNOWLEDGE_ROWS_PER_FUNCTION - val_rounds) * FUNCTION_COUNT,
+    )?;
+    ensure_unique_rows(
+        "veclab knowledge validation",
+        &knowledge_val,
+        val_rounds * FUNCTION_COUNT,
+    )?;
     ensure_disjoint_queries(&knowledge_train, &knowledge_val)?;
-    ensure_unique_rows("veclab task train", &train)?;
-    ensure_unique_rows("veclab task heldout", &heldout)?;
-    ensure_unique_rows("veclab encoder", &encoder_mix)?;
+    ensure_unique_rows(
+        "veclab task train",
+        &train,
+        SEEN_FUNCTION_MAX * TASKS_PER_FUNCTION,
+    )?;
+    ensure_unique_rows(
+        "veclab task heldout",
+        &heldout,
+        (FUNCTION_COUNT - SEEN_FUNCTION_MAX) * TASKS_PER_FUNCTION,
+    )?;
+    ensure_unique_rows("veclab encoder", &encoder_mix, 20_000)?;
 
     fs::write(data_dir.join("veclab_docs.txt"), &docs_rows)?;
     fs::write(data_dir.join("veclab_knowledge.txt"), &knowledge)?;
@@ -1562,6 +1595,7 @@ pub fn prepare(opts: PrepareOptions) -> Result<()> {
     run_leak_guards(
         &data_dir,
         &eval_root,
+        &functions,
         &training_paraphrases,
         &eval_lines
             .iter()
@@ -1691,6 +1725,7 @@ fn stub_solve_source(f: &FunctionDef) -> String {
 fn run_leak_guards(
     data_dir: &Path,
     eval_root: &Path,
+    functions: &[FunctionDef],
     training_paraphrases: &HashSet<String>,
     eval_tasks: &[&str],
 ) -> Result<()> {
@@ -1705,6 +1740,22 @@ fn run_leak_guards(
     }
     if let Some(row) = heldout_gold_in(&knowledge_text).into_iter().next() {
         bail!("held-out gold leaked into knowledge: fn {}", row);
+    }
+    let bridge_leaks = bridge_val_gold_in(&train_text, functions);
+    if !bridge_leaks.is_empty() {
+        let sample = bridge_leaks
+            .iter()
+            .take(5)
+            .map(|(row, partner)| format!("fn {row} -> fn {partner}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "bridge validation gold leaked into bridge train rows: {} rows tagged fn <= {} call fns {}-{} ({sample})",
+            bridge_leaks.len(),
+            BRIDGE_TRAIN_FUNCTION_MAX,
+            BRIDGE_TRAIN_FUNCTION_MAX + 1,
+            SEEN_FUNCTION_MAX
+        );
     }
     if train_text.contains("data/fictional/veclab") {
         bail!("implementation path leaked into train data");
@@ -1740,6 +1791,32 @@ fn parse_fn_tag(line: &str) -> Option<usize> {
     let rest = &line[start..];
     let end = rest.find(']')?;
     rest[..end].parse().ok()
+}
+
+/// Bridge-train rows (fn <= 80) whose gold target calls a bridge-validation
+/// function (fn 81-100). `heldout_gold_in` only sees the 100/200 boundary, so
+/// this covers the 80/100 boundary the bridge stage actually trains on.
+fn bridge_val_gold_in(text: &str, functions: &[FunctionDef]) -> Vec<(usize, usize)> {
+    let val_calls = functions
+        .iter()
+        .filter(|f| f.id > BRIDGE_TRAIN_FUNCTION_MAX && f.id <= SEEN_FUNCTION_MAX)
+        .map(|f| (format!("veclab.{}(", f.name), f.id))
+        .collect::<Vec<_>>();
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let state = fields.next()?;
+            let next = fields.next().unwrap_or("");
+            let id = parse_fn_tag(state)?;
+            if id > BRIDGE_TRAIN_FUNCTION_MAX || !next.contains("package solution") {
+                return None;
+            }
+            val_calls
+                .iter()
+                .find(|(call, _)| next.contains(call.as_str()))
+                .map(|(_, partner)| (id, *partner))
+        })
+        .collect()
 }
 
 fn heldout_gold_in(text: &str) -> Vec<usize> {

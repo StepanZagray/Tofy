@@ -37,6 +37,39 @@ pub(crate) fn masked_cross_entropy(
     masked_weighted_cross_entropy(logits, labels, mask, None)
 }
 
+/// Cross-entropy against a `smoothing`-interpolated uniform target.
+///
+/// Callers must keep this off the reported validation CE: smoothing adds a
+/// vocabulary-sized constant floor, so a smoothed number is not comparable
+/// with an unsmoothed one across runs.
+pub(crate) fn masked_cross_entropy_smoothed(
+    logits: &Tensor,
+    labels: &Tensor,
+    mask: &Tensor,
+    smoothing: f64,
+) -> Result<Tensor> {
+    let nll = masked_weighted_cross_entropy(logits, labels, mask, None)?;
+    if smoothing <= 0.0 {
+        return Ok(nll);
+    }
+    let log_probs = candle_nn::ops::log_softmax(logits, candle_core::D::Minus1)?;
+    let flat_mask = mask
+        .reshape((mask.elem_count(),))?
+        .to_dtype(log_probs.dtype())?;
+    let uniform = log_probs
+        .mean(candle_core::D::Minus1)?
+        .affine(-1.0, 0.0)?
+        .reshape((labels.elem_count(),))?
+        .broadcast_mul(&flat_mask)?
+        .sum_all()?
+        .broadcast_div(&flat_mask.sum_all()?)?;
+    // (1 - eps) * NLL + eps * mean_vocab(-log p); the mean already divides by
+    // the vocabulary size, so no extra 1/V factor here.
+    nll.affine(1.0 - smoothing, 0.0)?
+        .broadcast_add(&uniform.affine(smoothing, 0.0)?)
+        .map_err(Into::into)
+}
+
 /// Penalizes the target tokens under a deliberately wrong conditioning state.
 /// Unlike `-cross_entropy`, this keeps a useful gradient when the decoder has
 /// already assigned the target probability very close to one.
