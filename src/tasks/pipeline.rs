@@ -779,6 +779,9 @@ fn set_pipeline_env(cfg: &PipelineConfig, defaults: &ProfileDefaults) {
     set_env_default_owned("TOFY_BRIDGE_MAX_SEQ", defaults.bridge_max_seq.to_string());
     set_env_default("TOFY_DECODER_CONDITIONING_NEGATIVES", "hard");
     set_env_default("TOFY_BRIDGE_MIN_SEMANTIC_GAP", "0.02");
+    set_env_default("TOFY_RAG_CEILING_SEEN", "0.35");
+    set_env_default("TOFY_RAG_CEILING_HELDOUT", "0.42");
+    set_env_default("TOFY_BRIDGE_MIN_AR_PASS_FRACTION", "0.5");
     set_env_default("TOFY_BRIDGE_COUNTERFACTUAL_PROMPTS", "true");
     set_env_default("TOFY_BRIDGE_TRAIN_FUNCTION_MAX", "80");
     set_env_default("TOFY_BRIDGE_VALIDATION_FUNCTION_MAX", "100");
@@ -3969,7 +3972,16 @@ fn immutable_training_env(defaults: &ProfileDefaults) -> BTreeMap<String, String
         "TOFY_BRIDGE_VAL_EVERY",
         "TOFY_BRIDGE_AR_VAL_EVERY",
         "TOFY_BRIDGE_AR_VAL_ROWS",
+        "TOFY_BRIDGE_AR_TRAIN_ROWS",
         "TOFY_BRIDGE_AR_MAX_NEW",
+        "TOFY_BRIDGE_DECODE_TEMP",
+        "TOFY_BRIDGE_DECODE_TOP_K",
+        "TOFY_BRIDGE_DECODE_SAMPLES",
+        "TOFY_BRIDGE_PASS_AT_K",
+        "TOFY_BRIDGE_DECODE_SEED",
+        "TOFY_RAG_CEILING_SEEN",
+        "TOFY_RAG_CEILING_HELDOUT",
+        "TOFY_BRIDGE_MIN_AR_PASS_FRACTION",
         "TOFY_BRIDGE_MIN_AR_PASS_RATE",
         "TOFY_BRIDGE_MIN_AR_ADVANTAGE",
         "TOFY_BRIDGE_MIN_SEMANTIC_GAP",

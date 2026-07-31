@@ -27,6 +27,82 @@ use crate::tasks::world_support::{
 };
 use crate::util;
 
+/// Recorded frozen-Qwen RAG ceiling on the full 300-task slices (2026-07-23).
+pub(crate) const DEFAULT_RAG_CEILING_SEEN: f64 = 0.35;
+pub(crate) const DEFAULT_RAG_CEILING_HELDOUT: f64 = 0.42;
+
+pub(crate) fn rag_ceiling_for_function(function_id: usize) -> f32 {
+    let seen = function_id <= SEEN_FUNCTION_MAX;
+    let env_name = if seen {
+        "TOFY_RAG_CEILING_SEEN"
+    } else {
+        "TOFY_RAG_CEILING_HELDOUT"
+    };
+    let default = if seen {
+        DEFAULT_RAG_CEILING_SEEN
+    } else {
+        DEFAULT_RAG_CEILING_HELDOUT
+    };
+    env_f64(env_name, default).clamp(0.0, 1.0) as f32
+}
+
+pub(crate) fn rag_ceiling_for_split_label(label: &str) -> f32 {
+    match label {
+        "seen" | "train" | "matched" => rag_ceiling_for_function(1),
+        "heldout" | "held-out" => rag_ceiling_for_function(SEEN_FUNCTION_MAX + 1),
+        _ => rag_ceiling_for_function(1),
+    }
+}
+
+pub(crate) fn pass_rate_rag_fraction(pass_rate: f32, rag_ceiling: f32) -> f32 {
+    if rag_ceiling <= 0.0 {
+        0.0
+    } else {
+        pass_rate / rag_ceiling
+    }
+}
+
+pub(crate) fn bridge_min_ar_pass_rate() -> f32 {
+    if std::env::var_os("TOFY_BRIDGE_MIN_AR_PASS_RATE").is_some() {
+        return env_f64("TOFY_BRIDGE_MIN_AR_PASS_RATE", 0.25).clamp(0.0, 1.0) as f32;
+    }
+    let fraction = env_f64("TOFY_BRIDGE_MIN_AR_PASS_FRACTION", 0.5).clamp(0.0, 1.0) as f32;
+    fraction * rag_ceiling_for_function(1)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BridgeDecodeConfig {
+    pub temperature: f64,
+    pub top_k: usize,
+    pub samples: usize,
+    pub pass_at_k: usize,
+    pub seed: u64,
+}
+
+impl BridgeDecodeConfig {
+    pub fn from_env() -> Self {
+        let temperature = env_f64("TOFY_BRIDGE_DECODE_TEMP", 0.0).max(0.0);
+        let top_k = env_usize("TOFY_BRIDGE_DECODE_TOP_K", 0);
+        let samples = env_usize("TOFY_BRIDGE_DECODE_SAMPLES", 1).max(1);
+        let pass_at_k = env_usize("TOFY_BRIDGE_PASS_AT_K", samples).clamp(1, samples);
+        let seed = std::env::var("TOFY_BRIDGE_DECODE_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(42);
+        Self {
+            temperature,
+            top_k,
+            samples,
+            pass_at_k,
+            seed,
+        }
+    }
+
+    pub fn uses_sampling(self) -> bool {
+        self.temperature > 0.0 || self.samples > 1
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BridgeNonqualificationReason {
@@ -739,13 +815,61 @@ fn go_outer_function_closed(source: &str) -> bool {
     false
 }
 
-fn greedy_generate_code(
+fn sample_token_from_logits(
+    logits: &Tensor,
+    temperature: f64,
+    top_k: usize,
+    rng: &mut StdRng,
+) -> Result<u32> {
+    let mut logits = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    if temperature <= 0.0 {
+        return Ok(logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index as u32)
+            .unwrap_or(0));
+    }
+    if top_k > 0 && top_k < logits.len() {
+        let mut indexed = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
+        indexed.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+        let cutoff = indexed[top_k - 1].1;
+        for value in &mut logits {
+            if *value < cutoff {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp = logits
+        .iter()
+        .map(|value| (*value - max).exp())
+        .collect::<Vec<_>>();
+    let total = exp.iter().sum::<f32>().max(f32::MIN_POSITIVE);
+    let draw = rng.random::<f32>() * total;
+    let mut cumulative = 0.0f32;
+    for (index, weight) in exp.iter().enumerate() {
+        cumulative += weight;
+        if draw <= cumulative {
+            return Ok(index as u32);
+        }
+    }
+    Ok((logits.len().saturating_sub(1)) as u32)
+}
+
+fn generate_code(
     tokenizer: &Tokenizer,
     model: &Qwen3Bridge,
     task: &str,
     conditioning: &Tensor,
     device: &Device,
     max_new: usize,
+    decode: BridgeDecodeConfig,
+    sample_index: usize,
 ) -> Result<String> {
     let text = qwen_example_text(task, "")?;
     let source_prefix = text
@@ -759,16 +883,18 @@ fn greedy_generate_code(
     let eos = Some(qwen_eos_id(tokenizer)?);
     let mut cache = model.new_cache();
     let mut next_input = ids.clone();
+    let mut rng = StdRng::seed_from_u64(decode.seed ^ sample_index as u64);
     for _ in 0..max_new {
         let input = Tensor::from_vec(next_input.clone(), (1, next_input.len()), device)?;
         let logits = model.forward_cached(&input, conditioning, &mut cache)?;
-        let next = logits
-            .narrow(1, logits.dim(1)? - 1, 1)?
-            .squeeze(1)?
-            .to_dtype(DType::F32)?
-            .argmax(candle_core::D::Minus1)?
-            .squeeze(0)?
-            .to_scalar::<u32>()?;
+        let next = sample_token_from_logits(
+            &logits
+                .narrow(1, logits.dim(1)? - 1, 1)?
+                .squeeze(1)?,
+            decode.temperature,
+            decode.top_k,
+            &mut rng,
+        )?;
         ids.push(next);
         if Some(next) == eos {
             break;
@@ -965,6 +1091,10 @@ impl BridgeRuntime {
         .map_err(Into::into)
     }
 
+    pub fn output_slots(&self) -> usize {
+        self.output_slots
+    }
+
     pub fn generate(&self, prompt: &str, conditioning: &Tensor, max_new: usize) -> Result<String> {
         let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
         let prompt = if eval_mode == "bridge" {
@@ -972,14 +1102,46 @@ impl BridgeRuntime {
         } else {
             model_visible_task(prompt).to_string()
         };
-        greedy_generate_code(
+        let decode = BridgeDecodeConfig::from_env();
+        generate_code(
             &self.tokenizer,
             &self.model,
             &prompt,
             conditioning,
             &self.device,
             max_new,
+            decode,
+            0,
         )
+    }
+
+    pub fn generate_samples(
+        &self,
+        prompt: &str,
+        conditioning: &Tensor,
+        max_new: usize,
+        decode: BridgeDecodeConfig,
+    ) -> Result<Vec<String>> {
+        let eval_mode = std::env::var("TOFY_EVAL_MODE").unwrap_or_else(|_| "bridge".into());
+        let prompt = if eval_mode == "bridge" {
+            counterfactual_bridge_prompt(prompt)
+        } else {
+            model_visible_task(prompt).to_string()
+        };
+        (0..decode.samples)
+            .map(|sample_index| {
+                generate_code(
+                    &self.tokenizer,
+                    &self.model,
+                    &prompt,
+                    conditioning,
+                    &self.device,
+                    max_new,
+                    decode,
+                    sample_index,
+                )
+            })
+            .collect()
     }
 }
 
@@ -1128,6 +1290,10 @@ fn full_val_losses(
 struct AutoregressiveBridgeMetrics {
     matched_pass_rate: f32,
     wrong_pass_rate: f32,
+    matched_pass_at_k: f32,
+    rag_ceiling: f32,
+    matched_rag_fraction: f32,
+    matched_pass_at_k_rag_fraction: f32,
 }
 
 /// Round-robin across functions so the sample spans the whole split.
@@ -1215,8 +1381,11 @@ fn autoregressive_bridge_metrics(
     let matched = adapter.forward(&matched_slots)?;
     let wrong = adapter.forward(&wrong_slots)?;
     let max_new = env_usize("TOFY_BRIDGE_AR_MAX_NEW", 192);
+    let decode = BridgeDecodeConfig::from_env();
+    let rag_ceiling = rag_ceiling_for_split_label(label);
     let mut matched_passes = 0usize;
     let mut wrong_passes = 0usize;
+    let mut matched_pass_at_k = 0usize;
     let mut matched_categories: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut by_function: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
     for (index, row) in selected.iter().enumerate() {
@@ -1225,33 +1394,48 @@ fn autoregressive_bridge_metrics(
         // same signature-only counterfactual contract used by deployment, so
         // validation cannot leak the requested fictional API in text.
         let qwen_task = counterfactual_bridge_prompt(&row.task);
-        let matched_code = greedy_generate_code(
-            tokenizer,
-            model,
-            &qwen_task,
-            &matched.narrow(0, index, 1)?,
-            device,
-            harness.max_new_tokens.min(max_new),
-        )?;
-        let wrong_code = greedy_generate_code(
+        let conditioning = matched.narrow(0, index, 1)?;
+        let mut sample_passed = false;
+        for sample_index in 0..decode.pass_at_k {
+            let matched_code = generate_code(
+                tokenizer,
+                model,
+                &qwen_task,
+                &conditioning,
+                device,
+                harness.max_new_tokens.min(max_new),
+                decode,
+                sample_index,
+            )?;
+            let matched_category =
+                compile_and_test(harness, &matched_code, "bridge-ar-matched")?;
+            sample_passed |= matched_category.is_pass();
+            if sample_index == 0 {
+                matched_passes += usize::from(matched_category.is_pass());
+                *matched_categories
+                    .entry(matched_category.as_str())
+                    .or_insert(0) += 1;
+                let tally = by_function.entry(row.function_id).or_insert((0, 0));
+                tally.0 += usize::from(matched_category.is_pass());
+                tally.1 += 1;
+            }
+        }
+        matched_pass_at_k += usize::from(sample_passed);
+        let wrong_code = generate_code(
             tokenizer,
             model,
             &qwen_task,
             &wrong.narrow(0, index, 1)?,
             device,
             harness.max_new_tokens.min(max_new),
+            decode,
+            0,
         )?;
-        let matched_category = compile_and_test(harness, &matched_code, "bridge-ar-matched")?;
-        matched_passes += usize::from(matched_category.is_pass());
-        *matched_categories
-            .entry(matched_category.as_str())
-            .or_insert(0) += 1;
-        let tally = by_function.entry(row.function_id).or_insert((0, 0));
-        tally.0 += usize::from(matched_category.is_pass());
-        tally.1 += 1;
         wrong_passes +=
             usize::from(compile_and_test(harness, &wrong_code, "bridge-ar-wrong")?.is_pass());
     }
+    let matched_pass_rate = matched_passes as f32 / selected.len() as f32;
+    let matched_pass_at_k_rate = matched_pass_at_k as f32 / selected.len() as f32;
     // A bare 0.0 pass rate cannot distinguish "named a function that does not
     // exist" from "compiled and returned the wrong value", and those point at
     // different stages. Keep the breakdown next to the rate that summarizes it.
@@ -1268,13 +1452,20 @@ fn autoregressive_bridge_metrics(
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "bridge ar {label} tasks={} functions={} breakdown: {breakdown} per_function: {per_function}",
+        "bridge ar {label} tasks={} functions={} pass_rate={matched_pass_rate:.4} pass@{k}={matched_pass_at_k_rate:.4} rag_ceiling={rag_ceiling:.4} rag_fraction={:.4} pass@{k}_rag_fraction={:.4} decode={decode:?} breakdown: {breakdown} per_function: {per_function}",
         selected.len(),
-        by_function.len()
+        by_function.len(),
+        pass_rate_rag_fraction(matched_pass_rate, rag_ceiling),
+        pass_rate_rag_fraction(matched_pass_at_k_rate, rag_ceiling),
+        k = decode.pass_at_k,
     );
     Ok(AutoregressiveBridgeMetrics {
-        matched_pass_rate: matched_passes as f32 / selected.len() as f32,
+        matched_pass_rate,
         wrong_pass_rate: wrong_passes as f32 / selected.len() as f32,
+        matched_pass_at_k: matched_pass_at_k_rate,
+        rag_ceiling,
+        matched_rag_fraction: pass_rate_rag_fraction(matched_pass_rate, rag_ceiling),
+        matched_pass_at_k_rag_fraction: pass_rate_rag_fraction(matched_pass_at_k_rate, rag_ceiling),
     })
 }
 
@@ -1760,8 +1951,13 @@ fn train(args: BridgeArgs) -> Result<()> {
     // manifest, but nothing read it, so every run so far reported a smoothing
     // it never applied.
     let label_smoothing = env_f64("TOFY_LABEL_SMOOTHING", 0.0).clamp(0.0, 0.5);
-    let min_ar_pass_rate = env_f64("TOFY_BRIDGE_MIN_AR_PASS_RATE", 0.25).clamp(0.0, 1.0) as f32;
+    let min_ar_pass_rate = bridge_min_ar_pass_rate();
     let min_ar_advantage = env_f64("TOFY_BRIDGE_MIN_AR_ADVANTAGE", 0.125).clamp(0.0, 1.0) as f32;
+    println!(
+        "Bridge AR gate uses min_pass_rate={min_ar_pass_rate:.4} ({:.1}% of seen RAG ceiling {:.4})",
+        (min_ar_pass_rate / rag_ceiling_for_function(1) * 100.0),
+        rag_ceiling_for_function(1),
+    );
     let log_every = env_usize("TOFY_BRIDGE_LOG_EVERY", 10).max(1);
     let grad_accum = env_usize("TOFY_BRIDGE_GRAD_ACCUM", 1).max(1);
     let clip_norm = env_f64("TOFY_BRIDGE_CLIP_NORM", 1.0).max(0.0);
@@ -2262,14 +2458,14 @@ fn train(args: BridgeArgs) -> Result<()> {
             )?;
             let zero_gap = losses.zeroed - losses.matched;
             let semantic_gap = losses.wrong_semantic - losses.matched_semantic;
-            let ar_metrics = if requires_semantic_gap {
+            let (train_ar_metrics, ar_metrics) = if requires_semantic_gap {
                 if step % ar_val_every == 0 || step == args.steps {
                     // The train-function rate is the control that separates "the
                     // conditioning channel cannot carry function identity at all"
                     // from "it carries it but does not generalize". Without it a
                     // held-out rate of zero is unattributable.
-                    if ar_train_rows > 0 {
-                        autoregressive_bridge_metrics(
+                    let train_ar = if ar_train_rows > 0 {
+                        Some(autoregressive_bridge_metrics(
                             &train_code_rows,
                             ar_train_rows,
                             "train",
@@ -2283,12 +2479,14 @@ fn train(args: BridgeArgs) -> Result<()> {
                             &qwen,
                             max_seq,
                             &device,
-                        )?;
-                    }
-                    Some(autoregressive_bridge_metrics(
+                        )?)
+                    } else {
+                        None
+                    };
+                    let val_ar = Some(autoregressive_bridge_metrics(
                         &val_rows,
                         ar_val_rows,
-                        "matched",
+                        "val",
                         regime,
                         &tokenizer,
                         &encoder,
@@ -2299,12 +2497,13 @@ fn train(args: BridgeArgs) -> Result<()> {
                         &qwen,
                         max_seq,
                         &device,
-                    )?)
+                    )?);
+                    (train_ar, val_ar)
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             };
             if val_semantic_ce_improved(
                 losses.matched_semantic,
@@ -2333,9 +2532,30 @@ fn train(args: BridgeArgs) -> Result<()> {
             if let Some(ar) = ar_metrics {
                 tb.add_scalar("val/ar_matched_pass_rate", ar.matched_pass_rate, step);
                 tb.add_scalar("val/ar_wrong_pass_rate", ar.wrong_pass_rate, step);
+                tb.add_scalar("val/ar_matched_pass_at_k", ar.matched_pass_at_k, step);
+                tb.add_scalar("val/ar_matched_rag_fraction", ar.matched_rag_fraction, step);
+                tb.add_scalar(
+                    "val/ar_matched_pass_at_k_rag_fraction",
+                    ar.matched_pass_at_k_rag_fraction,
+                    step,
+                );
                 tb.add_scalar(
                     "val/ar_causal_advantage",
                     ar.matched_pass_rate - ar.wrong_pass_rate,
+                    step,
+                );
+            }
+            if let Some(train_ar) = train_ar_metrics {
+                tb.add_scalar("train/ar_matched_pass_rate", train_ar.matched_pass_rate, step);
+                tb.add_scalar("train/ar_matched_pass_at_k", train_ar.matched_pass_at_k, step);
+                tb.add_scalar(
+                    "train/ar_matched_rag_fraction",
+                    train_ar.matched_rag_fraction,
+                    step,
+                );
+                tb.add_scalar(
+                    "train/ar_matched_pass_at_k_rag_fraction",
+                    train_ar.matched_pass_at_k_rag_fraction,
                     step,
                 );
             }
@@ -2373,13 +2593,12 @@ fn train(args: BridgeArgs) -> Result<()> {
             }
             tb.flush();
             println!(
-                "bridge val step={step} val_ce_matched={:.4} val_ce_zeroed={:.4} val_ce_wrong={:.4} val_semantic_ce_matched={:.4} val_semantic_ce_wrong={:.4} zero_gap={zero_gap:.4} semantic_gap={semantic_gap:.4} ar={:?}",
+                "bridge val step={step} val_ce_matched={:.4} val_ce_zeroed={:.4} val_ce_wrong={:.4} val_semantic_ce_matched={:.4} val_semantic_ce_wrong={:.4} zero_gap={zero_gap:.4} semantic_gap={semantic_gap:.4} train_ar={train_ar_metrics:?} val_ar={ar_metrics:?}",
                 losses.matched,
                 losses.zeroed,
                 losses.wrong,
                 losses.matched_semantic,
                 losses.wrong_semantic,
-                ar_metrics,
             );
             let checkpoint_id = util::new_resume_checkpoint_id(&resume_stage, step);
             resume_metadata.checkpoint_id = Some(checkpoint_id.clone());
@@ -2918,5 +3137,11 @@ mod tests {
         let after = util::vec1_f32(gate.as_tensor())?;
         assert_ne!(before, after, "optimizer did not update the bridge gate");
         Ok(())
+    }
+
+    #[test]
+    fn pass_rate_rag_fraction_normalizes_against_ceiling() {
+        assert!((pass_rate_rag_fraction(0.07, 0.35) - 0.2).abs() < 1e-6);
+        assert!((pass_rate_rag_fraction(0.0, 0.35)).abs() < 1e-6);
     }
 }

@@ -67,6 +67,9 @@ pub fn print_usage(program: &str) {
     );
     eprintln!("    {program} --train-channel-probe <qwen_dir> <bridge> <encoder> <vocab> <world> <seen_tasks> <heldout_tasks> <output> [steps]");
     eprintln!(
+        "    {program} --run-conditioning-corruption-probe <qwen_dir> <bridge> <encoder> <vocab> <world> <tasks> <report.json>"
+    );
+    eprintln!(
         "    {program} --check-dtype-discipline | --sustained-oom-probe ... | --max-vram-probe [--profile minimal] ..."
     );
 }

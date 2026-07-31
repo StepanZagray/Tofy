@@ -54,6 +54,6 @@ pub fn run(args: &[String]) -> Result<()> {
     let program = args.first().map(String::as_str).unwrap_or("jepa_ai");
     cli::print_usage(program);
     bail!(
-        "specify a mode: train / prepare cache / --prepare-veclab / --print-split-stats / --prepare-pipeline-cache / --prepare-encoder-corpus / --latent / --latent-from-checkpoint / --eval-jepa / --train-world-knowledge / --train-bridge / --eval-bridge / --train-channel-probe"
+        "specify a mode: train / prepare cache / --prepare-veclab / --print-split-stats / --prepare-pipeline-cache / --prepare-encoder-corpus / --latent / --latent-from-checkpoint / --eval-jepa / --train-world-knowledge / --train-bridge / --eval-bridge / --train-channel-probe / --run-conditioning-corruption-probe"
     );
 }

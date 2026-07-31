@@ -12,8 +12,11 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tasks::bridge::BridgeRuntime;
+use crate::tasks::bridge::{
+    pass_rate_rag_fraction, rag_ceiling_for_function, BridgeDecodeConfig, BridgeRuntime,
+};
 use crate::tasks::prepare_veclab::MODULE_PATH;
+use crate::tasks::veclab::SEEN_FUNCTION_MAX;
 use crate::tasks::veclab::{load_docs_map, VeclabTaskRow};
 use crate::tasks::world_support::different_group_conditioning_latent;
 
@@ -49,6 +52,14 @@ struct Rates {
     compile_rate: f64,
     passed: usize,
     suite_pass_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pass_at_k: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rag_ceiling: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rag_fraction: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pass_at_k_rag_fraction: Option<f64>,
     failure_categories: BTreeMap<String, usize>,
 }
 
@@ -339,13 +350,38 @@ pub(crate) fn compile_and_test(
     Ok(category)
 }
 
-fn rate(metrics: &Metrics) -> Rates {
+fn rate(
+    metrics: &Metrics,
+    pass_at_k: Option<usize>,
+    subset: &str,
+) -> Rates {
     let denom = metrics.tasks.max(1) as f64;
+    let suite_pass_rate = metrics.passed as f64 / denom;
+    let pass_at_k_rate = pass_at_k.map(|passed| passed as f64 / denom);
+    let rag_ceiling = if metrics.tasks > 0 {
+        Some(
+            if subset == "heldout" {
+                rag_ceiling_for_function(SEEN_FUNCTION_MAX + 1)
+            } else {
+                rag_ceiling_for_function(1)
+            } as f64,
+        )
+    } else {
+        None
+    };
     Rates {
         tasks: metrics.tasks,
         compile_rate: metrics.compiled as f64 / denom,
         passed: metrics.passed,
-        suite_pass_rate: metrics.passed as f64 / denom,
+        suite_pass_rate,
+        pass_at_k: pass_at_k_rate,
+        rag_ceiling,
+        rag_fraction: rag_ceiling.map(|ceiling| {
+            pass_rate_rag_fraction(suite_pass_rate as f32, ceiling as f32) as f64
+        }),
+        pass_at_k_rag_fraction: pass_at_k_rate.zip(rag_ceiling).map(|(passed, ceiling)| {
+            pass_rate_rag_fraction(passed as f32, ceiling as f32) as f64
+        }),
         failure_categories: metrics.categories.clone(),
     }
 }
@@ -432,7 +468,9 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
     let function_ids = rows.iter().map(|row| row.function_id).collect::<Vec<_>>();
     let shuffled = different_group_conditioning_latent(&all_cond, &function_ids, 7)?;
     let swapped = different_group_conditioning_latent(&all_cond, &function_ids, 1)?;
+    let decode = BridgeDecodeConfig::from_env();
     let mut totals: BTreeMap<(String, String), Metrics> = BTreeMap::new();
+    let mut pass_at_k_totals: BTreeMap<(String, String), usize> = BTreeMap::new();
     let failure_code_limit = std::env::var("TOFY_EVAL_FAILURE_CODE_LIMIT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -463,42 +501,60 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
             } else {
                 cond.zeros_like()?
             };
-            let code = runtime.generate(&prompt, &cond, task.max_new_tokens.min(512))?;
-            let category = compile_and_test(task, &code, condition)
-                .with_context(|| format!("evaluate {} under {condition}", task.id))?;
-            let metric = totals
-                .entry((task.subset.clone(), condition.into()))
-                .or_default();
-            metric.tasks += 1;
-            metric.compiled += usize::from(matches!(
-                category,
-                FailureCategory::TestsFailed | FailureCategory::Pass
-            ));
-            metric.passed += usize::from(matches!(category, FailureCategory::Pass));
-            *metric
-                .categories
-                .entry(category.as_str().to_string())
-                .or_default() += 1;
-            let retain_code = !matches!(category, FailureCategory::Pass)
-                && stored_failure_codes < failure_code_limit;
-            if retain_code {
-                stored_failure_codes += 1;
+            let samples = if decode.uses_sampling() {
+                runtime.generate_samples(&prompt, &cond, task.max_new_tokens.min(512), decode)?
+            } else {
+                vec![runtime.generate(&prompt, &cond, task.max_new_tokens.min(512))?]
+            };
+            let mut sample_passed = false;
+            for (sample_index, code) in samples.iter().take(decode.pass_at_k).enumerate() {
+                let category = compile_and_test(task, code, condition)
+                    .with_context(|| format!("evaluate {} under {condition}", task.id))?;
+                sample_passed |= category.is_pass();
+                if sample_index == 0 {
+                    let metric = totals
+                        .entry((task.subset.clone(), condition.into()))
+                        .or_default();
+                    metric.tasks += 1;
+                    metric.compiled += usize::from(matches!(
+                        category,
+                        FailureCategory::TestsFailed | FailureCategory::Pass
+                    ));
+                    metric.passed += usize::from(matches!(category, FailureCategory::Pass));
+                    *metric
+                        .categories
+                        .entry(category.as_str().to_string())
+                        .or_default() += 1;
+                    let retain_code = !matches!(category, FailureCategory::Pass)
+                        && stored_failure_codes < failure_code_limit;
+                    if retain_code {
+                        stored_failure_codes += 1;
+                    }
+                    task_results.push(TaskResult {
+                        id: task.id.clone(),
+                        subset: task.subset.clone(),
+                        condition: condition.to_string(),
+                        category,
+                        generated_code: retain_code.then(|| code.clone()),
+                    });
+                }
             }
-            task_results.push(TaskResult {
-                id: task.id.clone(),
-                subset: task.subset.clone(),
-                condition: condition.to_string(),
-                category,
-                generated_code: retain_code.then_some(code),
-            });
+            if sample_passed {
+                *pass_at_k_totals
+                    .entry((task.subset.clone(), condition.into()))
+                    .or_default() += 1;
+            }
         }
     }
     let mut results: BTreeMap<String, BTreeMap<String, Rates>> = BTreeMap::new();
     for ((subset, condition), metrics) in totals {
+        let pass_at_k = pass_at_k_totals
+            .get(&(subset.clone(), condition.clone()))
+            .copied();
         results
-            .entry(subset)
+            .entry(subset.clone())
             .or_default()
-            .insert(condition, rate(&metrics));
+            .insert(condition, rate(&metrics, pass_at_k, &subset));
     }
     let paired_causal_controls = paired_causal_controls(&task_results);
     let report = EvalReport {
@@ -528,6 +584,18 @@ pub fn try_run_code_eval(args: &[String]) -> Result<bool> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    for (subset, conditions) in &report.results {
+        for (condition, rates) in conditions {
+            if let (Some(pass_at_k), Some(rag_fraction)) = (rates.pass_at_k, rates.rag_fraction) {
+                println!(
+                    "eval {subset}/{condition}: pass_rate={:.4} pass@k={pass_at_k:.4} rag_ceiling={:.4} rag_fraction={rag_fraction:.4} pass@k_rag_fraction={:.4}",
+                    rates.suite_pass_rate,
+                    rates.rag_ceiling.unwrap_or(0.0),
+                    rates.pass_at_k_rag_fraction.unwrap_or(0.0),
+                );
+            }
+        }
+    }
     println!("Evaluation report: {}", report_path.display());
     if let Some(minimum) = optional_probability_env("TOFY_EVAL_MIN_PASS_RATE")? {
         if eval_mode == "bridge" {
