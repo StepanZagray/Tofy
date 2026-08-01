@@ -4,13 +4,12 @@
 //! [`Goal`], never `Scenario.hidden_goal_index`.
 
 use crate::domain::{
-    goal_satisfied, goal_terminal_failure, legal_actions, Action, Dir, Goal, Pos, Scenario,
-    Simulator, Split, State,
+    goal_family, goal_satisfied, goal_terminal_failure, legal_actions, Action, Dir, Goal, Pos,
+    Scenario, Simulator, Split, State,
 };
 use crate::generator::{
     generate, generate_p1c, generate_p1c_hard_candidate, p1c_falsification_probe_width, rng_for,
 };
-use crate::report::goal_family;
 use crate::search::shortest_path;
 use anyhow::{anyhow, bail, ensure, Result};
 use rand::prelude::*;

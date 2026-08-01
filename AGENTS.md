@@ -41,5 +41,6 @@
   before using an exception.
 
 ## Results Tracking
-- Keep `docs/RESULTS_P1.md` up to date for active P1 metrics (`docs/RESULTS.md` indexes phase logs; `docs/RESULTS_P0.md` is archived pre-P1).
+- Keep `docs/RESULTS_P2.md` up to date for active P2 metrics (`docs/RESULTS.md` indexes phase logs; `docs/RESULTS_P1.md` is archived P1; `docs/RESULTS_P0.md` is archived pre-P1).
+- The P1 exact-simulator harness lives only on the `p1` git branch; do not reintroduce `p1a` / `p1b` / `p1c` CLI or agents on `main`.
 - When a better metric is reported, update the "Best So Far" section with the new metric and exact command used.

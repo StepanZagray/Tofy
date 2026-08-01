@@ -81,6 +81,18 @@ pub enum Goal {
     TriggerTerminal { trigger: u8 },
 }
 
+/// Stable family label for public candidate goals (curriculum / reporting).
+pub fn goal_family(goal: &Goal) -> &'static str {
+    match goal {
+        Goal::ReachMarker { .. } => "reach_marker",
+        Goal::CollectAll => "collect_all",
+        Goal::ActivateSwitchesInOrder { .. } => "activate_switches_in_order",
+        Goal::PreserveResourceReachMarker { .. } => "preserve_resource_reach_marker",
+        Goal::AvoidHazardReachMarker { .. } => "avoid_hazard_reach_marker",
+        Goal::TriggerTerminal { .. } => "trigger_terminal",
+    }
+}
+
 /// Dataset split label carried in scenario metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Split {

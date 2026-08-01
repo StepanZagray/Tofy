@@ -1,6 +1,8 @@
 # Results P1
 
-Prior P1 metrics. Archived pre-P1 numbers are in [`RESULTS_P0.md`](RESULTS_P0.md).
+Archived P1 metrics. The exact-simulator harness that produced these numbers lives
+only on the `p1` git branch; reproduce the commands below from that branch.
+Archived pre-P1 numbers are in [`RESULTS_P0.md`](RESULTS_P0.md).
 
 ## Best So Far
 
