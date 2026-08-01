@@ -1,7 +1,0 @@
-{
-  "stage": "world",
-  "step": 300,
-  "best_metric": 0.31569824,
-  "best_aux_metric": 0.31569824,
-  "saved_checkpoint": true
-}

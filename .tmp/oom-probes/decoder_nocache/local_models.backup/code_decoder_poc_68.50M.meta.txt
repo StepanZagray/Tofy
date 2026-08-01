@@ -1,9 +1,0 @@
-kind=code_specialist
-vocab_signature=9c9b790488d69b79
-vocab_size=16000
-planner_dim=640
-planner_slots=64
-decoder_dim=640
-decoder_layers=6
-decoder_heads=8
-decoder_ff_dim=2560

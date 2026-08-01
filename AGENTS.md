@@ -41,5 +41,5 @@
   before using an exception.
 
 ## Results Tracking
-- Keep `docs/RESULTS.md` up to date.
+- Keep `docs/RESULTS_P1.md` up to date for active P1 metrics (`docs/RESULTS.md` indexes phase logs; `docs/RESULTS_P0.md` is archived pre-P1).
 - When a better metric is reported, update the "Best So Far" section with the new metric and exact command used.

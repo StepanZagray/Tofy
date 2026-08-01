@@ -1,7 +1,0 @@
-{
-  "stage": "orchestrator",
-  "step": 15000,
-  "best_metric": 0.000009918213,
-  "best_aux_metric": 0.000009918213,
-  "saved_checkpoint": true
-}

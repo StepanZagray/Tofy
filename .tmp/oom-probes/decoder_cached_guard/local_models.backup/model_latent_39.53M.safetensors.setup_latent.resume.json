@@ -1,7 +1,0 @@
-{
-  "stage": "setup_latent",
-  "step": 1,
-  "best_metric": 3.4028235e+38,
-  "best_aux_metric": 3.4028235e+38,
-  "saved_checkpoint": false
-}

@@ -2,34 +2,24 @@
 name = "tofy"
 version = "0.1.0"
 edition = "2021"
+description = "Recursive world-model experiments for hidden-objective discovery and planning"
 
 [features]
-default = ["cuda"]
+default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
-anyhow = "1.0.102"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-rand = "0.10.1"
-rayon = "1.12.0"
-candle-core = { version = "=0.11.0", default-features = false }
-candle-nn = { version = "=0.11.0", default-features = false }
-candle-transformers = { version = "=0.11.0", default-features = false }
-tokenizers = { version = "=0.22.2", default-features = false, features = [
-    "onig",
-] }
-hf-hub = "0.5.0"
-parquet = "59.0.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-regex = "1.12.4"
-sha2 = "0.11.0"
-md5 = "0.8.0"
-# TensorBoard logging (local: writes to runs/, view with tensorboard --logdir runs/)
-tensorboard-rs = "0.5.9"
-tree-sitter = "0.25.10"
-tree-sitter-go = "0.25.0"
-fs2 = "0.4.3"
-libc = "0.2.183"
+anyhow = "1.0"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
