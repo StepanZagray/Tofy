@@ -54,8 +54,10 @@ if [[ -z "${AGENT_BIN:-}" ]]; then
   fi
 fi
 TMUX_SESSION="${TMUX_SESSION:-p2-readiness}"
-# Limit glibc per-thread arenas; long Rayon/prefetch runs otherwise retain multi-GB RSS.
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# Glibc's arena count is left at its default on purpose. Capping it to 2 serialised
+# every malloc across the ~100 episode-generation threads: measured on an L40S at
+# physical_batch=512 that cost 15x throughput (1.9 vs 28.6 steps/min) and left the GPU
+# idle ~90% of the time. RSS is held down by the periodic malloc_trim below instead.
 # Periodic malloc_trim in the train loop (optimizer steps); 0 disables.
 export TOFY_MALLOC_TRIM_EVERY="${TOFY_MALLOC_TRIM_EVERY:-100}"
 LOG_DIR="$OUT/repair-logs"

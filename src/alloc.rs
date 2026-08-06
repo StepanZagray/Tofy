@@ -2,18 +2,22 @@
 //!
 //! Overnight training with Rayon episode generation on glibc can retain multi-giB of
 //! anonymous RSS from per-thread malloc arenas even when live allocations are modest.
-//! `MALLOC_ARENA_MAX`, periodic `malloc_trim`, and optional jemalloc target that
-//! fragmentation path. GPU VRAM is separate; this module only affects process RSS.
-
-/// Glibc mallopt parameter: cap per-thread arena count (see `malloc.h`).
-#[cfg(target_os = "linux")]
-const M_ARENA_MAX: i32 = 8;
+//! Periodic `malloc_trim` targets that fragmentation path. GPU VRAM is separate; this
+//! module only affects process RSS.
+//!
+//! Arena *count* is deliberately left at the glibc default. P2 training runs ~100
+//! allocation-heavy threads (the Rayon episode pool plus the prefetch workers), and
+//! funnelling those through a couple of arenas serialises every malloc in the process.
+//! Measured on an L40S pod at `physical_batch=512`, `MALLOC_ARENA_MAX=2` cost 15x
+//! throughput -- 1.9 vs 28.6 optimizer steps/min -- and left the GPU idle ~90% of the
+//! time waiting on batch generation. Hosts that genuinely need the RSS ceiling can set
+//! `MALLOC_ARENA_MAX`, which glibc reads on its own.
 
 /// Install host allocator tuning before the first heap allocation.
-pub fn init() {
-    #[cfg(target_os = "linux")]
-    limit_glibc_arenas();
-}
+///
+/// Arena count is left to glibc (see the module docs). This stays as the single hook
+/// that is guaranteed to run before `main` allocates, so future tuning has one home.
+pub fn init() {}
 
 /// Return freed heap pages to the OS where glibc supports it (no-op elsewhere).
 pub fn trim_host_heap() {
@@ -29,17 +33,6 @@ pub fn trim_interval_from_env() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100)
-}
-
-#[cfg(target_os = "linux")]
-fn limit_glibc_arenas() {
-    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
-        return;
-    }
-  // Must run before the first malloc; `main` calls `init` first.
-    unsafe {
-        libc::mallopt(M_ARENA_MAX, 2);
-    }
 }
 
 #[cfg(test)]

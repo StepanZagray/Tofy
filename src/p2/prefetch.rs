@@ -36,7 +36,7 @@ pub struct BatchPrefetcher {
     accepting: bool,
     work: Arc<WorkQueue>,
     result_rx: Receiver<PrefetchMsg>,
-    ready: VecDeque<Vec<TransitionSample>>,
+    ready: VecDeque<Result<Vec<TransitionSample>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -162,10 +162,10 @@ impl BatchPrefetcher {
     pub fn poll(&mut self) {
         while let Ok(msg) = self.result_rx.try_recv() {
             match msg {
-                PrefetchMsg::Ready(batch) => match batch {
-                    Ok(samples) => self.ready.push_back(samples),
-                    Err(_) => {}
-                },
+                // Queue failures in order rather than dropping them. A swallowed error
+                // silently shrank the ready queue with no log, so the pipeline lost a
+                // slot per failure and `recv` could block on a batch that never comes.
+                PrefetchMsg::Ready(batch) => self.ready.push_back(batch),
             }
         }
     }
@@ -180,8 +180,8 @@ impl BatchPrefetcher {
 
     pub fn recv(&mut self) -> Result<Vec<TransitionSample>> {
         self.poll();
-        if let Some(samples) = self.ready.pop_front() {
-            return Ok(samples);
+        if let Some(batch) = self.ready.pop_front() {
+            return batch;
         }
         match self
             .result_rx

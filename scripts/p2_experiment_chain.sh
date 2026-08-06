@@ -33,7 +33,8 @@ MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-3}"
 AGENT_BIN="${AGENT_BIN:-cursor-agent}"
 AGENT_MODEL="${AGENT_MODEL:-cursor-grok-4.5-high}"
 FROM_INDEX="${FROM_INDEX:-1}"
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# No glibc arena cap: it serialises malloc across the generation threads and starves
+# the GPU (15x throughput loss at physical_batch=512). malloc_trim bounds RSS instead.
 export TOFY_MALLOC_TRIM_EVERY="${TOFY_MALLOC_TRIM_EVERY:-100}"
 
 LOG_DIR="$OUTPUT_ROOT/chain-logs"

@@ -2971,6 +2971,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             latest_checkpoint_step = Some(state.global_step);
             if use_prefetch {
                 prefetcher = Some(BatchPrefetcher::new());
+                // The old prefetcher's queued *and* already-generated batches died with
+                // it, so the lookahead cursor has to rewind with it. Left alone it stays
+                // `lookahead` steps ahead, so `top_up_prefetch` enqueues a single batch
+                // per step from here on and every step blocks in `recv` on a cold
+                // generation -- a 1-deep pipeline that never refills.
+                prefetched_through_step = state.global_step;
             }
         }
         profile.steps += 1;
