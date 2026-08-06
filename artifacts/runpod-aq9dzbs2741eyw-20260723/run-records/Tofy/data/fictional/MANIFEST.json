@@ -1,0 +1,46 @@
+{
+  "seed": 20260705,
+  "generator_version": "1.2.0",
+  "files": [
+    {
+      "path": "data/fictional/veclab_docs.txt",
+      "rows": 200,
+      "sha256": "f0a81c1da2cd91a23c0fdf81d45c740ffe0c1aed9f5698af7e82ebd15ad5b471"
+    },
+    {
+      "path": "data/fictional/veclab_knowledge.txt",
+      "rows": 8000,
+      "sha256": "c51ef34f75ac00cb4261110dcf04dfe7ca873f3dabb5ecbaac99df92d212fb73"
+    },
+    {
+      "path": "data/fictional/veclab_knowledge_train.txt",
+      "rows": 7600,
+      "sha256": "face1f84d1ef7dc5497a0c6fb523365ca8116ca33e9c69ec7e16de98dad597ce"
+    },
+    {
+      "path": "data/fictional/veclab_knowledge_val.txt",
+      "rows": 400,
+      "sha256": "036342a2842222e36954442d2e34ee5b86579f044f686178b4fb3210fa93b11d"
+    },
+    {
+      "path": "data/fictional/veclab_tasks_train.txt",
+      "rows": 4000,
+      "sha256": "6427ac6bea0929a6f6f777c6f0f954eabe32725b70728299c4c9fe4bbd8fc1d3"
+    },
+    {
+      "path": "data/fictional/veclab_tasks_heldout.txt",
+      "rows": 4000,
+      "sha256": "e4d7a58c0a54dc522417831e9462379dde41d53060029be56281d9590f305278"
+    },
+    {
+      "path": "data/fictional/veclab_encoder_mix.txt",
+      "rows": 20000,
+      "sha256": "d93f0817ec918e0cba5da42a8a3c6fbb76219ce204a1b61a28f449bdebbf15b9"
+    },
+    {
+      "path": "eval/veclab_eval.jsonl",
+      "rows": 600,
+      "sha256": "2008ffa1c415f73a3bc99e051f08cc4417ea76e79133c962fefd19d2fc9e92a6"
+    }
+  ]
+}

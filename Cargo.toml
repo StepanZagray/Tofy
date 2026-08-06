@@ -9,17 +9,43 @@ default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
 metal = ["candle-core/metal", "candle-nn/metal"]
+# Chrome Trace Event JSON via tracing-chrome. Keep off by default so normal
+# builds do not pull the subscriber stack.
+profiling = ["dep:tracing-chrome", "dep:tracing-subscriber"]
+# Host allocator for long Rayon training runs (alternative to glibc arena tuning).
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 anyhow = "1.0"
+libc = "0.2"
+tikv-jemallocator = { version = "0.6", optional = true }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Compiles to no-ops when no subscriber is installed; always available so
+# spans can be added without forcing the profiling feature.
+tracing = "0.1"
+tracing-chrome = { version = "0.7", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+candle-graph = { path = "../candle_graph", features = ["all"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "p2_hotpath"
+harness = false
+
+# candle 0.11.0 only routes *forward* conv through cuDNN; weight grads are rewritten
+# as a pathological forward conv. This patch adds ConvBackwardFilter / ConvBackwardData.
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }
 
 [profile.release]
 lto = "thin"

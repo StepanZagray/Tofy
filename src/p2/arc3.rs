@@ -108,7 +108,7 @@ pub fn parse_action_input(raw: &Value) -> Result<ParsedActionInput> {
         "ACTION4" => 4,
         "ACTION5" => 5,
         "ACTION6" => 6,
-        "ACTION7" => bail!("ACTION7 is not mapped into ArcAction 1..=6"),
+        "ACTION7" => 7,
         other => bail!("unknown action id {other}"),
     };
 
@@ -274,7 +274,7 @@ pub fn load_recording_jsonl(path: &Path) -> Result<Vec<RecordingEvent>> {
 /// RESET actions are skipped (not emitted as transitions).
 pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<TransitionSample>> {
     let mut out = Vec::new();
-    for w in events.windows(2) {
+    for (idx, w) in events.windows(2).enumerate() {
         let prev = &w[0];
         let curr = &w[1];
         let Some(parsed) = curr.action.as_ref() else {
@@ -298,18 +298,107 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
             family: format!("arc3:{}", curr.game_id),
             seed: 0,
             episode_id: curr.line as u64,
+            transition_index: idx as u64,
+            oracle_latent: None,
         });
     }
     Ok(out)
 }
 
 /// WIN / GAME_OVER labels come only from the public `state` string.
+///
+/// Other official states (`NOT_FINISHED`, `NOT_STARTED`) are non-terminal here.
+/// See https://docs.arcprize.org/full-play-test .
 pub fn terminal_labels_from_public_state(state: &str) -> (bool, bool) {
     match state {
         "WIN" => (true, false),
         "GAME_OVER" => (false, true),
         _ => (false, false),
     }
+}
+
+/// Per-run counters aligned with official scorecard `RunSummary` fields.
+///
+/// Derived from toolkit recordings only; human baselines are absent so RHAE
+/// cannot be computed from this struct alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordingRunSummary {
+    pub game_id: String,
+    pub guid: String,
+    pub actions: usize,
+    pub resets: usize,
+    pub levels_completed: i64,
+    pub win_levels: i64,
+    pub state: String,
+    pub completed: bool,
+}
+
+/// Aggregate one JSONL recording file into per-`guid` runs.
+pub fn summarize_recording_runs(events: &[RecordingEvent]) -> Vec<RecordingRunSummary> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Acc {
+        game_id: String,
+        actions: usize,
+        resets: usize,
+        levels_completed: i64,
+        win_levels: i64,
+        state: String,
+    }
+
+    let mut runs: BTreeMap<String, Acc> = BTreeMap::new();
+    for event in events {
+        let guid = if event.guid.is_empty() {
+            event.source_path.to_string_lossy().into_owned()
+        } else {
+            event.guid.clone()
+        };
+        let acc = runs.entry(guid).or_default();
+        acc.game_id = event.game_id.clone();
+        acc.levels_completed = acc.levels_completed.max(event.levels_completed);
+        acc.win_levels = acc.win_levels.max(event.win_levels);
+        acc.state = event.state.clone();
+        if event.full_reset {
+            acc.resets += 1;
+        }
+        if let Some(parsed) = event.action.as_ref() {
+            if parsed.is_reset {
+                acc.resets += 1;
+            } else {
+                acc.actions += 1;
+            }
+        }
+    }
+
+    runs.into_iter()
+        .map(|(guid, acc)| {
+            let completed = matches!(acc.state.as_str(), "WIN" | "GAME_OVER");
+            RecordingRunSummary {
+                game_id: acc.game_id,
+                guid,
+                actions: acc.actions,
+                resets: acc.resets,
+                levels_completed: acc.levels_completed,
+                win_levels: acc.win_levels,
+                state: acc.state,
+                completed,
+            }
+        })
+        .collect()
+}
+
+/// Summarize every `*.jsonl` recording under `root`.
+pub fn summarize_recordings_dir(root: &Path) -> Result<Vec<RecordingRunSummary>> {
+    let mut files = Vec::new();
+    collect_jsonl(root, &mut files)?;
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let events = load_recording_jsonl(&path)?;
+        out.extend(summarize_recording_runs(&events));
+    }
+    Ok(out)
 }
 
 /// Recursively import `*.jsonl` under `root`, sorted deterministically by path.
@@ -368,7 +457,7 @@ mod tests {
 
     fn event_line(ts: &str, state: &str, action_id: &str, data: &str, frame_json: &str) -> String {
         format!(
-            "{{\"timestamp\":\"{ts}\",\"data\":{{\"game_id\":\"demo\",\"state\":\"{state}\",\"levels_completed\":0,\"win_levels\":1,\"action_input\":{{\"id\":\"{action_id}\",\"data\":{data},\"reasoning\":null}},\"guid\":\"g1\",\"full_reset\":false,\"available_actions\":[1,2,3,4,5,6],\"frame\":{frame_json}}}}}"
+            "{{\"timestamp\":\"{ts}\",\"data\":{{\"game_id\":\"demo\",\"state\":\"{state}\",\"levels_completed\":0,\"win_levels\":1,\"action_input\":{{\"id\":\"{action_id}\",\"data\":{data},\"reasoning\":null}},\"guid\":\"g1\",\"full_reset\":false,\"available_actions\":[1,2,3,4,5,6,7],\"frame\":{frame_json}}}}}"
         )
     }
 
@@ -484,6 +573,46 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].goal_satisfied, Some(true));
         assert_eq!(samples[0].goal_failed, Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn action7_undo_imports() {
+        let dir = std::env::temp_dir().join(format!("tofy-arc3-action7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = [
+            event_line("t0", "NOT_FINISHED", "ACTION1", "{}", &layer(1, 1, 0)),
+            event_line("t1", "NOT_FINISHED", "ACTION7", "{}", &layer(1, 1, 1)),
+        ]
+        .join("\n");
+        let path = write_fixture(&dir, "undo.jsonl", &body);
+        let samples = events_to_transitions(&load_recording_jsonl(&path).unwrap()).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].action.id, 7);
+        assert_eq!(samples[0].action.to_tofy().unwrap(), crate::domain::Action::Undo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_run_summary_counts_actions() {
+        let dir = std::env::temp_dir().join(format!("tofy-arc3-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = [
+            event_line("t0", "NOT_FINISHED", "RESET", "{}", &layer(1, 1, 0)),
+            event_line("t1", "NOT_FINISHED", "ACTION1", "{}", &layer(1, 1, 1)),
+            event_line("t2", "WIN", "ACTION2", "{}", &layer(1, 1, 2)),
+        ]
+        .join("\n");
+        let path = write_fixture(&dir, "run.jsonl", &body);
+        let events = load_recording_jsonl(&path).unwrap();
+        let runs = summarize_recording_runs(&events);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].actions, 2);
+        assert_eq!(runs[0].resets, 1);
+        assert!(runs[0].completed);
+        assert_eq!(runs[0].state, "WIN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

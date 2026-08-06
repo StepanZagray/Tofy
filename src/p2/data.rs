@@ -24,6 +24,9 @@ pub const GOAL_FEATURES_DIM: usize = 19;
 /// Maximum switch-order slots packed into goal features.
 pub const GOAL_ORDER_SLOTS: usize = 8;
 
+/// Fixed-size simulator oracle for LeJEPA identifiability diagnostics in `p2-eval`.
+pub const ORACLE_LATENT_DIM: usize = 16;
+
 /// Stable categorical palette for synthetic Tofy renders (values in `0..16`).
 pub mod palette {
     pub const EMPTY: u8 = 0;
@@ -99,7 +102,11 @@ impl ArcFrame {
     }
 }
 
-/// Official-like discrete action: ids `1..=6`. Coordinates allowed only for id 6.
+/// Official ARC-AGI-3 discrete action ids `1..=7`. Coordinates only for id 6.
+///
+/// Matches https://docs.arcprize.org/actions :
+/// ACTION1=up, ACTION2=down, ACTION3=left, ACTION4=right, ACTION5=interact,
+/// ACTION6=coordinate, ACTION7=undo. `RESET` is not an `ArcAction`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArcAction {
     pub id: u8,
@@ -109,7 +116,7 @@ pub struct ArcAction {
 
 impl ArcAction {
     pub fn new(id: u8, x: Option<u8>, y: Option<u8>) -> Result<Self> {
-        ensure!((1..=6).contains(&id), "action id {id} not in 1..=6");
+        ensure!((1..=7).contains(&id), "action id {id} not in 1..=7");
         match id {
             6 => {
                 ensure!(
@@ -143,9 +150,9 @@ impl ArcAction {
         let id = match action {
             Action::Move(Dir::North) => 1,
             Action::Move(Dir::South) => 2,
-            Action::Move(Dir::East) => 3,
-            Action::Move(Dir::West) => 4,
-            Action::Undo => 5,
+            Action::Move(Dir::West) => 3,
+            Action::Move(Dir::East) => 4,
+            Action::Undo => 7,
         };
         Self {
             id,
@@ -158,10 +165,11 @@ impl ArcAction {
         match self.id {
             1 => Ok(Action::Move(Dir::North)),
             2 => Ok(Action::Move(Dir::South)),
-            3 => Ok(Action::Move(Dir::East)),
-            4 => Ok(Action::Move(Dir::West)),
-            5 => Ok(Action::Undo),
+            3 => Ok(Action::Move(Dir::West)),
+            4 => Ok(Action::Move(Dir::East)),
+            5 => bail!("ACTION5 (interact) has no Tofy Action mapping"),
             6 => bail!("ACTION6 has no Tofy Action mapping"),
+            7 => Ok(Action::Undo),
             other => bail!("invalid action id {other}"),
         }
     }
@@ -243,6 +251,62 @@ pub struct TransitionSample {
     pub family: String,
     pub seed: u64,
     pub episode_id: u64,
+    /// Monotonic index within `(seed, episode_id)` for rollout ordering.
+    #[serde(default)]
+    pub transition_index: u64,
+    /// Exact-simulator features for identifiability eval; absent for ARC recordings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_latent: Option<Vec<f32>>,
+}
+
+fn popcount_norm(bits: u32, denom: usize) -> f32 {
+    let denom = denom.max(1) as f32;
+    bits.count_ones() as f32 / denom
+}
+
+fn norm_pos(scenario: &Scenario, pos: Pos) -> (f32, f32) {
+    let x = (pos.x as f32 + 0.5) / scenario.width.max(1) as f32 * 2.0 - 1.0;
+    let y = (pos.y as f32 + 0.5) / scenario.height.max(1) as f32 * 2.0 - 1.0;
+    (x, y)
+}
+
+/// Compact oracle latent from exact simulator state (layout-independent dynamics).
+pub fn oracle_latent(scenario: &Scenario, state: &State) -> Vec<f32> {
+    let budget = scenario.action_budget.max(1) as f32;
+    let n_switch = scenario.switches.len().max(1) as f32;
+    let (px, py) = norm_pos(scenario, state.pos);
+    let mut out = vec![0f32; ORACLE_LATENT_DIM];
+    out[0] = px;
+    out[1] = py;
+    out[2] = state.resource as f32 / 255.0;
+    out[3] = state.actions_used as f32 / budget;
+    out[4] = popcount_norm(state.remaining_collectibles, scenario.collectibles.len());
+    out[5] = popcount_norm(state.remaining_pickups, scenario.resource_pickups.len());
+    out[6] = popcount_norm(state.touched_hazards, scenario.hazards.len());
+    out[7] = state.switch_trace.len() as f32 / GOAL_ORDER_SLOTS as f32;
+    for slot in 0..GOAL_ORDER_SLOTS {
+        out[8 + slot] = if slot < state.switch_trace.len() {
+            state.switch_trace[slot] as f32 / n_switch
+        } else {
+            -1.0
+        };
+    }
+    out
+}
+
+/// Frame-only oracle fallback when no simulator `State` is available.
+pub fn oracle_latent_from_frame(frame: &ArcFrame) -> Vec<f32> {
+    let mut out = vec![0f32; ORACLE_LATENT_DIM];
+    for (idx, &pixel) in frame.pixels.iter().enumerate() {
+        if pixel == palette::AGENT {
+            let x = idx % FRAME_SIDE;
+            let y = idx / FRAME_SIDE;
+            out[0] = x as f32 / (FRAME_SIDE.saturating_sub(1).max(1) as f32) * 2.0 - 1.0;
+            out[1] = y as f32 / (FRAME_SIDE.saturating_sub(1).max(1) as f32) * 2.0 - 1.0;
+            break;
+        }
+    }
+    out
 }
 
 /// Render `Scenario` layout + public `State` as a discrete grid (no pad).
@@ -296,51 +360,24 @@ pub fn render_state(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
     ArcFrame::new(scenario.width as u16, scenario.height as u16, pixels)
 }
 
-/// Render and pad to the official `64x64` observation size.
-pub fn render_state_fixed(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
-    let native = render_state(scenario, state)?;
-    let play_height = FRAME_SIDE - 2;
-    let cell = (FRAME_SIDE / native.width as usize)
-        .min(play_height / native.height as usize)
-        .max(1);
-    let used_width = native.width as usize * cell;
-    let used_height = native.height as usize * cell;
-    let origin_x = (FRAME_SIDE - used_width) / 2;
-    let origin_y = (play_height - used_height) / 2;
-    let mut frame = ArcFrame::new(
-        FRAME_SIDE as u16,
-        FRAME_SIDE as u16,
-        vec![palette::PAD; FRAME_SIDE * FRAME_SIDE],
-    )?;
-    for y in 0..native.height as usize {
-        for x in 0..native.width as usize {
-            let color = native.pixels[y * native.width as usize + x];
-            for dy in 0..cell {
-                for dx in 0..cell {
-                    let px = origin_x + x * cell + dx;
-                    let py = origin_y + y * cell + dy;
-                    frame.pixels[py * FRAME_SIDE + px] = color;
-                }
-            }
-        }
-    }
-    // Preserve public counters as a compact visual HUD rather than feeding
-    // privileged structured state to the pixel model.
-    let resource = usize::from(state.resource).min(FRAME_SIDE);
-    for x in 0..resource {
-        frame.pixels[(FRAME_SIDE - 1) * FRAME_SIDE + x] = palette::PICKUP;
-    }
-    let progress = if scenario.action_budget == 0 {
-        0
-    } else {
-        usize::from(state.actions_used).saturating_mul(FRAME_SIDE)
-            / usize::from(scenario.action_budget)
-    }
-    .min(FRAME_SIDE);
-    for x in 0..progress {
-        frame.pixels[(FRAME_SIDE - 2) * FRAME_SIDE + x] = palette::WALL;
-    }
+/// Render native grid, pad to official `64×64`, and draw per-episode status UI in the
+/// margin (ARC-AGI-3 frames embed budget counters in pixels; placement varies by game).
+pub fn render_state_padded(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
+    let mut frame = render_state(scenario, state)?.to_fixed_64()?;
+    apply_arc_status_ui(&mut frame, scenario, state);
     Ok(frame)
+}
+
+/// Render a `(before, after)` pair padded to [`FRAME_SIDE`].
+pub fn render_transition_frames(
+    scenario: &Scenario,
+    before: &State,
+    after: &State,
+) -> Result<(ArcFrame, ArcFrame)> {
+    Ok((
+        render_state_padded(scenario, before)?,
+        render_state_padded(scenario, after)?,
+    ))
 }
 
 /// Whether `action` is a deterministic no-op under exact transition rules.
@@ -364,9 +401,9 @@ pub fn sample_from_transition(
     after: &State,
     action: Action,
     goal: &Goal,
+    transition_index: u64,
 ) -> Result<TransitionSample> {
-    let current = render_state_fixed(scenario, before)?;
-    let next = render_state_fixed(scenario, after)?;
+    let (current, next) = render_transition_frames(scenario, before, after)?;
     let goal_satisfied = goal_satisfied(scenario, after, goal);
     let goal_failed = goal_terminal_failure(scenario, after, goal);
     let exhausted = !goal_satisfied && !goal_failed && after.actions_used >= scenario.action_budget;
@@ -383,14 +420,59 @@ pub fn sample_from_transition(
         family: goal_family(goal).to_string(),
         seed: scenario.seed,
         episode_id: scenario.episode_id,
+        transition_index,
+        oracle_latent: Some(oracle_latent(scenario, before)),
     })
+}
+
+/// Goal-free transition sample: zero goal features and masked event labels (early ARC play).
+pub fn sample_from_transition_goal_free(
+    scenario: &Scenario,
+    before: &State,
+    after: &State,
+    action: Action,
+    family: &str,
+    transition_index: u64,
+) -> Result<TransitionSample> {
+    let (current, next) = render_transition_frames(scenario, before, after)?;
+    Ok(TransitionSample {
+        current,
+        next,
+        action: ArcAction::from_tofy(action),
+        goal_features: GoalFeatures::zeros(),
+        noop: Some(action_is_noop(scenario, before, action)),
+        goal_satisfied: None,
+        goal_failed: None,
+        exhausted: None,
+        split: scenario.split,
+        family: family.into(),
+        seed: scenario.seed,
+        episode_id: scenario.episode_id,
+        transition_index,
+        oracle_latent: Some(oracle_latent(scenario, before)),
+    })
+}
+
+/// Paint remaining action-budget UI on the bottom row (common ARC-AGI-3 layout).
+fn apply_arc_status_ui(frame: &mut ArcFrame, scenario: &Scenario, state: &State) {
+    paint_status_ui(frame, scenario.action_budget, state.actions_used);
+}
+
+fn paint_status_ui(frame: &mut ArcFrame, action_budget: u16, actions_used: u16) {
+    let budget = action_budget.max(1) as usize;
+    let remaining = budget.saturating_sub(actions_used as usize);
+    let filled = remaining.saturating_mul(FRAME_SIDE) / budget;
+    let color = palette::WALL;
+    for x in 0..filled.min(FRAME_SIDE) {
+        frame.pixels[(FRAME_SIDE - 1) * FRAME_SIDE + x] = color;
+    }
 }
 
 fn apply_action(sim: &Simulator, state: &State, action: Action) -> State {
     sim.transition(state, action)
 }
 
-/// Random legal one-step transitions under a public goal.
+/// Random legal one-step transitions without candidate-goal conditioning (early ARC play).
 pub fn generate_random_one_step(
     seed: u64,
     episode_id: u64,
@@ -398,23 +480,22 @@ pub fn generate_random_one_step(
     n: usize,
 ) -> Result<Vec<TransitionSample>> {
     let scenario = generate(seed, episode_id, split);
-    let public_goal =
-        scenario.candidate_goals[(episode_id as usize) % scenario.candidate_goals.len()].clone();
     let sim = Simulator::new(scenario.clone());
     let mut rng = rng_for(seed ^ 0xA11C_E001, episode_id, split);
     let mut out = Vec::with_capacity(n);
     let mut state = State::initial(&scenario);
-    for _ in 0..n {
+    for step in 0..n {
         let actions = legal_actions(&scenario);
         ensure!(!actions.is_empty(), "no legal actions");
         let action = *actions.choose(&mut rng).expect("non-empty");
         let next = apply_action(&sim, &state, action);
-        out.push(sample_from_transition(
+        out.push(sample_from_transition_goal_free(
             &scenario,
             &state,
             &next,
             action,
-            &public_goal,
+            "dynamics",
+            step as u64,
         )?);
         state = next;
         if state.actions_used >= scenario.action_budget {
@@ -452,9 +533,12 @@ pub fn generate_coordinate_one_step(
         let mut next_pixels = current_pixels.clone();
         next_pixels[start_y * FRAME_SIDE + start_x] = palette::EMPTY;
         next_pixels[y as usize * FRAME_SIDE + x as usize] = palette::AGENT;
+        let mut current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?;
+        let mut next = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?;
+        paint_status_ui(&mut current, 64, step as u16);
+        paint_status_ui(&mut next, 64, step as u16 + 1);
         out.push(TransitionSample {
-            current: ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?,
-            next: ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?,
+            next,
             action: ArcAction::new(6, Some(x), Some(y))?,
             goal_features: GoalFeatures::zeros(),
             noop: Some(false),
@@ -465,7 +549,101 @@ pub fn generate_coordinate_one_step(
             family: "coordinate_action".into(),
             seed,
             episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+            transition_index: step as u64,
+            oracle_latent: Some(oracle_latent_from_frame(&current)),
+            current,
         });
+    }
+    Ok(out)
+}
+
+/// Train official `ACTION5` (interact) on a synthetic toggle transition.
+pub fn generate_interact_one_step(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+    n: usize,
+) -> Result<Vec<TransitionSample>> {
+    let mut rng = rng_for(seed ^ 0xA11C_A005, episode_id, split);
+    let mut out = Vec::with_capacity(n);
+    for step in 0..n {
+        let switch_x = rng.random_range(10..54) as u8;
+        let switch_y = rng.random_range(10..54) as u8;
+        let agent_x = switch_x.saturating_sub(1);
+        let agent_y = switch_y;
+        let mut current_pixels = vec![palette::PAD; FRAME_SIDE * FRAME_SIDE];
+        current_pixels[agent_y as usize * FRAME_SIDE + agent_x as usize] = palette::AGENT;
+        current_pixels[switch_y as usize * FRAME_SIDE + switch_x as usize] = palette::SWITCH_BASE;
+        let mut next_pixels = current_pixels.clone();
+        next_pixels[switch_y as usize * FRAME_SIDE + switch_x as usize] =
+            palette::SWITCH_BASE + 1;
+        let mut current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?;
+        let mut next = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?;
+        paint_status_ui(&mut current, 64, step as u16);
+        paint_status_ui(&mut next, 64, step as u16 + 1);
+        out.push(TransitionSample {
+            oracle_latent: Some(oracle_latent_from_frame(&current)),
+            current,
+            next,
+            action: ArcAction::new(5, None, None)?,
+            goal_features: GoalFeatures::zeros(),
+            noop: Some(false),
+            goal_satisfied: Some(false),
+            goal_failed: Some(false),
+            exhausted: Some(false),
+            split,
+            family: "action5_interact".into(),
+            seed,
+            episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+            transition_index: step as u64,
+        });
+    }
+    Ok(out)
+}
+
+/// Deliberate hazard-entry transitions with `goal_failed=true` for event-head training.
+pub fn generate_hazard_one_step(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+    n: usize,
+) -> Result<Vec<TransitionSample>> {
+    let mut out = Vec::with_capacity(n);
+    for step in 0..n {
+        let mut scenario = generate(seed, episode_id.wrapping_add(step as u64), split);
+        if scenario.hazards.is_empty() {
+            scenario.hazards.push(Pos::new(2, 2));
+        }
+        if scenario.markers.is_empty() {
+            scenario.markers.push(Pos::new(4, 4));
+        }
+        let hazard_pos = scenario.hazards[0];
+        let west = Pos::new(hazard_pos.x - 1, hazard_pos.y);
+        let east = Pos::new(hazard_pos.x + 1, hazard_pos.y);
+        let start = if scenario.in_bounds(west) && !scenario.is_blocked(west) {
+            west
+        } else if scenario.in_bounds(east) && !scenario.is_blocked(east) {
+            east
+        } else {
+            scenario.start
+        };
+        scenario.start = start;
+        let sim = Simulator::new(scenario.clone());
+        let state = State::initial(&scenario);
+        let action = if hazard_pos.x > start.x {
+            Action::Move(Dir::East)
+        } else {
+            Action::Move(Dir::West)
+        };
+        let next = apply_action(&sim, &state, action);
+        out.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            "hazard_failure",
+            step as u64,
+        )?);
     }
     Ok(out)
 }
@@ -507,12 +685,104 @@ pub fn generate_plan_fragments(
         .ok_or_else(|| anyhow!("no public-candidate plan for seed={seed} episode={episode_id}"))?;
     let mut state = start;
     let mut out = Vec::with_capacity(plan.actions.len());
-    for action in plan.actions {
+    for (idx, action) in plan.actions.into_iter().enumerate() {
         let next = apply_action(&sim, &state, action);
         out.push(sample_from_transition(
-            &scenario, &state, &next, action, goal,
+            &scenario,
+            &state,
+            &next,
+            action,
+            goal,
+            idx as u64,
         )?);
         state = next;
+    }
+    Ok(out)
+}
+
+/// Goal-free random walk on ordinary maps (early-game exploration proxy).
+pub fn generate_exploration_episode(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
+    let scenario = generate(seed, episode_id, split);
+    let sim = Simulator::new(scenario.clone());
+    let mut rng = rng_for(seed ^ 0xE1A1_0E001, episode_id, split);
+    let mut state = State::initial(&scenario);
+    let steps = 8 + (episode_id as usize % 5);
+    let mut out = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let actions = legal_actions(&scenario);
+        ensure!(!actions.is_empty(), "no legal actions");
+        let action = *actions.choose(&mut rng).expect("non-empty");
+        let next = apply_action(&sim, &state, action);
+        out.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            "exploration",
+            step as u64,
+        )?);
+        state = next;
+        if state.actions_used >= scenario.action_budget {
+            break;
+        }
+    }
+    ensure!(!out.is_empty(), "exploration episode produced no transitions");
+    Ok(out)
+}
+
+/// P1C episode: short goal-free prefix, then a safe multi-candidate probe from the
+/// initial state (synthetic stand-in for “explore, then test hypotheses”).
+pub fn generate_hypothesis_probe_episode(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
+    let scenario = generate_p1c(seed, episode_id, split);
+    ensure!(
+        p1c_falsification_probe_width(&scenario) >= 2,
+        "P1C scenario lacks safe falsification probe"
+    );
+    let sim = Simulator::new(scenario.clone());
+    let mut rng = rng_for(seed ^ 0xE97A_7E570, episode_id, split);
+    let mut state = State::initial(&scenario);
+    let prefix = 8 + (episode_id as usize % 3);
+    let mut out = Vec::new();
+    for step in 0..prefix {
+        let actions = legal_actions(&scenario);
+        ensure!(!actions.is_empty(), "no legal actions");
+        let action = *actions.choose(&mut rng).expect("non-empty");
+        let next = apply_action(&sim, &state, action);
+        out.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            "exploration",
+            step as u64,
+        )?);
+        state = next;
+        if state.actions_used >= scenario.action_budget {
+            break;
+        }
+    }
+    // Standardized safe probe from the published initial state.
+    let start = State::initial(&scenario);
+    let probe = Action::Move(Dir::South);
+    let next = apply_action(&sim, &start, probe);
+    let probe_base = out.len() as u64;
+    for (gi, goal) in scenario.candidate_goals.iter().enumerate() {
+        out.push(sample_from_transition(
+            &scenario,
+            &start,
+            &next,
+            probe,
+            goal,
+            probe_base + gi as u64,
+        )?);
     }
     Ok(out)
 }
@@ -535,9 +805,14 @@ pub fn generate_p1c_falsification_episode(
     let action = Action::Move(Dir::South);
     let next = apply_action(&sim, &start, action);
     let mut out = Vec::new();
-    for goal in &scenario.candidate_goals {
+    for (gi, goal) in scenario.candidate_goals.iter().enumerate() {
         out.push(sample_from_transition(
-            &scenario, &start, &next, action, goal,
+            &scenario,
+            &start,
+            &next,
+            action,
+            goal,
+            gi as u64,
         )?);
     }
     Ok(out)
@@ -570,7 +845,7 @@ pub fn generate_p1c_hard_retarget_multistep(
     let mut out = Vec::new();
 
     if let Some(wrong_plan) = shortest_path(&sim, &state, &wrong_goal, scenario.action_budget) {
-        for action in wrong_plan.actions.into_iter().take(wrong_steps) {
+        for (idx, action) in wrong_plan.actions.into_iter().take(wrong_steps).enumerate() {
             let next = apply_action(&sim, &state, action);
             // Labels stay candidate-conditioned on the wrong commitment.
             out.push(sample_from_transition(
@@ -579,6 +854,7 @@ pub fn generate_p1c_hard_retarget_multistep(
                 &next,
                 action,
                 &wrong_goal,
+                idx as u64,
             )?);
             state = next;
             if goal_terminal_failure(&scenario, &state, &wrong_goal)
@@ -598,7 +874,8 @@ pub fn generate_p1c_hard_retarget_multistep(
                 .map(|plan| (goal.clone(), plan))
         });
     if let Some((retarget_goal, true_plan)) = retarget {
-        for action in true_plan.actions {
+        let base = out.len() as u64;
+        for (idx, action) in true_plan.actions.into_iter().enumerate() {
             let next = apply_action(&sim, &state, action);
             out.push(sample_from_transition(
                 &scenario,
@@ -606,6 +883,7 @@ pub fn generate_p1c_hard_retarget_multistep(
                 &next,
                 action,
                 &retarget_goal,
+                base + idx as u64,
             )?);
             state = next;
             if goal_satisfied(&scenario, &state, &retarget_goal) {
@@ -627,10 +905,18 @@ pub fn generate_curriculum(
 ) -> Result<Vec<TransitionSample>> {
     match kind {
         "random_one_step" => Ok(interleave(
-            generate_random_one_step(seed, episode_id, split, 4)?,
-            generate_coordinate_one_step(seed, episode_id, split, 4)?,
+            interleave(
+                generate_random_one_step(seed, episode_id, split, 2)?,
+                generate_coordinate_one_step(seed, episode_id, split, 2)?,
+            ),
+            interleave(
+                generate_interact_one_step(seed, episode_id, split, 2)?,
+                generate_hazard_one_step(seed, episode_id, split, 2)?,
+            ),
         )),
         "plan_fragment" | "sequential" => generate_plan_fragments(seed, episode_id, split, 64),
+        "exploration" => generate_exploration_episode(seed, episode_id, split),
+        "hypothesis_probe" => generate_hypothesis_probe_episode(seed, episode_id, split),
         "p1c_falsification" => generate_p1c_falsification_episode(seed, episode_id, split),
         "p1c_hard_retarget" => generate_p1c_hard_retarget_multistep(seed, episode_id, split, 3),
         other => bail!("unknown curriculum kind {other}"),
@@ -688,14 +974,17 @@ mod tests {
     fn action_mapping_nsew_undo_and_action6_coords() {
         assert_eq!(ArcAction::from_tofy(Action::Move(Dir::North)).id, 1);
         assert_eq!(ArcAction::from_tofy(Action::Move(Dir::South)).id, 2);
-        assert_eq!(ArcAction::from_tofy(Action::Move(Dir::East)).id, 3);
-        assert_eq!(ArcAction::from_tofy(Action::Move(Dir::West)).id, 4);
-        assert_eq!(ArcAction::from_tofy(Action::Undo).id, 5);
+        assert_eq!(ArcAction::from_tofy(Action::Move(Dir::West)).id, 3);
+        assert_eq!(ArcAction::from_tofy(Action::Move(Dir::East)).id, 4);
+        assert_eq!(ArcAction::from_tofy(Action::Undo).id, 7);
+        assert!(ArcAction::new(5, None, None).is_ok());
+        assert!(ArcAction::new(5, None, None).unwrap().to_tofy().is_err());
         assert!(ArcAction::new(6, Some(10), Some(20)).is_ok());
         assert!(ArcAction::new(6, None, None).is_err());
         assert!(ArcAction::new(1, Some(0), None).is_err());
         assert!(ArcAction::new(0, None, None).is_err());
-        assert!(ArcAction::new(7, None, None).is_err());
+        assert_eq!(ArcAction::new(7, None, None).unwrap().to_tofy().unwrap(), Action::Undo);
+        assert!(ArcAction::new(8, None, None).is_err());
     }
 
     #[test]
@@ -719,9 +1008,9 @@ mod tests {
     fn render_has_no_hidden_index_leakage() {
         let mut sc = tiny_scenario();
         let st = State::initial(&sc);
-        let f0 = render_state_fixed(&sc, &st).unwrap();
+        let f0 = render_state_padded(&sc, &st).unwrap();
         sc.hidden_goal_index = 4;
-        let f1 = render_state_fixed(&sc, &st).unwrap();
+        let f1 = render_state_padded(&sc, &st).unwrap();
         assert_eq!(f0, f1);
         let json = serde_json::to_string(&f0).unwrap();
         assert!(!json.contains("hidden"));
@@ -755,10 +1044,24 @@ mod tests {
             marker: 0,
         };
         let reach = Goal::ReachMarker { marker: 0 };
-        let sample_avoid =
-            sample_from_transition(&sc, &before, &state, Action::Move(Dir::South), &avoid).unwrap();
-        let sample_reach =
-            sample_from_transition(&sc, &before, &state, Action::Move(Dir::South), &reach).unwrap();
+        let sample_avoid = sample_from_transition(
+            &sc,
+            &before,
+            &state,
+            Action::Move(Dir::South),
+            &avoid,
+            0,
+        )
+        .unwrap();
+        let sample_reach = sample_from_transition(
+            &sc,
+            &before,
+            &state,
+            Action::Move(Dir::South),
+            &reach,
+            1,
+        )
+        .unwrap();
         assert_eq!(sample_avoid.goal_failed, Some(true));
         assert_eq!(sample_avoid.goal_satisfied, Some(false));
         assert_eq!(sample_reach.goal_failed, Some(false));
@@ -771,9 +1074,14 @@ mod tests {
         let b = generate_curriculum("random_one_step", 11, 2, Split::Train).unwrap();
         assert_eq!(a, b);
         assert!(!a.is_empty());
-        assert_eq!(a[1].family, "coordinate_action");
-        assert_eq!(a[1].action.id, 6);
-        assert!(a[1].action.x.is_some() && a[1].action.y.is_some());
+        let coord = a
+            .iter()
+            .find(|s| s.family == "coordinate_action")
+            .expect("coordinate sample");
+        assert_eq!(coord.action.id, 6);
+        assert!(coord.action.x.is_some() && coord.action.y.is_some());
+        assert!(a.iter().any(|s| s.family == "action5_interact"));
+        assert!(a.iter().any(|s| s.family == "hazard_failure"));
 
         let p = generate_curriculum("plan_fragment", 3, 0, Split::Train).unwrap();
         let q = generate_curriculum("plan_fragment", 3, 0, Split::Train).unwrap();
@@ -792,6 +1100,60 @@ mod tests {
         let i = generate_curriculum("p1c_hard_retarget", 9, 0, Split::Train).unwrap();
         assert_eq!(h, i);
         assert!(!h.is_empty());
+
+        let ex = generate_curriculum("exploration", 7, 2, Split::Train).unwrap();
+        assert!(ex.iter().all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM]));
+        assert!(ex.iter().all(|s| s.goal_satisfied.is_none()));
+
+        let hp = generate_curriculum("hypothesis_probe", 5, 1, Split::Train).unwrap();
+        assert!(hp.len() >= 3);
+        assert!(hp.iter().any(|s| s.goal_satisfied.is_some()));
+
+        let plan = generate_curriculum("sequential", 11, 2, Split::Train).unwrap();
+        assert!(plan.len() >= 2);
+        for pair in plan.windows(2) {
+            assert_eq!(
+                pair[0].next, pair[1].current,
+                "sequential trace must chain rendered frames"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamics_samples_are_goal_free() {
+        let samples = generate_curriculum("random_one_step", 11, 2, Split::Train).unwrap();
+        assert!(samples.iter().any(|s| s.family == "dynamics"));
+        assert!(
+            samples
+                .iter()
+                .filter(|s| s.family == "dynamics")
+                .all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM])
+        );
+        assert!(
+            samples
+                .iter()
+                .filter(|s| s.family == "dynamics")
+                .all(|s| s.goal_satisfied.is_none())
+        );
+    }
+
+    #[test]
+    fn status_ui_preserves_native_playfield() -> Result<()> {
+        let sc = tiny_scenario();
+        let st = State::initial(&sc);
+        let padded = render_state_padded(&sc, &st)?;
+        let native = render_state(&sc, &st)?;
+        let pw = sc.width as usize;
+        let ph = sc.height as usize;
+        for y in 0..ph {
+            for x in 0..pw {
+                assert_eq!(
+                    padded.pixels[y * FRAME_SIDE + x],
+                    native.pixels[y * pw + x]
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

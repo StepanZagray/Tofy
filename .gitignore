@@ -25,7 +25,13 @@ data/*.tsv
 !data/.gitkeep
 data/cache/
 data/fictional/
+
+# P2 train/eval outputs (default root: runs/p2/ via scripts/p2_runs.sh)
 runs/
+
+# Legacy P2 output dirs at repo root (pre-runs/p2 layout)
+p2-output*/
+p2-arc-recordings/
 
 # Python
 __pycache__/
@@ -56,3 +62,6 @@ Thumbs.db
 # Downloaded GGUF decoders (optional; use local_models for trained weights)
 models/
 *.gguf
+
+# Nested crate build dirs (e.g. vendor/*/target)
+vendor/**/target/

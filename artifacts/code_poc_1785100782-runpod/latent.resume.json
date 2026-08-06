@@ -1,0 +1,13 @@
+{
+  "best_aux_metric": 0.007812086492776871,
+  "best_metric": 0.007812086492776871,
+  "checkpoint_id": "latent-12800-436713-1785145334596674417",
+  "effective_batch": 128,
+  "grad_accum": 8,
+  "physical_batch": 16,
+  "saved_checkpoint": true,
+  "stage": "latent",
+  "step": 12800,
+  "terminal": "early_stopped",
+  "last_improvement_step": 8200
+}

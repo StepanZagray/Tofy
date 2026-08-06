@@ -1,0 +1,13 @@
+{
+  "best_aux_metric": 0.11167265474796295,
+  "best_metric": 0.11167265474796295,
+  "checkpoint_id": "world-6000-1079907-1785316832126913927",
+  "effective_batch": 256,
+  "grad_accum": 8,
+  "last_improvement_step": 3000,
+  "physical_batch": 32,
+  "saved_checkpoint": true,
+  "stage": "world",
+  "step": 6000,
+  "terminal": "early_stopped"
+}

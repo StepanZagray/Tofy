@@ -41,6 +41,7 @@ The defaults are deliberately tiny smoke settings and always write
 ```bash
 cargo run --release -- p2-train \
   --lessons dynamics,sequential,falsification,retarget \
+  --checkpoint-every-steps 100 \
   --output-dir runs/p2/smoke
 
 cargo run --release -- p2-eval \
@@ -54,11 +55,41 @@ cargo run --release -- p2-arc3-eval \
   --arc-recordings-dir /path/to/official-toolkit-recordings \
   --output runs/p2/smoke/arc3_eval_report.json
 
-scripts/audit_p2.sh \
-  runs/p2/smoke/analyzer \
-  runs/p2/smoke/model.safetensors \
-  runs/p2/smoke/runtime.json
+# Optional: attach official RHAE from a closed scorecard JSON
+cargo run --release -- p2-eval \
+  --checkpoint runs/p2/smoke/model.safetensors \
+  --train-config runs/p2/smoke/config.json \
+  --scorecard-json /path/to/scorecard.json \
+  --output runs/p2/smoke/eval_with_rhae.json
+
+cargo p2-view runs/p2/smoke/profile.jsonl --output runs/p2/smoke/model.html
 ```
+
+`p2-train` treats `SIGINT`/`SIGTERM` as a clean pause request. It finishes the
+current optimizer update and prints the complete checkpoint bundle. Resume from that
+bundle, its `checkpoints` parent, or the run directory:
+
+```bash
+cargo run --release -- p2-train \
+  --lessons dynamics,sequential,falsification,retarget \
+  --output-dir runs/p2/smoke \
+  --resume runs/p2/smoke/checkpoints
+```
+
+All trajectory-defining options must match. Checkpoint cadence and
+`--max-steps-this-run` are operational controls and may change across invocations.
+
+Accelerator builds (prefer `cudnn` — see [`vendor/candle-core/TOFY_PATCH.md`](vendor/candle-core/TOFY_PATCH.md)):
+
+```bash
+cargo run --release --features cudnn -- p2-train --device cuda ...
+```
+
+Optional timings: `TOFY_P2_STEP_PROFILE=20`, or Chrome Trace via
+`TOFY_PERF_TRACE=/tmp/tofy-perf.json` with `--features profiling,cudnn`.
+For unified CPU+GPU timelines on CUDA, wrap the same binary with NVIDIA
+Nsight Systems (`nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas --sample=cpu
+...`); see [`src/perf.rs`](src/perf.rs).
 
 Validation:
 
@@ -69,6 +100,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 See [`docs/P2.md`](docs/P2.md) for the contract and
-[`docs/CANDLE_MODEL_ANALYZER.md`](docs/CANDLE_MODEL_ANALYZER.md) for the external
-audit boundary. Track metrics in [`docs/RESULTS_P2.md`](docs/RESULTS_P2.md) (index:
+[`docs/ARC_AGI_3_PLAN.md`](docs/ARC_AGI_3_PLAN.md) for the staged path to the official
+evaluation. See
+[`docs/CANDLE_GRAPH.md`](docs/CANDLE_GRAPH.md) for the full
+candle-graph guide (HTML visualizer, train/infer graphs, audit, v10 artifacts). Track metrics in [`docs/RESULTS_P2.md`](docs/RESULTS_P2.md) (index:
 [`docs/RESULTS.md`](docs/RESULTS.md)).

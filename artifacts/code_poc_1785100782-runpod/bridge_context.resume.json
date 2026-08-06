@@ -1,0 +1,14 @@
+{
+  "best_aux_metric": 3.4028234663852886e+38,
+  "best_metric": 3.4028234663852886e+38,
+  "best_observed_aux_metric": 3.721473217010498,
+  "checkpoint_id": "bridge_context-3300-1214485-1785359476117388770",
+  "effective_batch": 128,
+  "grad_accum": 16,
+  "last_aux_progress_step": 2100,
+  "physical_batch": 8,
+  "saved_checkpoint": true,
+  "stage": "bridge_context",
+  "step": 3300,
+  "terminal": "early_stopped"
+}

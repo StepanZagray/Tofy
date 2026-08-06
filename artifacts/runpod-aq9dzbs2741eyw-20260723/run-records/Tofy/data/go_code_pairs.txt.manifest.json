@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "kind": "github_top_code",
+  "output_path": "data/go_code_pairs.txt",
+  "params": {
+    "languages": [
+      "Go"
+    ],
+    "max_files": 120000,
+    "min_lines": 5,
+    "min_lines_completion": 2,
+    "min_lines_prefix": 2,
+    "split": "train",
+    "split_ratio": 0.5
+  },
+  "inputs": [
+    {
+      "path": "hub:ronantakizawa/github-top-code:train",
+      "len": 0,
+      "modified_unix_nanos": 0,
+      "content_hash": "bfa4ed24f8f153ee76ce0af3088030c8964d874e34e670e7d34a2c3bf43f7388"
+    }
+  ],
+  "rows": 51212
+}

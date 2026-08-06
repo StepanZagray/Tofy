@@ -1,0 +1,1840 @@
+{
+  "regime": "rag",
+  "bridge_model": "runs/nonexistent-control.safetensors",
+  "results": {
+    "seen": {
+      "base": {
+        "tasks": 300,
+        "compile_rate": 0.49666666666666665,
+        "suite_pass_rate": 0.35,
+        "failure_categories": {
+          "must_call_violation": 151,
+          "pass": 105,
+          "tests_failed": 44
+        }
+      }
+    }
+  },
+  "task_results": [
+    {
+      "id": "veclab-1-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-1-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement this function\n\treturn 0\n}"
+    },
+    {
+      "id": "veclab-1-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0\n}"
+    },
+    {
+      "id": "veclab-2-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-2-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0\n}"
+    },
+    {
+      "id": "veclab-2-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0\n}"
+    },
+    {
+      "id": "veclab-3-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-3-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-3-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-4-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-4-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-4-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-5-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-5-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\tif len(values) == 0 || n < 1 {\n\t\treturn 0\n\t}\n\n\t// Sort the values in descending order\n\tsortValues := veclab.SortDesc(values)\n\n\t// Take the first 2 elements\n\tfirstTwo := sortValues[:2]\n\n\t// Calculate the product of the first 2 elements\n\tproduct := firstTwo[0] * firstTwo[1]\n\n\t// Multiply the product by 1.00\n\treturn product * 1.00\n}"
+    },
+    {
+      "id": "veclab-5-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-6-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-6-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-6-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-7-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-7-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-7-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-8-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-8-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-8-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-9-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-9-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement this function\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-9-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-10-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-10-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(values []float64, n int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-10-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation",
+      "generated_code": "package solution\n\nimport \"veclab.dev/veclab\"\n\nfunc Solve(data []float64, limit int) float64 {\n\t// TODO: implement me\n\treturn 0.0\n}"
+    },
+    {
+      "id": "veclab-11-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-11-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-11-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-12-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-12-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-12-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-13-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-13-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-13-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-14-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-14-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-14-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-15-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-15-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-15-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-16-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-16-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-16-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-17-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-17-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-17-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-18-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-18-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-18-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-19-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-19-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-19-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-20-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-20-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-20-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-21-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-21-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-21-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-22-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-22-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-22-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-23-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-23-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-23-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-24-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-24-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-24-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-25-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-25-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-25-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-26-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-26-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-26-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-27-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-27-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-27-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-28-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-28-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-28-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-29-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-29-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-29-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-30-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-30-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-30-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-31-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-31-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-31-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-32-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-32-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-32-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-33-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-33-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-33-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-34-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-34-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-34-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-35-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-35-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-35-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-36-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-36-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-36-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-37-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-37-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-37-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-38-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-38-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-38-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-39-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-39-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-39-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-40-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-40-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-40-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-41-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-41-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-41-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-42-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-42-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-42-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-43-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-43-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-43-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-44-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-44-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-44-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-45-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-45-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-45-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-46-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-46-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-46-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-47-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-47-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-47-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-48-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-48-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-48-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-49-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-49-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-49-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-50-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-50-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-50-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-51-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-51-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-51-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-52-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-52-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-52-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-53-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-53-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-53-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-54-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-54-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-54-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-55-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-55-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-55-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-56-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-56-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-56-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-57-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-57-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-57-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-58-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-58-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-58-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-59-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-59-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-59-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "tests_failed"
+    },
+    {
+      "id": "veclab-60-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-60-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-60-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-61-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-61-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-61-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-62-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-62-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-62-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-63-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-63-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-63-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-64-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-64-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-64-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-65-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-65-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-65-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-66-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-66-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-66-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-67-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-67-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-67-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-68-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-68-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-68-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-69-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-69-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-69-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-70-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-70-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-70-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-71-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-71-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-71-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-72-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-72-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-72-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-73-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-73-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-73-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-74-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-74-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-74-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-75-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-75-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-75-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-76-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-76-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-76-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-77-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-77-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-77-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-78-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-78-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-78-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-79-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-79-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-79-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-80-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-80-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-80-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-81-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-81-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-81-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-82-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-82-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-82-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-83-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-83-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-83-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-84-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-84-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-84-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-85-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-85-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-85-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-86-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-86-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-86-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-87-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-87-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-87-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-88-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-88-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-88-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-89-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-89-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-89-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-90-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-90-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-90-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-91-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-91-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-91-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-92-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-92-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-92-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-93-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-93-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-93-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-94-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-94-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-94-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-95-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-95-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-95-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-96-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-96-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-96-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-97-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-97-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-97-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-98-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-98-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-98-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-99-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-99-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-99-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-100-0",
+      "subset": "seen",
+      "condition": "base",
+      "category": "pass"
+    },
+    {
+      "id": "veclab-100-1",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    },
+    {
+      "id": "veclab-100-2",
+      "subset": "seen",
+      "condition": "base",
+      "category": "must_call_violation"
+    }
+  ]
+}

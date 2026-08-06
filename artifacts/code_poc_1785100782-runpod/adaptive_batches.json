@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "stages": {
+    "bridge_context": {
+      "initial_physical_batch": 8,
+      "initial_grad_accum": 16,
+      "effective_batch": 128,
+      "current_physical_batch": 8,
+      "current_grad_accum": 16,
+      "attempts": [
+        {
+          "sequence": 1,
+          "physical_batch": 8,
+          "grad_accum": 16,
+          "effective_batch": 128,
+          "started_unix": 1785343433,
+          "finished_unix": 1785359478,
+          "outcome": "succeeded"
+        }
+      ]
+    },
+    "latent": {
+      "initial_physical_batch": 16,
+      "initial_grad_accum": 8,
+      "effective_batch": 128,
+      "current_physical_batch": 16,
+      "current_grad_accum": 8,
+      "attempts": [
+        {
+          "sequence": 1,
+          "physical_batch": 16,
+          "grad_accum": 8,
+          "effective_batch": 128,
+          "started_unix": 1785101027,
+          "finished_unix": 1785145626,
+          "outcome": "interrupted",
+          "error": "pipeline parent stopped before attempt completion"
+        }
+      ]
+    },
+    "world": {
+      "initial_physical_batch": 8,
+      "initial_grad_accum": 32,
+      "effective_batch": 256,
+      "current_physical_batch": 2,
+      "current_grad_accum": 128,
+      "attempts": [
+        {
+          "sequence": 1,
+          "physical_batch": 8,
+          "grad_accum": 32,
+          "effective_batch": 256,
+          "started_unix": 1785145835,
+          "finished_unix": 1785149978,
+          "outcome": "cuda_out_of_memory",
+          "error": "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")\n   0: <candle_core::error::Error>::bt\n   1: <core::result::Result<cudarc::driver::safe::core::CudaSlice<f64>, cudarc::driver::result::DriverError> as candle_core::cuda_backend::error::WrapErr<cudarc::driver::safe::core::CudaSlice<f64>>>::w\n   2: <candle_core::op::Add as candle_core::cuda_backend::utils::Map2>::map\n   3: <candle_core::cuda_backend::CudaStorage as candle_core::backend::BackendStorage>::binary_impl::<candle_core::op::Add>\n   4: <candle_core::storage::Storage>::binary_impl::<candle_core::op::Add>\n   5: <candle_core::tensor::Tensor>::add\n   6: <candle_core::tensor::Tensor>::backward\n   7: tofy::model::lejepa::sigreg_epps_pulley_linearization_chunked_seeded\n   8: tofy::tasks::knowledge::run_world_training\n   9: tofy::tasks::knowledge::try_run_train\n  10: tofy::run\n  11: tofy::main\n  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>\n  13: std::rt::lang_start::<()>::{closure#0}\n  14: std::rt::lang_start_internal\n  15: main\n  16: <unknown>\n  17: __libc_start_main\n  18: _start\n"
+        },
+        {
+          "sequence": 2,
+          "physical_batch": 4,
+          "grad_accum": 64,
+          "effective_batch": 256,
+          "started_unix": 1785149978,
+          "finished_unix": 1785157448,
+          "outcome": "cuda_out_of_memory",
+          "error": "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")\n   0: <candle_core::error::Error>::bt\n   1: <core::result::Result<cudarc::driver::safe::core::CudaSlice<f64>, cudarc::driver::result::DriverError> as candle_core::cuda_backend::error::WrapErr<cudarc::driver::safe::core::CudaSlice<f64>>>::w\n   2: <candle_core::op::Add as candle_core::cuda_backend::utils::Map2>::map\n   3: <candle_core::cuda_backend::CudaStorage as candle_core::backend::BackendStorage>::binary_impl::<candle_core::op::Add>\n   4: <candle_core::storage::Storage>::binary_impl::<candle_core::op::Add>\n   5: <candle_core::tensor::Tensor>::add\n   6: <candle_core::tensor::Tensor>::backward\n   7: tofy::model::lejepa::sigreg_epps_pulley_linearization_chunked_seeded\n   8: tofy::tasks::knowledge::run_world_training\n   9: tofy::tasks::knowledge::try_run_train\n  10: tofy::run\n  11: tofy::main\n  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>\n  13: std::rt::lang_start::<()>::{closure#0}\n  14: std::rt::lang_start_internal\n  15: main\n  16: <unknown>\n  17: __libc_start_main\n  18: _start\n"
+        },
+        {
+          "sequence": 3,
+          "physical_batch": 2,
+          "grad_accum": 128,
+          "effective_batch": 256,
+          "started_unix": 1785157448,
+          "finished_unix": 1785228642,
+          "outcome": "interrupted",
+          "error": "pipeline parent stopped before attempt completion"
+        }
+      ]
+    }
+  }
+}
