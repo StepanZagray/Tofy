@@ -1836,6 +1836,38 @@ fn enqueue_batch_prefetch(
     prefetcher.submit_many(&batch_prefetch_requests(curriculum, cfg, global_step, accum))
 }
 
+fn prefetch_lookahead_steps() -> u64 {
+    std::env::var("TOFY_P2_PREFETCH_LOOKAHEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .max(1)
+}
+
+/// Keep `lookahead` optimizer steps of microbatches queued so CPU generation runs ahead of GPU.
+fn top_up_prefetch(
+    prefetched_through_step: &mut u64,
+    prefetcher: &mut BatchPrefetcher,
+    curriculum: &str,
+    cfg: &TrainConfig,
+    global_step: u64,
+    accum: usize,
+) -> Result<()> {
+    prefetcher.poll();
+    let want_through = global_step.saturating_add(prefetch_lookahead_steps());
+    while *prefetched_through_step < want_through {
+        enqueue_batch_prefetch(
+            prefetcher,
+            curriculum,
+            cfg,
+            *prefetched_through_step,
+            accum,
+        )?;
+        *prefetched_through_step = prefetched_through_step.saturating_add(1);
+    }
+    Ok(())
+}
+
 fn collect_one_micro_sample_batch(
     micro: usize,
     accum: usize,
@@ -2606,6 +2638,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     } else {
         None
     };
+    let mut prefetched_through_step = state.global_step;
 
     loop {
         let complete = state.lesson_index == cfg.lessons.len();
@@ -2691,10 +2724,14 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             None
         };
         if use_prefetch {
-            let pf = prefetcher.as_mut().unwrap();
-            if pf.ready_len() < accum {
-                enqueue_batch_prefetch(pf, curriculum, cfg, state.global_step, accum)?;
-            }
+            top_up_prefetch(
+                &mut prefetched_through_step,
+                prefetcher.as_mut().unwrap(),
+                curriculum,
+                cfg,
+                state.global_step,
+                accum,
+            )?;
         }
         let accum_f = accum as f64;
         let mut accumulated_grads: Option<GradStore> = None;
@@ -2722,11 +2759,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 })?
             };
             if micro == 0 && use_prefetch {
-                enqueue_batch_prefetch(
+                top_up_prefetch(
+                    &mut prefetched_through_step,
                     prefetcher.as_mut().unwrap(),
                     curriculum,
                     cfg,
-                    state.global_step.wrapping_add(1),
+                    state.global_step,
                     accum,
                 )?;
             }

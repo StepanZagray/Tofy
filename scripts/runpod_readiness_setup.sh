@@ -12,7 +12,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
   git curl ca-certificates build-essential pkg-config libssl-dev \
-  openssh-client tmux htop rsync jq
+  openssh-client tmux htop rsync jq \
+  libcudnn9-dev-cuda-12
 
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -52,6 +53,7 @@ cat <<EOF
 === After clone or rsync ===
 cd ${TOFY}
 export P2_PHYSICAL_BATCH=512 P2_GRAD_ACCUM=1 P2_DEVICE=cuda
+export RAYON_NUM_THREADS=32 TOFY_P2_PREFETCH_WORKERS=24 TOFY_P2_PREFETCH_LOOKAHEAD=8 TOFY_P2_PREFETCH_QUEUE_DEPTH=16
 cargo build --release --features cudnn
 bash scripts/p2_readiness_train.sh run
 

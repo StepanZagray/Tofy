@@ -44,12 +44,20 @@ fn prefetch_worker_count() -> usize {
     std::env::var("TOFY_P2_PREFETCH_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| rayon::current_num_threads().max(2).min(8))
+        .unwrap_or_else(|| rayon::current_num_threads().max(2).min(32))
+}
+
+fn prefetch_queue_depth() -> usize {
+    std::env::var("TOFY_P2_PREFETCH_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PREFETCH_QUEUE_DEPTH)
+        .max(2)
 }
 
 impl BatchPrefetcher {
     pub fn new() -> Self {
-        Self::with_queue_depth(DEFAULT_PREFETCH_QUEUE_DEPTH)
+        Self::with_queue_depth(prefetch_queue_depth())
     }
 
     pub fn with_queue_depth(queue_depth: usize) -> Self {
