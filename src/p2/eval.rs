@@ -269,7 +269,21 @@ pub struct ContrastiveProbeMetrics {
     pub noop_identity_mse: Option<f64>,
     pub action_effect_mse: Option<f64>,
     pub inverse_action_cosine: Option<f64>,
+    /// `action_effect_mse / noop_identity_mse`: how much more a real action
+    /// moves the latent than a no-op does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_effect_ratio: Option<f64>,
+    /// Copy-forward tripwire. False when actions barely change the prediction,
+    /// i.e. the model has settled on `next ~= current`. A world model that
+    /// fails this cannot support planning no matter how low its one-step MSE
+    /// is, so it is reported as an explicit gate rather than left to be
+    /// inferred from two separate numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_forward_pass: Option<bool>,
 }
+
+/// Minimum `action_effect_mse / noop_identity_mse` for the copy-forward gate.
+pub const COPY_FORWARD_MIN_RATIO: f64 = 2.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecursionProbeSummary {
@@ -1072,13 +1086,27 @@ fn eval_q(q_logit: &Tensor, mse: &[f32], threshold: f64) -> Result<QEvalAccum> {
 
 fn ptrm_metrics_for_k(
     trajectories: &[crate::p2::model::PtrmTrajectory],
-    best_indices: &[usize],
     next_z: &Tensor,
     k: usize,
     noise: f64,
     threshold: f64,
 ) -> Result<PtrmKMetrics> {
     let b = next_z.dim(0)?;
+    // Q logits of the k trajectories actually under consideration, read once.
+    let q_vals: Vec<Vec<f32>> = trajectories
+        .iter()
+        .take(k)
+        .map(|t| Ok(t.q_logit.flatten_all()?.to_vec1::<f32>()?))
+        .collect::<Result<_>>()?;
+    let best_q_index_within = |sample: usize| -> usize {
+        (0..q_vals.len())
+            .max_by(|&a, &b| {
+                q_vals[a][sample]
+                    .partial_cmp(&q_vals[b][sample])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0)
+    };
     let mut pass = 0usize;
     let mut best_q_pass = 0usize;
     let mut disagree_acc = 0f64;
@@ -1100,7 +1128,12 @@ fn ptrm_metrics_for_k(
         if any_pass {
             pass += 1;
         }
-        let best = best_indices[sample];
+        // `best_indices` ranks all `max_k` trajectories, but `mses` only covers
+        // the first `k`. Indexing the former into the latter scored every
+        // `best >= k` sample as a failure, so `best_q_at_k` and `ranking_gap`
+        // for k < max_k measured the truncation rate (1 - k/max_k), not Q's
+        // ranking. Re-rank over the truncated slice instead.
+        let best = best_q_index_within(sample);
         if mses.get(best).copied().unwrap_or(f64::INFINITY) < threshold {
             best_q_pass += 1;
         }
@@ -1177,9 +1210,10 @@ fn ptrm_metrics(
         .map(|&k| {
             ptrm_metrics_for_k(
                 &ptrm.trajectories,
-                &ptrm.best_indices,
                 next_z,
                 k,
+                // Trajectory 0 is forced deterministic (see `forward_ptrm`), so
+                // the k=1 row really is the noise-free baseline this reports.
                 if k == 1 { 0.0 } else { effective_noise },
                 threshold,
             )
@@ -1203,6 +1237,9 @@ struct BatchEvalPartial {
     ptrm_acc: BTreeMap<usize, (f64, f64, f64, f64, usize)>,
     matched_acc: BTreeMap<usize, (f64, usize, usize)>,
     ensemble_disagreement: f64,
+    /// Per-sample disagreement, in sample order, so uncertainty can be scored
+    /// against per-sample error instead of the reliability head's output.
+    ensemble_disagreements: Vec<f32>,
     ensemble_n: usize,
 }
 
@@ -1306,7 +1343,9 @@ fn eval_one_batch(
                 }
             }
             if dpairs > 0 {
-                partial.ensemble_disagreement += dsum / dpairs as f64;
+                let per_sample = dsum / dpairs as f64;
+                partial.ensemble_disagreement += per_sample;
+                partial.ensemble_disagreements.push(per_sample as f32);
                 partial.ensemble_n += 1;
             }
         }
@@ -1370,6 +1409,9 @@ fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> BatchEv
         merged.reliability_probs.extend(partial.reliability_probs);
         merged.recursion_probes.extend(partial.recursion_probes);
         merged.ensemble_disagreement += partial.ensemble_disagreement;
+        merged
+            .ensemble_disagreements
+            .extend(partial.ensemble_disagreements);
         merged.ensemble_n += partial.ensemble_n;
         for (k, (p, bq, d, oracle, n)) in partial.ptrm_acc {
             let e = merged.ptrm_acc.entry(k).or_insert((0.0, 0.0, 0.0, 0.0, 0));
@@ -1840,17 +1882,23 @@ fn eval_sample_set(
             .take(merged.ensemble_n.min(mse_all.len()))
             .map(|m| f64::from(*m) > cfg.q_mse_threshold)
             .collect();
-        let uncertainty: Vec<f32> = (0..high_error.len())
-            .map(|i| merged.reliability_probs.get(i).copied().unwrap_or(0.5))
+        // Score ensemble *disagreement* against error. This previously read
+        // `reliability_probs`, i.e. the reliability head, which made
+        // `uncertainty_auroc` a bit-identical copy of `reliability_auroc` and
+        // meant the pre-registered "disagreement is uncorrelated with error"
+        // stop rule could never be evaluated. Higher disagreement should
+        // predict higher error, so the score is used directly.
+        let uncertainty: Vec<f32> = merged
+            .ensemble_disagreements
+            .iter()
+            .take(high_error.len())
+            .copied()
             .collect();
         EnsembleMetrics {
             members: cfg.ensemble_members,
             mean_disagreement,
             uncertainty_auroc: if uncertainty.len() == high_error.len() && !high_error.is_empty() {
-                binary_auroc(
-                    &uncertainty.iter().map(|u| 1.0 - u).collect::<Vec<_>>(),
-                    &high_error,
-                )
+                binary_auroc(&uncertainty, &high_error)
             } else {
                 None
             },
@@ -1969,10 +2017,13 @@ fn eval_contrastive_probes(
     let den = (delta_fwd.sqr()?.sum_all()?.to_scalar::<f32>()? as f64).sqrt()
         * (delta_inv.sqr()?.sum_all()?.to_scalar::<f32>()? as f64).sqrt()
         + 1e-8;
+    let ratio = (noop_mse > 0.0).then(|| action_mse / noop_mse);
     Ok(ContrastiveProbeMetrics {
         noop_identity_mse: Some(noop_mse),
         action_effect_mse: Some(action_mse),
         inverse_action_cosine: Some(num / den),
+        action_effect_ratio: ratio,
+        copy_forward_pass: ratio.map(|r| r >= COPY_FORWARD_MIN_RATIO),
     })
 }
 

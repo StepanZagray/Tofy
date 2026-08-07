@@ -260,14 +260,13 @@ pub fn effective_sigreg_max_rows(cfg: &TrainConfig) -> usize {
     // Spatial stack is (B·H·W·2)×C; pool halves H/W when enabled.
     let cells = if cfg.sigreg_spatial_pool { 16 } else { 64 };
     let spatial_rows = cfg.physical_batch.saturating_mul(cells).saturating_mul(2);
-    let mut effective = cap.min(spatial_rows);
-  if cfg.physical_batch >= 128 {
-        // 8GB: batch 128 + full-depth recursion peaks ~7 GiB; leave headroom for checkpoint IO.
-        effective = effective.min(1024);
-    } else if cfg.physical_batch >= 64 {
-        effective = effective.min(2048);
-    }
-    effective
+    // `sigreg_max_rows` is authoritative. A previous batch-keyed clamp silently
+    // pinned this to 1024 rows for any physical_batch >= 128, so raising the
+    // batch bought SIGReg no extra samples even though the statistic is what
+    // batch size is supposed to improve. The rows are cheap enough that the
+    // clamp protected nothing: the full pooled stack at batch 1024 is
+    // 32768x128 f32 = 16.8 MiB, against ~6.8 GiB of retained recursion graph.
+    cap.min(spatial_rows)
 }
 
 fn default_prefetch_batches() -> bool {
@@ -1181,9 +1180,13 @@ pub fn sample_recursion_depth(cfg: &TrainConfig, global_step: u64) -> RecursionD
             .wrapping_mul(0x9E37_79B9_7F4A_7C15),
     );
     let max_outer = cfg.outer_steps.max(1);
+    // Outer depth 1 combined with `residual_y_update` makes the recursion the
+    // identity map, which supervises the copy-forward solution directly. Draw
+    // from 2 whenever the configured range allows it.
+    let min_outer = max_outer.min(2);
     RecursionDepth {
         inner_steps: rng.random_range(1..=cfg.inner_steps),
-        outer_steps: rng.random_range(1..=max_outer),
+        outer_steps: rng.random_range(min_outer..=max_outer),
     }
 }
 
@@ -2876,6 +2879,10 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 ("sigreg", &micro_losses.sigreg),
                 ("event", &micro_losses.event),
                 ("q", &micro_losses.q),
+                // Both feed `total`, so a NaN here poisons the step; they were
+                // previously neither guarded nor reported.
+                ("prefix", &micro_losses.prefix),
+                ("reliability", &micro_losses.reliability),
             ])?;
             let inv = 1.0 / accum_f;
             step_metrics.total += micro_vals[0] as f64 * inv;
@@ -2884,6 +2891,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             step_metrics.sigreg += micro_vals[3] as f64 * inv;
             step_metrics.event += micro_vals[4] as f64 * inv;
             step_metrics.q += micro_vals[5] as f64 * inv;
+            step_metrics.prefix += micro_vals[6] as f64 * inv;
+            step_metrics.reliability += micro_vals[7] as f64 * inv;
 
             let scaled_micro = micro_total.affine(inv, 0.0)?;
             let micro_grads = {
@@ -2923,6 +2932,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             state.active_sums.sigreg += step_metrics.sigreg;
             state.active_sums.event += step_metrics.event;
             state.active_sums.q += step_metrics.q;
+            state.active_sums.prefix += step_metrics.prefix;
+            state.active_sums.reliability += step_metrics.reliability;
             Ok(())
         })?;
         state.global_step = state
@@ -3024,6 +3035,47 @@ mod tests {
             checkpoint_every_steps: 0,
             output_dir,
             ..TrainConfig::default()
+        }
+    }
+
+    /// Compare state produced by two independently executed runs.
+    ///
+    /// candle's CPU backend reduces over rayon, so float accumulation order —
+    /// and therefore the low bits — depends on how the work happens to be
+    /// split at runtime. Model weights and lesson losses are already compared
+    /// with a tolerance for exactly this reason; asserting *bitwise* equality
+    /// on the optimizer moments and `active_sums` made this test flaky (the
+    /// same binary passes or fails run to run on identical input) while
+    /// claiming to check resume fidelity. The property that actually matters is
+    /// that resumed state matches to within accumulated float error — a
+    /// genuinely dropped or mis-restored moment is orders of magnitude larger
+    /// than this tolerance and still fails.
+    fn assert_close_f32(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "length mismatch at {what}");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            let tol = 1e-5 * x.abs().max(y.abs()).max(1.0);
+            assert!(
+                (x - y).abs() <= tol,
+                "optimizer mismatch at {what}[{i}]: {x} vs {y}"
+            );
+        }
+    }
+
+    fn assert_loss_means_close(a: &LessonLossMeans, b: &LessonLossMeans, eps: f64) {
+        for (name, x, y) in [
+            ("total", a.total, b.total),
+            ("next_latent", a.next_latent, b.next_latent),
+            ("rollout", a.rollout, b.rollout),
+            ("sigreg", a.sigreg, b.sigreg),
+            ("event", a.event, b.event),
+            ("q", a.q, b.q),
+            ("prefix", a.prefix, b.prefix),
+            ("reliability", a.reliability, b.reliability),
+        ] {
+            assert!(
+                (x - y).abs() <= eps * x.abs().max(y.abs()).max(1.0),
+                "active_sums {name} diverged: {x} vs {y}"
+            );
         }
     }
 
@@ -3471,7 +3523,11 @@ mod tests {
     }
 
     #[test]
-    fn effective_sigreg_max_rows_caps_spatial_batch_128() {
+    fn effective_sigreg_max_rows_honours_configured_cap() {
+        // `sigreg_max_rows` is authoritative, bounded only by the rows the
+        // spatial stack actually has. A previous batch-keyed clamp pinned this
+        // to 1024 for any physical_batch >= 128, so raising the batch gave
+        // SIGReg no extra samples to estimate its statistic from.
         let cfg = TrainConfig {
             physical_batch: 128,
             sigreg_spatial: true,
@@ -3479,12 +3535,29 @@ mod tests {
             sigreg_max_rows: 4096,
             ..TrainConfig::default()
         };
-        assert_eq!(effective_sigreg_max_rows(&cfg), 1024);
+        // pooled: 128 * 16 * 2 = 4096 available, cap 4096.
+        assert_eq!(effective_sigreg_max_rows(&cfg), 4096);
         let unpooled = TrainConfig {
             sigreg_spatial_pool: false,
             ..cfg.clone()
         };
-        assert_eq!(effective_sigreg_max_rows(&unpooled), 1024);
+        // unpooled: 128 * 64 * 2 = 16384 available, so the cap binds.
+        assert_eq!(effective_sigreg_max_rows(&unpooled), 4096);
+        // Larger batches now actually reach more rows.
+        let big = TrainConfig {
+            physical_batch: 1024,
+            sigreg_max_rows: 32768,
+            ..cfg.clone()
+        };
+        assert_eq!(effective_sigreg_max_rows(&big), 32768);
+        // A small explicit cap is still respected (tight-VRAM profile).
+        let laptop = TrainConfig {
+            physical_batch: 1024,
+            sigreg_max_rows: 1024,
+            ..cfg.clone()
+        };
+        assert_eq!(effective_sigreg_max_rows(&laptop), 1024);
+        // Availability binds below the cap for small batches.
         let mid = TrainConfig {
             physical_batch: 64,
             sigreg_spatial: true,
@@ -3724,7 +3797,7 @@ mod tests {
             resumed_state.completed_lessons,
             full_state.completed_lessons
         );
-        assert_eq!(resumed_state.active_sums, full_state.active_sums);
+        assert_loss_means_close(&resumed_state.active_sums, &full_state.active_sums, 1e-5);
 
         let full_moments = unsafe {
             candle_core::safetensors::MmapedSafetensors::new(
@@ -3747,7 +3820,7 @@ mod tests {
                     .load(&muon_key, &Device::Cpu)?
                     .flatten_all()?
                     .to_vec1::<f32>()?;
-                assert_eq!(a, b, "optimizer mismatch at {muon_key}");
+                assert_close_f32(&a, &b, &muon_key);
                 continue;
             }
             for prefix in ["first_moment", "second_moment"] {
@@ -3760,7 +3833,7 @@ mod tests {
                     .load(&key, &Device::Cpu)?
                     .flatten_all()?
                     .to_vec1::<f32>()?;
-                assert_eq!(a, b, "optimizer mismatch at {key}");
+                assert_close_f32(&a, &b, &key);
             }
         }
         let _ = fs::remove_dir_all(&root);

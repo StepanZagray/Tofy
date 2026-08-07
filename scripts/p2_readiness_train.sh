@@ -28,7 +28,10 @@ cd -- "$repo_root"
 MODE="${1:-run}"
 shift || true
 
-OUT="${P2_OUTPUT_DIR:-$(p2_migrate_legacy_run_dir readiness-v2)}"
+# v3: the depth-sampling, Q-target and SIGReg-row changes all alter the resume
+# contract, so v2's completed checkpoints cannot (and must not) be resumed into
+# this run. Keeping a new directory also preserves v2 for comparison.
+OUT="${P2_OUTPUT_DIR:-$(p2_migrate_legacy_run_dir readiness-v3)}"
 case "$MODE" in
   run)
     if [[ $# -ge 1 && "$1" != --* ]]; then
@@ -39,8 +42,8 @@ case "$MODE" in
 esac
 
 DEVICE="${P2_DEVICE:-cuda}"
-PHYSICAL_BATCH="${P2_PHYSICAL_BATCH:-128}"
-GRAD_ACCUM="${P2_GRAD_ACCUM:-4}"
+PHYSICAL_BATCH="${P2_PHYSICAL_BATCH:-1024}"
+GRAD_ACCUM="${P2_GRAD_ACCUM:-1}"
 MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-5}"
 if [[ -z "${AGENT_BIN:-}" ]]; then
   if [[ -x "${HOME}/.local/bin/agent" ]]; then
@@ -147,6 +150,15 @@ train_cmd() {
     --shuffled-episodes
     --prefix-weight 0.1
     --reliability-weight 0.1
+    # Q labels are a threshold on the model's own latent error. With a fixed
+    # absolute threshold that label collapses to all-ones as training fits
+    # (falsification reached next_latent 0.0022 against a 0.05 threshold), so Q
+    # scored ~0 loss by always predicting "reliable" and was uncalibrated on
+    # held-out data. The median-quantile target keeps both classes populated.
+    --q-quantile-targets
+    # SIGReg estimates a distributional statistic, so it needs rows; the full
+    # pooled stack at batch 1024 is 32768 rows and costs ~17 MiB.
+    --sigreg-max-rows 32768
     --outer-steps 8
     --inner-steps 2
     --hidden-dim 128

@@ -604,6 +604,15 @@ impl WorldModel {
         self.event_head.forward(&event_in).map_err(Into::into)
     }
 
+    /// Inject noise into `z`, with `sigma` interpreted **relative to the current
+    /// latent scale**.
+    ///
+    /// `run_recursion` renormalises `y` to unit RMS every outer step, so an
+    /// absolute sigma was attenuated to a ~3% perturbation by the time it
+    /// reached the measured output: every PTRM trajectory collapsed onto the
+    /// same answer and `pass@k` was flat in `k`. Scaling by the tensor's own RMS
+    /// keeps the injected diversity meaningful at any latent scale. The scale
+    /// stays on-device so this adds no stream synchronisation.
     fn maybe_noise_z(&self, z: &Tensor, sigma: f64, noise_seed: Option<u64>) -> Result<Tensor> {
         if sigma == 0.0 {
             return Ok(z.clone());
@@ -612,6 +621,9 @@ impl WorldModel {
             Some(seed) => seeded_gaussian_like(z, sigma, seed)?,
             None => z.randn_like(0.0, sigma)?,
         };
+        let ones = vec![1usize; z.rank()];
+        let rms = z.sqr()?.mean_all()?.sqrt()?.reshape(ones)?;
+        let eps = eps.broadcast_mul(&rms)?;
         z.add(&eps).map_err(Into::into)
     }
 
@@ -1018,13 +1030,21 @@ impl WorldModel {
         let mut trajectories = Vec::with_capacity(ptrm.k);
         let mut q_logits = Vec::with_capacity(ptrm.k);
         for traj in 0..ptrm.k {
+            // Trajectory 0 is the deterministic member. Previously every
+            // trajectory (including 0) was perturbed, so the K-set never
+            // contained the noise-free answer and the reported `k=1` row was a
+            // noisy sample mislabelled as deterministic — the deterministic-vs-
+            // PTRM ablation the design requires could not be read off it.
+            // Keeping member 0 clean also makes the training-time ranking label
+            // meaningful: it asks whether a perturbation beats the default.
+            let sigma = if traj == 0 { 0.0 } else { ptrm.sigma };
             let noise_base = ptrm
                 .seed
                 .map(|s| s ^ (traj as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let out = self.run_recursion(
                 x,
                 goal_h,
-                ptrm.sigma,
+                sigma,
                 noise_base,
                 depth,
                 y_init.clone(),
