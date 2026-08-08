@@ -35,7 +35,7 @@ enum Commands {
     /// P2: held-out live evaluation on every public ARC-AGI-3 environment
     #[command(name = "p2-arc3-live-eval")]
     P2Arc3LiveEval(P2Arc3LiveEvalArgs),
-    /// P2: HTML execution-graph visualizer from `profile.jsonl`
+    /// P2: unified application and optional GPU evidence viewer
     #[command(name = "p2-view")]
     P2View(P2ViewArgs),
 }

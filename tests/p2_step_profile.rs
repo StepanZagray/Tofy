@@ -12,7 +12,7 @@ use candle_core::Device;
 use std::time::Instant;
 use tofy::domain::Split;
 use tofy::p2::data::{generate_curriculum, TransitionSample};
-use tofy::p2::train::{batch_from_samples, frames_to_one_hot};
+use tofy::p2::train::{batch_from_samples, frames_to_indices};
 
 const BATCH: usize = 1024;
 
@@ -41,7 +41,7 @@ fn sequential_collect_batch(
 fn host_side_step_phases() -> Result<()> {
     let device = Device::Cpu;
     for curriculum in ["random_one_step", "sequential", "p1c_falsification"] {
-        let (mut gen_ms, mut onehot_ms, mut stage_ms) = (0.0, 0.0, 0.0);
+        let (mut gen_ms, mut index_ms, mut stage_ms) = (0.0, 0.0, 0.0);
         let reps = 3;
 
         for step in 0..reps {
@@ -51,9 +51,9 @@ fn host_side_step_phases() -> Result<()> {
 
             let currents: Vec<_> = samples.iter().map(|s| s.current.clone()).collect();
             let t1 = Instant::now();
-            let _ = frames_to_one_hot(&currents, &device)?;
-            let _ = frames_to_one_hot(&currents, &device)?; // frames + next_frames
-            onehot_ms += t1.elapsed().as_secs_f64() * 1e3;
+            let _ = frames_to_indices(&currents, &device)?;
+            let _ = frames_to_indices(&currents, &device)?; // frames + next_frames
+            index_ms += t1.elapsed().as_secs_f64() * 1e3;
 
             let t2 = Instant::now();
             let _ = batch_from_samples(&samples, &device)?;
@@ -61,10 +61,10 @@ fn host_side_step_phases() -> Result<()> {
         }
 
         println!(
-            "{curriculum:<20} sequential_generate={:>8.1}ms  one_hot(x2)={:>7.1}ms  \
+            "{curriculum:<20} sequential_generate={:>8.1}ms  indices(x2)={:>7.1}ms  \
              batch_from_samples={:>7.1}ms",
             gen_ms / reps as f64,
-            onehot_ms / reps as f64,
+            index_ms / reps as f64,
             stage_ms / reps as f64,
         );
     }

@@ -2,21 +2,23 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
-use crate::p2::cg_profile::StepProfileCapture;
+use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCapture};
 use crate::p2::data::{
     generate_curriculum, ArcFrame, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
-    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, PIXEL_CHANNELS, PREFIX_HORIZONS,
+    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, PALETTE_SIZE, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
-use crate::p2::optimizer::{accumulate_grad_store, clip_gradients_gpu, CheckpointHybridOptimizer};
-use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest};
+use crate::p2::optimizer::{
+    accumulate_parameter_gradients, clip_gradients_gpu, CheckpointHybridOptimizer,
+};
+use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest, PrefetchScope};
 use crate::p2::sigreg::sigreg_epps_pulley_seeded;
 use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
-use candle_graph::SpanKind;
+use candle_graph::{ExecutionStep, SpanKind};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::{VarBuilder, VarMap};
@@ -62,8 +64,8 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v4";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v2";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v6";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v4";
 
 /// Optimizer steps for a lesson (`dynamics` / `exploration` get 2× base steps).
 pub fn steps_for_lesson(cfg: &TrainConfig, lesson: &str) -> usize {
@@ -128,6 +130,8 @@ pub struct TrainConfig {
     pub checkpoint_every_steps: usize,
     /// Stop cleanly after this many updates in this invocation (scheduler/testing hook).
     pub max_steps_this_run: Option<usize>,
+    /// One-based representative optimizer update captured by candle-graph.
+    pub profile_update: u64,
     /// Run PTRM ranking loss every N optimizer steps on sequential/retarget (`1` = every step).
     #[serde(default = "default_ptrm_rank_every")]
     pub ptrm_rank_every: usize,
@@ -144,7 +148,7 @@ pub struct TrainConfig {
     #[serde(default = "default_phased_training")]
     pub phased_training: bool,
     /// Stop-gradient on predicted `y` for event loss only (Q keeps full gradients).
-    #[serde(default = "default_stop_grad_event_y", alias = "stop_grad_auxiliary_y")]
+    #[serde(default = "default_stop_grad_event_y")]
     pub stop_grad_event_y: bool,
     /// Pre-LN residual dynamics update (see `ModelConfig.residual_y_update`).
     #[serde(default)]
@@ -158,6 +162,9 @@ pub struct TrainConfig {
     /// 2×2 avg-pool latents before spatial SIGReg (4× fewer rows; keeps local geometry).
     #[serde(default = "default_sigreg_spatial_pool")]
     pub sigreg_spatial_pool: bool,
+    /// Apply SIGReg directly to unpooled pre-RMS encoder cells without learned parameters.
+    #[serde(default)]
+    pub sigreg_pre_rms_spatial: bool,
     /// Experimental pre-RMS pooled encoder projector with `T×B×D` SIGReg geometry.
     #[serde(default)]
     pub sigreg_projector: bool,
@@ -190,9 +197,6 @@ pub struct TrainConfig {
     /// Bootstrap ensemble size for eval uncertainty (Phase D).
     #[serde(default = "default_ensemble_members")]
     pub ensemble_members: usize,
-    /// Muon optimizer for 2D weight matrices (DeepSeek-V4 hybrid with AdamW on emb/bias).
-    #[serde(default = "default_use_muon")]
-    pub use_muon: bool,
     #[serde(default = "default_muon_momentum")]
     pub muon_momentum: f64,
     #[serde(default = "default_muon_rms_scale")]
@@ -233,10 +237,6 @@ fn default_randomize_depth() -> bool {
 
 fn default_ensemble_members() -> usize {
     8
-}
-
-fn default_use_muon() -> bool {
-    true
 }
 
 fn default_muon_momentum() -> f64 {
@@ -327,6 +327,7 @@ impl Default for TrainConfig {
             allow_batch_schedule_migration: false,
             checkpoint_every_steps: 100,
             max_steps_this_run: None,
+            profile_update: 2,
             ptrm_rank_every: 4,
             randomize_depth: false,
             steady_gpu: false,
@@ -337,6 +338,7 @@ impl Default for TrainConfig {
             warm_start_y: false,
             sigreg_spatial: false,
             sigreg_spatial_pool: true,
+            sigreg_pre_rms_spatial: false,
             sigreg_projector: false,
             sigreg_projector_dim: default_sigreg_projector_dim(),
             stop_grad_q_y: false,
@@ -348,7 +350,6 @@ impl Default for TrainConfig {
             reliability_weight: 0.0,
             bf16_conv: false,
             ensemble_members: 8,
-            use_muon: true,
             muon_momentum: 0.95,
             muon_rms_scale: MUON_RMS_SCALE,
             sigreg_max_rows: 4096,
@@ -374,6 +375,9 @@ impl TrainConfig {
         if self.max_steps_this_run == Some(0) {
             bail!("max_steps_this_run must be > 0 when provided");
         }
+        if self.profile_update == 0 {
+            bail!("profile_update is one-based and must be > 0");
+        }
         for lesson in &self.lessons {
             lesson_to_curriculum(lesson)?;
         }
@@ -398,6 +402,13 @@ impl TrainConfig {
         }
         if self.sigreg_projector && self.sigreg_projector_dim < 2 {
             bail!("sigreg_projector_dim must be >= 2 when --sigreg-projector is enabled");
+        }
+        if self.sigreg_pre_rms_spatial
+            && (!self.sigreg_spatial || self.sigreg_spatial_pool || self.sigreg_projector)
+        {
+            bail!(
+                "sigreg_pre_rms_spatial requires spatial=true, spatial_pool=false, and projector=false"
+            );
         }
         if !(self.q_mse_threshold.is_finite() && self.q_mse_threshold >= 0.0) {
             bail!("q_mse_threshold must be finite and >= 0");
@@ -483,8 +494,8 @@ pub struct TrainReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_checkpoint: Option<PathBuf>,
     pub config_path: PathBuf,
-    /// candle-graph trace from the first update (`profile.jsonl`, trace/4).
-    pub profile_trace: Option<PathBuf>,
+    /// Published representative-update evidence, if the configured update completed.
+    pub profile: ProfileState,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
 }
@@ -498,6 +509,7 @@ struct TrainingContract {
     lesson_steps: Vec<usize>,
     physical_batch: usize,
     grad_accum: usize,
+    profile_update: u64,
     lr: f64,
     weight_decay: f64,
     sigreg_projections: usize,
@@ -518,7 +530,7 @@ struct TrainingContract {
     #[serde(default)]
     supervise_last_outer_only: bool,
     phased_training: bool,
-    #[serde(default = "default_stop_grad_event_y", alias = "stop_grad_auxiliary_y")]
+    #[serde(default = "default_stop_grad_event_y")]
     stop_grad_event_y: bool,
     #[serde(default)]
     residual_y_update: bool,
@@ -528,6 +540,8 @@ struct TrainingContract {
     sigreg_spatial: bool,
     #[serde(default = "default_sigreg_spatial_pool")]
     sigreg_spatial_pool: bool,
+    #[serde(default)]
+    sigreg_pre_rms_spatial: bool,
     sigreg_projector: bool,
     sigreg_projector_dim: usize,
     #[serde(default)]
@@ -547,8 +561,6 @@ struct TrainingContract {
     adam_beta1: f64,
     adam_beta2: f64,
     adam_eps: f64,
-    #[serde(default = "default_use_muon")]
-    use_muon: bool,
     #[serde(default = "default_muon_momentum")]
     muon_momentum: f64,
     #[serde(default = "default_muon_rms_scale")]
@@ -565,6 +577,7 @@ impl From<&TrainConfig> for TrainingContract {
             lesson_steps: resolved_lesson_steps(cfg),
             physical_batch: cfg.physical_batch,
             grad_accum: cfg.grad_accum,
+            profile_update: cfg.profile_update,
             lr: cfg.lr,
             weight_decay: cfg.weight_decay,
             sigreg_projections: cfg.sigreg_projections,
@@ -588,6 +601,7 @@ impl From<&TrainConfig> for TrainingContract {
             warm_start_y: cfg.warm_start_y,
             sigreg_spatial: cfg.sigreg_spatial,
             sigreg_spatial_pool: cfg.sigreg_spatial_pool,
+            sigreg_pre_rms_spatial: cfg.sigreg_pre_rms_spatial,
             sigreg_projector: cfg.sigreg_projector,
             sigreg_projector_dim: cfg.sigreg_projector_dim,
             stop_grad_q_y: cfg.stop_grad_q_y,
@@ -603,7 +617,6 @@ impl From<&TrainConfig> for TrainingContract {
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
             adam_eps: adam.eps,
-            use_muon: cfg.use_muon,
             muon_momentum: cfg.muon_momentum,
             muon_rms_scale: cfg.muon_rms_scale,
         }
@@ -632,10 +645,7 @@ struct TrainerState {
     parameter_names: Vec<String>,
     #[serde(default)]
     batch_schedule_migrations: Vec<BatchScheduleMigration>,
-    #[serde(default)]
-    profile_emitted: bool,
-    #[serde(default, skip_serializing, alias = "runtime_trace")]
-    legacy_runtime_trace: Option<serde_json::Value>,
+    profile: ProfileState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,16 +679,13 @@ pub fn lesson_to_curriculum(lesson: &str) -> Result<&'static str> {
 
 pub fn resolve_device(spec: &str) -> Result<Device> {
     let spec = spec.trim();
-    if spec.eq_ignore_ascii_case("cpu") {
+    if spec == "cpu" {
         return Ok(Device::Cpu);
     }
-    if spec.eq_ignore_ascii_case("cuda") {
+    if spec == "cuda" {
         return Device::new_cuda(0).context("open cuda:0");
     }
-    if let Some(rest) = spec
-        .strip_prefix("cuda:")
-        .or_else(|| spec.strip_prefix("CUDA:"))
-    {
+    if let Some(rest) = spec.strip_prefix("cuda:") {
         let ordinal: usize = rest.parse().context("parse cuda ordinal")?;
         return Device::new_cuda(ordinal).with_context(|| format!("open cuda:{ordinal}"));
     }
@@ -795,7 +802,7 @@ pub fn parameter_count(varmap: &VarMap) -> usize {
     varmap.all_vars().iter().map(|v| v.elem_count()).sum()
 }
 
-/// Palette indices `B×1×64×64` on device (compact vs one-hot).
+/// Palette indices `B×1×64×64` on device.
 pub fn frames_to_indices(frames: &[ArcFrame], device: &Device) -> Result<Tensor> {
     let b = frames.len();
     if b == 0 {
@@ -808,8 +815,8 @@ pub fn frames_to_indices(frames: &[ArcFrame], device: &Device) -> Result<Tensor>
         .zip(frames.par_iter())
         .try_for_each(|(slot, frame)| -> Result<()> {
             ensure_fixed_frame(frame)?;
-            if let Some(&pix) = frame.pixels.iter().find(|&&p| p as usize >= PIXEL_CHANNELS) {
-                bail!("palette value {pix} out of 0..{PIXEL_CHANNELS}");
+            if let Some(&pix) = frame.pixels.iter().find(|&&p| p as usize >= PALETTE_SIZE) {
+                bail!("palette value {pix} out of 0..{PALETTE_SIZE}");
             }
             slot.copy_from_slice(&frame.pixels);
             Ok(())
@@ -817,41 +824,29 @@ pub fn frames_to_indices(frames: &[ArcFrame], device: &Device) -> Result<Tensor>
     Tensor::from_vec(indices, (b, 1, FRAME_SIDE, FRAME_SIDE), device).map_err(Into::into)
 }
 
-/// Convert palette frames to categorical `B×16×64×64` one-hot tensors (legacy/tests).
-///
-/// Only the palette indices cross the bus: `B×64×64` `u8` is staged to the device and
-/// expanded to one-hot there. Expanding on the host first would push 64x more data
-/// through both host memory and PCIe — 268 MB per call at batch 1024, against 4 MB —
-/// and the trainer builds two of these every step.
-pub fn frames_to_one_hot(frames: &[ArcFrame], device: &Device) -> Result<Tensor> {
-    let b = frames.len();
-    if b == 0 {
-        bail!("frames_to_one_hot requires at least one frame");
+fn sample_frames_to_indices(
+    samples: &[TransitionSample],
+    next: bool,
+    device: &Device,
+) -> Result<Tensor> {
+    if samples.is_empty() {
+        bail!("sample frame batch requires at least one transition");
     }
     let pixels = FRAME_SIDE * FRAME_SIDE;
-    let mut indices = vec![0u8; b * pixels];
-    // Frames are already row-major `u8` palette indices in exactly this layout, so
-    // each slot is a validated memcpy. Disjoint slices, so no synchronization.
+    let mut indices = vec![0u8; samples.len() * pixels];
     indices
         .par_chunks_mut(pixels)
-        .zip(frames.par_iter())
-        .try_for_each(|(slot, frame)| -> Result<()> {
+        .zip(samples.par_iter())
+        .try_for_each(|(slot, sample)| -> Result<()> {
+            let frame = if next { &sample.next } else { &sample.current };
             ensure_fixed_frame(frame)?;
-            if let Some(&pix) = frame.pixels.iter().find(|&&p| p as usize >= PIXEL_CHANNELS) {
-                bail!("palette value {pix} out of 0..{PIXEL_CHANNELS}");
+            if let Some(&pix) = frame.pixels.iter().find(|&&p| p as usize >= PALETTE_SIZE) {
+                bail!("palette value {pix} out of 0..{PALETTE_SIZE}");
             }
             slot.copy_from_slice(&frame.pixels);
             Ok(())
         })?;
-
-    let indices = Tensor::from_vec(indices, (b, 1, FRAME_SIDE, FRAME_SIDE), device)?;
-    let channels =
-        Tensor::arange(0u8, PIXEL_CHANNELS as u8, device)?.reshape((1, PIXEL_CHANNELS, 1, 1))?;
-    // Broadcast compare lands directly in NCHW, so there is no transpose/contiguous
-    // pass afterwards.
-    indices
-        .broadcast_eq(&channels)?
-        .to_dtype(DType::F32)
+    Tensor::from_vec(indices, (samples.len(), 1, FRAME_SIDE, FRAME_SIDE), device)
         .map_err(Into::into)
 }
 
@@ -905,6 +900,13 @@ pub struct BatchTensors {
     pub event_mask: Tensor,
 }
 
+pub struct OrderedTraceTensors {
+    pub frames: Tensor,
+    pub next_frames: Tensor,
+    pub actions: Tensor,
+    pub action_coords: Tensor,
+}
+
 pub fn action_tensors_from_samples(
     samples: &[TransitionSample],
     device: &Device,
@@ -946,11 +948,9 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
     if samples.is_empty() {
         bail!("empty batch");
     }
-    let currents: Vec<ArcFrame> = samples.iter().map(|s| s.current.clone()).collect();
-    let nexts: Vec<ArcFrame> = samples.iter().map(|s| s.next.clone()).collect();
     let (frames, next_frames) = rayon::join(
-        || frames_to_indices(&currents, device),
-        || frames_to_indices(&nexts, device),
+        || sample_frames_to_indices(samples, false, device),
+        || sample_frames_to_indices(samples, true, device),
     );
     let frames = frames?;
     let next_frames = next_frames?;
@@ -969,6 +969,26 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         goals,
         event_targets,
         event_mask,
+    })
+}
+
+pub fn ordered_trace_from_samples(
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<OrderedTraceTensors> {
+    if samples.len() < 2 {
+        bail!("ordered trace requires at least two transitions");
+    }
+    let (frames, next_frames) = rayon::join(
+        || sample_frames_to_indices(samples, false, device),
+        || sample_frames_to_indices(samples, true, device),
+    );
+    let (actions, action_coords) = action_tensors_from_samples(samples, device)?;
+    Ok(OrderedTraceTensors {
+        frames: frames?,
+        next_frames: next_frames?,
+        actions,
+        action_coords,
     })
 }
 
@@ -1487,12 +1507,8 @@ pub fn batch_latent_covariance_frobenius(z: &Tensor) -> Result<f64> {
     Ok(err.sqrt())
 }
 
-fn event_slot_weight_tensor(batch: usize, device: &Device) -> Result<Tensor> {
-    let mut weights = Vec::with_capacity(batch * DEFAULT_NUM_EVENTS);
-    for _ in 0..batch {
-        weights.extend_from_slice(&EVENT_SLOT_WEIGHTS);
-    }
-    Tensor::from_vec(weights, (batch, DEFAULT_NUM_EVENTS), device).map_err(Into::into)
+fn event_slot_weight_tensor(device: &Device) -> Result<Tensor> {
+    Tensor::from_slice(&EVENT_SLOT_WEIGHTS, (1, DEFAULT_NUM_EVENTS), device).map_err(Into::into)
 }
 
 fn masked_bce_with_slot_weights(
@@ -1502,7 +1518,7 @@ fn masked_bce_with_slot_weights(
     slot_weights: Option<&Tensor>,
 ) -> Result<Tensor> {
     let effective_mask = match slot_weights {
-        Some(w) => (mask * w)?,
+        Some(w) => mask.broadcast_mul(w)?,
         None => mask.clone(),
     };
     let elem = bce_with_logits_elem(logits, targets)?;
@@ -1531,16 +1547,10 @@ pub fn ptrm_ranking_loss(
     if k < 2 {
         return Tensor::zeros((), DType::F32, next_z.device()).map_err(Into::into);
     }
-    let (x, goal_h, y_init) = model.prepare_transition_from_encoded(
+    let ptrm = model.ptrm_ranking_trajectories_from_encoded(
         cur_z,
         &batch.actions,
         &batch.action_coords,
-        &batch.goals,
-    )?;
-    let ptrm = model.forward_ptrm_prepared(
-        &x,
-        &goal_h,
-        y_init,
         depth,
         PtrmConfig {
             k,
@@ -1550,7 +1560,7 @@ pub fn ptrm_ranking_loss(
     )?;
     let mut q_rows = Vec::with_capacity(k);
     let mut y_rows = Vec::with_capacity(k);
-    for traj in &ptrm.trajectories {
+    for traj in &ptrm {
         q_rows.push(traj.q_logit.squeeze(1)?);
         y_rows.push(traj.y.clone());
     }
@@ -1580,23 +1590,39 @@ pub fn prefix_one_step_loss(
 
 pub fn prefix_multi_horizon_loss(
     model: &WorldModel,
-    samples: &[TransitionSample],
-    device: &Device,
+    trace: &OrderedTraceTensors,
 ) -> Result<Tensor> {
+    let trace_len = trace.frames.dim(0)?;
+    let valid_horizons = PREFIX_HORIZONS
+        .iter()
+        .copied()
+        .filter(|&horizon| trace_len > horizon)
+        .collect::<Vec<_>>();
+    let max_horizon = valid_horizons
+        .last()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("prefix trace too short"))?;
     let mut total: Option<Tensor> = None;
     let mut weight_sum = 0f64;
-    for &horizon in &PREFIX_HORIZONS {
-        if samples.len() <= horizon {
+    let target_frames = valid_horizons
+        .iter()
+        .map(|&horizon| trace.frames.narrow(0, horizon, 1).map_err(Into::into))
+        .collect::<Result<Vec<Tensor>>>()?;
+    let targets = model.encode_state(&Tensor::cat(&target_frames, 0)?)?;
+    let mut target_index = 0usize;
+    let mut z = model.encode_state(&trace.frames.narrow(0, 0, 1)?)?;
+    for step in 0..max_horizon {
+        z = model.prefix_predict(
+            &z,
+            &trace.actions.narrow(0, step, 1)?,
+            &trace.action_coords.narrow(0, step, 1)?,
+        )?;
+        let horizon = step + 1;
+        if !valid_horizons.contains(&horizon) {
             continue;
         }
-        let start = batch_from_samples(&[samples[0].clone()], device)?;
-        let mut z = model.encode_state(&start.frames)?;
-        for sample in samples.iter().take(horizon) {
-            let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
-            z = model.prefix_predict(&z, &batch.actions, &batch.action_coords)?;
-        }
-        let target =
-            model.encode_state(&batch_from_samples(&[samples[horizon].clone()], device)?.frames)?;
+        let target = targets.narrow(0, target_index, 1)?;
+        target_index += 1;
         let w = prefix_horizon_weight(horizon);
         let robust = candle_nn::loss::huber(&z, &target, 1.0)?;
         let term = smooth_cap_nonnegative(&robust, ROLLOUT_STEP_LOSS_CAP)?.affine(w, 0.0)?;
@@ -1607,11 +1633,44 @@ pub fn prefix_multi_horizon_loss(
         weight_sum += w;
     }
     total
-        .ok_or_else(|| anyhow::anyhow!("prefix trace too short"))
-        .and_then(|t| {
-            t.affine(1.0 / weight_sum.max(1e-8), 0.0)
-                .map_err(Into::into)
-        })
+        .expect("valid_horizons is non-empty")
+        .affine(1.0 / weight_sum.max(1e-8), 0.0)
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+fn prefix_multi_horizon_loss_reference(
+    model: &WorldModel,
+    trace: &OrderedTraceTensors,
+) -> Result<Tensor> {
+    let mut total: Option<Tensor> = None;
+    let mut weight_sum = 0f64;
+    for &horizon in &PREFIX_HORIZONS {
+        if trace.frames.dim(0)? <= horizon {
+            continue;
+        }
+        let mut z = model.encode_state(&trace.frames.narrow(0, 0, 1)?)?;
+        for step in 0..horizon {
+            z = model.prefix_predict(
+                &z,
+                &trace.actions.narrow(0, step, 1)?,
+                &trace.action_coords.narrow(0, step, 1)?,
+            )?;
+        }
+        let target = model.encode_state(&trace.frames.narrow(0, horizon, 1)?)?;
+        let weight = prefix_horizon_weight(horizon);
+        let robust = candle_nn::loss::huber(&z, &target, 1.0)?;
+        let term = smooth_cap_nonnegative(&robust, ROLLOUT_STEP_LOSS_CAP)?.affine(weight, 0.0)?;
+        total = Some(match total {
+            None => term,
+            Some(acc) => acc.add(&term)?,
+        });
+        weight_sum += weight;
+    }
+    total
+        .ok_or_else(|| anyhow::anyhow!("prefix trace too short"))?
+        .affine(1.0 / weight_sum.max(1e-8), 0.0)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1668,37 +1727,62 @@ struct CheckedTrainingLosses {
     reliability: f32,
 }
 
-fn checked_training_losses(
+fn training_loss_tensors(
     losses: &LossBreakdown,
     rollout: &Tensor,
     prefix_multi: &Tensor,
     total: &Tensor,
-) -> Result<CheckedTrainingLosses> {
-    let values = ensure_all_finite(&[
-        ("next_latent", &losses.next_latent),
-        ("rollout", rollout),
-        ("sigreg_raw", &losses.sigreg_raw),
-        ("sigreg_bounded", &losses.sigreg_bounded),
-        ("event", &losses.event),
-        ("q", &losses.q),
-        ("q_surprise", &losses.q_surprise),
-        ("ptrm_rank", &losses.ptrm_rank),
-        ("prefix", &losses.prefix),
-        ("prefix_multi", prefix_multi),
-        ("reliability", &losses.reliability),
-        ("total", total),
-    ])?;
-    Ok(CheckedTrainingLosses {
-        total: values[11],
-        next_latent: values[0],
-        rollout: values[1],
-        sigreg_raw: values[2],
-        sigreg_bounded: values[3],
-        event: values[4],
-        q: values[5],
-        prefix: values[8],
-        reliability: values[10],
-    })
+) -> [Tensor; 12] {
+    [
+        losses.next_latent.detach(),
+        rollout.detach(),
+        losses.sigreg_raw.detach(),
+        losses.sigreg_bounded.detach(),
+        losses.event.detach(),
+        losses.q.detach(),
+        losses.q_surprise.detach(),
+        losses.ptrm_rank.detach(),
+        losses.prefix.detach(),
+        prefix_multi.detach(),
+        losses.reliability.detach(),
+        total.detach(),
+    ]
+}
+
+fn checked_training_losses(tensors: &[[Tensor; 12]]) -> Result<Vec<CheckedTrainingLosses>> {
+    const NAMES: [&str; 12] = [
+        "next_latent",
+        "rollout",
+        "sigreg_raw",
+        "sigreg_bounded",
+        "event",
+        "q",
+        "q_surprise",
+        "ptrm_rank",
+        "prefix",
+        "prefix_multi",
+        "reliability",
+        "total",
+    ];
+    let named = tensors
+        .iter()
+        .flat_map(|micro| NAMES.iter().copied().zip(micro))
+        .collect::<Vec<_>>();
+    let values = ensure_all_finite(&named)?;
+    Ok(values
+        .chunks_exact(12)
+        .map(|values| CheckedTrainingLosses {
+            total: values[11],
+            next_latent: values[0],
+            rollout: values[1],
+            sigreg_raw: values[2],
+            sigreg_bounded: values[3],
+            event: values[4],
+            q: values[5],
+            prefix: values[8],
+            reliability: values[10],
+        })
+        .collect())
 }
 
 /// Randomly subsample SIGReg rows to cap activation memory.
@@ -1750,24 +1834,45 @@ fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
-/// Raw and smoothly bounded SIGReg for an already encoded current/next pair.
-/// The projector treatment supplies `T×B×D`; the control keeps the existing
-/// RMS-normalized spatial/pooled construction unchanged.
-pub fn sigreg_losses_for_encoded_pair(
+/// Select the preregistered SIGReg representation without changing dynamics latents.
+pub fn sigreg_stack_for_encoded_pair(
     cur_z: &Tensor,
     next_z: &Tensor,
+    cur_raw: &Tensor,
+    next_raw: &Tensor,
     projected: Option<&Tensor>,
     cfg: &TrainConfig,
     seed: u64,
-) -> Result<(Tensor, Tensor)> {
-    let stack = match projected {
-        Some(stack) => stack.clone(),
+) -> Result<Tensor> {
+    if cfg.sigreg_pre_rms_spatial {
+        return subsample_sigreg_rows(
+            &stack_latents_for_sigreg(cur_raw, next_raw, true, false)?,
+            effective_sigreg_max_rows(cfg),
+            seed.wrapping_add(0x5196_0001),
+        );
+    }
+    match projected {
+        Some(stack) => Ok(stack.clone()),
         None => subsample_sigreg_rows(
             &stack_latents_for_sigreg(cur_z, next_z, cfg.sigreg_spatial, cfg.sigreg_spatial_pool)?,
             effective_sigreg_max_rows(cfg),
             seed.wrapping_add(0x5196_0001),
-        )?,
-    };
+        ),
+    }
+}
+
+/// Raw and smoothly bounded SIGReg for an already encoded current/next pair.
+pub fn sigreg_losses_for_encoded_pair(
+    cur_z: &Tensor,
+    next_z: &Tensor,
+    cur_raw: &Tensor,
+    next_raw: &Tensor,
+    projected: Option<&Tensor>,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<(Tensor, Tensor)> {
+    let stack =
+        sigreg_stack_for_encoded_pair(cur_z, next_z, cur_raw, next_raw, projected, cfg, seed)?;
     let raw = sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
     let bounded = bounded_sigreg_loss(&raw)?;
     Ok((raw, bounded))
@@ -1810,14 +1915,13 @@ pub fn leworld_loss(
     } else {
         0.0
     };
-    let (cur_z, next_z, projected_sigreg) =
-        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
-    let out = model.forward_from_encoded_state(
+    let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let cur_z = encoded.current;
+    let next_z = encoded.next;
+    let out = model.training_latents_from_encoded_state(
         &cur_z,
-        &batch.frames,
         &batch.actions,
         &batch.action_coords,
-        &batch.goals,
         depth,
         z_noise,
         Some(sigreg_seed.wrapping_add(0x7E57)),
@@ -1829,7 +1933,7 @@ pub fn leworld_loss(
     } else {
         let mut pred_acc: Option<Tensor> = None;
         for step in &out.steps {
-            let mse = step.y.sub(&next_z)?.sqr()?.mean_all()?;
+            let mse = step.sub(&next_z)?.sqr()?.mean_all()?;
             pred_acc = Some(match pred_acc {
                 None => mse,
                 Some(acc) => acc.add(&mse)?,
@@ -1844,22 +1948,24 @@ pub fn leworld_loss(
     let (sigreg_raw, sigreg_bounded) = sigreg_losses_for_encoded_pair(
         &cur_z,
         &next_z,
-        projected_sigreg.as_ref(),
+        &encoded.current_raw,
+        &encoded.next_raw,
+        encoded.projected_sigreg.as_ref(),
         cfg,
         sigreg_seed,
     )?;
 
     let device = batch.frames.device();
-    let zero_scalar =
-        || -> Result<Tensor> { Tensor::zeros((), DType::F32, device).map_err(Into::into) };
+    let zero = Tensor::zeros((), DType::F32, device)?;
 
     let (event_raw, event) = if weights.event > 0.0 {
-        let slot_weights = event_slot_weight_tensor(batch.frames.dim(0)?, device)?;
-        let event_logits = if cfg.stop_grad_event_y {
-            model.event_logits_from(&out.y.detach(), &batch.goals)?
+        let slot_weights = event_slot_weight_tensor(device)?;
+        let event_y = if cfg.stop_grad_event_y {
+            out.y.detach()
         } else {
-            out.event_logits.clone()
+            out.y.clone()
         };
+        let event_logits = model.event_logits_from(&event_y, &batch.goals)?;
         let raw = masked_bce_with_slot_weights(
             &event_logits,
             &batch.event_targets,
@@ -1868,26 +1974,22 @@ pub fn leworld_loss(
         )?;
         (raw.clone(), raw)
     } else {
-        (zero_scalar()?, zero_scalar()?)
+        (zero.clone(), zero.clone())
     };
 
-    let (q_raw, q) = if weights.q > 0.0 {
-        let q_logit = if cfg.stop_grad_q_y {
-            model.q_logit_from_y(&out.y.detach())?
-        } else {
-            out.q_logit.clone()
-        };
-        let q_pred = if cfg.stop_grad_q_y {
+    let (q_raw, q, q_logit, q_mse_per_sample) = if weights.q > 0.0 {
+        let q_y = if cfg.stop_grad_q_y {
             out.y.detach()
         } else {
             out.y.clone()
         };
-        let per = latent_mse_per_sample(&q_pred, &next_z)?.detach();
-        let q_targets = q_targets_from_mse(&per, cfg)?;
+        let q_logit = model.q_logit_from_y(&q_y)?;
+        let per = latent_mse_per_sample(&q_y, &next_z)?;
+        let q_targets = q_targets_from_mse(&per.detach(), cfg)?;
         let raw = bce_with_logits(&q_logit, &q_targets)?;
-        (raw.clone(), raw)
+        (raw.clone(), raw, Some(q_logit), Some(per))
     } else {
-        (zero_scalar()?, zero_scalar()?)
+        (zero.clone(), zero.clone(), None, None)
     };
 
     let (rel_raw, reliability) = if weights.reliability > 0.0 {
@@ -1897,31 +1999,39 @@ pub fn leworld_loss(
         let raw = bce_with_logits(&reliability_logit, &q_targets)?;
         (raw.clone(), raw)
     } else {
-        (zero_scalar()?, zero_scalar()?)
+        (zero.clone(), zero.clone())
     };
 
     let (prefix_raw, prefix) = if weights.prefix > 0.0 {
         let raw = prefix_one_step_loss(model, batch, &cur_z, &next_z)?;
         (raw.clone(), raw)
     } else {
-        (zero_scalar()?, zero_scalar()?)
+        (zero.clone(), zero.clone())
     };
 
-    let mut total = next_latent
-        .add(&sigreg_bounded.affine(weights.sigreg, 0.0)?)?
-        .add(&event.affine(weights.event, 0.0)?)?
-        .add(&q.affine(weights.q, 0.0)?)?
-        .add(&reliability.affine(weights.reliability, 0.0)?)?
-        .add(&prefix.affine(weights.prefix, 0.0)?)?;
+    let mut total = next_latent.clone();
+    for (weight, loss) in [
+        (weights.sigreg, &sigreg_bounded),
+        (weights.event, &event),
+        (weights.q, &q),
+        (weights.reliability, &reliability),
+        (weights.prefix, &prefix),
+    ] {
+        if weight > 0.0 {
+            total = total.add(&loss.affine(weight, 0.0)?)?;
+        }
+    }
     let q_surprise = if weights.q > 0.0 && !cfg.stop_grad_q_y {
-        let q_logit = out.q_logit.clone();
-        let q_prob = candle_nn::ops::sigmoid(&q_logit)?;
-        let mse_per = latent_mse_per_sample(&out.y, &next_z)?;
-        q_prob.mul(&mse_per)?.mean_all()?
+        let q_prob = candle_nn::ops::sigmoid(q_logit.as_ref().expect("active Q head"))?;
+        q_prob
+            .mul(q_mse_per_sample.as_ref().expect("active Q error"))?
+            .mean_all()?
     } else {
-        zero_scalar()?
+        zero.clone()
     };
-    total = total.add(&q_surprise.affine(Q_SURPRISE_WEIGHT, 0.0)?)?;
+    if weights.q > 0.0 && !cfg.stop_grad_q_y {
+        total = total.add(&q_surprise.affine(Q_SURPRISE_WEIGHT, 0.0)?)?;
+    }
     let ptrm_rank = if weights.ptrm_rank {
         ptrm_ranking_loss(
             model,
@@ -1934,9 +2044,11 @@ pub fn leworld_loss(
             sigreg_seed.wrapping_add(1),
         )?
     } else {
-        zero_scalar()?
+        zero
     };
-    total = total.add(&ptrm_rank.affine(PTRM_RANK_WEIGHT, 0.0)?)?;
+    if weights.ptrm_rank {
+        total = total.add(&ptrm_rank.affine(PTRM_RANK_WEIGHT, 0.0)?)?;
+    }
 
     Ok(LossBreakdown {
         total,
@@ -2016,6 +2128,41 @@ fn prefetch_lookahead_steps() -> u64 {
         .max(1)
 }
 
+fn ensure_prefetch_scope(
+    prefetcher: &mut Option<BatchPrefetcher>,
+    prefetched_through_step: &mut u64,
+    curriculum: &str,
+    cfg: &TrainConfig,
+    global_step: u64,
+) {
+    let expected = PrefetchScope {
+        curriculum: curriculum.to_string(),
+        seed: cfg.seed,
+        physical_batch: cfg.physical_batch,
+        split: Split::Train,
+    };
+    let stale = prefetcher
+        .as_ref()
+        .and_then(BatchPrefetcher::scope)
+        .is_some_and(|active| active != &expected);
+    if stale {
+        if let Some(active) = prefetcher.as_mut() {
+            active.shutdown();
+        }
+        *prefetcher = Some(BatchPrefetcher::new());
+        *prefetched_through_step = global_step;
+    }
+}
+
+fn restart_prefetch_pipeline(
+    prefetcher: &mut Option<BatchPrefetcher>,
+    prefetched_through_step: &mut u64,
+    global_step: u64,
+) {
+    *prefetcher = Some(BatchPrefetcher::new());
+    *prefetched_through_step = global_step;
+}
+
 /// Keep `lookahead` optimizer steps of microbatches queued so CPU generation runs ahead of GPU.
 fn top_up_prefetch(
     prefetched_through_step: &mut u64,
@@ -2075,35 +2222,31 @@ fn collect_one_micro_sample_batch(
 /// Open-loop latent rollout with optional AR-forcing resets to real encodings.
 pub fn open_loop_latent_loss(
     model: &WorldModel,
-    samples: &[TransitionSample],
-    device: &Device,
+    trace: &OrderedTraceTensors,
     horizon: usize,
     depth: RecursionDepth,
     teacher_mix: f64,
     seed: u64,
 ) -> Result<Tensor> {
-    if samples.len() < 2 || horizon < 2 {
+    let trace_len = trace.frames.dim(0)?;
+    if trace_len < 2 || horizon < 2 {
         bail!("open-loop loss requires at least two ordered transitions");
     }
-    let steps = horizon.min(samples.len());
-    let first = batch_from_samples(&[samples[0].clone()], device)?;
-    let mut latent = model.encode_state(&first.frames)?;
-    let nexts: Vec<ArcFrame> = samples.iter().take(steps).map(|s| s.next.clone()).collect();
-    let targets = model.encode_state(&frames_to_indices(&nexts, device)?)?;
+    let steps = horizon.min(trace_len);
+    let mut latent = model.encode_state(&trace.frames.narrow(0, 0, 1)?)?;
+    let targets = model.encode_state(&trace.next_frames.narrow(0, 0, steps)?)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut total: Option<Tensor> = None;
     let mut n = 0usize;
-    for (step, sample) in samples.iter().take(steps).enumerate() {
-        let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
-        let predicted = model.forward_from_latent_with_depth(
+    for step in 0..steps {
+        let predicted = model.predict_latent_with_depth(
             &latent,
-            &batch.actions,
-            &batch.action_coords,
-            &batch.goals,
+            &trace.actions.narrow(0, step, 1)?,
+            &trace.action_coords.narrow(0, step, 1)?,
             depth,
         )?;
         let target = targets.narrow(0, step, 1)?;
-        let mse = candle_nn::loss::huber(&predicted.y, &target, 1.0)?;
+        let mse = candle_nn::loss::huber(&predicted, &target, 1.0)?;
         let capped = smooth_cap_nonnegative(&mse, ROLLOUT_STEP_LOSS_CAP)?;
         total = Some(match total {
             None => capped,
@@ -2117,8 +2260,8 @@ pub fn open_loop_latent_loss(
         } else {
             let reset_mask = reset
                 .reshape((1, 1, 1, 1))?
-                .broadcast_as(predicted.y.dims())?;
-            latent = reset_mask.where_cond(&target.detach(), &predicted.y)?;
+                .broadcast_as(predicted.dims())?;
+            latent = reset_mask.where_cond(&target.detach(), &predicted)?;
         }
     }
     total
@@ -2311,6 +2454,7 @@ fn timed<T>(
     if !enabled {
         return f();
     }
+    device.synchronize()?;
     let start = std::time::Instant::now();
     let value = f()?;
     device.synchronize()?;
@@ -2568,10 +2712,6 @@ fn load_training_checkpoint(
     let optimizer_path = bundle.join("optimizer.safetensors");
     load_varmap_exact(varmap, &model_path)?;
     optimizer.load(&optimizer_path, state.optimizer_step)?;
-    if state.legacy_runtime_trace.is_some() {
-        state.profile_emitted = true;
-    }
-    state.legacy_runtime_trace = None;
     Ok(state)
 }
 
@@ -2616,9 +2756,7 @@ fn build_report(
         checkpoint: cfg.output_dir.join("model.safetensors"),
         export_checkpoint: export_checkpoint_path(&cfg.output_dir),
         config_path: cfg.output_dir.join("config.json"),
-        profile_trace: state
-            .profile_emitted
-            .then(|| cfg.output_dir.join("profile.jsonl")),
+        profile: state.profile.clone(),
         research_claim: false,
     }
 }
@@ -2660,11 +2798,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = WorldModel::new(model_cfg, vb)?;
     let adam = adam_params(cfg);
-    let mut optimizer = if cfg.use_muon {
-        CheckpointHybridOptimizer::new(&varmap, adam, cfg.muon_momentum, cfg.muon_rms_scale)?
-    } else {
-        bail!("use_muon=false is no longer supported; Muon+AdamW hybrid is required");
-    };
+    let mut optimizer =
+        CheckpointHybridOptimizer::new(&varmap, adam, cfg.muon_momentum, cfg.muon_rms_scale)?;
     let parameter_names = optimizer.parameter_names();
     let parameter_count = parameter_count(&varmap);
 
@@ -2688,8 +2823,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             active_sums: LessonLossMeans::default(),
             parameter_names,
             batch_schedule_migrations: Vec::new(),
-            profile_emitted: false,
-            legacy_runtime_trace: None,
+            profile: ProfileState::Pending,
         }
     };
     let mut latest_checkpoint = resumed_from.clone();
@@ -2697,6 +2831,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     let mut updates_this_run = 0usize;
     if resumed_from.is_some() {
         device.synchronize()?;
+    }
+    if state.global_step >= cfg.profile_update && matches!(state.profile, ProfileState::Pending) {
+        bail!(
+            "resume state has passed profile update {} without a published evidence bundle",
+            cfg.profile_update
+        );
     }
     // Derived state only: never checkpointed, since a cold cache regenerates the
     // identical episodes on resume.
@@ -2759,9 +2899,28 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let lesson = &cfg.lessons[state.lesson_index];
         let active_lesson_steps = steps_for_lesson(cfg, lesson);
         let curriculum = lesson_to_curriculum(lesson)?;
-        let trace_step = state.global_step;
-        let cg_profile =
-            StepProfileCapture::begin(trace_step, state.profile_emitted, &cfg.output_dir)?;
+        let cg_profile = RepresentativeUpdateCapture::begin(CaptureSpec {
+            completed_updates: state.global_step,
+            selected_update: cfg.profile_update,
+            state: &state.profile,
+            output_dir: &cfg.output_dir,
+            device: &cfg.device,
+            lesson,
+            physical_batch: cfg.physical_batch,
+            grad_accum: cfg.grad_accum,
+            hidden_dim: cfg.hidden_dim,
+            inner_steps: cfg.inner_steps,
+            outer_steps: cfg.outer_steps,
+            precision: if cfg.bf16_conv {
+                "bf16-conv/f32-rest"
+            } else {
+                "f32"
+            },
+        })?;
+        if cg_profile.active() {
+            sync_cuda_device(&device)?;
+        }
+        let profile_measurement = cg_profile.measurement();
         let prof = profile.enabled();
         let accum = cfg.grad_accum.max(1);
         let sigreg_seed = cfg.seed.wrapping_add(state.global_step);
@@ -2782,6 +2941,13 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             None
         };
         if use_prefetch {
+            ensure_prefetch_scope(
+                &mut prefetcher,
+                &mut prefetched_through_step,
+                curriculum,
+                cfg,
+                state.global_step,
+            );
             top_up_prefetch(
                 &mut prefetched_through_step,
                 prefetcher.as_mut().unwrap(),
@@ -2792,12 +2958,14 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             )?;
         }
         let accum_f = accum as f64;
+        let inv = 1.0 / accum_f;
         let mut accumulated_grads: Option<GradStore> = None;
+        let mut metric_tensors = Vec::with_capacity(accum);
         let mut step_metrics = LessonLossMeans::default();
         let mut rollout_trace_cache: Option<Vec<TransitionSample>> = None;
         for micro in 0..accum {
             let samples = {
-                let _cg = cg_profile.span("generate", SpanKind::Module);
+                let _cg = cg_profile.phase("generate", SpanKind::Module, None);
                 timed(prof, &device, &mut profile.generate, || {
                     let _span = tracing::info_span!("generate").entered();
                     collect_one_micro_sample_batch(
@@ -2852,28 +3020,43 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     }
                 });
             }
-            let batch = {
-                let _cg = cg_profile.span("stage", SpanKind::Module);
-                timed(prof, &device, &mut profile.stage, || {
+            let (batch, ordered_trace) = {
+                let cg = cg_profile.phase("stage", SpanKind::Module, None);
+                let staged = timed(prof, &device, &mut profile.stage, || {
                     let _span = tracing::info_span!("stage").entered();
-                    batch_from_samples(&samples, &device)
-                })?
+                    let batch = batch_from_samples(&samples, &device)?;
+                    let ordered_trace = if micro == 0 && run_rollout_this_step {
+                        rollout_trace_cache
+                            .as_deref()
+                            .map(|trace| ordered_trace_from_samples(trace, &device))
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    Ok((batch, ordered_trace))
+                })?;
+                if let Some(range) = cg.as_ref() {
+                    cg_profile.record_tensor(range, "batch.frames", &staged.0.frames, None)?;
+                }
+                staged
             };
             let micro_sigreg_seed = sigreg_seed.wrapping_add(micro as u64);
             let run_rollout = micro == 0
                 && loss_weights.rollout > 0.0
                 && matches!(lesson.as_str(), "sequential" | "retarget");
             let (micro_losses, micro_rollout, micro_prefix_multi, micro_total) = {
-                let _cg = cg_profile.span("forward", SpanKind::Function);
-                timed(prof, &device, &mut profile.forward, || {
+                let cg =
+                    cg_profile.phase("forward", SpanKind::Function, Some(ExecutionStep::Forward));
+                let result = timed(prof, &device, &mut profile.forward, || {
                     let _span = tracing::info_span!("forward").entered();
                     let losses =
                         leworld_loss(&model, &batch, cfg, depth, micro_sigreg_seed, loss_weights)?;
                     let rollout_trace = if run_rollout {
-                        rollout_trace_cache.as_ref()
+                        ordered_trace.as_ref()
                     } else {
                         None
                     };
+                    let zero = Tensor::zeros((), DType::F32, &device)?;
                     let rollout = if let Some(trace) = rollout_trace {
                         let horizon = if cfg.phased_training {
                             rollout_horizon_for_lesson(
@@ -2889,38 +3072,63 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         open_loop_latent_loss(
                             &model,
                             trace,
-                            &device,
                             horizon,
                             depth,
                             rollout_teacher_mix(lesson, state.step_in_lesson, active_lesson_steps),
                             cfg.seed.wrapping_add(state.global_step),
                         )?
                     } else {
-                        Tensor::zeros((), DType::F32, &device)?
+                        zero.clone()
                     };
                     let prefix_multi = if let Some(trace) = rollout_trace {
                         if loss_weights.prefix > 0.0 {
-                            prefix_multi_horizon_loss(&model, trace, &device)?
+                            prefix_multi_horizon_loss(&model, trace)?
                         } else {
-                            Tensor::zeros((), DType::F32, &device)?
+                            zero.clone()
                         }
                     } else {
-                        Tensor::zeros((), DType::F32, &device)?
+                        zero
                     };
-                    let total = losses
-                        .total
-                        .add(&rollout.affine(loss_weights.rollout, 0.0)?)?
-                        .add(&prefix_multi.affine(loss_weights.prefix, 0.0)?)?;
+                    let mut total = losses.total.clone();
+                    if loss_weights.rollout > 0.0 {
+                        total = total.add(&rollout.affine(loss_weights.rollout, 0.0)?)?;
+                    }
+                    if loss_weights.prefix > 0.0 && rollout_trace.is_some() {
+                        total = total.add(&prefix_multi.affine(loss_weights.prefix, 0.0)?)?;
+                    }
                     Ok((losses, rollout, prefix_multi, total))
+                })?;
+                if let Some(range) = cg.as_ref() {
+                    cg_profile.record_tensor(
+                        range,
+                        "loss.total",
+                        &result.3,
+                        Some(ExecutionStep::Forward),
+                    )?;
+                }
+                result
+            };
+            let scaled_micro = micro_total.affine(inv, 0.0)?;
+            let micro_grads = {
+                let _cg = cg_profile.phase(
+                    "backward",
+                    SpanKind::Function,
+                    Some(ExecutionStep::Backward),
+                );
+                timed(prof, &device, &mut profile.backward, || {
+                    let _span = tracing::info_span!("backward").entered();
+                    scaled_micro.backward().map_err(Into::into)
                 })?
             };
-            let micro_vals = checked_training_losses(
+            accumulate_parameter_gradients(&mut accumulated_grads, micro_grads, &varmap)?;
+            metric_tensors.push(training_loss_tensors(
                 &micro_losses,
                 &micro_rollout,
                 &micro_prefix_multi,
                 &micro_total,
-            )?;
-            let inv = 1.0 / accum_f;
+            ));
+        }
+        for micro_vals in checked_training_losses(&metric_tensors)? {
             step_metrics.total += micro_vals.total as f64 * inv;
             step_metrics.next_latent += micro_vals.next_latent as f64 * inv;
             step_metrics.rollout += micro_vals.rollout as f64 * inv;
@@ -2930,50 +3138,54 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             step_metrics.q += micro_vals.q as f64 * inv;
             step_metrics.prefix += micro_vals.prefix as f64 * inv;
             step_metrics.reliability += micro_vals.reliability as f64 * inv;
-
-            let scaled_micro = micro_total.affine(inv, 0.0)?;
-            let micro_grads = {
-                let _cg = cg_profile.span("backward", SpanKind::Function);
-                timed(prof, &device, &mut profile.backward, || {
-                    let _span = tracing::info_span!("backward").entered();
-                    scaled_micro.backward().map_err(Into::into)
-                })?
-            };
-            match accumulated_grads {
-                None => accumulated_grads = Some(micro_grads),
-                Some(ref mut acc) => accumulate_grad_store(acc, micro_grads)?,
-            }
         }
         let mut grads = accumulated_grads
             .ok_or_else(|| anyhow::anyhow!("grad_accum produced no microbatches"))?;
         clip_gradients_gpu(&mut grads, &varmap, MAX_GRAD_NORM)?;
         if cg_profile.active() {
+            let _cg =
+                cg_profile.phase("gradients", SpanKind::Module, Some(ExecutionStep::Backward));
             cg_profile.record_gradients(&varmap, &grads)?;
-            cg_profile.finish()?;
-            state.profile_emitted = true;
         }
-        timed(prof, &device, &mut profile.optimizer, || {
-            let _span = tracing::info_span!("optimizer").entered();
-            optimizer.step(&grads)
-        })?;
+        {
+            let _cg = cg_profile.phase(
+                "optimizer",
+                SpanKind::Function,
+                Some(ExecutionStep::Optimizer),
+            );
+            timed(prof, &device, &mut profile.optimizer, || {
+                let _span = tracing::info_span!("optimizer").entered();
+                optimizer.step(&grads)
+            })?;
+        }
         drop(grads);
-        if device.is_cuda() {
-            let _ = device.synchronize();
-        }
 
-        timed(prof, &device, &mut profile.metrics, || {
-            let _span = tracing::info_span!("metrics").entered();
-            state.active_sums.total += step_metrics.total;
-            state.active_sums.next_latent += step_metrics.next_latent;
-            state.active_sums.rollout += step_metrics.rollout;
-            state.active_sums.sigreg_raw += step_metrics.sigreg_raw;
-            state.active_sums.sigreg_bounded += step_metrics.sigreg_bounded;
-            state.active_sums.event += step_metrics.event;
-            state.active_sums.q += step_metrics.q;
-            state.active_sums.prefix += step_metrics.prefix;
-            state.active_sums.reliability += step_metrics.reliability;
-            Ok(())
-        })?;
+        {
+            let _cg = cg_profile.phase("metrics", SpanKind::Module, None);
+            timed(prof, &device, &mut profile.metrics, || {
+                let _span = tracing::info_span!("metrics").entered();
+                state.active_sums.total += step_metrics.total;
+                state.active_sums.next_latent += step_metrics.next_latent;
+                state.active_sums.rollout += step_metrics.rollout;
+                state.active_sums.sigreg_raw += step_metrics.sigreg_raw;
+                state.active_sums.sigreg_bounded += step_metrics.sigreg_bounded;
+                state.active_sums.event += step_metrics.event;
+                state.active_sums.q += step_metrics.q;
+                state.active_sums.prefix += step_metrics.prefix;
+                state.active_sums.reliability += step_metrics.reliability;
+                Ok(())
+            })?;
+        }
+        if cg_profile.active() {
+            sync_cuda_device(&device)?;
+        }
+        drop(profile_measurement);
+        let published_profile = if let Some(artifacts) = cg_profile.finish()? {
+            state.profile = ProfileState::Published(artifacts);
+            true
+        } else {
+            false
+        };
         state.global_step = state
             .global_step
             .checked_add(1)
@@ -3005,8 +3217,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let complete = state.lesson_index == cfg.lessons.len();
         let requested_pause = PAUSE_REQUESTED.load(Ordering::SeqCst)
             || cfg.max_steps_this_run == Some(updates_this_run);
-        let periodic = cfg.checkpoint_every_steps > 0
-            && state.global_step % cfg.checkpoint_every_steps as u64 == 0;
+        let periodic = published_profile
+            || (cfg.checkpoint_every_steps > 0
+                && state.global_step % cfg.checkpoint_every_steps as u64 == 0);
         if complete || requested_pause || periodic {
             if let Some(p) = prefetcher.as_mut() {
                 p.shutdown();
@@ -3019,13 +3232,13 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             })?);
             latest_checkpoint_step = Some(state.global_step);
             if use_prefetch {
-                prefetcher = Some(BatchPrefetcher::new());
-                // The old prefetcher's queued *and* already-generated batches died with
-                // it, so the lookahead cursor has to rewind with it. Left alone it stays
-                // `lookahead` steps ahead, so `top_up_prefetch` enqueues a single batch
-                // per step from here on and every step blocks in `recv` on a cold
-                // generation -- a 1-deep pipeline that never refills.
-                prefetched_through_step = state.global_step;
+                // The queued batches died with the old workers, so rewind the
+                // submission cursor and refill the whole lookahead window.
+                restart_prefetch_pipeline(
+                    &mut prefetcher,
+                    &mut prefetched_through_step,
+                    state.global_step,
+                );
             }
         }
         profile.steps += 1;
@@ -3070,6 +3283,7 @@ mod tests {
             sigreg_projections: 2,
             sigreg_knots: 3,
             checkpoint_every_steps: 0,
+            profile_update: 1,
             output_dir,
             ..TrainConfig::default()
         }
@@ -3187,7 +3401,7 @@ mod tests {
     }
 
     #[test]
-    fn one_hot_conversion_and_event_mask() -> Result<()> {
+    fn index_staging_and_event_mask() -> Result<()> {
         let device = Device::Cpu;
         let mut coordinate_sample = toy_sample(7);
         coordinate_sample.action = ArcAction::new(6, Some(63), Some(21))?;
@@ -3198,18 +3412,6 @@ mod tests {
         let pix = f0.flatten_all()?.to_vec1::<u8>()?;
         assert!(pix.iter().all(|&v| v == 3));
 
-        let one_hot = frames_to_one_hot(
-            &samples
-                .iter()
-                .map(|s| s.current.clone())
-                .collect::<Vec<_>>(),
-            &device,
-        )?;
-        assert_eq!(one_hot.dims(), &[2, 16, 64, 64]);
-        let oh0 = one_hot.get(0)?;
-        let ch3 = oh0.get(3)?.flatten_all()?.to_vec1::<f32>()?;
-        assert!(ch3.iter().all(|v| *v == 1.0));
-
         let targets = batch.event_targets.to_vec2::<f32>()?;
         let mask = batch.event_mask.to_vec2::<f32>()?;
         // goal_failed is None → mask 0
@@ -3219,6 +3421,31 @@ mod tests {
         assert_eq!(
             batch.action_coords.to_vec2::<f32>()?,
             vec![vec![0.0, 0.0], vec![1.0, 21.0 / 63.0],]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_trace_staging_matches_full_batch_fields_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let samples = vec![toy_sample(1), toy_sample(2), toy_sample(3)];
+        let full = batch_from_samples(&samples, &device)?;
+        let trace = ordered_trace_from_samples(&samples, &device)?;
+        assert_eq!(
+            full.frames.flatten_all()?.to_vec1::<u8>()?,
+            trace.frames.flatten_all()?.to_vec1::<u8>()?
+        );
+        assert_eq!(
+            full.next_frames.flatten_all()?.to_vec1::<u8>()?,
+            trace.next_frames.flatten_all()?.to_vec1::<u8>()?
+        );
+        assert_eq!(
+            full.actions.flatten_all()?.to_vec1::<u32>()?,
+            trace.actions.flatten_all()?.to_vec1::<u32>()?
+        );
+        assert_eq!(
+            full.action_coords.flatten_all()?.to_vec1::<f32>()?,
+            trace.action_coords.flatten_all()?.to_vec1::<f32>()?
         );
         Ok(())
     }
@@ -3520,10 +3747,7 @@ mod tests {
         let mut accumulated: Option<GradStore> = None;
         for term in terms {
             let micro_grads = term.affine(1.0 / accum_f, 0.0)?.backward()?;
-            match accumulated {
-                None => accumulated = Some(micro_grads),
-                Some(ref mut acc) => accumulate_grad_store(acc, micro_grads)?,
-            }
+            accumulate_parameter_gradients(&mut accumulated, micro_grads, &varmap)?;
         }
         let micro_grads = accumulated.expect("micro gradients");
 
@@ -3910,6 +4134,65 @@ mod tests {
     }
 
     #[test]
+    fn pre_rms_spatial_sigreg_uses_unpooled_raw_cells() -> Result<()> {
+        let device = Device::Cpu;
+        let normalized = Tensor::zeros((2, 3, 2, 2), DType::F32, &device)?;
+        let raw_current = Tensor::ones((2, 3, 2, 2), DType::F32, &device)?;
+        let raw_next = raw_current.affine(2.0, 0.0)?;
+        let cfg = TrainConfig {
+            physical_batch: 2,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: false,
+            sigreg_pre_rms_spatial: true,
+            sigreg_max_rows: 0,
+            ..TrainConfig::default()
+        };
+        cfg.validate()?;
+        let stack = sigreg_stack_for_encoded_pair(
+            &normalized,
+            &normalized,
+            &raw_current,
+            &raw_next,
+            None,
+            &cfg,
+            7,
+        )?;
+        assert_eq!(stack.dims(), &[16, 3]);
+        let rows = stack.to_vec2::<f32>()?;
+        assert!(rows[..8].iter().flatten().all(|value| *value == 1.0));
+        assert!(rows[8..].iter().flatten().all(|value| *value == 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn pre_rms_spatial_sigreg_rejects_conflicting_geometry() {
+        let invalid = [
+            TrainConfig {
+                sigreg_pre_rms_spatial: true,
+                sigreg_spatial: false,
+                sigreg_spatial_pool: false,
+                ..TrainConfig::default()
+            },
+            TrainConfig {
+                sigreg_pre_rms_spatial: true,
+                sigreg_spatial: true,
+                sigreg_spatial_pool: true,
+                ..TrainConfig::default()
+            },
+            TrainConfig {
+                sigreg_pre_rms_spatial: true,
+                sigreg_spatial: true,
+                sigreg_spatial_pool: false,
+                sigreg_projector: true,
+                ..TrainConfig::default()
+            },
+        ];
+        for cfg in invalid {
+            assert!(cfg.validate().is_err());
+        }
+    }
+
+    #[test]
     fn sigreg_cap_retains_gradient_above_reported_limit() -> Result<()> {
         let device = Device::Cpu;
         let raw = Var::new(&[20_000f32], &device)?;
@@ -3944,7 +4227,8 @@ mod tests {
             reliability: zero.clone(),
         };
 
-        let error = checked_training_losses(&losses, &zero, &nan, &nan).unwrap_err();
+        let tensors = training_loss_tensors(&losses, &zero, &nan, &nan);
+        let error = checked_training_losses(&[tensors]).unwrap_err();
         assert!(
             error.to_string().contains("prefix_multi is not finite"),
             "expected the originating component, got {error:#}"
@@ -4071,13 +4355,55 @@ mod tests {
             inner_steps: cfg.inner_steps,
             outer_steps: cfg.outer_steps,
         };
-        let loss = open_loop_latent_loss(&model, &trace, &device, 4, depth, 0.25, cfg.seed)?;
+        let trace = ordered_trace_from_samples(&trace, &device)?;
+        let loss = open_loop_latent_loss(&model, &trace, 4, depth, 0.25, cfg.seed)?;
         assert!(ensure_finite("open_loop", &loss)?.is_finite());
         let grads = loss.backward()?;
         assert!(varmap
             .all_vars()
             .iter()
             .any(|var| grads.get(var.as_tensor()).is_some()));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_prefix_rollout_matches_recomputed_reference() -> Result<()> {
+        let cfg = TrainConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            ..TrainConfig::default()
+        };
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg.model_config(), vb)?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let samples = collect_rollout_trace("sequential", cfg.seed, 0, Split::Train)?;
+        let trace = ordered_trace_from_samples(&samples, &device)?;
+
+        let actual = prefix_multi_horizon_loss(&model, &trace)?;
+        let expected = prefix_multi_horizon_loss_reference(&model, &trace)?;
+        let actual_value = actual.to_scalar::<f32>()?;
+        let expected_value = expected.to_scalar::<f32>()?;
+        assert!((actual_value - expected_value).abs() <= 1e-6);
+
+        let actual_grads = actual.backward()?;
+        let expected_grads = expected.backward()?;
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            match (
+                actual_grads.get(var.as_tensor()),
+                expected_grads.get(var.as_tensor()),
+            ) {
+                (Some(actual), Some(expected)) => {
+                    let diff = actual.sub(expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    assert!(diff <= 2e-5, "prefix gradient mismatch for {name}: {diff}");
+                }
+                (None, None) => {}
+                _ => panic!("prefix gradient presence mismatch for {name}"),
+            }
+        }
         Ok(())
     }
 
@@ -4101,7 +4427,7 @@ mod tests {
             checkpoint: PathBuf::from("m.safetensors"),
             export_checkpoint: None,
             config_path: PathBuf::from("c.json"),
-            profile_trace: Some(PathBuf::from("profile.jsonl")),
+            profile: ProfileState::Pending,
             research_claim: false,
         };
         let s = serde_json::to_string(&report)?;
@@ -4121,6 +4447,19 @@ mod tests {
         let paused = train(&cfg)?;
         assert_eq!(paused.status, TrainStatus::Paused);
         assert_eq!(paused.global_step, 1);
+        let ProfileState::Published(artifacts) = &paused.profile else {
+            panic!("first optimizer update must publish profile evidence");
+        };
+        assert!(artifacts.trace.is_file());
+        assert!(artifacts.evidence_json.is_file());
+        assert!(artifacts.evidence_markdown.is_file());
+        assert!(artifacts.viewer_html.is_file());
+        let evidence: candle_graph::EvidencePacket =
+            serde_json::from_slice(&fs::read(&artifacts.evidence_json)?)?;
+        assert!(evidence.health.trusted);
+        assert!(evidence.health.coverage.forward_spans > 0);
+        assert!(evidence.health.coverage.backward_spans > 0);
+        assert!(evidence.health.coverage.optimizer_spans > 0);
 
         cfg.max_steps_this_run = None;
         cfg.resume = None;
@@ -4132,7 +4471,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_resume_matches_uninterrupted_training_exactly() -> Result<()> {
+    fn pause_resume_matches_uninterrupted_training_within_cpu_reduction_tolerance() -> Result<()> {
         let root =
             std::env::temp_dir().join(format!("tofy-p2-exact-resume-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -4176,9 +4515,10 @@ mod tests {
             read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
         assert_eq!(resumed_state.global_step, full_state.global_step);
         assert_eq!(resumed_state.optimizer_step, full_state.optimizer_step);
-        assert_eq!(
-            resumed_state.completed_lessons,
-            full_state.completed_lessons
+        lessons_match_within_eps(
+            &resumed_state.completed_lessons,
+            &full_state.completed_lessons,
+            1e-5,
         );
         assert_loss_means_close(&resumed_state.active_sums, &full_state.active_sums, 1e-5);
 
@@ -4220,6 +4560,52 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn curriculum_transition_matches_with_and_without_prefetch() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-p2-prefetch-curriculum-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let base = TrainConfig {
+            lessons: vec!["dynamics".into(), "exploration".into()],
+            steps_per_lesson: 1,
+            physical_batch: 2,
+            grad_accum: 1,
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            sigreg_projections: 2,
+            sigreg_knots: 3,
+            profile_update: 99,
+            checkpoint_every_steps: 0,
+            ..TrainConfig::default()
+        };
+        let without_cfg = TrainConfig {
+            prefetch_batches: false,
+            output_dir: root.join("without"),
+            ..base.clone()
+        };
+        let with_cfg = TrainConfig {
+            prefetch_batches: true,
+            output_dir: root.join("with"),
+            ..base
+        };
+        let without = train(&without_cfg)?;
+        let with = train(&with_cfg)?;
+        lessons_match_within_eps(&without.lessons, &with.lessons, 1e-5);
+        let without_values = loaded_model_values(&without_cfg, &without.checkpoint)?;
+        let with_values = loaded_model_values(&with_cfg, &with.checkpoint)?;
+        for ((without_name, without), (with_name, with)) in without_values.iter().zip(&with_values)
+        {
+            assert_eq!(without_name, with_name);
+            assert_close_f32(without, with, without_name);
+        }
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -4272,6 +4658,11 @@ mod tests {
         let mut cfg = base.clone();
         cfg.sigreg_max_rows += 1;
         changed.push(("sigreg_max_rows", cfg));
+        let mut cfg = base.clone();
+        cfg.sigreg_spatial = true;
+        cfg.sigreg_spatial_pool = false;
+        cfg.sigreg_pre_rms_spatial = true;
+        changed.push(("sigreg_pre_rms_spatial", cfg));
 
         for (name, cfg) in changed {
             assert_ne!(

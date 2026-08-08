@@ -30,34 +30,54 @@
 //!
 //! ## Nsight Systems (`nsys`) — CPU + GPU
 //!
-//! For unified CPU and CUDA timelines, wrap a release train binary with NVIDIA
-//! Nsight Systems. Prefer this when optimizing GPU utilization, launch/sync
-//! stalls, or cuDNN/cuBLAS vs host work. Day-to-day phase timings can stay on
-//! `TOFY_P2_STEP_PROFILE` / `TOFY_PERF_TRACE`.
+//! The representative update uses identical candle-graph and NVTX semantic labels.
+//! Capture and normalize it through the repository wrapper:
 //!
 //! ```bash
-//! nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas --sample=cpu \
-//!   --output=tofy-train \
-//!   cargo run --release --features cudnn -- p2-train --device cuda ...
+//! P2_NSYS=auto scripts/p2_profile_nsys.sh runs/p2/example -- \
+//!   cargo run --release --features cudnn,profiling -- p2-train \
+//!   --device cuda --output-dir runs/p2/example --profile-update 2 ...
 //! ```
 //!
-//! Open the `.nsys-rep` in the Nsight Systems GUI. Use Nsight Compute (`ncu`)
-//! only after `nsys` identifies a hot kernel.
+//! The bundle retains `.nsys-rep`, official CSV reports, agent evidence, and unified HTML.
 //!
 //! ## Host RSS (`alloc`)
 //!
 //! Long Rayon episode generation on glibc can retain multi-giB anonymous RSS from
-//! arena fragmentation even when live allocations are small. At process start,
-//! [`crate::alloc::init`] caps glibc arenas when `MALLOC_ARENA_MAX` is unset.
-//! During P2 training, `TOFY_MALLOC_TRIM_EVERY` (default `100`) calls `malloc_trim`.
-//! Shell scripts may also export `MALLOC_ARENA_MAX=2`. For overnight runs:
-//! `cargo build --release --features jemalloc` uses jemalloc as the global allocator.
+//! arena fragmentation even when live allocations are small. During P2 training,
+//! `TOFY_MALLOC_TRIM_EVERY` (default `100`) calls `malloc_trim`. Do not cap glibc
+//! arenas for the allocation-heavy worker pool; the L40S measurement in `alloc`
+//! showed a 15x throughput regression. For overnight runs, jemalloc remains available.
 //!
 //! Prefer `--features cudnn` only when the vendored candle patch makes it faster
 //! than im2col; stock candle cudnn can regress conv backward. See
 //! [`vendor/candle-core/TOFY_PATCH.md`](../vendor/candle-core/TOFY_PATCH.md).
 
 use anyhow::Result;
+
+/// Semantic NVTX range used to project GPU work onto Tofy's training phases.
+pub struct NvtxRange {
+    #[cfg(feature = "profiling")]
+    _guard: nvtx::RangeGuard,
+}
+
+impl NvtxRange {
+    #[inline]
+    pub fn new(label: &str) -> Self {
+        #[cfg(feature = "profiling")]
+        {
+            Self {
+                _guard: nvtx::range!("{}", label),
+            }
+        }
+
+        #[cfg(not(feature = "profiling"))]
+        {
+            let _ = label;
+            Self {}
+        }
+    }
+}
 
 /// RAII handle that keeps the Chrome Trace writer alive until drop.
 ///
@@ -102,4 +122,20 @@ fn install_profiling() -> Result<Option<PerfGuard>> {
         .try_init()
         .context("failed to install tracing-chrome subscriber for TOFY_PERF_TRACE")?;
     Ok(Some(PerfGuard { _flush: flush }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NvtxRange;
+
+    #[test]
+    fn nvtx_range_is_safe_to_construct_and_drop() {
+        let _range = NvtxRange::new("p2.forward");
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    #[test]
+    fn nvtx_range_is_zero_sized_without_profiling() {
+        assert_eq!(std::mem::size_of::<NvtxRange>(), 0);
+    }
 }

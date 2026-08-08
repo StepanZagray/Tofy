@@ -14,7 +14,7 @@ use std::path::PathBuf;
 /// `p2-train` — synthetic curriculum only (no ARC public recordings).
 #[derive(Debug, Clone, Args)]
 pub struct P2TrainArgs {
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     pub seed: u64,
 
     /// Comma-separated lessons in order.
@@ -31,7 +31,7 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 2)]
     pub physical_batch: usize,
 
-    /// Recorded; initial trainer requires 1.
+    /// Number of physical microbatches per optimizer update.
     #[arg(long, default_value_t = 1)]
     pub grad_accum: usize,
 
@@ -97,6 +97,10 @@ pub struct P2TrainArgs {
     #[arg(long)]
     pub max_steps_this_run: Option<usize>,
 
+    /// One-based optimizer update captured as a candle-graph evidence bundle.
+    #[arg(long, default_value_t = 2)]
+    pub profile_update: u64,
+
     /// PTRM ranking loss cadence on sequential/retarget (`1` = every step).
     #[arg(long, default_value_t = 4)]
     pub ptrm_rank_every: usize,
@@ -134,6 +138,10 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = true)]
     pub sigreg_spatial_pool: bool,
 
+    /// Feed unpooled pre-RMS spatial cells directly to SIGReg without a projector.
+    #[arg(long, default_value_t = false, conflicts_with = "sigreg_projector")]
+    pub sigreg_pre_rms_spatial: bool,
+
     /// Experimental pre-RMS pooled encoder projector with T×B×D SIGReg geometry.
     #[arg(long, default_value_t = false)]
     pub sigreg_projector: bool,
@@ -168,9 +176,6 @@ pub struct P2TrainArgs {
 
     #[arg(long, default_value_t = 8)]
     pub ensemble_members: usize,
-
-    #[arg(long, default_value_t = true)]
-    pub use_muon: bool,
 
     #[arg(long, default_value_t = 0.95)]
     pub muon_momentum: f64,
@@ -217,6 +222,7 @@ impl P2TrainArgs {
             allow_batch_schedule_migration: self.allow_batch_schedule_migration,
             checkpoint_every_steps: self.checkpoint_every_steps,
             max_steps_this_run: self.max_steps_this_run,
+            profile_update: self.profile_update,
             ptrm_rank_every: self.ptrm_rank_every,
             randomize_depth: self.randomize_depth,
             steady_gpu: self.steady_gpu,
@@ -225,8 +231,9 @@ impl P2TrainArgs {
             stop_grad_event_y: self.stop_grad_event_y,
             residual_y_update: self.residual_y_update,
             warm_start_y: self.warm_start_y,
-            sigreg_spatial: self.sigreg_spatial,
-            sigreg_spatial_pool: self.sigreg_spatial_pool,
+            sigreg_spatial: self.sigreg_spatial || self.sigreg_pre_rms_spatial,
+            sigreg_spatial_pool: self.sigreg_spatial_pool && !self.sigreg_pre_rms_spatial,
+            sigreg_pre_rms_spatial: self.sigreg_pre_rms_spatial,
             sigreg_projector: self.sigreg_projector,
             sigreg_projector_dim: self.sigreg_projector_dim,
             stop_grad_q_y: self.stop_grad_q_y,
@@ -238,7 +245,6 @@ impl P2TrainArgs {
             reliability_weight: self.reliability_weight,
             bf16_conv: self.bf16_conv,
             ensemble_members: self.ensemble_members,
-            use_muon: self.use_muon,
             muon_momentum: self.muon_momentum,
             muon_rms_scale: self.muon_rms_scale,
             sigreg_max_rows: self.sigreg_max_rows,

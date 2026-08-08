@@ -49,8 +49,14 @@ Sibling crate: [`../candle_graph`](../candle_graph). **Guide:**
 [`docs/CANDLE_GRAPH.md`](docs/CANDLE_GRAPH.md).
 
 ```bash
-cargo p2-view runs/p2/v15/profile.jsonl --output runs/p2/v15/model.html
-cargo candle-graph summary runs/p2/v15/profile.jsonl
+sed -n '1,220p' runs/p2/v15/profile/update-000000000001/EVIDENCE.md
+cargo p2-view runs/p2/v15/profile/update-000000000001 \
+  --output runs/p2/v15/profile/update-000000000001/viewer.html
+cargo candle-graph summary runs/p2/v15/profile/update-000000000001/application.jsonl
 ```
+
+Agents start from `EVIDENCE.md`/`evidence.json`, verify `health.trusted` and gaps, then use bounded
+queries. Use `compare` with an explicit baseline before attributing a performance change. Optional
+Nsight facts appear in the same packet/viewer; their absence is a stated gap, not a training error.
 
 `.cargo/config.toml` aliases: `candle-graph`, `p2-view`.

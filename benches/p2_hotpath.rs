@@ -8,7 +8,7 @@ use candle_core::Device;
 use criterion::{criterion_group, criterion_main, Criterion};
 use tofy::domain::Split;
 use tofy::p2::data::{generate_curriculum, ArcFrame, TransitionSample};
-use tofy::p2::train::{batch_from_samples, frames_to_one_hot};
+use tofy::p2::train::{batch_from_samples, frames_to_indices};
 
 const BATCH: usize = 1024;
 
@@ -45,16 +45,16 @@ fn bench_generate_curriculum(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_frames_to_one_hot(c: &mut Criterion) {
+fn bench_frames_to_indices(c: &mut Criterion) {
     let samples = collect_samples("random_one_step", BATCH);
     let frames: Vec<ArcFrame> = samples.iter().map(|s| s.current.clone()).collect();
     let device = Device::Cpu;
 
-    let mut group = c.benchmark_group("frames_to_one_hot");
+    let mut group = c.benchmark_group("frames_to_indices");
     group.sample_size(10);
     group.bench_function("batch_1024_cpu", |b| {
         b.iter(|| {
-            let tensor = frames_to_one_hot(&frames, &device).expect("frames_to_one_hot");
+            let tensor = frames_to_indices(&frames, &device).expect("frames_to_indices");
             std::hint::black_box(tensor)
         });
     });
@@ -79,7 +79,7 @@ fn bench_batch_from_samples(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_generate_curriculum,
-    bench_frames_to_one_hot,
+    bench_frames_to_indices,
     bench_batch_from_samples
 );
 criterion_main!(benches);

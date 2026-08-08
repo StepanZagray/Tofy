@@ -58,11 +58,15 @@ advances both arms to seeds 2 and 3.
 # Run one arm/seed through the 1,000 and 2,000 update pauses and evaluations.
 P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
 P2_EXPECTED_SHA=a4cd11213e7aec91ec744012223d36b73848741c \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
 TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
 bash scripts/p2_sigreg_action_ab.sh control 1
 
 P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
 P2_EXPECTED_SHA=a4cd11213e7aec91ec744012223d36b73848741c \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
 TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
 bash scripts/p2_sigreg_action_ab.sh projector 1
 
@@ -117,6 +121,61 @@ hypothesis is a fresh geometric-isolation arm: pre-RMS spatial-cell SIGReg
 without global pooling or a learned projector, with all other control fields
 fixed. Exact expanded phase commands and immutable reports live under
 `runs/p2/ab-sigreg-action-v1/`; the decision is in `pilot-gates.{json,md}`.
+
+### SIGReg geometry-isolation A/B v2 preregistration (pending)
+
+The next pilot uses fresh initialization for both arms at one reviewed Git SHA.
+It retains the v1 seed-1 dynamics-only schedule, physical batch `1024`, accumulation
+`1`, row cap `32768`, seed-fixed shuffled episodes, randomized `8×2` recursion,
+final-outer-only supervision, update-1,000/update-2,000 pauses, evaluation seed
+`424242`, and all v1 action/noncollapse gates.
+
+- `control` remains post-RMS, 2×2-pooled spatial-cell SIGReg: all
+  `2×1024×4×4 = 32768` rows are used.
+- `pre-rms-spatial` adds no parameters. Dynamics still use RMS-normalized latents;
+  SIGReg uses unpooled pre-RMS encoder cells, deterministically subsampling
+  `32768` rows from `2×1024×8×8 = 131072`.
+
+The treatment intentionally isolates the proposed raw local-cell construction
+from the failed global-pool/linear-projector path, but it changes both normalization
+placement and pooling relative to control. Existing noncollapse gates continue to
+measure globally pooled normalized encoder output, so they test downstream representation
+health rather than the exact raw cell population regularized by the treatment.
+
+Run seed 1 only, then apply the unchanged pilot decision. Stop after 2,000 when
+neither arm hard-passes nor shows the preregistered credible monotonic approach;
+otherwise replicate both arms at seeds 2 and 3. Do not extend to 4,000 or restart
+the full curriculum without the subsequent three-seed gate.
+
+```bash
+P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2 \
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_sigreg_geometry_ab.sh control 1
+
+P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2 \
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_sigreg_geometry_ab.sh pre-rms-spatial 1
+
+python3 scripts/p2_ab_gate.py \
+  --root /workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2 \
+  --seeds 1 --treatment-arm pre-rms-spatial \
+  --output-json /workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2/pilot-gates.json \
+  --output-md /workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2/pilot-gates.md
+
+# On a 46 GiB L40S, run the two ~17.3 GiB arms together and adapt through the
+# pilot, three-seed replication, and preregistered extension gates:
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_sigreg_geometry_overnight.sh
+```
 
 These commands and any interim smoke metrics are experimental diagnostics only.
 They do not set `research_claim=true`, use public ARC games, or justify a model claim.
@@ -254,11 +313,68 @@ never used to initialize the SIGReg/action A/B.
 |--------|-------|-----|
 | rollout MSE @ 8 | **0.17** | `p2-output-v11-control` |
 | rollout MSE @ 4 | **0.084** | `p2-output-v11-control` |
-| one-step latent MSE | **0.026** | `p2-output-v11-control` |
+| one-step latent MSE | **0.024** | `p2-output-v13` |
 | events accuracy | 0.906 | `p2-output-v11-control` |
 
 v11-control replayed the v8 curriculum (no exploration, `q_mse_threshold=0.25`) on
 pre-v12 architecture; it restored multi-step rollout after v9/v10 Stage 1b collapse.
+v13 tightened `q_mse_threshold` to 0.05 on the same architecture and improved
+one-step MSE from 0.0258 to 0.0240, but rollout regressed to 0.1185 @4 and 0.3204 @8
+and Q saturated. It did not replace v11 as the rollout baseline.
+
+**Implementation hot path (2026-08-08; not a model-quality result):** direct transition-frame
+packing reduced CPU `batch_from_samples` at batch 1024 to a Criterion median of **778.75 µs**
+(`762.43–795.42 µs`), a measured **72.29%** improvement over the immediately preceding baseline.
+The release step probe measured `1.2–1.6 ms` across sequential, random-one-step, and falsification
+sources. Exact commands:
+
+```bash
+cargo bench --bench p2_hotpath -- --noplot
+cargo test --release --test p2_step_profile -- --ignored --nocapture --test-threads=1
+```
+
+The full-depth CUDA capacity gate passed both falsification (K=4 PTRM) and retarget
+(PTRM plus open-loop) on the RTX 5060 Laptop 8 GiB at physical **64** × accumulation **8**
+(effective 512). Falsification at 128×4 OOMed, so 64×8 is the largest tested stable physical
+batch for the worst branch on this machine. The gate uses hidden 128, inner/outer depth 2×8,
+spatial SIGReg, active auxiliaries, and fixed worst-case recursion. After the final synchronization
+and Muon changes, falsification completed in **13.47 s**. After the final shared-prefix and
+batched-target change, retarget completed in **7.56 s**. Exact commands:
+
+```bash
+TOFY_VRAM_PROBE=1 TOFY_VRAM_PHYSICAL_BATCH=64 TOFY_VRAM_GRAD_ACCUM=8 \
+TOFY_VRAM_LESSON=falsification \
+  cargo test --release --features cudnn --test p2_vram_probe -- \
+  --ignored --nocapture --test-threads=1
+
+TOFY_VRAM_PROBE=1 TOFY_VRAM_PHYSICAL_BATCH=64 TOFY_VRAM_GRAD_ACCUM=8 \
+TOFY_VRAM_LESSON=retarget \
+  cargo test --release --features cudnn --test p2_vram_probe -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The current L40S acceptance command remains physical 512×1. Prior L40S training reached update
+18,500 at physical 1024×1 and stopped on a numerical failure rather than OOM; because
+falsification 512×K4 has the same aggregate PTRM trajectory batch as sequential 1024×K2, this is
+strong fit evidence, but not a substitute for rerunning the current capacity gate on that card.
+
+A final warm-update candle-graph capture used the same local 64×8 effective-batch-512 schedule.
+The evidence packet was **TRUSTED** with 37/37 closed spans, one measured root, forward/backward/
+optimizer coverage, 28 gradient facts, and `root_device_synchronized=true`. The trace correctly
+labels its nested semantic spans as host enqueue timing; the synchronized full-update root was
+**2425.29 ms**. Nsight, allocation events, and device-memory samples were not captured, so no
+kernel-level attribution or VRAM high-water claim is made from this packet.
+
+```bash
+cargo run --release --features cudnn -- p2-train \
+  --device cuda --seed 7 --lessons dynamics --steps-per-lesson 2 \
+  --physical-batch 64 --grad-accum 8 --hidden-dim 128 --action-dim 32 \
+  --inner-steps 2 --outer-steps 8 --supervise-last-outer-only \
+  --sigreg-spatial --sigreg-spatial-pool --sigreg-max-rows 32768 \
+  --residual-y-update --warm-start-y --shuffled-episodes \
+  --checkpoint-every-steps 0 --profile-update 2 \
+  --output-dir /tmp/tofy-architecture-profile-final.WtuJcm
+```
 
 ```bash
 cargo run --release --features cudnn -- p2-train \
@@ -276,9 +392,26 @@ cargo run --release --features cudnn -- p2-eval \
   --output p2-output-v11-control/eval_report_64ep_v3.json
 ```
 
-**In progress:** v12 architecture (dual TRM blocks, dual-pool encoder, delta/stop-grad
-defaults) + 7-experiment chain — `scripts/p2_experiment_chain.sh run` →
-`p2-output-v12/`. See `docs/P2_V12.md`.
+The v13 one-step result used:
+
+```bash
+cargo run --release --features cudnn -- p2-train \
+  --device cuda --hidden-dim 128 --action-dim 32 \
+  --physical-batch 1024 --grad-accum 1 --steps-per-lesson 4096 \
+  --checkpoint-every-steps 100 \
+  --output-dir p2-output-v13
+
+cargo run --release --features cudnn -- p2-eval \
+  --checkpoint p2-output-v13/model.safetensors \
+  --train-config p2-output-v13/config.json \
+  --device cuda --synthetic-episodes 64 --physical-batch 64 \
+  --ptrm-k 1,2,4,8 --q-mse-threshold 0.05 \
+  --output p2-output-v13/eval_report_64ep_v3.json
+```
+
+The superseded v12--v17 root-output experiments and their negative results are
+summarized in [`P2_LEGACY_ROOT_OUTPUTS.md`](P2_LEGACY_ROOT_OUTPUTS.md). The generated
+root directories were removed after archival; new run paths use `runs/p2/`.
 
 ## Implementation validation (not a result)
 
@@ -316,12 +449,13 @@ evaluator leaves `official_rhae=null` and records `public_data_used_for_fitting=
 Pass `--scorecard-json` with a closed official scorecard to populate RHAE per
 https://docs.arcprize.org/methodology .
 
-Exact pause/resume was added and validated without recording a model-quality result.
+Pause/resume was added and validated without recording a model-quality result.
 The equivalence test compares an uninterrupted two-update run with a one-update
-pause plus resume and requires exact equality of every final model tensor, both
-named AdamW moment tensors, the optimizer/global step, curriculum cursor, and lesson
-metrics. Separate checks reject a changed training contract and a missing optimizer
-file. A command-line smoke paused at step 1, resumed through the `checkpoints`
+pause plus resume and requires model weights, named optimizer moments, lesson metrics,
+and active sums to agree within `1e-5` relative tolerance. Candle's CPU reductions are
+parallel and are not bitwise repeatable; the test name and contract now state that limitation.
+Optimizer/global step and curriculum cursor remain exact. Separate checks reject a changed
+training contract and a missing optimizer file. A command-line smoke paused at step 1, resumed through the `checkpoints`
 directory, completed at step 2, and passed the external analyzer audit. A separate
 PTY smoke sent an actual `SIGINT`; the trainer finished its in-flight update, wrote
 `step-000000000012`, reported `status=Paused`, and exited with code 0. Resuming that

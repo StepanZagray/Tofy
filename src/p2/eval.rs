@@ -1629,14 +1629,17 @@ fn eval_one_batch(
         &batch.action_coords,
         &batch.goals,
     )?;
-    let (current_z, next_z, projected_sigreg) =
-        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let current_z = encoded.current;
+    let next_z = encoded.next;
     let sigreg = (chunk.len() >= 2)
         .then(|| {
             sigreg_losses_for_encoded_pair(
                 &current_z,
                 &next_z,
-                projected_sigreg.as_ref(),
+                &encoded.current_raw,
+                &encoded.next_raw,
+                encoded.projected_sigreg.as_ref(),
                 train_cfg,
                 cfg.seed.wrapping_add(bi as u64),
             )
@@ -3049,7 +3052,7 @@ mod tests {
             checkpoint: dir.join("model.safetensors"),
             export_checkpoint: None,
             config_path: dir.join("config.json"),
-            profile_trace: Some(dir.join("profile.jsonl")),
+            profile: crate::p2::cg_profile::ProfileState::Pending,
             research_claim: false,
         };
         save_checkpoint(&varmap, &train_cfg, &report)?;

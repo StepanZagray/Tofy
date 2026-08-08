@@ -27,6 +27,9 @@ PHYSICAL_BATCH=1024
 GRAD_ACCUM=1
 STEPS_PER_LESSON=4096
 MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-3}"
+P2_PROFILE_UPDATE="${P2_PROFILE_UPDATE:-2}"
+P2_NSYS="${P2_NSYS:-auto}"
+export P2_PROFILE_UPDATE P2_NSYS
 AGENT_BIN="${AGENT_BIN:-agent}"
 TMUX_SESSION="${TMUX_SESSION:-p2-night}"
 # No glibc arena cap: it serialises malloc across the generation threads and starves
@@ -39,17 +42,21 @@ mkdir -p -- "$OUTPUT_DIR" "$LOG_DIR" "$ARC_DIR"
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*"; }
 
 preflight_profile_view() {
-  if [[ ! -f "$OUTPUT_DIR/profile.jsonl" ]]; then
-    log "skip pre-flight profile view (no profile.jsonl yet)"
+  local bundle
+  printf -v bundle '%s/profile/update-%012d' "$OUTPUT_DIR" "$P2_PROFILE_UPDATE"
+  if [[ ! -f "$bundle/application.jsonl" ]]; then
+    log "skip pre-flight profile view (no published evidence bundle yet)"
     return 0
   fi
-  log "pre-flight profile HTML -> $OUTPUT_DIR/model.html"
-  cargo p2-view "$OUTPUT_DIR/profile.jsonl" --output "$OUTPUT_DIR/model.html"
+  log "pre-flight profile HTML -> $bundle/viewer.html"
+  cargo p2-view "$bundle" --output "$bundle/viewer.html"
 }
 
 train_cmd() {
+  local features=cudnn
+  if [[ "$P2_NSYS" != off ]]; then features=cudnn,profiling; fi
   local -a cmd=(
-    cargo run --release --features cudnn -- p2-train
+    cargo run --release --features "$features" -- p2-train
     --device "$DEVICE"
     --hidden-dim "$HIDDEN_DIM"
     --action-dim "$ACTION_DIM"
@@ -57,11 +64,12 @@ train_cmd() {
     --grad-accum "$GRAD_ACCUM"
     --steps-per-lesson "$STEPS_PER_LESSON"
     --output-dir "$OUTPUT_DIR"
+    --profile-update "$P2_PROFILE_UPDATE"
   )
   if [[ -d "$OUTPUT_DIR/checkpoints" ]] || [[ -f "$OUTPUT_DIR/checkpoints/latest.json" ]]; then
     cmd+=(--resume "$OUTPUT_DIR/checkpoints")
   fi
-  "${cmd[@]}"
+  "$script_dir/p2_profile_nsys.sh" "$OUTPUT_DIR" -- "${cmd[@]}"
 }
 
 eval_cmd() {
@@ -103,7 +111,9 @@ invoke_repair_agent() {
   local attempt="$3"
   local agent_log="$LOG_DIR/agent-repair-${attempt}-$(date +%Y%m%dT%H%M%S).log"
   local tail_file="$LOG_DIR/failure-tail-${attempt}.txt"
-  local profile_trace="$OUTPUT_DIR/profile.jsonl"
+  local profile_bundle
+  printf -v profile_bundle '%s/profile/update-%012d' "$OUTPUT_DIR" "$P2_PROFILE_UPDATE"
+  local profile_trace="$profile_bundle/application.jsonl"
 
   tail -n 400 -- "$log_file" >"$tail_file"
 
@@ -115,9 +125,11 @@ invoke_repair_agent() {
   if [[ -f "$profile_trace" ]]; then
     profile_block="$(cat <<PROFILE
 
-Execution profile trace (candle-graph trace/4):
-- file: $profile_trace
-- view: cargo p2-view $profile_trace --output $OUTPUT_DIR/model.html
+Execution evidence packet:
+- agent summary: $profile_bundle/EVIDENCE.md
+- machine packet: $profile_bundle/evidence.json
+- trace: $profile_trace
+- view: cargo p2-view $profile_bundle --output $profile_bundle/viewer.html
 - query: cargo candle-graph query $profile_trace --kind slowest
 PROFILE
 )"

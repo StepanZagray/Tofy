@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run one preregistered SIGReg/action-conditioning arm to updates 1,000 and 2,000.
-# Usage: scripts/p2_sigreg_action_ab.sh <control|projector> <training-seed>
+# Run one preregistered SIGReg/action-conditioning or geometry arm to updates 1,000 and 2,000.
+# Usage: scripts/p2_sigreg_action_ab.sh <control|projector|pre-rms-spatial> <training-seed>
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,11 +9,13 @@ ab_root="${P2_AB_ROOT:-$repo_root/runs/p2/ab-sigreg-action-v1}"
 tofy_bin="${TOFY_BIN:-$repo_root/target/release/tofy}"
 eval_seed="${P2_AB_EVAL_SEED:-424242}"
 target_update="${P2_AB_TARGET_UPDATE:-2000}"
+experiment="${P2_AB_EXPERIMENT:-action}"
+candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 
-arm="${1:?usage: $0 <control|projector> <training-seed>}"
+arm="${1:?usage: $0 <control|projector|pre-rms-spatial> <training-seed>}"
 seed="${2:?usage: $0 <control|projector> <training-seed>}"
 case "$arm" in
-  control|projector) ;;
+  control|projector|pre-rms-spatial) ;;
   *) printf 'invalid arm: %s\n' "$arm" >&2; exit 2 ;;
 esac
 [[ "$seed" =~ ^[1-9][0-9]*$ ]] || { printf 'seed must be a positive integer\n' >&2; exit 2; }
@@ -21,11 +23,44 @@ esac
   printf 'P2_AB_TARGET_UPDATE must be 2000 or 4000\n' >&2
   exit 2
 }
+[[ "$experiment" == action || "$experiment" == geometry ]] || {
+  printf 'P2_AB_EXPERIMENT must be action or geometry\n' >&2
+  exit 2
+}
+case "$experiment:$arm" in
+  action:control|action:projector|geometry:control|geometry:pre-rms-spatial) ;;
+  *) printf 'arm %s is invalid for %s experiment\n' "$arm" "$experiment" >&2; exit 2 ;;
+esac
 [[ -x "$tofy_bin" ]] || { printf 'missing reviewed binary: %s\n' "$tofy_bin" >&2; exit 2; }
+for required in git jq nvidia-smi sha256sum awk tee python3; do
+  command -v "$required" >/dev/null || { printf 'missing required command: %s\n' "$required" >&2; exit 2; }
+done
+: "${P2_EXPECTED_SHA:?set P2_EXPECTED_SHA to the reviewed Tofy commit}"
+: "${P2_EXPECTED_CANDLE_SHA:?set P2_EXPECTED_CANDLE_SHA to the reviewed candle_graph commit}"
+: "${P2_EXPECTED_BINARY_SHA:?set P2_EXPECTED_BINARY_SHA to the reviewed tofy binary hash}"
+[[ -d "$candle_root/.git" ]] || { printf 'missing candle_graph checkout: %s\n' "$candle_root" >&2; exit 2; }
 
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
-if [[ -n "${P2_EXPECTED_SHA:-}" && "$git_sha" != "$P2_EXPECTED_SHA" ]]; then
+if [[ "$git_sha" != "$P2_EXPECTED_SHA" ]]; then
   printf 'HEAD %s does not match P2_EXPECTED_SHA %s\n' "$git_sha" "$P2_EXPECTED_SHA" >&2
+  exit 2
+fi
+candle_git_sha="$(git -C "$candle_root" rev-parse HEAD)"
+if [[ "$candle_git_sha" != "$P2_EXPECTED_CANDLE_SHA" ]]; then
+  printf 'candle_graph HEAD %s does not match P2_EXPECTED_CANDLE_SHA %s\n' \
+    "$candle_git_sha" "$P2_EXPECTED_CANDLE_SHA" >&2
+  exit 2
+fi
+[[ -z "$(git -C "$repo_root" status --porcelain)" ]] || {
+  printf 'Tofy tracked worktree is dirty; refusing an attributed experiment\n' >&2; exit 2;
+}
+[[ -z "$(git -C "$candle_root" status --porcelain)" ]] || {
+  printf 'candle_graph tracked worktree is dirty; refusing an attributed experiment\n' >&2; exit 2;
+}
+binary_sha256="$(sha256sum "$tofy_bin" | awk '{print $1}')"
+if [[ "$binary_sha256" != "$P2_EXPECTED_BINARY_SHA" ]]; then
+  printf 'binary SHA-256 %s does not match P2_EXPECTED_BINARY_SHA %s\n' \
+    "$binary_sha256" "$P2_EXPECTED_BINARY_SHA" >&2
   exit 2
 fi
 
@@ -55,9 +90,11 @@ record_phase() {
     --arg log_path "$log_path" \
     --arg time_path "$time_path" \
     --arg git_sha "$git_sha" \
+    --arg candle_git_sha "$candle_git_sha" \
+    --arg binary_sha256 "$binary_sha256" \
     --arg arm "$arm" \
     --argjson seed "$seed" \
-    '{stage:$stage,attempt:$attempt,started_utc:$started_utc,finished_utc:$finished_utc,status:$status,git_sha:$git_sha,arm:$arm,seed:$seed,log_path:$log_path,time_path:$time_path}' \
+    '{stage:$stage,attempt:$attempt,started_utc:$started_utc,finished_utc:$finished_utc,status:$status,git_sha:$git_sha,candle_git_sha:$candle_git_sha,binary_sha256:$binary_sha256,arm:$arm,seed:$seed,log_path:$log_path,time_path:$time_path}' \
     >>"$phase_log"
 }
 
@@ -123,8 +160,6 @@ common_train=(
   --supervise-last-outer-only
   --residual-y-update
   --warm-start-y
-  --sigreg-spatial
-  --sigreg-spatial-pool
   --sigreg-max-rows 32768
   --shuffled-episodes
   --outer-steps 8
@@ -139,17 +174,28 @@ common_train=(
   --ensemble-members 1
   --output-dir "$arm_dir"
 )
-if [[ "$arm" == projector ]]; then
-  common_train+=(--sigreg-projector --sigreg-projector-dim 128)
-fi
+case "$arm" in
+  control) common_train+=(--sigreg-spatial --sigreg-spatial-pool) ;;
+  projector) common_train+=(--sigreg-spatial --sigreg-spatial-pool --sigreg-projector --sigreg-projector-dim 128) ;;
+  pre-rms-spatial) common_train+=(--sigreg-pre-rms-spatial) ;;
+esac
 
 eval_update() {
-  local update="$1" checkpoint_dir eval_dir
+  local update="$1" checkpoint_dir eval_dir eval_stage sha_path
   printf -v checkpoint_dir '%s/checkpoints/step-%012d' "$arm_dir" "$update"
   printf -v eval_dir '%s/eval-update-%04d' "$arm_dir" "$update"
-  if [[ -e "$eval_dir/eval_report.json" ]]; then
-    printf 'preserving existing evaluation: %s\n' "$eval_dir/eval_report.json"
+  eval_stage="eval-$update"
+  sha_path="$eval_dir/sha256.txt"
+  if [[ -f "$eval_dir/eval_report.json" && -f "$sha_path" && -f "$phase_log" ]] \
+    && sha256sum --check --status "$sha_path" \
+    && jq -s -e --arg stage "$eval_stage" \
+      '[.[] | select(.stage == $stage)] | length > 0 and .[-1].status == "0"' \
+      "$phase_log" >/dev/null; then
+    printf 'preserving verified evaluation: %s\n' "$eval_dir/eval_report.json"
     return 0
+  fi
+  if [[ -e "$eval_dir/eval_report.json" || -e "$sha_path" ]]; then
+    printf 'retrying incomplete or invalid evaluation: %s\n' "$eval_dir"
   fi
   mkdir -p -- "$eval_dir"
   local eval_cmd=(
@@ -166,14 +212,14 @@ eval_update() {
     --episode-jsonl "$eval_dir/episodes.jsonl"
     --output "$eval_dir/eval_report.json"
   )
-  run_phase "eval-$update" "$eval_dir/eval.log" "${eval_cmd[@]}"
+  run_phase "$eval_stage" "$eval_dir/eval.log" "${eval_cmd[@]}"
   sha256sum \
     "$checkpoint_dir/model.safetensors" \
     "$checkpoint_dir/optimizer.safetensors" \
     "$checkpoint_dir/trainer_state.json" \
     "$arm_dir/config.json" \
     "$eval_dir/eval_report.json" \
-    >"$eval_dir/sha256.txt"
+    >"$sha_path"
 }
 
 checkpoint_1000="$arm_dir/checkpoints/step-000000001000/model.safetensors"
@@ -200,15 +246,17 @@ if [[ "$target_update" == 4000 ]]; then
 fi
 
 jq -nc \
-  --arg schema p2.sigreg_action_arm.v1 \
+  --arg schema "$(if [[ "$experiment" == geometry ]]; then printf p2.sigreg_geometry_arm.v1; else printf p2.sigreg_action_arm.v1; fi)" \
   --arg git_sha "$git_sha" \
+  --arg candle_git_sha "$candle_git_sha" \
+  --arg binary_sha256 "$binary_sha256" \
   --arg arm "$arm" \
   --argjson seed "$seed" \
   --argjson eval_seed "$eval_seed" \
   --arg output_dir "$arm_dir" \
   --arg config_sha256 "$(sha256sum "$arm_dir/config.json" | awk '{print $1}')" \
   --argjson complete_through_update "$target_update" \
-  '{schema:$schema,git_sha:$git_sha,arm:$arm,seed:$seed,eval_seed:$eval_seed,physical_batch:1024,grad_accum:1,projector_dim:(if $arm=="projector" then 128 else null end),output_dir:$output_dir,config_sha256:$config_sha256,complete_through_update:$complete_through_update}' \
+  '{schema:$schema,git_sha:$git_sha,candle_git_sha:$candle_git_sha,binary_sha256:$binary_sha256,arm:$arm,seed:$seed,eval_seed:$eval_seed,physical_batch:1024,grad_accum:1,sigreg_geometry:(if $arm=="projector" then "pre_rms_global_pool_linear_projector" elif $arm=="pre-rms-spatial" then "pre_rms_unpooled_spatial_cells" else "post_rms_pooled_spatial_cells" end),projector_dim:(if $arm=="projector" then 128 else null end),output_dir:$output_dir,config_sha256:$config_sha256,complete_through_update:$complete_through_update}' \
   >"$arm_dir/manifest.json"
 
 stop_sampler

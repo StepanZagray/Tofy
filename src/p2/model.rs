@@ -6,14 +6,15 @@ use candle_nn::{
     conv2d, embedding, linear, Conv2d, Conv2dConfig, Embedding, Linear, Module, VarBuilder,
 };
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Fixed observation resolution required by the pixel encoder.
 pub const FRAME_SIDE: usize = 64;
-/// Embedded palette dim (replaces 16-plane one-hot at 64×64).
+/// Embedded palette feature width.
 pub const PIXEL_EMB_DIM: usize = 8;
-/// One-hot channel count (legacy / tests).
-pub const PIXEL_CHANNELS: usize = 16;
+/// Number of discrete ARC palette values accepted by the pixel embedding.
+pub const PALETTE_SIZE: usize = 16;
 /// Inclusive action ID range `0..=6`.
 /// Embedding rows for official action ids `0..=7` (`0` unused; `1..=7` = ACTION1..ACTION7).
 pub const ACTION_VOCAB: usize = 8;
@@ -32,6 +33,15 @@ pub const EVENT_EXHAUSTED: usize = 3;
 pub struct RecursionDepth {
     pub inner_steps: usize,
     pub outer_steps: usize,
+}
+
+/// One encoder pass shared by normalized dynamics and experimental SIGReg geometry.
+pub struct TrainingEncodedPair {
+    pub current: Tensor,
+    pub next: Tensor,
+    pub current_raw: Tensor,
+    pub next_raw: Tensor,
+    pub projected_sigreg: Option<Tensor>,
 }
 
 impl RecursionDepth {
@@ -163,19 +173,18 @@ fn seeded_gaussian_like(template: &Tensor, sigma: f64, seed: u64) -> Result<Tens
     }
     let batch = shape[0];
     let per_sample = template.elem_count() / batch.max(1);
-    let tail = &shape[1..];
     let scale = sigma as f32;
-    let mut rows = Vec::with_capacity(batch);
-    for b in 0..batch {
-        let sample_seed = seed.wrapping_add((b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
-        let mut data = Vec::with_capacity(per_sample);
-        for _ in 0..per_sample {
-            data.push(standard_normal(&mut rng) * scale);
-        }
-        rows.push(Tensor::from_vec(data, tail, template.device())?);
-    }
-    Tensor::stack(&rows, 0).map_err(Into::into)
+    let mut data = vec![0f32; template.elem_count()];
+    data.par_chunks_mut(per_sample)
+        .enumerate()
+        .for_each(|(b, row)| {
+            let sample_seed = seed.wrapping_add((b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
+            for value in row {
+                *value = standard_normal(&mut rng) * scale;
+            }
+        });
+    Tensor::from_vec(data, shape, template.device()).map_err(Into::into)
 }
 
 /// Side length of square input patches (`64 / PATCH_SIZE` grid).
@@ -351,10 +360,25 @@ pub struct ForwardOutput {
 }
 
 #[derive(Debug, Clone)]
+pub struct LatentRecursionOutput {
+    /// Retained outer-step latents according to [`RecursionOpts`].
+    pub steps: Vec<Tensor>,
+    pub y: Tensor,
+    #[allow(clippy::type_complexity)]
+    pub recursion_probes: Vec<RecursionStepProbe>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PtrmTrajectory {
     pub steps: Vec<StepOutput>,
     pub y: Tensor,
     pub event_logits: Tensor,
+    pub q_logit: Tensor,
+}
+
+#[derive(Debug, Clone)]
+pub struct PtrmRankingTrajectory {
+    pub y: Tensor,
     pub q_logit: Tensor,
 }
 
@@ -434,7 +458,7 @@ impl WorldModel {
             })
             .transpose()?;
         Ok(Self {
-            pixel_emb: embedding(PIXEL_CHANNELS, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
+            pixel_emb: embedding(PALETTE_SIZE, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
             encoder: GridEncoder::new(cfg.hidden_dim, vb.pp("encoder"))?,
             action_emb: embedding(ACTION_VOCAB, cfg.action_dim, vb.pp("action_emb"))?,
             action_proj: linear(cfg.action_dim, cfg.hidden_dim, vb.pp("action_proj"))?,
@@ -454,7 +478,7 @@ impl WorldModel {
         &self.config
     }
 
-    /// Encode palette-index or one-hot frames into the shared latent space.
+    /// Encode palette-index frames into the shared latent space.
     pub fn encode_state(&self, frames: &Tensor) -> Result<Tensor> {
         let embedded = self.embed_frames(frames)?;
         rms_norm_latent(&self.encoder.forward(&embedded, self.config.bf16_conv)?)
@@ -491,13 +515,13 @@ impl WorldModel {
         Ok((rms_norm_latent(&current)?, rms_norm_latent(&next)?))
     }
 
-    /// Return normalized dynamics latents plus optional pre-RMS `T×B×D`
-    /// projector embeddings for the experimental SIGReg treatment.
+    /// Return normalized dynamics latents together with their pre-RMS source tensors
+    /// and optional `T×B×D` projector embeddings used only by SIGReg treatments.
     pub fn encode_state_pair_for_training(
         &self,
         frames: &Tensor,
         next_frames: &Tensor,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+    ) -> Result<TrainingEncodedPair> {
         let (current_raw, next_raw) = self.encode_state_pair_raw(frames, next_frames)?;
         let projected = self
             .sigreg_projector
@@ -508,11 +532,13 @@ impl WorldModel {
                 Ok(Tensor::stack(&[current, next], 0)?)
             })
             .transpose()?;
-        Ok((
-            rms_norm_latent(&current_raw)?,
-            rms_norm_latent(&next_raw)?,
-            projected,
-        ))
+        Ok(TrainingEncodedPair {
+            current: rms_norm_latent(&current_raw)?,
+            next: rms_norm_latent(&next_raw)?,
+            current_raw,
+            next_raw,
+            projected_sigreg: projected,
+        })
     }
 
     fn embed_frames(&self, frames: &Tensor) -> Result<Tensor> {
@@ -532,18 +558,7 @@ impl WorldModel {
                 .permute((0, 3, 1, 2))?
                 .contiguous()?);
         }
-        if c == PIXEL_CHANNELS {
-            let flat = frames
-                .permute((0, 2, 3, 1))?
-                .reshape((b * h * w, PIXEL_CHANNELS))?;
-            let indices = flat.argmax(D::Minus1)?;
-            let emb = self.pixel_emb.forward(&indices)?;
-            return Ok(emb
-                .reshape((b, h, w, PIXEL_EMB_DIM))?
-                .permute((0, 3, 1, 2))?
-                .contiguous()?);
-        }
-        bail!("embed_frames: expected 1, {PIXEL_EMB_DIM}, or {PIXEL_CHANNELS} channels, got {c}");
+        bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
     }
 
     fn add_action(
@@ -605,24 +620,6 @@ impl WorldModel {
         }
         let _ = b;
         Ok(self.goal_proj.forward(goal_features)?)
-    }
-
-    /// Shared transition prep from an already-encoded state (avoids a second encode).
-    pub fn prepare_transition_from_encoded(
-        &self,
-        state: &Tensor,
-        actions: &Tensor,
-        action_coords: &Tensor,
-        goal_features: &Tensor,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        let y_init = if self.config.warm_start_y {
-            Some(state.clone())
-        } else {
-            None
-        };
-        let x = self.add_action(state, actions, action_coords)?;
-        let goal_h = self.project_goal(goal_features)?;
-        Ok((x, goal_h, y_init))
     }
 
     /// Shared transition prep: encode state/action, project goals, optional warm-start `y`.
@@ -720,16 +717,15 @@ impl WorldModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_recursion(
+    fn run_latent_recursion(
         &self,
         x: &Tensor,
-        goal_h: &Tensor,
         sigma: f64,
         noise_seed_base: Option<u64>,
         depth: RecursionDepth,
         y_init: Option<Tensor>,
         opts: RecursionOpts,
-    ) -> Result<ForwardOutput> {
+    ) -> Result<LatentRecursionOutput> {
         if depth.inner_steps == 0 || depth.inner_steps > self.config.inner_steps {
             bail!(
                 "inner_steps must be in 1..={}, got {}",
@@ -754,7 +750,6 @@ impl WorldModel {
             Vec::new()
         };
         let mut noise_counter = 0u64;
-        let mut reliability_logit = None;
         for outer_idx in 0..depth.outer_steps {
             let y_before = if opts.record_probes {
                 Some(y.clone())
@@ -781,40 +776,59 @@ impl WorldModel {
                 probes.push(Self::probe_step(&y_before, &y, outer_idx)?);
             }
             let is_last = outer_idx + 1 == depth.outer_steps;
-            let (event_logits, q_logit) = if is_last {
-                let h = self.heads(&y, goal_h)?;
-                reliability_logit = Some(h.2.clone());
-                (Some(h.0), Some(h.1))
-            } else {
-                (None, None)
-            };
             if opts.store_intermediate_steps || is_last {
-                steps.push(StepOutput {
-                    y: y.clone(),
-                    event_logits,
-                    q_logit,
-                });
+                steps.push(y.clone());
             }
         }
-        let last = steps
-            .last()
-            .expect("outer_steps >= 1 guaranteed by validate")
-            .clone();
-        let event_logits = last
-            .event_logits
-            .clone()
-            .expect("last outer step must have event logits");
-        let q_logit = last
-            .q_logit
-            .clone()
-            .expect("last outer step must have q logit");
-        Ok(ForwardOutput {
-            y: last.y.clone(),
-            event_logits,
-            q_logit,
-            reliability_logit: reliability_logit.expect("outer_steps >= 1"),
+        Ok(LatentRecursionOutput {
+            y: steps
+                .last()
+                .expect("outer_steps >= 1 guaranteed by validate")
+                .clone(),
             steps,
             recursion_probes: probes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_recursion(
+        &self,
+        x: &Tensor,
+        goal_h: &Tensor,
+        sigma: f64,
+        noise_seed_base: Option<u64>,
+        depth: RecursionDepth,
+        y_init: Option<Tensor>,
+        opts: RecursionOpts,
+    ) -> Result<ForwardOutput> {
+        let latent = self.run_latent_recursion(x, sigma, noise_seed_base, depth, y_init, opts)?;
+        self.attach_heads(latent, goal_h)
+    }
+
+    fn attach_heads(
+        &self,
+        latent: LatentRecursionOutput,
+        goal_h: &Tensor,
+    ) -> Result<ForwardOutput> {
+        let (event_logits, q_logit, reliability_logit) = self.heads(&latent.y, goal_h)?;
+        let last = latent.steps.len() - 1;
+        let steps = latent
+            .steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, y)| StepOutput {
+                y,
+                event_logits: (index == last).then(|| event_logits.clone()),
+                q_logit: (index == last).then(|| q_logit.clone()),
+            })
+            .collect();
+        Ok(ForwardOutput {
+            y: latent.y,
+            event_logits,
+            q_logit,
+            reliability_logit,
+            steps,
+            recursion_probes: latent.recursion_probes,
         })
     }
 
@@ -943,6 +957,27 @@ impl WorldModel {
         )
     }
 
+    /// Training recursion with no observer heads or goal projection.
+    ///
+    /// Loss code applies only the heads active for the current lesson to the
+    /// returned latent. The transition computation and retained outer-step
+    /// latents are identical to [`Self::forward_from_encoded_state`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn training_latents_from_encoded_state(
+        &self,
+        cur_state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
+        let x = self.add_action(cur_state, actions, action_coords)?;
+        let y_init = self.config.warm_start_y.then(|| cur_state.clone());
+        self.run_latent_recursion(&x, z_noise_sigma, noise_seed, depth, y_init, recursion)
+    }
+
     /// Deterministic forward (no noise, no learned halting).
     pub fn forward(
         &self,
@@ -1031,6 +1066,21 @@ impl WorldModel {
         )
     }
 
+    /// Goal-free latent transition for training losses that consume only `y`.
+    pub fn predict_latent_with_depth(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        depth: RecursionDepth,
+    ) -> Result<Tensor> {
+        let x = self.add_action(state, actions, action_coords)?;
+        let y_init = self.config.warm_start_y.then(|| state.clone());
+        Ok(self
+            .run_latent_recursion(&x, 0.0, None, depth, y_init, RecursionOpts::training(true))?
+            .y)
+    }
+
     /// PTRM forward: K stochastic trajectories with Gaussian noise on z at
     /// every inner recursion step. When `seed` is set, noise uses a
     /// deterministic `StdRng` (mixed seed/trajectory plus injection counter), which
@@ -1088,29 +1138,11 @@ impl WorldModel {
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
+        let latent_trajectories = self.ptrm_latent_trajectories(x, y_init, depth, ptrm)?;
         let mut trajectories = Vec::with_capacity(ptrm.k);
         let mut q_logits = Vec::with_capacity(ptrm.k);
-        for traj in 0..ptrm.k {
-            // Trajectory 0 is the deterministic member. Previously every
-            // trajectory (including 0) was perturbed, so the K-set never
-            // contained the noise-free answer and the reported `k=1` row was a
-            // noisy sample mislabelled as deterministic — the deterministic-vs-
-            // PTRM ablation the design requires could not be read off it.
-            // Keeping member 0 clean also makes the training-time ranking label
-            // meaningful: it asks whether a perturbation beats the default.
-            let sigma = if traj == 0 { 0.0 } else { ptrm.sigma };
-            let noise_base = ptrm
-                .seed
-                .map(|s| s ^ (traj as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let out = self.run_recursion(
-                x,
-                goal_h,
-                sigma,
-                noise_base,
-                depth,
-                y_init.clone(),
-                RecursionOpts::training(false),
-            )?;
+        for latent in latent_trajectories {
+            let out = self.attach_heads(latent, goal_h)?;
             q_logits.push(out.q_logit.clone());
             trajectories.push(PtrmTrajectory {
                 steps: out.steps,
@@ -1124,6 +1156,69 @@ impl WorldModel {
             trajectories,
             best_indices,
         })
+    }
+
+    fn ptrm_latent_trajectories(
+        &self,
+        x: &Tensor,
+        y_init: Option<Tensor>,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<Vec<LatentRecursionOutput>> {
+        let mut trajectories = Vec::with_capacity(ptrm.k);
+        for traj in 0..ptrm.k {
+            // Trajectory 0 is the deterministic member. Previously every
+            // trajectory (including 0) was perturbed, so the K-set never
+            // contained the noise-free answer and the reported `k=1` row was a
+            // noisy sample mislabelled as deterministic — the deterministic-vs-
+            // PTRM ablation the design requires could not be read off it.
+            // Keeping member 0 clean also makes the training-time ranking label
+            // meaningful: it asks whether a perturbation beats the default.
+            let sigma = if traj == 0 { 0.0 } else { ptrm.sigma };
+            let noise_base = ptrm
+                .seed
+                .map(|s| s ^ (traj as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let out = self.run_latent_recursion(
+                x,
+                sigma,
+                noise_base,
+                depth,
+                y_init.clone(),
+                RecursionOpts::training(false),
+            )?;
+            trajectories.push(out);
+        }
+        Ok(trajectories)
+    }
+
+    /// Training-only PTRM trajectories: dynamics plus Q, with no observer heads,
+    /// goal projection, or host-side best-index selection.
+    pub fn ptrm_ranking_trajectories_from_encoded(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<Vec<PtrmRankingTrajectory>> {
+        if ptrm.k == 0 {
+            bail!("PTRM requires K >= 1");
+        }
+        if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
+            bail!("PTRM sigma must be finite and non-negative");
+        }
+        let x = self.add_action(state, actions, action_coords)?;
+        let y_init = self.config.warm_start_y.then(|| state.clone());
+        self.ptrm_latent_trajectories(&x, y_init, depth, ptrm)?
+            .into_iter()
+            .map(|trajectory| {
+                let q_logit = self.q_logit_from_y(&trajectory.y)?;
+                Ok(PtrmRankingTrajectory {
+                    y: trajectory.y,
+                    q_logit,
+                })
+            })
+            .collect()
     }
 }
 
@@ -1159,10 +1254,11 @@ mod tests {
         batch: usize,
         goal_dim: usize,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let frames = Tensor::randn(
-            0f32,
-            1.0,
-            (batch, PIXEL_CHANNELS, FRAME_SIDE, FRAME_SIDE),
+        let frames = Tensor::from_vec(
+            (0..batch * FRAME_SIDE * FRAME_SIDE)
+                .map(|i| (i % PALETTE_SIZE) as u8)
+                .collect::<Vec<_>>(),
+            (batch, 1, FRAME_SIDE, FRAME_SIDE),
             device,
         )?;
         let actions = Tensor::from_vec(
@@ -1264,7 +1360,7 @@ mod tests {
         let device = Device::Cpu;
         let (model, _) = make_model(&device)?;
         let (frames, _, _, _) = sample_batch(&device, 4, model.config.goal_dim)?;
-        let next_frames = Tensor::randn(0f32, 1.0, frames.dims(), &device)?;
+        let next_frames = Tensor::ones(frames.dims(), DType::U8, &device)?;
         let (cur, next) = model.encode_state_pair(&frames, &next_frames)?;
         let cur_solo = model.encode_state(&frames)?;
         let next_solo = model.encode_state(&next_frames)?;
@@ -1290,10 +1386,15 @@ mod tests {
         let model = WorldModel::new(cfg, vb)?;
         let current = Tensor::zeros((3, 1, FRAME_SIDE, FRAME_SIDE), DType::U8, &device)?;
         let next = Tensor::ones((3, 1, FRAME_SIDE, FRAME_SIDE), DType::U8, &device)?;
-        let (cur_z, next_z, projected) = model.encode_state_pair_for_training(&current, &next)?;
-        assert_eq!(cur_z.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
-        assert_eq!(next_z.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
-        assert_eq!(projected.expect("projector enabled").dims(), &[2, 3, 6]);
+        let pair = model.encode_state_pair_for_training(&current, &next)?;
+        assert_eq!(pair.current.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
+        assert_eq!(pair.next.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
+        assert_eq!(pair.current_raw.dims(), pair.current.dims());
+        assert_eq!(pair.next_raw.dims(), pair.next.dims());
+        assert_eq!(
+            pair.projected_sigreg.expect("projector enabled").dims(),
+            &[2, 3, 6]
+        );
         let names = varmap.data().lock().unwrap();
         assert!(names.contains_key("sigreg_projector.weight"));
         assert!(names.contains_key("sigreg_projector.bias"));
@@ -1378,6 +1479,36 @@ mod tests {
     }
 
     #[test]
+    fn ptrm_ranking_path_matches_full_trajectory_outputs_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = make_model(&device)?;
+        let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
+        let depth = RecursionDepth::from_config(model.config());
+        let config = PtrmConfig {
+            k: 3,
+            sigma: 0.1,
+            seed: Some(123),
+        };
+        let full =
+            model.forward_ptrm_with_depth(&frames, &actions, &coords, &goals, depth, config)?;
+        let current = model.encode_state(&frames)?;
+        let ranking = model
+            .ptrm_ranking_trajectories_from_encoded(&current, &actions, &coords, depth, config)?;
+        assert_eq!(full.trajectories.len(), ranking.len());
+        for (full, ranking) in full.trajectories.iter().zip(&ranking) {
+            assert_eq!(
+                full.y.flatten_all()?.to_vec1::<f32>()?,
+                ranking.y.flatten_all()?.to_vec1::<f32>()?
+            );
+            assert_eq!(
+                full.q_logit.flatten_all()?.to_vec1::<f32>()?,
+                ranking.q_logit.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn best_q_selection_is_per_sample() -> Result<()> {
         let device = Device::Cpu;
         let a = Tensor::from_vec(vec![2f32, -1.0], (2, 1), &device)?;
@@ -1431,6 +1562,48 @@ mod tests {
     }
 
     #[test]
+    fn training_latents_match_all_head_recursion_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = make_model(&device)?;
+        let (frames, actions, coords, goals) = sample_batch(&device, 3, model.config.goal_dim)?;
+        let current = model.encode_state(&frames)?;
+        let depth = RecursionDepth::from_config(model.config());
+        let opts = RecursionOpts::training(false);
+        let full = model.forward_from_encoded_state(
+            &current,
+            &frames,
+            &actions,
+            &coords,
+            &goals,
+            depth,
+            0.1,
+            Some(73),
+            opts,
+        )?;
+        let latent = model.training_latents_from_encoded_state(
+            &current,
+            &actions,
+            &coords,
+            depth,
+            0.1,
+            Some(73),
+            opts,
+        )?;
+        assert_eq!(
+            full.y.flatten_all()?.to_vec1::<f32>()?,
+            latent.y.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(full.steps.len(), latent.steps.len());
+        for (with_heads, without_heads) in full.steps.iter().zip(&latent.steps) {
+            assert_eq!(
+                with_heads.y.flatten_all()?.to_vec1::<f32>()?,
+                without_heads.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn seeded_noise_is_invariant_to_batch_layout() -> Result<()> {
         let device = Device::Cpu;
         let template1 = Tensor::zeros((1, 4, 2, 2), DType::F32, &device)?;
@@ -1440,6 +1613,28 @@ mod tests {
         let v1 = n1.flatten_all()?.to_vec1::<f32>()?;
         let v2 = n2.i(0)?.flatten_all()?.to_vec1::<f32>()?;
         assert_eq!(v1, v2);
+        Ok(())
+    }
+
+    #[test]
+    fn contiguous_seeded_noise_matches_rowwise_reference_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let template = Tensor::zeros((4, 3, 2, 2), DType::F32, &device)?;
+        let actual = seeded_gaussian_like(&template, 0.125, 91)?;
+        let mut rows = Vec::new();
+        for batch in 0..4u64 {
+            let sample_seed = 91u64.wrapping_add(batch.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut rng = rand::rngs::StdRng::seed_from_u64(sample_seed);
+            let data = (0..12)
+                .map(|_| standard_normal(&mut rng) * 0.125)
+                .collect::<Vec<_>>();
+            rows.push(Tensor::from_vec(data, (3, 2, 2), &device)?);
+        }
+        let reference = Tensor::stack(&rows, 0)?;
+        assert_eq!(
+            actual.flatten_all()?.to_vec1::<f32>()?,
+            reference.flatten_all()?.to_vec1::<f32>()?
+        );
         Ok(())
     }
 }

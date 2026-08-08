@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 
-ARMS = ("control", "projector")
 NONFINITE_TRAINING_PATTERN = re.compile(
     r"(?:\bnan\b|\b(?:non[- ]finite|not finite)\b|\binfinite (?:loss|gradient)\b)",
     re.IGNORECASE,
@@ -59,11 +58,14 @@ def verify_sha256_file(path: Path) -> list[str]:
     return errors
 
 
-def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
+def load_run(
+    root: Path, seed: int, arm: str, update: int, treatment_arm: str
+) -> dict[str, Any]:
     arm_dir = root / f"seed-{seed}" / arm
     report_path = arm_dir / f"eval-update-{update:04d}" / "eval_report.json"
     sha_path = arm_dir / f"eval-update-{update:04d}" / "sha256.txt"
     manifest_path = arm_dir / "manifest.json"
+    config_path = arm_dir / "config.json"
     phases_path = arm_dir / "phases.jsonl"
     errors: list[str] = []
     try:
@@ -71,8 +73,88 @@ def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
     except Exception as exc:  # artifact corruption is itself a failed gate
         report = {}
         errors.append(f"cannot read {report_path}: {exc}")
-    if update == 2000 and not manifest_path.is_file():
-        errors.append(f"missing {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception as exc:
+        manifest = {}
+        errors.append(f"cannot read {manifest_path}: {exc}")
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception as exc:
+        config = {}
+        errors.append(f"cannot read {config_path}: {exc}")
+    expected_schema = (
+        "p2.sigreg_geometry_arm.v1"
+        if treatment_arm == "pre-rms-spatial"
+        else "p2.sigreg_action_arm.v1"
+    )
+    expected_geometry = {
+        "control": "post_rms_pooled_spatial_cells",
+        "projector": "pre_rms_global_pool_linear_projector",
+        "pre-rms-spatial": "pre_rms_unpooled_spatial_cells",
+    }[arm]
+    for key, expected in (
+        ("schema", expected_schema),
+        ("arm", arm),
+        ("seed", seed),
+        ("physical_batch", 1024),
+        ("grad_accum", 1),
+        ("sigreg_geometry", expected_geometry),
+    ):
+        if manifest.get(key) != expected:
+            errors.append(f"manifest {key}={manifest.get(key)!r}, expected {expected!r}")
+    if not isinstance(manifest.get("complete_through_update"), int) or manifest[
+        "complete_through_update"
+    ] < update:
+        errors.append(
+            f"manifest complete_through_update={manifest.get('complete_through_update')!r} "
+            f"does not cover update {update}"
+        )
+    for provenance_key in ("git_sha", "candle_git_sha", "binary_sha256"):
+        if not manifest.get(provenance_key):
+            errors.append(f"manifest missing {provenance_key}")
+    if config_path.is_file():
+        actual_config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        if manifest.get("config_sha256") != actual_config_sha:
+            errors.append("manifest config_sha256 does not match config.json")
+    shared_contract = {
+        "physical_batch": 1024,
+        "grad_accum": 1,
+        "sigreg_max_rows": 32768,
+        "lessons": ["dynamics"],
+    }
+    for key, expected in shared_contract.items():
+        if config.get(key) != expected:
+            errors.append(f"config {key}={config.get(key)!r}, expected {expected!r}")
+    expected_flags = {
+        "control": (True, True, False, False),
+        "projector": (True, True, False, True),
+        "pre-rms-spatial": (True, False, True, False),
+    }[arm]
+    actual_flags = tuple(
+        bool(config.get(key, False))
+        for key in (
+            "sigreg_spatial",
+            "sigreg_spatial_pool",
+            "sigreg_pre_rms_spatial",
+            "sigreg_projector",
+        )
+    )
+    if actual_flags != expected_flags:
+        errors.append(f"config SIGReg flags={actual_flags!r}, expected {expected_flags!r}")
+    comparison_config = dict(config)
+    for varying_key in (
+        "output_dir",
+        "sigreg_spatial",
+        "sigreg_spatial_pool",
+        "sigreg_pre_rms_spatial",
+        "sigreg_projector",
+        "sigreg_projector_dim",
+    ):
+        comparison_config.pop(varying_key, None)
+    comparison_config_sha256 = hashlib.sha256(
+        json.dumps(comparison_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     if report.get("schema") != "p2.eval_report.v9":
         errors.append(f"unexpected eval schema {report.get('schema')!r}")
     if not finite_tree(report):
@@ -96,6 +178,11 @@ def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
             stage = phase.get("stage")
             if isinstance(stage, str):
                 phases_by_stage.setdefault(stage, []).append(phase)
+            for provenance_key in ("git_sha", "candle_git_sha", "binary_sha256"):
+                if phase.get(provenance_key) != manifest.get(provenance_key):
+                    errors.append(
+                        f"phase line {line_number} {provenance_key} does not match manifest"
+                    )
     else:
         errors.append(f"missing {phases_path}")
     for stage in expected_stages:
@@ -161,6 +248,10 @@ def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
         "arm": arm,
         "update": update,
         "report_path": str(report_path),
+        "git_sha": manifest.get("git_sha"),
+        "candle_git_sha": manifest.get("candle_git_sha"),
+        "binary_sha256": manifest.get("binary_sha256"),
+        "comparison_config_sha256": comparison_config_sha256,
         "errors": errors,
         "artifact_valid": artifact_valid,
         "sigreg_valid": sigreg_valid,
@@ -211,30 +302,30 @@ def credible_approach(early: dict[str, Any], late: dict[str, Any]) -> bool:
     )
 
 
-def projector_materially_better(control: dict[str, Any], projector: dict[str, Any]) -> bool:
+def treatment_materially_better(control: dict[str, Any], treatment: dict[str, Any]) -> bool:
     keys = ("aggregate_ratio", "random_one_step_ratio", "changed_improvement")
     return all(
         isinstance(control.get(key), (int, float))
-        and isinstance(projector.get(key), (int, float))
-        and projector[key] - control[key] >= 0.05
+        and isinstance(treatment.get(key), (int, float))
+        and treatment[key] - control[key] >= 0.05
         for key in keys
     )
 
 
-def pilot_decision(runs: list[dict[str, Any]]) -> dict[str, Any]:
+def pilot_decision(runs: list[dict[str, Any]], treatment_arm: str) -> dict[str, Any]:
     indexed = {(run["arm"], run["update"]): run for run in runs}
     control = indexed[("control", 2000)]
-    projector = indexed[("projector", 2000)]
+    treatment = indexed[(treatment_arm, 2000)]
     control_credible = credible_approach(indexed[("control", 1000)], control)
-    projector_credible = credible_approach(indexed[("projector", 1000)], projector)
-    material = projector_materially_better(control, projector)
-    if control["hard_pass"] and projector["hard_pass"]:
+    treatment_credible = credible_approach(indexed[(treatment_arm, 1000)], treatment)
+    material = treatment_materially_better(control, treatment)
+    if control["hard_pass"] and treatment["hard_pass"]:
         branch = "C"
         action = "replicate_both_arms_seeds_2_and_3"
-    elif control["hard_pass"] != projector["hard_pass"]:
+    elif control["hard_pass"] != treatment["hard_pass"]:
         branch = "B"
         action = "replicate_both_arms_seeds_2_and_3"
-    elif control_credible or projector_credible:
+    elif control_credible or treatment_credible:
         branch = "B"
         action = "replicate_both_arms_seeds_2_and_3"
     else:
@@ -245,13 +336,14 @@ def pilot_decision(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "terminal_branch": branch,
         "action": action,
         "control_credible_approach": control_credible,
-        "projector_credible_approach": projector_credible,
-        "projector_material_improvement": material,
+        "treatment_arm": treatment_arm,
+        "treatment_credible_approach": treatment_credible,
+        "treatment_material_improvement": material,
         "note": (
             "Credible approach was preregistered as all 2,000-step point metrics reaching "
             "1.05/1.05/0.05, improving from 1,000, with valid SIGReg and noncollapse. "
             "Any arm meeting that monotonic criterion advances both arms; material "
-            "projector improvement requires +0.05 in both action ratios and "
+            "treatment improvement requires +0.05 in both action ratios and "
             "changed-transition improvement."
         ),
     }
@@ -313,37 +405,38 @@ def severe_relative_regressions(
 
 
 def three_seed_decision(
-    runs: list[dict[str, Any]], decision_update: int, allow_extension: bool
+    runs: list[dict[str, Any]], decision_update: int, allow_extension: bool, treatment_arm: str
 ) -> dict[str, Any]:
+    arms = ("control", treatment_arm)
     late = [run for run in runs if run["update"] == decision_update]
-    by_arm = {arm: [run for run in late if run["arm"] == arm] for arm in ARMS}
-    qualifies = {arm: arm_three_seed_pass(by_arm[arm]) for arm in ARMS}
+    by_arm = {arm: [run for run in late if run["arm"] == arm] for arm in arms}
+    qualifies = {arm: arm_three_seed_pass(by_arm[arm]) for arm in arms}
     severe_regressions = {
-        "control": severe_relative_regressions(by_arm["control"], by_arm["projector"]),
-        "projector": severe_relative_regressions(by_arm["projector"], by_arm["control"]),
+        "control": severe_relative_regressions(by_arm["control"], by_arm[treatment_arm]),
+        treatment_arm: severe_relative_regressions(by_arm[treatment_arm], by_arm["control"]),
     }
-    for arm in ARMS:
+    for arm in arms:
         qualifies[arm] &= not severe_regressions[arm]
 
     paired = {}
     for key in ("aggregate_ratio", "random_one_step_ratio", "changed_improvement"):
         paired[key] = [
-            next(run for run in by_arm["projector"] if run["seed"] == seed)[key]
+            next(run for run in by_arm[treatment_arm] if run["seed"] == seed)[key]
             - next(run for run in by_arm["control"] if run["seed"] == seed)[key]
             for seed in (1, 2, 3)
         ]
-    projector_material = all(median(values) >= 0.05 for values in paired.values())
-    if qualifies["control"] and (not qualifies["projector"] or not projector_material):
+    treatment_material = all(median(values) >= 0.05 for values in paired.values())
+    if qualifies["control"] and (not qualifies[treatment_arm] or not treatment_material):
         promoted = "control"
-    elif qualifies["projector"]:
-        promoted = "projector"
+    elif qualifies[treatment_arm]:
+        promoted = treatment_arm
     else:
         promoted = None
 
     early_update = 1000 if decision_update == 2000 else 2000
     early = [run for run in runs if run["update"] == early_update]
     improving_arms = []
-    for arm in ARMS:
+    for arm in arms:
         if all(
             credible_approach(
                 next(run for run in early if run["arm"] == arm and run["seed"] == seed),
@@ -366,8 +459,9 @@ def three_seed_decision(
         ),
         "qualifies": qualifies,
         "promoted_arm": promoted,
-        "paired_projector_minus_control": paired,
-        "projector_material_across_seeds": projector_material,
+        "treatment_arm": treatment_arm,
+        "paired_treatment_minus_control": paired,
+        "treatment_material_across_seeds": treatment_material,
         "severe_relative_regressions": severe_regressions,
         "improving_arms": improving_arms,
         "regression_threshold_note": (
@@ -379,7 +473,7 @@ def three_seed_decision(
 
 def markdown(result: dict[str, Any]) -> str:
     lines = [
-        "# P2 SIGReg/action-conditioning gate result",
+        f"# P2 {result['experiment']} gate result",
         "",
         "| seed | arm | update | hard pass | aggregate ratio [95% CI] | random_one_step ratio [95% CI] | changed improvement [95% CI] | variance | effective rank | raw / bounded SIGReg |",
         "|---:|---|---:|---|---|---|---|---:|---:|---|",
@@ -425,6 +519,11 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
     parser.add_argument("--final-update", type=int, choices=(2000, 4000), default=2000)
+    parser.add_argument(
+        "--treatment-arm",
+        choices=("projector", "pre-rms-spatial"),
+        default="projector",
+    )
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-md", type=Path, required=True)
     args = parser.parse_args()
@@ -433,18 +532,78 @@ def main() -> None:
         raise SystemExit("--seeds must be exactly 1 or 1 2 3")
     if args.final_update == 4000 and seeds != [1, 2, 3]:
         raise SystemExit("--final-update 4000 requires --seeds 1 2 3")
+    arms = ("control", args.treatment_arm)
     updates = (1000, 2000) if args.final_update == 2000 else (1000, 2000, 4000)
-    runs = [load_run(args.root, seed, arm, update) for seed in seeds for arm in ARMS for update in updates]
+    runs = [
+        load_run(args.root, seed, arm, update, args.treatment_arm)
+        for seed in seeds
+        for arm in arms
+        for update in updates
+    ]
+    provenance = {
+        (run["git_sha"], run["candle_git_sha"], run["binary_sha256"])
+        for run in runs
+    }
+    if len(provenance) != 1:
+        raise SystemExit(f"runs do not share one immutable provenance tuple: {sorted(provenance)!r}")
+    for seed in seeds:
+        config_contracts = {
+            run["comparison_config_sha256"] for run in runs if run["seed"] == seed
+        }
+        if len(config_contracts) != 1:
+            raise SystemExit(
+                f"seed {seed} arms differ outside preregistered SIGReg geometry fields"
+            )
+    invalid_runs = [run for run in runs if not run["artifact_valid"]]
+    if invalid_runs:
+        failure = {
+            "schema": "p2.ab_gate_validation_failure.v1",
+            "root": str(args.root),
+            "treatment_arm": args.treatment_arm,
+            "runs": runs,
+            "errors": [
+                {"seed": run["seed"], "arm": run["arm"], "update": run["update"], "errors": run["errors"]}
+                for run in invalid_runs
+            ],
+        }
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_md.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n")
+        lines = ["# P2 A/B artifact validation failed", ""]
+        for run in invalid_runs:
+            lines.append(f"## seed {run['seed']} / {run['arm']} / update {run['update']}")
+            lines.extend(f"- {error}" for error in run["errors"])
+            lines.append("")
+        args.output_md.write_text("\n".join(lines))
+        raise SystemExit("artifact validation failed; decision gate was not evaluated")
     decision = (
-        pilot_decision(runs)
+        pilot_decision(runs, args.treatment_arm)
         if seeds == [1]
         else three_seed_decision(
             runs,
             decision_update=args.final_update,
             allow_extension=args.final_update == 2000,
+            treatment_arm=args.treatment_arm,
         )
     )
-    result = {"schema": "p2.sigreg_action_gate.v2", "root": str(args.root), "runs": runs, "decision": decision}
+    experiment = (
+        "SIGReg/action-conditioning"
+        if args.treatment_arm == "projector"
+        else "SIGReg geometry-isolation"
+    )
+    schema = (
+        "p2.sigreg_action_gate.v2"
+        if args.treatment_arm == "projector"
+        else "p2.sigreg_geometry_gate.v1"
+    )
+    result = {
+        "schema": schema,
+        "experiment": experiment,
+        "treatment_arm": args.treatment_arm,
+        "root": str(args.root),
+        "runs": runs,
+        "decision": decision,
+    }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_md.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

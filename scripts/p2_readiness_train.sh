@@ -12,11 +12,12 @@
 #   P2_DEVICE            (default: cuda)
 #   P2_OUTPUT_DIR        (default: runs/p2/readiness-v2)
 #   P2_RUNS_ROOT         (default: runs/p2)
-#   P2_PHYSICAL_BATCH    (default: 128)
-#   P2_GRAD_ACCUM        (default: 4)
+#   P2_PHYSICAL_BATCH    (default: 1024; use at least 512 on L40S)
+#   P2_GRAD_ACCUM        (default: 1)
+#   P2_PROFILE_UPDATE    (default: 2)
+#   P2_NSYS              off | auto | require (default: auto)
 #   TMUX_SESSION         (default: p2-readiness)
 #
-# Legacy root dirs (p2-output-*): mv p2-output-foo runs/p2/foo before resume.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +32,7 @@ shift || true
 # v3: the depth-sampling, Q-target and SIGReg-row changes all alter the resume
 # contract, so v2's completed checkpoints cannot (and must not) be resumed into
 # this run. Keeping a new directory also preserves v2 for comparison.
-OUT="${P2_OUTPUT_DIR:-$(p2_migrate_legacy_run_dir readiness-v3)}"
+OUT="${P2_OUTPUT_DIR:-$(p2_run_dir readiness-v3)}"
 case "$MODE" in
   run)
     if [[ $# -ge 1 && "$1" != --* ]]; then
@@ -45,6 +46,9 @@ DEVICE="${P2_DEVICE:-cuda}"
 PHYSICAL_BATCH="${P2_PHYSICAL_BATCH:-1024}"
 GRAD_ACCUM="${P2_GRAD_ACCUM:-1}"
 MAX_REPAIR_ATTEMPTS="${MAX_REPAIR_ATTEMPTS:-5}"
+P2_PROFILE_UPDATE="${P2_PROFILE_UPDATE:-2}"
+P2_NSYS="${P2_NSYS:-auto}"
+export P2_PROFILE_UPDATE P2_NSYS
 if [[ -z "${AGENT_BIN:-}" ]]; then
   if [[ -x "${HOME}/.local/bin/agent" ]]; then
     AGENT_BIN="${HOME}/.local/bin/agent"
@@ -68,7 +72,11 @@ mkdir -p -- "$OUT" "$LOG_DIR"
 
 FEATURES=""
 if command -v nvidia-smi >/dev/null 2>&1; then
-  FEATURES="--features cudnn"
+  if [[ "$P2_NSYS" == off ]]; then
+    FEATURES="--features cudnn"
+  else
+    FEATURES="--features cudnn,profiling"
+  fi
 fi
 
 TOFY_BIN="${TOFY_BIN:-}"
@@ -131,8 +139,16 @@ train_cmd() {
       sleep 1
     fi
   done
+  local -a runner
+  if [[ -n "$TOFY_BIN" ]]; then
+    runner=("$TOFY_BIN")
+  else
+    runner=(cargo run --release)
+    if [[ -n "$FEATURES" ]]; then runner+=($FEATURES); fi
+    runner+=(--)
+  fi
   local -a cmd=(
-    cargo_p2 p2-train
+    "${runner[@]}" p2-train
     --device "$DEVICE"
     --seed 1
     --lessons dynamics,exploration,sequential,q_calibration,falsification
@@ -163,12 +179,13 @@ train_cmd() {
     --inner-steps 2
     --hidden-dim 128
     --output-dir "$OUT"
+    --profile-update "$P2_PROFILE_UPDATE"
   )
   if [[ -f "$OUT/checkpoints/latest.json" ]] || [[ -d "$OUT/checkpoints" ]]; then
     cmd+=(--resume "$OUT/checkpoints")
     log "resuming from $OUT/checkpoints"
   fi
-  "${cmd[@]}"
+  "$script_dir/p2_profile_nsys.sh" "$OUT" -- "${cmd[@]}"
 }
 
 wait_for_gpu_idle() {
@@ -241,7 +258,9 @@ invoke_repair_agent() {
   local attempt="$3"
   local agent_log="$LOG_DIR/agent-repair-${attempt}-$(date +%Y%m%dT%H%M%S).log"
   local tail_file="$LOG_DIR/failure-tail-${attempt}.txt"
-  local profile_trace="$OUT/profile.jsonl"
+  local profile_bundle
+  printf -v profile_bundle '%s/profile/update-%012d' "$OUT" "$P2_PROFILE_UPDATE"
+  local profile_trace="$profile_bundle/application.jsonl"
   local latest_ckpt="none"
   if [[ -f "$OUT/checkpoints/latest.json" ]]; then
     latest_ckpt="$(cat "$OUT/checkpoints/latest.json")"
@@ -255,9 +274,10 @@ invoke_repair_agent() {
   if [[ -f "$profile_trace" ]]; then
     profile_block="$(cat <<PROFILE
 
-Profile trace:
-- $profile_trace
-- cargo p2-view $profile_trace --output $OUT/model.html
+Profile evidence:
+- $profile_bundle/EVIDENCE.md
+- $profile_bundle/evidence.json
+- cargo p2-view $profile_bundle --output $profile_bundle/viewer.html
 PROFILE
 )"
   fi

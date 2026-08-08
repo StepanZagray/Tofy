@@ -1,7 +1,7 @@
 # Cargo-integrated candle-graph trace tools (sibling crate):
-#   cargo candle-graph view runs/p2/v15/profile.jsonl --output model.html
-#   cargo candle-graph summary runs/p2/v15/profile.jsonl
-#   cargo p2-view runs/p2/v15/profile.jsonl --output runs/p2/v15/model.html
+#   cargo candle-graph summary runs/p2/example/profile/update-000000000002/application.jsonl
+#   cargo p2-view runs/p2/example/profile/update-000000000002 --output viewer.html
 
+[alias]
 candle-graph = "run --manifest-path ../candle_graph/Cargo.toml --features all --bin cargo-candle-graph --"
 p2-view = "run -- p2-view"

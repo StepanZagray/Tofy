@@ -247,6 +247,32 @@ pub fn accumulate_grad_store(acc: &mut GradStore, micro: GradStore) -> Result<()
     acc.extend(micro).map_err(Into::into)
 }
 
+/// Retain and accumulate only trainable-parameter gradients from one microbatch.
+///
+/// Backward also returns gradients for intermediate tensors. Keeping those stores
+/// across microbatches retains the corresponding graphs and needlessly increases
+/// accelerator memory, so move only `VarMap` entries into the durable accumulator.
+pub fn accumulate_parameter_gradients(
+    acc: &mut Option<GradStore>,
+    mut micro: GradStore,
+    varmap: &VarMap,
+) -> Result<()> {
+    let mut parameter_grads = GradStore::default();
+    for var in varmap.all_vars() {
+        let tensor = var.as_tensor();
+        if let Some(gradient) = micro.remove(tensor) {
+            parameter_grads.insert(tensor, gradient);
+        }
+    }
+    match acc {
+        Some(accumulated) => accumulate_grad_store(accumulated, parameter_grads),
+        None => {
+            *acc = Some(parameter_grads);
+            Ok(())
+        }
+    }
+}
+
 /// GPU-side global L2 gradient clip (no host download of full grad vectors).
 pub fn clip_gradients_gpu(grads: &mut GradStore, varmap: &VarMap, max_norm: f64) -> Result<()> {
     let mut sum_sq: Option<Tensor> = None;

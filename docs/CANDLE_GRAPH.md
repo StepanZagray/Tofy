@@ -1,66 +1,98 @@
-# candle-graph integration (Tofy P2)
+# candle-graph evidence in Tofy P2
 
-Tofy links the sibling [`../candle_graph`](../candle_graph) crate and emits a **step-0
-execution trace** on every `p2-train` run.
+Every training run targets one configurable, one-based representative optimizer update
+(`--profile-update`, default `2`, after one warm-up update). Instrumentation is inactive on every
+other update.
 
-## What training writes
+## Artifact bundle
 
-| File | When | Schema |
-| --- | --- | --- |
-| `profile.jsonl` | first optimizer update (global step 0) | `candle-graph/trace/4` |
-| `train_report.json` | train end / pause | `p2.train_report.v3` — field `profile_trace` |
+The default update 2 publishes atomically under:
 
-The trace includes nested spans for `generate`, `stage`, `forward`, `backward`, plus
-parameter gradient facts under VarBuilder root `vb`. There is **no per-step overhead**
-after step 0.
-
-Resumed runs skip re-emission when `profile_emitted` is already set in the checkpoint.
-
-## View the graph
-
-From the Tofy repo root:
-
-```bash
-cargo p2-view runs/p2/v15/profile.jsonl --output runs/p2/v15/model.html
+```text
+OUTPUT/profile/update-000000000002/
+├── application.jsonl   # candle-graph/trace/6
+├── evidence.json       # candle-graph/evidence/1
+├── EVIDENCE.md         # bounded repair/research handoff
+├── viewer.html         # Evidence + Trace + Span costs + Memory + GPU
+└── nsight/             # optional raw .nsys-rep, CSV reports, status
 ```
 
-Or via the sibling CLI:
+`train_report.json` (`p2.train_report.v6`) and resumable trainer state carry a structured
+`profile` status (`pending` or `published`). A published bundle forces a durable checkpoint.
+
+The root measured region is device-synchronized once before and once after the complete update.
+Generation, staging, forward, backward, gradient inspection, optimizer, and metrics retain typed
+semantic spans; the trace therefore uses `timing_mode=host` and records
+`root_device_synchronized=true`, rather than overstating every nested duration as synchronized.
+Nsight supplies kernel durations. Gradient norms use one batched device read. Batch frames, loss storage, and every
+parameter gradient are captured. Tensor metadata is not misrepresented as allocation lifetime.
+
+## Agent workflow
+
+Start with the bounded packet, not raw JSONL:
 
 ```bash
-cargo candle-graph view runs/p2/v15/profile.jsonl --output runs/p2/v15/model.html
-cargo candle-graph summary runs/p2/v15/profile.jsonl
-cargo candle-graph query runs/p2/v15/profile.jsonl --kind slowest
+sed -n '1,220p' runs/p2/example/profile/update-000000000002/EVIDENCE.md
+cargo candle-graph summary runs/p2/example/profile/update-000000000002/application.jsonl
+cargo candle-graph query runs/p2/example/profile/update-000000000002/application.jsonl --kind gradients
+cargo candle-graph query runs/p2/example/profile/update-000000000002/application.jsonl --kind tensors
 ```
 
-## Cargo aliases (`.cargo/config.toml`)
+Compare an explicit baseline:
 
-| Alias | Command |
-| --- | --- |
-| `cargo candle-graph …` | Sibling `cargo-candle-graph` binary (`--features all`) |
-| `cargo p2-view …` | Tofy wrapper around `candle-graph view` |
+```bash
+cargo candle-graph compare \
+  runs/p2/baseline/profile/update-000000000002/application.jsonl \
+  runs/p2/candidate/profile/update-000000000002/application.jsonl
+```
 
-## Other profiling (not candle-graph)
+## Human workflow
 
-| Tool | Enable | Use |
-| --- | --- | --- |
-| Phase ms | `TOFY_P2_STEP_PROFILE=N` | Per-step generate/forward/backward breakdown |
-| Chrome trace | `TOFY_PERF_TRACE=path` + `--features profiling` | Perfetto timeline |
-| GPU | `nsys profile …` | CUDA kernels and stalls |
+Open the already-published `viewer.html`, or regenerate with a baseline/Nsight directory:
 
-See [`src/perf.rs`](../src/perf.rs) and [`docs/P2.md`](P2.md).
+```bash
+cargo p2-view runs/p2/example/profile/update-000000000002 \
+  --baseline runs/p2/baseline/profile/update-000000000002/application.jsonl \
+  --output runs/p2/example/profile/update-000000000002/viewer.html
+```
 
-## Legacy removed (v0.4 candle-graph)
+## Optional Nsight capture
 
-- Static Rust analysis (`cargo candle-graph check/view --path .`)
-- `runtime.json` (`candle-graph/runtime/2`)
-- `cargo p2-audit` / analyzer feature / `model-ir.json` bundles
+Use the wrapper; normal training succeeds when Nsight is absent or fails in `auto` mode:
 
-Old checkpoints may still carry a `runtime_trace` blob in `trainer_state.json`; resume
-treats that as `profile_emitted = true` without rewriting `profile.jsonl`.
+```bash
+P2_NSYS=auto P2_PROFILE_UPDATE=2 scripts/p2_profile_nsys.sh runs/p2/example -- \
+  cargo run --release --features cudnn,profiling -- p2-train \
+  --device cuda --output-dir runs/p2/example --profile-update 2 ...
+```
 
-## Docs
+The wrapper retains `.nsys-rep`, exports official CSV reports, and regenerates the same
+`evidence.json`, `EVIDENCE.md`, and `viewer.html`. Candle and NVTX use exact labels such as
+`tofy.p2/update-000000000002/forward`, allowing `nvtx_gpu_proj_trace` to connect semantic phases to
+GPU work. Global kernel/runtime summaries remain explicitly global.
 
-| Doc | Contents |
-| --- | --- |
-| [`../candle_graph/README.md`](../candle_graph/README.md) | Trace protocol + CLI |
-| [`../candle_graph/docs/runtime-analysis-guide.md`](../candle_graph/docs/runtime-analysis-guide.md) | Probe design |
+`P2_NSYS=off|auto|require`: `auto` never changes the training command's exit status and reruns
+normally if the profiler ends without a child result; `require` fails when Nsight evidence cannot
+be produced. A previously published representative bundle bypasses capture on resume. Nsight
+augmentation is assembled beside the published bundle and exchanged atomically only after JSON,
+Markdown, and HTML all succeed.
+
+## Full-update capacity gate
+
+The capacity probe runs production hidden width, worst-case fixed recursion depth, spatial SIGReg,
+PTRM ranking, and active auxiliary losses. Use accumulation locally while keeping effective batch
+512; the L40S acceptance run must use physical 512 with accumulation 1:
+
+```bash
+# 8 GiB development GPU
+TOFY_VRAM_PROBE=1 TOFY_VRAM_PHYSICAL_BATCH=64 TOFY_VRAM_GRAD_ACCUM=8 \
+  cargo test --release --features cudnn --test p2_vram_probe -- --ignored --nocapture
+
+# L40S 48 GiB acceptance gate
+TOFY_VRAM_PROBE=1 TOFY_VRAM_PHYSICAL_BATCH=512 TOFY_VRAM_GRAD_ACCUM=1 \
+  cargo test --release --features cudnn --test p2_vram_probe -- --ignored --nocapture
+```
+
+Run the same command with `TOFY_VRAM_LESSON=retarget` to cover the open-loop branch. Candle-graph
+records tensor facts, not allocator high-water; record peak process VRAM from Nsight or
+`nvidia-smi` beside the result.

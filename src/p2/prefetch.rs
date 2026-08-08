@@ -21,6 +21,26 @@ pub struct PrefetchRequest {
     pub split: Split,
 }
 
+/// Inputs that define which deterministic batch stream a prefetcher serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefetchScope {
+    pub curriculum: String,
+    pub seed: u64,
+    pub physical_batch: usize,
+    pub split: Split,
+}
+
+impl From<&PrefetchRequest> for PrefetchScope {
+    fn from(request: &PrefetchRequest) -> Self {
+        Self {
+            curriculum: request.curriculum.clone(),
+            seed: request.seed,
+            physical_batch: request.physical_batch,
+            split: request.split,
+        }
+    }
+}
+
 /// A queued request tagged with its submission order, so results can be handed
 /// back deterministically regardless of which worker finishes first.
 struct SeqRequest {
@@ -54,6 +74,7 @@ pub struct BatchPrefetcher {
     ready: BTreeMap<u64, Result<Vec<TransitionSample>>>,
     submitted: u64,
     next_out: u64,
+    scope: Option<PrefetchScope>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -132,6 +153,7 @@ impl BatchPrefetcher {
             ready: BTreeMap::new(),
             submitted: 0,
             next_out: 0,
+            scope: None,
             workers,
         }
     }
@@ -147,13 +169,33 @@ impl BatchPrefetcher {
         // restarts with the queue it belongs to.
         self.submitted = 0;
         self.next_out = 0;
+        self.scope = None;
         let _ = self.workers.drain(..);
+    }
+
+    pub fn scope(&self) -> Option<&PrefetchScope> {
+        self.scope.as_ref()
+    }
+
+    fn accept_scope(&mut self, request: &PrefetchRequest) -> Result<()> {
+        let requested = PrefetchScope::from(request);
+        match &self.scope {
+            Some(active) if active != &requested => Err(anyhow::anyhow!(
+                "prefetch scope changed without restart: active={active:?} requested={requested:?}"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.scope = Some(requested);
+                Ok(())
+            }
+        }
     }
 
     pub fn submit(&mut self, req: PrefetchRequest) -> Result<()> {
         if !self.accepting {
             return Err(anyhow::anyhow!("prefetch submit after shutdown"));
         }
+        self.accept_scope(&req)?;
         let seq = self.submitted;
         self.submitted += 1;
         {
@@ -170,6 +212,9 @@ impl BatchPrefetcher {
         }
         if !self.accepting {
             return Err(anyhow::anyhow!("prefetch submit after shutdown"));
+        }
+        for request in reqs {
+            self.accept_scope(request)?;
         }
         let start = self.submitted;
         self.submitted += reqs.len() as u64;
