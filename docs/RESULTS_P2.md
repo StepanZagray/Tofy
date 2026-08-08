@@ -57,12 +57,12 @@ advances both arms to seeds 2 and 3.
 ```bash
 # Run one arm/seed through the 1,000 and 2,000 update pauses and evaluations.
 P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
-P2_EXPECTED_SHA=<reviewed-commit> \
+P2_EXPECTED_SHA=a4cd11213e7aec91ec744012223d36b73848741c \
 TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
 bash scripts/p2_sigreg_action_ab.sh control 1
 
 P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
-P2_EXPECTED_SHA=<reviewed-commit> \
+P2_EXPECTED_SHA=a4cd11213e7aec91ec744012223d36b73848741c \
 TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
 bash scripts/p2_sigreg_action_ab.sh projector 1
 
@@ -79,6 +79,44 @@ python3 scripts/p2_ab_gate.py \
   --output-json /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/final-4000-gates.json \
   --output-md /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/final-4000-gates.md
 ```
+
+### Pilot result (2026-08-08)
+
+Both seed-1 arms completed four status-0 phases from fresh initialization at the
+reviewed experiment SHA `a4cd11213e7aec91ec744012223d36b73848741c`.
+Every update-1,000/update-2,000 checkpoint/report SHA-256 manifest verifies. The
+control config hash is
+`bcf4b3e456227f1441e680857327a02f292bd323f741d7dfefab5eb7dd819f09`;
+the projector config hash is
+`0994064d59d7b7b1e3bf9dc6784b7e5016142c45f74cb5d026a099fa6d77cdf2`.
+
+| Arm | Update | Aggregate shuffled/true [95% CI] | `random_one_step` [95% CI] | Changed learned-vs-copy improvement [95% CI] | Variance | Effective-rank fraction | Hard pass |
+|---|---:|---|---|---|---:|---:|---|
+| control | 1,000 | 1.0396 [1.0219, 1.0607] | 1.1536 [1.0777, 1.2383] | 0.6607 [0.6123, 0.7000] | 0.002760 | 0.0140 | no |
+| control | 2,000 | 1.2073 [1.1535, 1.2681] | 1.7291 [1.5048, 1.9963] | 0.4955 [0.4448, 0.5418] | 0.006791 | 0.0245 | no |
+| projector | 1,000 | 1.0000 [0.9999, 1.0001] | 1.0000 [0.9998, 1.0003] | -98.4505 [-102.1645, -94.7269] | 1.50e-7 | 0.0157 | no |
+| projector | 2,000 | 1.0000 [0.9999, 1.0001] | 1.0001 [0.9999, 1.0002] | -159.3740 [-171.4533, -146.9218] | 3.92e-8 | 0.0144 | no |
+
+At update 2,000, raw/bounded SIGReg was `927.069 / 841.820` for
+control and `339.291 / 326.971` for projector; neither was near the 10,000
+bound. Control passed both action gates and the changed-transition gate, but
+failed noncollapse (`0.0245 < 0.10` rank fraction) and deteriorated over time:
+one-step MSE rose `0.0246→0.1087` and horizon-8 open-loop MSE rose
+`0.106→0.752`. Its exploration and hazard-source shuffle ratios remained near
+1.0. Projector variance collapsed, its action-shuffle ratios stayed at 1.0, and
+its learned changed-transition MSE was about 160 times copy-forward at update
+2,000; its low absolute latent MSE is therefore degenerate, not a positive
+result.
+
+The unchanged preregistered gate selected terminal branch A
+(`stop_after_pilot`): neither arm hard-passed or showed the defined credible
+monotonic approach, and projector did not materially improve control. Seeds 2
+and 3 and the 4,000-update extension were not run. No arm is promoted, and a
+full 28,672-update curriculum restart is not recommended. The smallest next
+hypothesis is a fresh geometric-isolation arm: pre-RMS spatial-cell SIGReg
+without global pooling or a learned projector, with all other control fields
+fixed. Exact expanded phase commands and immutable reports live under
+`runs/p2/ab-sigreg-action-v1/`; the decision is in `pilot-gates.{json,md}`.
 
 These commands and any interim smoke metrics are experimental diagnostics only.
 They do not set `research_claim=true`, use public ARC games, or justify a model claim.
@@ -189,6 +227,24 @@ cargo test --lib p2::optimizer::tests::gradient_clip_rejects_non_finite_norm -- 
 cargo test --lib p2::train::tests::sigreg_cap_retains_gradient_above_reported_limit -- --exact
 cargo test --lib p2::train::tests::loss_check_reports_constituent_before_non_finite_total -- --exact
 ```
+
+#### Preserved readiness-v3 pause and evaluation (2026-08-08)
+
+After the reviewed correctness commit was ready, PID 88711 was re-resolved from
+`runs/p2/readiness-v3/train.pid`; its full command, cwd, parent wrapper, and sole
+GPU ownership were verified. Exactly one `SIGINT` was sent at
+`2026-08-08T11:08:17Z`. The trainer finished its optimizer update and atomically
+paused at step 20,557. The wrapper's post-train evaluator then completed normally
+at `2026-08-08T11:18:01Z` without interference.
+
+- Preserved checkpoint:
+  `runs/p2/readiness-v3/checkpoints/step-000000020557/`.
+- Preserved synthetic evaluation: `runs/p2/readiness-v3/eval_report.json` and
+  `episodes.jsonl` (`research_claim=false`, no official scorecard).
+- Trainer/evaluator/wrapper PIDs exited and the GPU lock was released.
+
+This remains an inherited recovery/stability run, not a clean result, and it was
+never used to initialize the SIGReg/action A/B.
 
 ## Best So Far
 
