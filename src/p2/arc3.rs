@@ -590,7 +590,10 @@ mod tests {
         let samples = events_to_transitions(&load_recording_jsonl(&path).unwrap()).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].action.id, 7);
-        assert_eq!(samples[0].action.to_tofy().unwrap(), crate::domain::Action::Undo);
+        assert_eq!(
+            samples[0].action.to_tofy().unwrap(),
+            crate::domain::Action::Undo
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

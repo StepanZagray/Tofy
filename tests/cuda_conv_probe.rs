@@ -79,7 +79,8 @@ fn encoder_c1_conv_ops() -> Result<()> {
     let grad = Tensor::randn(0f32, 1.0, (BATCH, CHANNELS, out_side, out_side), &device)?;
 
     bench("forward conv2d", &device, 20, || {
-        x.conv2d(&w, PADDING, STRIDE, DILATION, 1).map_err(Into::into)
+        x.conv2d(&w, PADDING, STRIDE, DILATION, 1)
+            .map_err(Into::into)
     });
 
     // backprop.rs:300-302 — note stride and dilation are swapped relative to the forward op.
@@ -93,10 +94,15 @@ fn encoder_c1_conv_ops() -> Result<()> {
     // backprop.rs:290-297 — the input gradient; never has a cuDNN path.
     let out_size = (out_side - 1) * STRIDE + DILATION * (KERNEL - 1) + 1 - 2 * PADDING;
     let out_padding = SIDE - out_size;
-    bench("backward input-grad (conv_transpose2d)", &device, 20, || {
-        grad.conv_transpose2d(&w, PADDING, out_padding, STRIDE, DILATION)
-            .map_err(Into::into)
-    });
+    bench(
+        "backward input-grad (conv_transpose2d)",
+        &device,
+        20,
+        || {
+            grad.conv_transpose2d(&w, PADDING, out_padding, STRIDE, DILATION)
+                .map_err(Into::into)
+        },
+    );
 
     // What the whole layer costs end to end.
     // Leaf-input case (matches P2 pixels): weight grad only; input grad is dead work
@@ -118,7 +124,9 @@ fn encoder_c1_conv_ops() -> Result<()> {
         &device,
     )?)?;
     bench("full fwd+bwd (var input)", &device, 10, || {
-        let y = xv.as_tensor().conv2d(wv.as_tensor(), PADDING, STRIDE, DILATION, 1)?;
+        let y = xv
+            .as_tensor()
+            .conv2d(wv.as_tensor(), PADDING, STRIDE, DILATION, 1)?;
         let loss = y.sqr()?.sum_all()?;
         let _ = loss.backward()?;
         Ok(loss)

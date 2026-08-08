@@ -1,7 +1,8 @@
 # Results P2
 
-P2 is implemented as a recursive latent world-model experiment. No trained metric is
-recorded yet; implementation smoke tests must not be promoted to a research result.
+P2 is implemented as a recursive latent world-model experiment. The completed
+`readiness-v2` run is recorded below as a negative diagnostic result; implementation
+smoke tests must not be promoted to research results.
 
 ## Frozen fields for the first experimental run
 
@@ -16,7 +17,7 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
-## Readiness training (in progress)
+## Readiness training
 
 VRAM/GPU/Muon integration landed 2026-08-05:
 
@@ -32,6 +33,96 @@ bash scripts/p2_readiness_train.sh run
 ```
 
 Resume checkpoint: `runs/p2/readiness-v2/checkpoints/` (see `latest.json`).
+
+### Readiness-v2 action-conditioning diagnostic (2026-08-07)
+
+The report-schema-v8 action shuffle holds frames, next-frame targets, and goals fixed
+while deranging the complete action tuple (including ACTION6 coordinates) within each
+curriculum source. A ratio `shuffled MSE / true-action MSE <= 1.1` is
+action-marginalized. Every source with at least two distinct action
+conditionings failed:
+
+| Source | Shuffle ratio | Coverage note |
+|--------|--------------:|---------------|
+| dynamics aggregate | 1.0023 | all ACTION1..7 represented |
+| `random_one_step` | 1.0078 | ACTION5=25%, ACTION6=25%; 127 distinct coordinates |
+| `exploration` | 1.0001 | ACTION1..4,7; 40.2% no-op |
+| `hazard_one_step` | 1.0012 | ACTION3/4 only |
+| planner aggregate | 1.0005 | ACTION2=60.0% |
+| `sequential` | 0.9999 | ACTION1..4 |
+| `hypothesis_probe` | 1.0023 | ACTION2=62.0% |
+| `p1c_falsification` | n/a | ACTION2 only; shuffling cannot intervene |
+| `p1c_hard_retarget` | 1.0018 | ACTION1..4 |
+
+This confirms action-marginalized dynamics, but does not support narrow planner
+coverage as the sole cause: the deliberately broad `random_one_step` source also
+fails by a wide margin. The live differentiable target-encoder collapse hypothesis
+therefore moves ahead of curriculum coverage for the next A/B.
+
+```bash
+cargo run --release --features cudnn -- p2-eval \
+  --checkpoint runs/p2/readiness-v2/checkpoints/step-000000028672/model.safetensors \
+  --train-config runs/p2/readiness-v2/config.json \
+  --seed 2 --device cuda --synthetic-episodes 64 --physical-batch 64 \
+  --ptrm-k 1 --ptrm-noise 0.1 --q-mse-threshold 0.05 --ensemble-members 1 \
+  --output runs/p2/readiness-v2/eval_report_action_shuffle.json
+```
+
+### Readiness-v3 incomplete NaN run (2026-08-08)
+
+The L40S run at commit `2ae5a3ac` used physical batch `1024` and
+gradient accumulation `1`. It started at `2026-08-07T13:12:39Z` and exited at
+`2026-08-08T08:11:00Z` with `Error: total is not finite: NaN`. The last durable
+checkpoint is step `18,500 / 28,672` (64.5%), at sequential step `2,116 / 4,096`;
+the failure occurred before the step-19,000 checkpoint. There is no completed
+`train_report.json`, synthetic eval report, or ARC-AGI-3 eval report.
+
+Every saved checkpoint reports SIGReg exactly at its `10,000` clamp, including the
+first 500 steps. At step 18,500 the sequential lesson's accumulated means were
+`total=34.5368`, `next_latent=0.04187`, `rollout=0.01722`, `sigreg=10000`, and
+`prefix=0.01066`. The saturated SIGReg term contributed a constant `30` to total
+loss and did not provide a useful training signal. The terminal component cannot be
+identified from the captured error: the trainer checks `total` before its named
+constituents, and multi-horizon prefix plus PTRM rank are not reported separately.
+
+```bash
+P2_DEVICE=cuda \
+P2_OUTPUT_DIR=runs/p2/readiness-v3 \
+P2_PHYSICAL_BATCH=1024 \
+P2_GRAD_ACCUM=1 \
+RAYON_NUM_THREADS=64 \
+TOFY_P2_PREFETCH_WORKERS=32 \
+TOFY_P2_PREFETCH_LOOKAHEAD=16 \
+TOFY_P2_PREFETCH_QUEUE_DEPTH=32 \
+MAX_REPAIR_ATTEMPTS=0 \
+bash scripts/p2_readiness_train.sh run
+```
+
+#### Readiness-v3 repair evidence
+
+Fast CPU regressions isolated the stability chain before resume:
+
+- the 16-step prefix recurrence reached RMS `4083.7` and `19335.5` instead of
+  remaining on the encoder's unit-RMS latent support;
+- `clip_gradients_gpu` returned success for a NaN global norm, allowing a bad
+  gradient to reach the optimizer;
+- the hard SIGReg clamp had exactly zero gradient above `10,000`; and
+- aggregate `total` was checked before its constituents, while Q surprise, PTRM rank,
+  and multi-horizon prefix were not named separately.
+
+The repair unit-normalizes every prefix prediction, uses bounded smooth losses that
+retain gradients, rejects non-finite gradient norms before the optimizer, and checks
+every named constituent before `total`. All four regression tests fail on the old
+behavior and pass after the repair. A one-episode CUDA eval also loaded the step-18,500
+checkpoint successfully (`dyn_mse=0.000574`, `plan_mse=0.000471`), confirming the
+durable checkpoint itself is finite.
+
+```bash
+cargo test --lib p2::model::tests::prefix_rollout_stays_on_unit_rms_latent_support -- --exact
+cargo test --lib p2::optimizer::tests::gradient_clip_rejects_non_finite_norm -- --exact
+cargo test --lib p2::train::tests::sigreg_cap_retains_gradient_above_reported_limit -- --exact
+cargo test --lib p2::train::tests::loss_check_reports_constituent_before_non_finite_total -- --exact
+```
 
 ## Best So Far
 

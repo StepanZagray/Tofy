@@ -61,7 +61,7 @@ fn prefetch_worker_count() -> usize {
     std::env::var("TOFY_P2_PREFETCH_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| rayon::current_num_threads().max(2).min(32))
+        .unwrap_or_else(|| rayon::current_num_threads().clamp(2, 32))
 }
 
 fn prefetch_queue_depth() -> usize {
@@ -97,10 +97,7 @@ impl BatchPrefetcher {
                     let req = {
                         let mut guard = work.pending.lock().expect("prefetch work queue");
                         while guard.is_empty() && !cancelled.load(Ordering::Relaxed) {
-                            guard = work
-                                .notify
-                                .wait(guard)
-                                .expect("prefetch work notify");
+                            guard = work.notify.wait(guard).expect("prefetch work notify");
                         }
                         if cancelled.load(Ordering::Relaxed) && guard.is_empty() {
                             None
@@ -238,6 +235,12 @@ impl BatchPrefetcher {
             out.push(self.recv()?);
         }
         Ok(out)
+    }
+}
+
+impl Default for BatchPrefetcher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

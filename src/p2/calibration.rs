@@ -28,7 +28,8 @@ pub fn expected_calibration_error(probs: &[f32], labels: &[bool], n_bins: usize)
             continue;
         }
         let acc = bucket_labels.iter().filter(|&&y| y).count() as f64 / bucket_probs.len() as f64;
-        let conf = bucket_probs.iter().map(|p| f64::from(*p)).sum::<f64>() / bucket_probs.len() as f64;
+        let conf =
+            bucket_probs.iter().map(|p| f64::from(*p)).sum::<f64>() / bucket_probs.len() as f64;
         ece += (bucket_probs.len() as f64 / n) * (acc - conf).abs();
     }
     Some(ece)
@@ -54,24 +55,19 @@ pub fn binary_auroc(scores: &[f32], labels: &[bool]) -> Option<f64> {
             j += 1;
         }
         let avg_rank = ((i + j + 1) as f64) / 2.0;
-        for k in i..j {
-            if pairs[k].1 {
+        for &(_, positive) in &pairs[i..j] {
+            if positive {
                 rank_sum_pos += avg_rank;
             }
         }
         i = j;
     }
-    let auc = (rank_sum_pos - (n_pos * (n_pos + 1)) as f64 / 2.0)
-        / (n_pos as f64 * n_neg as f64);
+    let auc = (rank_sum_pos - (n_pos * (n_pos + 1)) as f64 / 2.0) / (n_pos as f64 * n_neg as f64);
     Some(auc.clamp(0.0, 1.0))
 }
 
 /// Risk (1 - accuracy on kept set) at each coverage bucket, sorted by descending score.
-pub fn risk_coverage_buckets(
-    scores: &[f32],
-    labels: &[bool],
-    n_buckets: usize,
-) -> Vec<(f64, f64)> {
+pub fn risk_coverage_buckets(scores: &[f32], labels: &[bool], n_buckets: usize) -> Vec<(f64, f64)> {
     if scores.len() != labels.len() || scores.is_empty() || n_buckets == 0 {
         return Vec::new();
     }

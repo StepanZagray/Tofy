@@ -2,26 +2,23 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
+use crate::p2::cg_profile::StepProfileCapture;
 use crate::p2::data::{
     generate_curriculum, ArcFrame, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
-use crate::p2::cg_profile::StepProfileCapture;
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth,
-    RecursionOpts, WorldModel,
-    ACTION_VOCAB, DEFAULT_NUM_EVENTS, PIXEL_CHANNELS, PREFIX_HORIZONS,
+    flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
+    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, PIXEL_CHANNELS, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
-use crate::p2::optimizer::{
-    accumulate_grad_store, clip_gradients_gpu, CheckpointHybridOptimizer,
-};
+use crate::p2::optimizer::{accumulate_grad_store, clip_gradients_gpu, CheckpointHybridOptimizer};
 use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest};
 use crate::p2::sigreg::sigreg_epps_pulley_seeded;
 use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor};
+use candle_graph::SpanKind;
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
-use candle_graph::SpanKind;
 use candle_nn::{VarBuilder, VarMap};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -59,6 +56,8 @@ const ROLLOUT_STEP_LOSS_CAP: f64 = 10.0;
 const ROLLOUT_ERROR_RESET: f32 = 5.0;
 /// Penalize high Q when latent error is large (anti-hallucination).
 const Q_SURPRISE_WEIGHT: f64 = 0.1;
+/// Smooth forward bound for SIGReg while retaining gradients above the limit.
+const SIGREG_LOSS_CAP: f64 = 10_000.0;
 /// Global gradient L2 clip for recursive training stability.
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
@@ -81,11 +80,14 @@ pub fn resolved_lesson_steps(cfg: &TrainConfig) -> Vec<usize> {
         .collect()
 }
 
-pub fn global_step_from_cursor(lesson_steps: &[usize], lesson_index: usize, step_in_lesson: usize) -> u64 {
+pub fn global_step_from_cursor(
+    lesson_steps: &[usize],
+    lesson_index: usize,
+    step_in_lesson: usize,
+) -> u64 {
     let prior: usize = lesson_steps.iter().take(lesson_index).sum();
     (prior + step_in_lesson) as u64
 }
-
 
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PAUSE_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
@@ -139,10 +141,7 @@ pub struct TrainConfig {
     #[serde(default = "default_phased_training")]
     pub phased_training: bool,
     /// Stop-gradient on predicted `y` for event loss only (Q keeps full gradients).
-    #[serde(
-        default = "default_stop_grad_event_y",
-        alias = "stop_grad_auxiliary_y"
-    )]
+    #[serde(default = "default_stop_grad_event_y", alias = "stop_grad_auxiliary_y")]
     pub stop_grad_event_y: bool,
     /// Pre-LN residual dynamics update (see `ModelConfig.residual_y_update`).
     #[serde(default)]
@@ -494,10 +493,7 @@ struct TrainingContract {
     #[serde(default)]
     supervise_last_outer_only: bool,
     phased_training: bool,
-    #[serde(
-        default = "default_stop_grad_event_y",
-        alias = "stop_grad_auxiliary_y"
-    )]
+    #[serde(default = "default_stop_grad_event_y", alias = "stop_grad_auxiliary_y")]
     stop_grad_event_y: bool,
     #[serde(default)]
     residual_y_update: bool,
@@ -784,8 +780,8 @@ pub fn frames_to_one_hot(frames: &[ArcFrame], device: &Device) -> Result<Tensor>
         })?;
 
     let indices = Tensor::from_vec(indices, (b, 1, FRAME_SIDE, FRAME_SIDE), device)?;
-    let channels = Tensor::arange(0u8, PIXEL_CHANNELS as u8, device)?
-        .reshape((1, PIXEL_CHANNELS, 1, 1))?;
+    let channels =
+        Tensor::arange(0u8, PIXEL_CHANNELS as u8, device)?.reshape((1, PIXEL_CHANNELS, 1, 1))?;
     // Broadcast compare lands directly in NCHW, so there is no transpose/contiguous
     // pass afterwards.
     indices
@@ -844,6 +840,43 @@ pub struct BatchTensors {
     pub event_mask: Tensor,
 }
 
+pub fn action_tensors_from_samples(
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let actions: Vec<u32> = samples
+        .par_iter()
+        .map(|sample| {
+            let id = sample.action.id as u32;
+            if !(1..ACTION_VOCAB as u32).contains(&id) {
+                bail!("action id {id} out of official range 1..{ACTION_VOCAB}");
+            }
+            match (id, sample.action.x, sample.action.y) {
+                (6, Some(_), Some(_)) | (1..=5, None, None) | (7, None, None) => Ok(id),
+                (6, _, _) => bail!("ACTION6 requires a complete coordinate pair"),
+                (_, Some(_), _) | (_, _, Some(_)) => {
+                    bail!("coordinates are only valid for ACTION6")
+                }
+                _ => bail!("invalid action conditioning"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let actions = Tensor::from_vec(actions, (samples.len(),), device)?;
+    let coords: Vec<f32> = samples
+        .par_iter()
+        .map(|sample| match (sample.action.x, sample.action.y) {
+            (Some(x), Some(y)) => Ok([f32::from(x) / 63.0, f32::from(y) / 63.0]),
+            (None, None) => Ok([0.0, 0.0]),
+            _ => Err(anyhow::anyhow!("action coordinate pair is incomplete")),
+        })
+        .collect::<Result<Vec<[f32; 2]>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let action_coords = Tensor::from_vec(coords, (samples.len(), 2), device)?;
+    Ok((actions, action_coords))
+}
+
 pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Result<BatchTensors> {
     if samples.is_empty() {
         bail!("empty batch");
@@ -856,31 +889,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
     );
     let frames = frames?;
     let next_frames = next_frames?;
-    let actions: Vec<u32> = samples
-        .par_iter()
-        .map(|s| {
-            let id = s.action.id as u32;
-            if id as usize >= ACTION_VOCAB {
-                bail!("action id {id} out of ACTION_VOCAB={ACTION_VOCAB}");
-            }
-            Ok(id)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let actions = Tensor::from_vec(actions, (samples.len(),), device)?;
-    let coords: Vec<f32> = samples
-        .par_iter()
-        .map(|sample| {
-            match (sample.action.x, sample.action.y) {
-                (Some(x), Some(y)) => Ok([f32::from(x) / 63.0, f32::from(y) / 63.0]),
-                (None, None) => Ok([0.0, 0.0]),
-                _ => Err(anyhow::anyhow!("action coordinate pair is incomplete")),
-            }
-        })
-        .collect::<Result<Vec<[f32; 2]>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    let action_coords = Tensor::from_vec(coords, (samples.len(), 2), device)?;
+    let (actions, action_coords) = action_tensors_from_samples(samples, device)?;
     let goals: Vec<f32> = samples
         .iter()
         .flat_map(|s| s.goal_features.values.iter().copied())
@@ -1050,7 +1059,9 @@ impl EpisodeCache {
             };
             let generated: Vec<Vec<TransitionSample>> = (0..wave)
                 .into_par_iter()
-                .map(|offset| generate_curriculum(curriculum, seed, next.wrapping_add(offset), split))
+                .map(|offset| {
+                    generate_curriculum(curriculum, seed, next.wrapping_add(offset), split)
+                })
                 .collect::<Result<_>>()?;
             self.episodes.extend(generated);
             self.trim_excess();
@@ -1078,9 +1089,7 @@ impl EpisodeCache {
         start_episode: u64,
         split: Split,
     ) -> std::result::Result<Vec<TransitionSample>, u64> {
-        if !self.key_matches(curriculum, seed, split)
-            || start_episode < self.first_episode
-        {
+        if !self.key_matches(curriculum, seed, split) || start_episode < self.first_episode {
             return Err(start_episode);
         }
         let skip = (start_episode - self.first_episode) as usize;
@@ -1141,7 +1150,12 @@ fn bce_with_logits(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
 }
 
 /// Whether this optimizer step should include PTRM ranking loss.
-pub fn ptrm_rank_this_step(lesson: &str, global_step: u64, every: usize, baseline_d1: bool) -> bool {
+pub fn ptrm_rank_this_step(
+    lesson: &str,
+    global_step: u64,
+    every: usize,
+    baseline_d1: bool,
+) -> bool {
     if baseline_d1 {
         return false;
     }
@@ -1218,7 +1232,12 @@ pub fn lesson_loss_weights(
             rollout: cfg.rollout_weight,
             prefix: cfg.prefix_weight,
             reliability: cfg.reliability_weight,
-            ptrm_rank: ptrm_rank_this_step(lesson, global_step, cfg.ptrm_rank_every, cfg.baseline_d1),
+            ptrm_rank: ptrm_rank_this_step(
+                lesson,
+                global_step,
+                cfg.ptrm_rank_every,
+                cfg.baseline_d1,
+            ),
             ptrm_rank_k: ptrm_rank_k_for_lesson(lesson),
         };
     }
@@ -1336,7 +1355,11 @@ pub fn rollout_horizon_for_lesson(
 }
 
 /// Ramp open-loop horizon 2 → 4 → 8 → 16 within a lesson when phased training is on.
-pub fn rollout_horizon(step_in_lesson: usize, steps_per_lesson: usize, max_horizon: usize) -> usize {
+pub fn rollout_horizon(
+    step_in_lesson: usize,
+    steps_per_lesson: usize,
+    max_horizon: usize,
+) -> usize {
     let max_horizon = max_horizon.max(2);
     if steps_per_lesson == 0 {
         return max_horizon;
@@ -1429,6 +1452,7 @@ fn masked_bce_with_slot_weights(
         .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ptrm_ranking_loss(
     model: &WorldModel,
     cur_z: &Tensor,
@@ -1468,11 +1492,7 @@ pub fn ptrm_ranking_loss(
     let q_logits = Tensor::stack(&q_rows, 1)?;
     let y_stack = Tensor::stack(&y_rows, 1)?;
     let target = next_z.unsqueeze(1)?.broadcast_as(y_stack.dims())?;
-    let mse = y_stack
-        .sub(&target)?
-        .sqr()?
-        .flatten_from(2)?
-        .mean(2)?;
+    let mse = y_stack.sub(&target)?.sqr()?.flatten_from(2)?.mean(2)?;
     let labels = mse.argmin(1)?.to_dtype(DType::U32)?;
     candle_nn::loss::cross_entropy(&q_logits, &labels).map_err(Into::into)
 }
@@ -1506,14 +1526,15 @@ pub fn prefix_multi_horizon_loss(
         }
         let start = batch_from_samples(&[samples[0].clone()], device)?;
         let mut z = model.encode_state(&start.frames)?;
-        for step in 0..horizon {
-            let batch = batch_from_samples(&[samples[step].clone()], device)?;
+        for sample in samples.iter().take(horizon) {
+            let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
             z = model.prefix_predict(&z, &batch.actions, &batch.action_coords)?;
         }
-        let target = model.encode_state(&batch_from_samples(&[samples[horizon].clone()], device)?.frames)?;
+        let target =
+            model.encode_state(&batch_from_samples(&[samples[horizon].clone()], device)?.frames)?;
         let w = prefix_horizon_weight(horizon);
-        let mse = candle_nn::loss::mse(&z, &target)?;
-        let term = mse.affine(w, 0.0)?;
+        let robust = candle_nn::loss::huber(&z, &target, 1.0)?;
+        let term = smooth_cap_nonnegative(&robust, ROLLOUT_STEP_LOSS_CAP)?.affine(w, 0.0)?;
         total = Some(match total {
             None => term,
             Some(acc) => acc.add(&term)?,
@@ -1522,7 +1543,10 @@ pub fn prefix_multi_horizon_loss(
     }
     total
         .ok_or_else(|| anyhow::anyhow!("prefix trace too short"))
-        .and_then(|t| t.affine(1.0 / weight_sum.max(1e-8), 0.0).map_err(Into::into))
+        .and_then(|t| {
+            t.affine(1.0 / weight_sum.max(1e-8), 0.0)
+                .map_err(Into::into)
+        })
 }
 
 #[cfg(test)]
@@ -1559,8 +1583,53 @@ pub struct LossBreakdown {
     pub sigreg: Tensor,
     pub event: Tensor,
     pub q: Tensor,
+    pub q_surprise: Tensor,
+    pub ptrm_rank: Tensor,
     pub prefix: Tensor,
     pub reliability: Tensor,
+}
+
+#[derive(Debug)]
+struct CheckedTrainingLosses {
+    total: f32,
+    next_latent: f32,
+    rollout: f32,
+    sigreg: f32,
+    event: f32,
+    q: f32,
+    prefix: f32,
+    reliability: f32,
+}
+
+fn checked_training_losses(
+    losses: &LossBreakdown,
+    rollout: &Tensor,
+    prefix_multi: &Tensor,
+    total: &Tensor,
+) -> Result<CheckedTrainingLosses> {
+    let values = ensure_all_finite(&[
+        ("next_latent", &losses.next_latent),
+        ("rollout", rollout),
+        ("sigreg", &losses.sigreg),
+        ("event", &losses.event),
+        ("q", &losses.q),
+        ("q_surprise", &losses.q_surprise),
+        ("ptrm_rank", &losses.ptrm_rank),
+        ("prefix", &losses.prefix),
+        ("prefix_multi", prefix_multi),
+        ("reliability", &losses.reliability),
+        ("total", total),
+    ])?;
+    Ok(CheckedTrainingLosses {
+        total: values[10],
+        next_latent: values[0],
+        rollout: values[1],
+        sigreg: values[2],
+        event: values[3],
+        q: values[4],
+        prefix: values[7],
+        reliability: values[9],
+    })
 }
 
 /// Randomly subsample SIGReg rows to cap activation memory.
@@ -1592,20 +1661,24 @@ pub fn stack_latents_for_sigreg(
             (cur_z.clone(), next_z.clone())
         };
         let (b, c, h, w) = cur.dims4()?;
-        let cur = cur
-            .permute((0, 2, 3, 1))?
-            .reshape((b * h * w, c))?;
-        let next = next
-            .permute((0, 2, 3, 1))?
-            .reshape((b * h * w, c))?;
+        let cur = cur.permute((0, 2, 3, 1))?.reshape((b * h * w, c))?;
+        let next = next.permute((0, 2, 3, 1))?.reshape((b * h * w, c))?;
         Tensor::cat(&[cur, next], 0).map_err(Into::into)
     } else {
-        Tensor::stack(
-            &[flatten_latent(cur_z)?, flatten_latent(next_z)?],
-            0,
-        )
-        .map_err(Into::into)
+        Tensor::stack(&[flatten_latent(cur_z)?, flatten_latent(next_z)?], 0).map_err(Into::into)
     }
+}
+
+fn smooth_cap_nonnegative(raw: &Tensor, cap: f64) -> Result<Tensor> {
+    let nonnegative = raw.clamp(0.0, f64::INFINITY)?;
+    nonnegative
+        .affine(cap, 0.0)?
+        .div(&nonnegative.affine(1.0, cap)?)
+        .map_err(Into::into)
+}
+
+fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
+    smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
 fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
@@ -1676,25 +1749,20 @@ pub fn leworld_loss(
     };
 
     let stack = subsample_sigreg_rows(
-        &stack_latents_for_sigreg(
-            &cur_z,
-            &next_z,
-            cfg.sigreg_spatial,
-            cfg.sigreg_spatial_pool,
-        )?,
+        &stack_latents_for_sigreg(&cur_z, &next_z, cfg.sigreg_spatial, cfg.sigreg_spatial_pool)?,
         effective_sigreg_max_rows(cfg),
         sigreg_seed.wrapping_add(0x5196_0001),
     )?;
-    let sigreg = sigreg_epps_pulley_seeded(
+    let sigreg = bounded_sigreg_loss(&sigreg_epps_pulley_seeded(
         &stack,
         cfg.sigreg_projections,
         cfg.sigreg_knots,
         sigreg_seed,
-    )?
-    .clamp(0.0, 10_000.0)?;
+    )?)?;
 
     let device = batch.frames.device();
-    let zero_scalar = || -> Result<Tensor> { Tensor::zeros((), DType::F32, device).map_err(Into::into) };
+    let zero_scalar =
+        || -> Result<Tensor> { Tensor::zeros((), DType::F32, device).map_err(Into::into) };
 
     let (event_raw, event) = if weights.event > 0.0 {
         let slot_weights = event_slot_weight_tensor(batch.frames.dim(0)?, device)?;
@@ -1756,15 +1824,17 @@ pub fn leworld_loss(
         .add(&q.affine(weights.q, 0.0)?)?
         .add(&reliability.affine(weights.reliability, 0.0)?)?
         .add(&prefix.affine(weights.prefix, 0.0)?)?;
-    if weights.q > 0.0 && !cfg.stop_grad_q_y {
+    let q_surprise = if weights.q > 0.0 && !cfg.stop_grad_q_y {
         let q_logit = out.q_logit.clone();
         let q_prob = candle_nn::ops::sigmoid(&q_logit)?;
         let mse_per = latent_mse_per_sample(&out.y, &next_z)?;
-        let surprise = q_prob.mul(&mse_per)?.mean_all()?;
-        total = total.add(&surprise.affine(Q_SURPRISE_WEIGHT, 0.0)?)?;
-    }
-    if weights.ptrm_rank {
-        let rank = ptrm_ranking_loss(
+        q_prob.mul(&mse_per)?.mean_all()?
+    } else {
+        zero_scalar()?
+    };
+    total = total.add(&q_surprise.affine(Q_SURPRISE_WEIGHT, 0.0)?)?;
+    let ptrm_rank = if weights.ptrm_rank {
+        ptrm_ranking_loss(
             model,
             &cur_z,
             batch,
@@ -1773,9 +1843,11 @@ pub fn leworld_loss(
             weights.ptrm_rank_k,
             0.1,
             sigreg_seed.wrapping_add(1),
-        )?;
-        total = total.add(&rank.affine(PTRM_RANK_WEIGHT, 0.0)?)?;
-    }
+        )?
+    } else {
+        zero_scalar()?
+    };
+    total = total.add(&ptrm_rank.affine(PTRM_RANK_WEIGHT, 0.0)?)?;
 
     Ok(LossBreakdown {
         total,
@@ -1783,6 +1855,8 @@ pub fn leworld_loss(
         sigreg,
         event: event_raw,
         q: q_raw,
+        q_surprise,
+        ptrm_rank,
         prefix: prefix_raw,
         reliability: rel_raw,
     })
@@ -1836,7 +1910,12 @@ fn enqueue_batch_prefetch(
     global_step: u64,
     accum: usize,
 ) -> Result<()> {
-    prefetcher.submit_many(&batch_prefetch_requests(curriculum, cfg, global_step, accum))
+    prefetcher.submit_many(&batch_prefetch_requests(
+        curriculum,
+        cfg,
+        global_step,
+        accum,
+    ))
 }
 
 fn prefetch_lookahead_steps() -> u64 {
@@ -1859,18 +1938,13 @@ fn top_up_prefetch(
     prefetcher.poll();
     let want_through = global_step.saturating_add(prefetch_lookahead_steps());
     while *prefetched_through_step < want_through {
-        enqueue_batch_prefetch(
-            prefetcher,
-            curriculum,
-            cfg,
-            *prefetched_through_step,
-            accum,
-        )?;
+        enqueue_batch_prefetch(prefetcher, curriculum, cfg, *prefetched_through_step, accum)?;
         *prefetched_through_step = prefetched_through_step.saturating_add(1);
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_one_micro_sample_batch(
     micro: usize,
     accum: usize,
@@ -1886,13 +1960,8 @@ fn collect_one_micro_sample_batch(
             .expect("prefetch enabled without prefetcher")
             .recv();
     }
-    let episode_start = scheduled_episode_start(
-        cfg.seed,
-        global_step,
-        micro,
-        accum,
-        cfg.shuffled_episodes,
-    );
+    let episode_start =
+        scheduled_episode_start(cfg.seed, global_step, micro, accum, cfg.shuffled_episodes);
     if cfg.shuffled_episodes {
         collect_batch_uncached(
             curriculum,
@@ -1945,29 +2014,21 @@ pub fn open_loop_latent_loss(
         )?;
         let target = targets.narrow(0, step, 1)?;
         let mse = candle_nn::loss::huber(&predicted.y, &target, 1.0)?;
-        let capped = mse.clamp(0.0, ROLLOUT_STEP_LOSS_CAP)?;
+        let capped = smooth_cap_nonnegative(&mse, ROLLOUT_STEP_LOSS_CAP)?;
         total = Some(match total {
             None => capped,
             Some(acc) => acc.add(&capped)?,
         });
         n += 1;
         let teacher = teacher_mix > 0.0 && rng.random::<f64>() < teacher_mix;
-        let reset = mse
-            .mean_all()?
-            .gt(ROLLOUT_ERROR_RESET as f64)?
-            .to_dtype(DType::F32)?;
+        let reset = mse.mean_all()?.gt(ROLLOUT_ERROR_RESET as f64)?;
         if teacher {
             latent = target.detach();
         } else {
             let reset_mask = reset
-                .to_dtype(predicted.y.dtype())?
                 .reshape((1, 1, 1, 1))?
                 .broadcast_as(predicted.y.dims())?;
-            let keep_pred = (Tensor::ones_like(&reset_mask)? - &reset_mask)?;
-            latent = predicted
-                .y
-                .mul(&keep_pred)?
-                .add(&target.detach().mul(&reset_mask)?)?;
+            latent = reset_mask.where_cond(&target.detach(), &predicted.y)?;
         }
     }
     total
@@ -2048,8 +2109,7 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
 }
 
 fn save_export_snapshot(varmap: &VarMap, output_dir: &Path) -> Result<()> {
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("create {}", output_dir.display()))?;
+    fs::create_dir_all(output_dir).with_context(|| format!("create {}", output_dir.display()))?;
     let path = output_dir.join("model.best.safetensors");
     let tmp = output_dir.join("model.best.safetensors.tmp");
     varmap
@@ -2354,9 +2414,8 @@ fn save_training_checkpoint(
                 final_dir.display()
             );
         }
-        fs::remove_dir_all(&final_dir).with_context(|| {
-            format!("remove incomplete checkpoint {}", final_dir.display())
-        })?;
+        fs::remove_dir_all(&final_dir)
+            .with_context(|| format!("remove incomplete checkpoint {}", final_dir.display()))?;
     }
     let staging = checkpoints.join(format!(".{directory}.tmp-{}", std::process::id()));
     fs::create_dir(&staging).with_context(|| format!("create {}", staging.display()))?;
@@ -2418,7 +2477,8 @@ fn load_training_checkpoint(
             effective_batch_contract(&state.contract),
         );
         state.contract = requested;
-        if (state.contract.physical_batch, state.contract.grad_accum) != (saved_batch.0, saved_batch.1)
+        if (state.contract.physical_batch, state.contract.grad_accum)
+            != (saved_batch.0, saved_batch.1)
             && saved_batch.2 == effective_batch_contract(&state.contract)
         {
             tracing::info!(
@@ -2460,7 +2520,8 @@ fn load_training_checkpoint(
     {
         bail!("checkpoint step_in_lesson exceeds lesson budget");
     }
-    let expected_step = global_step_from_cursor(&lesson_steps, state.lesson_index, state.step_in_lesson);
+    let expected_step =
+        global_step_from_cursor(&lesson_steps, state.lesson_index, state.step_in_lesson);
     if state.global_step != expected_step as u64 {
         bail!(
             "checkpoint global step {} disagrees with lesson cursor {}",
@@ -2541,11 +2602,7 @@ fn build_report(
     }
 }
 
-fn publish_run_artifacts(
-    varmap: &VarMap,
-    cfg: &TrainConfig,
-    report: &TrainReport,
-) -> Result<()> {
+fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport) -> Result<()> {
     save_checkpoint(varmap, cfg, report)?;
     let _ = report;
     Ok(())
@@ -2586,22 +2643,14 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     let model = WorldModel::new(model_cfg, vb)?;
     let adam = adam_params(cfg);
     let mut optimizer = if cfg.use_muon {
-        CheckpointHybridOptimizer::new(
-            &varmap,
-            adam,
-            cfg.muon_momentum,
-            cfg.muon_rms_scale,
-        )?
+        CheckpointHybridOptimizer::new(&varmap, adam, cfg.muon_momentum, cfg.muon_rms_scale)?
     } else {
         bail!("use_muon=false is no longer supported; Muon+AdamW hybrid is required");
     };
     let parameter_names = optimizer.parameter_names();
     let parameter_count = parameter_count(&varmap);
 
-    let resume_source = cfg
-        .resume
-        .clone()
-        .or_else(|| implicit_resume_source(cfg));
+    let resume_source = cfg.resume.clone().or_else(|| implicit_resume_source(cfg));
     let resumed_from = resume_source
         .as_deref()
         .map(resolve_resume_checkpoint)
@@ -2647,12 +2696,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let complete = state.lesson_index == cfg.lessons.len();
         if complete {
             if latest_checkpoint.is_none() {
-                latest_checkpoint = Some(save_training_checkpoint(
-                    &varmap,
-                    &optimizer,
-                    &state,
-                    cfg,
-                )?);
+                latest_checkpoint =
+                    Some(save_training_checkpoint(&varmap, &optimizer, &state, cfg)?);
             }
             let report = build_report(
                 cfg,
@@ -2701,22 +2746,13 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let prof = profile.enabled();
         let accum = cfg.grad_accum.max(1);
         let sigreg_seed = cfg.seed.wrapping_add(state.global_step);
-        let loss_weights = lesson_loss_weights(
-            lesson,
-            cfg,
-            state.step_in_lesson,
-            state.global_step,
-        );
+        let loss_weights =
+            lesson_loss_weights(lesson, cfg, state.step_in_lesson, state.global_step);
         let depth = sample_recursion_depth(cfg, state.global_step);
-        let run_rollout_this_step = loss_weights.rollout > 0.0
-            && matches!(lesson.as_str(), "sequential" | "retarget");
-        let rollout_episode_start = scheduled_episode_start(
-            cfg.seed,
-            state.global_step,
-            0,
-            accum,
-            cfg.shuffled_episodes,
-        );
+        let run_rollout_this_step =
+            loss_weights.rollout > 0.0 && matches!(lesson.as_str(), "sequential" | "retarget");
+        let rollout_episode_start =
+            scheduled_episode_start(cfg.seed, state.global_step, 0, accum, cfg.shuffled_episodes);
         let mut rollout_trace_handle = if run_rollout_this_step {
             let curriculum_owned = curriculum.to_string();
             let seed = cfg.seed;
@@ -2791,12 +2827,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         Split::Train,
                     ) {
                         Ok(trace) => trace,
-                        Err(resume_from) => collect_rollout_trace(
-                            curriculum,
-                            cfg.seed,
-                            resume_from,
-                            Split::Train,
-                        )?,
+                        Err(resume_from) => {
+                            collect_rollout_trace(curriculum, cfg.seed, resume_from, Split::Train)?
+                        }
                     }
                 });
             }
@@ -2811,18 +2844,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             let run_rollout = micro == 0
                 && loss_weights.rollout > 0.0
                 && matches!(lesson.as_str(), "sequential" | "retarget");
-            let (micro_losses, micro_rollout, micro_total) = {
+            let (micro_losses, micro_rollout, micro_prefix_multi, micro_total) = {
                 let _cg = cg_profile.span("forward", SpanKind::Function);
                 timed(prof, &device, &mut profile.forward, || {
                     let _span = tracing::info_span!("forward").entered();
-                    let losses = leworld_loss(
-                        &model,
-                        &batch,
-                        cfg,
-                        depth,
-                        micro_sigreg_seed,
-                        loss_weights,
-                    )?;
+                    let losses =
+                        leworld_loss(&model, &batch, cfg, depth, micro_sigreg_seed, loss_weights)?;
                     let rollout_trace = if run_rollout {
                         rollout_trace_cache.as_ref()
                     } else {
@@ -2846,22 +2873,18 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                             &device,
                             horizon,
                             depth,
-                            rollout_teacher_mix(
-                                lesson,
-                                state.step_in_lesson,
-                                active_lesson_steps,
-                            ),
+                            rollout_teacher_mix(lesson, state.step_in_lesson, active_lesson_steps),
                             cfg.seed.wrapping_add(state.global_step),
                         )?
                     } else {
                         Tensor::zeros((), DType::F32, &device)?
                     };
-                    let prefix_multi = if rollout_trace.is_some() && loss_weights.prefix > 0.0 {
-                        prefix_multi_horizon_loss(
-                            &model,
-                            rollout_trace.unwrap(),
-                            &device,
-                        )?
+                    let prefix_multi = if let Some(trace) = rollout_trace {
+                        if loss_weights.prefix > 0.0 {
+                            prefix_multi_horizon_loss(&model, trace, &device)?
+                        } else {
+                            Tensor::zeros((), DType::F32, &device)?
+                        }
                     } else {
                         Tensor::zeros((), DType::F32, &device)?
                     };
@@ -2869,30 +2892,24 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         .total
                         .add(&rollout.affine(loss_weights.rollout, 0.0)?)?
                         .add(&prefix_multi.affine(loss_weights.prefix, 0.0)?)?;
-                    Ok((losses, rollout, total))
+                    Ok((losses, rollout, prefix_multi, total))
                 })?
             };
-            let micro_vals = ensure_all_finite(&[
-                ("total", &micro_total),
-                ("next_latent", &micro_losses.next_latent),
-                ("rollout", &micro_rollout),
-                ("sigreg", &micro_losses.sigreg),
-                ("event", &micro_losses.event),
-                ("q", &micro_losses.q),
-                // Both feed `total`, so a NaN here poisons the step; they were
-                // previously neither guarded nor reported.
-                ("prefix", &micro_losses.prefix),
-                ("reliability", &micro_losses.reliability),
-            ])?;
+            let micro_vals = checked_training_losses(
+                &micro_losses,
+                &micro_rollout,
+                &micro_prefix_multi,
+                &micro_total,
+            )?;
             let inv = 1.0 / accum_f;
-            step_metrics.total += micro_vals[0] as f64 * inv;
-            step_metrics.next_latent += micro_vals[1] as f64 * inv;
-            step_metrics.rollout += micro_vals[2] as f64 * inv;
-            step_metrics.sigreg += micro_vals[3] as f64 * inv;
-            step_metrics.event += micro_vals[4] as f64 * inv;
-            step_metrics.q += micro_vals[5] as f64 * inv;
-            step_metrics.prefix += micro_vals[6] as f64 * inv;
-            step_metrics.reliability += micro_vals[7] as f64 * inv;
+            step_metrics.total += micro_vals.total as f64 * inv;
+            step_metrics.next_latent += micro_vals.next_latent as f64 * inv;
+            step_metrics.rollout += micro_vals.rollout as f64 * inv;
+            step_metrics.sigreg += micro_vals.sigreg as f64 * inv;
+            step_metrics.event += micro_vals.event as f64 * inv;
+            step_metrics.q += micro_vals.q as f64 * inv;
+            step_metrics.prefix += micro_vals.prefix as f64 * inv;
+            step_metrics.reliability += micro_vals.reliability as f64 * inv;
 
             let scaled_micro = micro_total.affine(inv, 0.0)?;
             let micro_grads = {
@@ -2992,7 +3009,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
         profile.steps += 1;
         profile.report(state.global_step);
-        if malloc_trim_every > 0 && state.global_step as usize % malloc_trim_every == 0 {
+        if malloc_trim_every > 0 && (state.global_step as usize).is_multiple_of(malloc_trim_every) {
             crate::alloc::trim_host_heap();
         }
         if requested_pause && !complete {
@@ -3017,9 +3034,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Var;
     use crate::domain::Split;
     use crate::p2::data::{ArcAction, GoalFeatures};
+    use candle_core::Var;
 
     fn resume_test_config(output_dir: PathBuf) -> TrainConfig {
         TrainConfig {
@@ -3157,7 +3174,10 @@ mod tests {
         assert!(pix.iter().all(|&v| v == 3));
 
         let one_hot = frames_to_one_hot(
-            &samples.iter().map(|s| s.current.clone()).collect::<Vec<_>>(),
+            &samples
+                .iter()
+                .map(|s| s.current.clone())
+                .collect::<Vec<_>>(),
             &device,
         )?;
         assert_eq!(one_hot.dims(), &[2, 16, 64, 64]);
@@ -3356,14 +3376,18 @@ mod tests {
                 .get(&logit_var)
                 .expect("logit gradient")
                 .to_vec1::<f32>()?;
-            assert!(g.iter().all(|v| v.is_finite()), "gradient not finite: {g:?}");
+            assert!(
+                g.iter().all(|v| v.is_finite()),
+                "gradient not finite: {g:?}"
+            );
         }
 
         // Matches the closed form on values where the naive version is safe.
         let mid = Tensor::new(&[-2.0f32, -0.5, 0.5, 3.0], &device)?;
         let t = Tensor::new(&[0.0f32, 1.0, 0.0, 1.0], &device)?;
         let got = bce_with_logits(&mid, &t)?.to_scalar::<f32>()?;
-        let want = candle_nn::loss::binary_cross_entropy_with_logit(&mid, &t)?.to_scalar::<f32>()?;
+        let want =
+            candle_nn::loss::binary_cross_entropy_with_logit(&mid, &t)?.to_scalar::<f32>()?;
         assert!((got - want).abs() < 1e-6, "{got} vs {want}");
         Ok(())
     }
@@ -3575,6 +3599,48 @@ mod tests {
     }
 
     #[test]
+    fn sigreg_cap_retains_gradient_above_reported_limit() -> Result<()> {
+        let device = Device::Cpu;
+        let raw = Var::new(&[20_000f32], &device)?;
+        let bounded = bounded_sigreg_loss(raw.as_tensor())?.sum_all()?;
+        let grads = bounded.backward()?;
+        let gradient = grads
+            .get(raw.as_tensor())
+            .expect("SIGReg cap must retain a gradient")
+            .to_vec1::<f32>()?[0];
+        assert!(
+            gradient.is_finite() && gradient > 0.0,
+            "expected positive finite gradient above the cap, got {gradient}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loss_check_reports_constituent_before_non_finite_total() -> Result<()> {
+        let device = Device::Cpu;
+        let zero = Tensor::new(0f32, &device)?;
+        let nan = Tensor::new(f32::NAN, &device)?;
+        let losses = LossBreakdown {
+            total: nan.clone(),
+            next_latent: zero.clone(),
+            sigreg: zero.clone(),
+            event: zero.clone(),
+            q: zero.clone(),
+            q_surprise: zero.clone(),
+            ptrm_rank: zero.clone(),
+            prefix: zero.clone(),
+            reliability: zero.clone(),
+        };
+
+        let error = checked_training_losses(&losses, &zero, &nan, &nan).unwrap_err();
+        assert!(
+            error.to_string().contains("prefix_multi is not finite"),
+            "expected the originating component, got {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rollout_horizon_caps_retarget() {
         assert_eq!(rollout_horizon_for_lesson("retarget", 80, 100), 4);
         assert_eq!(rollout_horizon_for_lesson("sequential", 80, 100), 8);
@@ -3582,7 +3648,9 @@ mod tests {
 
     #[test]
     fn rollout_teacher_mix_is_higher_on_retarget() {
-        assert!(rollout_teacher_mix("retarget", 0, 100) > rollout_teacher_mix("sequential", 0, 100));
+        assert!(
+            rollout_teacher_mix("retarget", 0, 100) > rollout_teacher_mix("sequential", 0, 100)
+        );
         assert_eq!(rollout_teacher_mix("sequential", 100, 100), 0.0);
     }
 
@@ -3591,7 +3659,10 @@ mod tests {
         assert_eq!(lesson_to_curriculum("q_calibration").unwrap(), "sequential");
         assert_eq!(lesson_to_curriculum("events").unwrap(), "sequential");
         assert_eq!(lesson_to_curriculum("exploration").unwrap(), "exploration");
-        assert_eq!(lesson_to_curriculum("falsification").unwrap(), "p1c_falsification");
+        assert_eq!(
+            lesson_to_curriculum("falsification").unwrap(),
+            "p1c_falsification"
+        );
     }
 
     #[test]
@@ -3730,8 +3801,7 @@ mod tests {
 
     #[test]
     fn auto_resumes_from_output_checkpoints_without_explicit_resume() -> Result<()> {
-        let root =
-            std::env::temp_dir().join(format!("tofy-p2-auto-resume-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tofy-p2-auto-resume-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut cfg = resume_test_config(root.join("run"));
         cfg.max_steps_this_run = Some(1);
@@ -3880,8 +3950,7 @@ mod tests {
         cfg.grad_accum = 1;
         let resumed = train(&cfg)?;
         assert_eq!(resumed.status, TrainStatus::Completed);
-        let state: TrainerState =
-            read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
+        let state: TrainerState = read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
         assert_eq!(state.contract.physical_batch, 4);
         assert_eq!(state.contract.grad_accum, 1);
         assert_eq!(effective_batch_contract(&state.contract), 4);
@@ -3913,10 +3982,8 @@ mod tests {
 
     #[test]
     fn resume_allows_steady_gpu_toggle_on_explicit_resume() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "tofy-p2-resume-steady-gpu-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tofy-p2-resume-steady-gpu-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut cfg = resume_test_config(root.clone());
         cfg.max_steps_this_run = Some(1);
@@ -3926,8 +3993,7 @@ mod tests {
         cfg.steady_gpu = true;
         let resumed = train(&cfg)?;
         assert_eq!(resumed.status, TrainStatus::Completed);
-        let state: TrainerState =
-            read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
+        let state: TrainerState = read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
         assert!(state.contract.steady_gpu);
         let _ = fs::remove_dir_all(&root);
         Ok(())

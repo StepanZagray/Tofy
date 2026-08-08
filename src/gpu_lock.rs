@@ -47,12 +47,22 @@ fn process_cmdline(pid: u32) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
-    Some(buf.split(|&b| b == 0).map(|s| String::from_utf8_lossy(s)).collect::<Vec<_>>().join(" "))
+    Some(
+        buf.split(|&b| b == 0)
+            .map(|s| String::from_utf8_lossy(s))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn is_tofy_gpu_process(pid: u32) -> bool {
     process_cmdline(pid)
-        .map(|cmd| cmd.contains("tofy") && (cmd.contains("p2-train") || cmd.contains("p2-eval")))
+        .map(|cmd| {
+            cmd.contains("tofy")
+                && (cmd.contains("p2-train")
+                    || cmd.contains("p2-eval")
+                    || cmd.contains("p2-arc3-live-eval"))
+        })
         .unwrap_or(false)
 }
 

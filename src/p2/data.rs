@@ -575,8 +575,7 @@ pub fn generate_interact_one_step(
         current_pixels[agent_y as usize * FRAME_SIDE + agent_x as usize] = palette::AGENT;
         current_pixels[switch_y as usize * FRAME_SIDE + switch_x as usize] = palette::SWITCH_BASE;
         let mut next_pixels = current_pixels.clone();
-        next_pixels[switch_y as usize * FRAME_SIDE + switch_x as usize] =
-            palette::SWITCH_BASE + 1;
+        next_pixels[switch_y as usize * FRAME_SIDE + switch_x as usize] = palette::SWITCH_BASE + 1;
         let mut current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?;
         let mut next = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?;
         paint_status_ui(&mut current, 64, step as u16);
@@ -688,12 +687,7 @@ pub fn generate_plan_fragments(
     for (idx, action) in plan.actions.into_iter().enumerate() {
         let next = apply_action(&sim, &state, action);
         out.push(sample_from_transition(
-            &scenario,
-            &state,
-            &next,
-            action,
-            goal,
-            idx as u64,
+            &scenario, &state, &next, action, goal, idx as u64,
         )?);
         state = next;
     }
@@ -730,7 +724,10 @@ pub fn generate_exploration_episode(
             break;
         }
     }
-    ensure!(!out.is_empty(), "exploration episode produced no transitions");
+    ensure!(
+        !out.is_empty(),
+        "exploration episode produced no transitions"
+    );
     Ok(out)
 }
 
@@ -807,12 +804,7 @@ pub fn generate_p1c_falsification_episode(
     let mut out = Vec::new();
     for (gi, goal) in scenario.candidate_goals.iter().enumerate() {
         out.push(sample_from_transition(
-            &scenario,
-            &start,
-            &next,
-            action,
-            goal,
-            gi as u64,
+            &scenario, &start, &next, action, goal, gi as u64,
         )?);
     }
     Ok(out)
@@ -983,7 +975,10 @@ mod tests {
         assert!(ArcAction::new(6, None, None).is_err());
         assert!(ArcAction::new(1, Some(0), None).is_err());
         assert!(ArcAction::new(0, None, None).is_err());
-        assert_eq!(ArcAction::new(7, None, None).unwrap().to_tofy().unwrap(), Action::Undo);
+        assert_eq!(
+            ArcAction::new(7, None, None).unwrap().to_tofy().unwrap(),
+            Action::Undo
+        );
         assert!(ArcAction::new(8, None, None).is_err());
     }
 
@@ -1044,24 +1039,12 @@ mod tests {
             marker: 0,
         };
         let reach = Goal::ReachMarker { marker: 0 };
-        let sample_avoid = sample_from_transition(
-            &sc,
-            &before,
-            &state,
-            Action::Move(Dir::South),
-            &avoid,
-            0,
-        )
-        .unwrap();
-        let sample_reach = sample_from_transition(
-            &sc,
-            &before,
-            &state,
-            Action::Move(Dir::South),
-            &reach,
-            1,
-        )
-        .unwrap();
+        let sample_avoid =
+            sample_from_transition(&sc, &before, &state, Action::Move(Dir::South), &avoid, 0)
+                .unwrap();
+        let sample_reach =
+            sample_from_transition(&sc, &before, &state, Action::Move(Dir::South), &reach, 1)
+                .unwrap();
         assert_eq!(sample_avoid.goal_failed, Some(true));
         assert_eq!(sample_avoid.goal_satisfied, Some(false));
         assert_eq!(sample_reach.goal_failed, Some(false));
@@ -1102,7 +1085,9 @@ mod tests {
         assert!(!h.is_empty());
 
         let ex = generate_curriculum("exploration", 7, 2, Split::Train).unwrap();
-        assert!(ex.iter().all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM]));
+        assert!(ex
+            .iter()
+            .all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM]));
         assert!(ex.iter().all(|s| s.goal_satisfied.is_none()));
 
         let hp = generate_curriculum("hypothesis_probe", 5, 1, Split::Train).unwrap();
@@ -1123,18 +1108,14 @@ mod tests {
     fn dynamics_samples_are_goal_free() {
         let samples = generate_curriculum("random_one_step", 11, 2, Split::Train).unwrap();
         assert!(samples.iter().any(|s| s.family == "dynamics"));
-        assert!(
-            samples
-                .iter()
-                .filter(|s| s.family == "dynamics")
-                .all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM])
-        );
-        assert!(
-            samples
-                .iter()
-                .filter(|s| s.family == "dynamics")
-                .all(|s| s.goal_satisfied.is_none())
-        );
+        assert!(samples
+            .iter()
+            .filter(|s| s.family == "dynamics")
+            .all(|s| s.goal_features.values == [0.0; GOAL_FEATURES_DIM]));
+        assert!(samples
+            .iter()
+            .filter(|s| s.family == "dynamics")
+            .all(|s| s.goal_satisfied.is_none()));
     }
 
     #[test]
@@ -1147,10 +1128,7 @@ mod tests {
         let ph = sc.height as usize;
         for y in 0..ph {
             for x in 0..pw {
-                assert_eq!(
-                    padded.pixels[y * FRAME_SIDE + x],
-                    native.pixels[y * pw + x]
-                );
+                assert_eq!(padded.pixels[y * FRAME_SIDE + x], native.pixels[y * pw + x]);
             }
         }
         Ok(())

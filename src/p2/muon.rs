@@ -18,15 +18,8 @@ const MUON_MIN_SIDE: usize = 2;
 /// Name fragments that stay on AdamW per DeepSeek-V4 §2.4:
 /// embeddings, prediction heads, norm scales, biases.
 const ADAMW_NAME_FRAGMENTS: &[&str] = &[
-    "embed",
-    "emb", // pixel_emb, action_emb
-    "head",
-    "norm",
-    "ln",
-    "bias",
-    "pos",
-    "token",
-    "lm_head",
+    "embed", "emb", // pixel_emb, action_emb
+    "head", "norm", "ln", "bias", "pos", "token", "lm_head",
 ];
 
 /// Leading `[rows, cols]` for a weight tensor (conv/linear flattened on trailing dims).
@@ -49,10 +42,7 @@ pub fn uses_muon(name: &str, shape: &[usize]) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
-    if ADAMW_NAME_FRAGMENTS
-        .iter()
-        .any(|frag| lower.contains(frag))
-    {
+    if ADAMW_NAME_FRAGMENTS.iter().any(|frag| lower.contains(frag)) {
         return false;
     }
     let Some((rows, cols)) = weight_matrix_dims(shape) else {
@@ -91,10 +81,7 @@ pub fn hybrid_newton_schulz(g: &Tensor) -> Result<Tensor> {
     for (a, b, c) in std::iter::repeat_n(NS_FAST, 8).chain(std::iter::repeat_n(NS_LOCK, 2)) {
         let a_mat = x.matmul(&x.transpose(D::Minus1, D::Minus2)?)?;
         let b_term = a_mat.matmul(&x)?.affine(b, 0.0)?;
-        let c_term = a_mat
-            .matmul(&a_mat)?
-            .matmul(&x)?
-            .affine(c, 0.0)?;
+        let c_term = a_mat.matmul(&a_mat)?.matmul(&x)?.affine(c, 0.0)?;
         x = x.affine(a, 0.0)?.add(&b_term)?.add(&c_term)?;
     }
     if transposed {

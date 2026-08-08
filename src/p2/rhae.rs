@@ -55,7 +55,7 @@ pub fn total_rhae_percent(game_scores: &[f64]) -> Option<f64> {
 #[derive(Debug, Clone, Deserialize)]
 struct ScorecardFile {
     #[serde(default)]
-    score: Option<i64>,
+    score: Option<f64>,
     #[serde(default)]
     environments: Vec<EnvironmentEntry>,
 }
@@ -71,11 +71,11 @@ struct EnvironmentEntry {
 #[derive(Debug, Clone, Deserialize)]
 struct RunEntry {
     #[serde(default)]
-    levels_completed: i64,
+    levels_completed: Option<i64>,
     #[serde(default)]
     number_of_levels: i64,
     #[serde(default)]
-    level_scores: Vec<i64>,
+    level_scores: Vec<f64>,
     #[serde(default)]
     level_actions: Vec<i64>,
     #[serde(default)]
@@ -93,14 +93,13 @@ pub struct ScorecardBenchmark {
 
 /// Parse official scorecard JSON and recompute RHAE from per-level baselines.
 pub fn benchmark_from_scorecard_json(path: &Path) -> Result<ScorecardBenchmark> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read scorecard {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read scorecard {}", path.display()))?;
     benchmark_from_scorecard_str(&text)
 }
 
 pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
-    let card: ScorecardFile =
-        serde_json::from_str(json).context("parse scorecard JSON")?;
+    let card: ScorecardFile = serde_json::from_str(json).context("parse scorecard JSON")?;
     let mut game_scores = Vec::new();
     let mut n_runs = 0usize;
 
@@ -128,16 +127,15 @@ pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
             } else if !run.level_scores.is_empty() {
                 run.level_scores
                     .iter()
-                    .map(|&s| s as f64 / 100.0)
+                    .map(|&s| s / 100.0)
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
-            let completed = if run.levels_completed > 0 {
-                run.levels_completed as usize
-            } else {
-                per_level.len()
-            };
+            let completed = run
+                .levels_completed
+                .map(|count| count.max(0) as usize)
+                .unwrap_or(per_level.len());
             let truncated: Vec<f64> = per_level.into_iter().take(completed).collect();
             let total = if total_levels > 0 {
                 total_levels
@@ -151,7 +149,7 @@ pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
     }
 
     let recomputed = total_rhae_percent(&game_scores);
-    let api_score = card.score.map(|s| s as f64);
+    let api_score = card.score;
 
     Ok(ScorecardBenchmark {
         api_score,
@@ -221,5 +219,24 @@ mod tests {
         let bench = benchmark_from_scorecard_str(json).unwrap();
         let rhae = bench.recomputed_rhae_percent.unwrap();
         assert!((rhae - (10.0 / 15.0 * 100.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn live_scorecard_accepts_fractional_numeric_fields() {
+        let json = r#"{
+            "score": 0.0,
+            "environments": [{
+                "level_count": 2,
+                "runs": [{
+                    "levels_completed": 0,
+                    "level_scores": [0.0, 0.0],
+                    "level_actions": [1, 0],
+                    "level_baseline_actions": [10, 20]
+                }]
+            }]
+        }"#;
+        let bench = benchmark_from_scorecard_str(json).unwrap();
+        assert_eq!(bench.api_score, Some(0.0));
+        assert_eq!(bench.recomputed_rhae_percent, Some(0.0));
     }
 }

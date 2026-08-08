@@ -4,18 +4,25 @@ use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::arc3::{import_recordings_dir, summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
-use crate::p2::data::{generate_curriculum, generate_hazard_one_step, TransitionSample, ORACLE_LATENT_DIM};
+use crate::p2::data::{
+    generate_curriculum, generate_hazard_one_step, TransitionSample, ORACLE_LATENT_DIM,
+};
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, RecursionStepProbe, PtrmConfig, WorldModel,
+    flatten_latent, latent_mse_per_sample, PtrmConfig, RecursionStepProbe, WorldModel,
     EVENT_GOAL_FAILED,
 };
-use crate::p2::rhae::{benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark};
+use crate::p2::rhae::{
+    benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
+};
 use crate::p2::train::{
-    batch_from_samples, load_train_config, resolve_device, BatchTensors, TrainConfig,
+    action_tensors_from_samples, batch_from_samples, load_train_config, resolve_device,
+    BatchTensors, TrainConfig,
 };
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, VarBuilder, VarMap};
+use rand::Rng;
+use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -23,10 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use rand::Rng;
-use rand::SeedableRng;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v7";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v8";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HorizonRolloutStats {
@@ -285,6 +290,51 @@ pub struct ContrastiveProbeMetrics {
 /// Minimum `action_effect_mse / noop_identity_mse` for the copy-forward gate.
 pub const COPY_FORWARD_MIN_RATIO: f64 = 2.0;
 
+/// Shuffled actions should increase one-step prediction error by more than 10%.
+/// Ratios at or below this threshold indicate action-marginalized dynamics.
+pub const ACTION_SHUFFLE_MIN_RATIO: f64 = 1.1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionShuffleMetrics {
+    pub n: usize,
+    /// Rows whose shuffled `(id,x,y)` differs from the true conditioning.
+    pub changed_conditionings: usize,
+    pub changed_fraction: Option<f64>,
+    /// One-step latent MSE under the transition's true action.
+    pub true_action_mse: Option<f64>,
+    /// One-step latent MSE after deranging action IDs and coordinates while
+    /// keeping current frames, targets, and goals fixed.
+    pub shuffled_action_mse: Option<f64>,
+    /// `shuffled_action_mse / true_action_mse`; larger means actions matter.
+    pub ratio: Option<f64>,
+    /// False at the published action-marginalization threshold (`ratio <= 1.1`).
+    pub action_conditioning_pass: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionCoverageMetrics {
+    pub n: usize,
+    pub action_counts: BTreeMap<u8, usize>,
+    pub action_fractions: BTreeMap<u8, f64>,
+    pub noop_labeled: usize,
+    pub noop_rate: Option<f64>,
+    pub coordinate_actions: usize,
+    pub distinct_coordinate_actions: usize,
+    pub distinct_action_conditionings: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionSourceDiagnostics {
+    pub shuffle: ActionShuffleMetrics,
+    pub coverage: ActionCoverageMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDiagnostics {
+    pub aggregate: ActionSourceDiagnostics,
+    pub by_source: BTreeMap<String, ActionSourceDiagnostics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecursionProbeSummary {
     pub n_steps: usize,
@@ -363,6 +413,8 @@ pub struct SplitEval {
     pub calibration_gates: Option<CalibrationGates>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contrastive: Option<ContrastiveProbeMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_diagnostics: Option<ActionDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recursion_probes: Option<RecursionProbeSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,16 +507,16 @@ fn with_thread_local_model<R>(
             let (model, _varmap) = load_model(train_cfg, checkpoint, device)?;
             *guard = Some((checkpoint.to_path_buf(), Arc::new(model)));
         }
-        Ok(guard
-            .as_ref()
-            .expect("model loaded")
-            .1
-            .clone())
+        Ok(guard.as_ref().expect("model loaded").1.clone())
     })?;
     f(model.as_ref())
 }
 
-fn collect_synthetic(seed: u64, episodes: usize, kinds: &[&str]) -> Result<Vec<TransitionSample>> {
+fn collect_synthetic_sources(
+    seed: u64,
+    episodes: usize,
+    kinds: &[&str],
+) -> Result<Vec<(String, Vec<TransitionSample>)>> {
     let jobs: Vec<(usize, usize, &str)> = kinds
         .iter()
         .enumerate()
@@ -482,7 +534,29 @@ fn collect_synthetic(seed: u64, episodes: usize, kinds: &[&str]) -> Result<Vec<T
         })
         .collect::<Result<Vec<_>>>()?;
     parts.sort_by_key(|(job_idx, _)| *job_idx);
-    Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
+    let mut sources = kinds
+        .iter()
+        .map(|kind| ((*kind).to_string(), Vec::new()))
+        .collect::<Vec<_>>();
+    for (job_index, samples) in parts {
+        let kind_index = job_index / episodes.max(1);
+        sources[kind_index].1.extend(samples);
+    }
+    Ok(sources)
+}
+
+fn flatten_sources(sources: &[(String, Vec<TransitionSample>)]) -> Vec<TransitionSample> {
+    sources
+        .iter()
+        .flat_map(|(_, samples)| samples.iter().cloned())
+        .collect()
+}
+
+fn source_lengths(sources: &[(String, Vec<TransitionSample>)]) -> Vec<(String, usize)> {
+    sources
+        .iter()
+        .map(|(name, samples)| (name.clone(), samples.len()))
+        .collect()
 }
 
 fn collect_hazard_samples(seed: u64, episodes: usize) -> Result<Vec<TransitionSample>> {
@@ -563,6 +637,126 @@ fn per_sample_mse(pred: &Tensor, target: &Tensor) -> Result<Vec<f32>> {
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()
         .map_err(Into::into)
+}
+
+/// Sattolo's algorithm: a seeded single-cycle permutation with no fixed points
+/// for `len > 1`. This makes the action ablation deterministic and guarantees
+/// that a transition never receives its own action-conditioning tuple.
+fn action_shuffle_indices(len: usize, seed: u64) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..len).collect();
+    if len < 2 {
+        return indices;
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    for i in (1..len).rev() {
+        let j = rng.random_range(0..i);
+        indices.swap(i, j);
+    }
+    indices
+}
+
+/// Copy only action conditioning from the permuted source transition. ACTION6
+/// coordinates live inside `ArcAction`, so ID and coordinates cannot separate.
+fn shuffled_action_samples(
+    samples: &[TransitionSample],
+    permutation: &[usize],
+) -> Result<Vec<TransitionSample>> {
+    if samples.len() != permutation.len() {
+        bail!(
+            "action permutation length {} != sample length {}",
+            permutation.len(),
+            samples.len()
+        );
+    }
+    let unique: BTreeSet<_> = permutation.iter().copied().collect();
+    if unique.len() != samples.len() || permutation.iter().any(|&idx| idx >= samples.len()) {
+        bail!("action permutation must contain every sample index exactly once");
+    }
+    Ok(samples
+        .iter()
+        .zip(permutation.iter().copied())
+        .map(|(target, source)| {
+            let mut shuffled = target.clone();
+            shuffled.action = samples[source].action.clone();
+            shuffled
+        })
+        .collect())
+}
+
+fn summarize_action_shuffle(
+    true_errors: &[f32],
+    shuffled_errors: &[f32],
+    changed_conditionings: usize,
+) -> Result<ActionShuffleMetrics> {
+    if true_errors.len() != shuffled_errors.len() {
+        bail!(
+            "true-action error count {} != shuffled-action error count {}",
+            true_errors.len(),
+            shuffled_errors.len()
+        );
+    }
+    let true_action_mse = mean(true_errors);
+    let shuffled_action_mse = mean(shuffled_errors);
+    let ratio = match (true_action_mse, shuffled_action_mse) {
+        (Some(true_mse), Some(shuffled_mse)) if true_mse > 0.0 => Some(shuffled_mse / true_mse),
+        _ => None,
+    };
+    Ok(ActionShuffleMetrics {
+        n: true_errors.len(),
+        changed_conditionings,
+        changed_fraction: (!true_errors.is_empty())
+            .then_some(changed_conditionings as f64 / true_errors.len() as f64),
+        true_action_mse,
+        shuffled_action_mse,
+        ratio,
+        action_conditioning_pass: (changed_conditionings > 0)
+            .then(|| ratio.map(|value| value > ACTION_SHUFFLE_MIN_RATIO))
+            .flatten(),
+    })
+}
+
+fn action_coverage(samples: &[TransitionSample]) -> ActionCoverageMetrics {
+    let mut action_counts = BTreeMap::new();
+    let mut noop_labeled = 0usize;
+    let mut noop_count = 0usize;
+    let mut coordinate_actions = 0usize;
+    let mut coordinates = BTreeSet::new();
+    let mut action_conditionings = BTreeSet::new();
+    for sample in samples {
+        *action_counts.entry(sample.action.id).or_insert(0) += 1;
+        action_conditionings.insert((sample.action.id, sample.action.x, sample.action.y));
+        if let Some(noop) = sample.noop {
+            noop_labeled += 1;
+            noop_count += usize::from(noop);
+        }
+        if let (Some(x), Some(y)) = (sample.action.x, sample.action.y) {
+            coordinate_actions += 1;
+            coordinates.insert((x, y));
+        }
+    }
+    let action_fractions = action_counts
+        .iter()
+        .map(|(&action, &count)| {
+            (
+                action,
+                if samples.is_empty() {
+                    0.0
+                } else {
+                    count as f64 / samples.len() as f64
+                },
+            )
+        })
+        .collect();
+    ActionCoverageMetrics {
+        n: samples.len(),
+        action_counts,
+        action_fractions,
+        noop_labeled,
+        noop_rate: (noop_labeled > 0).then_some(noop_count as f64 / noop_labeled as f64),
+        coordinate_actions,
+        distinct_coordinate_actions: coordinates.len(),
+        distinct_action_conditionings: action_conditionings.len(),
+    }
 }
 
 fn mean(xs: &[f32]) -> Option<f64> {
@@ -694,7 +888,13 @@ fn mat_transpose_mul(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out.into_iter().map(|v| v as f32).collect()
 }
 
-fn mat_transpose_mul_rhs(a: &[f32], rows: usize, cols: usize, b: &[f32], b_cols: usize) -> Vec<f32> {
+fn mat_transpose_mul_rhs(
+    a: &[f32],
+    rows: usize,
+    cols: usize,
+    b: &[f32],
+    b_cols: usize,
+) -> Vec<f32> {
     let mut out = vec![0f64; cols * b_cols];
     for i in 0..rows {
         for c in 0..cols {
@@ -911,7 +1111,9 @@ fn eval_identifiability(
     if samples.len() != encoders.len() {
         return None;
     }
-    let latent_dim = encoders.iter().find_map(|row| row.as_ref().map(|h| h.len()))?;
+    let latent_dim = encoders
+        .iter()
+        .find_map(|row| row.as_ref().map(|h| h.len()))?;
     let mut labeled_h = Vec::new();
     let mut labeled_z = Vec::new();
     for (sample, encoder) in samples.iter().zip(encoders.iter()) {
@@ -1261,7 +1463,9 @@ fn eval_one_batch(
         &batch.goals,
     )?;
     let current_z = model.encode_state(&batch.frames)?;
-    let current_vecs = flatten_latent(&current_z)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let current_vecs = flatten_latent(&current_z)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
     let mut partial = BatchEvalPartial {
         encoder_embeddings: chunk
             .iter()
@@ -1322,12 +1526,7 @@ fn eval_one_batch(
         for sample in 0..b {
             let mut ys = Vec::with_capacity(cfg.ensemble_members);
             for traj in &ptrm.trajectories {
-                ys.push(
-                    traj.y
-                        .get(sample)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
-                );
+                ys.push(traj.y.get(sample)?.flatten_all()?.to_vec1::<f32>()?);
             }
             let mut dsum = 0f64;
             let mut dpairs = 0usize;
@@ -1365,7 +1564,10 @@ fn eval_one_batch(
             outer_steps,
         )?;
         let values = per_sample_mse(&deterministic.y, &next_z)?;
-        let entry = partial.matched_acc.entry(k).or_insert((0.0, 0, outer_steps));
+        let entry = partial
+            .matched_acc
+            .entry(k)
+            .or_insert((0.0, 0, outer_steps));
         entry.0 += values.iter().map(|value| f64::from(*value)).sum::<f64>();
         entry.1 += values.len();
     }
@@ -1430,12 +1632,176 @@ fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> BatchEv
     merged
 }
 
+fn eval_shuffled_action_batch(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    shuffled: &[TransitionSample],
+    device: &Device,
+) -> Result<Vec<f32>> {
+    if samples.len() != shuffled.len() {
+        bail!("shuffled action batch must preserve sample count");
+    }
+    let batch = batch_from_samples(samples, device)?;
+    let (shuffled_actions, shuffled_action_coords) = action_tensors_from_samples(shuffled, device)?;
+    let out = model.forward(
+        &batch.frames,
+        &shuffled_actions,
+        &shuffled_action_coords,
+        &batch.goals,
+    )?;
+    let next_z = model.encode_state(&batch.next_frames)?;
+    per_sample_mse(&out.y, &next_z)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_action_diagnostics(
+    train_cfg: &TrainConfig,
+    checkpoint: &Path,
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    true_errors: &[f32],
+    source_lengths: &[(String, usize)],
+    batch_size: usize,
+    device: &Device,
+    seed: u64,
+) -> Result<ActionDiagnostics> {
+    if samples.len() != true_errors.len() {
+        bail!(
+            "action diagnostics sample count {} != true-error count {}",
+            samples.len(),
+            true_errors.len()
+        );
+    }
+    let declared: usize = source_lengths.iter().map(|(_, len)| *len).sum();
+    if declared != samples.len() {
+        bail!(
+            "action diagnostic source lengths sum to {declared}, expected {}",
+            samples.len()
+        );
+    }
+
+    let mut permutation = Vec::with_capacity(samples.len());
+    let mut source_ranges = Vec::with_capacity(source_lengths.len());
+    let mut start = 0usize;
+    for (source_index, (name, len)) in source_lengths.iter().enumerate() {
+        let end = start + len;
+        let local = action_shuffle_indices(
+            *len,
+            seed.wrapping_add(source_index as u64).wrapping_add(0xA571),
+        );
+        permutation.extend(local.into_iter().map(|index| start + index));
+        source_ranges.push((name.clone(), start, end));
+        start = end;
+    }
+    let shuffled = shuffled_action_samples(samples, &permutation)?;
+    let ranges = batch_ranges(samples.len(), batch_size.max(1));
+    let mut partials: Vec<(usize, Vec<f32>)> = if device.is_cpu() {
+        ranges
+            .par_iter()
+            .enumerate()
+            .map(|(batch_index, &(start, end))| {
+                with_thread_local_model(train_cfg, checkpoint, device, |thread_model| {
+                    eval_shuffled_action_batch(
+                        thread_model,
+                        &samples[start..end],
+                        &shuffled[start..end],
+                        device,
+                    )
+                    .map(|errors| (batch_index, errors))
+                })
+            })
+            .collect::<Result<_>>()?
+    } else {
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(batch_index, &(start, end))| {
+                let errors = eval_shuffled_action_batch(
+                    model,
+                    &samples[start..end],
+                    &shuffled[start..end],
+                    device,
+                )?;
+                if device.is_cuda() {
+                    device.synchronize()?;
+                }
+                Ok((batch_index, errors))
+            })
+            .collect::<Result<_>>()?
+    };
+    partials.sort_by_key(|(batch_index, _)| *batch_index);
+    let shuffled_errors: Vec<f32> = partials
+        .into_iter()
+        .flat_map(|(_, errors)| errors)
+        .collect();
+    if shuffled_errors.len() != true_errors.len() {
+        bail!("shuffled-action evaluation changed sample count");
+    }
+
+    let mut aggregate_true = Vec::new();
+    let mut aggregate_shuffled = Vec::new();
+    let mut aggregate_changed = 0usize;
+    let mut by_source = BTreeMap::new();
+    for (name, start, end) in source_ranges {
+        let valid_shuffle = end.saturating_sub(start) >= 2;
+        let true_slice = if valid_shuffle {
+            &true_errors[start..end]
+        } else {
+            &[]
+        };
+        let shuffled_slice = if valid_shuffle {
+            &shuffled_errors[start..end]
+        } else {
+            &[]
+        };
+        let changed_conditionings = samples[start..end]
+            .iter()
+            .zip(shuffled[start..end].iter())
+            .filter(|(truth, ablated)| truth.action != ablated.action)
+            .count();
+        aggregate_true.extend_from_slice(true_slice);
+        aggregate_shuffled.extend_from_slice(shuffled_slice);
+        aggregate_changed += changed_conditionings;
+        by_source.insert(
+            name,
+            ActionSourceDiagnostics {
+                shuffle: summarize_action_shuffle(
+                    true_slice,
+                    shuffled_slice,
+                    changed_conditionings,
+                )?,
+                coverage: action_coverage(&samples[start..end]),
+            },
+        );
+    }
+    Ok(ActionDiagnostics {
+        aggregate: ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(
+                &aggregate_true,
+                &aggregate_shuffled,
+                aggregate_changed,
+            )?,
+            coverage: action_coverage(samples),
+        },
+        by_source,
+    })
+}
+
+type RolloutSextuple = (
+    Option<f32>,
+    Option<f32>,
+    Option<f32>,
+    Option<f32>,
+    Option<f32>,
+    Option<f32>,
+);
+
 fn eval_rollout_group(
     model: &WorldModel,
     steps: &[TransitionSample],
     device: &Device,
     closed_loop: bool,
-) -> Result<(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> {
+) -> Result<RolloutSextuple> {
     if steps.len() < 4 {
         return Ok((None, None, None, None, None, None));
     }
@@ -1466,16 +1832,8 @@ fn eval_rollout_group(
             latent = pred.clone();
         }
         let target = model.encode_state(&batch.next_frames)?;
-        let mse = pred
-            .sub(&target)?
-            .sqr()?
-            .mean_all()?
-            .to_scalar::<f32>()? as f32;
-        let cf = z0
-            .sub(&target)?
-            .sqr()?
-            .mean_all()?
-            .to_scalar::<f32>()? as f32;
+        let mse = pred.sub(&target)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f32;
+        let cf = z0.sub(&target)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f32;
         let step_no = idx + 1;
         if step_no == 4 {
             mse4 = Some(mse);
@@ -1507,10 +1865,7 @@ fn normalized_ratio(model: &[f32], baseline: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn merge_rollout_sextuples(
-    sextuples: &[(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)],
-    seed: u64,
-) -> RolloutMetrics {
+fn merge_rollout_sextuples(sextuples: &[RolloutSextuple], seed: u64) -> RolloutMetrics {
     let mut mse4 = Vec::new();
     let mut mse8 = Vec::new();
     let mut mse16 = Vec::new();
@@ -1563,10 +1918,7 @@ fn merge_rollout_sextuples(
     }
 }
 
-fn merge_copy_forward_sextuples(
-    sextuples: &[(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)],
-    seed: u64,
-) -> RolloutMetrics {
+fn merge_copy_forward_sextuples(sextuples: &[RolloutSextuple], seed: u64) -> RolloutMetrics {
     let mut cf4 = Vec::new();
     let mut cf8 = Vec::new();
     let mut cf16 = Vec::new();
@@ -1658,7 +2010,7 @@ fn eval_rollouts(
         .filter(|steps| steps.len() >= 4)
         .map(|steps| steps.iter().map(|s| (*s).clone()).collect())
         .collect();
-    let sextuples: Vec<(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = if device.is_cpu() {
+    let sextuples: Vec<RolloutSextuple> = if device.is_cpu() {
         groups
             .into_par_iter()
             .map(|steps| {
@@ -1692,7 +2044,7 @@ pub fn eval_copy_forward_rollouts(
         .filter(|steps| steps.len() >= 4)
         .map(|steps| steps.iter().map(|s| (*s).clone()).collect())
         .collect();
-    let sextuples: Vec<(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = if device.is_cpu() {
+    let sextuples: Vec<RolloutSextuple> = if device.is_cpu() {
         groups
             .into_par_iter()
             .map(|steps| {
@@ -1717,6 +2069,7 @@ fn eval_sample_set(
     model: &WorldModel,
     samples: &[TransitionSample],
     source: &str,
+    action_sources: Option<&[(String, usize)]>,
     cfg: &EvalConfig,
     device: &Device,
     with_rollout: bool,
@@ -1752,6 +2105,7 @@ fn eval_sample_set(
             calibration: None,
             calibration_gates: None,
             contrastive: None,
+            action_diagnostics: None,
             recursion_probes: None,
             ensemble: None,
         });
@@ -1905,29 +2259,29 @@ fn eval_sample_set(
         }
     });
     let contrastive = eval_contrastive_probes(model, samples, device).ok();
+    let fallback_sources = [(source.to_string(), samples.len())];
+    let action_diagnostics = Some(eval_action_diagnostics(
+        train_cfg,
+        checkpoint,
+        model,
+        samples,
+        &mse_all,
+        action_sources.unwrap_or(&fallback_sources),
+        cfg.physical_batch,
+        device,
+        cfg.seed,
+    )?);
 
     let rollout = if with_rollout {
         Some(eval_rollouts(
-            train_cfg,
-            checkpoint,
-            model,
-            samples,
-            device,
-            false,
-            cfg.seed,
+            train_cfg, checkpoint, model, samples, device, false, cfg.seed,
         )?)
     } else {
         None
     };
     let closed_loop = if with_rollout {
         Some(eval_rollouts(
-            train_cfg,
-            checkpoint,
-            model,
-            samples,
-            device,
-            true,
-            cfg.seed,
+            train_cfg, checkpoint, model, samples, device, true, cfg.seed,
         )?)
     } else {
         None
@@ -1950,6 +2304,7 @@ fn eval_sample_set(
         calibration,
         calibration_gates,
         contrastive,
+        action_diagnostics,
         recursion_probes,
         ensemble,
     })
@@ -1965,9 +2320,7 @@ fn summarize_recursion_probes(probes: &[RecursionStepProbe]) -> Option<Recursion
         mean_residual_norm: Some(
             probes.iter().map(|p| p.mean_residual_norm).sum::<f64>() / n as f64,
         ),
-        mean_latent_norm: Some(
-            probes.iter().map(|p| p.mean_latent_norm).sum::<f64>() / n as f64,
-        ),
+        mean_latent_norm: Some(probes.iter().map(|p| p.mean_latent_norm).sum::<f64>() / n as f64),
         mean_amplification: Some(
             probes.iter().map(|p| p.mean_amplification).sum::<f64>() / n as f64,
         ),
@@ -1984,44 +2337,32 @@ fn eval_contrastive_probes(
         bail!("contrastive probes need samples");
     }
     let sample = &samples[0];
-    let batch = batch_from_samples(&[sample.clone()], device)?;
+    let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
     let z = model.encode_state(&batch.frames)?;
     let noop = Tensor::zeros((1,), DType::U32, device)?;
     let noop_coords = Tensor::zeros((1, 2), DType::F32, device)?;
     let pred_noop = model.forward_from_latent(&z, &noop, &noop_coords, &batch.goals)?;
-    let noop_mse = pred_noop
+    let noop_mse = pred_noop.y.sub(&z)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f64;
+    let pred_action =
+        model.forward_from_latent(&z, &batch.actions, &batch.action_coords, &batch.goals)?;
+    // This probe measures whether the dynamics react to the action at all.
+    // Prediction error against `next_z` is reported separately and is not an
+    // action-effect magnitude; using it here made the ratio compare unrelated
+    // quantities (target error versus no-op drift).
+    let action_mse = pred_action
         .y
         .sub(&z)?
         .sqr()?
         .mean_all()?
         .to_scalar::<f32>()? as f64;
-    let pred_action = model.forward_from_latent(
-        &z,
-        &batch.actions,
-        &batch.action_coords,
-        &batch.goals,
-    )?;
-    let next_z = model.encode_state(&batch.next_frames)?;
-    let action_mse = pred_action
-        .y
-        .sub(&next_z)?
-        .sqr()?
-        .mean_all()?
-        .to_scalar::<f32>()? as f64;
-    let delta_fwd = pred_action.y.sub(&z)?;
-    let delta_inv = z.sub(&pred_action.y)?;
-    let num = delta_fwd
-        .mul(&delta_inv)?
-        .sum_all()?
-        .to_scalar::<f32>()? as f64;
-    let den = (delta_fwd.sqr()?.sum_all()?.to_scalar::<f32>()? as f64).sqrt()
-        * (delta_inv.sqr()?.sum_all()?.to_scalar::<f32>()? as f64).sqrt()
-        + 1e-8;
     let ratio = (noop_mse > 0.0).then(|| action_mse / noop_mse);
     Ok(ContrastiveProbeMetrics {
         noop_identity_mse: Some(noop_mse),
         action_effect_mse: Some(action_mse),
-        inverse_action_cosine: Some(num / den),
+        // A real inverse-action probe needs a paired inverse transition. The
+        // previous implementation compared a delta with its own negation and
+        // therefore reported -1 for every model.
+        inverse_action_cosine: None,
         action_effect_ratio: ratio,
         copy_forward_pass: ratio.map(|r| r >= COPY_FORWARD_MIN_RATIO),
     })
@@ -2060,19 +2401,21 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     let device = resolve_device(&cfg.device)?;
     let (model, _varmap) = load_model(&train_cfg, &cfg.checkpoint, &device)?;
 
-    let mut dynamics_samples = collect_synthetic(
+    let mut dynamics_sources = collect_synthetic_sources(
         cfg.seed,
         cfg.synthetic_episodes,
         &["random_one_step", "exploration"],
     )?;
-    dynamics_samples.extend(collect_hazard_samples(
-        cfg.seed,
-        cfg.synthetic_episodes,
-    )?);
+    dynamics_sources.push((
+        "hazard_one_step".into(),
+        collect_hazard_samples(cfg.seed, cfg.synthetic_episodes)?,
+    ));
+    let dynamics_samples = flatten_sources(&dynamics_sources);
+    let dynamics_source_lengths = source_lengths(&dynamics_sources);
     let dynamics_rollout_samples =
         collect_dynamics_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
 
-    let planner_samples = collect_synthetic(
+    let planner_sources = collect_synthetic_sources(
         cfg.seed,
         cfg.synthetic_episodes,
         &[
@@ -2082,6 +2425,8 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
             "p1c_hard_retarget",
         ],
     )?;
+    let planner_samples = flatten_sources(&planner_sources);
+    let planner_source_lengths = source_lengths(&planner_sources);
     let planner_rollout_samples =
         collect_planner_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
 
@@ -2091,6 +2436,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &dynamics_samples,
         "synthetic_dynamics",
+        Some(&dynamics_source_lengths),
         cfg,
         &device,
         false,
@@ -2138,6 +2484,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &planner_samples,
         "synthetic_planner",
+        Some(&planner_source_lengths),
         cfg,
         &device,
         false,
@@ -2187,6 +2534,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
             &model,
             &samples,
             "arc3_transfer",
+            None,
             cfg,
             &device,
             false,
@@ -2240,8 +2588,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
                 episode_id: 0,
                 family: "synthetic_dynamics".into(),
                 horizon: 8,
-                open_mse: report.synthetic_dynamics.rollout.as_ref().and_then(|r| r.mse_8),
-                closed_mse: report.synthetic_dynamics.closed_loop.as_ref().and_then(|r| r.mse_8),
+                open_mse: report
+                    .synthetic_dynamics
+                    .rollout
+                    .as_ref()
+                    .and_then(|r| r.mse_8),
+                closed_mse: report
+                    .synthetic_dynamics
+                    .closed_loop
+                    .as_ref()
+                    .and_then(|r| r.mse_8),
                 copy_forward_mse: report
                     .synthetic_dynamics
                     .copy_forward
@@ -2253,8 +2609,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
                 episode_id: 1,
                 family: "synthetic_planner".into(),
                 horizon: 8,
-                open_mse: report.synthetic_planner.rollout.as_ref().and_then(|r| r.mse_8),
-                closed_mse: report.synthetic_planner.closed_loop.as_ref().and_then(|r| r.mse_8),
+                open_mse: report
+                    .synthetic_planner
+                    .rollout
+                    .as_ref()
+                    .and_then(|r| r.mse_8),
+                closed_mse: report
+                    .synthetic_planner
+                    .closed_loop
+                    .as_ref()
+                    .and_then(|r| r.mse_8),
                 copy_forward_mse: report
                     .synthetic_planner
                     .copy_forward
@@ -2279,9 +2643,91 @@ pub fn evaluate_arc3(cfg: &EvalConfig) -> Result<EvalReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p2::data::{ArcAction, ArcFrame, GoalFeatures};
     use crate::p2::train::{
         reinit_varmap_deterministic, save_checkpoint, TrainReport, TRAIN_REPORT_SCHEMA,
     };
+
+    fn action_diagnostic_sample(action: ArcAction, episode_id: u64) -> Result<TransitionSample> {
+        let current = ArcFrame::new(1, 1, vec![episode_id as u8])?;
+        let next = ArcFrame::new(1, 1, vec![episode_id as u8 + 1])?;
+        Ok(TransitionSample {
+            current,
+            next,
+            action,
+            goal_features: GoalFeatures::zeros(),
+            noop: Some(false),
+            goal_satisfied: None,
+            goal_failed: None,
+            exhausted: None,
+            split: Split::HeldOutComposition,
+            family: "action_diagnostic".into(),
+            seed: 7,
+            episode_id,
+            transition_index: 0,
+            oracle_latent: None,
+        })
+    }
+
+    #[test]
+    fn action_shuffle_is_a_deterministic_derangement_and_keeps_coordinates_attached() -> Result<()>
+    {
+        let samples = vec![
+            action_diagnostic_sample(ArcAction::new(1, None, None)?, 0)?,
+            action_diagnostic_sample(ArcAction::new(6, Some(11), Some(23))?, 1)?,
+            action_diagnostic_sample(ArcAction::new(7, None, None)?, 2)?,
+        ];
+        let permutation = action_shuffle_indices(samples.len(), 19);
+        assert_eq!(permutation, action_shuffle_indices(samples.len(), 19));
+        assert!(permutation
+            .iter()
+            .enumerate()
+            .all(|(target, source)| target != *source));
+
+        let shuffled = shuffled_action_samples(&samples, &permutation)?;
+        for (target, source) in permutation.into_iter().enumerate() {
+            assert_eq!(shuffled[target].action, samples[source].action);
+            assert_eq!(shuffled[target].current, samples[target].current);
+            assert_eq!(shuffled[target].next, samples[target].next);
+            assert_eq!(
+                shuffled[target].goal_features,
+                samples[target].goal_features
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn action_shuffle_ratio_compares_prediction_error_on_the_same_targets() -> Result<()> {
+        let metrics = summarize_action_shuffle(&[1.0, 3.0], &[2.0, 4.0], 2)?;
+        assert_eq!(metrics.n, 2);
+        assert_eq!(metrics.changed_conditionings, 2);
+        assert_eq!(metrics.changed_fraction, Some(1.0));
+        assert_eq!(metrics.true_action_mse, Some(2.0));
+        assert_eq!(metrics.shuffled_action_mse, Some(3.0));
+        assert_eq!(metrics.ratio, Some(1.5));
+        assert_eq!(metrics.action_conditioning_pass, Some(true));
+
+        let failed = summarize_action_shuffle(&[2.0, 2.0], &[2.1, 2.1], 2)?;
+        assert_eq!(failed.action_conditioning_pass, Some(false));
+        let unavailable = summarize_action_shuffle(&[2.0, 2.0], &[2.0, 2.0], 0)?;
+        assert_eq!(unavailable.action_conditioning_pass, None);
+        Ok(())
+    }
+
+    #[test]
+    fn action_tensor_conversion_rejects_coordinates_on_non_coordinate_actions() -> Result<()> {
+        let invalid = action_diagnostic_sample(
+            ArcAction {
+                id: 1,
+                x: Some(11),
+                y: Some(23),
+            },
+            0,
+        )?;
+        assert!(action_tensors_from_samples(&[invalid], &Device::Cpu).is_err());
+        Ok(())
+    }
 
     #[test]
     fn tiny_eval_and_report_schema() -> Result<()> {
@@ -2369,7 +2815,32 @@ mod tests {
                 .map(|row| row.noise),
             Some(0.0)
         );
-        assert_eq!(eval.synthetic_dynamics.deterministic_matched_compute.len(), 2);
+        assert_eq!(
+            eval.synthetic_dynamics.deterministic_matched_compute.len(),
+            2
+        );
+        let action_diagnostics = eval
+            .synthetic_dynamics
+            .action_diagnostics
+            .as_ref()
+            .expect("synthetic action diagnostics");
+        assert!(action_diagnostics.aggregate.shuffle.n > 0);
+        assert!(action_diagnostics.aggregate.shuffle.ratio.is_some());
+        let random_one_step = action_diagnostics
+            .by_source
+            .get("random_one_step")
+            .expect("random-one-step action diagnostics");
+        assert!(random_one_step
+            .coverage
+            .action_counts
+            .get(&6)
+            .is_some_and(|count| *count > 0));
+        assert!(random_one_step.coverage.distinct_coordinate_actions > 0);
+        assert!(eval
+            .synthetic_planner
+            .action_diagnostics
+            .as_ref()
+            .is_some_and(|metrics| metrics.by_source.contains_key("sequential")));
         let text = fs::read_to_string(&eval_cfg.output)?;
         let back: EvalReport = serde_json::from_str(&text)?;
         assert_eq!(back.schema, EVAL_REPORT_SCHEMA);

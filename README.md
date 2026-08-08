@@ -30,6 +30,7 @@ enters the dynamics model.
 | `src/p2/sigreg.rs` | LeWorldModel Epps--Pulley SIGReg loss |
 | `src/p2/data.rs` | synthetic lesson transitions and ARC-shaped tensors |
 | `src/p2/arc3.rs` | official-toolkit recording JSONL importer |
+| `src/p2/arc3_live.rs` | held-out live public-game API runner and model policy |
 | `src/p2/train.rs` | ordered curriculum trainer and runtime-gradient trace |
 | `src/p2/eval.rs` | held-out dynamics, rollout, calibration, and PTRM metrics |
 
@@ -54,6 +55,13 @@ cargo run --release -- p2-arc3-eval \
   --train-config runs/p2/smoke/config.json \
   --arc-recordings-dir /path/to/official-toolkit-recordings \
   --output runs/p2/smoke/arc3_eval_report.json
+
+# Live held-out evaluation; no --games filter means every discovered public game.
+cargo run --release --features cudnn -- p2-arc3-live-eval \
+  --checkpoint runs/p2/readiness-v2/model.best.safetensors \
+  --train-config runs/p2/readiness-v2/config.json \
+  --device cuda \
+  --output runs/p2/readiness-v2/arc3_live_report.json
 
 # Optional: attach official RHAE from a closed scorecard JSON
 cargo run --release -- p2-eval \
@@ -101,7 +109,8 @@ cargo clippy --all-targets -- -D warnings
 
 See [`docs/P2.md`](docs/P2.md) for the contract and
 [`docs/ARC_AGI_3_PLAN.md`](docs/ARC_AGI_3_PLAN.md) for the staged path to the official
-evaluation. See
+evaluation and [`docs/P2_ARC3_LIVE_EVAL.md`](docs/P2_ARC3_LIVE_EVAL.md) for the live
+public-suite command and held-out boundary. See
 [`docs/CANDLE_GRAPH.md`](docs/CANDLE_GRAPH.md) for the full
 candle-graph guide (HTML visualizer, train/infer graphs, audit, v10 artifacts). Track metrics in [`docs/RESULTS_P2.md`](docs/RESULTS_P2.md) (index:
 [`docs/RESULTS.md`](docs/RESULTS.md)).

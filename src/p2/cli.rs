@@ -3,9 +3,10 @@
 //! Defaults are tiny smoke settings and must not be treated as a research result.
 //! Wiring into the top-level CLI is owned by the primary agent.
 
+use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig};
-use crate::p2::train::{train, TrainConfig, DEFAULT_LESSONS};
 use crate::p2::muon::MUON_RMS_SCALE;
+use crate::p2::train::{train, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -362,10 +363,7 @@ pub fn run_p2_eval(args: P2EvalArgs) -> Result<()> {
             .identifiability
             .as_ref()
             .and_then(|m| m.latent_covariance_frobenius),
-        report
-            .arc3_recording_runs
-            .as_ref()
-            .map(|b| b.n_runs),
+        report.arc3_recording_runs.as_ref().map(|b| b.n_runs),
     );
     Ok(())
 }
@@ -443,6 +441,105 @@ pub fn run_p2_arc3_eval(args: P2Arc3EvalArgs) -> Result<()> {
     println!(
         "p2-arc3-eval smoke complete research_claim={} official_rhae={:?} public_fit={} samples={} recording_runs={}",
         report.research_claim, report.official_rhae, report.public_data_used_for_fitting, n, runs
+    );
+    Ok(())
+}
+
+/// `p2-arc3-live-eval` — run a frozen checkpoint on public ARC-AGI-3 games.
+#[derive(Debug, Clone, Args)]
+pub struct P2Arc3LiveEvalArgs {
+    #[arg(long, default_value = "runs/p2/smoke/model.safetensors")]
+    pub checkpoint: PathBuf,
+
+    #[arg(long, default_value = "runs/p2/smoke/config.json")]
+    pub train_config: PathBuf,
+
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+
+    #[arg(long, default_value = "https://three.arcprize.org")]
+    pub base_url: String,
+
+    /// Environment variable containing the API key. `.env` is loaded automatically.
+    #[arg(long, default_value = "ARC_API_KEY")]
+    pub api_key_env: String,
+
+    /// Optional comma-separated subset. The default evaluates every discovered public game.
+    #[arg(long, value_delimiter = ',')]
+    pub games: Vec<String>,
+
+    #[arg(long, default_value_t = 512)]
+    pub max_actions_per_game: usize,
+
+    /// Maximum candidate actions scored together by Candle.
+    #[arg(long, default_value_t = 128)]
+    pub physical_batch: usize,
+
+    /// Maximum candidate coordinates considered whenever ACTION6 is available.
+    #[arg(long, default_value_t = 128)]
+    pub action6_max_candidates: usize,
+
+    /// Uniform ACTION6 grid spacing, augmented with visible-object coordinates.
+    #[arg(long, default_value_t = 8)]
+    pub action6_grid_stride: usize,
+
+    #[arg(long, default_value_t = 30)]
+    pub request_timeout_secs: u64,
+
+    #[arg(long, default_value = "runs/p2/arc3_live_report.json")]
+    pub output: PathBuf,
+
+    /// Authenticate and list public games without opening a scorecard or loading a checkpoint.
+    #[arg(long, default_value_t = false)]
+    pub list_only: bool,
+}
+
+impl P2Arc3LiveEvalArgs {
+    pub fn to_config(&self) -> LiveEvalConfig {
+        LiveEvalConfig {
+            checkpoint: self.checkpoint.clone(),
+            train_config: self.train_config.clone(),
+            device: self.device.clone(),
+            base_url: self.base_url.clone(),
+            api_key_env: self.api_key_env.clone(),
+            games: self.games.clone(),
+            max_actions_per_game: self.max_actions_per_game,
+            physical_batch: self.physical_batch,
+            action6_max_candidates: self.action6_max_candidates,
+            action6_grid_stride: self.action6_grid_stride,
+            request_timeout_secs: self.request_timeout_secs,
+            output: self.output.clone(),
+        }
+    }
+}
+
+pub fn run_p2_arc3_live_eval(args: P2Arc3LiveEvalArgs) -> Result<()> {
+    let config = args.to_config();
+    if args.list_only {
+        let games = list_public_games(&config)?;
+        println!("public ARC-AGI-3 games: {}", games.len());
+        for game in games {
+            println!("{}\t{}", game.game_id, game.title);
+        }
+        return Ok(());
+    }
+
+    let report = evaluate_live(&config)?;
+    let completed = report
+        .games
+        .iter()
+        .filter(|game| game.stop_reason == "completed")
+        .count();
+    let actions: usize = report.games.iter().map(|game| game.actions).sum();
+    println!(
+        "p2-arc3-live-eval complete games={}/{} completed={} actions={} official_rhae={:?} public_fit={} report={}",
+        report.selected_game_count,
+        report.discovered_games.len(),
+        completed,
+        actions,
+        report.official_rhae,
+        report.public_data_used_for_fitting,
+        config.output.display(),
     );
     Ok(())
 }

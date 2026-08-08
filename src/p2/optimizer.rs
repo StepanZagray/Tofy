@@ -1,7 +1,7 @@
 //! Resumable hybrid Muon + AdamW optimizer for P2 training.
 
 use crate::p2::muon::{matrix_view, muon_update, uses_muon};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Tensor, Var};
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::VarMap;
@@ -54,11 +54,7 @@ impl CheckpointHybridOptimizer {
             let kind = if uses_muon(&name, var.shape().dims()) {
                 muon_count += 1;
                 let m = matrix_view(var.as_tensor())?;
-                let momentum = Var::from_tensor(&Tensor::zeros(
-                    m.shape(),
-                    m.dtype(),
-                    m.device(),
-                )?)?;
+                let momentum = Var::from_tensor(&Tensor::zeros(m.shape(), m.dtype(), m.device())?)?;
                 moments
                     .data()
                     .lock()
@@ -67,16 +63,10 @@ impl CheckpointHybridOptimizer {
                 OptKind::Muon
             } else {
                 adam_count += 1;
-                let first = Var::from_tensor(&Tensor::zeros(
-                    var.shape(),
-                    var.dtype(),
-                    var.device(),
-                )?)?;
-                let second = Var::from_tensor(&Tensor::zeros(
-                    var.shape(),
-                    var.dtype(),
-                    var.device(),
-                )?)?;
+                let first =
+                    Var::from_tensor(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)?;
+                let second =
+                    Var::from_tensor(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)?;
                 {
                     let mut md = moments.data().lock().unwrap();
                     md.insert(format!("first_moment.{name}"), first);
@@ -227,7 +217,10 @@ pub fn clip_gradients_gpu(grads: &mut GradStore, varmap: &VarMap, max_norm: f64)
         return Ok(());
     };
     let norm = sum_sq.sqrt()?.to_scalar::<f32>()? as f64;
-    if !norm.is_finite() || norm <= max_norm {
+    if !norm.is_finite() {
+        bail!("gradient norm is not finite: {norm}");
+    }
+    if norm <= max_norm {
         return Ok(());
     }
     let scale = max_norm / norm;
@@ -266,6 +259,27 @@ mod tests {
         let loss = lin.forward(&x)?.sqr()?.mean_all()?;
         opt.step(&loss.backward()?)?;
         assert_eq!(opt.step_t(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gradient_clip_rejects_non_finite_norm() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let variable = Var::from_tensor(&Tensor::zeros((2,), DType::F32, &device)?)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("probe.weight".to_string(), variable.clone());
+        let mut grads = GradStore::default();
+        grads.insert(
+            variable.as_tensor(),
+            Tensor::from_vec(vec![f32::NAN, 0.0], (2,), &device)?,
+        );
+
+        let error = clip_gradients_gpu(&mut grads, &varmap, 1.0).unwrap_err();
+        assert!(error.to_string().contains("gradient norm is not finite"));
         Ok(())
     }
 }

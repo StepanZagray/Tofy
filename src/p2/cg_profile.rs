@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use candle_core::{backprop::GradStore, DType, Tensor};
-use candle_nn::VarMap;
 use candle_graph::trace::schema::GradientState;
 use candle_graph::{ExecutionPhase, SpanKind, TraceSession};
+use candle_nn::VarMap;
 use std::path::{Path, PathBuf};
 
 const ENTRYPOINT: &str = "p2::train::leworld_loss";
@@ -46,13 +46,13 @@ impl StepProfileCapture {
         let data = varmap.data().lock().unwrap();
         let mut names: Vec<_> = data.keys().cloned().collect();
         names.sort();
-    for name in names {
-        let var = data
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("missing var {name}"))?;
-        let (state, norm) = gradient_fact(grads, var.as_tensor())?;
-        session.record_gradient("vb", name, state, norm)?;
-    }
+        for name in names {
+            let var = data
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("missing var {name}"))?;
+            let (state, norm) = gradient_fact(grads, var.as_tensor())?;
+            session.record_gradient("vb", name, state, norm)?;
+        }
         Ok(())
     }
 

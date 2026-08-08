@@ -280,13 +280,7 @@ impl GridEncoder {
             ..Default::default()
         };
         Ok(Self {
-            patch: conv2d(
-                PIXEL_EMB_DIM,
-                32,
-                PATCH_SIZE,
-                patch_cfg,
-                vb.pp("patch"),
-            )?,
+            patch: conv2d(PIXEL_EMB_DIM, 32, PATCH_SIZE, patch_cfg, vb.pp("patch"))?,
             c2: conv2d(32, 64, 3, conv_cfg, vb.pp("c2"))?,
             c3: conv2d(64, 64, 3, conv_cfg, vb.pp("c3"))?,
             proj: conv2d(64, cell_dim, 1, Default::default(), vb.pp("proj"))?,
@@ -296,10 +290,8 @@ impl GridEncoder {
     /// `frames`: palette indices `B×1×H×W` (u8/f32) or embedded `B×PIXEL_EMB_DIM×H×W`.
     fn forward(&self, frames: &Tensor, bf16: bool) -> Result<Tensor> {
         let (b, c, h, w) = frames.dims4()?;
-        if h != FRAME_SIDE as usize || w != FRAME_SIDE as usize {
-            bail!(
-                "expected frames spatial {FRAME_SIDE}x{FRAME_SIDE}, got {h}x{w}"
-            );
+        if h != FRAME_SIDE || w != FRAME_SIDE {
+            bail!("expected frames spatial {FRAME_SIDE}x{FRAME_SIDE}, got {h}x{w}");
         }
         let input = if c == 1 {
             bail!("use WorldModel::encode_state for index tensors");
@@ -441,7 +433,11 @@ impl WorldModel {
     }
 
     /// Encode current and next frames in one conv pass (`2B` batch), then split.
-    pub fn encode_state_pair(&self, frames: &Tensor, next_frames: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn encode_state_pair(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         let batch = frames.dim(0)?;
         if next_frames.dim(0)? != batch {
             bail!(
@@ -469,7 +465,10 @@ impl WorldModel {
             let idx = frames.squeeze(1)?.to_dtype(DType::U32)?;
             let flat = idx.flatten_all()?;
             let emb = self.pixel_emb.forward(&flat)?;
-            return Ok(emb.reshape((b, h, w, PIXEL_EMB_DIM))?.permute((0, 3, 1, 2))?.contiguous()?);
+            return Ok(emb
+                .reshape((b, h, w, PIXEL_EMB_DIM))?
+                .permute((0, 3, 1, 2))?
+                .contiguous()?);
         }
         if c == PIXEL_CHANNELS {
             let flat = frames
@@ -517,7 +516,9 @@ impl WorldModel {
             .action_proj
             .forward(&self.action_emb.forward(&actions)?)?;
         let coords = self.coord_proj.forward(action_coords)?;
-        let bias = action.add(&coords)?.reshape((b, self.config.hidden_dim, 1, 1))?;
+        let bias = action
+            .add(&coords)?
+            .reshape((b, self.config.hidden_dim, 1, 1))?;
         state.broadcast_add(&bias).map_err(Into::into)
     }
 
@@ -593,11 +594,7 @@ impl WorldModel {
     }
 
     /// Event logits from detached or live `y` (training may stop-grad events only).
-    pub fn event_logits_from(
-        &self,
-        y: &Tensor,
-        goal_features: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn event_logits_from(&self, y: &Tensor, goal_features: &Tensor) -> Result<Tensor> {
         let goal_h = self.project_goal(goal_features)?;
         let pooled = pool_latent(y)?;
         let event_in = Tensor::cat(&[&pooled, &goal_h], D::Minus1)?;
@@ -660,6 +657,7 @@ impl WorldModel {
         Ok((y, z))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_recursion(
         &self,
         x: &Tensor,
@@ -791,16 +789,16 @@ impl WorldModel {
         let delta = self.prefix_head.forward(&fused)?;
         let (_, c, hh, ww) = state.dims4()?;
         let delta = delta.reshape((b, c, 1, 1))?.broadcast_as((b, c, hh, ww))?;
-        state.add(&delta).map_err(Into::into)
+        rms_norm_latent(&state.add(&delta)?)
     }
 
-    fn probe_step(y_before: &Tensor, y_after: &Tensor, outer_idx: usize) -> Result<RecursionStepProbe> {
+    fn probe_step(
+        y_before: &Tensor,
+        y_after: &Tensor,
+        outer_idx: usize,
+    ) -> Result<RecursionStepProbe> {
         let residual = y_after.sub(y_before)?.detach();
-        let res_norm = residual
-            .sqr()?
-            .mean_all()?
-            .sqrt()?
-            .to_scalar::<f32>()? as f64;
+        let res_norm = residual.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()? as f64;
         let lat_norm = y_after
             .detach()
             .sqr()?
@@ -852,6 +850,7 @@ impl WorldModel {
     }
 
     /// Like [`Self::forward_with_depth`] but reuses a pre-encoded current state tensor.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_from_encoded_state(
         &self,
         cur_state: &Tensor,
@@ -1144,6 +1143,28 @@ mod tests {
     }
 
     #[test]
+    fn prefix_rollout_stays_on_unit_rms_latent_support() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = make_model(&device)?;
+        let (frames, actions, coords, _) = sample_batch(&device, 2, model.config.goal_dim)?;
+        let mut latent = model.encode_state(&frames)?;
+        for _ in 0..PREFIX_HORIZONS[PREFIX_HORIZONS.len() - 1] {
+            latent = model.prefix_predict(&latent, &actions, &coords)?;
+        }
+        let rms = latent
+            .sqr()?
+            .flatten_from(1)?
+            .mean(D::Minus1)?
+            .sqrt()?
+            .to_vec1::<f32>()?;
+        assert!(
+            rms.iter().all(|value| (*value - 1.0).abs() < 1e-4),
+            "prefix rollout left normalized latent support: {rms:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn forward_output_shapes() -> Result<()> {
         let device = Device::Cpu;
         let (model, _) = make_model(&device)?;
@@ -1181,12 +1202,7 @@ mod tests {
         let device = Device::Cpu;
         let (model, _) = make_model(&device)?;
         let (frames, _, _, _) = sample_batch(&device, 4, model.config.goal_dim)?;
-        let next_frames = Tensor::randn(
-            0f32,
-            1.0,
-            frames.dims(),
-            &device,
-        )?;
+        let next_frames = Tensor::randn(0f32, 1.0, frames.dims(), &device)?;
         let (cur, next) = model.encode_state_pair(&frames, &next_frames)?;
         let cur_solo = model.encode_state(&frames)?;
         let next_solo = model.encode_state(&next_frames)?;
@@ -1202,14 +1218,8 @@ mod tests {
         let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
         let cur_z = model.encode_state(&frames)?;
         let depth = RecursionDepth::from_config(model.config());
-        let out =
-            model.forward_from_latent_with_depth(&cur_z, &actions, &coords, &goals, depth)?;
-        let y_norm = out
-            .y
-            .sqr()?
-            .mean_all()?
-            .to_scalar::<f32>()?
-            .sqrt();
+        let out = model.forward_from_latent_with_depth(&cur_z, &actions, &coords, &goals, depth)?;
+        let y_norm = out.y.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
         assert!(
             y_norm > 1e-4,
             "recurrence should move y away from zero at init, got norm {y_norm}"
@@ -1326,8 +1336,7 @@ mod tests {
         let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
         let depth = model.config().outer_steps;
         let normal = model.forward(&frames, &actions, &coords, &goals)?;
-        let matched =
-            model.forward_with_outer_steps(&frames, &actions, &coords, &goals, depth)?;
+        let matched = model.forward_with_outer_steps(&frames, &actions, &coords, &goals, depth)?;
         assert!(max_abs_diff(&normal.y, &matched.y)? < 1e-5);
         Ok(())
     }

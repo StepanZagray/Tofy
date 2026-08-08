@@ -1,4 +1,5 @@
 pub mod arc3;
+pub mod arc3_live;
 pub mod calibration;
 pub mod cg_profile;
 pub mod cli;
