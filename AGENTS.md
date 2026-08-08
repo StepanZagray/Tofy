@@ -23,8 +23,6 @@
 
 ## Delegation
 - Capable primary agents should delegate bounded, independent coding, documentation, analysis, and research work when doing so improves speed or supplies an independent review.
-- Use Composer 2.5 through Cursor CLI for focused implementation, test writing, and code review when it is available.
-- Use GPT-5.6 Luna High through Codex CLI model `gpt-5.6-luna` with `--config 'model_reasoning_effort="high"'` for bounded analysis, research, documentation, or alternate implementation work when the current Codex provider supports it.
 - Keep delegated tasks narrow, safe, and verifiable. The primary agent owns scope, safety, integration decisions, review of every delegated change, and final validation.
 - Never claim a delegated model was used if the CLI or account rejected it; record the failure and continue with an available agent or locally.
 

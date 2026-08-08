@@ -127,14 +127,14 @@ claim; a formal literature review would need a broader search.
 Suppose cached slot `p2` was computed as
 
 ```text
-(y, z) <- F^64(y0, z0; x(predicted_s1, planned_a1)).
+(y, z) <- F^64(y0, z0; x(predicted_s1, planned_a2)).
 ```
 
 After executing `p1`, the environment supplies `actual_s1`. The correct new
 conditioning input is
 
 ```text
-x' = x(actual_s1, revised_a1).
+x' = x(actual_s1, revised_a2).
 ```
 
 Continuing `F` from the old `(y,z)` with `x'` is a warm start. The first 64
