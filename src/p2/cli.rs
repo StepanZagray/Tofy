@@ -84,6 +84,11 @@ pub struct P2TrainArgs {
     #[arg(long)]
     pub resume: Option<PathBuf>,
 
+    /// Explicitly migrate physical batch / accumulation at equal effective batch.
+    /// This changes the trajectory and is durably labeled as a migration.
+    #[arg(long, default_value_t = false)]
+    pub allow_batch_schedule_migration: bool,
+
     /// Save a complete resumable checkpoint every N updates; zero disables periodic saves.
     #[arg(long, default_value_t = 100)]
     pub checkpoint_every_steps: usize,
@@ -92,7 +97,7 @@ pub struct P2TrainArgs {
     #[arg(long)]
     pub max_steps_this_run: Option<usize>,
 
-    /// PTRM ranking loss cadence on sequential/retarget (`1` = every step). Not in resume contract.
+    /// PTRM ranking loss cadence on sequential/retarget (`1` = every step).
     #[arg(long, default_value_t = 4)]
     pub ptrm_rank_every: usize,
 
@@ -128,6 +133,13 @@ pub struct P2TrainArgs {
     /// 2×2 avg-pool latents before spatial SIGReg (4× fewer rows).
     #[arg(long, default_value_t = true)]
     pub sigreg_spatial_pool: bool,
+
+    /// Experimental pre-RMS pooled encoder projector with T×B×D SIGReg geometry.
+    #[arg(long, default_value_t = false)]
+    pub sigreg_projector: bool,
+
+    #[arg(long, default_value_t = 128)]
+    pub sigreg_projector_dim: usize,
 
     #[arg(long, default_value_t = false)]
     pub stop_grad_q_y: bool,
@@ -202,6 +214,7 @@ impl P2TrainArgs {
             device: self.device.clone(),
             output_dir: self.output_dir.clone(),
             resume: self.resume.clone(),
+            allow_batch_schedule_migration: self.allow_batch_schedule_migration,
             checkpoint_every_steps: self.checkpoint_every_steps,
             max_steps_this_run: self.max_steps_this_run,
             ptrm_rank_every: self.ptrm_rank_every,
@@ -214,6 +227,8 @@ impl P2TrainArgs {
             warm_start_y: self.warm_start_y,
             sigreg_spatial: self.sigreg_spatial,
             sigreg_spatial_pool: self.sigreg_spatial_pool,
+            sigreg_projector: self.sigreg_projector,
+            sigreg_projector_dim: self.sigreg_projector_dim,
             stop_grad_q_y: self.stop_grad_q_y,
             q_quantile_targets: self.q_quantile_targets,
             train_z_noise: self.train_z_noise,

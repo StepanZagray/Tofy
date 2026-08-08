@@ -15,7 +15,7 @@ use crate::p2::optimizer::{accumulate_grad_store, clip_gradients_gpu, Checkpoint
 use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest};
 use crate::p2::sigreg::sigreg_epps_pulley_seeded;
 use anyhow::{bail, Context, Result};
-use candle_core::{backprop::GradStore, DType, Device, Tensor};
+use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_graph::SpanKind;
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
@@ -62,8 +62,8 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v3";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v1";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v4";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v2";
 
 /// Optimizer steps for a lesson (`dynamics` / `exploration` get 2× base steps).
 pub fn steps_for_lesson(cfg: &TrainConfig, lesson: &str) -> usize {
@@ -120,12 +120,15 @@ pub struct TrainConfig {
     pub output_dir: PathBuf,
     /// Optional complete checkpoint bundle (or run/checkpoints directory) to resume.
     pub resume: Option<PathBuf>,
+    /// Explicitly migrate an equal-effective-batch physical/accumulation schedule.
+    /// This is trajectory-changing and is recorded; it is never an exact resume.
+    #[serde(default)]
+    pub allow_batch_schedule_migration: bool,
     /// Save a complete resumable checkpoint every N optimizer updates. Zero disables it.
     pub checkpoint_every_steps: usize,
     /// Stop cleanly after this many updates in this invocation (scheduler/testing hook).
     pub max_steps_this_run: Option<usize>,
     /// Run PTRM ranking loss every N optimizer steps on sequential/retarget (`1` = every step).
-    /// Not part of the resume contract; safe to change across pause/resume.
     #[serde(default = "default_ptrm_rank_every")]
     pub ptrm_rank_every: usize,
     /// Sample inner/outer recursion depth uniformly in `1..=configured` each optimizer step.
@@ -155,6 +158,11 @@ pub struct TrainConfig {
     /// 2×2 avg-pool latents before spatial SIGReg (4× fewer rows; keeps local geometry).
     #[serde(default = "default_sigreg_spatial_pool")]
     pub sigreg_spatial_pool: bool,
+    /// Experimental pre-RMS pooled encoder projector with `T×B×D` SIGReg geometry.
+    #[serde(default)]
+    pub sigreg_projector: bool,
+    #[serde(default = "default_sigreg_projector_dim")]
+    pub sigreg_projector_dim: usize,
     /// Stop-gradient on `y` for Q BCE and surprise (Q becomes a pure observer).
     #[serde(default)]
     pub stop_grad_q_y: bool,
@@ -247,6 +255,10 @@ fn default_sigreg_spatial_pool() -> bool {
     true
 }
 
+fn default_sigreg_projector_dim() -> usize {
+    128
+}
+
 /// Cap SIGReg rows for tight VRAM (8GB + batch 128 + steady full-depth).
 pub fn effective_sigreg_max_rows(cfg: &TrainConfig) -> usize {
     let cap = cfg.sigreg_max_rows;
@@ -284,6 +296,7 @@ fn persist_train_config(cfg: &TrainConfig) -> TrainConfig {
     let mut persisted = cfg.clone();
     persisted.resume = None;
     persisted.max_steps_this_run = None;
+    persisted.allow_batch_schedule_migration = false;
     persisted
 }
 
@@ -311,6 +324,7 @@ impl Default for TrainConfig {
             device: "cpu".into(),
             output_dir: PathBuf::from("runs/p2/smoke"),
             resume: None,
+            allow_batch_schedule_migration: false,
             checkpoint_every_steps: 100,
             max_steps_this_run: None,
             ptrm_rank_every: 4,
@@ -323,6 +337,8 @@ impl Default for TrainConfig {
             warm_start_y: false,
             sigreg_spatial: false,
             sigreg_spatial_pool: true,
+            sigreg_projector: false,
+            sigreg_projector_dim: default_sigreg_projector_dim(),
             stop_grad_q_y: false,
             q_quantile_targets: false,
             train_z_noise: 0.0,
@@ -380,6 +396,9 @@ impl TrainConfig {
         if self.sigreg_projections == 0 || self.sigreg_knots < 3 {
             bail!("sigreg_projections >= 1 and sigreg_knots >= 3 required");
         }
+        if self.sigreg_projector && self.sigreg_projector_dim < 2 {
+            bail!("sigreg_projector_dim must be >= 2 when --sigreg-projector is enabled");
+        }
         if !(self.q_mse_threshold.is_finite() && self.q_mse_threshold >= 0.0) {
             bail!("q_mse_threshold must be finite and >= 0");
         }
@@ -404,6 +423,8 @@ impl TrainConfig {
             residual_y_update: self.residual_y_update,
             warm_start_y: self.warm_start_y,
             bf16_conv: self.bf16_conv,
+            sigreg_projector: self.sigreg_projector,
+            sigreg_projector_dim: self.sigreg_projector_dim,
         }
     }
 }
@@ -413,7 +434,8 @@ pub struct LessonLossMeans {
     pub total: f64,
     pub next_latent: f64,
     pub rollout: f64,
-    pub sigreg: f64,
+    pub sigreg_raw: f64,
+    pub sigreg_bounded: f64,
     pub event: f64,
     pub q: f64,
     #[serde(default)]
@@ -454,6 +476,8 @@ pub struct TrainReport {
     /// Complete bundle from which training can resume exactly.
     pub latest_checkpoint: PathBuf,
     pub resumed_from: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_schedule_migrations: Vec<BatchScheduleMigration>,
     pub checkpoint: PathBuf,
     /// Weights exported for eval when a pre-retarget snapshot exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,6 +511,7 @@ struct TrainingContract {
     action_dim: usize,
     inner_steps: usize,
     outer_steps: usize,
+    ptrm_rank_every: usize,
     randomize_depth: bool,
     #[serde(default)]
     steady_gpu: bool,
@@ -503,6 +528,8 @@ struct TrainingContract {
     sigreg_spatial: bool,
     #[serde(default = "default_sigreg_spatial_pool")]
     sigreg_spatial_pool: bool,
+    sigreg_projector: bool,
+    sigreg_projector_dim: usize,
     #[serde(default)]
     stop_grad_q_y: bool,
     #[serde(default)]
@@ -511,6 +538,11 @@ struct TrainingContract {
     train_z_noise: f64,
     #[serde(default)]
     shuffled_episodes: bool,
+    baseline_d1: bool,
+    prefix_weight: f64,
+    reliability_weight: f64,
+    bf16_conv: bool,
+    sigreg_max_rows: usize,
     device: String,
     adam_beta1: f64,
     adam_beta2: f64,
@@ -546,6 +578,7 @@ impl From<&TrainConfig> for TrainingContract {
             action_dim: cfg.action_dim,
             inner_steps: cfg.inner_steps,
             outer_steps: cfg.outer_steps,
+            ptrm_rank_every: cfg.ptrm_rank_every,
             randomize_depth: cfg.randomize_depth,
             steady_gpu: cfg.steady_gpu,
             supervise_last_outer_only: cfg.supervise_last_outer_only,
@@ -555,10 +588,17 @@ impl From<&TrainConfig> for TrainingContract {
             warm_start_y: cfg.warm_start_y,
             sigreg_spatial: cfg.sigreg_spatial,
             sigreg_spatial_pool: cfg.sigreg_spatial_pool,
+            sigreg_projector: cfg.sigreg_projector,
+            sigreg_projector_dim: cfg.sigreg_projector_dim,
             stop_grad_q_y: cfg.stop_grad_q_y,
             q_quantile_targets: cfg.q_quantile_targets,
             train_z_noise: cfg.train_z_noise,
             shuffled_episodes: cfg.shuffled_episodes,
+            baseline_d1: cfg.baseline_d1,
+            prefix_weight: cfg.prefix_weight,
+            reliability_weight: cfg.reliability_weight,
+            bf16_conv: cfg.bf16_conv,
+            sigreg_max_rows: cfg.sigreg_max_rows,
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
@@ -591,9 +631,21 @@ struct TrainerState {
     active_sums: LessonLossMeans,
     parameter_names: Vec<String>,
     #[serde(default)]
+    batch_schedule_migrations: Vec<BatchScheduleMigration>,
+    #[serde(default)]
     profile_emitted: bool,
     #[serde(default, skip_serializing, alias = "runtime_trace")]
     legacy_runtime_trace: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchScheduleMigration {
+    pub from_physical_batch: usize,
+    pub from_grad_accum: usize,
+    pub to_physical_batch: usize,
+    pub to_grad_accum: usize,
+    pub effective_batch: usize,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,50 +730,63 @@ pub fn reinit_varmap_deterministic(varmap: &VarMap, master_seed: u64) -> Result<
     Ok(())
 }
 
-/// Load matching tensors from a checkpoint; deterministically init any missing keys.
-pub fn load_varmap_flexible(varmap: &VarMap, path: &Path, master_seed: u64) -> Result<()> {
+/// Load an exact model checkpoint after validating every name, shape, and dtype.
+pub fn load_varmap_exact(varmap: &VarMap, path: &Path) -> Result<()> {
     let device = varmap
         .all_vars()
         .first()
         .map(|v| v.device().clone())
         .ok_or_else(|| anyhow::anyhow!("empty varmap"))?;
     let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
-    let names: Vec<String> = {
+    let expected: Vec<(String, Var)> = {
         let data = varmap.data().lock().unwrap();
-        let mut n: Vec<_> = data.keys().cloned().collect();
-        n.sort();
-        n
+        let mut vars: Vec<_> = data
+            .iter()
+            .map(|(name, var)| (name.clone(), var.clone()))
+            .collect();
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        vars
     };
-    for name in names {
-        let var = {
-            let data = varmap.data().lock().unwrap();
-            data.get(&name)
-                .ok_or_else(|| anyhow::anyhow!("missing var {name}"))?
-                .clone()
-        };
-        if let Ok(t) = mmap.load(&name, &device) {
-            if t.dims() == var.shape().dims() {
-                var.set(&t)?;
-                continue;
-            }
-            tracing::info!(
-                "checkpoint shape mismatch for {name}: {:?} vs {:?}; reinitializing",
-                t.dims(),
+    let expected_names: Vec<_> = expected.iter().map(|(name, _)| name.clone()).collect();
+    let mut checkpoint_names: Vec<_> = mmap.tensors().into_iter().map(|(name, _)| name).collect();
+    checkpoint_names.sort();
+    if checkpoint_names != expected_names {
+        let missing: Vec<_> = expected_names
+            .iter()
+            .filter(|name| !checkpoint_names.contains(name))
+            .cloned()
+            .collect();
+        let extra: Vec<_> = checkpoint_names
+            .iter()
+            .filter(|name| !expected_names.contains(name))
+            .cloned()
+            .collect();
+        bail!("model checkpoint tensor names mismatch: missing={missing:?} extra={extra:?}");
+    }
+
+    let mut loaded = Vec::with_capacity(expected.len());
+    for (name, var) in expected {
+        let tensor = mmap
+            .load(&name, &device)
+            .with_context(|| format!("load model tensor {name}"))?;
+        if tensor.dims() != var.shape().dims() {
+            bail!(
+                "model checkpoint shape mismatch for {name}: checkpoint={:?} model={:?}",
+                tensor.dims(),
                 var.shape().dims()
             );
         }
-        let shape = var.shape().dims().to_vec();
-        let n = var.elem_count();
-        let seed = stable_name_seed(master_seed, &name);
-        let is_bias = name.rsplit('.').next() == Some("bias") || name.ends_with("bias");
-        let values = if is_bias {
-            vec![0f32; n]
-        } else {
-            xavier_uniform_vec(&shape, seed)
-        };
-        let t = Tensor::from_vec(values, shape.as_slice(), &device)?.to_dtype(var.dtype())?;
-        var.set(&t)?;
-        tracing::info!("checkpoint missing {name}; initialized deterministically");
+        if tensor.dtype() != var.dtype() {
+            bail!(
+                "model checkpoint dtype mismatch for {name}: checkpoint={:?} model={:?}",
+                tensor.dtype(),
+                var.dtype()
+            );
+        }
+        loaded.push((var, tensor));
+    }
+    for (var, tensor) in loaded {
+        var.set(&tensor)?;
     }
     Ok(())
 }
@@ -1580,7 +1645,8 @@ fn ensure_all_finite(named: &[(&str, &Tensor)]) -> Result<Vec<f32>> {
 pub struct LossBreakdown {
     pub total: Tensor,
     pub next_latent: Tensor,
-    pub sigreg: Tensor,
+    pub sigreg_raw: Tensor,
+    pub sigreg_bounded: Tensor,
     pub event: Tensor,
     pub q: Tensor,
     pub q_surprise: Tensor,
@@ -1594,7 +1660,8 @@ struct CheckedTrainingLosses {
     total: f32,
     next_latent: f32,
     rollout: f32,
-    sigreg: f32,
+    sigreg_raw: f32,
+    sigreg_bounded: f32,
     event: f32,
     q: f32,
     prefix: f32,
@@ -1610,7 +1677,8 @@ fn checked_training_losses(
     let values = ensure_all_finite(&[
         ("next_latent", &losses.next_latent),
         ("rollout", rollout),
-        ("sigreg", &losses.sigreg),
+        ("sigreg_raw", &losses.sigreg_raw),
+        ("sigreg_bounded", &losses.sigreg_bounded),
         ("event", &losses.event),
         ("q", &losses.q),
         ("q_surprise", &losses.q_surprise),
@@ -1621,14 +1689,15 @@ fn checked_training_losses(
         ("total", total),
     ])?;
     Ok(CheckedTrainingLosses {
-        total: values[10],
+        total: values[11],
         next_latent: values[0],
         rollout: values[1],
-        sigreg: values[2],
-        event: values[3],
-        q: values[4],
-        prefix: values[7],
-        reliability: values[9],
+        sigreg_raw: values[2],
+        sigreg_bounded: values[3],
+        event: values[4],
+        q: values[5],
+        prefix: values[8],
+        reliability: values[10],
     })
 }
 
@@ -1681,6 +1750,29 @@ fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
+/// Raw and smoothly bounded SIGReg for an already encoded current/next pair.
+/// The projector treatment supplies `T×B×D`; the control keeps the existing
+/// RMS-normalized spatial/pooled construction unchanged.
+pub fn sigreg_losses_for_encoded_pair(
+    cur_z: &Tensor,
+    next_z: &Tensor,
+    projected: Option<&Tensor>,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<(Tensor, Tensor)> {
+    let stack = match projected {
+        Some(stack) => stack.clone(),
+        None => subsample_sigreg_rows(
+            &stack_latents_for_sigreg(cur_z, next_z, cfg.sigreg_spatial, cfg.sigreg_spatial_pool)?,
+            effective_sigreg_max_rows(cfg),
+            seed.wrapping_add(0x5196_0001),
+        )?,
+    };
+    let raw = sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+    let bounded = bounded_sigreg_loss(&raw)?;
+    Ok((raw, bounded))
+}
+
 fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
     if !cfg.q_quantile_targets {
         return per
@@ -1718,7 +1810,8 @@ pub fn leworld_loss(
     } else {
         0.0
     };
-    let (cur_z, next_z) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let (cur_z, next_z, projected_sigreg) =
+        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let out = model.forward_from_encoded_state(
         &cur_z,
         &batch.frames,
@@ -1748,17 +1841,13 @@ pub fn leworld_loss(
             .affine(1.0 / n_steps, 0.0)?
     };
 
-    let stack = subsample_sigreg_rows(
-        &stack_latents_for_sigreg(&cur_z, &next_z, cfg.sigreg_spatial, cfg.sigreg_spatial_pool)?,
-        effective_sigreg_max_rows(cfg),
-        sigreg_seed.wrapping_add(0x5196_0001),
-    )?;
-    let sigreg = bounded_sigreg_loss(&sigreg_epps_pulley_seeded(
-        &stack,
-        cfg.sigreg_projections,
-        cfg.sigreg_knots,
+    let (sigreg_raw, sigreg_bounded) = sigreg_losses_for_encoded_pair(
+        &cur_z,
+        &next_z,
+        projected_sigreg.as_ref(),
+        cfg,
         sigreg_seed,
-    )?)?;
+    )?;
 
     let device = batch.frames.device();
     let zero_scalar =
@@ -1767,7 +1856,7 @@ pub fn leworld_loss(
     let (event_raw, event) = if weights.event > 0.0 {
         let slot_weights = event_slot_weight_tensor(batch.frames.dim(0)?, device)?;
         let event_logits = if cfg.stop_grad_event_y {
-            out.event_logits.detach()
+            model.event_logits_from(&out.y.detach(), &batch.goals)?
         } else {
             out.event_logits.clone()
         };
@@ -1784,7 +1873,7 @@ pub fn leworld_loss(
 
     let (q_raw, q) = if weights.q > 0.0 {
         let q_logit = if cfg.stop_grad_q_y {
-            out.q_logit.detach()
+            model.q_logit_from_y(&out.y.detach())?
         } else {
             out.q_logit.clone()
         };
@@ -1819,7 +1908,7 @@ pub fn leworld_loss(
     };
 
     let mut total = next_latent
-        .add(&sigreg.affine(weights.sigreg, 0.0)?)?
+        .add(&sigreg_bounded.affine(weights.sigreg, 0.0)?)?
         .add(&event.affine(weights.event, 0.0)?)?
         .add(&q.affine(weights.q, 0.0)?)?
         .add(&reliability.affine(weights.reliability, 0.0)?)?
@@ -1852,7 +1941,8 @@ pub fn leworld_loss(
     Ok(LossBreakdown {
         total,
         next_latent,
-        sigreg,
+        sigreg_raw,
+        sigreg_bounded,
         event: event_raw,
         q: q_raw,
         q_surprise,
@@ -2262,84 +2352,25 @@ fn implicit_resume_source(cfg: &TrainConfig) -> Option<PathBuf> {
     }
 }
 
-fn merge_saved_training_contract(cfg: &mut TrainConfig) -> Result<()> {
-    let path = cfg.output_dir.join("config.json");
-    if !path.is_file() {
-        return Ok(());
-    }
-    let cli_physical_batch = cfg.physical_batch;
-    let cli_grad_accum = cfg.grad_accum;
-    let cli_effective = effective_batch(cfg);
-    let saved: TrainConfig = read_json(&path)?;
-    let saved_effective = effective_batch(&saved);
-    if cli_effective != saved_effective
-        && (cli_physical_batch != saved.physical_batch || cli_grad_accum != saved.grad_accum)
-    {
-        bail!(
-            "resume would change effective batch from {saved_effective} (physical_batch={} grad_accum={}) \
-             to {cli_effective} (physical_batch={cli_physical_batch} grad_accum={cli_grad_accum}); \
-             effective batch must match when resuming",
-            saved.physical_batch,
-            saved.grad_accum,
-        );
-    }
-    cfg.seed = saved.seed;
-    cfg.lessons = saved.lessons;
-    cfg.steps_per_lesson = saved.steps_per_lesson;
-    cfg.physical_batch = saved.physical_batch;
-    cfg.grad_accum = saved.grad_accum;
-    cfg.lr = saved.lr;
-    cfg.weight_decay = saved.weight_decay;
-    cfg.sigreg_projections = saved.sigreg_projections;
-    cfg.sigreg_knots = saved.sigreg_knots;
-    cfg.sigreg_weight = saved.sigreg_weight;
-    cfg.event_weight = saved.event_weight;
-    cfg.q_weight = saved.q_weight;
-    cfg.rollout_weight = saved.rollout_weight;
-    cfg.q_mse_threshold = saved.q_mse_threshold;
-    cfg.hidden_dim = saved.hidden_dim;
-    cfg.action_dim = saved.action_dim;
-    cfg.inner_steps = saved.inner_steps;
-    cfg.outer_steps = saved.outer_steps;
-    cfg.randomize_depth = saved.randomize_depth;
-    cfg.phased_training = saved.phased_training;
-    cfg.stop_grad_event_y = saved.stop_grad_event_y;
-    cfg.residual_y_update = saved.residual_y_update;
-    cfg.warm_start_y = saved.warm_start_y;
-    cfg.sigreg_spatial = saved.sigreg_spatial;
-    cfg.stop_grad_q_y = saved.stop_grad_q_y;
-    cfg.q_quantile_targets = saved.q_quantile_targets;
-    cfg.train_z_noise = saved.train_z_noise;
-    cfg.shuffled_episodes = saved.shuffled_episodes;
-    cfg.device = saved.device;
-    cfg.use_muon = saved.use_muon;
-    cfg.muon_momentum = saved.muon_momentum;
-    cfg.muon_rms_scale = saved.muon_rms_scale;
-    cfg.sigreg_max_rows = saved.sigreg_max_rows;
-    cfg.prefetch_batches = saved.prefetch_batches;
-    if cli_effective == saved_effective {
-        cfg.physical_batch = cli_physical_batch;
-        cfg.grad_accum = cli_grad_accum;
-    }
-    Ok(())
-}
-
-fn contract_resume_migration_ok(saved: &TrainingContract, requested: &TrainingContract) -> bool {
-    let mut saved = saved.clone();
-    saved.adam_beta2 = requested.adam_beta2;
-    saved.use_muon = requested.use_muon;
-    saved.muon_momentum = requested.muon_momentum;
-    saved.muon_rms_scale = requested.muon_rms_scale;
-    // Runtime VRAM knobs; safe to toggle when resuming.
-    saved.steady_gpu = requested.steady_gpu;
-    saved.supervise_last_outer_only = requested.supervise_last_outer_only;
-    saved.sigreg_spatial_pool = requested.sigreg_spatial_pool;
-    // Microbatch schedule (physical_batch × grad_accum) when effective batch is unchanged.
-    if effective_batch_contract(&saved) == effective_batch_contract(requested) {
-        saved.physical_batch = requested.physical_batch;
-        saved.grad_accum = requested.grad_accum;
-    }
-    saved == *requested
+fn batch_schedule_migration(
+    saved: &TrainingContract,
+    requested: &TrainingContract,
+) -> Option<BatchScheduleMigration> {
+    let mut migrated = saved.clone();
+    migrated.physical_batch = requested.physical_batch;
+    migrated.grad_accum = requested.grad_accum;
+    (migrated == *requested
+        && (saved.physical_batch, saved.grad_accum)
+            != (requested.physical_batch, requested.grad_accum)
+        && effective_batch_contract(saved) == effective_batch_contract(requested))
+    .then(|| BatchScheduleMigration {
+        from_physical_batch: saved.physical_batch,
+        from_grad_accum: saved.grad_accum,
+        to_physical_batch: requested.physical_batch,
+        to_grad_accum: requested.grad_accum,
+        effective_batch: effective_batch_contract(saved),
+        label: "trajectory_migration_equal_effective_batch".into(),
+    })
 }
 
 fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
@@ -2463,44 +2494,32 @@ fn load_training_checkpoint(
         bail!("unsupported trainer state schema {}", state.schema);
     }
     let requested = TrainingContract::from(cfg);
-    if state.contract != requested && !contract_resume_migration_ok(&state.contract, &requested) {
-        bail!(
-            "resume training contract mismatch; checkpoint={} requested={}",
-            serde_json::to_string(&state.contract)?,
-            serde_json::to_string(&requested)?
-        );
-    }
     if state.contract != requested {
-        let saved_batch = (
-            state.contract.physical_batch,
-            state.contract.grad_accum,
-            effective_batch_contract(&state.contract),
+        let migration = cfg
+            .allow_batch_schedule_migration
+            .then(|| batch_schedule_migration(&state.contract, &requested))
+            .flatten()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resume training contract mismatch; checkpoint={} requested={}",
+                    serde_json::to_string(&state.contract).unwrap_or_default(),
+                    serde_json::to_string(&requested).unwrap_or_default()
+                )
+            })?;
+        tracing::warn!(
+            "{}: physical_batch {}→{} grad_accum {}→{} (effective_batch={})",
+            migration.label,
+            migration.from_physical_batch,
+            migration.to_physical_batch,
+            migration.from_grad_accum,
+            migration.to_grad_accum,
+            migration.effective_batch,
         );
         state.contract = requested;
-        if (state.contract.physical_batch, state.contract.grad_accum)
-            != (saved_batch.0, saved_batch.1)
-            && saved_batch.2 == effective_batch_contract(&state.contract)
-        {
-            tracing::info!(
-                "resume batch schedule migrated: physical_batch {}→{} grad_accum {}→{} (effective_batch={})",
-                saved_batch.0,
-                state.contract.physical_batch,
-                saved_batch.1,
-                state.contract.grad_accum,
-                saved_batch.2,
-            );
-        }
+        state.batch_schedule_migrations.push(migration);
     }
     if state.parameter_names != optimizer.parameter_names() {
-        let current = optimizer.parameter_names();
-        if !state
-            .parameter_names
-            .iter()
-            .all(|n| current.iter().any(|c| c == n))
-        {
-            bail!("resume parameter names do not match the current model");
-        }
-        state.parameter_names = current;
+        bail!("resume parameter names do not exactly match the current model");
     }
     if state.global_step != state.optimizer_step as u64 {
         bail!(
@@ -2547,7 +2566,7 @@ fn load_training_checkpoint(
     }
     let model_path = bundle.join("model.safetensors");
     let optimizer_path = bundle.join("optimizer.safetensors");
-    load_varmap_flexible(varmap, &model_path, cfg.seed)?;
+    load_varmap_exact(varmap, &model_path)?;
     optimizer.load(&optimizer_path, state.optimizer_step)?;
     if state.legacy_runtime_trace.is_some() {
         state.profile_emitted = true;
@@ -2562,7 +2581,8 @@ fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
         total: sums.total / n,
         next_latent: sums.next_latent / n,
         rollout: sums.rollout / n,
-        sigreg: sums.sigreg / n,
+        sigreg_raw: sums.sigreg_raw / n,
+        sigreg_bounded: sums.sigreg_bounded / n,
         event: sums.event / n,
         q: sums.q / n,
         prefix: sums.prefix / n,
@@ -2592,6 +2612,7 @@ fn build_report(
         global_step: state.global_step,
         latest_checkpoint,
         resumed_from,
+        batch_schedule_migrations: state.batch_schedule_migrations.clone(),
         checkpoint: cfg.output_dir.join("model.safetensors"),
         export_checkpoint: export_checkpoint_path(&cfg.output_dir),
         config_path: cfg.output_dir.join("config.json"),
@@ -2612,15 +2633,12 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
 pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     let mut cfg = cfg.clone();
     let explicit_resume = cfg.resume.is_some();
-    if explicit_resume || implicit_resume_source(&cfg).is_some() {
-        merge_saved_training_contract(&mut cfg)?;
-        if !explicit_resume {
-            cfg.resume = Some(cfg.output_dir.join("checkpoints"));
-            tracing::info!(
-                "auto-resuming from {}",
-                cfg.output_dir.join("checkpoints").display()
-            );
-        }
+    if !explicit_resume && implicit_resume_source(&cfg).is_some() {
+        cfg.resume = Some(cfg.output_dir.join("checkpoints"));
+        tracing::info!(
+            "auto-resuming from {}",
+            cfg.output_dir.join("checkpoints").display()
+        );
     }
     let cfg = &cfg;
     cfg.validate()?;
@@ -2669,6 +2687,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             completed_lessons: Vec::with_capacity(cfg.lessons.len()),
             active_sums: LessonLossMeans::default(),
             parameter_names,
+            batch_schedule_migrations: Vec::new(),
             profile_emitted: false,
             legacy_runtime_trace: None,
         }
@@ -2905,7 +2924,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             step_metrics.total += micro_vals.total as f64 * inv;
             step_metrics.next_latent += micro_vals.next_latent as f64 * inv;
             step_metrics.rollout += micro_vals.rollout as f64 * inv;
-            step_metrics.sigreg += micro_vals.sigreg as f64 * inv;
+            step_metrics.sigreg_raw += micro_vals.sigreg_raw as f64 * inv;
+            step_metrics.sigreg_bounded += micro_vals.sigreg_bounded as f64 * inv;
             step_metrics.event += micro_vals.event as f64 * inv;
             step_metrics.q += micro_vals.q as f64 * inv;
             step_metrics.prefix += micro_vals.prefix as f64 * inv;
@@ -2946,7 +2966,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             state.active_sums.total += step_metrics.total;
             state.active_sums.next_latent += step_metrics.next_latent;
             state.active_sums.rollout += step_metrics.rollout;
-            state.active_sums.sigreg += step_metrics.sigreg;
+            state.active_sums.sigreg_raw += step_metrics.sigreg_raw;
+            state.active_sums.sigreg_bounded += step_metrics.sigreg_bounded;
             state.active_sums.event += step_metrics.event;
             state.active_sums.q += step_metrics.q;
             state.active_sums.prefix += step_metrics.prefix;
@@ -3036,7 +3057,6 @@ mod tests {
     use super::*;
     use crate::domain::Split;
     use crate::p2::data::{ArcAction, GoalFeatures};
-    use candle_core::Var;
 
     fn resume_test_config(output_dir: PathBuf) -> TrainConfig {
         TrainConfig {
@@ -3083,7 +3103,8 @@ mod tests {
             ("total", a.total, b.total),
             ("next_latent", a.next_latent, b.next_latent),
             ("rollout", a.rollout, b.rollout),
-            ("sigreg", a.sigreg, b.sigreg),
+            ("sigreg_raw", a.sigreg_raw, b.sigreg_raw),
+            ("sigreg_bounded", a.sigreg_bounded, b.sigreg_bounded),
             ("event", a.event, b.event),
             ("q", a.q, b.q),
             ("prefix", a.prefix, b.prefix),
@@ -3107,7 +3128,11 @@ mod tests {
             assert!((dl.total - dr.total).abs() < eps, "total loss");
             assert!((dl.next_latent - dr.next_latent).abs() < eps, "next_latent");
             assert!((dl.rollout - dr.rollout).abs() < eps, "rollout");
-            assert!((dl.sigreg - dr.sigreg).abs() < eps, "sigreg");
+            assert!((dl.sigreg_raw - dr.sigreg_raw).abs() < eps, "sigreg_raw");
+            assert!(
+                (dl.sigreg_bounded - dr.sigreg_bounded).abs() < eps,
+                "sigreg_bounded"
+            );
             assert!((dl.event - dr.event).abs() < eps, "event");
             assert!((dl.q - dr.q).abs() < eps, "q");
             assert!((dl.prefix - dr.prefix).abs() < eps, "prefix");
@@ -3241,6 +3266,89 @@ mod tests {
                 assert!(va.iter().all(|v| *v == 0.0), "bias not zero: {name}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_model_load_rejects_missing_tensor() -> Result<()> {
+        let device = Device::Cpu;
+        let target = VarMap::new();
+        target.data().lock().unwrap().insert(
+            "first".into(),
+            Var::from_tensor(&Tensor::zeros((2,), DType::F32, &device)?)?,
+        );
+        target.data().lock().unwrap().insert(
+            "second".into(),
+            Var::from_tensor(&Tensor::zeros((3,), DType::F32, &device)?)?,
+        );
+        let checkpoint = VarMap::new();
+        checkpoint.data().lock().unwrap().insert(
+            "first".into(),
+            Var::from_tensor(&Tensor::ones((2,), DType::F32, &device)?)?,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "tofy-p2-model-missing-tensor-{}.safetensors",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        checkpoint.save(&path)?;
+        let err = load_varmap_exact(&target, &path)
+            .expect_err("exact model load must reject a missing tensor");
+        assert!(err.to_string().contains("missing"), "{err:#}");
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_model_load_rejects_extra_shape_and_dtype_mismatches() -> Result<()> {
+        let device = Device::Cpu;
+        let target = VarMap::new();
+        target.data().lock().unwrap().insert(
+            "weight".into(),
+            Var::from_tensor(&Tensor::zeros((2,), DType::F32, &device)?)?,
+        );
+        let root = std::env::temp_dir().join(format!(
+            "tofy-p2-model-exact-mismatch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+
+        let extra = VarMap::new();
+        extra.data().lock().unwrap().insert(
+            "weight".into(),
+            Var::from_tensor(&Tensor::ones((2,), DType::F32, &device)?)?,
+        );
+        extra.data().lock().unwrap().insert(
+            "unexpected".into(),
+            Var::from_tensor(&Tensor::ones((1,), DType::F32, &device)?)?,
+        );
+        let path = root.join("extra.safetensors");
+        extra.save(&path)?;
+        let err = load_varmap_exact(&target, &path).expect_err("extra tensor must reject");
+        assert!(err.to_string().contains("extra"), "{err:#}");
+
+        let wrong_shape = VarMap::new();
+        wrong_shape.data().lock().unwrap().insert(
+            "weight".into(),
+            Var::from_tensor(&Tensor::ones((3,), DType::F32, &device)?)?,
+        );
+        let path = root.join("shape.safetensors");
+        wrong_shape.save(&path)?;
+        let err = load_varmap_exact(&target, &path).expect_err("shape mismatch must reject");
+        assert!(err.to_string().contains("shape mismatch"), "{err:#}");
+
+        let wrong_dtype = VarMap::new();
+        wrong_dtype.data().lock().unwrap().insert(
+            "weight".into(),
+            Var::from_tensor(&Tensor::ones((2,), DType::F64, &device)?)?,
+        );
+        let path = root.join("dtype.safetensors");
+        wrong_dtype.save(&path)?;
+        let err = load_varmap_exact(&target, &path).expect_err("dtype mismatch must reject");
+        assert!(err.to_string().contains("dtype mismatch"), "{err:#}");
+
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -3490,6 +3598,209 @@ mod tests {
     }
 
     #[test]
+    fn event_stop_gradient_updates_observer_head_and_goal_projection() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TrainConfig {
+            physical_batch: 2,
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            sigreg_projections: 2,
+            sigreg_knots: 3,
+            stop_grad_event_y: true,
+            ..TrainConfig::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg.model_config(), vb)?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let mut first = toy_sample(3);
+        first.goal_features.values[0] = 1.0;
+        let mut second = toy_sample(7);
+        second.goal_features.values[1] = 1.0;
+        let batch = batch_from_samples(&[first, second], &device)?;
+        let losses = leworld_loss(
+            &model,
+            &batch,
+            &cfg,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+            cfg.seed,
+            LessonLossWeights {
+                rollout: 0.0,
+                sigreg: 0.0,
+                event: 1.0,
+                q: 0.0,
+                ptrm_rank: false,
+                ptrm_rank_k: 1,
+                prefix: 0.0,
+                reliability: 0.0,
+            },
+        )?;
+        let grads = losses.event.backward()?;
+        let (event_weight, goal_weight) = {
+            let data = varmap.data().lock().unwrap();
+            (
+                data["event_head.weight"].clone(),
+                data["goal_proj.weight"].clone(),
+            )
+        };
+        for (name, var) in [
+            ("event_head.weight", &event_weight),
+            ("goal_proj.weight", &goal_weight),
+        ] {
+            let grad = grads
+                .get(var.as_tensor())
+                .unwrap_or_else(|| panic!("missing gradient for {name}"));
+            let norm = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            assert!(
+                norm > 0.0,
+                "expected nonzero gradient for {name}, got {norm}"
+            );
+        }
+
+        let before = event_weight.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            ParamsAdamW {
+                lr: cfg.lr,
+                ..ParamsAdamW::default()
+            },
+            cfg.muon_momentum,
+            cfg.muon_rms_scale,
+        )?;
+        optimizer.step(&grads)?;
+        let after = event_weight.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        assert_ne!(before, after, "event head parameters did not update");
+        Ok(())
+    }
+
+    #[test]
+    fn q_stop_gradient_updates_observer_head() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TrainConfig {
+            physical_batch: 2,
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            sigreg_projections: 2,
+            sigreg_knots: 3,
+            stop_grad_q_y: true,
+            ..TrainConfig::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg.model_config(), vb)?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let batch = batch_from_samples(&[toy_sample(3), toy_sample(7)], &device)?;
+        let losses = leworld_loss(
+            &model,
+            &batch,
+            &cfg,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+            cfg.seed,
+            LessonLossWeights {
+                rollout: 0.0,
+                sigreg: 0.0,
+                event: 0.0,
+                q: 1.0,
+                ptrm_rank: false,
+                ptrm_rank_k: 1,
+                prefix: 0.0,
+                reliability: 0.0,
+            },
+        )?;
+        let grads = losses.q.backward()?;
+        let q_weight = {
+            let data = varmap.data().lock().unwrap();
+            data["q_head.weight"].clone()
+        };
+        let grad = grads
+            .get(q_weight.as_tensor())
+            .expect("missing gradient for q_head.weight");
+        let norm = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        assert!(norm > 0.0, "expected nonzero Q-head gradient, got {norm}");
+
+        let before = q_weight.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            ParamsAdamW {
+                lr: cfg.lr,
+                ..ParamsAdamW::default()
+            },
+            cfg.muon_momentum,
+            cfg.muon_rms_scale,
+        )?;
+        optimizer.step(&grads)?;
+        let after = q_weight.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        assert_ne!(before, after, "Q head parameters did not update");
+        Ok(())
+    }
+
+    #[test]
+    fn projector_sigreg_updates_learned_projector() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TrainConfig {
+            physical_batch: 2,
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            sigreg_projections: 2,
+            sigreg_knots: 3,
+            sigreg_projector: true,
+            sigreg_projector_dim: 6,
+            ..TrainConfig::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg.model_config(), vb)?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let batch = batch_from_samples(&[toy_sample(3), toy_sample(7)], &device)?;
+        let losses = leworld_loss(
+            &model,
+            &batch,
+            &cfg,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+            cfg.seed,
+            LessonLossWeights {
+                rollout: 0.0,
+                sigreg: 1.0,
+                event: 0.0,
+                q: 0.0,
+                ptrm_rank: false,
+                ptrm_rank_k: 1,
+                prefix: 0.0,
+                reliability: 0.0,
+            },
+        )?;
+        let grads = losses.sigreg_raw.backward()?;
+        let projector = {
+            let data = varmap.data().lock().unwrap();
+            data["sigreg_projector.weight"].clone()
+        };
+        let grad = grads
+            .get(projector.as_tensor())
+            .expect("SIGReg must reach the learned projector");
+        let norm = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        assert!(
+            norm > 0.0,
+            "expected nonzero projector gradient, got {norm}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn phased_lesson_weights_gate_auxiliary_losses() {
         let cfg = TrainConfig {
             event_weight: 0.1,
@@ -3623,7 +3934,8 @@ mod tests {
         let losses = LossBreakdown {
             total: nan.clone(),
             next_latent: zero.clone(),
-            sigreg: zero.clone(),
+            sigreg_raw: zero.clone(),
+            sigreg_bounded: zero.clone(),
             event: zero.clone(),
             q: zero.clone(),
             q_surprise: zero.clone(),
@@ -3785,6 +4097,7 @@ mod tests {
             global_step: 0,
             latest_checkpoint: PathBuf::from("checkpoint"),
             resumed_from: None,
+            batch_schedule_migrations: vec![],
             checkpoint: PathBuf::from("m.safetensors"),
             export_checkpoint: None,
             config_path: PathBuf::from("c.json"),
@@ -3911,7 +4224,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_merges_saved_contract_on_explicit_resume() -> Result<()> {
+    fn exact_resume_rejects_requested_trajectory_change() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "tofy-p2-resume-merge-contract-{}",
             std::process::id()
@@ -3926,14 +4239,51 @@ mod tests {
         cfg.sigreg_weight = 999.0;
         cfg.inner_steps = 99;
         cfg.outer_steps = 99;
-        let resumed = train(&cfg)?;
-        assert_eq!(resumed.status, TrainStatus::Completed);
+        let err = train(&cfg).expect_err("changed trajectory config must reject exact resume");
+        assert!(
+            err.to_string().contains("training contract mismatch"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
     #[test]
-    fn resume_allows_equal_effective_batch_schedule_migration() -> Result<()> {
+    fn resume_contract_covers_all_trajectory_config_fields() {
+        let base = resume_test_config(PathBuf::from("unused"));
+        let base_contract = TrainingContract::from(&base);
+        let mut changed = Vec::new();
+
+        let mut cfg = base.clone();
+        cfg.ptrm_rank_every += 1;
+        changed.push(("ptrm_rank_every", cfg));
+        let mut cfg = base.clone();
+        cfg.baseline_d1 = !cfg.baseline_d1;
+        changed.push(("baseline_d1", cfg));
+        let mut cfg = base.clone();
+        cfg.prefix_weight += 0.25;
+        changed.push(("prefix_weight", cfg));
+        let mut cfg = base.clone();
+        cfg.reliability_weight += 0.25;
+        changed.push(("reliability_weight", cfg));
+        let mut cfg = base.clone();
+        cfg.bf16_conv = !cfg.bf16_conv;
+        changed.push(("bf16_conv", cfg));
+        let mut cfg = base.clone();
+        cfg.sigreg_max_rows += 1;
+        changed.push(("sigreg_max_rows", cfg));
+
+        for (name, cfg) in changed {
+            assert_ne!(
+                base_contract,
+                TrainingContract::from(&cfg),
+                "trajectory field {name} is absent from the resume contract"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_resume_rejects_equal_effective_batch_schedule_change() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "tofy-p2-resume-batch-schedule-{}",
             std::process::id()
@@ -3948,12 +4298,48 @@ mod tests {
         cfg.resume = Some(paused.latest_checkpoint);
         cfg.physical_batch = 4;
         cfg.grad_accum = 1;
+        let err = train(&cfg).expect_err("exact resume must reject a changed batch schedule");
+        assert!(
+            err.to_string().contains("training contract mismatch"),
+            "{err:#}"
+        );
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_batch_schedule_migration_is_labeled_durably() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-p2-explicit-batch-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = resume_test_config(root.clone());
+        cfg.physical_batch = 2;
+        cfg.grad_accum = 2;
+        cfg.max_steps_this_run = Some(1);
+        let paused = train(&cfg)?;
+        cfg.max_steps_this_run = None;
+        cfg.resume = Some(paused.latest_checkpoint);
+        cfg.physical_batch = 4;
+        cfg.grad_accum = 1;
+        cfg.allow_batch_schedule_migration = true;
         let resumed = train(&cfg)?;
         assert_eq!(resumed.status, TrainStatus::Completed);
         let state: TrainerState = read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
         assert_eq!(state.contract.physical_batch, 4);
         assert_eq!(state.contract.grad_accum, 1);
-        assert_eq!(effective_batch_contract(&state.contract), 4);
+        assert_eq!(state.batch_schedule_migrations.len(), 1);
+        let migration = &state.batch_schedule_migrations[0];
+        assert_eq!(
+            (migration.from_physical_batch, migration.from_grad_accum),
+            (2, 2)
+        );
+        assert_eq!(
+            (migration.to_physical_batch, migration.to_grad_accum),
+            (4, 1)
+        );
+        assert_eq!(migration.effective_batch, 4);
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
@@ -3975,13 +4361,16 @@ mod tests {
         cfg.physical_batch = 8;
         cfg.grad_accum = 1;
         let err = train(&cfg).expect_err("effective batch change must reject resume");
-        assert!(err.to_string().contains("effective batch"));
+        assert!(
+            err.to_string().contains("training contract mismatch"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
     #[test]
-    fn resume_allows_steady_gpu_toggle_on_explicit_resume() -> Result<()> {
+    fn exact_resume_rejects_steady_gpu_toggle() -> Result<()> {
         let root =
             std::env::temp_dir().join(format!("tofy-p2-resume-steady-gpu-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -3991,10 +4380,11 @@ mod tests {
         cfg.max_steps_this_run = None;
         cfg.resume = Some(paused.latest_checkpoint);
         cfg.steady_gpu = true;
-        let resumed = train(&cfg)?;
-        assert_eq!(resumed.status, TrainStatus::Completed);
-        let state: TrainerState = read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
-        assert!(state.contract.steady_gpu);
+        let err = train(&cfg).expect_err("steady_gpu changes the sampled depth trajectory");
+        assert!(
+            err.to_string().contains("training contract mismatch"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
@@ -4009,15 +4399,12 @@ mod tests {
         let paused = train(&cfg)?;
         cfg.max_steps_this_run = None;
         cfg.resume = Some(paused.latest_checkpoint.clone());
-        let config_path = cfg.output_dir.join("config.json");
-        let saved: TrainConfig = read_json(&config_path)?;
-        let mut tampered = saved.clone();
-        tampered.lr *= 2.0;
-        write_json_atomic(&config_path, &tampered)?;
-        let err = train(&cfg).expect_err("tampered config.json must reject resume");
+        let saved_lr = cfg.lr;
+        cfg.lr *= 2.0;
+        let err = train(&cfg).expect_err("changed requested contract must reject resume");
         assert!(err.to_string().contains("training contract mismatch"));
 
-        write_json_atomic(&config_path, &saved)?;
+        cfg.lr = saved_lr;
         fs::remove_file(paused.latest_checkpoint.join("optimizer.safetensors"))?;
         let err = train(&cfg).expect_err("missing optimizer state must reject resume");
         assert!(err.to_string().contains("checkpoint bundle is incomplete"));

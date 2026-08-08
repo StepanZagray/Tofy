@@ -184,11 +184,58 @@ impl CheckpointHybridOptimizer {
             .map(|p| p.var.device().clone())
             .ok_or_else(|| anyhow::anyhow!("optimizer has no params"))?;
         let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
-        let mut md = self.moments.data().lock().unwrap();
-        for (name, var) in md.iter_mut() {
-            if let Ok(t) = mmap.load(name, &device) {
-                var.set(&t)?;
+        let expected: Vec<(String, Var)> = {
+            let md = self.moments.data().lock().unwrap();
+            let mut vars: Vec<_> = md
+                .iter()
+                .map(|(name, var)| (name.clone(), var.clone()))
+                .collect();
+            vars.sort_by(|a, b| a.0.cmp(&b.0));
+            vars
+        };
+        let expected_names: Vec<_> = expected.iter().map(|(name, _)| name.clone()).collect();
+        let mut checkpoint_names: Vec<_> =
+            mmap.tensors().into_iter().map(|(name, _)| name).collect();
+        checkpoint_names.sort();
+        if checkpoint_names != expected_names {
+            let missing: Vec<_> = expected_names
+                .iter()
+                .filter(|name| !checkpoint_names.contains(name))
+                .cloned()
+                .collect();
+            let extra: Vec<_> = checkpoint_names
+                .iter()
+                .filter(|name| !expected_names.contains(name))
+                .cloned()
+                .collect();
+            bail!(
+                "optimizer checkpoint tensor names mismatch: missing={missing:?} extra={extra:?}"
+            );
+        }
+
+        let mut loaded = Vec::with_capacity(expected.len());
+        for (name, var) in expected {
+            let tensor = mmap
+                .load(&name, &device)
+                .with_context(|| format!("load optimizer tensor {name}"))?;
+            if tensor.dims() != var.shape().dims() {
+                bail!(
+                    "optimizer checkpoint shape mismatch for {name}: checkpoint={:?} optimizer={:?}",
+                    tensor.dims(),
+                    var.shape().dims()
+                );
             }
+            if tensor.dtype() != var.dtype() {
+                bail!(
+                    "optimizer checkpoint dtype mismatch for {name}: checkpoint={:?} optimizer={:?}",
+                    tensor.dtype(),
+                    var.dtype()
+                );
+            }
+            loaded.push((var, tensor));
+        }
+        for (var, tensor) in loaded {
+            var.set(&tensor)?;
         }
         self.step_t = step_t;
         Ok(())
@@ -259,6 +306,143 @@ mod tests {
         let loss = lin.forward(&x)?.sqr()?.mean_all()?;
         opt.step(&loss.backward()?)?;
         assert_eq!(opt.step_t(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_optimizer_load_rejects_missing_individual_moment() -> Result<()> {
+        let device = Device::Cpu;
+        let model_vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&model_vars, DType::F32, &device);
+        let _lin = linear(4, 2, vb.pp("lin"))?;
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &model_vars,
+            ParamsAdamW::default(),
+            0.95,
+            MUON_RMS_SCALE,
+        )?;
+        let root = std::env::temp_dir().join(format!(
+            "tofy-p2-optimizer-missing-moment-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        let complete = root.join("complete.safetensors");
+        let missing = root.join("missing.safetensors");
+        optimizer.save(&complete)?;
+
+        let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(&complete)? };
+        let incomplete = VarMap::new();
+        let omitted = "first_moment.lin.bias";
+        for (name, _) in mmap.tensors() {
+            if name != omitted {
+                incomplete
+                    .data()
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), Var::from_tensor(&mmap.load(&name, &device)?)?);
+            }
+        }
+        incomplete.save(&missing)?;
+        let err = optimizer
+            .load(&missing, 1)
+            .expect_err("exact optimizer load must reject a missing moment");
+        assert!(err.to_string().contains(omitted), "{err:#}");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_optimizer_load_rejects_extra_shape_and_dtype_mismatches() -> Result<()> {
+        let device = Device::Cpu;
+        let model_vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&model_vars, DType::F32, &device);
+        let _lin = linear(4, 2, vb.pp("lin"))?;
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &model_vars,
+            ParamsAdamW::default(),
+            0.95,
+            MUON_RMS_SCALE,
+        )?;
+        let root = std::env::temp_dir().join(format!(
+            "tofy-p2-optimizer-exact-mismatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        let complete = root.join("complete.safetensors");
+        optimizer.save(&complete)?;
+        let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(&complete)? };
+        let changed_name = mmap
+            .tensors()
+            .first()
+            .map(|(name, _)| name.clone())
+            .expect("optimizer has moments");
+
+        let extra = VarMap::new();
+        for (name, _) in mmap.tensors() {
+            extra
+                .data()
+                .lock()
+                .unwrap()
+                .insert(name.clone(), Var::from_tensor(&mmap.load(&name, &device)?)?);
+        }
+        extra.data().lock().unwrap().insert(
+            "unexpected".into(),
+            Var::from_tensor(&Tensor::zeros((1,), DType::F32, &device)?)?,
+        );
+        let path = root.join("extra.safetensors");
+        extra.save(&path)?;
+        let err = optimizer
+            .load(&path, 1)
+            .expect_err("extra moment must reject");
+        assert!(err.to_string().contains("extra"), "{err:#}");
+
+        let wrong_shape = VarMap::new();
+        for (name, _) in mmap.tensors() {
+            let tensor = if name == changed_name {
+                Tensor::zeros(
+                    (mmap.load(&name, &device)?.elem_count() + 1,),
+                    DType::F32,
+                    &device,
+                )?
+            } else {
+                mmap.load(&name, &device)?
+            };
+            wrong_shape
+                .data()
+                .lock()
+                .unwrap()
+                .insert(name, Var::from_tensor(&tensor)?);
+        }
+        let path = root.join("shape.safetensors");
+        wrong_shape.save(&path)?;
+        let err = optimizer
+            .load(&path, 1)
+            .expect_err("shape mismatch must reject");
+        assert!(err.to_string().contains("shape mismatch"), "{err:#}");
+
+        let wrong_dtype = VarMap::new();
+        for (name, _) in mmap.tensors() {
+            let tensor = if name == changed_name {
+                mmap.load(&name, &device)?.to_dtype(DType::F64)?
+            } else {
+                mmap.load(&name, &device)?
+            };
+            wrong_dtype
+                .data()
+                .lock()
+                .unwrap()
+                .insert(name, Var::from_tensor(&tensor)?);
+        }
+        let path = root.join("dtype.safetensors");
+        wrong_dtype.save(&path)?;
+        let err = optimizer
+            .load(&path, 1)
+            .expect_err("dtype mismatch must reject");
+        assert!(err.to_string().contains("dtype mismatch"), "{err:#}");
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

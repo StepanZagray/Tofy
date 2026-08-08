@@ -8,15 +8,15 @@ use crate::p2::data::{
     generate_curriculum, generate_hazard_one_step, TransitionSample, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, PtrmConfig, RecursionStepProbe, WorldModel,
+    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionStepProbe, WorldModel,
     EVENT_GOAL_FAILED,
 };
 use crate::p2::rhae::{
     benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
 };
 use crate::p2::train::{
-    action_tensors_from_samples, batch_from_samples, load_train_config, resolve_device,
-    BatchTensors, TrainConfig,
+    action_tensors_from_samples, batch_from_samples, load_train_config, load_varmap_exact,
+    resolve_device, sigreg_losses_for_encoded_pair, BatchTensors, TrainConfig,
 };
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v8";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v9";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HorizonRolloutStats {
@@ -293,6 +293,11 @@ pub const COPY_FORWARD_MIN_RATIO: f64 = 2.0;
 /// Shuffled actions should increase one-step prediction error by more than 10%.
 /// Ratios at or below this threshold indicate action-marginalized dynamics.
 pub const ACTION_SHUFFLE_MIN_RATIO: f64 = 1.1;
+pub const SIGREG_BOUND: f64 = 10_000.0;
+pub const SIGREG_NEAR_BOUND_FRACTION: f64 = 0.99;
+/// Preregistered collapse floors for normalized pooled encoder features.
+pub const ENCODER_MIN_MEAN_VARIANCE: f64 = 1e-4;
+pub const ENCODER_MIN_EFFECTIVE_RANK_FRACTION: f64 = 0.10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionShuffleMetrics {
@@ -307,8 +312,39 @@ pub struct ActionShuffleMetrics {
     pub shuffled_action_mse: Option<f64>,
     /// `shuffled_action_mse / true_action_mse`; larger means actions matter.
     pub ratio: Option<f64>,
+    pub ratio_ci95_low: Option<f64>,
+    pub ratio_ci95_high: Option<f64>,
     /// False at the published action-marginalization threshold (`ratio <= 1.1`).
     pub action_conditioning_pass: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedTransitionMetrics {
+    pub n: usize,
+    pub learned_mse: Option<f64>,
+    pub copy_forward_mse: Option<f64>,
+    /// `(copy_forward_mse - learned_mse) / copy_forward_mse`.
+    pub improvement_fraction: Option<f64>,
+    pub improvement_ci95_low: Option<f64>,
+    pub improvement_ci95_high: Option<f64>,
+    pub ten_percent_improvement_pass: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepresentationDiagnostics {
+    pub sigreg_raw: Option<f64>,
+    pub sigreg_bounded: Option<f64>,
+    pub sigreg_bound: f64,
+    pub sigreg_near_bound: Option<bool>,
+    pub encoder_rows: usize,
+    pub encoder_dim: usize,
+    pub mean_encoder_variance: Option<f64>,
+    /// Covariance participation ratio `(tr C)^2 / tr(C^2)`.
+    pub effective_rank: Option<f64>,
+    pub effective_rank_fraction: Option<f64>,
+    pub min_mean_variance: f64,
+    pub min_effective_rank_fraction: f64,
+    pub noncollapse_pass: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +431,8 @@ pub struct SplitEval {
     pub source: String,
     pub n_samples: usize,
     pub one_step_latent_mse: Option<f64>,
+    pub representation: Option<RepresentationDiagnostics>,
+    pub changed_transitions: Option<ChangedTransitionMetrics>,
     pub identifiability: Option<IdentifiabilityMetrics>,
     pub events: EventMetrics,
     pub q: QMetrics,
@@ -479,12 +517,11 @@ pub fn load_model(
     weights: &Path,
     device: &Device,
 ) -> Result<(WorldModel, VarMap)> {
-    let mut varmap = VarMap::new();
+    let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
     let model = WorldModel::new(train_cfg.model_config(), vb)?;
-    varmap
-        .load(weights)
-        .with_context(|| format!("load {}", weights.display()))?;
+    load_varmap_exact(&varmap, weights)
+        .with_context(|| format!("load exact model checkpoint {}", weights.display()))?;
     Ok((model, varmap))
 }
 
@@ -687,6 +724,7 @@ fn summarize_action_shuffle(
     true_errors: &[f32],
     shuffled_errors: &[f32],
     changed_conditionings: usize,
+    seed: u64,
 ) -> Result<ActionShuffleMetrics> {
     if true_errors.len() != shuffled_errors.len() {
         bail!(
@@ -701,6 +739,8 @@ fn summarize_action_shuffle(
         (Some(true_mse), Some(shuffled_mse)) if true_mse > 0.0 => Some(shuffled_mse / true_mse),
         _ => None,
     };
+    let (ratio_ci95_low, ratio_ci95_high) =
+        bootstrap_paired_ratio_ci95(shuffled_errors, true_errors, seed);
     Ok(ActionShuffleMetrics {
         n: true_errors.len(),
         changed_conditionings,
@@ -709,9 +749,12 @@ fn summarize_action_shuffle(
         true_action_mse,
         shuffled_action_mse,
         ratio,
-        action_conditioning_pass: (changed_conditionings > 0)
-            .then(|| ratio.map(|value| value > ACTION_SHUFFLE_MIN_RATIO))
-            .flatten(),
+        ratio_ci95_low,
+        ratio_ci95_high,
+        action_conditioning_pass: (changed_conditionings > 0).then_some(
+            ratio.is_some_and(|value| value >= ACTION_SHUFFLE_MIN_RATIO)
+                && ratio_ci95_low.is_some_and(|value| value > 1.0),
+        ),
     })
 }
 
@@ -817,6 +860,37 @@ fn bootstrap_ci95(values: &[f32], seed: u64) -> (Option<f64>, Option<f64>) {
     means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lo = means[(0.025 * means.len() as f64) as usize];
     let hi = means[((0.975 * means.len() as f64) as usize).min(means.len() - 1)];
+    (Some(lo), Some(hi))
+}
+
+fn bootstrap_paired_ratio_ci95(
+    numerators: &[f32],
+    denominators: &[f32],
+    seed: u64,
+) -> (Option<f64>, Option<f64>) {
+    if numerators.is_empty() || numerators.len() != denominators.len() {
+        return (None, None);
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut ratios = Vec::with_capacity(400);
+    for _ in 0..400 {
+        let mut numerator = 0f64;
+        let mut denominator = 0f64;
+        for _ in 0..numerators.len() {
+            let idx = rng.random_range(0..numerators.len());
+            numerator += numerators[idx] as f64;
+            denominator += denominators[idx] as f64;
+        }
+        if denominator > f64::EPSILON {
+            ratios.push(numerator / denominator);
+        }
+    }
+    if ratios.is_empty() {
+        return (None, None);
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo = ratios[(0.025 * ratios.len() as f64) as usize];
+    let hi = ratios[((0.975 * ratios.len() as f64) as usize).min(ratios.len() - 1)];
     (Some(lo), Some(hi))
 }
 
@@ -1069,6 +1143,92 @@ fn latent_covariance_frobenius(encoder: &[Vec<f32>]) -> Option<f64> {
         }
     }
     Some(err.sqrt())
+}
+
+fn encoder_variance_and_effective_rank(rows: &[Vec<f32>]) -> (Option<f64>, Option<f64>) {
+    if rows.len() < 2 || rows.first().is_none_or(Vec::is_empty) {
+        return (None, None);
+    }
+    let dim = rows[0].len();
+    if rows.iter().any(|row| row.len() != dim) {
+        return (None, None);
+    }
+    let centered = center_columns(rows);
+    let denom = (centered.len() as f64 - 1.0).max(1.0);
+    let mut covariance = vec![0f64; dim * dim];
+    for row in &centered {
+        for i in 0..dim {
+            let vi = row[i] as f64;
+            for j in 0..dim {
+                covariance[i * dim + j] += vi * row[j] as f64 / denom;
+            }
+        }
+    }
+    let trace: f64 = (0..dim).map(|i| covariance[i * dim + i]).sum();
+    let trace_sq: f64 = covariance.iter().map(|value| value * value).sum();
+    let mean_variance = trace / dim as f64;
+    let effective_rank = (trace_sq > f64::EPSILON).then_some(trace * trace / trace_sq);
+    (Some(mean_variance), effective_rank)
+}
+
+fn summarize_representation(
+    rows: &[Vec<f32>],
+    sigreg_raw_sum: f64,
+    sigreg_bounded_sum: f64,
+    sigreg_n: usize,
+) -> RepresentationDiagnostics {
+    let encoder_dim = rows.first().map(Vec::len).unwrap_or(0);
+    let (mean_encoder_variance, effective_rank) = encoder_variance_and_effective_rank(rows);
+    let effective_rank_fraction = effective_rank
+        .filter(|_| encoder_dim > 0)
+        .map(|rank| rank / encoder_dim as f64);
+    let sigreg_raw = (sigreg_n > 0).then_some(sigreg_raw_sum / sigreg_n as f64);
+    let sigreg_bounded = (sigreg_n > 0).then_some(sigreg_bounded_sum / sigreg_n as f64);
+    RepresentationDiagnostics {
+        sigreg_raw,
+        sigreg_bounded,
+        sigreg_bound: SIGREG_BOUND,
+        sigreg_near_bound: sigreg_bounded
+            .map(|value| value >= SIGREG_BOUND * SIGREG_NEAR_BOUND_FRACTION),
+        encoder_rows: rows.len(),
+        encoder_dim,
+        mean_encoder_variance,
+        effective_rank,
+        effective_rank_fraction,
+        min_mean_variance: ENCODER_MIN_MEAN_VARIANCE,
+        min_effective_rank_fraction: ENCODER_MIN_EFFECTIVE_RANK_FRACTION,
+        noncollapse_pass: mean_encoder_variance.map(|variance| {
+            variance >= ENCODER_MIN_MEAN_VARIANCE
+                && effective_rank_fraction.unwrap_or(0.0) >= ENCODER_MIN_EFFECTIVE_RANK_FRACTION
+        }),
+    }
+}
+
+fn summarize_changed_transitions(
+    learned: &[f32],
+    copy_forward: &[f32],
+    seed: u64,
+) -> Result<ChangedTransitionMetrics> {
+    if learned.len() != copy_forward.len() {
+        bail!("changed-transition learned/copy-forward counts differ");
+    }
+    let learned_mse = mean(learned);
+    let copy_forward_mse = mean(copy_forward);
+    let improvement_fraction = learned_mse
+        .zip(copy_forward_mse)
+        .and_then(|(learned, copy)| (copy > 0.0).then_some(1.0 - learned / copy));
+    let (ratio_low, ratio_high) = bootstrap_paired_ratio_ci95(learned, copy_forward, seed);
+    let improvement_ci95_low = ratio_high.map(|ratio| 1.0 - ratio);
+    let improvement_ci95_high = ratio_low.map(|ratio| 1.0 - ratio);
+    Ok(ChangedTransitionMetrics {
+        n: learned.len(),
+        learned_mse,
+        copy_forward_mse,
+        improvement_fraction,
+        improvement_ci95_low,
+        improvement_ci95_high,
+        ten_percent_improvement_pass: improvement_fraction.map(|value| value >= 0.10),
+    })
 }
 
 fn l2_sq(a: &[f32], b: &[f32]) -> f64 {
@@ -1427,6 +1587,12 @@ fn ptrm_metrics(
 struct BatchEvalPartial {
     mse_all: Vec<f32>,
     encoder_embeddings: Vec<Option<Vec<f32>>>,
+    representation_embeddings: Vec<Vec<f32>>,
+    sigreg_raw_weighted: f64,
+    sigreg_bounded_weighted: f64,
+    sigreg_n: usize,
+    changed_learned_errors: Vec<f32>,
+    changed_copy_forward_errors: Vec<f32>,
     event_labeled: usize,
     event_correct_weighted: f64,
     event_bce_weighted: f64,
@@ -1449,6 +1615,7 @@ fn eval_one_batch(
     model: &WorldModel,
     chunk: &[TransitionSample],
     bi: usize,
+    train_cfg: &TrainConfig,
     cfg: &EvalConfig,
     device: &Device,
 ) -> Result<BatchEvalPartial> {
@@ -1462,10 +1629,30 @@ fn eval_one_batch(
         &batch.action_coords,
         &batch.goals,
     )?;
-    let current_z = model.encode_state(&batch.frames)?;
+    let (current_z, next_z, projected_sigreg) =
+        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let sigreg = (chunk.len() >= 2)
+        .then(|| {
+            sigreg_losses_for_encoded_pair(
+                &current_z,
+                &next_z,
+                projected_sigreg.as_ref(),
+                train_cfg,
+                cfg.seed.wrapping_add(bi as u64),
+            )
+        })
+        .transpose()?;
     let current_vecs = flatten_latent(&current_z)?
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()?;
+    let mut representation_embeddings = pool_latent(&current_z)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    representation_embeddings.extend(
+        pool_latent(&next_z)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+    );
     let mut partial = BatchEvalPartial {
         encoder_embeddings: chunk
             .iter()
@@ -1478,11 +1665,31 @@ fn eval_one_batch(
                 }
             })
             .collect(),
+        representation_embeddings,
+        sigreg_raw_weighted: match &sigreg {
+            Some((raw, _)) => raw.to_scalar::<f32>()? as f64 * chunk.len() as f64,
+            None => 0.0,
+        },
+        sigreg_bounded_weighted: match &sigreg {
+            Some((_, bounded)) => bounded.to_scalar::<f32>()? as f64 * chunk.len() as f64,
+            None => 0.0,
+        },
+        sigreg_n: sigreg.as_ref().map_or(0, |_| chunk.len()),
         ..Default::default()
     };
-    let next_z = model.encode_state(&batch.next_frames)?;
     let mses = per_sample_mse(&out.y, &next_z)?;
+    let copy_forward_mses = per_sample_mse(&current_z, &next_z)?;
     partial.mse_all.extend(mses.iter().copied());
+    for ((sample, learned), copy_forward) in chunk
+        .iter()
+        .zip(mses.iter().copied())
+        .zip(copy_forward_mses.iter().copied())
+    {
+        if sample.current != sample.next {
+            partial.changed_learned_errors.push(learned);
+            partial.changed_copy_forward_errors.push(copy_forward);
+        }
+    }
 
     let (lab, acc, bce) = eval_events(&out.event_logits, &batch.event_targets, &batch.event_mask)?;
     if lab > 0 {
@@ -1601,6 +1808,18 @@ fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> BatchEv
     for (_, partial) in partials {
         merged.mse_all.extend(partial.mse_all);
         merged.encoder_embeddings.extend(partial.encoder_embeddings);
+        merged
+            .representation_embeddings
+            .extend(partial.representation_embeddings);
+        merged.sigreg_raw_weighted += partial.sigreg_raw_weighted;
+        merged.sigreg_bounded_weighted += partial.sigreg_bounded_weighted;
+        merged.sigreg_n += partial.sigreg_n;
+        merged
+            .changed_learned_errors
+            .extend(partial.changed_learned_errors);
+        merged
+            .changed_copy_forward_errors
+            .extend(partial.changed_copy_forward_errors);
         merged.event_labeled += partial.event_labeled;
         merged.event_correct_weighted += partial.event_correct_weighted;
         merged.event_bce_weighted += partial.event_bce_weighted;
@@ -1742,7 +1961,7 @@ fn eval_action_diagnostics(
     let mut aggregate_shuffled = Vec::new();
     let mut aggregate_changed = 0usize;
     let mut by_source = BTreeMap::new();
-    for (name, start, end) in source_ranges {
+    for (source_index, (name, start, end)) in source_ranges.into_iter().enumerate() {
         let valid_shuffle = end.saturating_sub(start) >= 2;
         let true_slice = if valid_shuffle {
             &true_errors[start..end]
@@ -1769,6 +1988,7 @@ fn eval_action_diagnostics(
                     true_slice,
                     shuffled_slice,
                     changed_conditionings,
+                    seed.wrapping_add(source_index as u64).wrapping_add(0xB005),
                 )?,
                 coverage: action_coverage(&samples[start..end]),
             },
@@ -1780,6 +2000,7 @@ fn eval_action_diagnostics(
                 &aggregate_true,
                 &aggregate_shuffled,
                 aggregate_changed,
+                seed.wrapping_add(0xA661),
             )?,
             coverage: action_coverage(samples),
         },
@@ -2079,6 +2300,8 @@ fn eval_sample_set(
             source: source.into(),
             n_samples: 0,
             one_step_latent_mse: None,
+            representation: None,
+            changed_transitions: None,
             identifiability: None,
             events: EventMetrics {
                 labeled: 0,
@@ -2120,7 +2343,8 @@ fn eval_sample_set(
             .map(|(bi, &(start, end))| {
                 let chunk = &samples[start..end];
                 with_thread_local_model(train_cfg, checkpoint, device, |m| {
-                    eval_one_batch(m, chunk, bi, cfg, device).map(|partial| (bi, partial))
+                    eval_one_batch(m, chunk, bi, train_cfg, cfg, device)
+                        .map(|partial| (bi, partial))
                 })
             })
             .collect::<Result<_>>()?;
@@ -2130,8 +2354,9 @@ fn eval_sample_set(
             .iter()
             .enumerate()
             .map(|(bi, &(start, end))| {
-                let partial = eval_one_batch(model, &samples[start..end], bi, cfg, device)
-                    .map(|partial| (bi, partial))?;
+                let partial =
+                    eval_one_batch(model, &samples[start..end], bi, train_cfg, cfg, device)
+                        .map(|partial| (bi, partial))?;
                 if device.is_cuda() {
                     device.synchronize()?;
                 }
@@ -2141,6 +2366,17 @@ fn eval_sample_set(
         merge_batch_partials(partials)
     };
 
+    let representation = Some(summarize_representation(
+        &merged.representation_embeddings,
+        merged.sigreg_raw_weighted,
+        merged.sigreg_bounded_weighted,
+        merged.sigreg_n,
+    ));
+    let changed_transitions = Some(summarize_changed_transitions(
+        &merged.changed_learned_errors,
+        &merged.changed_copy_forward_errors,
+        cfg.seed.wrapping_add(0xC0F1),
+    )?);
     let mse_all = merged.mse_all;
     let encoder_embeddings = merged.encoder_embeddings;
     let event_labeled = merged.event_labeled;
@@ -2292,6 +2528,8 @@ fn eval_sample_set(
         source: source.into(),
         n_samples: samples.len(),
         one_step_latent_mse: mean(&mse_all),
+        representation,
+        changed_transitions,
         identifiability,
         events,
         q,
@@ -2699,7 +2937,7 @@ mod tests {
 
     #[test]
     fn action_shuffle_ratio_compares_prediction_error_on_the_same_targets() -> Result<()> {
-        let metrics = summarize_action_shuffle(&[1.0, 3.0], &[2.0, 4.0], 2)?;
+        let metrics = summarize_action_shuffle(&[1.0, 3.0], &[2.0, 4.0], 2, 7)?;
         assert_eq!(metrics.n, 2);
         assert_eq!(metrics.changed_conditionings, 2);
         assert_eq!(metrics.changed_fraction, Some(1.0));
@@ -2708,10 +2946,50 @@ mod tests {
         assert_eq!(metrics.ratio, Some(1.5));
         assert_eq!(metrics.action_conditioning_pass, Some(true));
 
-        let failed = summarize_action_shuffle(&[2.0, 2.0], &[2.1, 2.1], 2)?;
+        let failed = summarize_action_shuffle(&[2.0, 2.0], &[2.1, 2.1], 2, 7)?;
         assert_eq!(failed.action_conditioning_pass, Some(false));
-        let unavailable = summarize_action_shuffle(&[2.0, 2.0], &[2.0, 2.0], 0)?;
+        let unavailable = summarize_action_shuffle(&[2.0, 2.0], &[2.0, 2.0], 0, 7)?;
         assert_eq!(unavailable.action_conditioning_pass, None);
+        Ok(())
+    }
+
+    #[test]
+    fn representation_diagnostics_apply_preregistered_collapse_thresholds() {
+        let collapsed = summarize_representation(
+            &[vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]],
+            30_000.0,
+            29_850.0,
+            3,
+        );
+        assert_eq!(collapsed.sigreg_raw, Some(10_000.0));
+        assert_eq!(collapsed.sigreg_bounded, Some(9_950.0));
+        assert_eq!(collapsed.sigreg_near_bound, Some(true));
+        assert_eq!(collapsed.noncollapse_pass, Some(false));
+
+        let diverse = summarize_representation(
+            &[
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 0.0, 1.0],
+            ],
+            40.0,
+            39.0,
+            4,
+        );
+        assert!(diverse.mean_encoder_variance.unwrap() > ENCODER_MIN_MEAN_VARIANCE);
+        assert!(diverse.effective_rank_fraction.unwrap() > ENCODER_MIN_EFFECTIVE_RANK_FRACTION);
+        assert_eq!(diverse.noncollapse_pass, Some(true));
+    }
+
+    #[test]
+    fn changed_transition_metrics_compare_only_paired_changed_rows() -> Result<()> {
+        let metrics = summarize_changed_transitions(&[0.8, 0.6, 0.4], &[1.0, 0.8, 0.6], 17)?;
+        assert_eq!(metrics.n, 3);
+        assert!(metrics.improvement_fraction.unwrap() >= 0.10);
+        assert_eq!(metrics.ten_percent_improvement_pass, Some(true));
+        assert!(metrics.improvement_ci95_low.is_some());
+        assert!(metrics.improvement_ci95_high.is_some());
         Ok(())
     }
 
@@ -2767,6 +3045,7 @@ mod tests {
             global_step: 0,
             latest_checkpoint: dir.join("checkpoints/step-000000000000"),
             resumed_from: None,
+            batch_schedule_migrations: vec![],
             checkpoint: dir.join("model.safetensors"),
             export_checkpoint: None,
             config_path: dir.join("config.json"),

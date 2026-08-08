@@ -84,6 +84,16 @@ pub struct ModelConfig {
     /// Run conv encoder/decoder paths in BF16 (norms/losses stay F32).
     #[serde(default)]
     pub bf16_conv: bool,
+    /// Feed pre-RMS pooled encoder features through a learned SIGReg projector.
+    #[serde(default)]
+    pub sigreg_projector: bool,
+    /// Projected embedding width used only when `sigreg_projector` is enabled.
+    #[serde(default = "default_sigreg_projector_dim")]
+    pub sigreg_projector_dim: usize,
+}
+
+fn default_sigreg_projector_dim() -> usize {
+    128
 }
 
 impl Default for ModelConfig {
@@ -99,6 +109,8 @@ impl Default for ModelConfig {
             residual_y_update: false,
             warm_start_y: false,
             bf16_conv: false,
+            sigreg_projector: false,
+            sigreg_projector_dim: default_sigreg_projector_dim(),
         }
     }
 }
@@ -130,6 +142,9 @@ impl ModelConfig {
             || self.num_events == 0
         {
             bail!("ModelConfig dims/steps must be positive");
+        }
+        if self.sigreg_projector && self.sigreg_projector_dim < 2 {
+            bail!("sigreg_projector_dim must be >= 2 when the projector is enabled");
         }
         Ok(())
     }
@@ -401,11 +416,23 @@ pub struct WorldModel {
     reliability_head: Linear,
     /// Direct one-step prefix delta from pooled state + action.
     prefix_head: Linear,
+    /// Optional pre-RMS `B×C` → `B×D` projection used only by SIGReg.
+    sigreg_projector: Option<Linear>,
 }
 
 impl WorldModel {
     pub fn new(cfg: ModelConfig, vb: VarBuilder) -> Result<Self> {
         cfg.validate()?;
+        let sigreg_projector = cfg
+            .sigreg_projector
+            .then(|| {
+                linear(
+                    cfg.hidden_dim,
+                    cfg.sigreg_projector_dim,
+                    vb.pp("sigreg_projector"),
+                )
+            })
+            .transpose()?;
         Ok(Self {
             pixel_emb: embedding(PIXEL_CHANNELS, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
             encoder: GridEncoder::new(cfg.hidden_dim, vb.pp("encoder"))?,
@@ -418,6 +445,7 @@ impl WorldModel {
             q_head: linear(cfg.hidden_dim, 1, vb.pp("q_head"))?,
             reliability_head: linear(cfg.hidden_dim, 1, vb.pp("reliability_head"))?,
             prefix_head: linear(cfg.hidden_dim * 2, cfg.hidden_dim, vb.pp("prefix_head"))?,
+            sigreg_projector,
             config: cfg,
         })
     }
@@ -432,8 +460,7 @@ impl WorldModel {
         rms_norm_latent(&self.encoder.forward(&embedded, self.config.bf16_conv)?)
     }
 
-    /// Encode current and next frames in one conv pass (`2B` batch), then split.
-    pub fn encode_state_pair(
+    fn encode_state_pair_raw(
         &self,
         frames: &Tensor,
         next_frames: &Tensor,
@@ -447,10 +474,45 @@ impl WorldModel {
             );
         }
         let both = Tensor::cat(&[frames, next_frames], 0)?;
-        let encoded = self.encode_state(&both)?;
-        let cur_z = encoded.narrow(0, 0, batch)?;
-        let next_z = encoded.narrow(0, batch, batch)?;
-        Ok((cur_z, next_z))
+        let embedded = self.embed_frames(&both)?;
+        let encoded = self.encoder.forward(&embedded, self.config.bf16_conv)?;
+        let current = encoded.narrow(0, 0, batch)?;
+        let next = encoded.narrow(0, batch, batch)?;
+        Ok((current, next))
+    }
+
+    /// Encode current and next frames in one conv pass (`2B` batch), then split.
+    pub fn encode_state_pair(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (current, next) = self.encode_state_pair_raw(frames, next_frames)?;
+        Ok((rms_norm_latent(&current)?, rms_norm_latent(&next)?))
+    }
+
+    /// Return normalized dynamics latents plus optional pre-RMS `T×B×D`
+    /// projector embeddings for the experimental SIGReg treatment.
+    pub fn encode_state_pair_for_training(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let (current_raw, next_raw) = self.encode_state_pair_raw(frames, next_frames)?;
+        let projected = self
+            .sigreg_projector
+            .as_ref()
+            .map(|projector| -> Result<Tensor> {
+                let current = projector.forward(&pool_latent(&current_raw)?)?;
+                let next = projector.forward(&pool_latent(&next_raw)?)?;
+                Ok(Tensor::stack(&[current, next], 0)?)
+            })
+            .transpose()?;
+        Ok((
+            rms_norm_latent(&current_raw)?,
+            rms_norm_latent(&next_raw)?,
+            projected,
+        ))
     }
 
     fn embed_frames(&self, frames: &Tensor) -> Result<Tensor> {
@@ -1208,6 +1270,33 @@ mod tests {
         let next_solo = model.encode_state(&next_frames)?;
         assert!(max_abs_diff(&cur, &cur_solo)? < 1e-5);
         assert!(max_abs_diff(&next, &next_solo)? < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn sigreg_projector_uses_pre_rms_features_and_returns_time_batch_embeddings() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            sigreg_projector: true,
+            sigreg_projector_dim: 6,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let current = Tensor::zeros((3, 1, FRAME_SIDE, FRAME_SIDE), DType::U8, &device)?;
+        let next = Tensor::ones((3, 1, FRAME_SIDE, FRAME_SIDE), DType::U8, &device)?;
+        let (cur_z, next_z, projected) = model.encode_state_pair_for_training(&current, &next)?;
+        assert_eq!(cur_z.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
+        assert_eq!(next_z.dims(), &[3, 8, LATENT_GRID, LATENT_GRID]);
+        assert_eq!(projected.expect("projector enabled").dims(), &[2, 3, 6]);
+        let names = varmap.data().lock().unwrap();
+        assert!(names.contains_key("sigreg_projector.weight"));
+        assert!(names.contains_key("sigreg_projector.bias"));
         Ok(())
     }
 

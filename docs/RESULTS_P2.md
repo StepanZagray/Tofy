@@ -17,11 +17,77 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## SIGReg/action-conditioning A/B v1 (experimental; not a positive claim)
+
+The controlled experiment is preregistered under
+`runs/p2/ab-sigreg-action-v1/` and run by
+`scripts/p2_sigreg_action_ab.sh`. Both arms use fresh initialization, physical
+batch `1024`, accumulation `1`, dynamics only, shuffled episodes, randomized
+recursion up to `8` outer / `2` inner steps, final-outer-only supervision, seed-fixed
+data order, and checkpoints every 500 updates. Event, Q, reliability, prefix,
+rollout, PTRM, ensemble, and live-policy signals are disabled or ignored for this
+representation experiment. Held-out evaluation uses 64 synthetic episodes,
+deterministic `K=1`, ensemble `1`, and evaluation seed `424242` at updates 1,000
+and 2,000.
+
+- `control` retains the existing RMS-normalized, 2×2 spatial-pooled cell-vector
+  SIGReg path unchanged.
+- `projector` globally pools the encoder's pre-RMS `B×128×8×8` features, applies
+  one learned linear `128→128` projector without output normalization, and supplies
+  current/next embeddings to SIGReg as `2×B×128` (`T×B×D`). A linear width-preserving
+  projector is the smallest treatment that tests the audited primary-source
+  constraints: the official statistic supports time×batch embeddings, while the
+  LeWorldModel report says a projector was needed when final encoder normalization
+  impeded the anti-collapse objective. The unchanged width avoids adding a capacity
+  or bottleneck confound.
+
+Before any result is read, representation collapse is defined as mean variance below
+`1e-4` or covariance participation-ratio effective rank below `10%` of encoder
+dimension. SIGReg is considered near-pinned at `>=99%` of its `10,000` smooth bound.
+Action gates require both dynamics aggregate and `random_one_step` shuffled/true MSE
+ratios `>=1.10` with paired-bootstrap 95% lower bounds above `1.0`. Genuinely changed
+transitions must show at least 10% lower learned one-step MSE than copy-forward.
+Across three seeds, the median lower confidence bound for each action ratio must
+also exceed `1.0`. A candidate arm has a preregistered severe relative regression
+if any paired seed has more than 25% worse horizon-8 rollout MSE, more than 25%
+lower encoder variance, or more than 25% lower effective-rank fraction. Such an
+arm is not promoted. Any arm with the preregistered credible monotonic approach
+advances both arms to seeds 2 and 3.
+
+```bash
+# Run one arm/seed through the 1,000 and 2,000 update pauses and evaluations.
+P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
+P2_EXPECTED_SHA=<reviewed-commit> \
+TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
+bash scripts/p2_sigreg_action_ab.sh control 1
+
+P2_AB_ROOT=/workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
+P2_EXPECTED_SHA=<reviewed-commit> \
+TOFY_BIN=/workspace/Personal/Tofy-p2-ab/target/release/tofy \
+bash scripts/p2_sigreg_action_ab.sh projector 1
+
+python3 scripts/p2_ab_gate.py \
+  --root /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
+  --seeds 1 \
+  --output-json /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/pilot-gates.json \
+  --output-md /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/pilot-gates.md
+
+# Only after branch E has been recorded and all six runs reach 4,000:
+python3 scripts/p2_ab_gate.py \
+  --root /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1 \
+  --seeds 1 2 3 --final-update 4000 \
+  --output-json /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/final-4000-gates.json \
+  --output-md /workspace/Personal/Tofy/runs/p2/ab-sigreg-action-v1/final-4000-gates.md
+```
+
+These commands and any interim smoke metrics are experimental diagnostics only.
+They do not set `research_claim=true`, use public ARC games, or justify a model claim.
+
 ## Readiness training
 
 VRAM/GPU/Muon integration landed 2026-08-05:
 
-- **Batch:** physical `128` × grad_accum `4` (effective 512) on RTX 5060 8GB (~6.4 GiB peak). Resume may migrate microbatch schedule when effective batch stays 512 (e.g. `512×1` on L40S).
+- **Batch:** physical `128` × grad_accum `4` (effective 512) on RTX 5060 8GB (~6.4 GiB peak). An equal-effective-batch physical/accumulation change is a trajectory migration, not exact resume, and now requires the explicit migration flag and durable label.
 - **Input:** palette index tensors + `pixel_emb` (replaces 16-ch one-hot staging)
 - **SIGReg:** spatial with row subsample cap `4096`
 - **Optimizer:** DeepSeek-V4 hybrid — Muon on hidden conv/proj weights (≥2×2); AdamW on embeddings, auxiliary heads (`event_head`, `q_head`, …), biases
