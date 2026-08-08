@@ -7,12 +7,17 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 from typing import Any
 
 
 ARMS = ("control", "projector")
+NONFINITE_TRAINING_PATTERN = re.compile(
+    r"(?:\bnan\b|\b(?:non[- ]finite|not finite)\b|\binfinite (?:loss|gradient)\b)",
+    re.IGNORECASE,
+)
 
 
 def finite_tree(value: Any) -> bool:
@@ -73,6 +78,12 @@ def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
     if not finite_tree(report):
         errors.append("report contains non-finite numeric values")
     errors.extend(verify_sha256_file(sha_path))
+    expected_stages = ["train-1000", "eval-1000"]
+    if update >= 2000:
+        expected_stages.extend(("train-2000", "eval-2000"))
+    if update >= 4000:
+        expected_stages.extend(("train-4000", "eval-4000"))
+    phases_by_stage: dict[str, list[dict[str, Any]]] = {}
     if phases_path.is_file():
         for line_number, line in enumerate(phases_path.read_text().splitlines(), 1):
             if not line.strip():
@@ -82,10 +93,32 @@ def load_run(root: Path, seed: int, arm: str, update: int) -> dict[str, Any]:
             except json.JSONDecodeError as exc:
                 errors.append(f"invalid phases.jsonl line {line_number}: {exc}")
                 continue
-            if str(phase.get("status")) != "0":
-                errors.append(f"phase {phase.get('stage')} exited {phase.get('status')}")
+            stage = phase.get("stage")
+            if isinstance(stage, str):
+                phases_by_stage.setdefault(stage, []).append(phase)
     else:
         errors.append(f"missing {phases_path}")
+    for stage in expected_stages:
+        attempts = phases_by_stage.get(stage, [])
+        if not attempts:
+            errors.append(f"missing phase {stage}")
+        elif str(attempts[-1].get("status")) != "0":
+            errors.append(f"latest phase {stage} exited {attempts[-1].get('status')}")
+    for stage, attempts in phases_by_stage.items():
+        if not stage.startswith("train-"):
+            continue
+        for attempt_index, phase in enumerate(attempts, 1):
+            log_text = phase.get("log_path")
+            log_path = Path(log_text) if isinstance(log_text, str) else arm_dir / f"{stage}.log"
+            try:
+                log_contents = log_path.read_text(errors="replace")
+            except OSError as exc:
+                errors.append(f"cannot read retained training log {log_path}: {exc}")
+                continue
+            if NONFINITE_TRAINING_PATTERN.search(log_contents):
+                errors.append(
+                    f"training phase {stage} attempt {attempt_index} recorded a non-finite value"
+                )
 
     dynamics = report.get("synthetic_dynamics", {})
     representation = dynamics.get("representation") or {}

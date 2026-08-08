@@ -45,32 +45,46 @@ record_command() {
 }
 
 record_phase() {
-  local stage="$1" started="$2" finished="$3" status="$4"
+  local stage="$1" started="$2" finished="$3" status="$4" attempt="$5" log_path="$6" time_path="$7"
   jq -nc \
     --arg stage "$stage" \
     --arg started_utc "$started" \
     --arg finished_utc "$finished" \
     --arg status "$status" \
+    --argjson attempt "$attempt" \
+    --arg log_path "$log_path" \
+    --arg time_path "$time_path" \
     --arg git_sha "$git_sha" \
     --arg arm "$arm" \
     --argjson seed "$seed" \
-    '{stage:$stage,started_utc:$started_utc,finished_utc:$finished_utc,status:$status,git_sha:$git_sha,arm:$arm,seed:$seed}' \
+    '{stage:$stage,attempt:$attempt,started_utc:$started_utc,finished_utc:$finished_utc,status:$status,git_sha:$git_sha,arm:$arm,seed:$seed,log_path:$log_path,time_path:$time_path}' \
     >>"$phase_log"
 }
 
 run_phase() {
   local stage="$1" log_path="$2"
   shift 2
-  local started finished rc
+  local started finished started_epoch finished_epoch rc attempt resolved_log time_path
+  attempt=1
+  resolved_log="$log_path"
+  time_path="$arm_dir/$stage.time"
+  while [[ -e "$resolved_log" || -e "$time_path" ]]; do
+    attempt=$((attempt + 1))
+    resolved_log="${log_path%.log}.attempt-$attempt.log"
+    time_path="$arm_dir/$stage.attempt-$attempt.time"
+  done
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  started_epoch="$(date -u +%s)"
   record_command "$stage" "$@"
   set +e
-  /usr/bin/time -f 'wall_seconds=%e max_rss_kib=%M exit_status=%x' -o "$arm_dir/$stage.time" \
-    "$@" > >(tee "$log_path") 2>&1
+  "$@" > >(tee "$resolved_log") 2>&1
   rc=$?
   set -e
   finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  record_phase "$stage" "$started" "$finished" "$rc"
+  finished_epoch="$(date -u +%s)"
+  printf 'wall_seconds=%s exit_status=%s\n' \
+    "$((finished_epoch - started_epoch))" "$rc" >"$time_path"
+  record_phase "$stage" "$started" "$finished" "$rc" "$attempt" "$resolved_log" "$time_path"
   return "$rc"
 }
 
