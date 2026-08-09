@@ -8,6 +8,9 @@ use candle_nn::{
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::p2::representation::RepresentationSeam;
 
 /// Fixed observation resolution required by the pixel encoder.
 pub const FRAME_SIDE: usize = 64;
@@ -368,6 +371,12 @@ pub struct LatentRecursionOutput {
     pub recursion_probes: Vec<RecursionStepProbe>,
 }
 
+/// Detached tensors from one forward pass, keyed by the stable evaluation seams.
+#[derive(Debug, Clone)]
+pub struct RepresentationDiagnosticOutput {
+    pub seams: BTreeMap<RepresentationSeam, Tensor>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PtrmTrajectory {
     pub steps: Vec<StepOutput>,
@@ -539,6 +548,80 @@ impl WorldModel {
             next_raw,
             projected_sigreg: projected,
         })
+    }
+
+    /// Capture every named representation seam from one deterministic batch forward.
+    ///
+    /// This intentionally exposes only detached tensors, rather than the trainable
+    /// encoder/recurrence internals, so evaluation can diagnose representations
+    /// without expanding the model's public training surface.
+    pub fn representation_diagnostic(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        _goal_features: &Tensor,
+    ) -> Result<RepresentationDiagnosticOutput> {
+        let (current_raw, target_raw) = self.encode_state_pair_raw(frames, next_frames)?;
+        let current = rms_norm_latent(&current_raw)?;
+        let target = rms_norm_latent(&target_raw)?;
+        let x = self.add_action(&current, actions, action_coords)?;
+        let y_init = self.config.warm_start_y.then(|| current.clone());
+        let recursion = self.run_latent_recursion(
+            &x,
+            0.0,
+            None,
+            RecursionDepth::from_config(&self.config),
+            y_init,
+            RecursionOpts {
+                record_probes: false,
+                store_intermediate_steps: true,
+            },
+        )?;
+        let outer_one = recursion
+            .steps
+            .first()
+            .expect("configured outer_steps is positive")
+            .clone();
+        let prediction = recursion.y;
+        let seams = BTreeMap::from([
+            (
+                RepresentationSeam::EncoderPreRmsPooled,
+                pool_latent(&current_raw)?.detach(),
+            ),
+            (
+                RepresentationSeam::EncoderPostRmsPooled,
+                pool_latent(&current)?.detach(),
+            ),
+            (
+                RepresentationSeam::EncoderPreRmsSpatial,
+                current_raw.detach(),
+            ),
+            (RepresentationSeam::EncoderPostRmsSpatial, current.detach()),
+            (
+                RepresentationSeam::ActionConditionedInputSpatial,
+                x.detach(),
+            ),
+            (
+                RepresentationSeam::RecursionOuterOneSpatial,
+                outer_one.detach(),
+            ),
+            (
+                RepresentationSeam::PredictionFinalPooled,
+                pool_latent(&prediction)?.detach(),
+            ),
+            (
+                RepresentationSeam::PredictionFinalSpatial,
+                prediction.detach(),
+            ),
+            (
+                RepresentationSeam::TargetPostRmsPooled,
+                pool_latent(&target)?.detach(),
+            ),
+            (RepresentationSeam::TargetPostRmsSpatial, target.detach()),
+        ]);
+        Ok(RepresentationDiagnosticOutput { seams })
     }
 
     fn embed_frames(&self, frames: &Tensor) -> Result<Tensor> {
@@ -1281,6 +1364,39 @@ mod tests {
             .flatten_all()?
             .to_vec1::<f32>()?;
         Ok(d.into_iter().fold(0.0f32, f32::max))
+    }
+
+    #[test]
+    fn representation_diagnostic_returns_every_named_detached_seam() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = make_model(&device)?;
+        let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
+        let next = frames.clone();
+        let output = model.representation_diagnostic(&frames, &next, &actions, &coords, &goals)?;
+        assert_eq!(output.seams.len(), 10);
+        for seam in [
+            RepresentationSeam::EncoderPreRmsPooled,
+            RepresentationSeam::EncoderPostRmsPooled,
+            RepresentationSeam::EncoderPreRmsSpatial,
+            RepresentationSeam::EncoderPostRmsSpatial,
+            RepresentationSeam::ActionConditionedInputSpatial,
+            RepresentationSeam::RecursionOuterOneSpatial,
+            RepresentationSeam::PredictionFinalPooled,
+            RepresentationSeam::PredictionFinalSpatial,
+            RepresentationSeam::TargetPostRmsPooled,
+            RepresentationSeam::TargetPostRmsSpatial,
+        ] {
+            assert!(output.seams.contains_key(&seam), "missing {seam:?}");
+        }
+        assert_eq!(
+            output.seams[&RepresentationSeam::EncoderPostRmsPooled].dims2()?,
+            (2, model.config.hidden_dim)
+        );
+        assert_eq!(
+            output.seams[&RepresentationSeam::PredictionFinalSpatial].dims4()?,
+            (2, model.config.hidden_dim, LATENT_GRID, LATENT_GRID)
+        );
+        Ok(())
     }
 
     #[test]

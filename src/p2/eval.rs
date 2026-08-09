@@ -8,8 +8,11 @@ use crate::p2::data::{
     generate_curriculum, generate_hazard_one_step, TransitionSample, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionStepProbe, WorldModel,
+    flatten_latent, latent_mse_per_sample, PtrmConfig, RecursionStepProbe, WorldModel,
     EVENT_GOAL_FAILED,
+};
+use crate::p2::representation::{
+    summarize_seams, RepresentationSeam, RepresentationSeamMap, DEFAULT_REPRESENTATION_ROW_CAP,
 };
 use crate::p2::rhae::{
     benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
@@ -21,6 +24,7 @@ use crate::p2::train::{
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, VarBuilder, VarMap};
+use clap::ValueEnum;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -31,7 +35,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v9";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v10";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalMode {
+    Full,
+    Representation,
+    Rollout,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HorizonRolloutStats {
@@ -70,10 +82,22 @@ pub struct EvalConfig {
     pub episode_jsonl: Option<PathBuf>,
     #[serde(default = "default_ensemble_members")]
     pub ensemble_members: usize,
+    #[serde(default = "default_eval_mode")]
+    pub mode: EvalMode,
+    #[serde(default = "default_representation_row_cap")]
+    pub representation_row_cap: usize,
 }
 
 fn default_ensemble_members() -> usize {
     8
+}
+
+fn default_eval_mode() -> EvalMode {
+    EvalMode::Full
+}
+
+fn default_representation_row_cap() -> usize {
+    DEFAULT_REPRESENTATION_ROW_CAP
 }
 
 impl Default for EvalConfig {
@@ -93,6 +117,8 @@ impl Default for EvalConfig {
             output: PathBuf::from("runs/p2/smoke/eval_report.json"),
             episode_jsonl: None,
             ensemble_members: 8,
+            mode: default_eval_mode(),
+            representation_row_cap: default_representation_row_cap(),
         }
     }
 }
@@ -101,6 +127,9 @@ impl EvalConfig {
     pub fn validate(&self) -> Result<()> {
         if self.physical_batch == 0 {
             bail!("physical_batch must be > 0");
+        }
+        if self.representation_row_cap == 0 {
+            bail!("representation_row_cap must be > 0");
         }
         if self.ptrm_k.is_empty() || self.ptrm_k.contains(&0) {
             bail!("ptrm_k must contain only positive values");
@@ -432,12 +461,14 @@ pub struct SplitEval {
     pub n_samples: usize,
     pub one_step_latent_mse: Option<f64>,
     pub representation: Option<RepresentationDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representation_seams: Option<RepresentationSeamMap>,
     pub changed_transitions: Option<ChangedTransitionMetrics>,
     pub identifiability: Option<IdentifiabilityMetrics>,
-    pub events: EventMetrics,
-    pub q: QMetrics,
-    pub ptrm: Vec<PtrmKMetrics>,
-    pub deterministic_matched_compute: Vec<MatchedComputeMetrics>,
+    pub events: Option<EventMetrics>,
+    pub q: Option<QMetrics>,
+    pub ptrm: Option<Vec<PtrmKMetrics>>,
+    pub deterministic_matched_compute: Option<Vec<MatchedComputeMetrics>>,
     pub rollout: Option<RolloutMetrics>,
     /// Re-encode real frame every step (matches ARC play).
     pub closed_loop: Option<RolloutMetrics>,
@@ -470,6 +501,7 @@ pub struct Arc3RecordingBenchmark {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub schema: String,
+    pub mode: EvalMode,
     pub seed: u64,
     pub checkpoint: PathBuf,
     pub device: String,
@@ -1145,6 +1177,7 @@ fn latent_covariance_frobenius(encoder: &[Vec<f32>]) -> Option<f64> {
     Some(err.sqrt())
 }
 
+#[cfg(test)]
 fn encoder_variance_and_effective_rank(rows: &[Vec<f32>]) -> (Option<f64>, Option<f64>) {
     if rows.len() < 2 || rows.first().is_none_or(Vec::is_empty) {
         return (None, None);
@@ -1171,6 +1204,7 @@ fn encoder_variance_and_effective_rank(rows: &[Vec<f32>]) -> (Option<f64>, Optio
     (Some(mean_variance), effective_rank)
 }
 
+#[cfg(test)]
 fn summarize_representation(
     rows: &[Vec<f32>],
     sigreg_raw_sum: f64,
@@ -1200,6 +1234,35 @@ fn summarize_representation(
         noncollapse_pass: mean_encoder_variance.map(|variance| {
             variance >= ENCODER_MIN_MEAN_VARIANCE
                 && effective_rank_fraction.unwrap_or(0.0) >= ENCODER_MIN_EFFECTIVE_RANK_FRACTION
+        }),
+    }
+}
+
+fn summarize_representation_from_seam(
+    seam: &crate::p2::representation::RepresentationSeamMetrics,
+    sigreg_raw_sum: f64,
+    sigreg_bounded_sum: f64,
+    sigreg_n: usize,
+) -> RepresentationDiagnostics {
+    let sigreg_raw = (sigreg_n > 0).then_some(sigreg_raw_sum / sigreg_n as f64);
+    let sigreg_bounded = (sigreg_n > 0).then_some(sigreg_bounded_sum / sigreg_n as f64);
+    RepresentationDiagnostics {
+        sigreg_raw,
+        sigreg_bounded,
+        sigreg_bound: SIGREG_BOUND,
+        sigreg_near_bound: sigreg_bounded
+            .map(|value| value >= SIGREG_BOUND * SIGREG_NEAR_BOUND_FRACTION),
+        encoder_rows: seam.rows_used,
+        encoder_dim: seam.dimension,
+        mean_encoder_variance: seam.mean_variance,
+        effective_rank: seam.effective_rank,
+        effective_rank_fraction: seam.effective_rank_fraction,
+        min_mean_variance: ENCODER_MIN_MEAN_VARIANCE,
+        min_effective_rank_fraction: ENCODER_MIN_EFFECTIVE_RANK_FRACTION,
+        noncollapse_pass: seam.mean_variance.map(|variance| {
+            variance >= ENCODER_MIN_MEAN_VARIANCE
+                && seam.effective_rank_fraction.unwrap_or(0.0)
+                    >= ENCODER_MIN_EFFECTIVE_RANK_FRACTION
         }),
     }
 }
@@ -1587,7 +1650,7 @@ fn ptrm_metrics(
 struct BatchEvalPartial {
     mse_all: Vec<f32>,
     encoder_embeddings: Vec<Option<Vec<f32>>>,
-    representation_embeddings: Vec<Vec<f32>>,
+    representation_tensors: BTreeMap<RepresentationSeam, Tensor>,
     sigreg_raw_weighted: f64,
     sigreg_bounded_weighted: f64,
     sigreg_n: usize,
@@ -1623,8 +1686,19 @@ fn eval_one_batch(
         return Ok(BatchEvalPartial::default());
     }
     let batch = batch_from_samples(chunk, device)?;
-    let out = model.forward(
+    let out = (cfg.mode == EvalMode::Full)
+        .then(|| {
+            model.forward(
+                &batch.frames,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+            )
+        })
+        .transpose()?;
+    let diagnostic = model.representation_diagnostic(
         &batch.frames,
+        &batch.next_frames,
         &batch.actions,
         &batch.action_coords,
         &batch.goals,
@@ -1648,14 +1722,17 @@ fn eval_one_batch(
     let current_vecs = flatten_latent(&current_z)?
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()?;
-    let mut representation_embeddings = pool_latent(&current_z)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()?;
-    representation_embeddings.extend(
-        pool_latent(&next_z)?
-            .to_dtype(DType::F32)?
-            .to_vec2::<f32>()?,
-    );
+    let mses = match &out {
+        Some(out) => per_sample_mse(&out.y, &next_z)?,
+        None => per_sample_mse(
+            diagnostic
+                .seams
+                .get(&RepresentationSeam::PredictionFinalSpatial)
+                .expect("diagnostic forward always captures the final prediction"),
+            &next_z,
+        )?,
+    };
+    let copy_forward_mses = per_sample_mse(&current_z, &next_z)?;
     let mut partial = BatchEvalPartial {
         encoder_embeddings: chunk
             .iter()
@@ -1668,7 +1745,7 @@ fn eval_one_batch(
                 }
             })
             .collect(),
-        representation_embeddings,
+        representation_tensors: diagnostic.seams,
         sigreg_raw_weighted: match &sigreg {
             Some((raw, _)) => raw.to_scalar::<f32>()? as f64 * chunk.len() as f64,
             None => 0.0,
@@ -1680,8 +1757,6 @@ fn eval_one_batch(
         sigreg_n: sigreg.as_ref().map_or(0, |_| chunk.len()),
         ..Default::default()
     };
-    let mses = per_sample_mse(&out.y, &next_z)?;
-    let copy_forward_mses = per_sample_mse(&current_z, &next_z)?;
     partial.mse_all.extend(mses.iter().copied());
     for ((sample, learned), copy_forward) in chunk
         .iter()
@@ -1694,126 +1769,137 @@ fn eval_one_batch(
         }
     }
 
-    let (lab, acc, bce) = eval_events(&out.event_logits, &batch.event_targets, &batch.event_mask)?;
-    if lab > 0 {
-        partial.event_labeled = lab;
-        partial.event_correct_weighted = acc.unwrap_or(0.0) * lab as f64;
-        partial.event_bce_weighted = bce.unwrap_or(0.0) * lab as f64;
-    }
-    let event_logits = out.event_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-    for (sample, logits) in chunk.iter().zip(event_logits.iter()) {
-        if sample.family == "avoid_hazard_reach_marker" && sample.goal_failed == Some(true) {
-            partial.hazard_failure_labeled += 1;
-            if logits[EVENT_GOAL_FAILED] < 0.0 {
-                partial.hazard_false_negatives += 1;
-            }
+    if cfg.mode == EvalMode::Full {
+        let out = out.as_ref().expect("full mode runs the observer forward");
+        let (lab, acc, bce) =
+            eval_events(&out.event_logits, &batch.event_targets, &batch.event_mask)?;
+        if lab > 0 {
+            partial.event_labeled = lab;
+            partial.event_correct_weighted = acc.unwrap_or(0.0) * lab as f64;
+            partial.event_bce_weighted = bce.unwrap_or(0.0) * lab as f64;
         }
-    }
-
-    partial.q_acc = eval_q(&out.q_logit, &mses, cfg.q_mse_threshold)?;
-    partial.q_probs = candle_nn::ops::sigmoid(&out.q_logit.to_dtype(DType::F32)?)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    partial.reliability_probs =
-        candle_nn::ops::sigmoid(&out.reliability_logit.to_dtype(DType::F32)?)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-    partial.recursion_probes.extend(out.recursion_probes);
-
-    if cfg.ensemble_members >= 2 {
-        let ptrm = model.forward_ptrm(
-            &batch.frames,
-            &batch.actions,
-            &batch.action_coords,
-            &batch.goals,
-            PtrmConfig {
-                k: cfg.ensemble_members,
-                sigma: cfg.ptrm_noise.max(0.01),
-                seed: Some(cfg.seed.wrapping_add(bi as u64).wrapping_add(0xE11A)),
-            },
-        )?;
-        let b = next_z.dim(0)?;
-        for sample in 0..b {
-            let mut ys = Vec::with_capacity(cfg.ensemble_members);
-            for traj in &ptrm.trajectories {
-                ys.push(traj.y.get(sample)?.flatten_all()?.to_vec1::<f32>()?);
-            }
-            let mut dsum = 0f64;
-            let mut dpairs = 0usize;
-            for i in 0..cfg.ensemble_members {
-                for j in (i + 1)..cfg.ensemble_members {
-                    let mut s = 0f64;
-                    for (a, b) in ys[i].iter().zip(ys[j].iter()) {
-                        let d = (*a - *b) as f64;
-                        s += d * d;
-                    }
-                    dsum += s.sqrt();
-                    dpairs += 1;
+        let event_logits = out.event_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        for (sample, logits) in chunk.iter().zip(event_logits.iter()) {
+            if sample.family == "avoid_hazard_reach_marker" && sample.goal_failed == Some(true) {
+                partial.hazard_failure_labeled += 1;
+                if logits[EVENT_GOAL_FAILED] < 0.0 {
+                    partial.hazard_false_negatives += 1;
                 }
             }
-            if dpairs > 0 {
-                let per_sample = dsum / dpairs as f64;
-                partial.ensemble_disagreement += per_sample;
-                partial.ensemble_disagreements.push(per_sample as f32);
-                partial.ensemble_n += 1;
+        }
+
+        partial.q_acc = eval_q(&out.q_logit, &mses, cfg.q_mse_threshold)?;
+        partial.q_probs = candle_nn::ops::sigmoid(&out.q_logit.to_dtype(DType::F32)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        partial.reliability_probs =
+            candle_nn::ops::sigmoid(&out.reliability_logit.to_dtype(DType::F32)?)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+        partial
+            .recursion_probes
+            .extend(out.recursion_probes.clone());
+
+        if cfg.ensemble_members >= 2 {
+            let ptrm = model.forward_ptrm(
+                &batch.frames,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                PtrmConfig {
+                    k: cfg.ensemble_members,
+                    sigma: cfg.ptrm_noise.max(0.01),
+                    seed: Some(cfg.seed.wrapping_add(bi as u64).wrapping_add(0xE11A)),
+                },
+            )?;
+            let b = next_z.dim(0)?;
+            for sample in 0..b {
+                let mut ys = Vec::with_capacity(cfg.ensemble_members);
+                for traj in &ptrm.trajectories {
+                    ys.push(traj.y.get(sample)?.flatten_all()?.to_vec1::<f32>()?);
+                }
+                let mut dsum = 0f64;
+                let mut dpairs = 0usize;
+                for i in 0..cfg.ensemble_members {
+                    for j in (i + 1)..cfg.ensemble_members {
+                        let mut s = 0f64;
+                        for (a, b) in ys[i].iter().zip(ys[j].iter()) {
+                            let d = (*a - *b) as f64;
+                            s += d * d;
+                        }
+                        dsum += s.sqrt();
+                        dpairs += 1;
+                    }
+                }
+                if dpairs > 0 {
+                    let per_sample = dsum / dpairs as f64;
+                    partial.ensemble_disagreement += per_sample;
+                    partial.ensemble_disagreements.push(per_sample as f32);
+                    partial.ensemble_n += 1;
+                }
             }
         }
-    }
 
-    for &k in &cfg.ptrm_k {
-        let outer_steps = model
-            .config()
-            .outer_steps
-            .checked_mul(k)
-            .ok_or_else(|| anyhow::anyhow!("matched-compute outer_steps overflow"))?;
-        let deterministic = model.forward_with_outer_steps(
-            &batch.frames,
-            &batch.actions,
-            &batch.action_coords,
-            &batch.goals,
-            outer_steps,
+        for &k in &cfg.ptrm_k {
+            let outer_steps = model
+                .config()
+                .outer_steps
+                .checked_mul(k)
+                .ok_or_else(|| anyhow::anyhow!("matched-compute outer_steps overflow"))?;
+            let deterministic = model.forward_with_outer_steps(
+                &batch.frames,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                outer_steps,
+            )?;
+            let values = per_sample_mse(&deterministic.y, &next_z)?;
+            let entry = partial
+                .matched_acc
+                .entry(k)
+                .or_insert((0.0, 0, outer_steps));
+            entry.0 += values.iter().map(|value| f64::from(*value)).sum::<f64>();
+            entry.1 += values.len();
+        }
+
+        let ptrm = ptrm_metrics(
+            model,
+            &batch,
+            &next_z,
+            &cfg.ptrm_k,
+            cfg.ptrm_noise,
+            cfg.q_mse_threshold,
+            cfg.seed.wrapping_add(bi as u64),
         )?;
-        let values = per_sample_mse(&deterministic.y, &next_z)?;
-        let entry = partial
-            .matched_acc
-            .entry(k)
-            .or_insert((0.0, 0, outer_steps));
-        entry.0 += values.iter().map(|value| f64::from(*value)).sum::<f64>();
-        entry.1 += values.len();
-    }
-
-    let ptrm = ptrm_metrics(
-        model,
-        &batch,
-        &next_z,
-        &cfg.ptrm_k,
-        cfg.ptrm_noise,
-        cfg.q_mse_threshold,
-        cfg.seed.wrapping_add(bi as u64),
-    )?;
-    for m in ptrm {
-        let e = partial
-            .ptrm_acc
-            .entry(m.k)
-            .or_insert((0.0, 0.0, 0.0, 0.0, 0));
-        e.0 += m.pass_at_k * m.n as f64;
-        e.1 += m.best_q_at_k * m.n as f64;
-        e.2 += m.disagreement * m.n as f64;
-        e.3 += m.q_oracle_rank_accuracy.unwrap_or(0.0) * m.n as f64;
-        e.4 += m.n;
+        for m in ptrm {
+            let e = partial
+                .ptrm_acc
+                .entry(m.k)
+                .or_insert((0.0, 0.0, 0.0, 0.0, 0));
+            e.0 += m.pass_at_k * m.n as f64;
+            e.1 += m.best_q_at_k * m.n as f64;
+            e.2 += m.disagreement * m.n as f64;
+            e.3 += m.q_oracle_rank_accuracy.unwrap_or(0.0) * m.n as f64;
+            e.4 += m.n;
+        }
     }
     Ok(partial)
 }
 
-fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> BatchEvalPartial {
+fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> Result<BatchEvalPartial> {
     partials.sort_by_key(|(bi, _)| *bi);
     let mut merged = BatchEvalPartial::default();
     for (_, partial) in partials {
         merged.mse_all.extend(partial.mse_all);
         merged.encoder_embeddings.extend(partial.encoder_embeddings);
-        merged
-            .representation_embeddings
-            .extend(partial.representation_embeddings);
+        for (seam, tensor) in partial.representation_tensors {
+            match merged.representation_tensors.get_mut(&seam) {
+                Some(existing) => *existing = Tensor::cat(&[existing, &tensor], 0)?,
+                None => {
+                    merged.representation_tensors.insert(seam, tensor);
+                }
+            }
+        }
         merged.sigreg_raw_weighted += partial.sigreg_raw_weighted;
         merged.sigreg_bounded_weighted += partial.sigreg_bounded_weighted;
         merged.sigreg_n += partial.sigreg_n;
@@ -1851,7 +1937,7 @@ fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> BatchEv
             e.1 += n;
         }
     }
-    merged
+    Ok(merged)
 }
 
 fn eval_shuffled_action_batch(
@@ -2343,6 +2429,32 @@ pub fn eval_copy_forward_rollouts(
     Ok(merge_copy_forward_sextuples(&sextuples, seed ^ 0xCF))
 }
 
+fn empty_split(source: &str, n_samples: usize) -> SplitEval {
+    SplitEval {
+        source: source.into(),
+        n_samples,
+        one_step_latent_mse: None,
+        representation: None,
+        representation_seams: None,
+        changed_transitions: None,
+        identifiability: None,
+        events: None,
+        q: None,
+        ptrm: None,
+        deterministic_matched_compute: None,
+        rollout: None,
+        closed_loop: None,
+        copy_forward: None,
+        q_surprise: None,
+        calibration: None,
+        calibration_gates: None,
+        contrastive: None,
+        action_diagnostics: None,
+        recursion_probes: None,
+        ensemble: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_sample_set(
     train_cfg: &TrainConfig,
@@ -2356,42 +2468,7 @@ fn eval_sample_set(
     with_rollout: bool,
 ) -> Result<SplitEval> {
     if samples.is_empty() {
-        return Ok(SplitEval {
-            source: source.into(),
-            n_samples: 0,
-            one_step_latent_mse: None,
-            representation: None,
-            changed_transitions: None,
-            identifiability: None,
-            events: EventMetrics {
-                labeled: 0,
-                accuracy: None,
-                bce: None,
-                hazard_failure_labeled: 0,
-                hazard_false_negatives: 0,
-                hazard_false_negative_rate: None,
-            },
-            q: QMetrics {
-                n: 0,
-                brier: None,
-                accuracy: None,
-                positive_label_rate: None,
-                balanced_accuracy: None,
-                saturated: false,
-            },
-            ptrm: Vec::new(),
-            deterministic_matched_compute: Vec::new(),
-            rollout: None,
-            closed_loop: None,
-            copy_forward: None,
-            q_surprise: None,
-            calibration: None,
-            calibration_gates: None,
-            contrastive: None,
-            action_diagnostics: None,
-            recursion_probes: None,
-            ensemble: None,
-        });
+        return Ok(empty_split(source, 0));
     }
 
     let batch_size = cfg.physical_batch.max(1);
@@ -2408,7 +2485,7 @@ fn eval_sample_set(
                 })
             })
             .collect::<Result<_>>()?;
-        merge_batch_partials(partials)
+        merge_batch_partials(partials)?
     } else {
         let partials: Vec<(usize, BatchEvalPartial)> = ranges
             .iter()
@@ -2423,11 +2500,19 @@ fn eval_sample_set(
                 Ok(partial)
             })
             .collect::<Result<_>>()?;
-        merge_batch_partials(partials)
+        merge_batch_partials(partials)?
     };
 
-    let representation = Some(summarize_representation(
-        &merged.representation_embeddings,
+    let representation_seams = summarize_seams(
+        &merged.representation_tensors,
+        cfg.seed,
+        cfg.representation_row_cap,
+    )?;
+    let post_rms_pooled = representation_seams
+        .get(&RepresentationSeam::EncoderPostRmsPooled)
+        .expect("diagnostic forward always captures the post-RMS pooled seam");
+    let representation = Some(summarize_representation_from_seam(
+        post_rms_pooled,
         merged.sigreg_raw_weighted,
         merged.sigreg_bounded_weighted,
         merged.sigreg_n,
@@ -2448,17 +2533,19 @@ fn eval_sample_set(
     let ptrm_acc = merged.ptrm_acc;
     let matched_acc = merged.matched_acc;
 
-    let events = if event_labeled == 0 {
-        EventMetrics {
+    let events = if cfg.mode != EvalMode::Full {
+        None
+    } else if event_labeled == 0 {
+        Some(EventMetrics {
             labeled: 0,
             accuracy: None,
             bce: None,
             hazard_failure_labeled,
             hazard_false_negatives,
             hazard_false_negative_rate: None,
-        }
+        })
     } else {
-        EventMetrics {
+        Some(EventMetrics {
             labeled: event_labeled,
             accuracy: Some(event_correct / event_labeled as f64),
             bce: Some(event_bce / event_labeled as f64),
@@ -2466,10 +2553,10 @@ fn eval_sample_set(
             hazard_false_negatives,
             hazard_false_negative_rate: (hazard_failure_labeled > 0)
                 .then_some(hazard_false_negatives as f64 / hazard_failure_labeled as f64),
-        }
+        })
     };
-    let q = q_acc.finalize();
-    let ptrm = ptrm_acc
+    let q = (cfg.mode == EvalMode::Full).then(|| q_acc.finalize());
+    let ptrm: Vec<_> = ptrm_acc
         .into_iter()
         .map(|(k, (p, bq, d, oracle, n))| {
             let pass_at_k = if n == 0 { 0.0 } else { p / n as f64 };
@@ -2487,7 +2574,8 @@ fn eval_sample_set(
             }
         })
         .collect();
-    let deterministic_matched_compute = matched_acc
+    let ptrm = (cfg.mode == EvalMode::Full).then_some(ptrm);
+    let deterministic_matched_compute: Vec<_> = matched_acc
         .into_iter()
         .map(|(k, (sum, n, outer_steps))| MatchedComputeMetrics {
             ptrm_k_equivalent: k,
@@ -2496,36 +2584,43 @@ fn eval_sample_set(
             one_step_latent_mse: (n > 0).then_some(sum / n as f64),
         })
         .collect();
+    let deterministic_matched_compute =
+        (cfg.mode == EvalMode::Full).then_some(deterministic_matched_compute);
 
-    let q_surprise = eval_q_surprise(&merged.q_probs, &mse_all, cfg.q_mse_threshold);
+    let q_surprise = (cfg.mode == EvalMode::Full)
+        .then(|| eval_q_surprise(&merged.q_probs, &mse_all, cfg.q_mse_threshold));
     let labels: Vec<bool> = mse_all
         .iter()
         .map(|m| f64::from(*m) <= cfg.q_mse_threshold)
         .collect();
-    let (calibration, calibration_gates) =
-        if merged.reliability_probs.len() == labels.len() && !labels.is_empty() {
-            let ece = expected_calibration_error(&merged.reliability_probs, &labels, 10);
-            let auroc = binary_auroc(&merged.reliability_probs, &labels);
-            let risk_coverage = risk_coverage_buckets(&merged.reliability_probs, &labels, 5);
-            let risk_monotone = risk_coverage.windows(2).all(|w| w[1].1 >= w[0].1 - 1e-6);
-            (
-                Some(CalibrationMetrics {
-                    n: labels.len(),
-                    ece,
-                    reliability_auroc: auroc,
-                    risk_coverage: risk_coverage.clone(),
-                }),
-                Some(CalibrationGates {
-                    ece_pass: ece.map(|v| v <= 0.05),
-                    auroc_pass: auroc.map(|v| v >= 0.85),
-                    risk_monotone_pass: Some(risk_monotone),
-                }),
-            )
-        } else {
-            (None, None)
-        };
-    let recursion_probes = summarize_recursion_probes(&merged.recursion_probes);
-    let ensemble = (merged.ensemble_n > 0).then(|| {
+    let (calibration, calibration_gates) = if cfg.mode == EvalMode::Full
+        && merged.reliability_probs.len() == labels.len()
+        && !labels.is_empty()
+    {
+        let ece = expected_calibration_error(&merged.reliability_probs, &labels, 10);
+        let auroc = binary_auroc(&merged.reliability_probs, &labels);
+        let risk_coverage = risk_coverage_buckets(&merged.reliability_probs, &labels, 5);
+        let risk_monotone = risk_coverage.windows(2).all(|w| w[1].1 >= w[0].1 - 1e-6);
+        (
+            Some(CalibrationMetrics {
+                n: labels.len(),
+                ece,
+                reliability_auroc: auroc,
+                risk_coverage: risk_coverage.clone(),
+            }),
+            Some(CalibrationGates {
+                ece_pass: ece.map(|v| v <= 0.05),
+                auroc_pass: auroc.map(|v| v >= 0.85),
+                risk_monotone_pass: Some(risk_monotone),
+            }),
+        )
+    } else {
+        (None, None)
+    };
+    let recursion_probes = (cfg.mode == EvalMode::Full)
+        .then(|| summarize_recursion_probes(&merged.recursion_probes))
+        .flatten();
+    let ensemble = (cfg.mode == EvalMode::Full && merged.ensemble_n > 0).then(|| {
         let mean_disagreement = Some(merged.ensemble_disagreement / merged.ensemble_n as f64);
         let high_error: Vec<bool> = mse_all
             .iter()
@@ -2607,6 +2702,7 @@ fn eval_sample_set(
         n_samples: samples.len(),
         one_step_latent_mse: mean(&mse_all),
         representation,
+        representation_seams: Some(representation_seams),
         changed_transitions,
         identifiability,
         events,
@@ -2616,7 +2712,7 @@ fn eval_sample_set(
         rollout,
         closed_loop,
         copy_forward: None,
-        q_surprise: Some(q_surprise),
+        q_surprise,
         calibration,
         calibration_gates,
         contrastive,
@@ -2746,50 +2842,56 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     let planner_rollout_samples =
         collect_planner_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
 
-    let mut synthetic_dynamics = eval_sample_set(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_samples,
-        "synthetic_dynamics",
-        Some(&dynamics_source_lengths),
-        cfg,
-        &device,
-        false,
-    )?;
-    synthetic_dynamics.rollout = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_dynamics",
-            closed_loop: false,
-        },
-    )?);
-    synthetic_dynamics.closed_loop = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_dynamics",
-            closed_loop: true,
-        },
-    )?);
-    synthetic_dynamics.copy_forward = Some(eval_copy_forward_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_rollout_samples,
-        &device,
-        cfg.seed,
-        "synthetic_dynamics",
-    )?);
+    let mut synthetic_dynamics = if cfg.mode == EvalMode::Rollout {
+        empty_split("synthetic_dynamics", dynamics_samples.len())
+    } else {
+        eval_sample_set(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &dynamics_samples,
+            "synthetic_dynamics",
+            Some(&dynamics_source_lengths),
+            cfg,
+            &device,
+            false,
+        )?
+    };
+    if cfg.mode != EvalMode::Representation {
+        synthetic_dynamics.rollout = Some(eval_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &dynamics_rollout_samples,
+            &device,
+            cfg.seed,
+            RolloutEvalContext {
+                source: "synthetic_dynamics",
+                closed_loop: false,
+            },
+        )?);
+        synthetic_dynamics.closed_loop = Some(eval_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &dynamics_rollout_samples,
+            &device,
+            cfg.seed,
+            RolloutEvalContext {
+                source: "synthetic_dynamics",
+                closed_loop: true,
+            },
+        )?);
+        synthetic_dynamics.copy_forward = Some(eval_copy_forward_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &dynamics_rollout_samples,
+            &device,
+            cfg.seed,
+            "synthetic_dynamics",
+        )?);
+    }
     if let (Some(open), Some(closed)) = (
         synthetic_dynamics.rollout.as_mut(),
         synthetic_dynamics.closed_loop.as_ref(),
@@ -2801,50 +2903,56 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         }
     }
 
-    let mut synthetic_planner = eval_sample_set(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_samples,
-        "synthetic_planner",
-        Some(&planner_source_lengths),
-        cfg,
-        &device,
-        false,
-    )?;
-    synthetic_planner.rollout = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_planner",
-            closed_loop: false,
-        },
-    )?);
-    synthetic_planner.closed_loop = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_planner",
-            closed_loop: true,
-        },
-    )?);
-    synthetic_planner.copy_forward = Some(eval_copy_forward_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_rollout_samples,
-        &device,
-        cfg.seed,
-        "synthetic_planner",
-    )?);
+    let mut synthetic_planner = if cfg.mode == EvalMode::Rollout {
+        empty_split("synthetic_planner", planner_samples.len())
+    } else {
+        eval_sample_set(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &planner_samples,
+            "synthetic_planner",
+            Some(&planner_source_lengths),
+            cfg,
+            &device,
+            false,
+        )?
+    };
+    if cfg.mode != EvalMode::Representation {
+        synthetic_planner.rollout = Some(eval_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &planner_rollout_samples,
+            &device,
+            cfg.seed,
+            RolloutEvalContext {
+                source: "synthetic_planner",
+                closed_loop: false,
+            },
+        )?);
+        synthetic_planner.closed_loop = Some(eval_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &planner_rollout_samples,
+            &device,
+            cfg.seed,
+            RolloutEvalContext {
+                source: "synthetic_planner",
+                closed_loop: true,
+            },
+        )?);
+        synthetic_planner.copy_forward = Some(eval_copy_forward_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &planner_rollout_samples,
+            &device,
+            cfg.seed,
+            "synthetic_planner",
+        )?);
+    }
     if let (Some(open), Some(closed)) = (
         synthetic_planner.rollout.as_mut(),
         synthetic_planner.closed_loop.as_ref(),
@@ -2856,37 +2964,49 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         }
     }
 
-    let arc3_transfer = if let Some(dir) = &cfg.arc_recordings_dir {
-        let samples = import_recordings_dir(dir)?;
-        Some(eval_sample_set(
-            &train_cfg,
-            &cfg.checkpoint,
-            &model,
-            &samples,
-            "arc3_transfer",
-            None,
-            cfg,
-            &device,
-            false,
-        )?)
+    let arc3_transfer = if cfg.mode != EvalMode::Rollout {
+        if let Some(dir) = &cfg.arc_recordings_dir {
+            let samples = import_recordings_dir(dir)?;
+            Some(eval_sample_set(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &samples,
+                "arc3_transfer",
+                None,
+                cfg,
+                &device,
+                false,
+            )?)
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    let arc3_recording_runs = if let Some(dir) = &cfg.arc_recordings_dir {
-        let runs = summarize_recordings_dir(dir)?;
-        Some(Arc3RecordingBenchmark {
-            n_runs: runs.len(),
-            total_actions: runs.iter().map(|r| r.actions).sum(),
-            total_levels_completed: runs.iter().map(|r| r.levels_completed).sum(),
-            runs,
-        })
+    let arc3_recording_runs = if cfg.mode == EvalMode::Full {
+        if let Some(dir) = &cfg.arc_recordings_dir {
+            let runs = summarize_recordings_dir(dir)?;
+            Some(Arc3RecordingBenchmark {
+                n_runs: runs.len(),
+                total_actions: runs.iter().map(|r| r.actions).sum(),
+                total_levels_completed: runs.iter().map(|r| r.levels_completed).sum(),
+                runs,
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    let official_scorecard = if let Some(path) = &cfg.scorecard_json {
-        Some(benchmark_from_scorecard_json(path)?)
+    let official_scorecard = if cfg.mode == EvalMode::Full {
+        if let Some(path) = &cfg.scorecard_json {
+            Some(benchmark_from_scorecard_json(path)?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -2896,6 +3016,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
 
     let report = EvalReport {
         schema: EVAL_REPORT_SCHEMA.into(),
+        mode: cfg.mode,
         seed: cfg.seed,
         checkpoint: cfg.checkpoint.clone(),
         device: cfg.device.clone(),
@@ -3075,6 +3196,30 @@ mod tests {
     }
 
     #[test]
+    fn v10_seam_keys_are_snake_case_and_top_level_uses_post_rms_pooled() -> Result<()> {
+        let metrics = crate::p2::representation::RepresentationSeamMetrics {
+            rows_seen: 9,
+            rows_used: 4,
+            dimension: 3,
+            mean_rms: Some(1.0),
+            mean_variance: Some(0.25),
+            effective_rank: Some(2.0),
+            effective_rank_fraction: Some(2.0 / 3.0),
+        };
+        let seams = BTreeMap::from([(RepresentationSeam::EncoderPostRmsPooled, metrics.clone())]);
+        let json = serde_json::to_string(&seams)?;
+        assert!(json.contains("\"encoder_post_rms_pooled\""));
+
+        let top = summarize_representation_from_seam(&metrics, 0.0, 0.0, 0);
+        assert_eq!(top.encoder_rows, metrics.rows_used);
+        assert_eq!(top.encoder_dim, metrics.dimension);
+        assert_eq!(top.mean_encoder_variance, metrics.mean_variance);
+        assert_eq!(top.effective_rank, metrics.effective_rank);
+        assert_eq!(top.effective_rank_fraction, metrics.effective_rank_fraction);
+        Ok(())
+    }
+
+    #[test]
     fn changed_transition_metrics_compare_only_paired_changed_rows() -> Result<()> {
         let metrics = summarize_changed_transitions(&[0.8, 0.6, 0.4], &[1.0, 0.8, 0.6], 17)?;
         assert_eq!(metrics.n, 3);
@@ -3161,6 +3306,8 @@ mod tests {
             output: dir.join("eval.json"),
             episode_jsonl: None,
             ensemble_members: 4,
+            mode: EvalMode::Full,
+            representation_row_cap: DEFAULT_REPRESENTATION_ROW_CAP,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);
@@ -3181,13 +3328,19 @@ mod tests {
         assert_eq!(
             eval.synthetic_dynamics
                 .ptrm
+                .as_ref()
+                .expect("full eval PTRM")
                 .iter()
                 .find(|row| row.k == 1)
                 .map(|row| row.noise),
             Some(0.0)
         );
         assert_eq!(
-            eval.synthetic_dynamics.deterministic_matched_compute.len(),
+            eval.synthetic_dynamics
+                .deterministic_matched_compute
+                .as_ref()
+                .expect("full eval matched compute")
+                .len(),
             2
         );
         let action_diagnostics = eval
@@ -3215,6 +3368,55 @@ mod tests {
         let text = fs::read_to_string(&eval_cfg.output)?;
         let back: EvalReport = serde_json::from_str(&text)?;
         assert_eq!(back.schema, EVAL_REPORT_SCHEMA);
+
+        let post_rms = eval
+            .synthetic_dynamics
+            .representation_seams
+            .as_ref()
+            .and_then(|seams| seams.get(&RepresentationSeam::EncoderPostRmsPooled))
+            .expect("post-RMS pooled seam");
+        let top = eval
+            .synthetic_dynamics
+            .representation
+            .as_ref()
+            .expect("top-level representation");
+        assert_eq!(top.encoder_rows, post_rms.rows_used);
+        assert_eq!(top.encoder_dim, post_rms.dimension);
+        assert_eq!(top.mean_encoder_variance, post_rms.mean_variance);
+        assert_eq!(top.effective_rank, post_rms.effective_rank);
+
+        let mut representation_cfg = eval_cfg.clone();
+        representation_cfg.mode = EvalMode::Representation;
+        representation_cfg.output = dir.join("representation.json");
+        let representation_eval = evaluate(&representation_cfg)?;
+        assert_eq!(representation_eval.mode, EvalMode::Representation);
+        assert!(representation_eval
+            .synthetic_dynamics
+            .representation_seams
+            .is_some());
+        assert!(representation_eval.synthetic_dynamics.events.is_none());
+        assert!(representation_eval.synthetic_dynamics.q.is_none());
+        assert!(representation_eval.synthetic_dynamics.ptrm.is_none());
+        assert!(representation_eval.synthetic_dynamics.rollout.is_none());
+
+        let mut rollout_cfg = eval_cfg.clone();
+        rollout_cfg.mode = EvalMode::Rollout;
+        rollout_cfg.output = dir.join("rollout.json");
+        let rollout_eval = evaluate(&rollout_cfg)?;
+        assert_eq!(rollout_eval.mode, EvalMode::Rollout);
+        assert!(rollout_eval
+            .synthetic_dynamics
+            .one_step_latent_mse
+            .is_none());
+        assert!(rollout_eval.synthetic_dynamics.representation.is_none());
+        assert!(rollout_eval
+            .synthetic_dynamics
+            .representation_seams
+            .is_none());
+        assert!(rollout_eval.synthetic_dynamics.action_diagnostics.is_none());
+        assert!(rollout_eval.synthetic_dynamics.rollout.is_some());
+        assert!(rollout_eval.synthetic_dynamics.closed_loop.is_some());
+        assert!(rollout_eval.synthetic_dynamics.copy_forward.is_some());
 
         let recordings = dir.join("empty-recordings");
         fs::create_dir_all(&recordings)?;

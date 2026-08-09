@@ -4,7 +4,7 @@
 //! Wiring into the top-level CLI is owned by the primary agent.
 
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
-use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig};
+use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::train::{train, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
@@ -320,6 +320,10 @@ pub struct P2EvalArgs {
     /// Bootstrap ensemble members for uncertainty (Phase D).
     #[arg(long, default_value_t = 8)]
     pub ensemble_members: usize,
+
+    /// Evaluation graph: complete, representation-only, or rollout-only.
+    #[arg(long, value_enum, default_value_t = EvalMode::Full)]
+    pub eval_mode: EvalMode,
 }
 
 impl P2EvalArgs {
@@ -339,6 +343,8 @@ impl P2EvalArgs {
             output: self.output.clone(),
             episode_jsonl: self.episode_jsonl.clone(),
             ensemble_members: self.ensemble_members,
+            mode: self.eval_mode,
+            representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
         }
     }
 }
@@ -443,6 +449,8 @@ impl P2Arc3EvalArgs {
             output: self.output.clone(),
             episode_jsonl: None,
             ensemble_members: 8,
+            mode: EvalMode::Full,
+            representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
         }
     }
 }
