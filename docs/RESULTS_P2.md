@@ -122,7 +122,7 @@ without global pooling or a learned projector, with all other control fields
 fixed. Exact expanded phase commands and immutable reports live under
 `runs/p2/ab-sigreg-action-v1/`; the decision is in `pilot-gates.{json,md}`.
 
-### SIGReg geometry-isolation A/B v2 preregistration and incomplete pilot
+### SIGReg geometry-isolation A/B v2 preregistration and completed pilot
 
 The next pilot uses fresh initialization for both arms at one reviewed Git SHA.
 It retains the v1 seed-1 dynamics-only schedule, physical batch `1024`, accumulation
@@ -168,8 +168,8 @@ python3 scripts/p2_ab_gate.py \
   --output-json /workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2/pilot-gates.json \
   --output-md /workspace/Personal/Tofy/runs/p2/ab-sigreg-geometry-v2/pilot-gates.md
 
-# On a 46 GiB L40S, run the two ~17.3 GiB arms together and adapt through the
-# pilot, three-seed replication, and preregistered extension gates:
+# Run the arms serially and adapt through the pilot, three-seed replication,
+# and preregistered extension gates:
 P2_EXPECTED_SHA=<reviewed-sha> \
 P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
 P2_EXPECTED_BINARY_SHA=<reviewed-tofy-binary-sha256> \
@@ -180,7 +180,41 @@ bash scripts/p2_sigreg_geometry_overnight.sh
 These commands and any interim smoke metrics are experimental diagnostics only.
 They do not set `research_claim=true`, use public ARC games, or justify a model claim.
 
-#### Overnight outcome (2026-08-08/09; incomplete)
+#### Completed recovery pilot (2026-08-09)
+
+The serialized recovery queue completed all eight seed-1 train/evaluation phases at
+Tofy commit `17fbfdff`, `candle_graph` commit `c9fa15ee`, and binary SHA-256
+`6540482ef354...`. Every phase exited zero, every checkpoint/report manifest
+verified, and the supervisor exited zero. A local replay against the transferred
+artifacts reproduced the unchanged gate decision.
+
+| Arm | Update | Aggregate shuffled/true [95% CI] | `random_one_step` [95% CI] | Changed improvement [95% CI] | Variance | Rank fraction | Dynamics H8 | Hard pass |
+|---|---:|---|---|---|---:|---:|---:|---|
+| control | 1,000 | 1.0402 [1.0225, 1.0620] | 1.1547 [1.0792, 1.2378] | 0.6665 [0.6187, 0.7054] | 0.002772 | 0.01383 | 0.1094 | no |
+| control | 2,000 | 1.2095 [1.1567, 1.2695] | 1.7365 [1.5164, 1.9980] | 0.4661 [0.4133, 0.5153] | 0.006128 | 0.02529 | 1.8082 | no |
+| pre-RMS spatial | 1,000 | 1.0000 [0.9997, 1.0003] | 0.9999 [0.9994, 1.0005] | -49.2690 [-52.4334, -45.9926] | 2.18e-6 | 0.01128 | 0.00465 | no |
+| pre-RMS spatial | 2,000 | 1.0004 [0.9992, 1.0018] | 1.0016 [0.9973, 1.0064] | -6.4256 [-6.6567, -6.1754] | 1.95e-5 | 0.00839 | 0.03124 | no |
+
+The unchanged gate selected terminal branch A (`stop_after_pilot`). Control acquired
+stronger action dependence but failed noncollapse and deteriorated sharply in
+one-step and rollout error. Treatment's much smaller raw latent MSE was degenerate:
+it remained action-marginalized, failed both downstream noncollapse floors, and its
+learned changed-transition MSE was `7.43x` copy-forward at update 2,000. Neither arm
+met the credible monotonic-approach rule; seeds 2/3 and the 4,000-update extension
+were not run, and no arm is promoted.
+
+Training used physical `1024` / accumulation `1` stably. Mean sampled training GPU
+utilization was `90.46%` control and `93.06%` treatment; peak memory was 14,866 and
+14,994 MiB. Evaluations remained CPU-heavy (`3.40%` and `4.16%` mean sampled GPU
+utilization). Trusted synchronized candle-graph updates were `4720.71 ms` control and
+`4760.75 ms` treatment, so the geometry change had negligible runtime cost. Operation,
+allocation/device-memory, and Nsight evidence remain gaps.
+
+The completed pilot, preserved A40 handoff, full metric interpretation, runtime
+analysis, and next recommendations are in
+[`P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md`](P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md).
+
+#### Prior failed overnight attempt (2026-08-08/09; incomplete)
 
 The seed-1 pilot did not reach its decision gate. Both arms trained from fresh
 initialization through update 1,000 at Tofy commit `0a3f8205`, `candle_graph`
