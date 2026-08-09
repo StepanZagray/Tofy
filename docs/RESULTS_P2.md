@@ -122,7 +122,7 @@ without global pooling or a learned projector, with all other control fields
 fixed. Exact expanded phase commands and immutable reports live under
 `runs/p2/ab-sigreg-action-v1/`; the decision is in `pilot-gates.{json,md}`.
 
-### SIGReg geometry-isolation A/B v2 preregistration (pending)
+### SIGReg geometry-isolation A/B v2 preregistration and incomplete pilot
 
 The next pilot uses fresh initialization for both arms at one reviewed Git SHA.
 It retains the v1 seed-1 dynamics-only schedule, physical batch `1024`, accumulation
@@ -179,6 +179,60 @@ bash scripts/p2_sigreg_geometry_overnight.sh
 
 These commands and any interim smoke metrics are experimental diagnostics only.
 They do not set `research_claim=true`, use public ARC games, or justify a model claim.
+
+#### Overnight outcome (2026-08-08/09; incomplete)
+
+The seed-1 pilot did not reach its decision gate. Both arms trained from fresh
+initialization through update 1,000 at Tofy commit `0a3f8205`, `candle_graph`
+commit `c9fa15ee`, and binary SHA-256 `682dc1e9e783...`. The control completed
+evaluation at updates 1,000 and 2,000. `pre-rms-spatial` aborted during its first
+evaluation with CUDA device assertion exit 134 and has no held-out report or arm
+manifest. There is therefore no valid A/B result, terminal branch, or promoted arm.
+
+Control alone moved toward stronger aggregate/random-one-step action dependence at
+update 2,000 (aggregate ratio `1.1817 [1.1308, 1.2405]`, random-one-step
+`1.6625 [1.4453, 1.9146]`) but
+still failed noncollapse (`0.02341 < 0.10` effective-rank fraction). Its true-action
+MSE worsened `0.02411 -> 0.10886` and horizon-8 MSE worsened
+`0.10303 -> 0.80915`; normalized H8 worsened `1.441 -> 4.452`. Because each
+checkpoint's encoder defines the latent target, the raw cross-checkpoint MSE change
+mixes dynamics and representation drift. This is a control diagnostic, not evidence
+for or against the treatment.
+
+The two concurrent training arms used 29,798 MiB peak and delivered only 2.36%
+more aggregate update throughput than the observed single-arm phase. Concurrent
+evaluation peaked at 34,754 / 46,068 MiB, so simple OOM is not supported. An
+isolated small CUDA replay with the exact binary and treatment checkpoint succeeded,
+making shared-device concurrency, asynchronous CUDA fault reporting, and original
+batch/runtime state important discriminants, not established causes. The later glibc
+heap-corruption message also keeps FFI/driver/allocator memory safety in scope. Future
+arms should be serialized for isolation, and the treatment checkpoint should be
+evaluated alone before any retraining.
+
+The supervisor's fail-stop behavior left the pod idle for approximately 8h31m
+between the completed control evaluation and artifact capture. Recovery queues are
+therefore required for future unattended runs.
+
+A non-preregistered local diagnostic then evaluated the exact treatment checkpoint
+and exact pod binary on all 64 held-out episodes at physical batch 256. It completed
+normally, which strongly disfavors a corrupt checkpoint or sample-specific rollout
+fault. Its aggregate/random action ratios were `0.99995 / 0.99978`, variance was
+`1.93e-6`, effective-rank fraction was `0.01204`, and learned changed-transition MSE
+was 40.4x copy-forward. The treatment was therefore directionally collapsed at
+update 1,000; these metrics do not replace the missing frozen L40S report or satisfy
+the pilot gate.
+
+The full forensic report, artifact inventory, timing/telemetry analysis, ranked
+hypotheses, and recovery sequence are in
+[`P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md`](P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md).
+
+Local remediation now makes artifact validation root-authoritative and relocatable,
+serializes complete arms, runs a default 64-episode/batch-1,024 CUDA preflight for
+both geometries, and performs one isolated synchronous-CUDA recovery plus an exact
+checksum-verified repeat before resuming a failed evaluation. Rollout failures include
+source, loop mode, seed, episode, transition, and operation context. These are
+implementation safeguards only; they do not change the incomplete pilot's status or
+produce a model-quality result.
 
 ## Readiness training
 

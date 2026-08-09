@@ -12,6 +12,8 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from p2_artifacts import resolve_artifact_path, verify_sha256_file
+
 
 NONFINITE_TRAINING_PATTERN = re.compile(
     r"(?:\bnan\b|\b(?:non[- ]finite|not finite)\b|\binfinite (?:loss|gradient)\b)",
@@ -36,26 +38,6 @@ def nested(data: dict[str, Any], *keys: str) -> Any:
             return None
         value = value[key]
     return value
-
-
-def verify_sha256_file(path: Path) -> list[str]:
-    errors: list[str] = []
-    if not path.is_file():
-        return [f"missing {path}"]
-    for line_number, line in enumerate(path.read_text().splitlines(), 1):
-        parts = line.strip().split(maxsplit=1)
-        if len(parts) != 2:
-            errors.append(f"invalid {path} line {line_number}")
-            continue
-        expected, artifact_text = parts
-        artifact = Path(artifact_text.lstrip("*"))
-        if not artifact.is_file():
-            errors.append(f"missing hashed artifact {artifact}")
-            continue
-        actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        if actual != expected:
-            errors.append(f"sha256 mismatch for {artifact}")
-    return errors
 
 
 def load_run(
@@ -159,7 +141,7 @@ def load_run(
         errors.append(f"unexpected eval schema {report.get('schema')!r}")
     if not finite_tree(report):
         errors.append("report contains non-finite numeric values")
-    errors.extend(verify_sha256_file(sha_path))
+    errors.extend(verify_sha256_file(sha_path, root))
     expected_stages = ["train-1000", "eval-1000"]
     if update >= 2000:
         expected_stages.extend(("train-2000", "eval-2000"))
@@ -196,7 +178,14 @@ def load_run(
             continue
         for attempt_index, phase in enumerate(attempts, 1):
             log_text = phase.get("log_path")
-            log_path = Path(log_text) if isinstance(log_text, str) else arm_dir / f"{stage}.log"
+            log_path = (
+                resolve_artifact_path(Path(log_text), root)
+                if isinstance(log_text, str)
+                else arm_dir / f"{stage}.log"
+            )
+            if log_path is None:
+                errors.append(f"training log path is outside experiment root: {log_text}")
+                continue
             try:
                 log_contents = log_path.read_text(errors="replace")
             except OSError as exc:
@@ -540,20 +529,6 @@ def main() -> None:
         for arm in arms
         for update in updates
     ]
-    provenance = {
-        (run["git_sha"], run["candle_git_sha"], run["binary_sha256"])
-        for run in runs
-    }
-    if len(provenance) != 1:
-        raise SystemExit(f"runs do not share one immutable provenance tuple: {sorted(provenance)!r}")
-    for seed in seeds:
-        config_contracts = {
-            run["comparison_config_sha256"] for run in runs if run["seed"] == seed
-        }
-        if len(config_contracts) != 1:
-            raise SystemExit(
-                f"seed {seed} arms differ outside preregistered SIGReg geometry fields"
-            )
     invalid_runs = [run for run in runs if not run["artifact_valid"]]
     if invalid_runs:
         failure = {
@@ -576,6 +551,23 @@ def main() -> None:
             lines.append("")
         args.output_md.write_text("\n".join(lines))
         raise SystemExit("artifact validation failed; decision gate was not evaluated")
+    provenance = {
+        (run["git_sha"], run["candle_git_sha"], run["binary_sha256"])
+        for run in runs
+    }
+    if len(provenance) != 1:
+        raise SystemExit(
+            "runs do not share one immutable provenance tuple: "
+            f"{sorted(provenance, key=repr)!r}"
+        )
+    for seed in seeds:
+        config_contracts = {
+            run["comparison_config_sha256"] for run in runs if run["seed"] == seed
+        }
+        if len(config_contracts) != 1:
+            raise SystemExit(
+                f"seed {seed} arms differ outside preregistered SIGReg geometry fields"
+            )
     decision = (
         pilot_decision(runs, args.treatment_arm)
         if seeds == [1]

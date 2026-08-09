@@ -2036,28 +2036,52 @@ fn eval_rollout_group(
     let mut cf8 = None;
     let mut cf16 = None;
     let z0 = {
-        let first = batch_from_samples(std::slice::from_ref(&steps[0]), device)?;
-        model.encode_state(&first.frames)?
+        let sample = &steps[0];
+        let first =
+            batch_from_samples(std::slice::from_ref(sample), device).with_context(|| {
+                rollout_operation_context(sample, closed_loop, "initial batch construction")
+            })?;
+        model.encode_state(&first.frames).with_context(|| {
+            rollout_operation_context(sample, closed_loop, "initial state encoding")
+        })?
     };
     let mut latent = z0.clone();
     for (idx, sample) in steps.iter().enumerate() {
-        let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
+        let batch =
+            batch_from_samples(std::slice::from_ref(sample), device).with_context(|| {
+                rollout_operation_context(sample, closed_loop, "step batch construction")
+            })?;
         if closed_loop {
-            latent = model.encode_state(&batch.frames)?;
+            latent = model.encode_state(&batch.frames).with_context(|| {
+                rollout_operation_context(sample, closed_loop, "closed-loop state encoding")
+            })?;
         }
-        let out = model.forward_from_latent(
-            &latent,
-            &batch.actions,
-            &batch.action_coords,
-            &batch.goals,
-        )?;
+        let out = model
+            .forward_from_latent(&latent, &batch.actions, &batch.action_coords, &batch.goals)
+            .with_context(|| rollout_operation_context(sample, closed_loop, "latent forward"))?;
         let pred = out.y;
         if !closed_loop {
             latent = pred.clone();
         }
-        let target = model.encode_state(&batch.next_frames)?;
-        let mse = pred.sub(&target)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f32;
-        let cf = z0.sub(&target)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f32;
+        let target = model.encode_state(&batch.next_frames).with_context(|| {
+            rollout_operation_context(sample, closed_loop, "target state encoding")
+        })?;
+        let mse = pred
+            .sub(&target)
+            .and_then(|value| value.sqr())
+            .and_then(|value| value.mean_all())
+            .and_then(|value| value.to_scalar::<f32>())
+            .with_context(|| {
+                rollout_operation_context(sample, closed_loop, "model MSE reduction")
+            })? as f32;
+        let cf = z0
+            .sub(&target)
+            .and_then(|value| value.sqr())
+            .and_then(|value| value.mean_all())
+            .and_then(|value| value.to_scalar::<f32>())
+            .with_context(|| {
+                rollout_operation_context(sample, closed_loop, "copy-forward MSE reduction")
+            })? as f32;
         let step_no = idx + 1;
         if step_no == 4 {
             mse4 = Some(mse);
@@ -2073,6 +2097,24 @@ fn eval_rollout_group(
         }
     }
     Ok((mse4, mse8, mse16, cf4, cf8, cf16))
+}
+
+fn rollout_operation_context(
+    sample: &TransitionSample,
+    closed_loop: bool,
+    operation: &str,
+) -> String {
+    format!(
+        "{operation} failed during {} rollout (seed={}, episode={}, transition={})",
+        if closed_loop {
+            "closed-loop"
+        } else {
+            "open-loop"
+        },
+        sample.seed,
+        sample.episode_id,
+        sample.transition_index,
+    )
 }
 
 fn normalized_ratio(model: &[f32], baseline: &[f32]) -> Vec<f32> {
@@ -2220,14 +2262,20 @@ fn group_rollouts(samples: &[TransitionSample]) -> BTreeMap<(u64, u64), Vec<&Tra
     map
 }
 
+#[derive(Clone, Copy)]
+struct RolloutEvalContext<'a> {
+    source: &'a str,
+    closed_loop: bool,
+}
+
 fn eval_rollouts(
     train_cfg: &TrainConfig,
     checkpoint: &Path,
     model: &WorldModel,
     samples: &[TransitionSample],
     device: &Device,
-    closed_loop: bool,
     seed: u64,
+    context: RolloutEvalContext<'_>,
 ) -> Result<RolloutMetrics> {
     let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)
         .into_values()
@@ -2239,19 +2287,23 @@ fn eval_rollouts(
             .into_par_iter()
             .map(|steps| {
                 with_thread_local_model(train_cfg, checkpoint, device, |m| {
-                    eval_rollout_group(m, &steps, device, closed_loop)
+                    eval_rollout_group(m, &steps, device, context.closed_loop)
+                        .with_context(|| format!("{} rollout group failed", context.source))
                 })
             })
             .collect::<Result<_>>()?
     } else {
         groups
             .iter()
-            .map(|steps| eval_rollout_group(model, steps, device, closed_loop))
+            .map(|steps| {
+                eval_rollout_group(model, steps, device, context.closed_loop)
+                    .with_context(|| format!("{} rollout group failed", context.source))
+            })
             .collect::<Result<_>>()?
     };
     Ok(merge_rollout_sextuples(
         &sextuples,
-        seed ^ if closed_loop { 0xC1 } else { 0x01 },
+        seed ^ if context.closed_loop { 0xC1 } else { 0x01 },
     ))
 }
 
@@ -2262,6 +2314,7 @@ pub fn eval_copy_forward_rollouts(
     samples: &[TransitionSample],
     device: &Device,
     seed: u64,
+    source: &str,
 ) -> Result<RolloutMetrics> {
     let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)
         .into_values()
@@ -2274,13 +2327,17 @@ pub fn eval_copy_forward_rollouts(
             .map(|steps| {
                 with_thread_local_model(train_cfg, checkpoint, device, |m| {
                     eval_rollout_group(m, &steps, device, false)
+                        .with_context(|| format!("{source} copy-forward rollout group failed"))
                 })
             })
             .collect::<Result<_>>()?
     } else {
         groups
             .iter()
-            .map(|steps| eval_rollout_group(model, steps, device, false))
+            .map(|steps| {
+                eval_rollout_group(model, steps, device, false)
+                    .with_context(|| format!("{source} copy-forward rollout group failed"))
+            })
             .collect::<Result<_>>()?
     };
     Ok(merge_copy_forward_sextuples(&sextuples, seed ^ 0xCF))
@@ -2513,14 +2570,32 @@ fn eval_sample_set(
 
     let rollout = if with_rollout {
         Some(eval_rollouts(
-            train_cfg, checkpoint, model, samples, device, false, cfg.seed,
+            train_cfg,
+            checkpoint,
+            model,
+            samples,
+            device,
+            cfg.seed,
+            RolloutEvalContext {
+                source,
+                closed_loop: false,
+            },
         )?)
     } else {
         None
     };
     let closed_loop = if with_rollout {
         Some(eval_rollouts(
-            train_cfg, checkpoint, model, samples, device, true, cfg.seed,
+            train_cfg,
+            checkpoint,
+            model,
+            samples,
+            device,
+            cfg.seed,
+            RolloutEvalContext {
+                source,
+                closed_loop: true,
+            },
         )?)
     } else {
         None
@@ -2688,8 +2763,11 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &dynamics_rollout_samples,
         &device,
-        false,
         cfg.seed,
+        RolloutEvalContext {
+            source: "synthetic_dynamics",
+            closed_loop: false,
+        },
     )?);
     synthetic_dynamics.closed_loop = Some(eval_rollouts(
         &train_cfg,
@@ -2697,8 +2775,11 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &dynamics_rollout_samples,
         &device,
-        true,
         cfg.seed,
+        RolloutEvalContext {
+            source: "synthetic_dynamics",
+            closed_loop: true,
+        },
     )?);
     synthetic_dynamics.copy_forward = Some(eval_copy_forward_rollouts(
         &train_cfg,
@@ -2707,6 +2788,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &dynamics_rollout_samples,
         &device,
         cfg.seed,
+        "synthetic_dynamics",
     )?);
     if let (Some(open), Some(closed)) = (
         synthetic_dynamics.rollout.as_mut(),
@@ -2736,8 +2818,11 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &planner_rollout_samples,
         &device,
-        false,
         cfg.seed,
+        RolloutEvalContext {
+            source: "synthetic_planner",
+            closed_loop: false,
+        },
     )?);
     synthetic_planner.closed_loop = Some(eval_rollouts(
         &train_cfg,
@@ -2745,8 +2830,11 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &model,
         &planner_rollout_samples,
         &device,
-        true,
         cfg.seed,
+        RolloutEvalContext {
+            source: "synthetic_planner",
+            closed_loop: true,
+        },
     )?);
     synthetic_planner.copy_forward = Some(eval_copy_forward_rollouts(
         &train_cfg,
@@ -2755,6 +2843,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &planner_rollout_samples,
         &device,
         cfg.seed,
+        "synthetic_planner",
     )?);
     if let (Some(open), Some(closed)) = (
         synthetic_planner.rollout.as_mut(),
