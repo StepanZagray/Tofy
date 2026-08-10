@@ -2674,6 +2674,10 @@ fn staging_path(destination: &Path, parent: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("episodes.jsonl");
     let sequence = EPISODE_JSONL_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    staging_path_with_sequence(name, parent, sequence)
+}
+
+fn staging_path_with_sequence(name: &str, parent: &Path, sequence: u64) -> PathBuf {
     parent.join(format!(
         ".{name}.{}.{}.staging",
         std::process::id(),
@@ -2699,38 +2703,46 @@ where
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let staging = staging_path(path, parent);
-    let result = (|| {
-        let mut file = OpenOptions::new()
+    loop {
+        let staging = staging_path(path, parent);
+        let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging)
-            .with_context(|| format!("create staging {}", staging.display()))?;
-        before(EpisodeJsonlWritePhase::BeforeWrite)?;
-        file.write_all(bytes)
-            .with_context(|| format!("write staging {}", staging.display()))?;
-        file.flush()
-            .with_context(|| format!("flush staging {}", staging.display()))?;
-        before(EpisodeJsonlWritePhase::BeforeFileSync)?;
-        file.sync_all()
-            .with_context(|| format!("sync staging {}", staging.display()))?;
-        drop(file);
-        before(EpisodeJsonlWritePhase::BeforeRename)?;
-        fs::rename(&staging, path).with_context(|| {
-            format!("atomic rename {} -> {}", staging.display(), path.display())
-        })?;
-        before(EpisodeJsonlWritePhase::BeforeParentSync)?;
-        fs::File::open(parent)
-            .with_context(|| format!("open parent directory {}", parent.display()))?
-            .sync_all()
-            .with_context(|| format!("sync parent directory {}", parent.display()))?;
-        Ok(())
-    })();
-    if result.is_err() && staging.exists() {
-        fs::remove_file(&staging)
-            .with_context(|| format!("remove failed staging {}", staging.display()))?;
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create staging {}", staging.display()))
+            }
+        };
+        let result = (|| {
+            before(EpisodeJsonlWritePhase::BeforeWrite)?;
+            file.write_all(bytes)
+                .with_context(|| format!("write staging {}", staging.display()))?;
+            file.flush()
+                .with_context(|| format!("flush staging {}", staging.display()))?;
+            before(EpisodeJsonlWritePhase::BeforeFileSync)?;
+            file.sync_all()
+                .with_context(|| format!("sync staging {}", staging.display()))?;
+            drop(file);
+            before(EpisodeJsonlWritePhase::BeforeRename)?;
+            fs::rename(&staging, path).with_context(|| {
+                format!("atomic rename {} -> {}", staging.display(), path.display())
+            })?;
+            before(EpisodeJsonlWritePhase::BeforeParentSync)?;
+            fs::File::open(parent)
+                .with_context(|| format!("open parent directory {}", parent.display()))?
+                .sync_all()
+                .with_context(|| format!("sync parent directory {}", parent.display()))?;
+            Ok(())
+        })();
+        if result.is_err() && staging.exists() {
+            fs::remove_file(&staging)
+                .with_context(|| format!("remove failed staging {}", staging.display()))?;
+        }
+        return result;
     }
-    result
 }
 
 fn sort_episode_rows(rows: &mut [EpisodeRolloutRow]) {
@@ -3321,6 +3333,27 @@ mod tests {
                 .iter()
                 .all(|name| !name.to_string_lossy().ends_with(".staging")));
         }
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn episode_jsonl_skips_existing_staging_candidate() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tofy-episode-jsonl-collision-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("episodes.jsonl");
+        let sequence = EPISODE_JSONL_STAGING_SEQUENCE.load(Ordering::Relaxed);
+        let collision = staging_path_with_sequence("episodes.jsonl", &dir, sequence);
+        fs::write(&collision, b"crash-leftover\n")?;
+
+        write_episode_jsonl_bytes_with(&path, b"replacement\n", |_| Ok(()))?;
+
+        assert_eq!(fs::read(&collision)?, b"crash-leftover\n");
+        assert_eq!(fs::read(&path)?, b"replacement\n");
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
