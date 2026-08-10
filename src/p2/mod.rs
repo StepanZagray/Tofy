@@ -9,6 +9,7 @@ pub mod model;
 pub mod muon;
 pub mod optimizer;
 pub mod prefetch;
+pub mod representation;
 pub mod rhae;
 pub mod sigreg;
 pub mod train;
