@@ -85,6 +85,10 @@ fn default_sigreg_temporal_window() -> usize {
     8
 }
 
+fn default_sigreg_global_mix() -> f64 {
+    0.0
+}
+
 /// Optimizer steps for a lesson (`dynamics` / `exploration` get 2× base steps).
 pub fn steps_for_lesson(cfg: &TrainConfig, lesson: &str) -> usize {
     match lesson {
@@ -228,6 +232,10 @@ pub struct TrainConfig {
     /// Ordered transition window size. Ignored by the legacy marginal fallback.
     #[serde(default = "default_sigreg_temporal_window")]
     pub sigreg_temporal_window: usize,
+    /// Convex weight on a global-spatial-mean temporal-residual population.
+    /// Zero preserves the original 2x2-pooled cell-row TC objective exactly.
+    #[serde(default = "default_sigreg_global_mix")]
+    pub sigreg_global_mix: f64,
     /// Overlap CPU batch generation with GPU work.
     #[serde(default = "default_prefetch_batches")]
     pub prefetch_batches: bool,
@@ -379,6 +387,7 @@ impl Default for TrainConfig {
             sigreg_max_rows: 4096,
             sigreg_target: SigregTarget::Marginal,
             sigreg_temporal_window: 8,
+            sigreg_global_mix: 0.0,
             prefetch_batches: true,
         }
     }
@@ -442,6 +451,13 @@ impl TrainConfig {
                     "temporal-residual SIGReg requires post-RMS 2x2 spatial SIGReg without pre-RMS or projector geometry"
                 );
             }
+            if !(self.sigreg_global_mix.is_finite()
+                && (0.0..=1.0).contains(&self.sigreg_global_mix))
+            {
+                bail!("sigreg_global_mix must be finite and in [0,1]");
+            }
+        } else if self.sigreg_global_mix != 0.0 {
+            bail!("sigreg_global_mix requires temporal-residual SIGReg");
         }
         if self.sigreg_pre_rms_spatial
             && (!self.sigreg_spatial || self.sigreg_spatial_pool || self.sigreg_projector)
@@ -536,8 +552,20 @@ pub struct TrainReport {
     pub config_path: PathBuf,
     /// Published representative-update evidence, if the configured update completed.
     pub profile: ProfileState,
+    /// One read-only attribution probe immediately before `profile_update`.
+    /// Its gradients are discarded and never reach the optimizer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient_pressure: Option<GradientPressureDiagnostics>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradientPressureDiagnostics {
+    pub update: u64,
+    pub encoder_next_latent_l2: f64,
+    pub encoder_sigreg_weighted_l2: f64,
+    pub sigreg_to_next_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -599,6 +627,7 @@ struct TrainingContract {
     sigreg_max_rows: usize,
     sigreg_target: SigregTarget,
     sigreg_temporal_window: usize,
+    sigreg_global_mix: f64,
     device: String,
     adam_beta1: f64,
     adam_beta2: f64,
@@ -657,6 +686,7 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_max_rows: cfg.sigreg_max_rows,
             sigreg_target: cfg.sigreg_target,
             sigreg_temporal_window: cfg.sigreg_temporal_window,
+            sigreg_global_mix: cfg.sigreg_global_mix,
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
@@ -690,6 +720,8 @@ struct TrainerState {
     #[serde(default)]
     batch_schedule_migrations: Vec<BatchScheduleMigration>,
     profile: ProfileState,
+    #[serde(default)]
+    gradient_pressure: Option<GradientPressureDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1808,6 +1840,32 @@ fn ensure_all_finite(named: &[(&str, &Tensor)]) -> Result<Vec<f32>> {
     Ok(values)
 }
 
+fn gradient_l2_for_parameter_prefix(
+    grads: &GradStore,
+    varmap: &VarMap,
+    prefix: &str,
+) -> Result<f64> {
+    let data = varmap.data().lock().unwrap();
+    let mut sum_sq: Option<Tensor> = None;
+    for (name, var) in data.iter().filter(|(name, _)| name.starts_with(prefix)) {
+        if let Some(gradient) = grads.get(var.as_tensor()) {
+            let squared = gradient.to_dtype(DType::F32)?.sqr()?.sum_all()?;
+            sum_sq = Some(match sum_sq {
+                None => squared,
+                Some(acc) => acc.add(&squared)?,
+            });
+        }
+    }
+    let norm = sum_sq
+        .ok_or_else(|| anyhow::anyhow!("no gradients found for parameter prefix {prefix}"))?
+        .sqrt()?
+        .to_scalar::<f32>()? as f64;
+    if !norm.is_finite() {
+        bail!("gradient norm for {prefix} is not finite: {norm}");
+    }
+    Ok(norm)
+}
+
 #[derive(Debug, Clone)]
 pub struct LossBreakdown {
     pub total: Tensor,
@@ -2060,16 +2118,92 @@ pub fn sigreg_stack_for_ordered_windows(
     )
 }
 
+/// Build the exact globally pooled population used by downstream `B x C`
+/// consumers, while retaining the same ordered windows and temporal centering.
+pub fn sigreg_global_stack_for_ordered_windows(
+    latents: &Tensor,
+    windows: &OrderedSigregWindows,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<Tensor> {
+    let (rows, channels, height, width) = latents.dims4()?;
+    if windows.row_indices.len() != windows.window.saturating_mul(windows.windows) {
+        bail!("ordered SIGReg window metadata has an invalid row count");
+    }
+    if windows.row_indices.iter().any(|&row| row >= rows) {
+        bail!("ordered SIGReg window row is outside encoded batch");
+    }
+    let indices = Tensor::from_vec(
+        windows
+            .row_indices
+            .iter()
+            .map(|&row| row as u32)
+            .collect::<Vec<_>>(),
+        (windows.row_indices.len(),),
+        latents.device(),
+    )?;
+    let ordered = latents.index_select(&indices, 0)?.reshape((
+        windows.window,
+        windows.windows,
+        channels,
+        height,
+        width,
+    ))?;
+    // Spatial pooling and temporal centering are both linear and commute. Pool
+    // first so the regularized rows exactly match global `B x C` consumers.
+    let pooled = ordered.mean(4)?.mean(3)?;
+    let temporal_mean = pooled.sum(0)?.affine(1.0 / windows.window as f64, 0.0)?;
+    let centered = pooled.broadcast_sub(&temporal_mean.broadcast_as(pooled.dims())?)?;
+    let rows = centered.reshape((windows.window * windows.windows, channels))?;
+    subsample_sigreg_rows(
+        &rows,
+        effective_sigreg_max_rows(cfg),
+        seed.wrapping_add(0x5196_6001),
+    )
+}
+
 fn sigreg_losses_for_ordered_windows(
     latents: &Tensor,
     windows: &OrderedSigregWindows,
     cfg: &TrainConfig,
     seed: u64,
 ) -> Result<(Tensor, Tensor)> {
-    let stack = sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
-    let raw = sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
-    let bounded = bounded_sigreg_loss(&raw)?;
-    Ok((raw, bounded))
+    let mix = cfg.sigreg_global_mix;
+    if mix == 0.0 {
+        let stack =
+            sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
+        let raw =
+            sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+        let bounded = bounded_sigreg_loss(&raw)?;
+        return Ok((raw, bounded));
+    }
+
+    let global_stack = sigreg_global_stack_for_ordered_windows(latents, windows, cfg, seed)?;
+    let global_raw = sigreg_epps_pulley_seeded(
+        &global_stack,
+        cfg.sigreg_projections,
+        cfg.sigreg_knots,
+        seed.wrapping_add(0x610B_A1),
+    )?;
+    let global_bounded = bounded_sigreg_loss(&global_raw)?;
+    if mix == 1.0 {
+        return Ok((global_raw, global_bounded));
+    }
+
+    let cell_stack =
+        sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
+    let cell_raw =
+        sigreg_epps_pulley_seeded(&cell_stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+    let cell_bounded = bounded_sigreg_loss(&cell_raw)?;
+    let cell_weight = 1.0 - mix;
+    Ok((
+        cell_raw
+            .affine(cell_weight, 0.0)?
+            .add(&global_raw.affine(mix, 0.0)?)?,
+        cell_bounded
+            .affine(cell_weight, 0.0)?
+            .add(&global_bounded.affine(mix, 0.0)?)?,
+    ))
 }
 
 fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
@@ -2971,6 +3105,7 @@ fn build_report(
         export_checkpoint: export_checkpoint_path(&cfg.output_dir),
         config_path: cfg.output_dir.join("config.json"),
         profile: state.profile.clone(),
+        gradient_pressure: state.gradient_pressure.clone(),
         research_claim: false,
     }
 }
@@ -3038,6 +3173,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             parameter_names,
             batch_schedule_migrations: Vec::new(),
             profile: ProfileState::Pending,
+            gradient_pressure: None,
         }
     };
     let mut latest_checkpoint = resumed_from.clone();
@@ -3339,6 +3475,30 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 }
                 result
             };
+            let pressure_update = cfg.profile_update.saturating_sub(1).max(1);
+            if micro == 0
+                && state.gradient_pressure.is_none()
+                && state.global_step.saturating_add(1) == pressure_update
+                && loss_weights.sigreg > 0.0
+            {
+                // Read-only attribution: these stores are discarded before the
+                // normal total-loss backward and never reach the optimizer.
+                let next_grads = micro_losses.next_latent.backward()?;
+                let sigreg_grads = micro_losses
+                    .sigreg_bounded
+                    .affine(loss_weights.sigreg, 0.0)?
+                    .backward()?;
+                let next_norm =
+                    gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
+                let sigreg_norm =
+                    gradient_l2_for_parameter_prefix(&sigreg_grads, &varmap, "encoder.")?;
+                state.gradient_pressure = Some(GradientPressureDiagnostics {
+                    update: pressure_update,
+                    encoder_next_latent_l2: next_norm,
+                    encoder_sigreg_weighted_l2: sigreg_norm,
+                    sigreg_to_next_ratio: (next_norm > 0.0).then_some(sigreg_norm / next_norm),
+                });
+            }
             let scaled_micro = micro_total.affine(inv, 0.0)?;
             let micro_grads = {
                 let _cg = cg_profile.phase(
@@ -3794,6 +3954,79 @@ mod tests {
     }
 
     #[test]
+    fn global_tc_rows_match_window_population_and_center_each_trace() -> Result<()> {
+        let device = Device::Cpu;
+        let windows = OrderedSigregWindows {
+            window: 2,
+            windows: 2,
+            row_indices: vec![0, 2, 1, 3],
+        };
+        let cfg = TrainConfig {
+            physical_batch: 4,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: true,
+            sigreg_max_rows: 0,
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            sigreg_global_mix: 1.0,
+            ..TrainConfig::default()
+        };
+        let latents = Tensor::from_vec(
+            (0..32).map(|value| value as f32).collect::<Vec<_>>(),
+            (4, 2, 2, 2),
+            &device,
+        )?;
+        let rows = sigreg_global_stack_for_ordered_windows(&latents, &windows, &cfg, 19)?;
+        assert_eq!(rows.dims(), &[4, 2]);
+        let centered = rows.reshape((2, 2, 2))?.sum(0)?.to_vec2::<f32>()?;
+        assert!(centered.iter().flatten().all(|value| value.abs() < 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn global_tc_is_invariant_to_window_local_spatial_offsets() -> Result<()> {
+        let device = Device::Cpu;
+        let windows = OrderedSigregWindows {
+            window: 2,
+            windows: 2,
+            row_indices: vec![0, 2, 1, 3],
+        };
+        let cfg = TrainConfig {
+            physical_batch: 4,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: true,
+            sigreg_max_rows: 0,
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            sigreg_global_mix: 0.5,
+            ..TrainConfig::default()
+        };
+        let base = Tensor::from_vec(
+            (0..32).map(|value| value as f32).collect::<Vec<_>>(),
+            (4, 2, 2, 2),
+            &device,
+        )?;
+        // Original rows 0/1 belong to trace 0 and 2/3 to trace 1.
+        let offsets = Tensor::from_vec(
+            [100.0f32, 100.0, 200.0, 200.0]
+                .into_iter()
+                .flat_map(|offset| std::iter::repeat_n(offset, 8))
+                .collect::<Vec<_>>(),
+            (4, 2, 2, 2),
+            &device,
+        )?;
+        let shifted = base.add(&offsets)?;
+        let actual = sigreg_global_stack_for_ordered_windows(&base, &windows, &cfg, 23)?;
+        let expected = sigreg_global_stack_for_ordered_windows(&shifted, &windows, &cfg, 23)?;
+        let actual = actual.to_vec2::<f32>()?;
+        let expected = expected.to_vec2::<f32>()?;
+        for (actual, expected) in actual.iter().flatten().zip(expected.iter().flatten()) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn temporal_sigreg_config_requires_window_and_control_geometry() {
         let invalid_window = TrainConfig {
             sigreg_target: SigregTarget::TemporalResidual,
@@ -3817,6 +4050,22 @@ mod tests {
         }
         .validate()
         .is_ok());
+        assert!(TrainConfig {
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            sigreg_spatial: true,
+            sigreg_global_mix: 1.01,
+            ..TrainConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(TrainConfig {
+            sigreg_target: SigregTarget::Marginal,
+            sigreg_global_mix: 0.5,
+            ..TrainConfig::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -3825,9 +4074,11 @@ mod tests {
         let object = value.as_object_mut().expect("config object");
         object.remove("sigreg_target");
         object.remove("sigreg_temporal_window");
+        object.remove("sigreg_global_mix");
         let loaded: TrainConfig = serde_json::from_value(value)?;
         assert_eq!(loaded.sigreg_target, SigregTarget::Marginal);
         assert_eq!(loaded.sigreg_temporal_window, 8);
+        assert_eq!(loaded.sigreg_global_mix, 0.0);
         Ok(())
     }
 
@@ -3838,6 +4089,7 @@ mod tests {
         let object = value.as_object_mut().expect("training contract object");
         object.remove("sigreg_target");
         object.remove("sigreg_temporal_window");
+        object.remove("sigreg_global_mix");
         assert!(serde_json::from_value::<TrainingContract>(value).is_err());
         Ok(())
     }
@@ -4820,6 +5072,7 @@ mod tests {
             export_checkpoint: None,
             config_path: PathBuf::from("c.json"),
             profile: ProfileState::Pending,
+            gradient_pressure: None,
             research_claim: false,
         };
         let s = serde_json::to_string(&report)?;
@@ -5066,6 +5319,11 @@ mod tests {
         let mut cfg = base.clone();
         cfg.sigreg_temporal_window += 1;
         changed.push(("sigreg_temporal_window", cfg));
+        let mut cfg = base.clone();
+        cfg.sigreg_target = SigregTarget::TemporalResidual;
+        cfg.sigreg_spatial = true;
+        cfg.sigreg_global_mix = 0.5;
+        changed.push(("sigreg_global_mix", cfg));
 
         for (name, cfg) in changed {
             assert_ne!(

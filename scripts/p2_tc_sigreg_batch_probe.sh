@@ -13,11 +13,15 @@ candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 : "${P2_TC_GRAD_ACCUM:?set candidate gradient accumulation}"
 physical_batch="$P2_TC_PHYSICAL_BATCH"
 grad_accum="$P2_TC_GRAD_ACCUM"
+global_mix="${P2_TC_GLOBAL_MIX:-0}"
 gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-1}"
 
 [[ "$physical_batch" =~ ^[1-9][0-9]*$ && "$grad_accum" =~ ^[1-9][0-9]*$ ]] || exit 2
 ((physical_batch % 8 == 0)) || { printf 'physical batch must be divisible by W=8\n' >&2; exit 2; }
 ((physical_batch * grad_accum == 1024)) || { printf 'effective batch must remain 1024\n' >&2; exit 2; }
+[[ "$global_mix" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || {
+  printf 'P2_TC_GLOBAL_MIX must be in [0,1]\n' >&2; exit 2;
+}
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
@@ -62,6 +66,7 @@ started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   --physical-batch "$physical_batch" --grad-accum "$grad_accum" \
   --checkpoint-every-steps 2 --profile-update 2 \
   --sigreg-target temporal-residual --sigreg-temporal-window 8 \
+  --sigreg-global-mix "$global_mix" \
   --sigreg-spatial --sigreg-spatial-pool --sigreg-max-rows 32768 \
   --steady-gpu --supervise-last-outer-only --residual-y-update --warm-start-y \
   --outer-steps 8 --inner-steps 2 --hidden-dim 128 --action-dim 8 \
@@ -87,11 +92,13 @@ jq -nc --arg schema p2.tc_sigreg_batch_probe.v1 --arg status passed \
   --arg gpu_name "$gpu_name" --arg started_utc "$started" --arg finished_utc "$finished" \
   --arg artifact_manifest_sha256 "$artifact_manifest_sha" \
   --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
+  --argjson sigreg_global_mix "$global_mix" \
   --argjson completed_updates "$completed" \
   '{schema:$schema,status:$status,git_sha:$git_sha,candle_git_sha:$candle_git_sha,
     binary_sha256:$binary_sha256,gpu_name:$gpu_name,physical_batch:$physical_batch,
     grad_accum:$grad_accum,effective_batch:1024,sigreg_target:"temporal_residual",
-    sigreg_temporal_window:8,steady_gpu:true,completed_updates:$completed_updates,
+    sigreg_temporal_window:8,sigreg_global_mix:$sigreg_global_mix,
+    steady_gpu:true,completed_updates:$completed_updates,
     artifact_manifest_sha256:$artifact_manifest_sha256,
     started_utc:$started_utc,finished_utc:$finished_utc}' >"$probe_root/probe.json.tmp"
 mv -- "$probe_root/probe.json.tmp" "$probe_root/probe.json"

@@ -194,6 +194,10 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 8)]
     pub sigreg_temporal_window: usize,
 
+    /// Convex weight on global-pooled TC rows; 0 keeps the original cell-row objective.
+    #[arg(long, default_value_t = 0.0)]
+    pub sigreg_global_mix: f64,
+
     #[arg(long, default_value_t = true)]
     pub prefetch_batches: bool,
 }
@@ -258,6 +262,7 @@ impl P2TrainArgs {
             sigreg_max_rows: self.sigreg_max_rows,
             sigreg_target: self.sigreg_target,
             sigreg_temporal_window: self.sigreg_temporal_window,
+            sigreg_global_mix: self.sigreg_global_mix,
             prefetch_batches: self.prefetch_batches,
         }
     }
