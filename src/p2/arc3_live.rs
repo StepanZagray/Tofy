@@ -537,22 +537,25 @@ impl<T: HttpTransport> ArcApi for HttpArcApi<T> {
                 .context("ACTION6 missing y")
                 .map_err(MutationError::Failed)?);
         }
-        let response: ApiObservation = self.action_post(
-            &path,
-            &body,
-            AmbiguousMutation {
-                operation: "submit action".into(),
-                game_id: Some(game_id.into()),
-                guid: Some(guid.into()),
-                action: Some(action.clone()),
-                cause: String::new(),
-            },
-        )?;
-        let observation = ArcObservation::try_from(response).map_err(MutationError::Failed)?;
+        let ambiguity = AmbiguousMutation {
+            operation: "submit action".into(),
+            game_id: Some(game_id.into()),
+            guid: Some(guid.into()),
+            action: Some(action.clone()),
+            cause: String::new(),
+        };
+        let response: ApiObservation = self.action_post(&path, &body, ambiguity.clone())?;
+        let observation = ArcObservation::try_from(response).map_err(|error| {
+            MutationError::Ambiguous(AmbiguousMutation {
+                cause: format!("validate ACTION response: {error:#}"),
+                ..ambiguity.clone()
+            })
+        })?;
         if observation.game_id != game_id || observation.guid != guid {
-            return Err(MutationError::Failed(anyhow::anyhow!(
-                "ACTION response session identifiers do not match request"
-            )));
+            return Err(MutationError::Ambiguous(AmbiguousMutation {
+                cause: "ACTION response session identifiers do not match request".into(),
+                ..ambiguity
+            }));
         }
         Ok(observation)
     }
@@ -1269,6 +1272,19 @@ mod tests {
         }
     }
 
+    fn observation_body(game_id: &str, guid: &str, state: &str, actions: &[u8]) -> String {
+        json!({
+            "game_id": game_id,
+            "guid": guid,
+            "frame": [[[0]]],
+            "state": state,
+            "levels_completed": 0,
+            "win_levels": 1,
+            "available_actions": actions,
+        })
+        .to_string()
+    }
+
     fn http_api(
         responses: Vec<std::result::Result<HttpResponse, String>>,
     ) -> HttpArcApi<FakeTransport> {
@@ -1312,6 +1328,48 @@ mod tests {
     }
 
     #[test]
+    fn action_response_body_read_failure_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(HttpResponse {
+            status: StatusCode::OK,
+            body: Err("connection closed while reading".into()),
+        })]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_invalid_json_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(response(StatusCode::OK, "not json"))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_rate_limit_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
     fn action_server_error_is_ambiguous_and_sends_once() {
         let mut api = http_api(vec![Ok(response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1324,6 +1382,76 @@ mod tests {
             Err(MutationError::Ambiguous(_))
         ));
         assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_semantic_observation_failure_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("game", "guid", "INVALID_STATE", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("semantic response failure must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_game_id_mismatch_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("other-game", "guid", "NOT_FINISHED", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("game_id mismatch must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_guid_mismatch_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("game", "other-guid", "NOT_FINISHED", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("guid mismatch must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_missing_coordinate_fails_before_send() {
+        let mut api = http_api(Vec::new());
+        let action = ArcAction {
+            id: 6,
+            x: None,
+            y: Some(1),
+        };
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Failed(_))
+        ));
+        assert_eq!(api.transport.send_count(), 0);
     }
 
     #[test]
@@ -1570,6 +1698,47 @@ mod tests {
                 .map(|action| action.id),
             Some(1)
         );
+    }
+
+    #[test]
+    fn semantic_action_failure_is_excluded_from_confirmed_trace_and_scorecard_closes() {
+        let mut api = http_api(vec![
+            Ok(response(
+                StatusCode::OK,
+                r#"[{"game_id":"game","title":"Game"}]"#,
+            )),
+            Ok(response(StatusCode::OK, r#"{"card_id":"card"}"#)),
+            Ok(response(
+                StatusCode::OK,
+                &observation_body("game", "guid-game", "NOT_FINISHED", &[1]),
+            )),
+            Ok(response(
+                StatusCode::OK,
+                &observation_body("game", "guid-game", "INVALID_STATE", &[1]),
+            )),
+            Ok(response(StatusCode::OK, "{}")),
+        ]);
+        let settings = LiveRunSettings {
+            checkpoint: "model.safetensors".into(),
+            checkpoint_sha256: "model-hash".into(),
+            train_config: "config.json".into(),
+            train_config_sha256: "config-hash".into(),
+            device: "cpu".into(),
+            base_url: "https://example.invalid".into(),
+            requested_games: vec!["game".into()],
+            max_actions_per_game: 4,
+        };
+
+        let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
+        let game = &report.games[0];
+        assert_eq!(game.stop_reason, "ambiguous_mutation");
+        assert_eq!(game.actions, 0);
+        assert!(game.trace.is_empty());
+        assert_eq!(
+            game.ambiguous_attempted_action.as_ref().map(|_| ()),
+            Some(())
+        );
+        assert_eq!(api.transport.send_count(), 5);
     }
 
     #[test]
