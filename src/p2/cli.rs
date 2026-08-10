@@ -6,7 +6,7 @@
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::muon::MUON_RMS_SCALE;
-use crate::p2::train::{train, TrainConfig, DEFAULT_LESSONS};
+use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -186,6 +186,14 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 4096)]
     pub sigreg_max_rows: usize,
 
+    /// SIGReg population: marginal control or temporally centered residuals.
+    #[arg(long, value_enum, default_value_t = SigregTarget::Marginal)]
+    pub sigreg_target: SigregTarget,
+
+    /// Consecutive transitions per ordered SIGReg window (temporal-residual needs >= 2).
+    #[arg(long, default_value_t = 8)]
+    pub sigreg_temporal_window: usize,
+
     #[arg(long, default_value_t = true)]
     pub prefetch_batches: bool,
 }
@@ -248,6 +256,8 @@ impl P2TrainArgs {
             muon_momentum: self.muon_momentum,
             muon_rms_scale: self.muon_rms_scale,
             sigreg_max_rows: self.sigreg_max_rows,
+            sigreg_target: self.sigreg_target,
+            sigreg_temporal_window: self.sigreg_temporal_window,
             prefetch_batches: self.prefetch_batches,
         }
     }

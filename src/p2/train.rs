@@ -22,6 +22,7 @@ use candle_graph::{ExecutionStep, SpanKind};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::{VarBuilder, VarMap};
+use clap::ValueEnum;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,23 @@ const MAX_GRAD_NORM: f64 = 1.0;
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
 pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v6";
 pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v4";
+
+/// Which population receives SIGReg. `TemporalResidual` removes a local temporal
+/// mean before the existing post-RMS spatial-cell statistic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SigregTarget {
+    Marginal,
+    TemporalResidual,
+}
+
+fn default_sigreg_target() -> SigregTarget {
+    SigregTarget::Marginal
+}
+
+fn default_sigreg_temporal_window() -> usize {
+    8
+}
 
 /// Optimizer steps for a lesson (`dynamics` / `exploration` get 2× base steps).
 pub fn steps_for_lesson(cfg: &TrainConfig, lesson: &str) -> usize {
@@ -204,6 +222,12 @@ pub struct TrainConfig {
     /// Cap SIGReg row count (0 = no cap). Reduces VRAM for spatial SIGReg.
     #[serde(default = "default_sigreg_max_rows")]
     pub sigreg_max_rows: usize,
+    /// Marginal control or per-window temporally centered residual population.
+    #[serde(default = "default_sigreg_target")]
+    pub sigreg_target: SigregTarget,
+    /// Ordered transition window size. Ignored by the legacy marginal fallback.
+    #[serde(default = "default_sigreg_temporal_window")]
+    pub sigreg_temporal_window: usize,
     /// Overlap CPU batch generation with GPU work.
     #[serde(default = "default_prefetch_batches")]
     pub prefetch_batches: bool,
@@ -353,6 +377,8 @@ impl Default for TrainConfig {
             muon_momentum: 0.95,
             muon_rms_scale: MUON_RMS_SCALE,
             sigreg_max_rows: 4096,
+            sigreg_target: SigregTarget::Marginal,
+            sigreg_temporal_window: 8,
             prefetch_batches: true,
         }
     }
@@ -402,6 +428,20 @@ impl TrainConfig {
         }
         if self.sigreg_projector && self.sigreg_projector_dim < 2 {
             bail!("sigreg_projector_dim must be >= 2 when --sigreg-projector is enabled");
+        }
+        if self.sigreg_target == SigregTarget::TemporalResidual {
+            if self.sigreg_temporal_window < 2 {
+                bail!("sigreg_temporal_window must be >= 2 for temporal-residual SIGReg");
+            }
+            if !self.sigreg_spatial
+                || !self.sigreg_spatial_pool
+                || self.sigreg_pre_rms_spatial
+                || self.sigreg_projector
+            {
+                bail!(
+                    "temporal-residual SIGReg requires post-RMS 2x2 spatial SIGReg without pre-RMS or projector geometry"
+                );
+            }
         }
         if self.sigreg_pre_rms_spatial
             && (!self.sigreg_spatial || self.sigreg_spatial_pool || self.sigreg_projector)
@@ -557,6 +597,10 @@ struct TrainingContract {
     reliability_weight: f64,
     bf16_conv: bool,
     sigreg_max_rows: usize,
+    #[serde(default = "default_sigreg_target")]
+    sigreg_target: SigregTarget,
+    #[serde(default = "default_sigreg_temporal_window")]
+    sigreg_temporal_window: usize,
     device: String,
     adam_beta1: f64,
     adam_beta2: f64,
@@ -613,6 +657,8 @@ impl From<&TrainConfig> for TrainingContract {
             reliability_weight: cfg.reliability_weight,
             bf16_conv: cfg.bf16_conv,
             sigreg_max_rows: cfg.sigreg_max_rows,
+            sigreg_target: cfg.sigreg_target,
+            sigreg_temporal_window: cfg.sigreg_temporal_window,
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
@@ -905,6 +951,70 @@ pub struct OrderedTraceTensors {
     pub next_frames: Tensor,
     pub actions: Tensor,
     pub action_coords: Tensor,
+}
+
+/// Non-overlapping, time-major rows selected from one deterministic batch.
+///
+/// Every window belongs to one `(seed, episode_id, family)` and has exactly
+/// consecutive transition indices. `row_indices` is laid out `[time, window]`,
+/// so it can be gathered directly into `T × B × C × H × W` encoder latents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderedSigregWindows {
+    pub window: usize,
+    pub windows: usize,
+    pub row_indices: Vec<usize>,
+}
+
+/// Select complete ordered SIGReg windows without reordering generated samples.
+/// Broken episode runs and short tails are deliberately excluded rather than joined.
+pub fn ordered_sigreg_windows(
+    samples: &[TransitionSample],
+    window: usize,
+) -> Result<Option<OrderedSigregWindows>> {
+    if window < 2 {
+        bail!("ordered SIGReg window must be >= 2");
+    }
+
+    let mut complete = Vec::<Vec<usize>>::new();
+    let mut run_start = 0;
+    while run_start < samples.len() {
+        let first = &samples[run_start];
+        let mut run_end = run_start + 1;
+        while run_end < samples.len() {
+            let previous = &samples[run_end - 1];
+            let next = &samples[run_end];
+            let same_trace = next.seed == first.seed
+                && next.episode_id == first.episode_id
+                && next.family == first.family;
+            let contiguous = next.transition_index == previous.transition_index.saturating_add(1);
+            if !same_trace || !contiguous {
+                break;
+            }
+            run_end += 1;
+        }
+        for chunk in (run_start..run_end)
+            .collect::<Vec<_>>()
+            .chunks_exact(window)
+        {
+            complete.push(chunk.to_vec());
+        }
+        run_start = run_end;
+    }
+    if complete.is_empty() {
+        return Ok(None);
+    }
+
+    let mut row_indices = Vec::with_capacity(complete.len() * window);
+    for time in 0..window {
+        for trace in &complete {
+            row_indices.push(trace[time]);
+        }
+    }
+    Ok(Some(OrderedSigregWindows {
+        window,
+        windows: complete.len(),
+        row_indices,
+    }))
 }
 
 pub fn action_tensors_from_samples(
@@ -1878,6 +1988,92 @@ pub fn sigreg_losses_for_encoded_pair(
     Ok((raw, bounded))
 }
 
+/// Apply the existing post-RMS spatial SIGReg geometry to an ordered population.
+/// The encoder is deliberately called before target selection, so marginal and
+/// temporal-residual arms have identical frame batches and encoder call shapes.
+pub fn sigreg_stack_for_ordered_windows(
+    latents: &Tensor,
+    windows: &OrderedSigregWindows,
+    target: SigregTarget,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<Tensor> {
+    let (rows, channels, height, width) = latents.dims4()?;
+    if windows.row_indices.len() != windows.window.saturating_mul(windows.windows) {
+        bail!("ordered SIGReg window metadata has an invalid row count");
+    }
+    if windows.row_indices.iter().any(|&row| row >= rows) {
+        bail!("ordered SIGReg window row is outside encoded batch");
+    }
+    let indices = Tensor::from_vec(
+        windows
+            .row_indices
+            .iter()
+            .map(|&row| row as u32)
+            .collect::<Vec<_>>(),
+        (windows.row_indices.len(),),
+        latents.device(),
+    )?;
+    let ordered = latents.index_select(&indices, 0)?.reshape((
+        windows.window,
+        windows.windows,
+        channels,
+        height,
+        width,
+    ))?;
+    // Pool after gathering. This is the same post-RMS 2x2 control geometry; the
+    // leading time/window axes are temporarily folded only for the pool operator.
+    let pooled = if cfg.sigreg_spatial && cfg.sigreg_spatial_pool {
+        let flat = ordered.reshape((windows.window * windows.windows, channels, height, width))?;
+        let pooled = flat.avg_pool2d(2)?;
+        let (_, _, pooled_height, pooled_width) = pooled.dims4()?;
+        pooled.reshape((
+            windows.window,
+            windows.windows,
+            channels,
+            pooled_height,
+            pooled_width,
+        ))?
+    } else {
+        ordered
+    };
+    let centered = if target == SigregTarget::TemporalResidual {
+        let mean = pooled.sum(0)?.affine(1.0 / windows.window as f64, 0.0)?;
+        pooled.broadcast_sub(&mean.broadcast_as(pooled.dims())?)?
+    } else {
+        pooled
+    };
+    let (_, _, _, pooled_height, pooled_width) = centered.dims5()?;
+    let rows = if cfg.sigreg_spatial {
+        centered.permute((0, 1, 3, 4, 2))?.reshape((
+            windows.window * windows.windows * pooled_height * pooled_width,
+            channels,
+        ))?
+    } else {
+        centered.reshape((
+            windows.window * windows.windows,
+            channels * pooled_height * pooled_width,
+        ))?
+    };
+    subsample_sigreg_rows(
+        &rows,
+        effective_sigreg_max_rows(cfg),
+        seed.wrapping_add(0x5196_0001),
+    )
+}
+
+fn sigreg_losses_for_ordered_windows(
+    latents: &Tensor,
+    windows: &OrderedSigregWindows,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<(Tensor, Tensor)> {
+    let stack = sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
+    let raw = sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+    let bounded = bounded_sigreg_loss(&raw)?;
+    Ok((raw, bounded))
+}
+
 fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
     if !cfg.q_quantile_targets {
         return per
@@ -1900,6 +2096,18 @@ fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
 pub fn leworld_loss(
     model: &WorldModel,
     batch: &BatchTensors,
+    cfg: &TrainConfig,
+    depth: RecursionDepth,
+    sigreg_seed: u64,
+    weights: LessonLossWeights,
+) -> Result<LossBreakdown> {
+    leworld_loss_with_sigreg_windows(model, batch, None, cfg, depth, sigreg_seed, weights)
+}
+
+fn leworld_loss_with_sigreg_windows(
+    model: &WorldModel,
+    batch: &BatchTensors,
+    sigreg_windows: Option<&OrderedSigregWindows>,
     cfg: &TrainConfig,
     depth: RecursionDepth,
     sigreg_seed: u64,
@@ -1945,15 +2153,23 @@ pub fn leworld_loss(
             .affine(1.0 / n_steps, 0.0)?
     };
 
-    let (sigreg_raw, sigreg_bounded) = sigreg_losses_for_encoded_pair(
-        &cur_z,
-        &next_z,
-        &encoded.current_raw,
-        &encoded.next_raw,
-        encoded.projected_sigreg.as_ref(),
-        cfg,
-        sigreg_seed,
-    )?;
+    let (sigreg_raw, sigreg_bounded) = match sigreg_windows {
+        Some(windows) if !cfg.sigreg_pre_rms_spatial && !cfg.sigreg_projector => {
+            sigreg_losses_for_ordered_windows(&cur_z, windows, cfg, sigreg_seed)?
+        }
+        None if cfg.sigreg_target == SigregTarget::TemporalResidual => bail!(
+            "temporal-residual SIGReg requires at least one complete ordered transition window"
+        ),
+        _ => sigreg_losses_for_encoded_pair(
+            &cur_z,
+            &next_z,
+            &encoded.current_raw,
+            &encoded.next_raw,
+            encoded.projected_sigreg.as_ref(),
+            cfg,
+            sigreg_seed,
+        )?,
+    };
 
     let device = batch.frames.device();
     let zero = Tensor::zeros((), DType::F32, device)?;
@@ -3020,11 +3236,21 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     }
                 });
             }
-            let (batch, ordered_trace) = {
+            let (batch, ordered_trace, sigreg_windows) = {
                 let cg = cg_profile.phase("stage", SpanKind::Module, None);
                 let staged = timed(prof, &device, &mut profile.stage, || {
                     let _span = tracing::info_span!("stage").entered();
                     let batch = batch_from_samples(&samples, &device)?;
+                    // Both arms derive their population from these exact ordered rows.
+                    // Target selection happens only after the shared encoder pass.
+                    let sigreg_windows = if cfg.sigreg_target == SigregTarget::Marginal
+                        && cfg.sigreg_temporal_window < 2
+                    {
+                        // The window is deliberately ignored for legacy marginal configs.
+                        None
+                    } else {
+                        ordered_sigreg_windows(&samples, cfg.sigreg_temporal_window)?
+                    };
                     let ordered_trace = if micro == 0 && run_rollout_this_step {
                         rollout_trace_cache
                             .as_deref()
@@ -3033,7 +3259,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     } else {
                         None
                     };
-                    Ok((batch, ordered_trace))
+                    Ok((batch, ordered_trace, sigreg_windows))
                 })?;
                 if let Some(range) = cg.as_ref() {
                     cg_profile.record_tensor(range, "batch.frames", &staged.0.frames, None)?;
@@ -3049,8 +3275,15 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     cg_profile.phase("forward", SpanKind::Function, Some(ExecutionStep::Forward));
                 let result = timed(prof, &device, &mut profile.forward, || {
                     let _span = tracing::info_span!("forward").entered();
-                    let losses =
-                        leworld_loss(&model, &batch, cfg, depth, micro_sigreg_seed, loss_weights)?;
+                    let losses = leworld_loss_with_sigreg_windows(
+                        &model,
+                        &batch,
+                        sigreg_windows.as_ref(),
+                        cfg,
+                        depth,
+                        micro_sigreg_seed,
+                        loss_weights,
+                    )?;
                     let rollout_trace = if run_rollout {
                         ordered_trace.as_ref()
                     } else {
@@ -3447,6 +3680,154 @@ mod tests {
             full.action_coords.flatten_all()?.to_vec1::<f32>()?,
             trace.action_coords.flatten_all()?.to_vec1::<f32>()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_sigreg_windows_never_cross_trace_boundaries() -> Result<()> {
+        let mut samples = (0..4).map(toy_sample).collect::<Vec<_>>();
+        for (index, sample) in samples.iter_mut().enumerate() {
+            sample.transition_index = index as u64;
+        }
+        let mut other = (0..4).map(toy_sample).collect::<Vec<_>>();
+        for (index, sample) in other.iter_mut().enumerate() {
+            sample.episode_id = 1;
+            sample.transition_index = index as u64;
+        }
+        samples.extend(other);
+        // A gap begins a new run; it must not be stitched to the preceding one.
+        samples[6].transition_index = 9;
+
+        let windows = ordered_sigreg_windows(&samples, 3)?.expect("one complete window");
+        assert_eq!(windows.windows, 1);
+        assert_eq!(windows.row_indices, vec![0, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_sigreg_is_invariant_to_window_local_offsets() -> Result<()> {
+        let device = Device::Cpu;
+        let windows = OrderedSigregWindows {
+            window: 2,
+            windows: 2,
+            row_indices: vec![0, 2, 1, 3],
+        };
+        let cfg = TrainConfig {
+            physical_batch: 4,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: true,
+            sigreg_max_rows: 0,
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            ..TrainConfig::default()
+        };
+        let base = Tensor::from_vec(
+            vec![
+                0.0f32, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0, 9.0, 10.0, 11.0,
+            ],
+            (4, 1, 2, 2),
+            &device,
+        )?;
+        let offsets = Tensor::from_vec(
+            vec![100.0f32; 8]
+                .into_iter()
+                .chain(vec![200.0f32; 8])
+                .collect::<Vec<_>>(),
+            (4, 1, 2, 2),
+            &device,
+        )?;
+        let shifted = base.add(&offsets)?;
+        let actual = sigreg_stack_for_ordered_windows(
+            &base,
+            &windows,
+            SigregTarget::TemporalResidual,
+            &cfg,
+            7,
+        )?;
+        let expected = sigreg_stack_for_ordered_windows(
+            &shifted,
+            &windows,
+            SigregTarget::TemporalResidual,
+            &cfg,
+            7,
+        )?;
+        assert_eq!(actual.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn tc_sigreg_arms_share_ordered_rows_and_encoder_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let mut samples = (0..8).map(toy_sample).collect::<Vec<_>>();
+        for (index, sample) in samples.iter_mut().enumerate() {
+            sample.transition_index = index as u64;
+        }
+        let selected = ordered_sigreg_windows(&samples, 4)?.expect("two ordered windows");
+        assert_eq!(selected.row_indices, vec![0, 4, 1, 5, 2, 6, 3, 7]);
+        let latents = Tensor::zeros((8, 3, 4, 4), DType::F32, &device)?;
+        let cfg = TrainConfig {
+            physical_batch: 8,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: true,
+            sigreg_max_rows: 0,
+            sigreg_temporal_window: 4,
+            ..TrainConfig::default()
+        };
+        let control = sigreg_stack_for_ordered_windows(
+            &latents,
+            &selected,
+            SigregTarget::Marginal,
+            &cfg,
+            11,
+        )?;
+        let treatment = sigreg_stack_for_ordered_windows(
+            &latents,
+            &selected,
+            SigregTarget::TemporalResidual,
+            &cfg,
+            11,
+        )?;
+        // Target selection is after the shared `B×C×H×W` encoder result.
+        assert_eq!(control.dims(), treatment.dims());
+        assert_eq!(control.dims(), &[32, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_sigreg_config_requires_window_and_control_geometry() {
+        let invalid_window = TrainConfig {
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 1,
+            sigreg_spatial: true,
+            ..TrainConfig::default()
+        };
+        assert!(invalid_window.validate().is_err());
+        let invalid_geometry = TrainConfig {
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: false,
+            ..TrainConfig::default()
+        };
+        assert!(invalid_geometry.validate().is_err());
+        assert!(TrainConfig {
+            sigreg_target: SigregTarget::Marginal,
+            sigreg_temporal_window: 1,
+            ..TrainConfig::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn older_serialized_config_loads_marginal_tc_defaults() -> Result<()> {
+        let mut value = serde_json::to_value(TrainConfig::default())?;
+        let object = value.as_object_mut().expect("config object");
+        object.remove("sigreg_target");
+        object.remove("sigreg_temporal_window");
+        let loaded: TrainConfig = serde_json::from_value(value)?;
+        assert_eq!(loaded.sigreg_target, SigregTarget::Marginal);
+        assert_eq!(loaded.sigreg_temporal_window, 8);
         Ok(())
     }
 
@@ -4625,6 +5006,10 @@ mod tests {
         cfg.sigreg_weight = 999.0;
         cfg.inner_steps = 99;
         cfg.outer_steps = 99;
+        cfg.sigreg_target = SigregTarget::TemporalResidual;
+        cfg.sigreg_temporal_window = 2;
+        cfg.sigreg_spatial = true;
+        cfg.sigreg_spatial_pool = true;
         let err = train(&cfg).expect_err("changed trajectory config must reject exact resume");
         assert!(
             err.to_string().contains("training contract mismatch"),
@@ -4663,6 +5048,13 @@ mod tests {
         cfg.sigreg_spatial_pool = false;
         cfg.sigreg_pre_rms_spatial = true;
         changed.push(("sigreg_pre_rms_spatial", cfg));
+        let mut cfg = base.clone();
+        cfg.sigreg_target = SigregTarget::TemporalResidual;
+        cfg.sigreg_spatial = true;
+        changed.push(("sigreg_target", cfg));
+        let mut cfg = base.clone();
+        cfg.sigreg_temporal_window += 1;
+        changed.push(("sigreg_temporal_window", cfg));
 
         for (name, cfg) in changed {
             assert_ne!(
