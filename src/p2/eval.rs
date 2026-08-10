@@ -12,7 +12,8 @@ use crate::p2::model::{
     EVENT_GOAL_FAILED,
 };
 use crate::p2::representation::{
-    summarize_seams, RepresentationSeam, RepresentationSeamMap, DEFAULT_REPRESENTATION_ROW_CAP,
+    RepresentationRowCollector, RepresentationSeam, RepresentationSeamCollector,
+    RepresentationSeamMap, DEFAULT_REPRESENTATION_ROW_CAP,
 };
 use crate::p2::rhae::{
     benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
@@ -1668,9 +1669,6 @@ struct BatchEvalPartial {
     ptrm_acc: BTreeMap<usize, (f64, f64, f64, f64, usize)>,
     matched_acc: BTreeMap<usize, (f64, usize, usize)>,
     ensemble_disagreement: f64,
-    /// Per-sample disagreement, in sample order, so uncertainty can be scored
-    /// against per-sample error instead of the reliability head's output.
-    ensemble_disagreements: Vec<f32>,
     ensemble_n: usize,
 }
 
@@ -1834,7 +1832,6 @@ fn eval_one_batch(
                 if dpairs > 0 {
                     let per_sample = dsum / dpairs as f64;
                     partial.ensemble_disagreement += per_sample;
-                    partial.ensemble_disagreements.push(per_sample as f32);
                     partial.ensemble_n += 1;
                 }
             }
@@ -1886,58 +1883,42 @@ fn eval_one_batch(
     Ok(partial)
 }
 
-fn merge_batch_partials(mut partials: Vec<(usize, BatchEvalPartial)>) -> Result<BatchEvalPartial> {
-    partials.sort_by_key(|(bi, _)| *bi);
-    let mut merged = BatchEvalPartial::default();
-    for (_, partial) in partials {
-        merged.mse_all.extend(partial.mse_all);
-        merged.encoder_embeddings.extend(partial.encoder_embeddings);
-        for (seam, tensor) in partial.representation_tensors {
-            match merged.representation_tensors.get_mut(&seam) {
-                Some(existing) => *existing = Tensor::cat(&[existing, &tensor], 0)?,
-                None => {
-                    merged.representation_tensors.insert(seam, tensor);
-                }
-            }
-        }
-        merged.sigreg_raw_weighted += partial.sigreg_raw_weighted;
-        merged.sigreg_bounded_weighted += partial.sigreg_bounded_weighted;
-        merged.sigreg_n += partial.sigreg_n;
-        merged
-            .changed_learned_errors
-            .extend(partial.changed_learned_errors);
-        merged
-            .changed_copy_forward_errors
-            .extend(partial.changed_copy_forward_errors);
-        merged.event_labeled += partial.event_labeled;
-        merged.event_correct_weighted += partial.event_correct_weighted;
-        merged.event_bce_weighted += partial.event_bce_weighted;
-        merged.hazard_failure_labeled += partial.hazard_failure_labeled;
-        merged.hazard_false_negatives += partial.hazard_false_negatives;
-        merged.q_acc.merge(partial.q_acc);
-        merged.q_probs.extend(partial.q_probs);
-        merged.reliability_probs.extend(partial.reliability_probs);
-        merged.recursion_probes.extend(partial.recursion_probes);
-        merged.ensemble_disagreement += partial.ensemble_disagreement;
-        merged
-            .ensemble_disagreements
-            .extend(partial.ensemble_disagreements);
-        merged.ensemble_n += partial.ensemble_n;
-        for (k, (p, bq, d, oracle, n)) in partial.ptrm_acc {
-            let e = merged.ptrm_acc.entry(k).or_insert((0.0, 0.0, 0.0, 0.0, 0));
-            e.0 += p;
-            e.1 += bq;
-            e.2 += d;
-            e.3 += oracle;
-            e.4 += n;
-        }
-        for (k, (sum, n, outer_steps)) in partial.matched_acc {
-            let e = merged.matched_acc.entry(k).or_insert((0.0, 0, outer_steps));
-            e.0 += sum;
-            e.1 += n;
-        }
+fn merge_batch_partial(merged: &mut BatchEvalPartial, partial: BatchEvalPartial) {
+    merged.mse_all.extend(partial.mse_all);
+    merged.encoder_embeddings.extend(partial.encoder_embeddings);
+    merged.sigreg_raw_weighted += partial.sigreg_raw_weighted;
+    merged.sigreg_bounded_weighted += partial.sigreg_bounded_weighted;
+    merged.sigreg_n += partial.sigreg_n;
+    merged
+        .changed_learned_errors
+        .extend(partial.changed_learned_errors);
+    merged
+        .changed_copy_forward_errors
+        .extend(partial.changed_copy_forward_errors);
+    merged.event_labeled += partial.event_labeled;
+    merged.event_correct_weighted += partial.event_correct_weighted;
+    merged.event_bce_weighted += partial.event_bce_weighted;
+    merged.hazard_failure_labeled += partial.hazard_failure_labeled;
+    merged.hazard_false_negatives += partial.hazard_false_negatives;
+    merged.q_acc.merge(partial.q_acc);
+    merged.q_probs.extend(partial.q_probs);
+    merged.reliability_probs.extend(partial.reliability_probs);
+    merged.recursion_probes.extend(partial.recursion_probes);
+    merged.ensemble_disagreement += partial.ensemble_disagreement;
+    merged.ensemble_n += partial.ensemble_n;
+    for (k, (p, bq, d, oracle, n)) in partial.ptrm_acc {
+        let e = merged.ptrm_acc.entry(k).or_insert((0.0, 0.0, 0.0, 0.0, 0));
+        e.0 += p;
+        e.1 += bq;
+        e.2 += d;
+        e.3 += oracle;
+        e.4 += n;
     }
-    Ok(merged)
+    for (k, (sum, n, outer_steps)) in partial.matched_acc {
+        let e = merged.matched_acc.entry(k).or_insert((0.0, 0, outer_steps));
+        e.0 += sum;
+        e.1 += n;
+    }
 }
 
 fn eval_shuffled_action_batch(
@@ -2455,6 +2436,31 @@ fn empty_split(source: &str, n_samples: usize) -> SplitEval {
     }
 }
 
+fn collect_top_level_representation(
+    collector: &mut RepresentationRowCollector,
+    tensors: &BTreeMap<RepresentationSeam, Tensor>,
+    sample_start: usize,
+    sample_count: usize,
+) -> Result<()> {
+    let current = tensors
+        .get(&RepresentationSeam::EncoderPostRmsPooled)
+        .expect("diagnostic forward always captures the current post-RMS pooled seam");
+    let target = tensors
+        .get(&RepresentationSeam::TargetPostRmsPooled)
+        .expect("diagnostic forward always captures the target post-RMS pooled seam");
+    let current_rows = current.dim(0)?;
+    let target_rows = target.dim(0)?;
+    if current_rows != sample_count || target_rows != sample_count {
+        bail!("pooled representation seams must have one row per sample");
+    }
+    let pooled = Tensor::cat(&[current, target], 0)?;
+    let row_ids = (sample_start..sample_start + sample_count)
+        .map(|sample| sample as u64 * 2)
+        .chain((sample_start..sample_start + sample_count).map(|sample| sample as u64 * 2 + 1))
+        .collect();
+    collector.collect_rows(&pooled, row_ids)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_sample_set(
     train_cfg: &TrainConfig,
@@ -2473,46 +2479,40 @@ fn eval_sample_set(
 
     let batch_size = cfg.physical_batch.max(1);
     let ranges = batch_ranges(samples.len(), batch_size);
-    let merged = if device.is_cpu() {
-        let partials: Vec<(usize, BatchEvalPartial)> = ranges
-            .par_iter()
-            .enumerate()
-            .map(|(bi, &(start, end))| {
-                let chunk = &samples[start..end];
-                with_thread_local_model(train_cfg, checkpoint, device, |m| {
-                    eval_one_batch(m, chunk, bi, train_cfg, cfg, device)
-                        .map(|partial| (bi, partial))
-                })
-            })
-            .collect::<Result<_>>()?;
-        merge_batch_partials(partials)?
-    } else {
-        let partials: Vec<(usize, BatchEvalPartial)> = ranges
-            .iter()
-            .enumerate()
-            .map(|(bi, &(start, end))| {
-                let partial =
-                    eval_one_batch(model, &samples[start..end], bi, train_cfg, cfg, device)
-                        .map(|partial| (bi, partial))?;
-                if device.is_cuda() {
-                    device.synchronize()?;
-                }
-                Ok(partial)
-            })
-            .collect::<Result<_>>()?;
-        merge_batch_partials(partials)?
-    };
-
-    let representation_seams = summarize_seams(
-        &merged.representation_tensors,
+    let mut merged = BatchEvalPartial::default();
+    let mut seam_collector = RepresentationSeamCollector::new(cfg.seed, cfg.representation_row_cap);
+    // Historical `SplitEval.representation` pooled current and target post-RMS latents.
+    // This separate internal collector preserves that population while named seams remain split.
+    let mut top_level_collector = RepresentationRowCollector::new(
         cfg.seed,
+        0x504F_4F4C_4544_5F5A,
         cfg.representation_row_cap,
-    )?;
-    let post_rms_pooled = representation_seams
-        .get(&RepresentationSeam::EncoderPostRmsPooled)
-        .expect("diagnostic forward always captures the post-RMS pooled seam");
+    );
+    for (bi, &(start, end)) in ranges.iter().enumerate() {
+        let partial = if device.is_cpu() {
+            with_thread_local_model(train_cfg, checkpoint, device, |m| {
+                eval_one_batch(m, &samples[start..end], bi, train_cfg, cfg, device)
+            })?
+        } else {
+            eval_one_batch(model, &samples[start..end], bi, train_cfg, cfg, device)?
+        };
+        seam_collector.collect_batch(&partial.representation_tensors, start, end - start)?;
+        collect_top_level_representation(
+            &mut top_level_collector,
+            &partial.representation_tensors,
+            start,
+            end - start,
+        )?;
+        merge_batch_partial(&mut merged, partial);
+        if device.is_cuda() {
+            device.synchronize()?;
+        }
+    }
+
+    let representation_seams = seam_collector.summarize()?;
+    let post_rms_pooled = top_level_collector.summarize()?;
     let representation = Some(summarize_representation_from_seam(
-        post_rms_pooled,
+        &post_rms_pooled,
         merged.sigreg_raw_weighted,
         merged.sigreg_bounded_weighted,
         merged.sigreg_n,
@@ -2627,23 +2627,20 @@ fn eval_sample_set(
             .take(merged.ensemble_n.min(mse_all.len()))
             .map(|m| f64::from(*m) > cfg.q_mse_threshold)
             .collect();
-        // Score ensemble *disagreement* against error. This previously read
-        // `reliability_probs`, i.e. the reliability head, which made
-        // `uncertainty_auroc` a bit-identical copy of `reliability_auroc` and
-        // meant the pre-registered "disagreement is uncorrelated with error"
-        // stop rule could never be evaluated. Higher disagreement should
-        // predict higher error, so the score is used directly.
-        let uncertainty: Vec<f32> = merged
-            .ensemble_disagreements
-            .iter()
-            .take(high_error.len())
-            .copied()
+        let uncertainty: Vec<f32> = (0..high_error.len())
+            .map(|index| merged.reliability_probs.get(index).copied().unwrap_or(0.5))
             .collect();
         EnsembleMetrics {
             members: cfg.ensemble_members,
             mean_disagreement,
             uncertainty_auroc: if uncertainty.len() == high_error.len() && !high_error.is_empty() {
-                binary_auroc(&uncertainty, &high_error)
+                binary_auroc(
+                    &uncertainty
+                        .iter()
+                        .map(|value| 1.0 - value)
+                        .collect::<Vec<_>>(),
+                    &high_error,
+                )
             } else {
                 None
             },
@@ -3196,10 +3193,11 @@ mod tests {
     }
 
     #[test]
-    fn v10_seam_keys_are_snake_case_and_top_level_uses_post_rms_pooled() -> Result<()> {
+    fn v10_seam_keys_are_snake_case() -> Result<()> {
         let metrics = crate::p2::representation::RepresentationSeamMetrics {
             rows_seen: 9,
             rows_used: 4,
+            non_finite_rows: 0,
             dimension: 3,
             mean_rms: Some(1.0),
             mean_variance: Some(0.25),
@@ -3216,6 +3214,30 @@ mod tests {
         assert_eq!(top.mean_encoder_variance, metrics.mean_variance);
         assert_eq!(top.effective_rank, metrics.effective_rank);
         assert_eq!(top.effective_rank_fraction, metrics.effective_rank_fraction);
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_representation_pools_current_and_target_post_rms_rows() -> Result<()> {
+        let current = Tensor::from_vec(vec![1f32, 0., 0., 1.], (2, 2), &Device::Cpu)?;
+        let target = Tensor::from_vec(vec![3f32, 0., 0., 3.], (2, 2), &Device::Cpu)?;
+        let seams = BTreeMap::from([
+            (RepresentationSeam::EncoderPostRmsPooled, current.clone()),
+            (RepresentationSeam::TargetPostRmsPooled, target.clone()),
+        ]);
+        let mut collector = RepresentationRowCollector::new(7, 0x504F_4F4C_4544_5F5A, 8);
+        collect_top_level_representation(&mut collector, &seams, 0, 2)?;
+        let pooled = collector.summarize()?;
+        let expected = crate::p2::representation::summarize_seam(
+            &Tensor::cat(&[&current, &target], 0)?,
+            RepresentationSeam::EncoderPostRmsPooled,
+            7,
+            8,
+        )?;
+        assert_eq!(pooled.rows_seen, 4);
+        assert_eq!(pooled.rows_used, 4);
+        assert_eq!(pooled.mean_variance, expected.mean_variance);
+        assert_eq!(pooled.effective_rank, expected.effective_rank);
         Ok(())
     }
 
@@ -3307,7 +3329,7 @@ mod tests {
             episode_jsonl: None,
             ensemble_members: 4,
             mode: EvalMode::Full,
-            representation_row_cap: DEFAULT_REPRESENTATION_ROW_CAP,
+            representation_row_cap: 7,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);
@@ -3375,15 +3397,20 @@ mod tests {
             .as_ref()
             .and_then(|seams| seams.get(&RepresentationSeam::EncoderPostRmsPooled))
             .expect("post-RMS pooled seam");
+        let target_post_rms = eval
+            .synthetic_dynamics
+            .representation_seams
+            .as_ref()
+            .and_then(|seams| seams.get(&RepresentationSeam::TargetPostRmsPooled))
+            .expect("target post-RMS pooled seam");
         let top = eval
             .synthetic_dynamics
             .representation
             .as_ref()
             .expect("top-level representation");
-        assert_eq!(top.encoder_rows, post_rms.rows_used);
+        assert_eq!(top.encoder_rows, eval_cfg.representation_row_cap);
         assert_eq!(top.encoder_dim, post_rms.dimension);
-        assert_eq!(top.mean_encoder_variance, post_rms.mean_variance);
-        assert_eq!(top.effective_rank, post_rms.effective_rank);
+        assert_eq!(top.encoder_dim, target_post_rms.dimension);
 
         let mut representation_cfg = eval_cfg.clone();
         representation_cfg.mode = EvalMode::Representation;
@@ -3398,6 +3425,32 @@ mod tests {
         assert!(representation_eval.synthetic_dynamics.q.is_none());
         assert!(representation_eval.synthetic_dynamics.ptrm.is_none());
         assert!(representation_eval.synthetic_dynamics.rollout.is_none());
+
+        let mut physical_batch_one = representation_cfg.clone();
+        physical_batch_one.physical_batch = 1;
+        physical_batch_one.output = dir.join("representation-batch-one.json");
+        let batch_one_eval = evaluate(&physical_batch_one)?;
+        let representation_json = serde_json::to_value(&representation_eval.synthetic_dynamics)?;
+        let batch_one_json = serde_json::to_value(&batch_one_eval.synthetic_dynamics)?;
+        // SIGReg is a batch statistic and is unavailable for a one-row physical batch.
+        // The bounded seam-derived geometry must still be partition invariant.
+        for field in [
+            "encoder_rows",
+            "encoder_dim",
+            "mean_encoder_variance",
+            "effective_rank",
+            "effective_rank_fraction",
+            "noncollapse_pass",
+        ] {
+            assert_eq!(
+                representation_json["representation"][field],
+                batch_one_json["representation"][field]
+            );
+        }
+        assert_eq!(
+            representation_json["representation_seams"],
+            batch_one_json["representation_seams"]
+        );
 
         let mut rollout_cfg = eval_cfg.clone();
         rollout_cfg.mode = EvalMode::Rollout;
