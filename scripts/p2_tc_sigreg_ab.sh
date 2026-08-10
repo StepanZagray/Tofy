@@ -35,7 +35,9 @@ done
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
-gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader)
+(( ${#gpu_names[@]} == 1 )) || { printf 'pilot requires exactly one visible physical GPU\n' >&2; exit 2; }
+gpu_name="${gpu_names[0]}"
 [[ "$git_sha" == "$P2_EXPECTED_SHA" ]] || { printf 'Tofy SHA mismatch\n' >&2; exit 2; }
 [[ "$candle_sha" == "$P2_EXPECTED_CANDLE_SHA" ]] || { printf 'candle_graph SHA mismatch\n' >&2; exit 2; }
 [[ "$binary_sha" == "$P2_EXPECTED_BINARY_SHA" ]] || { printf 'binary SHA mismatch\n' >&2; exit 2; }
@@ -46,6 +48,22 @@ gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 probe_dir="$(cd -- "$(dirname -- "$P2_TC_BATCH_PROBE")" && pwd)"
 probe_manifest="$probe_dir/artifacts.sha256"
 [[ -s "$probe_manifest" ]] || { printf 'missing probe artifact manifest\n' >&2; exit 2; }
+required_probe_artifacts=(
+  "$probe_dir/run/config.json"
+  "$probe_dir/run/train_report.json"
+  "$probe_dir/run/checkpoints/step-000000000002/model.safetensors"
+  "$probe_dir/run/checkpoints/step-000000000002/optimizer.safetensors"
+  "$probe_dir/run/checkpoints/step-000000000002/trainer_state.json"
+)
+mapfile -t manifest_paths < <(awk '{print $2}' "$probe_manifest")
+(( ${#manifest_paths[@]} == ${#required_probe_artifacts[@]} )) || {
+  printf 'probe artifact manifest has the wrong number of entries\n' >&2; exit 2;
+}
+for index in "${!required_probe_artifacts[@]}"; do
+  [[ "${manifest_paths[$index]}" == "${required_probe_artifacts[$index]}" ]] || {
+    printf 'probe artifact manifest entry %s is not the required artifact\n' "$index" >&2; exit 2;
+  }
+done
 (cd / && sha256sum --quiet -c "$probe_manifest") || { printf 'probe artifact verification failed\n' >&2; exit 2; }
 probe_manifest_sha="$(sha256sum "$probe_manifest" | awk '{print $1}')"
 jq -e \
@@ -63,11 +81,12 @@ jq -e \
 }
 probe_sha="$(sha256sum "$P2_TC_BATCH_PROBE" | awk '{print $1}')"
 
-[[ ! -e "$run_root" ]] || {
+run_parent="$(dirname -- "$run_root")"
+mkdir -p -- "$run_parent"
+mkdir -- "$run_root" || {
   printf 'pilot run root already exists; refusing mixed or relabeled artifacts: %s\n' "$run_root" >&2
   exit 2
 }
-mkdir -p -- "$run_root"
 run_root="$(realpath "$run_root")"
 
 sample_gpu() {
@@ -114,7 +133,7 @@ run_arm() {
   sampler_pid=$!
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   "$tofy_bin" p2-train \
-    --device cuda --seed 1 --lessons sequential --steps-per-lesson 1000 \
+    --device cuda:0 --seed 1 --lessons sequential --steps-per-lesson 1000 \
     --physical-batch "$physical_batch" --grad-accum "$grad_accum" \
     --checkpoint-every-steps 250 --profile-update 250 \
     --sigreg-target "$target" --sigreg-temporal-window 8 \
@@ -137,7 +156,7 @@ run_arm() {
     mkdir -p -- "$eval_dir"
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     "$tofy_bin" p2-eval --checkpoint "$checkpoint" --train-config "$arm_dir/config.json" \
-      --device cuda --seed 424242 --synthetic-episodes 64 --physical-batch "$eval_batch" \
+      --device cuda:0 --seed 424242 --synthetic-episodes 64 --physical-batch "$eval_batch" \
       --ptrm-k 1 --ptrm-noise 0 --ensemble-members 1 \
       --episode-jsonl "$eval_dir/episodes.jsonl" --output "$eval_dir/eval_report.json" \
       > >(tee "$eval_dir/eval.log") 2>&1

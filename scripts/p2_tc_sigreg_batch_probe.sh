@@ -21,7 +21,9 @@ gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-1}"
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
-gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader)
+(( ${#gpu_names[@]} == 1 )) || { printf 'probe requires exactly one visible physical GPU\n' >&2; exit 2; }
+gpu_name="${gpu_names[0]}"
 [[ "$git_sha" == "$P2_EXPECTED_SHA" && "$candle_sha" == "$P2_EXPECTED_CANDLE_SHA" \
   && "$binary_sha" == "$P2_EXPECTED_BINARY_SHA" ]] || { printf 'reviewed SHA mismatch\n' >&2; exit 2; }
 [[ "$gpu_name" == "NVIDIA A40" ]] || { printf 'probe requires NVIDIA A40, found %s\n' "$gpu_name" >&2; exit 2; }
@@ -29,8 +31,10 @@ gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph worktree\n' >&2; exit 2; }
 
 probe_root="${P2_TC_BATCH_PROBE_ROOT:-$repo_root/runs/p2/tc-sigreg-batch-probe/${git_sha:0:12}/batch-$physical_batch-accum-$grad_accum}"
-[[ ! -e "$probe_root" ]] || { printf 'probe root already exists: %s\n' "$probe_root" >&2; exit 2; }
-mkdir -p -- "$probe_root/telemetry"
+probe_parent="$(dirname -- "$probe_root")"
+mkdir -p -- "$probe_parent"
+mkdir -- "$probe_root" || { printf 'probe root already exists: %s\n' "$probe_root" >&2; exit 2; }
+mkdir -- "$probe_root/telemetry"
 probe_root="$(realpath "$probe_root")"
 sample_gpu() {
   while true; do
@@ -54,7 +58,7 @@ sample_gpu >>"$probe_root/telemetry/gpu.csv" &
 sampler_pid=$!
 started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "$tofy_bin" p2-train \
-  --device cuda --seed 1 --lessons sequential --steps-per-lesson 1000 --max-steps-this-run 2 \
+  --device cuda:0 --seed 1 --lessons sequential --steps-per-lesson 1000 --max-steps-this-run 2 \
   --physical-batch "$physical_batch" --grad-accum "$grad_accum" \
   --checkpoint-every-steps 2 --profile-update 2 \
   --sigreg-target temporal-residual --sigreg-temporal-window 8 \
@@ -70,9 +74,12 @@ nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization
   --format=csv,noheader,nounits >"$probe_root/telemetry/after.csv"
 completed="$(jq -r '.global_step' "$probe_root/run/train_report.json")"
 sha256sum "$probe_root/run/config.json" \
+  "$probe_root/run/train_report.json" \
   "$probe_root/run/checkpoints/step-000000000002/model.safetensors" \
+  "$probe_root/run/checkpoints/step-000000000002/optimizer.safetensors" \
   "$probe_root/run/checkpoints/step-000000000002/trainer_state.json" \
   >"$probe_root/artifacts.sha256.tmp"
+(cd / && sha256sum --quiet -c "$probe_root/artifacts.sha256.tmp")
 mv -- "$probe_root/artifacts.sha256.tmp" "$probe_root/artifacts.sha256"
 artifact_manifest_sha="$(sha256sum "$probe_root/artifacts.sha256" | awk '{print $1}')"
 jq -nc --arg schema p2.tc_sigreg_batch_probe.v1 --arg status passed \
