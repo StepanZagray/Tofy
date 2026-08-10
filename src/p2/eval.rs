@@ -400,9 +400,40 @@ pub struct ActionSourceDiagnostics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionKindDiagnostics {
+    /// ACTION1..ACTION5 and ACTION7 target rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simple: Option<ActionShuffleMetrics>,
+    /// ACTION6 target rows, including their target coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate: Option<ActionShuffleMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionKindDiagnostics {
+    /// Rows explicitly labeled as state-changing (`sample.noop == Some(false)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_transition: Option<ActionShuffleMetrics>,
+    /// Rows explicitly labeled as no-ops (`sample.noop == Some(true)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noop: Option<ActionShuffleMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionDiagnostics {
     pub aggregate: ActionSourceDiagnostics,
     pub by_source: BTreeMap<String, ActionSourceDiagnostics>,
+    /// Paired action-shuffle errors grouped by the target transition's action ID.
+    /// Missing from older reports; only source-local permutations with at least
+    /// two rows contribute, matching `aggregate.shuffle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_target_action_id: Option<BTreeMap<u8, ActionShuffleMetrics>>,
+    /// Paired action-shuffle errors split by the target action form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_target_action_kind: Option<ActionKindDiagnostics>,
+    /// Paired action-shuffle errors split by the transition label, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_transition_kind: Option<TransitionKindDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,6 +889,134 @@ fn summarize_action_shuffle(
                 && ratio_ci95_low.is_some_and(|value| value > 1.0),
         ),
     })
+}
+
+fn summarize_action_stratum(
+    samples: &[TransitionSample],
+    shuffled: &[TransitionSample],
+    true_errors: &[f32],
+    shuffled_errors: &[f32],
+    indices: &[usize],
+    seed: u64,
+) -> Result<Option<ActionShuffleMetrics>> {
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let true_errors: Vec<_> = indices.iter().map(|&index| true_errors[index]).collect();
+    let shuffled_errors: Vec<_> = indices
+        .iter()
+        .map(|&index| shuffled_errors[index])
+        .collect();
+    let changed_conditionings = indices
+        .iter()
+        .filter(|&&index| samples[index].action != shuffled[index].action)
+        .count();
+    Ok(Some(summarize_action_shuffle(
+        &true_errors,
+        &shuffled_errors,
+        changed_conditionings,
+        seed,
+    )?))
+}
+
+fn summarize_action_strata(
+    samples: &[TransitionSample],
+    shuffled: &[TransitionSample],
+    true_errors: &[f32],
+    shuffled_errors: &[f32],
+    paired: &[bool],
+    seed: u64,
+) -> Result<(
+    BTreeMap<u8, ActionShuffleMetrics>,
+    ActionKindDiagnostics,
+    TransitionKindDiagnostics,
+)> {
+    if samples.len() != shuffled.len()
+        || samples.len() != true_errors.len()
+        || samples.len() != shuffled_errors.len()
+        || samples.len() != paired.len()
+    {
+        bail!("action strata inputs must have matching lengths");
+    }
+
+    let mut by_action = BTreeMap::<u8, Vec<usize>>::new();
+    let mut simple = Vec::new();
+    let mut coordinate = Vec::new();
+    let mut changed_transition = Vec::new();
+    let mut noop = Vec::new();
+    for (index, sample) in samples.iter().enumerate() {
+        if !paired[index] {
+            continue;
+        }
+        by_action.entry(sample.action.id).or_default().push(index);
+        if sample.action.id == 6 {
+            coordinate.push(index);
+        } else {
+            simple.push(index);
+        }
+        match sample.noop {
+            Some(false) => changed_transition.push(index),
+            Some(true) => noop.push(index),
+            None => {}
+        }
+    }
+
+    let by_target_action_id = by_action
+        .into_iter()
+        .map(|(action_id, indices)| {
+            Ok((
+                action_id,
+                summarize_action_stratum(
+                    samples,
+                    shuffled,
+                    true_errors,
+                    shuffled_errors,
+                    &indices,
+                    seed.wrapping_add(action_id as u64).wrapping_add(0xA710),
+                )?
+                .expect("non-empty action stratum"),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok((
+        by_target_action_id,
+        ActionKindDiagnostics {
+            simple: summarize_action_stratum(
+                samples,
+                shuffled,
+                true_errors,
+                shuffled_errors,
+                &simple,
+                seed.wrapping_add(0x51A1_E3),
+            )?,
+            coordinate: summarize_action_stratum(
+                samples,
+                shuffled,
+                true_errors,
+                shuffled_errors,
+                &coordinate,
+                seed.wrapping_add(0xC00D),
+            )?,
+        },
+        TransitionKindDiagnostics {
+            changed_transition: summarize_action_stratum(
+                samples,
+                shuffled,
+                true_errors,
+                shuffled_errors,
+                &changed_transition,
+                seed.wrapping_add(0xC4A6ED),
+            )?,
+            noop: summarize_action_stratum(
+                samples,
+                shuffled,
+                true_errors,
+                shuffled_errors,
+                &noop,
+                seed.wrapping_add(0x0A00),
+            )?,
+        },
+    ))
 }
 
 fn action_coverage(samples: &[TransitionSample]) -> ActionCoverageMetrics {
@@ -2011,6 +2170,96 @@ fn eval_shuffled_action_batch(
     per_sample_mse(&out.y, &next_z)
 }
 
+fn action_diagnostics_from_pairs(
+    samples: &[TransitionSample],
+    shuffled: &[TransitionSample],
+    true_errors: &[f32],
+    shuffled_errors: &[f32],
+    source_ranges: &[(String, usize, usize)],
+    seed: u64,
+) -> Result<ActionDiagnostics> {
+    if samples.len() != shuffled.len()
+        || samples.len() != true_errors.len()
+        || samples.len() != shuffled_errors.len()
+    {
+        bail!("action diagnostics pair inputs must have matching lengths");
+    }
+
+    let mut aggregate_true = Vec::new();
+    let mut aggregate_shuffled = Vec::new();
+    let mut aggregate_changed = 0usize;
+    let mut by_source = BTreeMap::new();
+    let mut paired = vec![false; samples.len()];
+    for (source_index, (name, start, end)) in source_ranges.iter().enumerate() {
+        if start > end || *end > samples.len() {
+            bail!("action diagnostic source range is outside the sample population");
+        }
+        let valid_shuffle = end.saturating_sub(*start) >= 2;
+        let true_slice = if valid_shuffle {
+            &true_errors[*start..*end]
+        } else {
+            &[]
+        };
+        let shuffled_slice = if valid_shuffle {
+            &shuffled_errors[*start..*end]
+        } else {
+            &[]
+        };
+        if valid_shuffle {
+            for paired in &mut paired[*start..*end] {
+                *paired = true;
+            }
+        }
+        let changed_conditionings = valid_shuffle
+            .then(|| {
+                samples[*start..*end]
+                    .iter()
+                    .zip(shuffled[*start..*end].iter())
+                    .filter(|(truth, ablated)| truth.action != ablated.action)
+                    .count()
+            })
+            .unwrap_or(0);
+        aggregate_true.extend_from_slice(true_slice);
+        aggregate_shuffled.extend_from_slice(shuffled_slice);
+        aggregate_changed += changed_conditionings;
+        by_source.insert(
+            name.clone(),
+            ActionSourceDiagnostics {
+                shuffle: summarize_action_shuffle(
+                    true_slice,
+                    shuffled_slice,
+                    changed_conditionings,
+                    seed.wrapping_add(source_index as u64).wrapping_add(0xB005),
+                )?,
+                coverage: action_coverage(&samples[*start..*end]),
+            },
+        );
+    }
+    let (by_target_action_id, by_target_action_kind, by_transition_kind) = summarize_action_strata(
+        samples,
+        shuffled,
+        true_errors,
+        shuffled_errors,
+        &paired,
+        seed.wrapping_add(0x57A7_A),
+    )?;
+    Ok(ActionDiagnostics {
+        aggregate: ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(
+                &aggregate_true,
+                &aggregate_shuffled,
+                aggregate_changed,
+                seed.wrapping_add(0xA661),
+            )?,
+            coverage: action_coverage(samples),
+        },
+        by_source,
+        by_target_action_id: Some(by_target_action_id),
+        by_target_action_kind: Some(by_target_action_kind),
+        by_transition_kind: Some(by_transition_kind),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_action_diagnostics(
     train_cfg: &TrainConfig,
@@ -2096,55 +2345,14 @@ fn eval_action_diagnostics(
         bail!("shuffled-action evaluation changed sample count");
     }
 
-    let mut aggregate_true = Vec::new();
-    let mut aggregate_shuffled = Vec::new();
-    let mut aggregate_changed = 0usize;
-    let mut by_source = BTreeMap::new();
-    for (source_index, (name, start, end)) in source_ranges.into_iter().enumerate() {
-        let valid_shuffle = end.saturating_sub(start) >= 2;
-        let true_slice = if valid_shuffle {
-            &true_errors[start..end]
-        } else {
-            &[]
-        };
-        let shuffled_slice = if valid_shuffle {
-            &shuffled_errors[start..end]
-        } else {
-            &[]
-        };
-        let changed_conditionings = samples[start..end]
-            .iter()
-            .zip(shuffled[start..end].iter())
-            .filter(|(truth, ablated)| truth.action != ablated.action)
-            .count();
-        aggregate_true.extend_from_slice(true_slice);
-        aggregate_shuffled.extend_from_slice(shuffled_slice);
-        aggregate_changed += changed_conditionings;
-        by_source.insert(
-            name,
-            ActionSourceDiagnostics {
-                shuffle: summarize_action_shuffle(
-                    true_slice,
-                    shuffled_slice,
-                    changed_conditionings,
-                    seed.wrapping_add(source_index as u64).wrapping_add(0xB005),
-                )?,
-                coverage: action_coverage(&samples[start..end]),
-            },
-        );
-    }
-    Ok(ActionDiagnostics {
-        aggregate: ActionSourceDiagnostics {
-            shuffle: summarize_action_shuffle(
-                &aggregate_true,
-                &aggregate_shuffled,
-                aggregate_changed,
-                seed.wrapping_add(0xA661),
-            )?,
-            coverage: action_coverage(samples),
-        },
-        by_source,
-    })
+    action_diagnostics_from_pairs(
+        samples,
+        &shuffled,
+        true_errors,
+        &shuffled_errors,
+        &source_ranges,
+        seed,
+    )
 }
 
 fn eval_rollout_group(
@@ -3549,6 +3757,178 @@ mod tests {
         assert_eq!(failed.action_conditioning_pass, Some(false));
         let unavailable = summarize_action_shuffle(&[2.0, 2.0], &[2.0, 2.0], 0, 7)?;
         assert_eq!(unavailable.action_conditioning_pass, None);
+        Ok(())
+    }
+
+    #[test]
+    fn action_diagnostic_strata_partition_paired_target_rows_without_changing_aggregates(
+    ) -> Result<()> {
+        let mut samples = vec![
+            action_diagnostic_sample(ArcAction::new(1, None, None)?, 0)?,
+            action_diagnostic_sample(ArcAction::new(6, Some(11), Some(23))?, 1)?,
+            action_diagnostic_sample(ArcAction::new(6, Some(12), Some(24))?, 2)?,
+            action_diagnostic_sample(ArcAction::new(7, None, None)?, 3)?,
+            action_diagnostic_sample(ArcAction::new(4, None, None)?, 4)?,
+        ];
+        samples[1].noop = Some(true);
+        samples[3].noop = None;
+        let shuffled = shuffled_action_samples(&samples, &[2, 3, 1, 0, 4])?;
+        let true_errors = [1.0, 2.0, 3.0, 4.0, 99.0];
+        let shuffled_errors = [1.5, 2.5, 3.5, 4.5, 999.0];
+        let seed = 17;
+        let source_ranges = vec![
+            ("empty".into(), 0, 0),
+            ("paired".into(), 0, 4),
+            ("singleton".into(), 4, 5),
+        ];
+
+        let diagnostics = action_diagnostics_from_pairs(
+            &samples,
+            &shuffled,
+            &true_errors,
+            &shuffled_errors,
+            &source_ranges,
+            seed,
+        )?;
+
+        // The pre-stratification aggregate and source summaries use exactly the
+        // same eligible rows and seeds as before.
+        let expected_aggregate = ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(
+                &true_errors[..4],
+                &shuffled_errors[..4],
+                4,
+                seed + 0xA661,
+            )?,
+            coverage: action_coverage(&samples),
+        };
+        let expected_paired = ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(
+                &true_errors[..4],
+                &shuffled_errors[..4],
+                4,
+                seed + 1 + 0xB005,
+            )?,
+            coverage: action_coverage(&samples[..4]),
+        };
+        let expected_empty = ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(&[], &[], 0, seed + 0xB005)?,
+            coverage: action_coverage(&[]),
+        };
+        let expected_singleton = ActionSourceDiagnostics {
+            shuffle: summarize_action_shuffle(&[], &[], 0, seed + 2 + 0xB005)?,
+            coverage: action_coverage(&samples[4..]),
+        };
+        assert_eq!(
+            serde_json::to_value(&diagnostics.aggregate)?,
+            serde_json::to_value(expected_aggregate)?
+        );
+        assert_eq!(
+            serde_json::to_value(diagnostics.by_source.get("paired").expect("paired source"))?,
+            serde_json::to_value(expected_paired)?
+        );
+        for (source, expected) in [("empty", expected_empty), ("singleton", expected_singleton)] {
+            assert_eq!(
+                serde_json::to_value(diagnostics.by_source.get(source).expect("source"))?,
+                serde_json::to_value(expected)?
+            );
+            let shuffle = &diagnostics.by_source.get(source).expect("source").shuffle;
+            assert_eq!(shuffle.n, 0);
+            assert_eq!(shuffle.true_action_mse, None);
+            assert_eq!(shuffle.shuffled_action_mse, None);
+            assert_eq!(shuffle.ratio, None);
+        }
+
+        // ACTION6 remains an atomic `(id, x, y)` conditioning in the source-local shuffle.
+        assert_eq!(shuffled[0].action, samples[2].action);
+        assert_eq!(shuffled[2].action, samples[1].action);
+
+        let by_action = diagnostics
+            .by_target_action_id
+            .as_ref()
+            .expect("target-action strata");
+        assert_eq!(
+            by_action.values().map(|metrics| metrics.n).sum::<usize>(),
+            4
+        );
+        assert_eq!(by_action.get(&1).map(|metrics| metrics.n), Some(1));
+        assert_eq!(by_action.get(&6).map(|metrics| metrics.n), Some(2));
+        assert_eq!(by_action.get(&7).map(|metrics| metrics.n), Some(1));
+        assert!(!by_action.contains_key(&4));
+        assert_eq!(
+            by_action
+                .values()
+                .map(|metrics| metrics.true_action_mse.expect("non-empty") * metrics.n as f64)
+                .sum::<f64>()
+                / 4.0,
+            diagnostics
+                .aggregate
+                .shuffle
+                .true_action_mse
+                .expect("paired aggregate")
+        );
+        assert_eq!(
+            by_action
+                .values()
+                .map(|metrics| metrics.shuffled_action_mse.expect("non-empty") * metrics.n as f64)
+                .sum::<f64>()
+                / 4.0,
+            diagnostics
+                .aggregate
+                .shuffle
+                .shuffled_action_mse
+                .expect("paired aggregate")
+        );
+
+        let action_kind = diagnostics
+            .by_target_action_kind
+            .as_ref()
+            .expect("target-action-kind strata");
+        let simple = action_kind.simple.as_ref().expect("simple rows");
+        let coordinate = action_kind.coordinate.as_ref().expect("coordinate rows");
+        assert_eq!(simple.n + coordinate.n, 4);
+        assert_eq!(coordinate.n, 2);
+        assert_eq!(coordinate.true_action_mse, Some(2.5));
+        assert_eq!(
+            (simple.true_action_mse.expect("simple") * simple.n as f64
+                + coordinate.true_action_mse.expect("coordinate") * coordinate.n as f64)
+                / (simple.n + coordinate.n) as f64,
+            diagnostics
+                .aggregate
+                .shuffle
+                .true_action_mse
+                .expect("paired aggregate")
+        );
+
+        let transition_kind = diagnostics
+            .by_transition_kind
+            .as_ref()
+            .expect("transition-kind strata");
+        let changed = transition_kind
+            .changed_transition
+            .as_ref()
+            .expect("changed rows");
+        let noop = transition_kind.noop.as_ref().expect("no-op rows");
+        assert_eq!(changed.n + noop.n, 3);
+        assert_eq!(changed.n, 2);
+        assert_eq!(noop.n, 1);
+        assert_eq!(changed.true_action_mse, Some(2.0));
+        assert_eq!(noop.true_action_mse, Some(2.0));
+        assert_eq!(
+            (changed.true_action_mse.expect("changed") * changed.n as f64
+                + noop.true_action_mse.expect("no-op") * noop.n as f64)
+                / (changed.n + noop.n) as f64,
+            2.0
+        );
+
+        let legacy = serde_json::json!({
+            "aggregate": diagnostics.aggregate,
+            "by_source": diagnostics.by_source,
+        });
+        let decoded: ActionDiagnostics = serde_json::from_value(legacy)?;
+        assert!(decoded.by_target_action_id.is_none());
+        assert!(decoded.by_target_action_kind.is_none());
+        assert!(decoded.by_transition_kind.is_none());
         Ok(())
     }
 
