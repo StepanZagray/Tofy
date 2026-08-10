@@ -75,6 +75,7 @@ jq -e \
     and .binary_sha256 == $binary_sha and .physical_batch == $physical
     and .grad_accum == $accum and .effective_batch == 1024
     and .gpu_name == "NVIDIA A40" and .artifact_manifest_sha256 == $manifest_sha
+    and .steady_gpu == true
     and .sigreg_target == "temporal_residual" and .sigreg_temporal_window == 8
     and .completed_updates >= 2' "$P2_TC_BATCH_PROBE" >/dev/null || {
   printf 'batch probe does not authorize this exact experiment\n' >&2; exit 2;

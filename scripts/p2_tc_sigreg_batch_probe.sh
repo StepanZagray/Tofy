@@ -63,7 +63,7 @@ started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   --checkpoint-every-steps 2 --profile-update 2 \
   --sigreg-target temporal-residual --sigreg-temporal-window 8 \
   --sigreg-spatial --sigreg-spatial-pool --sigreg-max-rows 32768 \
-  --randomize-depth --supervise-last-outer-only --residual-y-update --warm-start-y \
+  --steady-gpu --supervise-last-outer-only --residual-y-update --warm-start-y \
   --outer-steps 8 --inner-steps 2 --hidden-dim 128 --action-dim 8 \
   --event-weight 0 --q-weight 0 --rollout-weight 0 --prefix-weight 0 --reliability-weight 0 \
   --ensemble-members 1 --output-dir "$probe_root/run" > >(tee "$probe_root/train.log") 2>&1
@@ -91,7 +91,7 @@ jq -nc --arg schema p2.tc_sigreg_batch_probe.v1 --arg status passed \
   '{schema:$schema,status:$status,git_sha:$git_sha,candle_git_sha:$candle_git_sha,
     binary_sha256:$binary_sha256,gpu_name:$gpu_name,physical_batch:$physical_batch,
     grad_accum:$grad_accum,effective_batch:1024,sigreg_target:"temporal_residual",
-    sigreg_temporal_window:8,completed_updates:$completed_updates,
+    sigreg_temporal_window:8,steady_gpu:true,completed_updates:$completed_updates,
     artifact_manifest_sha256:$artifact_manifest_sha256,
     started_utc:$started_utc,finished_utc:$finished_utc}' >"$probe_root/probe.json.tmp"
 mv -- "$probe_root/probe.json.tmp" "$probe_root/probe.json"
