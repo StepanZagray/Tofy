@@ -57,5 +57,7 @@ has a complete hidden-goal solver. This limitation is embedded in every report.
 ACTION6 coordinates are generated from visible-object representatives plus a uniform
 grid and scored in bounded batches. Server frames are fail-closed validated, and only
 the last animation frame is treated as the settled observation. The HTTP client keeps
-the affinity cookies established by RESET and retries `429`/`5xx` failures with
-exponential backoff.
+the affinity cookies established by RESET. It retries only idempotent reads such as
+game discovery on transport failures, `429`, and `5xx` responses. ACTION and other
+POST mutations are sent once; an ACTION transport, response-body, `429`, or `5xx`
+failure is reported as an ambiguous mutation and is not retried.

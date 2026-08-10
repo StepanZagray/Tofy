@@ -17,7 +17,7 @@ use crate::p2::train::{frames_to_indices, load_train_config, resolve_device};
 use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops;
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -195,16 +195,150 @@ pub trait ArcApi {
         guid: &str,
         action: &ArcAction,
         reasoning: &Value,
-    ) -> Result<ArcObservation>;
+    ) -> MutationResult<ArcObservation>;
     fn close_scorecard(&mut self, card_id: &str) -> Result<Value>;
 }
 
-pub struct HttpArcApi {
+#[derive(Debug, Clone, Copy)]
+enum RetryClass {
+    IdempotentRead,
+    AtMostOnceMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousMutation {
+    pub operation: String,
+    pub game_id: Option<String>,
+    pub guid: Option<String>,
+    pub action: Option<ArcAction>,
+    pub cause: String,
+}
+
+impl std::fmt::Display for AmbiguousMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ambiguous {}: {}", self.operation, self.cause)
+    }
+}
+
+impl std::error::Error for AmbiguousMutation {}
+
+#[derive(Debug)]
+pub enum MutationError {
+    Ambiguous(AmbiguousMutation),
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous(error) => error.fmt(formatter),
+            Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for MutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Ambiguous(error) => Some(error),
+            Self::Failed(error) => error.source(),
+        }
+    }
+}
+
+pub type MutationResult<T> = std::result::Result<T, MutationError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+#[derive(Debug, Clone)]
+struct HttpRequest {
+    method: HttpMethod,
+    url: String,
+    body: Option<Value>,
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: StatusCode,
+    body: std::result::Result<String, String>,
+}
+
+trait HttpTransport {
+    fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String>;
+}
+
+struct ReqwestTransport {
     client: Client,
+}
+
+impl HttpTransport for ReqwestTransport {
+    fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+        let builder = match request.method {
+            HttpMethod::Get => self.client.get(&request.url),
+            HttpMethod::Post => self
+                .client
+                .post(&request.url)
+                .json(&request.body.expect("POST requests include a body")),
+        };
+        let response = builder.send().map_err(|error| error.to_string())?;
+        let status = response.status();
+        let body = response.text().map_err(|error| error.to_string());
+        Ok(HttpResponse { status, body })
+    }
+}
+
+#[derive(Debug)]
+enum RequestFailure {
+    Transport(String),
+    ResponseBody(String),
+    Status { status: StatusCode, body: String },
+    Parse(String),
+}
+
+impl RequestFailure {
+    fn retryable_read(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::ResponseBody(_) => true,
+            Self::Status { status, .. } => {
+                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+            }
+            Self::Parse(_) => false,
+        }
+    }
+
+    fn ambiguous_action(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::ResponseBody(_) | Self::Parse(_) => true,
+            Self::Status { status, .. } => {
+                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+            }
+        }
+    }
+
+    fn operation_error(self, operation: &str) -> anyhow::Error {
+        match self {
+            Self::Transport(cause) => anyhow::anyhow!("ARC {operation}: {cause}"),
+            Self::ResponseBody(cause) => {
+                anyhow::anyhow!("read ARC {operation} response: {cause}")
+            }
+            Self::Status { status, body } => {
+                anyhow::anyhow!("ARC {operation} returned HTTP {status}: {body}")
+            }
+            Self::Parse(cause) => anyhow::anyhow!("parse ARC {operation} response: {cause}"),
+        }
+    }
+}
+
+struct HttpArcApi<T = ReqwestTransport> {
+    transport: T,
     base_url: String,
 }
 
-impl HttpArcApi {
+impl HttpArcApi<ReqwestTransport> {
     pub fn from_env(base_url: &str, api_key_env: &str, timeout: Duration) -> Result<Self> {
         let _ = dotenvy::dotenv();
         let mut names = vec![
@@ -239,60 +373,117 @@ impl HttpArcApi {
             .build()
             .context("build ARC HTTP client")?;
         Ok(Self {
-            client,
+            transport: ReqwestTransport { client },
             base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
+}
 
-    fn request_json<T, F>(&self, operation: &str, build: F) -> Result<T>
-    where
-        T: DeserializeOwned,
-        F: Fn() -> RequestBuilder,
-    {
+impl<T: HttpTransport> HttpArcApi<T> {
+    fn request_json<R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        retry_class: RetryClass,
+        request: HttpRequest,
+    ) -> std::result::Result<R, RequestFailure> {
+        let attempts = match retry_class {
+            RetryClass::IdempotentRead => MAX_HTTP_ATTEMPTS,
+            RetryClass::AtMostOnceMutation => 1,
+        };
         let mut last_error = None;
-        for attempt in 0..MAX_HTTP_ATTEMPTS {
-            match build().send() {
-                Ok(response) => {
-                    let status = response.status();
-                    let retryable =
-                        status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-                    let body = response
-                        .text()
-                        .with_context(|| format!("read ARC {operation} response"))?;
-                    if status.is_success() {
-                        return serde_json::from_str(&body)
-                            .with_context(|| format!("parse ARC {operation} response"));
-                    }
-                    let summary: String = body.chars().take(512).collect();
-                    last_error = Some(anyhow::anyhow!(
-                        "ARC {operation} returned HTTP {status}: {summary}"
-                    ));
-                    if !retryable {
-                        break;
-                    }
+        for attempt in 0..attempts {
+            match self.send_json(request.clone()) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if matches!(retry_class, RetryClass::IdempotentRead)
+                        && error.retryable_read()
+                        && attempt + 1 < attempts =>
+                {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(200 * (1u64 << attempt)));
                 }
-                Err(error) => {
-                    last_error =
-                        Some(anyhow::Error::new(error).context(format!("ARC {operation}")));
-                }
-            }
-            if attempt + 1 < MAX_HTTP_ATTEMPTS {
-                thread::sleep(Duration::from_millis(200 * (1u64 << attempt)));
+                Err(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ARC {operation} failed")))
+        Err(last_error
+            .unwrap_or_else(|| RequestFailure::Transport(format!("ARC {operation} failed"))))
     }
 
-    fn post<T: DeserializeOwned>(&self, path: &str, body: &Value, operation: &str) -> Result<T> {
-        let url = format!("{}{path}", self.base_url);
-        self.request_json(operation, || self.client.post(&url).json(body))
+    fn send_json<R: DeserializeOwned>(
+        &self,
+        request: HttpRequest,
+    ) -> std::result::Result<R, RequestFailure> {
+        let response = self
+            .transport
+            .send(request)
+            .map_err(RequestFailure::Transport)?;
+        let status = response.status;
+        let body = response.body.map_err(RequestFailure::ResponseBody)?;
+        if status.is_success() {
+            return serde_json::from_str(&body)
+                .map_err(|error| RequestFailure::Parse(error.to_string()));
+        }
+        Err(RequestFailure::Status {
+            status,
+            body: body.chars().take(512).collect(),
+        })
+    }
+
+    fn post<R: DeserializeOwned>(&self, path: &str, body: &Value, operation: &str) -> Result<R> {
+        // No ARC POST endpoint in this client has an official idempotency guarantee.
+        self.request_json(
+            operation,
+            RetryClass::AtMostOnceMutation,
+            HttpRequest {
+                method: HttpMethod::Post,
+                url: format!("{}{path}", self.base_url),
+                body: Some(body.clone()),
+            },
+        )
+        .map_err(|error| error.operation_error(operation))
+    }
+
+    fn action_post<R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        ambiguity: AmbiguousMutation,
+    ) -> MutationResult<R> {
+        match self.request_json(
+            &ambiguity.operation,
+            RetryClass::AtMostOnceMutation,
+            HttpRequest {
+                method: HttpMethod::Post,
+                url: format!("{}{path}", self.base_url),
+                body: Some(body.clone()),
+            },
+        ) {
+            Ok(response) => Ok(response),
+            Err(error) if error.ambiguous_action() => {
+                Err(MutationError::Ambiguous(AmbiguousMutation {
+                    cause: error.operation_error(&ambiguity.operation).to_string(),
+                    ..ambiguity
+                }))
+            }
+            Err(error) => Err(MutationError::Failed(
+                error.operation_error(&ambiguity.operation),
+            )),
+        }
     }
 }
 
-impl ArcApi for HttpArcApi {
+impl<T: HttpTransport> ArcApi for HttpArcApi<T> {
     fn list_games(&mut self) -> Result<Vec<PublicGame>> {
-        let url = format!("{}/api/games", self.base_url);
-        self.request_json("list games", || self.client.get(&url))
+        self.request_json(
+            "list games",
+            RetryClass::IdempotentRead,
+            HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{}/api/games", self.base_url),
+                body: None,
+            },
+        )
+        .map_err(|error| error.operation_error("list games"))
     }
 
     fn open_scorecard(&mut self, metadata: &Value) -> Result<String> {
@@ -329,7 +520,7 @@ impl ArcApi for HttpArcApi {
         guid: &str,
         action: &ArcAction,
         reasoning: &Value,
-    ) -> Result<ArcObservation> {
+    ) -> MutationResult<ArcObservation> {
         let path = format!("/api/cmd/ACTION{}", action.id);
         let mut body = json!({
             "game_id": game_id,
@@ -337,15 +528,35 @@ impl ArcApi for HttpArcApi {
             "reasoning": reasoning,
         });
         if action.id == 6 {
-            body["x"] = json!(action.x.context("ACTION6 missing x")?);
-            body["y"] = json!(action.y.context("ACTION6 missing y")?);
+            body["x"] = json!(action
+                .x
+                .context("ACTION6 missing x")
+                .map_err(MutationError::Failed)?);
+            body["y"] = json!(action
+                .y
+                .context("ACTION6 missing y")
+                .map_err(MutationError::Failed)?);
         }
-        let response: ApiObservation = self.post(&path, &body, "submit action")?;
-        let observation = ArcObservation::try_from(response)?;
-        ensure!(
-            observation.game_id == game_id && observation.guid == guid,
-            "ACTION response session identifiers do not match request"
-        );
+        let ambiguity = AmbiguousMutation {
+            operation: "submit action".into(),
+            game_id: Some(game_id.into()),
+            guid: Some(guid.into()),
+            action: Some(action.clone()),
+            cause: String::new(),
+        };
+        let response: ApiObservation = self.action_post(&path, &body, ambiguity.clone())?;
+        let observation = ArcObservation::try_from(response).map_err(|error| {
+            MutationError::Ambiguous(AmbiguousMutation {
+                cause: format!("validate ACTION response: {error:#}"),
+                ..ambiguity.clone()
+            })
+        })?;
+        if observation.game_id != game_id || observation.guid != guid {
+            return Err(MutationError::Ambiguous(AmbiguousMutation {
+                cause: "ACTION response session identifiers do not match request".into(),
+                ..ambiguity
+            }));
+        }
         Ok(observation)
     }
 
@@ -651,6 +862,16 @@ pub struct LiveActionTrace {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousAttemptedAction {
+    pub index: usize,
+    pub available_actions: Vec<u8>,
+    pub decision: ActionDecision,
+    pub levels_before: u16,
+    pub api_latency_ms: u128,
+    pub mutation: AmbiguousMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveGameReport {
     pub game_id: String,
     pub title: String,
@@ -662,6 +883,7 @@ pub struct LiveGameReport {
     pub error: Option<String>,
     pub duration_ms: u128,
     pub trace: Vec<LiveActionTrace>,
+    pub ambiguous_attempted_action: Option<AmbiguousAttemptedAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -729,6 +951,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     for game in &selected {
         let started = Instant::now();
         let mut trace = Vec::new();
+        let mut ambiguous_attempted_action = None;
         let mut error = None;
         let mut stop_reason = "reset_failed".to_string();
         let mut last = match api.reset(&game.game_id, &card_id) {
@@ -780,8 +1003,21 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 &reasoning,
             ) {
                 Ok(next) => next,
+                Err(MutationError::Ambiguous(mutation)) => {
+                    error = Some(format!("action {}: {mutation}", trace.len() + 1));
+                    stop_reason = "ambiguous_mutation".into();
+                    ambiguous_attempted_action = Some(AmbiguousAttemptedAction {
+                        index: trace.len(),
+                        available_actions: observation.available_actions.clone(),
+                        decision,
+                        levels_before: observation.levels_completed,
+                        api_latency_ms: call_started.elapsed().as_millis(),
+                        mutation,
+                    });
+                    break;
+                }
                 Err(err) => {
-                    error = Some(format!("action {}: {err:#}", trace.len() + 1));
+                    error = Some(format!("action {}: {err}", trace.len() + 1));
                     stop_reason = "api_error".into();
                     break;
                 }
@@ -820,6 +1056,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             error,
             duration_ms: started.elapsed().as_millis(),
             trace,
+            ambiguous_attempted_action,
         });
     }
 
@@ -980,6 +1217,8 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     fn frame(fill: u8) -> ArcFrame {
         ArcFrame::new(64, 64, vec![fill; 64 * 64]).unwrap()
@@ -995,6 +1234,232 @@ mod tests {
             win_levels: 1,
             available_actions: actions,
         }
+    }
+
+    struct FakeTransport {
+        responses: Mutex<VecDeque<std::result::Result<HttpResponse, String>>>,
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: Vec<std::result::Result<HttpResponse, String>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn send_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    impl HttpTransport for FakeTransport {
+        fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("deterministic fake transport has a response")
+        }
+    }
+
+    fn response(status: StatusCode, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: Ok(body.into()),
+        }
+    }
+
+    fn observation_body(game_id: &str, guid: &str, state: &str, actions: &[u8]) -> String {
+        json!({
+            "game_id": game_id,
+            "guid": guid,
+            "frame": [[[0]]],
+            "state": state,
+            "levels_completed": 0,
+            "win_levels": 1,
+            "available_actions": actions,
+        })
+        .to_string()
+    }
+
+    fn http_api(
+        responses: Vec<std::result::Result<HttpResponse, String>>,
+    ) -> HttpArcApi<FakeTransport> {
+        HttpArcApi {
+            transport: FakeTransport::new(responses),
+            base_url: "https://arc.example".into(),
+        }
+    }
+
+    #[test]
+    fn idempotent_get_retries_and_eventually_succeeds() {
+        let mut api = http_api(vec![
+            Ok(response(StatusCode::TOO_MANY_REQUESTS, "slow down")),
+            Ok(response(
+                StatusCode::OK,
+                r#"[{"game_id":"game","title":"Game"}]"#,
+            )),
+        ]);
+
+        assert_eq!(api.list_games().unwrap()[0].game_id, "game");
+        assert_eq!(api.transport.send_count(), 2);
+        assert_eq!(
+            api.transport.requests.lock().unwrap()[0].method,
+            HttpMethod::Get
+        );
+    }
+
+    #[test]
+    fn action_transport_failure_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Err("connection reset".into())]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("transport failure must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_response_body_read_failure_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(HttpResponse {
+            status: StatusCode::OK,
+            body: Err("connection closed while reading".into()),
+        })]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_invalid_json_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(response(StatusCode::OK, "not json"))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_rate_limit_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_server_error_is_ambiguous_and_sends_once() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server failed",
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_semantic_observation_failure_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("game", "guid", "INVALID_STATE", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("semantic response failure must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_game_id_mismatch_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("other-game", "guid", "NOT_FINISHED", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("game_id mismatch must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_guid_mismatch_is_ambiguous_and_preserves_attempt() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &observation_body("game", "other-guid", "NOT_FINISHED", &[1]),
+        ))]);
+        let action = ArcAction::new(1, None, None).unwrap();
+
+        let error = api.act("game", "guid", &action, &json!({})).unwrap_err();
+        let MutationError::Ambiguous(ambiguous) = error else {
+            panic!("guid mismatch must be ambiguous")
+        };
+        assert_eq!(ambiguous.game_id.as_deref(), Some("game"));
+        assert_eq!(ambiguous.guid.as_deref(), Some("guid"));
+        assert_eq!(ambiguous.action, Some(action));
+        assert_eq!(api.transport.send_count(), 1);
+    }
+
+    #[test]
+    fn action_missing_coordinate_fails_before_send() {
+        let mut api = http_api(Vec::new());
+        let action = ArcAction {
+            id: 6,
+            x: None,
+            y: Some(1),
+        };
+
+        assert!(matches!(
+            api.act("game", "guid", &action, &json!({})),
+            Err(MutationError::Failed(_))
+        ));
+        assert_eq!(api.transport.send_count(), 0);
+    }
+
+    #[test]
+    fn non_retryable_get_client_error_fails_once() {
+        let mut api = http_api(vec![Ok(response(StatusCode::BAD_REQUEST, "bad request"))]);
+
+        assert!(api.list_games().is_err());
+        assert_eq!(api.transport.send_count(), 1);
     }
 
     #[test]
@@ -1104,6 +1569,7 @@ mod tests {
     struct FakeApi {
         closed: bool,
         acted_games: Vec<String>,
+        ambiguous_action: bool,
     }
 
     impl ArcApi for FakeApi {
@@ -1132,11 +1598,20 @@ mod tests {
         fn act(
             &mut self,
             game_id: &str,
-            _guid: &str,
-            _action: &ArcAction,
+            guid: &str,
+            action: &ArcAction,
             _reasoning: &Value,
-        ) -> Result<ArcObservation> {
+        ) -> MutationResult<ArcObservation> {
             self.acted_games.push(game_id.into());
+            if self.ambiguous_action {
+                return Err(MutationError::Ambiguous(AmbiguousMutation {
+                    operation: "submit action".into(),
+                    game_id: Some(game_id.into()),
+                    guid: Some(guid.into()),
+                    action: Some(action.clone()),
+                    cause: "connection reset".into(),
+                }));
+            }
             let mut next = observation(game_id, "WIN", vec![]);
             next.levels_completed = 1;
             Ok(next)
@@ -1165,6 +1640,7 @@ mod tests {
         let mut api = FakeApi {
             closed: false,
             acted_games: Vec::new(),
+            ambiguous_action: false,
         };
         let settings = LiveRunSettings {
             checkpoint: "model.safetensors".into(),
@@ -1189,6 +1665,80 @@ mod tests {
             .games
             .iter()
             .all(|game| game.stop_reason == "completed"));
+    }
+
+    #[test]
+    fn ambiguous_attempt_is_reported_outside_confirmed_trace_and_scorecard_closes() {
+        let mut api = FakeApi {
+            closed: false,
+            acted_games: Vec::new(),
+            ambiguous_action: true,
+        };
+        let settings = LiveRunSettings {
+            checkpoint: "model.safetensors".into(),
+            checkpoint_sha256: "model-hash".into(),
+            train_config: "config.json".into(),
+            train_config_sha256: "config-hash".into(),
+            device: "cpu".into(),
+            base_url: "https://example.invalid".into(),
+            requested_games: vec!["a-1".into()],
+            max_actions_per_game: 4,
+        };
+
+        let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
+        let game = &report.games[0];
+        assert!(api.closed);
+        assert_eq!(game.stop_reason, "ambiguous_mutation");
+        assert_eq!(game.actions, 0);
+        assert!(game.trace.is_empty());
+        assert_eq!(
+            game.ambiguous_attempted_action
+                .as_ref()
+                .and_then(|attempt| attempt.mutation.action.as_ref())
+                .map(|action| action.id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn semantic_action_failure_is_excluded_from_confirmed_trace_and_scorecard_closes() {
+        let mut api = http_api(vec![
+            Ok(response(
+                StatusCode::OK,
+                r#"[{"game_id":"game","title":"Game"}]"#,
+            )),
+            Ok(response(StatusCode::OK, r#"{"card_id":"card"}"#)),
+            Ok(response(
+                StatusCode::OK,
+                &observation_body("game", "guid-game", "NOT_FINISHED", &[1]),
+            )),
+            Ok(response(
+                StatusCode::OK,
+                &observation_body("game", "guid-game", "INVALID_STATE", &[1]),
+            )),
+            Ok(response(StatusCode::OK, "{}")),
+        ]);
+        let settings = LiveRunSettings {
+            checkpoint: "model.safetensors".into(),
+            checkpoint_sha256: "model-hash".into(),
+            train_config: "config.json".into(),
+            train_config_sha256: "config-hash".into(),
+            device: "cpu".into(),
+            base_url: "https://example.invalid".into(),
+            requested_games: vec!["game".into()],
+            max_actions_per_game: 4,
+        };
+
+        let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
+        let game = &report.games[0];
+        assert_eq!(game.stop_reason, "ambiguous_mutation");
+        assert_eq!(game.actions, 0);
+        assert!(game.trace.is_empty());
+        assert_eq!(
+            game.ambiguous_attempted_action.as_ref().map(|_| ()),
+            Some(())
+        );
+        assert_eq!(api.transport.send_count(), 5);
     }
 
     #[test]
