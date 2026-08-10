@@ -214,6 +214,35 @@ The completed pilot, preserved A40 handoff, full metric interpretation, runtime
 analysis, and next recommendations are in
 [`P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md`](P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md).
 
+#### Phase-0 repaired re-evaluation (2026-08-10)
+
+The real-episode rollout, bounded seam-diagnostic, and at-most-once ARC action
+repairs were integrated through commit `11686b82`. The four preserved geometry-v2
+checkpoints were re-evaluated with `p2.eval_report.v10` in separate representation
+and rollout modes. All 1,776 `p2.episode_rollout.v2` rows reconcile, all named seams
+have zero non-finite rows, prior v9 scientific metrics reproduce, and a repeated
+control/update-1,000 representation report is byte-identical.
+
+The seam map localizes the dominant control bottleneck to global spatial pooling:
+at update 2,000, dynamics rank fraction falls from `0.08175` at post-RMS spatial
+cells to `0.02392` after pooling. The treatment is already collapsed before pooling
+(`0.02639` spatial rank), then falls to `0.00844`. Recursion preserves each arm's
+already-limited spatial rank rather than creating a new abrupt collapse. No metric
+is promoted to "Best So Far". Full provenance, commands, tables, and validation are
+in [`P2_PHASE0_REPAIR_REEVAL_2026-08-10.md`](P2_PHASE0_REPAIR_REEVAL_2026-08-10.md).
+
+#### Phase-1B paired TC-SIGReg seed-1 pilot
+
+The next authorized run is a serialized, fresh seed-1 comparison of unchanged
+marginal SIGReg against temporally centered residual SIGReg over ordered contiguous
+`W=8` windows. Both arms retain the same post-RMS, 2x2-pooled geometry, model,
+optimizer schedule, and effective batch 1,024. Checkpoints and frozen evaluations
+occur at updates 250, 500, 750, and 1,000. The physical/accumulation pair must come
+from the largest stable maximum-depth A40 probe for the exact Git, `candle_graph`,
+and binary hashes. The launcher cannot run seeds 2/3; promotion remains locked until
+the update-1,000 gate is analyzed. Factual-graph/executable-world-model work is not
+part of this experiment.
+
 #### Prior failed overnight attempt (2026-08-08/09; incomplete)
 
 The seed-1 pilot did not reach its decision gate. Both arms trained from fresh
