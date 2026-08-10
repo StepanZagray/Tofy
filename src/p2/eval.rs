@@ -25,10 +25,14 @@ use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v9";
@@ -389,13 +393,78 @@ pub struct EnsembleMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeRolloutRow {
+    /// Stable episode-rollout row schema. The evaluation report remains v9 in P0-A.
+    pub schema: String,
+    /// Evaluation population that supplied this factual episode.
+    pub source: String,
     pub seed: u64,
     pub episode_id: u64,
-    pub family: String,
+    /// Sorted, deduplicated family labels from the anchor through `horizon`.
+    pub families_through_horizon: Vec<String>,
     pub horizon: usize,
     pub open_mse: Option<f64>,
     pub closed_mse: Option<f64>,
     pub copy_forward_mse: Option<f64>,
+    /// `open_mse / copy_forward_mse` only for finite denominators above `1e-8`.
+    pub normalized_open_mse: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeRolloutResult {
+    seed: u64,
+    episode_id: u64,
+    families_through_horizon: Vec<String>,
+    horizon: usize,
+    open_mse: Option<f64>,
+    closed_mse: Option<f64>,
+    copy_forward_mse: Option<f64>,
+}
+
+impl EpisodeRolloutResult {
+    fn into_row(self, source: &str) -> EpisodeRolloutRow {
+        let normalized_open_mse =
+            self.open_mse
+                .zip(self.copy_forward_mse)
+                .and_then(|(numerator, denominator)| {
+                    (numerator.is_finite() && denominator.is_finite() && denominator > 1e-8)
+                        .then_some(numerator / denominator)
+                });
+        EpisodeRolloutRow {
+            schema: "p2.episode_rollout.v2".into(),
+            source: source.into(),
+            seed: self.seed,
+            episode_id: self.episode_id,
+            families_through_horizon: self.families_through_horizon,
+            horizon: self.horizon,
+            open_mse: self.open_mse,
+            closed_mse: self.closed_mse,
+            copy_forward_mse: self.copy_forward_mse,
+            normalized_open_mse,
+        }
+    }
+}
+
+fn episode_rollout_result<T: Borrow<TransitionSample>>(
+    steps: &[T],
+    horizon: usize,
+    open_mse: f64,
+    closed_mse: f64,
+    copy_forward_mse: f64,
+) -> EpisodeRolloutResult {
+    EpisodeRolloutResult {
+        seed: steps[0].borrow().seed,
+        episode_id: steps[0].borrow().episode_id,
+        families_through_horizon: steps[..horizon]
+            .iter()
+            .map(|step| step.borrow().family.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        horizon,
+        open_mse: Some(open_mse),
+        closed_mse: Some(closed_mse),
+        copy_forward_mse: Some(copy_forward_mse),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2011,204 +2080,164 @@ fn eval_action_diagnostics(
     })
 }
 
-type RolloutSextuple = (
-    Option<f32>,
-    Option<f32>,
-    Option<f32>,
-    Option<f32>,
-    Option<f32>,
-    Option<f32>,
-);
-
 fn eval_rollout_group(
     model: &WorldModel,
     steps: &[TransitionSample],
     device: &Device,
-    closed_loop: bool,
-) -> Result<RolloutSextuple> {
+) -> Result<Vec<EpisodeRolloutResult>> {
     if steps.len() < 4 {
-        return Ok((None, None, None, None, None, None));
+        return Ok(Vec::new());
     }
-    let mut mse4 = None;
-    let mut mse8 = None;
-    let mut mse16 = None;
-    let mut cf4 = None;
-    let mut cf8 = None;
-    let mut cf16 = None;
     let z0 = {
         let sample = &steps[0];
         let first =
             batch_from_samples(std::slice::from_ref(sample), device).with_context(|| {
-                rollout_operation_context(sample, closed_loop, "initial batch construction")
+                rollout_operation_context(sample, "open-loop", "initial batch construction")
             })?;
         model.encode_state(&first.frames).with_context(|| {
-            rollout_operation_context(sample, closed_loop, "initial state encoding")
+            rollout_operation_context(sample, "open-loop", "initial state encoding")
         })?
     };
-    let mut latent = z0.clone();
+    let mut open_latent = z0.clone();
+    let mut rows = Vec::new();
     for (idx, sample) in steps.iter().enumerate() {
         let batch =
             batch_from_samples(std::slice::from_ref(sample), device).with_context(|| {
-                rollout_operation_context(sample, closed_loop, "step batch construction")
+                rollout_operation_context(sample, "open-loop", "step batch construction")
             })?;
-        if closed_loop {
-            latent = model.encode_state(&batch.frames).with_context(|| {
-                rollout_operation_context(sample, closed_loop, "closed-loop state encoding")
-            })?;
-        }
-        let out = model
-            .forward_from_latent(&latent, &batch.actions, &batch.action_coords, &batch.goals)
-            .with_context(|| rollout_operation_context(sample, closed_loop, "latent forward"))?;
-        let pred = out.y;
-        if !closed_loop {
-            latent = pred.clone();
-        }
+        let open_pred = model
+            .forward_from_latent(
+                &open_latent,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+            )
+            .with_context(|| rollout_operation_context(sample, "open-loop", "latent forward"))?
+            .y;
+        open_latent = open_pred.clone();
+        let closed_latent = model
+            .encode_state(&batch.frames)
+            .with_context(|| rollout_operation_context(sample, "closed-loop", "state encoding"))?;
+        let closed_pred = model
+            .forward_from_latent(
+                &closed_latent,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+            )
+            .with_context(|| rollout_operation_context(sample, "closed-loop", "latent forward"))?
+            .y;
         let target = model.encode_state(&batch.next_frames).with_context(|| {
-            rollout_operation_context(sample, closed_loop, "target state encoding")
+            rollout_operation_context(sample, "open-loop", "target state encoding")
         })?;
-        let mse = pred
+        let open_mse = open_pred
             .sub(&target)
             .and_then(|value| value.sqr())
             .and_then(|value| value.mean_all())
             .and_then(|value| value.to_scalar::<f32>())
             .with_context(|| {
-                rollout_operation_context(sample, closed_loop, "model MSE reduction")
-            })? as f32;
-        let cf = z0
+                rollout_operation_context(sample, "open-loop", "model MSE reduction")
+            })? as f64;
+        let closed_mse = closed_pred
             .sub(&target)
             .and_then(|value| value.sqr())
             .and_then(|value| value.mean_all())
             .and_then(|value| value.to_scalar::<f32>())
             .with_context(|| {
-                rollout_operation_context(sample, closed_loop, "copy-forward MSE reduction")
-            })? as f32;
-        let step_no = idx + 1;
-        if step_no == 4 {
-            mse4 = Some(mse);
-            cf4 = Some(cf);
-        }
-        if step_no == 8 {
-            mse8 = Some(mse);
-            cf8 = Some(cf);
-        }
-        if step_no == 16 {
-            mse16 = Some(mse);
-            cf16 = Some(cf);
+                rollout_operation_context(sample, "closed-loop", "model MSE reduction")
+            })? as f64;
+        let copy_forward_mse = z0
+            .sub(&target)
+            .and_then(|value| value.sqr())
+            .and_then(|value| value.mean_all())
+            .and_then(|value| value.to_scalar::<f32>())
+            .with_context(|| {
+                rollout_operation_context(sample, "open-loop", "copy-forward MSE reduction")
+            })? as f64;
+        let horizon = idx + 1;
+        if matches!(horizon, 4 | 8 | 16) {
+            rows.push(episode_rollout_result(
+                steps,
+                horizon,
+                open_mse,
+                closed_mse,
+                copy_forward_mse,
+            ));
         }
     }
-    Ok((mse4, mse8, mse16, cf4, cf8, cf16))
+    Ok(rows)
 }
 
-fn rollout_operation_context(
-    sample: &TransitionSample,
-    closed_loop: bool,
-    operation: &str,
-) -> String {
+fn rollout_operation_context(sample: &TransitionSample, mode: &str, operation: &str) -> String {
     format!(
         "{operation} failed during {} rollout (seed={}, episode={}, transition={})",
-        if closed_loop {
-            "closed-loop"
-        } else {
-            "open-loop"
-        },
-        sample.seed,
-        sample.episode_id,
-        sample.transition_index,
+        mode, sample.seed, sample.episode_id, sample.transition_index,
     )
 }
 
-fn normalized_ratio(model: &[f32], baseline: &[f32]) -> Vec<f32> {
-    model
-        .iter()
-        .zip(baseline)
-        .map(|(m, b)| {
-            if b.is_finite() && *b > 1e-8 {
-                m / b
-            } else {
-                f32::NAN
-            }
-        })
-        .collect()
+#[derive(Clone, Copy)]
+enum RolloutMetric {
+    Open,
+    Closed,
+    CopyForward,
 }
 
-fn merge_rollout_sextuples(sextuples: &[RolloutSextuple], seed: u64) -> RolloutMetrics {
-    let mut mse4 = Vec::new();
-    let mut mse8 = Vec::new();
-    let mut mse16 = Vec::new();
-    let mut cf4 = Vec::new();
-    let mut cf8 = Vec::new();
-    let mut cf16 = Vec::new();
-    for (m4, m8, m16, c4, c8, c16) in sextuples {
-        if let Some(v) = m4 {
-            mse4.push(*v);
-        }
-        if let Some(v) = m8 {
-            mse8.push(*v);
-        }
-        if let Some(v) = m16 {
-            mse16.push(*v);
-        }
-        if let Some(v) = c4 {
-            cf4.push(*v);
-        }
-        if let Some(v) = c8 {
-            cf8.push(*v);
-        }
-        if let Some(v) = c16 {
-            cf16.push(*v);
-        }
-    }
+fn rollout_metrics_from_rows(
+    rows: &[EpisodeRolloutRow],
+    metric: RolloutMetric,
+    seed: u64,
+) -> RolloutMetrics {
+    let values = |horizon| -> Vec<f32> {
+        rows.iter()
+            .filter(|row| row.horizon == horizon)
+            .filter_map(|row| match metric {
+                RolloutMetric::Open => row.open_mse,
+                RolloutMetric::Closed => row.closed_mse,
+                RolloutMetric::CopyForward => row.copy_forward_mse,
+            })
+            .map(|value| value as f32)
+            .collect()
+    };
+    let normalized = |horizon| -> Vec<f32> {
+        (matches!(metric, RolloutMetric::Open))
+            .then(|| {
+                rows.iter()
+                    .filter(|row| row.horizon == horizon)
+                    .filter_map(|row| row.normalized_open_mse)
+                    .map(|value| value as f32)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let h4_values = values(4);
+    let h8_values = values(8);
+    let h16_values = values(16);
+    let (h4_seed_offset, h8_seed_offset, h16_seed_offset) = match metric {
+        RolloutMetric::CopyForward => (0x14, 0x18, 0x1C),
+        RolloutMetric::Open | RolloutMetric::Closed => (0x04, 0x08, 0x10),
+    };
     RolloutMetrics {
-        n4: mse4.len(),
-        mse_4: mean(&mse4),
-        n8: mse8.len(),
-        mse_8: mean(&mse8),
-        n16: mse16.len(),
-        mse_16: mean(&mse16),
+        n4: h4_values.len(),
+        mse_4: mean(&h4_values),
+        n8: h8_values.len(),
+        mse_8: mean(&h8_values),
+        n16: h16_values.len(),
+        mse_16: mean(&h16_values),
         h4: Some(summarize_horizon(
-            &mse4,
-            &normalized_ratio(&mse4, &cf4),
-            seed ^ 0x04,
+            &h4_values,
+            &normalized(4),
+            seed ^ h4_seed_offset,
         )),
         h8: Some(summarize_horizon(
-            &mse8,
-            &normalized_ratio(&mse8, &cf8),
-            seed ^ 0x08,
+            &h8_values,
+            &normalized(8),
+            seed ^ h8_seed_offset,
         )),
         h16: Some(summarize_horizon(
-            &mse16,
-            &normalized_ratio(&mse16, &cf16),
-            seed ^ 0x10,
+            &h16_values,
+            &normalized(16),
+            seed ^ h16_seed_offset,
         )),
-        open_closed_ratio_8: None,
-    }
-}
-
-fn merge_copy_forward_sextuples(sextuples: &[RolloutSextuple], seed: u64) -> RolloutMetrics {
-    let mut cf4 = Vec::new();
-    let mut cf8 = Vec::new();
-    let mut cf16 = Vec::new();
-    for (_, _, _, c4, c8, c16) in sextuples {
-        if let Some(v) = c4 {
-            cf4.push(*v);
-        }
-        if let Some(v) = c8 {
-            cf8.push(*v);
-        }
-        if let Some(v) = c16 {
-            cf16.push(*v);
-        }
-    }
-    RolloutMetrics {
-        n4: cf4.len(),
-        mse_4: mean(&cf4),
-        n8: cf8.len(),
-        mse_8: mean(&cf8),
-        n16: cf16.len(),
-        mse_16: mean(&cf16),
-        h4: Some(summarize_horizon(&cf4, &[], seed ^ 0x14)),
-        h8: Some(summarize_horizon(&cf8, &[], seed ^ 0x18)),
-        h16: Some(summarize_horizon(&cf16, &[], seed ^ 0x1C)),
         open_closed_ratio_8: None,
     }
 }
@@ -2262,72 +2291,26 @@ fn group_rollouts(samples: &[TransitionSample]) -> BTreeMap<(u64, u64), Vec<&Tra
     map
 }
 
-#[derive(Clone, Copy)]
-struct RolloutEvalContext<'a> {
-    source: &'a str,
-    closed_loop: bool,
-}
-
-fn eval_rollouts(
+fn eval_episode_rollouts(
     train_cfg: &TrainConfig,
     checkpoint: &Path,
     model: &WorldModel,
     samples: &[TransitionSample],
     device: &Device,
-    seed: u64,
-    context: RolloutEvalContext<'_>,
-) -> Result<RolloutMetrics> {
-    let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)
-        .into_values()
-        .filter(|steps| steps.len() >= 4)
-        .map(|steps| steps.iter().map(|s| (*s).clone()).collect())
-        .collect();
-    let sextuples: Vec<RolloutSextuple> = if device.is_cpu() {
-        groups
-            .into_par_iter()
-            .map(|steps| {
-                with_thread_local_model(train_cfg, checkpoint, device, |m| {
-                    eval_rollout_group(m, &steps, device, context.closed_loop)
-                        .with_context(|| format!("{} rollout group failed", context.source))
-                })
-            })
-            .collect::<Result<_>>()?
-    } else {
-        groups
-            .iter()
-            .map(|steps| {
-                eval_rollout_group(model, steps, device, context.closed_loop)
-                    .with_context(|| format!("{} rollout group failed", context.source))
-            })
-            .collect::<Result<_>>()?
-    };
-    Ok(merge_rollout_sextuples(
-        &sextuples,
-        seed ^ if context.closed_loop { 0xC1 } else { 0x01 },
-    ))
-}
-
-pub fn eval_copy_forward_rollouts(
-    train_cfg: &TrainConfig,
-    checkpoint: &Path,
-    model: &WorldModel,
-    samples: &[TransitionSample],
-    device: &Device,
-    seed: u64,
     source: &str,
-) -> Result<RolloutMetrics> {
+) -> Result<Vec<EpisodeRolloutRow>> {
     let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)
         .into_values()
         .filter(|steps| steps.len() >= 4)
         .map(|steps| steps.iter().map(|s| (*s).clone()).collect())
         .collect();
-    let sextuples: Vec<RolloutSextuple> = if device.is_cpu() {
+    let results: Vec<Vec<EpisodeRolloutResult>> = if device.is_cpu() {
         groups
             .into_par_iter()
             .map(|steps| {
                 with_thread_local_model(train_cfg, checkpoint, device, |m| {
-                    eval_rollout_group(m, &steps, device, false)
-                        .with_context(|| format!("{source} copy-forward rollout group failed"))
+                    eval_rollout_group(m, &steps, device)
+                        .with_context(|| format!("{source} rollout group failed"))
                 })
             })
             .collect::<Result<_>>()?
@@ -2335,12 +2318,18 @@ pub fn eval_copy_forward_rollouts(
         groups
             .iter()
             .map(|steps| {
-                eval_rollout_group(model, steps, device, false)
-                    .with_context(|| format!("{source} copy-forward rollout group failed"))
+                eval_rollout_group(model, steps, device)
+                    .with_context(|| format!("{source} rollout group failed"))
             })
             .collect::<Result<_>>()?
     };
-    Ok(merge_copy_forward_sextuples(&sextuples, seed ^ 0xCF))
+    let mut rows: Vec<_> = results
+        .into_iter()
+        .flatten()
+        .map(|result| result.into_row(source))
+        .collect();
+    sort_episode_rows(&mut rows);
+    Ok(rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2568,38 +2557,19 @@ fn eval_sample_set(
         cfg.seed,
     )?);
 
-    let rollout = if with_rollout {
-        Some(eval_rollouts(
-            train_cfg,
-            checkpoint,
-            model,
-            samples,
-            device,
-            cfg.seed,
-            RolloutEvalContext {
-                source,
-                closed_loop: false,
-            },
+    let rollout_rows = if with_rollout {
+        Some(eval_episode_rollouts(
+            train_cfg, checkpoint, model, samples, device, source,
         )?)
     } else {
         None
     };
-    let closed_loop = if with_rollout {
-        Some(eval_rollouts(
-            train_cfg,
-            checkpoint,
-            model,
-            samples,
-            device,
-            cfg.seed,
-            RolloutEvalContext {
-                source,
-                closed_loop: true,
-            },
-        )?)
-    } else {
-        None
-    };
+    let rollout = rollout_rows
+        .as_deref()
+        .map(|rows| rollout_metrics_from_rows(rows, RolloutMetric::Open, cfg.seed ^ 0x01));
+    let closed_loop = rollout_rows
+        .as_deref()
+        .map(|rows| rollout_metrics_from_rows(rows, RolloutMetric::Closed, cfg.seed ^ 0xC1));
     let identifiability = eval_identifiability(samples, &encoder_embeddings);
 
     Ok(SplitEval {
@@ -2684,16 +2654,117 @@ fn eval_contrastive_probes(
     })
 }
 
-fn write_episode_jsonl(path: &Path, rows: &[EpisodeRolloutRow]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let mut file = fs::File::create(path)?;
-    use std::io::Write;
+static EPISODE_JSONL_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn episode_jsonl_bytes(rows: &[EpisodeRolloutRow]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
     for row in rows {
-        writeln!(file, "{}", serde_json::to_string(row)?)?;
+        writeln!(
+            bytes,
+            "{}",
+            serde_json::to_string(row).context("serialize episode row")?
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn staging_path(destination: &Path, parent: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("episodes.jsonl");
+    let sequence = EPISODE_JSONL_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    staging_path_with_sequence(name, parent, sequence)
+}
+
+fn staging_path_with_sequence(name: &str, parent: &Path, sequence: u64) -> PathBuf {
+    parent.join(format!(
+        ".{name}.{}.{}.staging",
+        std::process::id(),
+        sequence
+    ))
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpisodeJsonlWritePhase {
+    BeforeWrite,
+    BeforeFileSync,
+    BeforeRename,
+    BeforeParentSync,
+}
+
+fn write_episode_jsonl_bytes_with<F>(path: &Path, bytes: &[u8], before: F) -> Result<()>
+where
+    F: Fn(EpisodeJsonlWritePhase) -> Result<()>,
+{
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    loop {
+        let staging = staging_path(path, parent);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create staging {}", staging.display()))
+            }
+        };
+        let result = (|| {
+            before(EpisodeJsonlWritePhase::BeforeWrite)?;
+            file.write_all(bytes)
+                .with_context(|| format!("write staging {}", staging.display()))?;
+            file.flush()
+                .with_context(|| format!("flush staging {}", staging.display()))?;
+            before(EpisodeJsonlWritePhase::BeforeFileSync)?;
+            file.sync_all()
+                .with_context(|| format!("sync staging {}", staging.display()))?;
+            drop(file);
+            before(EpisodeJsonlWritePhase::BeforeRename)?;
+            fs::rename(&staging, path).with_context(|| {
+                format!("atomic rename {} -> {}", staging.display(), path.display())
+            })?;
+            before(EpisodeJsonlWritePhase::BeforeParentSync)?;
+            fs::File::open(parent)
+                .with_context(|| format!("open parent directory {}", parent.display()))?
+                .sync_all()
+                .with_context(|| format!("sync parent directory {}", parent.display()))?;
+            Ok(())
+        })();
+        if result.is_err() && staging.exists() {
+            fs::remove_file(&staging)
+                .with_context(|| format!("remove failed staging {}", staging.display()))?;
+        }
+        return result;
+    }
+}
+
+fn sort_episode_rows(rows: &mut [EpisodeRolloutRow]) {
+    rows.sort_by(|left, right| {
+        (&left.source, left.seed, left.episode_id, left.horizon).cmp(&(
+            &right.source,
+            right.seed,
+            right.episode_id,
+            right.horizon,
+        ))
+    });
+}
+
+fn write_episode_jsonl(path: &Path, rows: &[EpisodeRolloutRow]) -> Result<()> {
+    let mut rows = rows.to_vec();
+    sort_episode_rows(&mut rows);
+    write_episode_jsonl_bytes_with(path, &episode_jsonl_bytes(&rows)?, |_| Ok(()))
+}
+
+fn maybe_write_episode_jsonl(path: Option<&Path>, rows: &[EpisodeRolloutRow]) -> Result<()> {
+    if let Some(path) = path {
+        write_episode_jsonl(path, rows)?;
     }
     Ok(())
 }
@@ -2757,39 +2828,29 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &device,
         false,
     )?;
-    synthetic_dynamics.rollout = Some(eval_rollouts(
+    let dynamics_rollout_rows = eval_episode_rollouts(
         &train_cfg,
         &cfg.checkpoint,
         &model,
         &dynamics_rollout_samples,
         &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_dynamics",
-            closed_loop: false,
-        },
-    )?);
-    synthetic_dynamics.closed_loop = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_dynamics",
-            closed_loop: true,
-        },
-    )?);
-    synthetic_dynamics.copy_forward = Some(eval_copy_forward_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &dynamics_rollout_samples,
-        &device,
-        cfg.seed,
         "synthetic_dynamics",
-    )?);
+    )?;
+    synthetic_dynamics.rollout = Some(rollout_metrics_from_rows(
+        &dynamics_rollout_rows,
+        RolloutMetric::Open,
+        cfg.seed ^ 0x01,
+    ));
+    synthetic_dynamics.closed_loop = Some(rollout_metrics_from_rows(
+        &dynamics_rollout_rows,
+        RolloutMetric::Closed,
+        cfg.seed ^ 0xC1,
+    ));
+    synthetic_dynamics.copy_forward = Some(rollout_metrics_from_rows(
+        &dynamics_rollout_rows,
+        RolloutMetric::CopyForward,
+        cfg.seed ^ 0xCF,
+    ));
     if let (Some(open), Some(closed)) = (
         synthetic_dynamics.rollout.as_mut(),
         synthetic_dynamics.closed_loop.as_ref(),
@@ -2812,39 +2873,29 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         &device,
         false,
     )?;
-    synthetic_planner.rollout = Some(eval_rollouts(
+    let planner_rollout_rows = eval_episode_rollouts(
         &train_cfg,
         &cfg.checkpoint,
         &model,
         &planner_rollout_samples,
         &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_planner",
-            closed_loop: false,
-        },
-    )?);
-    synthetic_planner.closed_loop = Some(eval_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_rollout_samples,
-        &device,
-        cfg.seed,
-        RolloutEvalContext {
-            source: "synthetic_planner",
-            closed_loop: true,
-        },
-    )?);
-    synthetic_planner.copy_forward = Some(eval_copy_forward_rollouts(
-        &train_cfg,
-        &cfg.checkpoint,
-        &model,
-        &planner_rollout_samples,
-        &device,
-        cfg.seed,
         "synthetic_planner",
-    )?);
+    )?;
+    synthetic_planner.rollout = Some(rollout_metrics_from_rows(
+        &planner_rollout_rows,
+        RolloutMetric::Open,
+        cfg.seed ^ 0x01,
+    ));
+    synthetic_planner.closed_loop = Some(rollout_metrics_from_rows(
+        &planner_rollout_rows,
+        RolloutMetric::Closed,
+        cfg.seed ^ 0xC1,
+    ));
+    synthetic_planner.copy_forward = Some(rollout_metrics_from_rows(
+        &planner_rollout_rows,
+        RolloutMetric::CopyForward,
+        cfg.seed ^ 0xCF,
+    ));
     if let (Some(open), Some(closed)) = (
         synthetic_planner.rollout.as_mut(),
         synthetic_planner.closed_loop.as_ref(),
@@ -2911,52 +2962,11 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         arc3_transfer,
         research_claim: false,
     };
-    if let Some(jsonl) = &cfg.episode_jsonl {
-        let rows = vec![
-            EpisodeRolloutRow {
-                seed: cfg.seed,
-                episode_id: 0,
-                family: "synthetic_dynamics".into(),
-                horizon: 8,
-                open_mse: report
-                    .synthetic_dynamics
-                    .rollout
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-                closed_mse: report
-                    .synthetic_dynamics
-                    .closed_loop
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-                copy_forward_mse: report
-                    .synthetic_dynamics
-                    .copy_forward
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-            },
-            EpisodeRolloutRow {
-                seed: cfg.seed,
-                episode_id: 1,
-                family: "synthetic_planner".into(),
-                horizon: 8,
-                open_mse: report
-                    .synthetic_planner
-                    .rollout
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-                closed_mse: report
-                    .synthetic_planner
-                    .closed_loop
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-                copy_forward_mse: report
-                    .synthetic_planner
-                    .copy_forward
-                    .as_ref()
-                    .and_then(|r| r.mse_8),
-            },
-        ];
-        write_episode_jsonl(jsonl, &rows)?;
+    if let Some(jsonl) = cfg.episode_jsonl.as_deref() {
+        let mut rows = dynamics_rollout_rows;
+        rows.extend(planner_rollout_rows);
+        sort_episode_rows(&mut rows);
+        maybe_write_episode_jsonl(Some(jsonl), &rows)?;
     }
     write_json_atomic(&cfg.output, &report)?;
     Ok(report)
@@ -2997,6 +3007,377 @@ mod tests {
             transition_index: 0,
             oracle_latent: None,
         })
+    }
+
+    fn rollout_fixture_sample(
+        seed: u64,
+        episode_id: u64,
+        transition_index: u64,
+        family: &str,
+    ) -> Result<TransitionSample> {
+        let mut sample = action_diagnostic_sample(ArcAction::new(1, None, None)?, 1)?;
+        sample.seed = seed;
+        sample.episode_id = episode_id;
+        sample.transition_index = transition_index;
+        sample.family = family.into();
+        Ok(sample)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rollout_row(
+        source: &str,
+        seed: u64,
+        episode_id: u64,
+        horizon: usize,
+        open_mse: Option<f64>,
+        closed_mse: Option<f64>,
+        copy_forward_mse: Option<f64>,
+        families: &[&str],
+    ) -> EpisodeRolloutRow {
+        let mut families_through_horizon: Vec<_> =
+            families.iter().map(|family| (*family).into()).collect();
+        families_through_horizon.sort();
+        families_through_horizon.dedup();
+        EpisodeRolloutResult {
+            seed,
+            episode_id,
+            families_through_horizon,
+            horizon,
+            open_mse,
+            closed_mse,
+            copy_forward_mse,
+        }
+        .into_row(source)
+    }
+
+    #[test]
+    fn rollout_rows_preserve_episode_identity_horizons_and_retarget_provenance() -> Result<()> {
+        let mut samples = Vec::new();
+        for index in 0..16 {
+            samples.push(rollout_fixture_sample(
+                9,
+                42,
+                index,
+                if index < 3 { "alpha" } else { "retarget" },
+            )?);
+        }
+        for index in 0..7 {
+            samples.push(rollout_fixture_sample(9, 77, index, "short")?);
+        }
+        samples.reverse();
+
+        let groups = group_rollouts(&samples);
+        let rows: Vec<_> = groups
+            .values()
+            .flat_map(|steps| {
+                [4, 8, 16]
+                    .into_iter()
+                    .filter(move |horizon| steps.len() >= *horizon)
+                    .map(|horizon| {
+                        episode_rollout_result(steps, horizon, 1.0, 2.0, 4.0)
+                            .into_row("synthetic_planner")
+                    })
+            })
+            .collect();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.seed, row.episode_id, row.horizon))
+                .collect::<Vec<_>>(),
+            vec![(9, 42, 4), (9, 42, 8), (9, 42, 16), (9, 77, 4)]
+        );
+        assert_eq!(rows[0].families_through_horizon, vec!["alpha", "retarget"]);
+        assert_eq!(rows[1].families_through_horizon, vec!["alpha", "retarget"]);
+        assert_eq!(rows[3].families_through_horizon, vec!["short"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_rows_reconcile_aggregates_and_weight_each_episode_once() {
+        let rows = vec![
+            rollout_row(
+                "synthetic_dynamics",
+                1,
+                3,
+                4,
+                Some(2.0),
+                Some(4.0),
+                Some(1.0),
+                &["a"],
+            ),
+            rollout_row(
+                "synthetic_dynamics",
+                1,
+                4,
+                4,
+                Some(6.0),
+                Some(8.0),
+                Some(2.0),
+                &["a", "b", "c"],
+            ),
+            rollout_row(
+                "synthetic_dynamics",
+                1,
+                3,
+                8,
+                Some(10.0),
+                Some(20.0),
+                Some(5.0),
+                &["a"],
+            ),
+        ];
+        let open = rollout_metrics_from_rows(&rows, RolloutMetric::Open, 7);
+        let closed = rollout_metrics_from_rows(&rows, RolloutMetric::Closed, 7);
+        let copy_forward = rollout_metrics_from_rows(&rows, RolloutMetric::CopyForward, 7);
+
+        assert_eq!(
+            (open.n4, open.mse_4, open.n8, open.mse_8, open.n16),
+            (2, Some(4.0), 1, Some(10.0), 0)
+        );
+        assert_eq!((closed.mse_4, closed.mse_8), (Some(6.0), Some(20.0)));
+        assert_eq!(
+            (copy_forward.mse_4, copy_forward.mse_8),
+            (Some(1.5), Some(5.0))
+        );
+        assert_eq!(open.h4.and_then(|stats| stats.normalized_mean), Some(2.5));
+    }
+
+    #[test]
+    fn rollout_normalization_rejects_invalid_copy_forward_denominators() {
+        for denominator in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                rollout_row(
+                    "synthetic_dynamics",
+                    1,
+                    1,
+                    4,
+                    Some(3.0),
+                    Some(2.0),
+                    Some(denominator),
+                    &["a"]
+                )
+                .normalized_open_mse,
+                None
+            );
+        }
+        assert_eq!(
+            rollout_row(
+                "synthetic_dynamics",
+                1,
+                1,
+                4,
+                Some(3.0),
+                Some(2.0),
+                Some(2.0),
+                &["a"]
+            )
+            .normalized_open_mse,
+            Some(1.5)
+        );
+        for numerator in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                rollout_row(
+                    "synthetic_dynamics",
+                    1,
+                    1,
+                    4,
+                    Some(numerator),
+                    Some(2.0),
+                    Some(2.0),
+                    &["a"]
+                )
+                .normalized_open_mse,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn copy_forward_bootstrap_seeds_preserve_horizon_offsets() {
+        let h4 = [1.0_f32, 3.0, 7.0, 13.0, 21.0];
+        let h8 = [2.0_f32, 5.0, 11.0, 17.0, 23.0];
+        let h16 = [4.0_f32, 6.0, 10.0, 16.0, 26.0];
+        let rows = h4
+            .iter()
+            .chain(h8.iter())
+            .chain(h16.iter())
+            .enumerate()
+            .map(|(index, value)| {
+                rollout_row(
+                    "synthetic_dynamics",
+                    1,
+                    index as u64,
+                    if index < h4.len() {
+                        4
+                    } else if index < h4.len() + h8.len() {
+                        8
+                    } else {
+                        16
+                    },
+                    Some(f64::from(*value)),
+                    Some(f64::from(*value)),
+                    Some(f64::from(*value)),
+                    &["a"],
+                )
+            })
+            .collect::<Vec<_>>();
+        let caller_seed = 0x1234_u64 ^ 0xCF;
+        let metrics = rollout_metrics_from_rows(&rows, RolloutMetric::CopyForward, caller_seed);
+
+        assert_eq!(
+            (
+                metrics.h4.as_ref().unwrap().ci95_low,
+                metrics.h4.as_ref().unwrap().ci95_high
+            ),
+            bootstrap_ci95(&h4, caller_seed ^ 0x14)
+        );
+        assert_eq!(
+            (
+                metrics.h8.as_ref().unwrap().ci95_low,
+                metrics.h8.as_ref().unwrap().ci95_high
+            ),
+            bootstrap_ci95(&h8, caller_seed ^ 0x18)
+        );
+        assert_eq!(
+            (
+                metrics.h16.as_ref().unwrap().ci95_low,
+                metrics.h16.as_ref().unwrap().ci95_high
+            ),
+            bootstrap_ci95(&h16, caller_seed ^ 0x1C)
+        );
+    }
+
+    #[test]
+    fn episode_jsonl_is_deterministic_sorted_and_durable() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("tofy-episode-jsonl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("episodes.jsonl");
+        let mut rows = vec![
+            rollout_row(
+                "synthetic_planner",
+                4,
+                2,
+                8,
+                Some(2.0),
+                Some(3.0),
+                Some(1.0),
+                &["x"],
+            ),
+            rollout_row(
+                "synthetic_dynamics",
+                3,
+                1,
+                4,
+                Some(1.0),
+                Some(2.0),
+                Some(1.0),
+                &["y"],
+            ),
+        ];
+        write_episode_jsonl(&path, &rows)?;
+        let first = fs::read(&path)?;
+        rows.reverse();
+        write_episode_jsonl(&path, &rows)?;
+        assert_eq!(fs::read(&path)?, first);
+        let sorted_rows: Vec<EpisodeRolloutRow> = String::from_utf8(first.clone())?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(
+            sorted_rows
+                .iter()
+                .map(|row| (row.source.as_str(), row.seed, row.episode_id, row.horizon))
+                .collect::<Vec<_>>(),
+            vec![
+                ("synthetic_dynamics", 3, 1, 4),
+                ("synthetic_planner", 4, 2, 8),
+            ]
+        );
+
+        let phases = RefCell::new(Vec::new());
+        write_episode_jsonl_bytes_with(&path, &first, |phase| {
+            phases.borrow_mut().push(phase);
+            Ok(())
+        })?;
+        assert_eq!(
+            *phases.borrow(),
+            vec![
+                EpisodeJsonlWritePhase::BeforeWrite,
+                EpisodeJsonlWritePhase::BeforeFileSync,
+                EpisodeJsonlWritePhase::BeforeRename,
+                EpisodeJsonlWritePhase::BeforeParentSync,
+            ]
+        );
+
+        for failure_phase in [
+            EpisodeJsonlWritePhase::BeforeWrite,
+            EpisodeJsonlWritePhase::BeforeFileSync,
+            EpisodeJsonlWritePhase::BeforeRename,
+        ] {
+            let before_failure = fs::read(&path)?;
+            assert!(
+                write_episode_jsonl_bytes_with(&path, b"replacement\n", |phase| {
+                    if phase == failure_phase {
+                        bail!("forced pre-rename failure");
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(fs::read(&path)?, before_failure);
+            let staging_entries: Vec<_> = fs::read_dir(&dir)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<_>>()?;
+            assert!(staging_entries
+                .iter()
+                .all(|name| !name.to_string_lossy().ends_with(".staging")));
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn episode_jsonl_skips_existing_staging_candidate() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tofy-episode-jsonl-collision-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("episodes.jsonl");
+        let sequence = EPISODE_JSONL_STAGING_SEQUENCE.load(Ordering::Relaxed);
+        let collision = staging_path_with_sequence("episodes.jsonl", &dir, sequence);
+        fs::write(&collision, b"crash-leftover\n")?;
+
+        write_episode_jsonl_bytes_with(&path, b"replacement\n", |_| Ok(()))?;
+
+        assert_eq!(fs::read(&collision)?, b"crash-leftover\n");
+        assert_eq!(fs::read(&path)?, b"replacement\n");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_episode_jsonl_does_not_change_row_aggregates() {
+        let rows = vec![rollout_row(
+            "synthetic_dynamics",
+            2,
+            8,
+            4,
+            Some(7.0),
+            Some(9.0),
+            Some(2.0),
+            &["a"],
+        )];
+        let before = rollout_metrics_from_rows(&rows, RolloutMetric::Open, 1);
+        maybe_write_episode_jsonl(None, &rows).expect("disabled JSONL output");
+        let after = rollout_metrics_from_rows(&rows, RolloutMetric::Open, 1);
+        assert_eq!(before.mse_4, after.mse_4);
+        assert_eq!(
+            before.h4.and_then(|stats| stats.normalized_mean),
+            after.h4.and_then(|stats| stats.normalized_mean)
+        );
     }
 
     #[test]
@@ -3159,7 +3540,7 @@ mod tests {
             arc_recordings_dir: None,
             scorecard_json: None,
             output: dir.join("eval.json"),
-            episode_jsonl: None,
+            episode_jsonl: Some(dir.join("episodes.jsonl")),
             ensemble_members: 4,
         };
         let eval = evaluate(&eval_cfg)?;
@@ -3215,6 +3596,23 @@ mod tests {
         let text = fs::read_to_string(&eval_cfg.output)?;
         let back: EvalReport = serde_json::from_str(&text)?;
         assert_eq!(back.schema, EVAL_REPORT_SCHEMA);
+        let episode_rows: Vec<EpisodeRolloutRow> =
+            fs::read_to_string(eval_cfg.episode_jsonl.as_ref().expect("episode JSONL path"))?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+        assert!(!episode_rows.is_empty());
+        assert!(episode_rows.iter().all(|row| {
+            row.schema == "p2.episode_rollout.v2"
+                && matches!(row.horizon, 4 | 8 | 16)
+                && !row.families_through_horizon.is_empty()
+        }));
+        assert!(episode_rows
+            .iter()
+            .any(|row| row.source == "synthetic_dynamics"));
+        assert!(episode_rows
+            .iter()
+            .any(|row| row.source == "synthetic_planner"));
 
         let recordings = dir.join("empty-recordings");
         fs::create_dir_all(&recordings)?;
