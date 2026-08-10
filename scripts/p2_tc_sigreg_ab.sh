@@ -35,31 +35,40 @@ done
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
+gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 [[ "$git_sha" == "$P2_EXPECTED_SHA" ]] || { printf 'Tofy SHA mismatch\n' >&2; exit 2; }
 [[ "$candle_sha" == "$P2_EXPECTED_CANDLE_SHA" ]] || { printf 'candle_graph SHA mismatch\n' >&2; exit 2; }
 [[ "$binary_sha" == "$P2_EXPECTED_BINARY_SHA" ]] || { printf 'binary SHA mismatch\n' >&2; exit 2; }
+[[ "$gpu_name" == "NVIDIA A40" ]] || { printf 'pilot requires NVIDIA A40, found %s\n' "$gpu_name" >&2; exit 2; }
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || { printf 'dirty Tofy worktree\n' >&2; exit 2; }
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph worktree\n' >&2; exit 2; }
 [[ -s "$P2_TC_BATCH_PROBE" ]] || { printf 'missing batch probe: %s\n' "$P2_TC_BATCH_PROBE" >&2; exit 2; }
+probe_dir="$(cd -- "$(dirname -- "$P2_TC_BATCH_PROBE")" && pwd)"
+probe_manifest="$probe_dir/artifacts.sha256"
+[[ -s "$probe_manifest" ]] || { printf 'missing probe artifact manifest\n' >&2; exit 2; }
+(cd / && sha256sum --quiet -c "$probe_manifest") || { printf 'probe artifact verification failed\n' >&2; exit 2; }
+probe_manifest_sha="$(sha256sum "$probe_manifest" | awk '{print $1}')"
 jq -e \
   --arg git_sha "$git_sha" --arg candle_sha "$candle_sha" --arg binary_sha "$binary_sha" \
+  --arg manifest_sha "$probe_manifest_sha" \
   --argjson physical "$physical_batch" --argjson accum "$grad_accum" \
   '.schema == "p2.tc_sigreg_batch_probe.v1" and .status == "passed"
     and .git_sha == $git_sha and .candle_git_sha == $candle_sha
     and .binary_sha256 == $binary_sha and .physical_batch == $physical
     and .grad_accum == $accum and .effective_batch == 1024
+    and .gpu_name == "NVIDIA A40" and .artifact_manifest_sha256 == $manifest_sha
     and .sigreg_target == "temporal_residual" and .sigreg_temporal_window == 8
     and .completed_updates >= 2' "$P2_TC_BATCH_PROBE" >/dev/null || {
   printf 'batch probe does not authorize this exact experiment\n' >&2; exit 2;
 }
 probe_sha="$(sha256sum "$P2_TC_BATCH_PROBE" | awk '{print $1}')"
 
-mkdir -p -- "$run_root"
-run_root="$(realpath "$run_root")"
-[[ ! -e "$run_root/seed-1" ]] || {
-  printf 'seed-1 run root already exists; refusing mixed or relabeled artifacts: %s\n' "$run_root" >&2
+[[ ! -e "$run_root" ]] || {
+  printf 'pilot run root already exists; refusing mixed or relabeled artifacts: %s\n' "$run_root" >&2
   exit 2
 }
+mkdir -p -- "$run_root"
+run_root="$(realpath "$run_root")"
 
 sample_gpu() {
   while true; do

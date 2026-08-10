@@ -21,8 +21,10 @@ gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-1}"
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
+gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 [[ "$git_sha" == "$P2_EXPECTED_SHA" && "$candle_sha" == "$P2_EXPECTED_CANDLE_SHA" \
   && "$binary_sha" == "$P2_EXPECTED_BINARY_SHA" ]] || { printf 'reviewed SHA mismatch\n' >&2; exit 2; }
+[[ "$gpu_name" == "NVIDIA A40" ]] || { printf 'probe requires NVIDIA A40, found %s\n' "$gpu_name" >&2; exit 2; }
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || { printf 'dirty Tofy worktree\n' >&2; exit 2; }
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph worktree\n' >&2; exit 2; }
 
@@ -67,20 +69,23 @@ sampler_pid=""
 nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu,power.draw \
   --format=csv,noheader,nounits >"$probe_root/telemetry/after.csv"
 completed="$(jq -r '.global_step' "$probe_root/run/train_report.json")"
-gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+sha256sum "$probe_root/run/config.json" \
+  "$probe_root/run/checkpoints/step-000000000002/model.safetensors" \
+  "$probe_root/run/checkpoints/step-000000000002/trainer_state.json" \
+  >"$probe_root/artifacts.sha256.tmp"
+mv -- "$probe_root/artifacts.sha256.tmp" "$probe_root/artifacts.sha256"
+artifact_manifest_sha="$(sha256sum "$probe_root/artifacts.sha256" | awk '{print $1}')"
 jq -nc --arg schema p2.tc_sigreg_batch_probe.v1 --arg status passed \
   --arg git_sha "$git_sha" --arg candle_git_sha "$candle_sha" --arg binary_sha256 "$binary_sha" \
   --arg gpu_name "$gpu_name" --arg started_utc "$started" --arg finished_utc "$finished" \
+  --arg artifact_manifest_sha256 "$artifact_manifest_sha" \
   --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
   --argjson completed_updates "$completed" \
   '{schema:$schema,status:$status,git_sha:$git_sha,candle_git_sha:$candle_git_sha,
     binary_sha256:$binary_sha256,gpu_name:$gpu_name,physical_batch:$physical_batch,
     grad_accum:$grad_accum,effective_batch:1024,sigreg_target:"temporal_residual",
     sigreg_temporal_window:8,completed_updates:$completed_updates,
+    artifact_manifest_sha256:$artifact_manifest_sha256,
     started_utc:$started_utc,finished_utc:$finished_utc}' >"$probe_root/probe.json.tmp"
 mv -- "$probe_root/probe.json.tmp" "$probe_root/probe.json"
-sha256sum "$probe_root/run/config.json" \
-  "$probe_root/run/checkpoints/step-000000000002/model.safetensors" \
-  "$probe_root/run/checkpoints/step-000000000002/trainer_state.json" \
-  "$probe_root/probe.json" >"$probe_root/sha256.txt"
 printf '%s\n' "$probe_root/probe.json"
