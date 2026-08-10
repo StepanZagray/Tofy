@@ -17,7 +17,7 @@ OUTPUT/profile/update-000000000002/
 └── nsight/             # optional raw .nsys-rep, CSV reports, status
 ```
 
-`train_report.json` (`p2.train_report.v6`) and resumable trainer state carry a structured
+`train_report.json` (`p2.train_report.v7`) and resumable trainer state carry a structured
 `profile` status (`pending` or `published`). A published bundle forces a durable checkpoint.
 
 The root measured region is device-synchronized once before and once after the complete update.

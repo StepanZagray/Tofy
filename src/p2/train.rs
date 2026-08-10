@@ -65,8 +65,8 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v6";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v4";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v7";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v5";
 
 /// Which population receives SIGReg. `TemporalResidual` removes a local temporal
 /// mean before the existing post-RMS spatial-cell statistic.
@@ -442,13 +442,9 @@ impl TrainConfig {
             if self.sigreg_temporal_window < 2 {
                 bail!("sigreg_temporal_window must be >= 2 for temporal-residual SIGReg");
             }
-            if !self.sigreg_spatial
-                || !self.sigreg_spatial_pool
-                || self.sigreg_pre_rms_spatial
-                || self.sigreg_projector
-            {
+            if !self.sigreg_spatial || self.sigreg_pre_rms_spatial || self.sigreg_projector {
                 bail!(
-                    "temporal-residual SIGReg requires post-RMS 2x2 spatial SIGReg without pre-RMS or projector geometry"
+                    "temporal-residual SIGReg requires post-RMS spatial SIGReg without pre-RMS or projector geometry"
                 );
             }
             if !(self.sigreg_global_mix.is_finite()
@@ -1847,7 +1843,7 @@ fn gradient_l2_for_parameter_prefix(
 ) -> Result<f64> {
     let data = varmap.data().lock().unwrap();
     let mut sum_sq: Option<Tensor> = None;
-    for (name, var) in data.iter().filter(|(name, _)| name.starts_with(prefix)) {
+    for (_, var) in data.iter().filter(|(name, _)| name.starts_with(prefix)) {
         if let Some(gradient) = grads.get(var.as_tensor()) {
             let squared = gradient.to_dtype(DType::F32)?.sqr()?.sum_all()?;
             sum_sq = Some(match sum_sq {
@@ -2183,7 +2179,7 @@ fn sigreg_losses_for_ordered_windows(
         &global_stack,
         cfg.sigreg_projections,
         cfg.sigreg_knots,
-        seed.wrapping_add(0x610B_A1),
+        seed.wrapping_add(0x0061_0BA1),
     )?;
     let global_bounded = bounded_sigreg_loss(&global_raw)?;
     if mix == 1.0 {
@@ -3484,12 +3480,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 // Read-only attribution: these stores are discarded before the
                 // normal total-loss backward and never reach the optimizer.
                 let next_grads = micro_losses.next_latent.backward()?;
+                let next_norm = gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
+                drop(next_grads);
                 let sigreg_grads = micro_losses
                     .sigreg_bounded
                     .affine(loss_weights.sigreg, 0.0)?
                     .backward()?;
-                let next_norm =
-                    gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
                 let sigreg_norm =
                     gradient_l2_for_parameter_prefix(&sigreg_grads, &varmap, "encoder.")?;
                 state.gradient_pressure = Some(GradientPressureDiagnostics {
@@ -3984,6 +3980,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_global_mix_is_exactly_the_original_cell_objective() -> Result<()> {
+        let device = Device::Cpu;
+        let windows = OrderedSigregWindows {
+            window: 2,
+            windows: 2,
+            row_indices: vec![0, 2, 1, 3],
+        };
+        let cfg = TrainConfig {
+            physical_batch: 4,
+            sigreg_spatial: true,
+            sigreg_spatial_pool: true,
+            sigreg_max_rows: 0,
+            sigreg_target: SigregTarget::TemporalResidual,
+            sigreg_temporal_window: 2,
+            sigreg_global_mix: 0.0,
+            sigreg_projections: 3,
+            sigreg_knots: 5,
+            ..TrainConfig::default()
+        };
+        let latents = Tensor::from_vec(
+            (0..64)
+                .map(|value| (value as f32 * 0.13).sin())
+                .collect::<Vec<_>>(),
+            (4, 4, 2, 2),
+            &device,
+        )?;
+        let seed = 29;
+        let stack = sigreg_stack_for_ordered_windows(
+            &latents,
+            &windows,
+            SigregTarget::TemporalResidual,
+            &cfg,
+            seed,
+        )?;
+        let expected_raw =
+            sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+        let expected_bounded = bounded_sigreg_loss(&expected_raw)?;
+        let (actual_raw, actual_bounded) =
+            sigreg_losses_for_ordered_windows(&latents, &windows, &cfg, seed)?;
+        assert_eq!(
+            actual_raw.to_scalar::<f32>()?.to_bits(),
+            expected_raw.to_scalar::<f32>()?.to_bits()
+        );
+        assert_eq!(
+            actual_bounded.to_scalar::<f32>()?.to_bits(),
+            expected_bounded.to_scalar::<f32>()?.to_bits()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn global_tc_is_invariant_to_window_local_spatial_offsets() -> Result<()> {
         let device = Device::Cpu;
         let windows = OrderedSigregWindows {
@@ -4035,14 +4082,14 @@ mod tests {
             ..TrainConfig::default()
         };
         assert!(invalid_window.validate().is_err());
-        let invalid_geometry = TrainConfig {
+        let valid_post_rms_unpooled = TrainConfig {
             sigreg_target: SigregTarget::TemporalResidual,
             sigreg_temporal_window: 2,
             sigreg_spatial: true,
             sigreg_spatial_pool: false,
             ..TrainConfig::default()
         };
-        assert!(invalid_geometry.validate().is_err());
+        assert!(valid_post_rms_unpooled.validate().is_ok());
         assert!(TrainConfig {
             sigreg_target: SigregTarget::Marginal,
             sigreg_temporal_window: 1,

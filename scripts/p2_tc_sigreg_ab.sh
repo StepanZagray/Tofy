@@ -78,6 +78,7 @@ jq -e \
     and .steady_gpu == true
     and .sigreg_target == "temporal_residual" and .sigreg_temporal_window == 8
     and .sigreg_global_mix == 0
+    and .sigreg_post_rms_unpooled == false
     and .completed_updates >= 2' "$P2_TC_BATCH_PROBE" >/dev/null || {
   printf 'batch probe does not authorize this exact experiment\n' >&2; exit 2;
 }

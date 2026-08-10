@@ -14,6 +14,7 @@ candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 physical_batch="$P2_TC_PHYSICAL_BATCH"
 grad_accum="$P2_TC_GRAD_ACCUM"
 global_mix="${P2_TC_GLOBAL_MIX:-0}"
+post_rms_unpooled="${P2_TC_POST_RMS_UNPOOLED:-false}"
 gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-1}"
 
 [[ "$physical_batch" =~ ^[1-9][0-9]*$ && "$grad_accum" =~ ^[1-9][0-9]*$ ]] || exit 2
@@ -22,6 +23,11 @@ gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-1}"
 [[ "$global_mix" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || {
   printf 'P2_TC_GLOBAL_MIX must be in [0,1]\n' >&2; exit 2;
 }
+[[ "$post_rms_unpooled" == true || "$post_rms_unpooled" == false ]] || exit 2
+geometry_args=(--sigreg-spatial --sigreg-spatial-pool)
+if [[ "$post_rms_unpooled" == true ]]; then
+  geometry_args=(--sigreg-post-rms-unpooled)
+fi
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
 candle_sha="$(git -C "$candle_root" rev-parse HEAD)"
 binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
@@ -34,7 +40,9 @@ gpu_name="${gpu_names[0]}"
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || { printf 'dirty Tofy worktree\n' >&2; exit 2; }
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph worktree\n' >&2; exit 2; }
 
-probe_root="${P2_TC_BATCH_PROBE_ROOT:-$repo_root/runs/p2/tc-sigreg-batch-probe/${git_sha:0:12}/batch-$physical_batch-accum-$grad_accum}"
+geometry_label=pooled
+[[ "$post_rms_unpooled" == true ]] && geometry_label=unpooled
+probe_root="${P2_TC_BATCH_PROBE_ROOT:-$repo_root/runs/p2/tc-sigreg-batch-probe/${git_sha:0:12}/batch-$physical_batch-accum-$grad_accum-mix-$global_mix-$geometry_label}"
 probe_parent="$(dirname -- "$probe_root")"
 mkdir -p -- "$probe_parent"
 mkdir -- "$probe_root" || { printf 'probe root already exists: %s\n' "$probe_root" >&2; exit 2; }
@@ -67,7 +75,7 @@ started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   --checkpoint-every-steps 2 --profile-update 2 \
   --sigreg-target temporal-residual --sigreg-temporal-window 8 \
   --sigreg-global-mix "$global_mix" \
-  --sigreg-spatial --sigreg-spatial-pool --sigreg-max-rows 32768 \
+  "${geometry_args[@]}" --sigreg-max-rows 32768 \
   --steady-gpu --supervise-last-outer-only --residual-y-update --warm-start-y \
   --outer-steps 8 --inner-steps 2 --hidden-dim 128 --action-dim 8 \
   --event-weight 0 --q-weight 0 --rollout-weight 0 --prefix-weight 0 --reliability-weight 0 \
@@ -93,11 +101,13 @@ jq -nc --arg schema p2.tc_sigreg_batch_probe.v1 --arg status passed \
   --arg artifact_manifest_sha256 "$artifact_manifest_sha" \
   --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
   --argjson sigreg_global_mix "$global_mix" \
+  --argjson sigreg_post_rms_unpooled "$post_rms_unpooled" \
   --argjson completed_updates "$completed" \
   '{schema:$schema,status:$status,git_sha:$git_sha,candle_git_sha:$candle_git_sha,
     binary_sha256:$binary_sha256,gpu_name:$gpu_name,physical_batch:$physical_batch,
     grad_accum:$grad_accum,effective_batch:1024,sigreg_target:"temporal_residual",
     sigreg_temporal_window:8,sigreg_global_mix:$sigreg_global_mix,
+    sigreg_post_rms_unpooled:$sigreg_post_rms_unpooled,
     steady_gpu:true,completed_updates:$completed_updates,
     artifact_manifest_sha256:$artifact_manifest_sha256,
     started_utc:$started_utc,finished_utc:$finished_utc}' >"$probe_root/probe.json.tmp"

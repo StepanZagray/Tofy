@@ -142,6 +142,14 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false, conflicts_with = "sigreg_projector")]
     pub sigreg_pre_rms_spatial: bool,
 
+    /// Feed unpooled post-RMS spatial cells to temporal SIGReg.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["sigreg_pre_rms_spatial", "sigreg_projector"]
+    )]
+    pub sigreg_post_rms_unpooled: bool,
+
     /// Experimental pre-RMS pooled encoder projector with T×B×D SIGReg geometry.
     #[arg(long, default_value_t = false)]
     pub sigreg_projector: bool,
@@ -243,8 +251,12 @@ impl P2TrainArgs {
             stop_grad_event_y: self.stop_grad_event_y,
             residual_y_update: self.residual_y_update,
             warm_start_y: self.warm_start_y,
-            sigreg_spatial: self.sigreg_spatial || self.sigreg_pre_rms_spatial,
-            sigreg_spatial_pool: self.sigreg_spatial_pool && !self.sigreg_pre_rms_spatial,
+            sigreg_spatial: self.sigreg_spatial
+                || self.sigreg_pre_rms_spatial
+                || self.sigreg_post_rms_unpooled,
+            sigreg_spatial_pool: self.sigreg_spatial_pool
+                && !self.sigreg_pre_rms_spatial
+                && !self.sigreg_post_rms_unpooled,
             sigreg_pre_rms_spatial: self.sigreg_pre_rms_spatial,
             sigreg_projector: self.sigreg_projector,
             sigreg_projector_dim: self.sigreg_projector_dim,

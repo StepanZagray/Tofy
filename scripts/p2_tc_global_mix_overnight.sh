@@ -59,6 +59,7 @@ jq -e \
     and .gpu_name == "NVIDIA A40" and .artifact_manifest_sha256 == $manifest_sha
     and .steady_gpu == true and .sigreg_target == "temporal_residual"
     and .sigreg_temporal_window == 8 and .sigreg_global_mix == 0.5
+    and .sigreg_post_rms_unpooled == true
     and .completed_updates >= 2' "$P2_TC_BATCH_PROBE" >/dev/null || {
   printf 'probe does not authorize the worst-case mixed objective\n' >&2; exit 2;
 }
@@ -73,7 +74,7 @@ jq -nc --arg schema p2.tc_global_mix_campaign.v1 --arg status running \
   --arg candle_git_sha "$candle_sha" --arg binary_sha256 "$binary_sha" \
   --arg batch_probe_sha256 "$probe_sha" \
   '{schema:$schema,status:$status,started_utc:$started_utc,seed:1,
-    arms:["marginal-control","tc-cell","tc-mix-025","tc-mix-050","tc-global"],
+    arms:["marginal-control","tc-cell","tc-mix-025","tc-mix-050","tc-global","tc-unpooled"],
     git_sha:$git_sha,candle_git_sha:$candle_git_sha,binary_sha256:$binary_sha256,
     batch_probe_sha256:$batch_probe_sha256,promotion:"locked_pending_gate_analysis"}' \
   >"$run_root/campaign.json"
@@ -88,14 +89,21 @@ sample_gpu() {
 }
 
 run_arm() {
-  local arm="$1" target="$2" mix="$3" arm_dir update checkpoint eval_dir started finished sampler_pid
+  local arm="$1" target="$2" mix="$3" unpooled="$4"
+  local arm_dir update checkpoint eval_dir started finished sampler_pid
+  local -a geometry_args=(--sigreg-spatial --sigreg-spatial-pool)
+  if [[ "$unpooled" == true ]]; then
+    geometry_args=(--sigreg-post-rms-unpooled)
+  fi
   arm_dir="$run_root/seed-1/$arm"
   mkdir -p -- "$arm_dir/telemetry"
   jq -nc --arg schema p2.tc_global_mix_arm.v1 --arg arm "$arm" --arg target "$target" \
     --arg git_sha "$git_sha" --arg candle_git_sha "$candle_sha" \
     --arg binary_sha256 "$binary_sha" --arg batch_probe_sha256 "$probe_sha" \
-    --argjson mix "$mix" --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
+    --argjson mix "$mix" --argjson unpooled "$unpooled" \
+    --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
     '{schema:$schema,arm:$arm,sigreg_target:$target,sigreg_global_mix:$mix,seed:1,
+      sigreg_post_rms_unpooled:$unpooled,
       physical_batch:$physical_batch,grad_accum:$grad_accum,effective_batch:1024,
       git_sha:$git_sha,candle_git_sha:$candle_git_sha,binary_sha256:$binary_sha256,
       batch_probe_sha256:$batch_probe_sha256,checkpoints:[250,500,750,1000],
@@ -110,7 +118,7 @@ run_arm() {
     --physical-batch "$physical_batch" --grad-accum "$grad_accum" \
     --checkpoint-every-steps 250 --profile-update 250 \
     --sigreg-target "$target" --sigreg-temporal-window 8 --sigreg-global-mix "$mix" \
-    --sigreg-spatial --sigreg-spatial-pool --sigreg-max-rows 32768 \
+    "${geometry_args[@]}" --sigreg-max-rows 32768 \
     --randomize-depth --supervise-last-outer-only --residual-y-update --warm-start-y \
     --outer-steps 8 --inner-steps 2 --hidden-dim 128 --action-dim 8 \
     --event-weight 0 --q-weight 0 --rollout-weight 0 --prefix-weight 0 --reliability-weight 0 \
@@ -144,17 +152,18 @@ run_arm() {
 }
 
 arms=(
-  'marginal-control marginal 0'
-  'tc-cell temporal-residual 0'
-  'tc-mix-025 temporal-residual 0.25'
-  'tc-mix-050 temporal-residual 0.5'
-  'tc-global temporal-residual 1.0'
+  'marginal-control marginal 0 false'
+  'tc-cell temporal-residual 0 false'
+  'tc-mix-025 temporal-residual 0.25 false'
+  'tc-mix-050 temporal-residual 0.5 false'
+  'tc-global temporal-residual 1.0 false'
+  'tc-unpooled temporal-residual 0 true'
 )
 failed=0
 for definition in "${arms[@]}"; do
-  read -r arm target mix <<<"$definition"
+  read -r arm target mix unpooled <<<"$definition"
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  if (set -euo pipefail; run_arm "$arm" "$target" "$mix"); then
+  if (set -euo pipefail; run_arm "$arm" "$target" "$mix" "$unpooled"); then
     status=passed
   else
     status=failed

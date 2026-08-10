@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v10";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v11";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -987,7 +987,7 @@ fn summarize_action_strata(
                 true_errors,
                 shuffled_errors,
                 &simple,
-                seed.wrapping_add(0x51A1_E3),
+                seed.wrapping_add(0x0051_A1E3),
             )?,
             coordinate: summarize_action_stratum(
                 samples,
@@ -2210,15 +2210,15 @@ fn action_diagnostics_from_pairs(
                 *paired = true;
             }
         }
-        let changed_conditionings = valid_shuffle
-            .then(|| {
-                samples[*start..*end]
-                    .iter()
-                    .zip(shuffled[*start..*end].iter())
-                    .filter(|(truth, ablated)| truth.action != ablated.action)
-                    .count()
-            })
-            .unwrap_or(0);
+        let changed_conditionings = if valid_shuffle {
+            samples[*start..*end]
+                .iter()
+                .zip(shuffled[*start..*end].iter())
+                .filter(|(truth, ablated)| truth.action != ablated.action)
+                .count()
+        } else {
+            0
+        };
         aggregate_true.extend_from_slice(true_slice);
         aggregate_shuffled.extend_from_slice(shuffled_slice);
         aggregate_changed += changed_conditionings;
@@ -2241,7 +2241,7 @@ fn action_diagnostics_from_pairs(
         true_errors,
         shuffled_errors,
         &paired,
-        seed.wrapping_add(0x57A7_A),
+        seed.wrapping_add(0x0005_7A7A),
     )?;
     Ok(ActionDiagnostics {
         aggregate: ActionSourceDiagnostics {
@@ -3962,7 +3962,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_seam_keys_are_snake_case() -> Result<()> {
+    fn current_seam_keys_are_snake_case() -> Result<()> {
         let metrics = crate::p2::representation::RepresentationSeamMetrics {
             rows_seen: 9,
             rows_used: 4,
@@ -4078,6 +4078,7 @@ mod tests {
             export_checkpoint: None,
             config_path: dir.join("config.json"),
             profile: crate::p2::cg_profile::ProfileState::Pending,
+            gradient_pressure: None,
             research_claim: false,
         };
         save_checkpoint(&varmap, &train_cfg, &report)?;
