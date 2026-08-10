@@ -597,9 +597,7 @@ struct TrainingContract {
     reliability_weight: f64,
     bf16_conv: bool,
     sigreg_max_rows: usize,
-    #[serde(default = "default_sigreg_target")]
     sigreg_target: SigregTarget,
-    #[serde(default = "default_sigreg_temporal_window")]
     sigreg_temporal_window: usize,
     device: String,
     adam_beta1: f64,
@@ -3689,14 +3687,16 @@ mod tests {
         for (index, sample) in samples.iter_mut().enumerate() {
             sample.transition_index = index as u64;
         }
-        let mut other = (0..4).map(toy_sample).collect::<Vec<_>>();
+        let mut other = (0..8).map(toy_sample).collect::<Vec<_>>();
         for (index, sample) in other.iter_mut().enumerate() {
             sample.episode_id = 1;
             sample.transition_index = index as u64;
         }
+        // Each identity component independently breaks an ordered run.
+        other[2].seed += 1;
+        other[4].family = "different-family".into();
+        other[6].transition_index = 9;
         samples.extend(other);
-        // A gap begins a new run; it must not be stitched to the preceding one.
-        samples[6].transition_index = 9;
 
         let windows = ordered_sigreg_windows(&samples, 3)?.expect("one complete window");
         assert_eq!(windows.windows, 1);
@@ -3828,6 +3828,17 @@ mod tests {
         let loaded: TrainConfig = serde_json::from_value(value)?;
         assert_eq!(loaded.sigreg_target, SigregTarget::Marginal);
         assert_eq!(loaded.sigreg_temporal_window, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_training_contract_without_tc_fields_is_rejected() -> Result<()> {
+        let contract = TrainingContract::from(&TrainConfig::default());
+        let mut value = serde_json::to_value(contract)?;
+        let object = value.as_object_mut().expect("training contract object");
+        object.remove("sigreg_target");
+        object.remove("sigreg_temporal_window");
+        assert!(serde_json::from_value::<TrainingContract>(value).is_err());
         Ok(())
     }
 

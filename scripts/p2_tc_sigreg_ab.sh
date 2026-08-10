@@ -7,25 +7,29 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 tofy_bin="${TOFY_BIN:-$repo_root/target/release/tofy}"
 candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 run_root="${P2_TC_SIGREG_ROOT:-$repo_root/runs/p2/tc-sigreg-v1}"
-physical_batch="${P2_TC_PHYSICAL_BATCH:-512}"
-grad_accum="${P2_TC_GRAD_ACCUM:-1}"
-eval_batch="${P2_TC_EVAL_BATCH:-$physical_batch}"
+eval_batch="${P2_TC_EVAL_BATCH:-1024}"
 gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-15}"
 
 : "${P2_EXPECTED_SHA:?set P2_EXPECTED_SHA to the reviewed Tofy commit}"
 : "${P2_EXPECTED_CANDLE_SHA:?set P2_EXPECTED_CANDLE_SHA to the reviewed candle_graph commit}"
 : "${P2_EXPECTED_BINARY_SHA:?set P2_EXPECTED_BINARY_SHA to the reviewed tofy binary hash}"
+: "${P2_TC_PHYSICAL_BATCH:?set P2_TC_PHYSICAL_BATCH from the passed A40 probe}"
+: "${P2_TC_GRAD_ACCUM:?set P2_TC_GRAD_ACCUM from the passed A40 probe}"
+: "${P2_TC_BATCH_PROBE:?set P2_TC_BATCH_PROBE to the passed probe.json}"
+physical_batch="$P2_TC_PHYSICAL_BATCH"
+grad_accum="$P2_TC_GRAD_ACCUM"
+
 for command in git jq nvidia-smi sha256sum awk realpath tee; do
   command -v "$command" >/dev/null || { printf 'missing required command: %s\n' "$command" >&2; exit 2; }
 done
 [[ -x "$tofy_bin" ]] || { printf 'missing reviewed binary: %s\n' "$tofy_bin" >&2; exit 2; }
 [[ -d "$candle_root/.git" ]] || { printf 'missing candle_graph checkout: %s\n' "$candle_root" >&2; exit 2; }
-[[ "$physical_batch" =~ ^[0-9]+$ ]] && ((10#$physical_batch >= 2)) || {
-  printf 'P2_TC_PHYSICAL_BATCH must be an integer >= 2\n' >&2; exit 2;
-}
-[[ "$grad_accum" =~ ^[1-9][0-9]*$ ]] || { printf 'P2_TC_GRAD_ACCUM must be >= 1\n' >&2; exit 2; }
-[[ "$eval_batch" =~ ^[0-9]+$ ]] && ((10#$eval_batch >= 1)) || {
-  printf 'P2_TC_EVAL_BATCH must be >= 1\n' >&2; exit 2;
+[[ "$physical_batch" =~ ^[1-9][0-9]*$ ]] || { printf 'invalid physical batch\n' >&2; exit 2; }
+[[ "$grad_accum" =~ ^[1-9][0-9]*$ ]] || { printf 'invalid gradient accumulation\n' >&2; exit 2; }
+[[ "$eval_batch" =~ ^[1-9][0-9]*$ ]] || { printf 'invalid evaluation batch\n' >&2; exit 2; }
+((physical_batch % 8 == 0)) || { printf 'physical batch must contain complete W=8 windows\n' >&2; exit 2; }
+((physical_batch * grad_accum == 1024)) || {
+  printf 'physical_batch * grad_accum must preserve effective batch 1024\n' >&2; exit 2;
 }
 
 git_sha="$(git -C "$repo_root" rev-parse HEAD)"
@@ -36,9 +40,26 @@ binary_sha="$(sha256sum "$tofy_bin" | awk '{print $1}')"
 [[ "$binary_sha" == "$P2_EXPECTED_BINARY_SHA" ]] || { printf 'binary SHA mismatch\n' >&2; exit 2; }
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || { printf 'dirty Tofy worktree\n' >&2; exit 2; }
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph worktree\n' >&2; exit 2; }
+[[ -s "$P2_TC_BATCH_PROBE" ]] || { printf 'missing batch probe: %s\n' "$P2_TC_BATCH_PROBE" >&2; exit 2; }
+jq -e \
+  --arg git_sha "$git_sha" --arg candle_sha "$candle_sha" --arg binary_sha "$binary_sha" \
+  --argjson physical "$physical_batch" --argjson accum "$grad_accum" \
+  '.schema == "p2.tc_sigreg_batch_probe.v1" and .status == "passed"
+    and .git_sha == $git_sha and .candle_git_sha == $candle_sha
+    and .binary_sha256 == $binary_sha and .physical_batch == $physical
+    and .grad_accum == $accum and .effective_batch == 1024
+    and .sigreg_target == "temporal_residual" and .sigreg_temporal_window == 8
+    and .completed_updates >= 2' "$P2_TC_BATCH_PROBE" >/dev/null || {
+  printf 'batch probe does not authorize this exact experiment\n' >&2; exit 2;
+}
+probe_sha="$(sha256sum "$P2_TC_BATCH_PROBE" | awk '{print $1}')"
 
 mkdir -p -- "$run_root"
 run_root="$(realpath "$run_root")"
+[[ ! -e "$run_root/seed-1" ]] || {
+  printf 'seed-1 run root already exists; refusing mixed or relabeled artifacts: %s\n' "$run_root" >&2
+  exit 2
+}
 
 sample_gpu() {
   while true; do
@@ -60,27 +81,31 @@ stop_sampler() {
 trap stop_sampler EXIT INT TERM
 
 run_arm() {
-  local seed="$1" arm="$2" target arm_dir update checkpoint eval_dir
+  local arm="$1" target arm_dir update checkpoint eval_dir started finished
   case "$arm" in
     control) target=marginal ;;
     temporal-residual) target=temporal-residual ;;
     *) printf 'invalid TC-SIGReg arm: %s\n' "$arm" >&2; return 2 ;;
   esac
-  arm_dir="$run_root/seed-$seed/$arm"
+  arm_dir="$run_root/seed-1/$arm"
   mkdir -p -- "$arm_dir/telemetry"
   jq -nc \
-    --arg schema p2.tc_sigreg_arm.v1 \
-    --arg arm "$arm" --arg target "$target" \
-    --arg git_sha "$git_sha" --arg candle_git_sha "$candle_sha" --arg binary_sha256 "$binary_sha" \
-    --argjson seed "$seed" --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
-    --argjson effective_batch "$((physical_batch * grad_accum))" \
-    '{schema:$schema,arm:$arm,sigreg_target:$target,seed:$seed,physical_batch:$physical_batch,grad_accum:$grad_accum,effective_batch:$effective_batch,git_sha:$git_sha,candle_git_sha:$candle_git_sha,binary_sha256:$binary_sha256,checkpoints:[250,500,750,1000],evaluation_updates:[250,500,750,1000]}' \
-    >"$arm_dir/run.json"
+    --arg schema p2.tc_sigreg_arm.v1 --arg arm "$arm" --arg target "$target" \
+    --arg git_sha "$git_sha" --arg candle_git_sha "$candle_sha" \
+    --arg binary_sha256 "$binary_sha" --arg batch_probe_sha256 "$probe_sha" \
+    --argjson physical_batch "$physical_batch" --argjson grad_accum "$grad_accum" \
+    '{schema:$schema,arm:$arm,sigreg_target:$target,seed:1,physical_batch:$physical_batch,
+      grad_accum:$grad_accum,effective_batch:1024,git_sha:$git_sha,candle_git_sha:$candle_git_sha,
+      binary_sha256:$binary_sha256,batch_probe_sha256:$batch_probe_sha256,
+      checkpoints:[250,500,750,1000],evaluation_updates:[250,500,750,1000]}' \
+    >"$arm_dir/run.json.tmp"
+  mv -- "$arm_dir/run.json.tmp" "$arm_dir/run.json"
 
   sample_gpu >>"$arm_dir/telemetry/gpu.csv" &
   sampler_pid=$!
+  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   "$tofy_bin" p2-train \
-    --device cuda --seed "$seed" --lessons sequential --steps-per-lesson 1000 \
+    --device cuda --seed 1 --lessons sequential --steps-per-lesson 1000 \
     --physical-batch "$physical_batch" --grad-accum "$grad_accum" \
     --checkpoint-every-steps 250 --profile-update 250 \
     --sigreg-target "$target" --sigreg-temporal-window 8 \
@@ -90,37 +115,39 @@ run_arm() {
     --event-weight 0 --q-weight 0 --rollout-weight 0 --prefix-weight 0 --reliability-weight 0 \
     --ensemble-members 1 --output-dir "$arm_dir" \
     > >(tee "$arm_dir/train.log") 2>&1
-  # Evaluation is intentionally after the trainer exits: no concurrent GPU-heavy process.
+  finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -nc --arg stage train --arg started_utc "$started" --arg finished_utc "$finished" \
+    '{stage:$stage,started_utc:$started_utc,finished_utc:$finished_utc,status:"passed"}' \
+    >>"$arm_dir/phases.jsonl"
+
+  # Evaluation starts only after the trainer exits; every GPU-heavy process is serialized.
   for update in 250 500 750 1000; do
     printf -v checkpoint '%s/checkpoints/step-%012d/model.safetensors' "$arm_dir" "$update"
     eval_dir="$arm_dir/eval-update-$update"
     [[ -s "$checkpoint" ]] || { printf 'missing checkpoint: %s\n' "$checkpoint" >&2; return 1; }
     mkdir -p -- "$eval_dir"
+    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     "$tofy_bin" p2-eval --checkpoint "$checkpoint" --train-config "$arm_dir/config.json" \
       --device cuda --seed 424242 --synthetic-episodes 64 --physical-batch "$eval_batch" \
       --ptrm-k 1 --ptrm-noise 0 --ensemble-members 1 \
       --episode-jsonl "$eval_dir/episodes.jsonl" --output "$eval_dir/eval_report.json" \
       > >(tee "$eval_dir/eval.log") 2>&1
-    sha256sum "$eval_dir/eval_report.json" >"$eval_dir/sha256.txt"
+    finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    sha256sum "$checkpoint" "$arm_dir/config.json" "$eval_dir/eval_report.json" \
+      "$eval_dir/episodes.jsonl" >"$eval_dir/sha256.txt"
+    jq -nc --arg stage "eval-$update" --arg started_utc "$started" --arg finished_utc "$finished" \
+      '{stage:$stage,started_utc:$started_utc,finished_utc:$finished_utc,status:"passed"}' \
+      >>"$arm_dir/phases.jsonl"
   done
   stop_sampler
 }
 
-# The two seed-1 arms are always serialized, preserving matched physical batch,
-# accumulation, ordered-window count, and one encoder-pair call per microbatch.
-run_arm 1 control
-run_arm 1 temporal-residual
-
-# Replication is opt-in and cannot start without an external gate result written by
-# the preregistered analysis. The default exits here, before seeds 2/3.
-if [[ "${P2_TC_RUN_SEEDS_2_3:-0}" != 1 ]]; then
-  printf 'seed-1 pilot complete; seeds 2/3 locked pending explicit gate result\n'
-  exit 0
-fi
-gate_result="${P2_TC_GATE_RESULT:?set P2_TC_GATE_RESULT to a passed seed-1 gate JSON}"
-jq -e '.schema == "p2.tc_sigreg_gate.v1" and .status == "passed" and .promotion == "run_seeds_2_3"' \
-  "$gate_result" >/dev/null || { printf 'seed-1 gate did not authorize seeds 2/3\n' >&2; exit 2; }
-for seed in 2 3; do
-  run_arm "$seed" control
-  run_arm "$seed" temporal-residual
-done
+run_arm control
+run_arm temporal-residual
+jq -nc --arg schema p2.tc_sigreg_pilot.v1 --arg git_sha "$git_sha" \
+  --arg binary_sha256 "$binary_sha" --arg batch_probe_sha256 "$probe_sha" \
+  '{schema:$schema,status:"seed_1_complete",promotion:"locked_pending_gate_analysis",seed:1,
+    arms:["control","temporal-residual"],git_sha:$git_sha,binary_sha256:$binary_sha256,
+    batch_probe_sha256:$batch_probe_sha256}' >"$run_root/pilot.json.tmp"
+mv -- "$run_root/pilot.json.tmp" "$run_root/pilot.json"
+printf 'seed-1 pilot complete; seeds 2/3 are not runnable from this launcher\n'
