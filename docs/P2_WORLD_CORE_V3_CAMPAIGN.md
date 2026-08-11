@@ -35,14 +35,17 @@ same-state factual groups.
 |---:|---|:---:|---:|---:|---|
 | 1 | global-control | no | 0 | 0 | fresh causal baseline |
 | 1 | spatial-residual | yes | 0 | 0 | isolate residual conditioning |
-| 1 | displacement-variance | yes | 0.02 | 0 | isolate scale-normalized spread |
-| 1 | displacement-decorrelated | yes | 0.02 | 0.002 | test independent displacement dimensions |
+| 1 | displacement-variance | yes | 0.3 | 0 | isolate scale-normalized spread |
+| 1 | displacement-decorrelated | yes | 0.3 | 0.03 | test independent displacement dimensions |
 | 2, 3 | global-control | no | 0 | 0 | matched baseline replication |
 | 2, 3 | spatial-residual | yes | 0 | 0 | matched treatment replication |
 
 The seed-2/3 pairs are predeclared replications of the architectural treatment,
 not automatic promotion based on seed 1. The health variants remain exploratory
-until their gradient pressure and factual metrics are inspected.
+until their gradient pressure and factual metrics are inspected. The health weights
+were calibrated by the two-update A40 probe: `0.02/0.002` produced only `0.00420x`
+prediction-gradient pressure, while `0.3/0.03` produced `0.06298x`, inside the desired
+`0.05–0.25` interval.
 
 ## Runtime and integrity controls
 

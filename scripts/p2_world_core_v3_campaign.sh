@@ -47,8 +47,8 @@ jq -e --arg git_sha "$git_sha" --arg candle_sha "$candle_sha" --arg binary_sha "
   "$P2_V3_BATCH_PROBE" >/dev/null
 jq -e --argjson physical "$physical_batch" '.world_core_v3 == true and .spatial_action_field == true
   and .spatial_action_residual == true and .spatial_action_residual_scale == 0.25
-  and .branch_learning.displacement_health.variance_weight == 0.02
-  and .branch_learning.displacement_health.covariance_weight == 0.002
+  and .branch_learning.displacement_health.variance_weight == 0.3
+  and .branch_learning.displacement_health.covariance_weight == 0.03
   and .branch_learning.displacement_norm_floor == 0.05
   and .physical_batch == $physical and .grad_accum == 1' "$probe_config" >/dev/null
 jq -e --argjson ratio "$(jq -er '.gradient_pressure.displacement_health_to_next_ratio' "$probe_report")" \
@@ -148,8 +148,8 @@ run_arm() {
 arms=(
   '1 global-control false 0 0'
   '1 spatial-residual true 0 0'
-  '1 displacement-variance true 0.02 0'
-  '1 displacement-decorrelated true 0.02 0.002'
+  '1 displacement-variance true 0.3 0'
+  '1 displacement-decorrelated true 0.3 0.03'
   '2 global-control false 0 0'
   '2 spatial-residual true 0 0'
   '3 global-control false 0 0'
