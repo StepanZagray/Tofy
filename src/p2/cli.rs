@@ -4,8 +4,10 @@
 //! Wiring into the top-level CLI is owned by the primary agent.
 
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
+use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::muon::MUON_RMS_SCALE;
+use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
@@ -208,6 +210,56 @@ pub struct P2TrainArgs {
 
     #[arg(long, default_value_t = true)]
     pub prefetch_batches: bool,
+
+    /// Train the intentionally checkpoint-incompatible factual world core.
+    #[arg(long, default_value_t = false)]
+    pub world_core_v2: bool,
+
+    /// Add localized ACTION6 fields while retaining global action identity.
+    #[arg(long, default_value_t = false)]
+    pub spatial_action_field: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub outcome_pull_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub outcome_push_weight: f64,
+
+    #[arg(long, default_value_t = 0.5)]
+    pub outcome_margin: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub action_recovery_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub coordinate_recovery_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub changed_margin_weight: f64,
+
+    #[arg(long, default_value_t = 0.1)]
+    pub changed_margin: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub spatial_variance_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub spatial_covariance_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub pooled_variance_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub pooled_covariance_weight: f64,
+
+    #[arg(long, default_value_t = 1.0)]
+    pub health_minimum_std: f32,
+
+    #[arg(long, default_value_t = 1e-4)]
+    pub health_epsilon: f32,
+
+    #[arg(long, default_value_t = 16_384)]
+    pub health_maximum_rows: usize,
 }
 
 impl P2TrainArgs {
@@ -276,6 +328,36 @@ impl P2TrainArgs {
             sigreg_temporal_window: self.sigreg_temporal_window,
             sigreg_global_mix: self.sigreg_global_mix,
             prefetch_batches: self.prefetch_batches,
+            world_core_v2: self.world_core_v2,
+            spatial_action_field: self.spatial_action_field,
+            branch_learning: BranchLearningConfig {
+                enabled: self.world_core_v2,
+                outcome_pull_weight: self.outcome_pull_weight,
+                outcome_push_weight: self.outcome_push_weight,
+                outcome_margin: self.outcome_margin,
+                action_recovery_weight: self.action_recovery_weight,
+                coordinate_recovery_weight: self.coordinate_recovery_weight,
+                changed_margin_weight: self.changed_margin_weight,
+                changed_margin: self.changed_margin,
+                spatial_health: (self.spatial_variance_weight > 0.0
+                    || self.spatial_covariance_weight > 0.0)
+                    .then_some(VicRegConfig {
+                        variance_weight: self.spatial_variance_weight as f32,
+                        covariance_weight: self.spatial_covariance_weight as f32,
+                        minimum_std: self.health_minimum_std,
+                        epsilon: self.health_epsilon,
+                        maximum_rows: self.health_maximum_rows,
+                    }),
+                pooled_health: (self.pooled_variance_weight > 0.0
+                    || self.pooled_covariance_weight > 0.0)
+                    .then_some(VicRegConfig {
+                        variance_weight: self.pooled_variance_weight as f32,
+                        covariance_weight: self.pooled_covariance_weight as f32,
+                        minimum_std: self.health_minimum_std,
+                        epsilon: self.health_epsilon,
+                        maximum_rows: self.health_maximum_rows,
+                    }),
+            },
         }
     }
 }

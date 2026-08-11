@@ -4061,6 +4061,7 @@ mod tests {
         reinit_varmap_deterministic(&varmap, train_cfg.seed)?;
         let report = TrainReport {
             schema: TRAIN_REPORT_SCHEMA.into(),
+            world_core_schema: "legacy_p2_eval_compatible".into(),
             seed: train_cfg.seed,
             physical_batch: train_cfg.physical_batch,
             grad_accum: 1,

@@ -106,6 +106,10 @@ pub struct ModelConfig {
     /// Use a spatial ACTION6 coordinate field instead of the legacy coordinate broadcast.
     #[serde(default)]
     pub spatial_action_field: bool,
+    /// Instantiate the action-faithful world-core-v2 heads. V2 checkpoints are
+    /// intentionally incompatible with legacy training checkpoints.
+    #[serde(default)]
+    pub world_core_v2: bool,
 }
 
 fn default_sigreg_projector_dim() -> usize {
@@ -128,6 +132,7 @@ impl Default for ModelConfig {
             sigreg_projector: false,
             sigreg_projector_dim: default_sigreg_projector_dim(),
             spatial_action_field: false,
+            world_core_v2: false,
         }
     }
 }
@@ -455,6 +460,9 @@ pub struct WorldModel {
     reliability_head: Linear,
     /// Direct one-step prefix delta from pooled state + action.
     prefix_head: Linear,
+    spatial_prefix_head: Option<Conv2d>,
+    action_decoder: Option<Linear>,
+    coordinate_decoder: Option<Linear>,
     /// Optional pre-RMS `B×C` → `B×D` projection used only by SIGReg.
     sigreg_projector: Option<Linear>,
 }
@@ -472,8 +480,7 @@ impl WorldModel {
                 )
             })
             .transpose()?;
-        let spatial_action_proj = cfg
-            .spatial_action_field
+        let spatial_action_proj = (cfg.world_core_v2 || cfg.spatial_action_field)
             .then(|| {
                 conv2d(
                     4,
@@ -483,6 +490,29 @@ impl WorldModel {
                     vb.pp("spatial_action_proj"),
                 )
             })
+            .transpose()?;
+        let spatial_prefix_head = cfg
+            .world_core_v2
+            .then(|| {
+                conv2d(
+                    cfg.hidden_dim * 2,
+                    cfg.hidden_dim,
+                    3,
+                    Conv2dConfig {
+                        padding: 1,
+                        ..Default::default()
+                    },
+                    vb.pp("spatial_prefix_head"),
+                )
+            })
+            .transpose()?;
+        let action_decoder = cfg
+            .world_core_v2
+            .then(|| linear(cfg.hidden_dim, ACTION_VOCAB, vb.pp("action_decoder")))
+            .transpose()?;
+        let coordinate_decoder = cfg
+            .world_core_v2
+            .then(|| linear(cfg.hidden_dim, 2, vb.pp("coordinate_decoder")))
             .transpose()?;
         Ok(Self {
             pixel_emb: embedding(PALETTE_SIZE, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
@@ -497,6 +527,9 @@ impl WorldModel {
             q_head: linear(cfg.hidden_dim, 1, vb.pp("q_head"))?,
             reliability_head: linear(cfg.hidden_dim, 1, vb.pp("reliability_head"))?,
             prefix_head: linear(cfg.hidden_dim * 2, cfg.hidden_dim, vb.pp("prefix_head"))?,
+            spatial_prefix_head,
+            action_decoder,
+            coordinate_decoder,
             sigreg_projector,
             config: cfg,
         })
@@ -697,7 +730,15 @@ impl WorldModel {
         let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
         let conditioned = state.broadcast_add(&action_bias)?;
         if !self.config.spatial_action_field {
-            let coords = self.coord_proj.forward(action_coords)?;
+            let mut coords = self.coord_proj.forward(action_coords)?;
+            if self.config.world_core_v2 {
+                let coordinate_active = actions
+                    .eq(6u32)?
+                    .to_dtype(coords.dtype())?
+                    .reshape((b, 1))?
+                    .broadcast_as(coords.dims())?;
+                coords = coords.mul(&coordinate_active)?;
+            }
             let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
             return conditioned.broadcast_add(&coord_bias).map_err(Into::into);
         }
@@ -1003,6 +1044,12 @@ impl WorldModel {
         action_coords: &Tensor,
     ) -> Result<Tensor> {
         let b = state.dim(0)?;
+        if let Some(spatial_prefix_head) = &self.spatial_prefix_head {
+            let conditioned = self.add_action(state, actions, action_coords)?;
+            let fused = Tensor::cat(&[state, &conditioned], 1)?;
+            let delta = spatial_prefix_head.forward(&fused)?;
+            return rms_norm_latent(&state.add(&delta)?);
+        }
         let pooled = pool_latent(state)?;
         let actions = match actions.rank() {
             1 => actions.clone(),
@@ -1018,6 +1065,31 @@ impl WorldModel {
         let (_, c, hh, ww) = state.dims4()?;
         let delta = delta.reshape((b, c, 1, 1))?.broadcast_as((b, c, hh, ww))?;
         rms_norm_latent(&state.add(&delta)?)
+    }
+
+    /// Recover action identity and ACTION6 coordinates from a predicted latent
+    /// displacement. This head is available only in world-core-v2 and is
+    /// trained on factual, board-effect-bearing branches.
+    pub fn decode_action_displacement(&self, displacement: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (_, channels) = displacement.dims2()?;
+        if channels != self.config.hidden_dim {
+            bail!(
+                "action displacement width {channels} != hidden_dim {}",
+                self.config.hidden_dim
+            );
+        }
+        let action_decoder = self
+            .action_decoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("action decoder requires world_core_v2"))?;
+        let coordinate_decoder = self
+            .coordinate_decoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinate decoder requires world_core_v2"))?;
+        Ok((
+            action_decoder.forward(displacement)?,
+            candle_nn::ops::sigmoid(&coordinate_decoder.forward(displacement)?)?,
+        ))
     }
 
     fn probe_step(

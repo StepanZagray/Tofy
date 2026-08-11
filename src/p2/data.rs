@@ -259,6 +259,117 @@ pub struct TransitionSample {
     pub oracle_latent: Option<Vec<f32>>,
 }
 
+/// Exact board-only result of one factual action. The bottom status row is
+/// deliberately excluded: it advances with the action budget even when the
+/// world itself did not change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardEffect {
+    pub changed: bool,
+    pub changed_cells: Vec<u16>,
+    /// Collision-free outcome key, meaningful only among branches that share
+    /// one current frame.
+    outcome_pixels: Vec<u8>,
+}
+
+/// One confirmed transition inside a same-state action comparison.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FactualActionBranch {
+    pub transition: TransitionSample,
+    pub board_effect: BoardEffect,
+    pub status_changed_cells: Vec<u16>,
+}
+
+/// Two or more factual actions executed from a byte-identical current frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BranchGroup {
+    branches: Vec<FactualActionBranch>,
+}
+
+impl FactualActionBranch {
+    pub fn try_from_transition(transition: TransitionSample) -> Result<Self> {
+        ensure!(
+            transition.current.width as usize == FRAME_SIDE
+                && transition.current.height as usize == FRAME_SIDE
+                && transition.next.width as usize == FRAME_SIDE
+                && transition.next.height as usize == FRAME_SIDE,
+            "factual branches require fixed {FRAME_SIDE}x{FRAME_SIDE} frames"
+        );
+        let status_start = (FRAME_SIDE - 1) * FRAME_SIDE;
+        let mut changed_cells = Vec::new();
+        let mut status_changed_cells = Vec::new();
+        for (index, (&before, &after)) in transition
+            .current
+            .pixels
+            .iter()
+            .zip(&transition.next.pixels)
+            .enumerate()
+        {
+            if before == after {
+                continue;
+            }
+            let index = u16::try_from(index).expect("64x64 cell index fits u16");
+            if usize::from(index) >= status_start {
+                status_changed_cells.push(index);
+            } else {
+                changed_cells.push(index);
+            }
+        }
+        let outcome_pixels = transition.next.pixels[..status_start].to_vec();
+        Ok(Self {
+            board_effect: BoardEffect {
+                changed: !changed_cells.is_empty(),
+                changed_cells,
+                outcome_pixels,
+            },
+            status_changed_cells,
+            transition,
+        })
+    }
+
+    pub fn outcome_equivalent(&self, other: &Self) -> bool {
+        self.board_effect.outcome_pixels == other.board_effect.outcome_pixels
+    }
+}
+
+impl BranchGroup {
+    pub fn try_new(branches: Vec<FactualActionBranch>) -> Result<Self> {
+        ensure!(
+            branches.len() >= 2,
+            "a factual branch group requires at least two branches"
+        );
+        let first = &branches[0].transition;
+        let mut actions = std::collections::BTreeSet::new();
+        for branch in &branches {
+            let transition = &branch.transition;
+            ensure!(
+                transition.current == first.current,
+                "all factual branches must share a byte-identical current frame"
+            );
+            ensure!(
+                transition.seed == first.seed && transition.episode_id == first.episode_id,
+                "all factual branches must share source provenance"
+            );
+            ensure!(
+                actions.insert((
+                    transition.action.id,
+                    transition.action.x,
+                    transition.action.y
+                )),
+                "factual branch actions must be distinct"
+            );
+        }
+        Ok(Self { branches })
+    }
+
+    pub fn branches(&self) -> &[FactualActionBranch] {
+        &self.branches
+    }
+
+    pub fn into_transitions(self) -> impl Iterator<Item = TransitionSample> {
+        self.branches.into_iter().map(|branch| branch.transition)
+    }
+}
+
 fn popcount_norm(bits: u32, denom: usize) -> f32 {
     let denom = denom.max(1) as f32;
     bits.count_ones() as f32 / denom
@@ -529,7 +640,6 @@ pub fn generate_coordinate_one_step(
         };
         let mut current_pixels = vec![palette::EMPTY; FRAME_SIDE * FRAME_SIDE];
         current_pixels[start_y * FRAME_SIDE + start_x] = palette::AGENT;
-        current_pixels[y as usize * FRAME_SIDE + x as usize] = palette::MARKER_BASE;
         let mut next_pixels = current_pixels.clone();
         next_pixels[start_y * FRAME_SIDE + start_x] = palette::EMPTY;
         next_pixels[y as usize * FRAME_SIDE + x as usize] = palette::AGENT;
@@ -645,6 +755,113 @@ pub fn generate_hazard_one_step(
         )?);
     }
     Ok(out)
+}
+
+fn generate_simulator_branch_group(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+) -> Result<BranchGroup> {
+    let scenario = generate(seed, episode_id, split);
+    let sim = Simulator::new(scenario.clone());
+    let mut state = State::initial(&scenario);
+    // Deterministically vary the shared source state without using the branch
+    // action itself to construct the observation.
+    let prefix_steps = (episode_id as usize) % 4;
+    for prefix in 0..prefix_steps {
+        let actions: Vec<_> = legal_actions(&scenario)
+            .into_iter()
+            .filter(|action| !matches!(action, Action::Undo))
+            .collect();
+        let action = actions[(episode_id as usize + prefix) % actions.len()];
+        state = apply_action(&sim, &state, action);
+    }
+    let branches = legal_actions(&scenario)
+        .into_iter()
+        .filter(|action| !matches!(action, Action::Undo))
+        .take(4)
+        .enumerate()
+        .map(|(index, action)| {
+            let next = apply_action(&sim, &state, action);
+            let mut sample = sample_from_transition_goal_free(
+                &scenario,
+                &state,
+                &next,
+                action,
+                "factual_branch",
+                index as u64,
+            )?;
+            sample.episode_id = episode_id;
+            FactualActionBranch::try_from_transition(sample)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    BranchGroup::try_new(branches)
+}
+
+fn generate_coordinate_branch_group(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+) -> Result<BranchGroup> {
+    let mut rng = rng_for(seed ^ 0xFAC7_A006, episode_id, split);
+    let start = (31u8, 31u8);
+    let mut current_pixels = vec![palette::EMPTY; FRAME_SIDE * FRAME_SIDE];
+    current_pixels[start.1 as usize * FRAME_SIDE + start.0 as usize] = palette::AGENT;
+    let mut current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?;
+    paint_status_ui(&mut current, 64, 0);
+    let mut coordinates = std::collections::BTreeSet::new();
+    while coordinates.len() < 4 {
+        let coordinate = (
+            rng.random_range(0..FRAME_SIDE) as u8,
+            rng.random_range(0..FRAME_SIDE - 1) as u8,
+        );
+        if coordinate != start {
+            coordinates.insert(coordinate);
+        }
+    }
+    let branches = coordinates
+        .into_iter()
+        .enumerate()
+        .map(|(index, (x, y))| {
+            let mut next_pixels = current.pixels.clone();
+            next_pixels[start.1 as usize * FRAME_SIDE + start.0 as usize] = palette::EMPTY;
+            next_pixels[y as usize * FRAME_SIDE + x as usize] = palette::AGENT;
+            let mut next = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?;
+            paint_status_ui(&mut next, 64, 1);
+            FactualActionBranch::try_from_transition(TransitionSample {
+                current: current.clone(),
+                next,
+                action: ArcAction::new(6, Some(x), Some(y))?,
+                goal_features: GoalFeatures::zeros(),
+                noop: Some(false),
+                goal_satisfied: None,
+                goal_failed: None,
+                exhausted: Some(false),
+                split,
+                family: "factual_coordinate_branch".into(),
+                seed,
+                episode_id,
+                transition_index: index as u64,
+                oracle_latent: Some(oracle_latent_from_frame(&current)),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    BranchGroup::try_new(branches)
+}
+
+/// Phase-1B factual experience: four different confirmed actions from one
+/// unchanged current state. Alternating groups cover simulator movement and
+/// marker-free ACTION6 coordinate transitions.
+pub fn generate_factual_branch_group(
+    seed: u64,
+    episode_id: u64,
+    split: Split,
+) -> Result<BranchGroup> {
+    if episode_id % 2 == 0 {
+        generate_simulator_branch_group(seed, episode_id, split)
+    } else {
+        generate_coordinate_branch_group(seed, episode_id, split)
+    }
 }
 
 fn interleave<T>(left: Vec<T>, right: Vec<T>) -> Vec<T> {
@@ -896,6 +1113,9 @@ pub fn generate_curriculum(
     split: Split,
 ) -> Result<Vec<TransitionSample>> {
     match kind {
+        "factual_branches" => Ok(generate_factual_branch_group(seed, episode_id, split)?
+            .into_transitions()
+            .collect()),
         "random_one_step" => Ok(interleave(
             interleave(
                 generate_random_one_step(seed, episode_id, split, 2)?,
@@ -1063,6 +1283,11 @@ mod tests {
             .expect("coordinate sample");
         assert_eq!(coord.action.id, 6);
         assert!(coord.action.x.is_some() && coord.action.y.is_some());
+        assert!(coord
+            .current
+            .pixels
+            .iter()
+            .all(|&pixel| { !(palette::MARKER_BASE..palette::COLLECTIBLE).contains(&pixel) }));
         assert!(a.iter().any(|s| s.family == "action5_interact"));
         assert!(a.iter().any(|s| s.family == "hazard_failure"));
 
@@ -1116,6 +1341,46 @@ mod tests {
             .iter()
             .filter(|s| s.family == "dynamics")
             .all(|s| s.goal_satisfied.is_none()));
+    }
+
+    #[test]
+    fn factual_groups_preserve_shared_state_and_board_only_effects() -> Result<()> {
+        let movement = generate_factual_branch_group(17, 2, Split::Train)?;
+        assert_eq!(movement.branches().len(), 4);
+        assert!(movement
+            .branches()
+            .windows(2)
+            .all(|pair| pair[0].transition.current == pair[1].transition.current));
+        assert!(movement
+            .branches()
+            .iter()
+            .all(|branch| !branch.status_changed_cells.is_empty()));
+
+        let coordinate = generate_factual_branch_group(17, 3, Split::Train)?;
+        assert_eq!(coordinate.branches().len(), 4);
+        let current = &coordinate.branches()[0].transition.current;
+        assert_eq!(
+            current
+                .pixels
+                .iter()
+                .filter(|&&pixel| pixel == palette::AGENT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            current
+                .pixels
+                .iter()
+                .filter(|&&pixel| (palette::MARKER_BASE..palette::COLLECTIBLE).contains(&pixel))
+                .count(),
+            0,
+            "ACTION6 target coordinates must not leak through marker pixels"
+        );
+        assert!(coordinate
+            .branches()
+            .iter()
+            .all(|branch| branch.board_effect.changed));
+        Ok(())
     }
 
     #[test]
