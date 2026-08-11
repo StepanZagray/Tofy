@@ -8,6 +8,164 @@ use std::collections::BTreeMap;
 /// Default maximum host rows retained for each representation seam.
 pub const DEFAULT_REPRESENTATION_ROW_CAP: usize = 8192;
 
+/// Configuration for the VICReg-style latent health penalty.
+///
+/// The penalty is evaluated in F32. `maximum_rows` bounds the covariance
+/// computation; selected row positions are deterministic in the canonical
+/// logical order, rather than depending on random sampling or device state.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VicRegConfig {
+    pub variance_weight: f32,
+    pub covariance_weight: f32,
+    pub minimum_std: f32,
+    pub epsilon: f32,
+    pub maximum_rows: usize,
+}
+
+impl Default for VicRegConfig {
+    fn default() -> Self {
+        Self {
+            variance_weight: 25.0,
+            covariance_weight: 1.0,
+            minimum_std: 1.0,
+            epsilon: 1e-4,
+            maximum_rows: DEFAULT_REPRESENTATION_ROW_CAP,
+        }
+    }
+}
+
+impl VicRegConfig {
+    /// Reject settings that would make the regularizer undefined or misleading.
+    pub fn validate(&self) -> Result<()> {
+        if !self.variance_weight.is_finite() || self.variance_weight < 0.0 {
+            bail!("VICReg variance_weight must be finite and >= 0");
+        }
+        if !self.covariance_weight.is_finite() || self.covariance_weight < 0.0 {
+            bail!("VICReg covariance_weight must be finite and >= 0");
+        }
+        if !self.minimum_std.is_finite() || self.minimum_std <= 0.0 {
+            bail!("VICReg minimum_std must be finite and > 0");
+        }
+        if !self.epsilon.is_finite() || self.epsilon <= 0.0 {
+            bail!("VICReg epsilon must be finite and > 0");
+        }
+        if self.maximum_rows < 2 {
+            bail!("VICReg maximum_rows must be >= 2");
+        }
+        Ok(())
+    }
+}
+
+/// Differentiable components of a [`vicreg_latent_health`] evaluation.
+///
+/// `variance` and `covariance` are unweighted scalar terms. `weighted_total`
+/// is the scalar to add to the consumer's loss, and `rows` records the exact
+/// deterministic sample size used for both terms.
+#[derive(Debug, Clone)]
+pub struct VicRegLoss {
+    pub variance: Tensor,
+    pub covariance: Tensor,
+    pub weighted_total: Tensor,
+    pub rows: usize,
+}
+
+/// Flatten rank-2 pooled or rank-4 spatial latents into canonical `rows × C`.
+///
+/// Spatial rows use `B×H×W×C` order. This establishes a stable logical row
+/// population before any cap is applied, independent of physical layout.
+fn vicreg_rows(latents: &Tensor) -> Result<Tensor> {
+    match latents.rank() {
+        2 => Ok(latents.clone()),
+        4 => {
+            let (batch, channels, height, width) = latents.dims4()?;
+            latents
+                .permute((0, 2, 3, 1))?
+                .contiguous()?
+                .reshape((batch * height * width, channels))
+                .map_err(Into::into)
+        }
+        rank => bail!("VICReg latents must be rank 2 (B×C) or rank 4 (B×C×H×W), got {rank}"),
+    }
+}
+
+/// Return evenly distributed canonical row positions, including both ends.
+///
+/// This has no RNG or host value dependency: identical logical latent rows
+/// receive identical selection regardless of device execution details.
+fn vicreg_row_indices(rows: usize, maximum_rows: usize) -> Result<Vec<u32>> {
+    if rows <= maximum_rows {
+        return (0..rows)
+            .map(|row| u32::try_from(row).map_err(|_| anyhow::anyhow!("VICReg row index overflow")))
+            .collect();
+    }
+    (0..maximum_rows)
+        .map(|selected| {
+            u32::try_from(selected * (rows - 1) / (maximum_rows - 1))
+                .map_err(|_| anyhow::anyhow!("VICReg row index overflow"))
+        })
+        .collect()
+}
+
+/// Compute VICReg-style variance and covariance health penalties for latents.
+///
+/// The input remains on its current autograd path: F32 conversion, reshape,
+/// row selection, centering, and both penalty terms are Candle operations with
+/// live gradients. The covariance term is the mean squared off-diagonal entry
+/// of the unbiased feature covariance matrix (zero for a one-channel latent).
+pub fn vicreg_latent_health(latents: &Tensor, config: VicRegConfig) -> Result<VicRegLoss> {
+    config.validate()?;
+    let rows = vicreg_rows(latents)?.to_dtype(DType::F32)?;
+    let row_count = rows.dim(0)?;
+    let channels = rows.dim(1)?;
+    if row_count < 2 {
+        bail!("VICReg requires at least two latent rows, got {row_count}");
+    }
+    if channels == 0 {
+        bail!("VICReg requires at least one latent channel");
+    }
+
+    let selected_indices = vicreg_row_indices(row_count, config.maximum_rows)?;
+    let selected_rows = selected_indices.len();
+    let indices = Tensor::from_vec(selected_indices, (selected_rows,), rows.device())?;
+    let rows = rows.index_select(&indices, 0)?;
+
+    let std = rows
+        .var(0)?
+        .affine(1.0, f64::from(config.epsilon))?
+        .sqrt()?;
+    let variance = std
+        .affine(-1.0, f64::from(config.minimum_std))?
+        .relu()?
+        .mean_all()?;
+
+    let centered = rows.broadcast_sub(&rows.mean_keepdim(0)?)?;
+    let covariance = centered
+        .transpose(0, 1)?
+        .matmul(&centered)?
+        .affine(1.0 / (selected_rows - 1) as f64, 0.0)?;
+    let covariance = if channels == 1 {
+        covariance.zeros_like()?.sum_all()?
+    } else {
+        let off_diagonal = Tensor::ones((channels, channels), DType::F32, rows.device())?
+            .sub(&Tensor::eye(channels, DType::F32, rows.device())?)?;
+        covariance
+            .sqr()?
+            .mul(&off_diagonal)?
+            .sum_all()?
+            .affine(1.0 / (channels * (channels - 1)) as f64, 0.0)?
+    };
+    let weighted_total = variance
+        .affine(f64::from(config.variance_weight), 0.0)?
+        .add(&covariance.affine(f64::from(config.covariance_weight), 0.0)?)?;
+
+    Ok(VicRegLoss {
+        variance,
+        covariance,
+        weighted_total,
+        rows: selected_rows,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepresentationSeam {
@@ -363,7 +521,102 @@ pub fn summarize_seam(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, Var};
+
+    #[test]
+    fn vicreg_rejects_invalid_config_and_too_few_rows() -> Result<()> {
+        let device = Device::Cpu;
+        let one_row = Tensor::zeros((1, 2), DType::F32, &device)?;
+        assert!(vicreg_latent_health(&one_row, VicRegConfig::default()).is_err());
+        assert!(VicRegConfig {
+            maximum_rows: 1,
+            ..VicRegConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(VicRegConfig {
+            epsilon: 0.0,
+            ..VicRegConfig::default()
+        }
+        .validate()
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vicreg_orders_healthy_latents_below_collapsed_latents() -> Result<()> {
+        let device = Device::Cpu;
+        let config = VicRegConfig {
+            variance_weight: 1.0,
+            covariance_weight: 1.0,
+            minimum_std: 0.9,
+            epsilon: 1e-4,
+            maximum_rows: 16,
+        };
+        let healthy = Tensor::from_vec(vec![1f32, 0., -1., 0., 0., 1., 0., -1.], (4, 2), &device)?;
+        let collapsed = Tensor::zeros((4, 2), DType::F32, &device)?;
+        let healthy = vicreg_latent_health(&healthy, config)?;
+        let collapsed = vicreg_latent_health(&collapsed, config)?;
+        assert_eq!(healthy.rows, 4);
+        assert!(
+            healthy.weighted_total.to_vec0::<f32>()? < collapsed.weighted_total.to_vec0::<f32>()?
+        );
+        assert!(healthy.covariance.to_vec0::<f32>()? < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn vicreg_spatial_rows_are_canonical_and_capped_deterministically() -> Result<()> {
+        let device = Device::Cpu;
+        let latents = Tensor::from_vec((0..16).map(|v| v as f32).collect(), (2, 2, 2, 2), &device)?;
+        let loss = vicreg_latent_health(
+            &latents,
+            VicRegConfig {
+                maximum_rows: 3,
+                ..VicRegConfig::default()
+            },
+        )?;
+        assert_eq!(loss.rows, 3);
+        assert!(loss.weighted_total.to_vec0::<f32>()?.is_finite());
+        assert_eq!(vicreg_row_indices(8, 3)?, vec![0, 3, 7]);
+        Ok(())
+    }
+
+    #[test]
+    fn vicreg_one_channel_covariance_is_a_scalar_zero() -> Result<()> {
+        let device = Device::Cpu;
+        let latents = Tensor::from_vec(vec![1f32, -1., 0.5, -0.5], (4, 1), &device)?;
+        let loss = vicreg_latent_health(&latents, VicRegConfig::default())?;
+        assert_eq!(loss.covariance.to_vec0::<f32>()?, 0.0);
+        assert!(loss.weighted_total.to_vec0::<f32>()?.is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn vicreg_backward_produces_finite_input_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let variable = Var::new(&[0f32, 0., 1., 0., -1., 0.5, 0.4, -0.9], &device)?;
+        let latents = variable.as_tensor().reshape((4, 2))?;
+        let loss = vicreg_latent_health(
+            &latents,
+            VicRegConfig {
+                variance_weight: 1.0,
+                covariance_weight: 1.0,
+                minimum_std: 1.2,
+                epsilon: 1e-4,
+                maximum_rows: 4,
+            },
+        )?;
+        let gradients = loss.weighted_total.backward()?;
+        let gradient = gradients
+            .get(&variable)
+            .expect("VICReg should retain input gradients")
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(gradient.iter().all(|value| value.is_finite()));
+        assert!(gradient.iter().any(|value| *value != 0.0));
+        Ok(())
+    }
 
     #[test]
     fn constant_rows_fail_variance_and_rank_gates() -> Result<()> {
