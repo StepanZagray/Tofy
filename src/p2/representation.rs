@@ -166,6 +166,55 @@ pub fn vicreg_latent_health(latents: &Tensor, config: VicRegConfig) -> Result<Vi
     })
 }
 
+/// VICReg variance with a scale-normalized off-diagonal correlation penalty.
+///
+/// This variant is intended for already semantically selected displacement
+/// rows. Per-feature standard deviations stay on the autograd path: the
+/// variance term observes feature spread after scalar population normalization,
+/// while correlation has no radial scale gradient.
+pub fn vicreg_displacement_health(latents: &Tensor, config: VicRegConfig) -> Result<VicRegLoss> {
+    let base = vicreg_latent_health(latents, config)?;
+    let rows = vicreg_rows(latents)?.to_dtype(DType::F32)?;
+    let row_count = rows.dim(0)?;
+    let channels = rows.dim(1)?;
+    let selected_indices = vicreg_row_indices(row_count, config.maximum_rows)?;
+    let selected_rows = selected_indices.len();
+    let indices = Tensor::from_vec(selected_indices, (selected_rows,), rows.device())?;
+    let rows = rows.index_select(&indices, 0)?;
+    let centered = rows.broadcast_sub(&rows.mean_keepdim(0)?)?;
+    let std = centered
+        .var(0)?
+        .affine(1.0, f64::from(config.epsilon))?
+        .sqrt()?
+        .clamp(f64::from(config.epsilon).sqrt(), f64::INFINITY)?;
+    let standardized = centered.broadcast_div(&std)?;
+    let correlation = standardized
+        .transpose(0, 1)?
+        .matmul(&standardized)?
+        .affine(1.0 / (selected_rows - 1) as f64, 0.0)?;
+    let covariance = if channels == 1 {
+        correlation.zeros_like()?.sum_all()?
+    } else {
+        let off_diagonal = Tensor::ones((channels, channels), DType::F32, rows.device())?
+            .sub(&Tensor::eye(channels, DType::F32, rows.device())?)?;
+        correlation
+            .sqr()?
+            .mul(&off_diagonal)?
+            .sum_all()?
+            .affine(1.0 / (channels * (channels - 1)) as f64, 0.0)?
+    };
+    let weighted_total = base
+        .variance
+        .affine(f64::from(config.variance_weight), 0.0)?
+        .add(&covariance.affine(f64::from(config.covariance_weight), 0.0)?)?;
+    Ok(VicRegLoss {
+        variance: base.variance,
+        covariance,
+        weighted_total,
+        rows: selected_rows,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepresentationSeam {
@@ -615,6 +664,59 @@ mod tests {
             .to_vec1::<f32>()?;
         assert!(gradient.iter().all(|value| value.is_finite()));
         assert!(gradient.iter().any(|value| *value != 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn displacement_correlation_is_invariant_to_feature_scale() -> Result<()> {
+        let device = Device::Cpu;
+        let values = Tensor::from_vec(
+            vec![1f32, 2., -1., -2., 0.5, -0.25, -0.5, 0.25],
+            (4, 2),
+            &device,
+        )?;
+        let scaled = values.broadcast_mul(&Tensor::new(&[3f32, 0.2], &device)?)?;
+        let config = VicRegConfig {
+            variance_weight: 0.0,
+            covariance_weight: 1.0,
+            minimum_std: 0.1,
+            epsilon: 1e-8,
+            maximum_rows: 4,
+        };
+        let first = vicreg_displacement_health(&values, config)?
+            .covariance
+            .to_scalar::<f32>()?;
+        let second = vicreg_displacement_health(&scaled, config)?
+            .covariance
+            .to_scalar::<f32>()?;
+        assert!((first - second).abs() < 1e-4, "{first} != {second}");
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_normalized_displacement_health_has_no_radial_scale_gradient() -> Result<()> {
+        let device = Device::Cpu;
+        let variable = Var::new(&[1f32, 2., -1., -2., 0.5, -0.25, -0.5, 0.25], &device)?;
+        let values = variable.as_tensor().reshape((4, 2))?;
+        let rms = values.sqr()?.mean_all()?.sqrt()?;
+        let normalized = values.broadcast_div(&rms)?;
+        let loss = vicreg_displacement_health(
+            &normalized,
+            VicRegConfig {
+                variance_weight: 1.0,
+                covariance_weight: 1.0,
+                minimum_std: 1.0,
+                epsilon: 1e-8,
+                maximum_rows: 4,
+            },
+        )?;
+        let gradients = loss.weighted_total.backward()?;
+        let gradient = gradients
+            .get(&variable)
+            .expect("normalized health should retain directional gradients")
+            .reshape((4, 2))?;
+        let radial = gradient.mul(&values)?.sum_all()?.to_scalar::<f32>()?;
+        assert!(radial.abs() < 1e-5, "radial gradient was {radial}");
         Ok(())
     }
 

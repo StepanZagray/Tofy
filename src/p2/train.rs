@@ -4,6 +4,7 @@ use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
 use crate::p2::branch_learning::{
     branch_learning_loss, BranchLearningAudit, BranchLearningConfig, WORLD_CORE_V2_SCHEMA,
+    WORLD_CORE_V3_SCHEMA,
 };
 use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCapture};
 use crate::p2::data::{
@@ -245,9 +246,17 @@ pub struct TrainConfig {
     /// Intentionally checkpoint-incompatible action-faithful world core.
     #[serde(default)]
     pub world_core_v2: bool,
+    /// V3 experiment schema: V2 topology plus residual spatial conditioning
+    /// and scale-normalized factual displacement health.
+    #[serde(default)]
+    pub world_core_v3: bool,
     /// Localized ACTION6 conditioning, independently switchable inside V2.
     #[serde(default)]
     pub spatial_action_field: bool,
+    #[serde(default)]
+    pub spatial_action_residual: bool,
+    #[serde(default = "default_spatial_action_residual_scale")]
+    pub spatial_action_residual_scale: f64,
     #[serde(default)]
     pub branch_learning: BranchLearningConfig,
 }
@@ -327,6 +336,10 @@ fn default_prefetch_batches() -> bool {
     true
 }
 
+fn default_spatial_action_residual_scale() -> f64 {
+    0.25
+}
+
 fn sync_cuda_device(device: &Device) -> Result<()> {
     if device.is_cuda() {
         device.synchronize()?;
@@ -401,7 +414,10 @@ impl Default for TrainConfig {
             sigreg_global_mix: 0.0,
             prefetch_batches: true,
             world_core_v2: false,
+            world_core_v3: false,
             spatial_action_field: false,
+            spatial_action_residual: false,
+            spatial_action_residual_scale: default_spatial_action_residual_scale(),
             branch_learning: BranchLearningConfig::default(),
         }
     }
@@ -489,8 +505,23 @@ impl TrainConfig {
         if self.world_core_v2 != self.branch_learning.enabled {
             bail!("world_core_v2 and branch_learning.enabled must match");
         }
+        if self.world_core_v3 && !self.world_core_v2 {
+            bail!("world_core_v3 requires the world_core_v2 base topology");
+        }
         if self.spatial_action_field && !self.world_core_v2 {
             bail!("spatial_action_field requires world_core_v2");
+        }
+        if self.spatial_action_residual && (!self.world_core_v3 || !self.spatial_action_field) {
+            bail!("spatial_action_residual requires world_core_v3 and spatial_action_field");
+        }
+        if !self.spatial_action_residual_scale.is_finite()
+            || self.spatial_action_residual_scale <= 0.0
+            || self.spatial_action_residual_scale > 1.0
+        {
+            bail!("spatial_action_residual_scale must be finite and in (0,1]");
+        }
+        if !self.world_core_v3 && self.branch_learning.displacement_health.is_some() {
+            bail!("displacement_health requires world_core_v3");
         }
         if self.world_core_v2 && self.sigreg_weight > 0.0 {
             bail!("world_core_v2 uses consumer-latent health; set sigreg_weight=0");
@@ -521,7 +552,10 @@ impl TrainConfig {
             sigreg_projector: self.sigreg_projector,
             sigreg_projector_dim: self.sigreg_projector_dim,
             spatial_action_field: self.spatial_action_field,
+            spatial_action_residual: self.spatial_action_residual,
+            spatial_action_residual_scale: self.spatial_action_residual_scale,
             world_core_v2: self.world_core_v2,
+            world_core_v3: self.world_core_v3,
         }
     }
 }
@@ -560,6 +594,10 @@ pub struct LessonLossMeans {
     #[serde(default)]
     pub pooled_covariance: f64,
     #[serde(default)]
+    pub displacement_variance: f64,
+    #[serde(default)]
+    pub displacement_covariance: f64,
+    #[serde(default)]
     pub branch_groups: f64,
     #[serde(default)]
     pub changed_branches: f64,
@@ -575,6 +613,10 @@ pub struct LessonLossMeans {
     pub spatial_population_rows: f64,
     #[serde(default)]
     pub pooled_population_rows: f64,
+    #[serde(default)]
+    pub displacement_population_rows: f64,
+    #[serde(default)]
+    pub unique_changed_outcomes: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -638,6 +680,12 @@ pub struct GradientPressureDiagnostics {
     pub encoder_next_latent_l2: f64,
     pub encoder_sigreg_weighted_l2: f64,
     pub sigreg_to_next_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_next_latent_l2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_health_weighted_l2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_health_to_next_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -705,6 +753,12 @@ struct TrainingContract {
     #[serde(default)]
     spatial_action_field: bool,
     #[serde(default)]
+    world_core_v3: bool,
+    #[serde(default)]
+    spatial_action_residual: bool,
+    #[serde(default = "default_spatial_action_residual_scale")]
+    spatial_action_residual_scale: f64,
+    #[serde(default)]
     branch_learning: BranchLearningConfig,
     device: String,
     adam_beta1: f64,
@@ -766,7 +820,10 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_temporal_window: cfg.sigreg_temporal_window,
             sigreg_global_mix: cfg.sigreg_global_mix,
             world_core_v2: cfg.world_core_v2,
+            world_core_v3: cfg.world_core_v3,
             spatial_action_field: cfg.spatial_action_field,
+            spatial_action_residual: cfg.spatial_action_residual,
+            spatial_action_residual_scale: cfg.spatial_action_residual_scale,
             branch_learning: cfg.branch_learning.clone(),
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
@@ -891,6 +948,27 @@ pub fn reinit_varmap_deterministic(varmap: &VarMap, master_seed: u64) -> Result<
         };
         let t = Tensor::from_vec(values, shape.as_slice(), var.device())?.to_dtype(var.dtype())?;
         var.set(&t)?;
+    }
+    Ok(())
+}
+
+/// V3 starts as the exact global-coordinate control: the shared spatial
+/// residual projection is zero in every arm and learns only when its gate is
+/// enabled. This removes an initialization-scale shock from the intervention.
+fn zero_v3_spatial_residual(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.starts_with("spatial_action_proj."))
+    {
+        let zero = Tensor::zeros(var.shape(), var.dtype(), var.device())?;
+        var.set(&zero)
+            .with_context(|| format!("zero V3 residual parameter {name}"))?;
+        matched += 1;
+    }
+    if matched == 0 {
+        bail!("V3 residual initialization found no spatial_action_proj parameters");
     }
     Ok(())
 }
@@ -1958,6 +2036,28 @@ fn gradient_l2_for_parameter_prefix(
     Ok(norm)
 }
 
+fn gradient_l2_all_parameters(grads: &GradStore, varmap: &VarMap) -> Result<f64> {
+    let data = varmap.data().lock().unwrap();
+    let mut sum_sq: Option<Tensor> = None;
+    for var in data.values() {
+        if let Some(gradient) = grads.get(var.as_tensor()) {
+            let squared = gradient.to_dtype(DType::F32)?.sqr()?.sum_all()?;
+            sum_sq = Some(match sum_sq {
+                None => squared,
+                Some(acc) => acc.add(&squared)?,
+            });
+        }
+    }
+    let norm = sum_sq
+        .ok_or_else(|| anyhow::anyhow!("no gradients found for model parameters"))?
+        .sqrt()?
+        .to_scalar::<f32>()? as f64;
+    if !norm.is_finite() {
+        bail!("global gradient norm is not finite: {norm}");
+    }
+    Ok(norm)
+}
+
 #[derive(Debug, Clone)]
 pub struct LossBreakdown {
     pub total: Tensor,
@@ -1980,6 +2080,8 @@ pub struct LossBreakdown {
     pub spatial_covariance: Tensor,
     pub pooled_variance: Tensor,
     pub pooled_covariance: Tensor,
+    pub displacement_variance: Tensor,
+    pub displacement_covariance: Tensor,
     pub branch_audit: BranchLearningAudit,
 }
 
@@ -2004,6 +2106,8 @@ struct CheckedTrainingLosses {
     spatial_covariance: f32,
     pooled_variance: f32,
     pooled_covariance: f32,
+    displacement_variance: f32,
+    displacement_covariance: f32,
 }
 
 fn training_loss_tensors(
@@ -2011,7 +2115,7 @@ fn training_loss_tensors(
     rollout: &Tensor,
     prefix_multi: &Tensor,
     total: &Tensor,
-) -> [Tensor; 22] {
+) -> [Tensor; 24] {
     [
         losses.next_latent.detach(),
         rollout.detach(),
@@ -2034,12 +2138,14 @@ fn training_loss_tensors(
         losses.spatial_covariance.detach(),
         losses.pooled_variance.detach(),
         losses.pooled_covariance.detach(),
+        losses.displacement_variance.detach(),
+        losses.displacement_covariance.detach(),
         total.detach(),
     ]
 }
 
-fn checked_training_losses(tensors: &[[Tensor; 22]]) -> Result<Vec<CheckedTrainingLosses>> {
-    const NAMES: [&str; 22] = [
+fn checked_training_losses(tensors: &[[Tensor; 24]]) -> Result<Vec<CheckedTrainingLosses>> {
+    const NAMES: [&str; 24] = [
         "next_latent",
         "rollout",
         "sigreg_raw",
@@ -2061,6 +2167,8 @@ fn checked_training_losses(tensors: &[[Tensor; 22]]) -> Result<Vec<CheckedTraini
         "spatial_covariance",
         "pooled_variance",
         "pooled_covariance",
+        "displacement_variance",
+        "displacement_covariance",
         "total",
     ];
     let named = tensors
@@ -2069,9 +2177,9 @@ fn checked_training_losses(tensors: &[[Tensor; 22]]) -> Result<Vec<CheckedTraini
         .collect::<Vec<_>>();
     let values = ensure_all_finite(&named)?;
     Ok(values
-        .chunks_exact(22)
+        .chunks_exact(24)
         .map(|values| CheckedTrainingLosses {
-            total: values[21],
+            total: values[23],
             next_latent: values[0],
             rollout: values[1],
             sigreg_raw: values[2],
@@ -2090,6 +2198,8 @@ fn checked_training_losses(tensors: &[[Tensor; 22]]) -> Result<Vec<CheckedTraini
             spatial_covariance: values[18],
             pooled_variance: values[19],
             pooled_covariance: values[20],
+            displacement_variance: values[21],
+            displacement_covariance: values[22],
         })
         .collect())
 }
@@ -2596,6 +2706,8 @@ fn leworld_loss_with_sigreg_windows(
         spatial_covariance: branch.spatial_covariance,
         pooled_variance: branch.pooled_variance,
         pooled_covariance: branch.pooled_covariance,
+        displacement_variance: branch.displacement_variance,
+        displacement_covariance: branch.displacement_covariance,
         branch_audit: branch.audit,
     })
 }
@@ -3273,6 +3385,8 @@ fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
         spatial_covariance: sums.spatial_covariance / n,
         pooled_variance: sums.pooled_variance / n,
         pooled_covariance: sums.pooled_covariance / n,
+        displacement_variance: sums.displacement_variance / n,
+        displacement_covariance: sums.displacement_covariance / n,
         branch_groups: sums.branch_groups / n,
         changed_branches: sums.changed_branches / n,
         equivalent_pairs: sums.equivalent_pairs / n,
@@ -3281,6 +3395,8 @@ fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
         action_recovery_branches: sums.action_recovery_branches / n,
         spatial_population_rows: sums.spatial_population_rows / n,
         pooled_population_rows: sums.pooled_population_rows / n,
+        displacement_population_rows: sums.displacement_population_rows / n,
+        unique_changed_outcomes: sums.unique_changed_outcomes / n,
     }
 }
 
@@ -3294,7 +3410,9 @@ fn build_report(
 ) -> TrainReport {
     TrainReport {
         schema: TRAIN_REPORT_SCHEMA.into(),
-        world_core_schema: if cfg.world_core_v2 {
+        world_core_schema: if cfg.world_core_v3 {
+            WORLD_CORE_V3_SCHEMA.into()
+        } else if cfg.world_core_v2 {
             WORLD_CORE_V2_SCHEMA.into()
         } else {
             "legacy_p2_eval_compatible".into()
@@ -3372,6 +3490,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         load_training_checkpoint(bundle, cfg, &mut varmap, &mut optimizer)?
     } else {
         reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        if cfg.world_core_v3 {
+            zero_v3_spatial_residual(&varmap)?;
+        }
         TrainerState {
             schema: TRAINER_STATE_SCHEMA.into(),
             contract: TrainingContract::from(cfg),
@@ -3701,29 +3822,63 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 micro_losses.branch_audit.spatial_population_rows as f64 * inv;
             step_metrics.pooled_population_rows +=
                 micro_losses.branch_audit.pooled_population_rows as f64 * inv;
+            step_metrics.displacement_population_rows +=
+                micro_losses.branch_audit.displacement_population_rows as f64 * inv;
+            step_metrics.unique_changed_outcomes +=
+                micro_losses.branch_audit.unique_changed_outcomes as f64 * inv;
             let pressure_update = cfg.profile_update.saturating_sub(1).max(1);
             if micro == 0
                 && state.gradient_pressure.is_none()
                 && state.global_step.saturating_add(1) == pressure_update
-                && loss_weights.sigreg > 0.0
+                && (loss_weights.sigreg > 0.0 || cfg.branch_learning.displacement_health.is_some())
             {
                 // Read-only attribution: these stores are discarded before the
                 // normal total-loss backward and never reach the optimizer.
-                let next_grads = micro_losses.next_latent.backward()?;
-                let next_norm = gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
-                drop(next_grads);
-                let sigreg_grads = micro_losses
-                    .sigreg_bounded
-                    .affine(loss_weights.sigreg, 0.0)?
-                    .backward()?;
-                let sigreg_norm =
-                    gradient_l2_for_parameter_prefix(&sigreg_grads, &varmap, "encoder.")?;
-                state.gradient_pressure = Some(GradientPressureDiagnostics {
-                    update: pressure_update,
-                    encoder_next_latent_l2: next_norm,
-                    encoder_sigreg_weighted_l2: sigreg_norm,
-                    sigreg_to_next_ratio: (next_norm > 0.0).then_some(sigreg_norm / next_norm),
-                });
+                if loss_weights.sigreg > 0.0 {
+                    let next_grads = micro_losses.next_latent.backward()?;
+                    let next_norm =
+                        gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
+                    drop(next_grads);
+                    let sigreg_grads = micro_losses
+                        .sigreg_bounded
+                        .affine(loss_weights.sigreg, 0.0)?
+                        .backward()?;
+                    let sigreg_norm =
+                        gradient_l2_for_parameter_prefix(&sigreg_grads, &varmap, "encoder.")?;
+                    state.gradient_pressure = Some(GradientPressureDiagnostics {
+                        update: pressure_update,
+                        encoder_next_latent_l2: next_norm,
+                        encoder_sigreg_weighted_l2: sigreg_norm,
+                        sigreg_to_next_ratio: (next_norm > 0.0).then_some(sigreg_norm / next_norm),
+                        model_next_latent_l2: None,
+                        displacement_health_weighted_l2: None,
+                        displacement_health_to_next_ratio: None,
+                    });
+                } else if let Some(health) = cfg.branch_learning.displacement_health {
+                    let next_grads = micro_losses.next_latent.backward()?;
+                    let next_norm = gradient_l2_all_parameters(&next_grads, &varmap)?;
+                    drop(next_grads);
+                    let weighted_health = micro_losses
+                        .displacement_variance
+                        .affine(f64::from(health.variance_weight), 0.0)?
+                        .add(
+                            &micro_losses
+                                .displacement_covariance
+                                .affine(f64::from(health.covariance_weight), 0.0)?,
+                        )?;
+                    let health_grads = weighted_health.backward()?;
+                    let health_norm = gradient_l2_all_parameters(&health_grads, &varmap)?;
+                    state.gradient_pressure = Some(GradientPressureDiagnostics {
+                        update: pressure_update,
+                        encoder_next_latent_l2: 0.0,
+                        encoder_sigreg_weighted_l2: 0.0,
+                        sigreg_to_next_ratio: None,
+                        model_next_latent_l2: Some(next_norm),
+                        displacement_health_weighted_l2: Some(health_norm),
+                        displacement_health_to_next_ratio: (next_norm > 0.0)
+                            .then_some(health_norm / next_norm),
+                    });
+                }
             }
             let scaled_micro = micro_total.affine(inv, 0.0)?;
             let micro_grads = {
@@ -3765,6 +3920,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             step_metrics.spatial_covariance += micro_vals.spatial_covariance as f64 * inv;
             step_metrics.pooled_variance += micro_vals.pooled_variance as f64 * inv;
             step_metrics.pooled_covariance += micro_vals.pooled_covariance as f64 * inv;
+            step_metrics.displacement_variance += micro_vals.displacement_variance as f64 * inv;
+            step_metrics.displacement_covariance += micro_vals.displacement_covariance as f64 * inv;
         }
         let mut grads = accumulated_grads
             .ok_or_else(|| anyhow::anyhow!("grad_accum produced no microbatches"))?;
@@ -3810,6 +3967,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 state.active_sums.spatial_covariance += step_metrics.spatial_covariance;
                 state.active_sums.pooled_variance += step_metrics.pooled_variance;
                 state.active_sums.pooled_covariance += step_metrics.pooled_covariance;
+                state.active_sums.displacement_variance += step_metrics.displacement_variance;
+                state.active_sums.displacement_covariance += step_metrics.displacement_covariance;
                 state.active_sums.branch_groups += step_metrics.branch_groups;
                 state.active_sums.changed_branches += step_metrics.changed_branches;
                 state.active_sums.equivalent_pairs += step_metrics.equivalent_pairs;
@@ -3818,6 +3977,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 state.active_sums.action_recovery_branches += step_metrics.action_recovery_branches;
                 state.active_sums.spatial_population_rows += step_metrics.spatial_population_rows;
                 state.active_sums.pooled_population_rows += step_metrics.pooled_population_rows;
+                state.active_sums.displacement_population_rows +=
+                    step_metrics.displacement_population_rows;
+                state.active_sums.unique_changed_outcomes += step_metrics.unique_changed_outcomes;
                 Ok(())
             })?;
         }
@@ -4441,6 +4603,40 @@ mod tests {
             if name.ends_with("bias") {
                 assert!(va.iter().all(|v| *v == 0.0), "bias not zero: {name}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v3_residual_projection_starts_exactly_zero() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TrainConfig {
+            world_core_v2: true,
+            world_core_v3: true,
+            spatial_action_field: true,
+            spatial_action_residual: true,
+            sigreg_weight: 0.0,
+            lessons: vec!["factual_branches".into()],
+            branch_learning: BranchLearningConfig {
+                enabled: true,
+                ..BranchLearningConfig::default()
+            },
+            ..TrainConfig::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let _model = WorldModel::new(cfg.model_config(), vb)?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        zero_v3_spatial_residual(&varmap)?;
+        let data = varmap.data().lock().unwrap();
+        let residuals = data
+            .iter()
+            .filter(|(name, _)| name.starts_with("spatial_action_proj."))
+            .collect::<Vec<_>>();
+        assert!(!residuals.is_empty());
+        for (name, var) in residuals {
+            let max = var.as_tensor().abs()?.max_all()?.to_scalar::<f32>()?;
+            assert_eq!(max, 0.0, "{name}");
         }
         Ok(())
     }
@@ -5184,6 +5380,8 @@ mod tests {
             spatial_covariance: zero.clone(),
             pooled_variance: zero.clone(),
             pooled_covariance: zero.clone(),
+            displacement_variance: zero.clone(),
+            displacement_covariance: zero.clone(),
             branch_audit: BranchLearningAudit::default(),
         };
 
@@ -5197,7 +5395,7 @@ mod tests {
     }
 
     #[test]
-    fn world_core_v2_loss_reports_factual_and_health_populations() -> Result<()> {
+    fn world_core_v3_loss_reports_factual_and_health_populations() -> Result<()> {
         let cfg = TrainConfig {
             lessons: vec!["factual_branches".into()],
             physical_batch: 4,
@@ -5208,7 +5406,9 @@ mod tests {
             inner_steps: 1,
             outer_steps: 1,
             world_core_v2: true,
+            world_core_v3: true,
             spatial_action_field: true,
+            spatial_action_residual: true,
             branch_learning: BranchLearningConfig {
                 enabled: true,
                 spatial_health: Some(crate::p2::representation::VicRegConfig {
@@ -5224,6 +5424,13 @@ mod tests {
                     minimum_std: 1.0,
                     epsilon: 1e-4,
                     maximum_rows: 12,
+                }),
+                displacement_health: Some(crate::p2::representation::VicRegConfig {
+                    variance_weight: 0.02,
+                    covariance_weight: 0.01,
+                    minimum_std: 0.1,
+                    epsilon: 1e-4,
+                    maximum_rows: 4,
                 }),
                 ..BranchLearningConfig::default()
             },
@@ -5254,6 +5461,8 @@ mod tests {
         assert_eq!(losses.branch_audit.branches, 4);
         assert_eq!(losses.branch_audit.spatial_population_rows, 128);
         assert_eq!(losses.branch_audit.pooled_population_rows, 12);
+        assert!(losses.branch_audit.unique_changed_outcomes >= 2);
+        assert!(losses.branch_audit.displacement_population_rows >= 2);
         assert!(losses.branch_total.to_scalar::<f32>()?.is_finite());
         let gradients = losses.total.backward()?;
         let data = varmap.data().lock().unwrap();
@@ -5714,8 +5923,19 @@ mod tests {
         cfg.branch_learning.enabled = true;
         changed.push(("world_core_v2", cfg));
         let mut cfg = base.clone();
+        cfg.world_core_v2 = true;
+        cfg.world_core_v3 = true;
+        cfg.branch_learning.enabled = true;
+        changed.push(("world_core_v3", cfg));
+        let mut cfg = base.clone();
         cfg.spatial_action_field = true;
         changed.push(("spatial_action_field", cfg));
+        let mut cfg = base.clone();
+        cfg.spatial_action_residual = true;
+        changed.push(("spatial_action_residual", cfg));
+        let mut cfg = base.clone();
+        cfg.spatial_action_residual_scale += 0.1;
+        changed.push(("spatial_action_residual_scale", cfg));
         let mut cfg = base.clone();
         cfg.branch_learning.outcome_pull_weight += 0.01;
         changed.push(("branch_learning", cfg));

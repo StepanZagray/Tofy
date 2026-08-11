@@ -215,9 +215,20 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub world_core_v2: bool,
 
+    /// Train the V3 factual world core while retaining the V2 parameter topology.
+    #[arg(long, default_value_t = false)]
+    pub world_core_v3: bool,
+
     /// Add localized ACTION6 fields while retaining global action identity.
     #[arg(long, default_value_t = false)]
     pub spatial_action_field: bool,
+
+    /// Add the spatial ACTION6 field as a residual on top of global coordinates.
+    #[arg(long, default_value_t = false)]
+    pub spatial_action_residual: bool,
+
+    #[arg(long, default_value_t = 0.25)]
+    pub spatial_action_residual_scale: f64,
 
     #[arg(long, default_value_t = 0.0)]
     pub outcome_pull_weight: f64,
@@ -251,6 +262,15 @@ pub struct P2TrainArgs {
 
     #[arg(long, default_value_t = 0.0)]
     pub pooled_covariance_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub displacement_variance_weight: f64,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub displacement_covariance_weight: f64,
+
+    #[arg(long, default_value_t = 0.05)]
+    pub displacement_norm_floor: f32,
 
     #[arg(long, default_value_t = 1.0)]
     pub health_minimum_std: f32,
@@ -328,10 +348,13 @@ impl P2TrainArgs {
             sigreg_temporal_window: self.sigreg_temporal_window,
             sigreg_global_mix: self.sigreg_global_mix,
             prefetch_batches: self.prefetch_batches,
-            world_core_v2: self.world_core_v2,
+            world_core_v2: self.world_core_v2 || self.world_core_v3,
+            world_core_v3: self.world_core_v3,
             spatial_action_field: self.spatial_action_field,
+            spatial_action_residual: self.spatial_action_residual,
+            spatial_action_residual_scale: self.spatial_action_residual_scale,
             branch_learning: BranchLearningConfig {
-                enabled: self.world_core_v2,
+                enabled: self.world_core_v2 || self.world_core_v3,
                 outcome_pull_weight: self.outcome_pull_weight,
                 outcome_push_weight: self.outcome_push_weight,
                 outcome_margin: self.outcome_margin,
@@ -357,6 +380,16 @@ impl P2TrainArgs {
                         epsilon: self.health_epsilon,
                         maximum_rows: self.health_maximum_rows,
                     }),
+                displacement_health: (self.displacement_variance_weight != 0.0
+                    || self.displacement_covariance_weight != 0.0)
+                    .then_some(VicRegConfig {
+                        variance_weight: self.displacement_variance_weight as f32,
+                        covariance_weight: self.displacement_covariance_weight as f32,
+                        minimum_std: self.health_minimum_std,
+                        epsilon: self.health_epsilon,
+                        maximum_rows: self.health_maximum_rows,
+                    }),
+                displacement_norm_floor: self.displacement_norm_floor,
             },
         }
     }

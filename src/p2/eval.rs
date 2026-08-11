@@ -3,6 +3,7 @@
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::arc3::{import_recordings_dir, summarize_recordings_dir, RecordingRunSummary};
+use crate::p2::board_probe::{BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT};
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
     generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, BranchGroup,
@@ -638,6 +639,9 @@ pub struct FactualBranchMetrics {
     pub changed_vs_unchanged_displacement_norm_auroc: Option<f64>,
     /// `changed_mean / unchanged_mean`, only when both means are supported.
     pub changed_to_unchanged_displacement_norm_ratio: Option<f64>,
+    /// Eval-only standardized ridge probe. The decoder is fitted on a
+    /// deterministic disjoint prefix and scored on the remaining factual rows.
+    pub board_probe: Option<BoardTransitionMetrics>,
     pub by_family: BTreeMap<String, FactualBranchStratumCounts>,
     pub by_action_id: BTreeMap<u8, FactualBranchStratumCounts>,
 }
@@ -3193,18 +3197,68 @@ fn squared_distance(left: &[f32], right: &[f32]) -> f64 {
         .sum()
 }
 
+fn patch_rows(latent: &Tensor) -> Result<Vec<Vec<f32>>> {
+    let (batch, channels, height, width) = latent.dims4()?;
+    if channels == 0 || height != 8 || width != 8 {
+        bail!("board probe requires BxCx8x8 spatial latents");
+    }
+    let values = latent
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut rows = Vec::with_capacity(batch * PATCH_COUNT);
+    for sample in 0..batch {
+        for y in 0..8 {
+            for x in 0..8 {
+                rows.push(
+                    (0..channels)
+                        .map(|channel| values[((sample * channels + channel) * 8 + y) * 8 + x])
+                        .collect(),
+                );
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn exact_changed_patch_labels(samples: &[TransitionSample]) -> Vec<bool> {
+    samples
+        .iter()
+        .flat_map(|sample| {
+            (0..8).flat_map(move |patch_y| {
+                (0..8).map(move |patch_x| {
+                    let y_start = patch_y * 8;
+                    let y_end = ((patch_y + 1) * 8).min(63);
+                    let x_start = patch_x * 8;
+                    let x_end = (patch_x + 1) * 8;
+                    (y_start..y_end).any(|y| {
+                        (x_start..x_end).any(|x| {
+                            let index = y * 64 + x;
+                            sample.current.pixels[index] != sample.next.pixels[index]
+                        })
+                    })
+                })
+            })
+        })
+        .collect()
+}
+
 fn evaluate_factual_branches(
     model: &WorldModel,
     cfg: &EvalConfig,
     device: &Device,
 ) -> Result<FactualBranchMetrics> {
     let seed = factual_branch_eval_seed(cfg.seed);
-    let groups = (0..cfg.synthetic_episodes)
+    // The generic evaluation count controls expensive rollouts. Factual
+    // branches are cheap one-step groups, so use four times as many to keep the
+    // frozen overnight population at 256 groups when synthetic_episodes=64.
+    let factual_group_count = cfg.synthetic_episodes.saturating_mul(4);
+    let groups = (0..factual_group_count)
         .map(|episode| {
             generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
         })
         .collect::<Result<Vec<_>>>()?;
-    let population_fingerprint = factual_population_fingerprint(&groups, cfg.synthetic_episodes);
+    let population_fingerprint = factual_population_fingerprint(&groups, factual_group_count);
     let samples = groups
         .iter()
         .flat_map(|group| {
@@ -3218,6 +3272,8 @@ fn evaluate_factual_branches(
     let mut predicted_displacements = Vec::with_capacity(samples.len());
     let mut action_logits = Vec::with_capacity(samples.len());
     let mut coordinate_predictions = Vec::with_capacity(samples.len());
+    let mut target_patch_latents = Vec::new();
+    let mut predicted_patch_latents = Vec::new();
     for (start, end) in batch_ranges(samples.len(), cfg.physical_batch.max(1)) {
         let batch = batch_from_samples(&samples[start..end], device)?;
         let current = model.encode_state(&batch.frames)?;
@@ -3227,13 +3283,53 @@ fn evaluate_factual_branches(
             &batch.action_coords,
             &batch.goals,
         )?;
+        let target = model.encode_state(&batch.next_frames)?;
         let displacement = pool_latent(&output.y.sub(&current)?)?;
         let (decoded_actions, decoded_coordinates) =
             model.decode_action_displacement(&displacement)?;
         predicted_displacements.extend(displacement.to_dtype(DType::F32)?.to_vec2::<f32>()?);
         action_logits.extend(decoded_actions.to_dtype(DType::F32)?.to_vec2::<f32>()?);
         coordinate_predictions.extend(decoded_coordinates.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        target_patch_latents.extend(patch_rows(&target)?);
+        predicted_patch_latents.extend(patch_rows(&output.y)?);
     }
+
+    let board_probe = if groups.len() >= 2 {
+        // Split only between same-state groups. Cutting a four-branch group
+        // would leak the shared current state (and sometimes an equivalent
+        // outcome) from decoder fit into the held-out score.
+        let fit_group_count = (groups.len() / 3).max(1).min(groups.len() - 1);
+        let fit_samples = groups[..fit_group_count]
+            .iter()
+            .map(|group| group.branches().len())
+            .sum::<usize>();
+        let fit_rows = fit_samples * PATCH_COUNT;
+        let probe = FixedBoardProbe::fit(
+            &target_patch_latents[..fit_rows],
+            &samples[..fit_samples]
+                .iter()
+                .map(|sample| sample.next.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let held_out = &samples[fit_samples..];
+        Some(
+            probe.summarize_held_out(
+                &target_patch_latents[fit_rows..],
+                &predicted_patch_latents[fit_rows..],
+                &held_out
+                    .iter()
+                    .map(|sample| sample.current.clone())
+                    .collect::<Vec<_>>(),
+                &held_out
+                    .iter()
+                    .map(|sample| sample.next.clone())
+                    .collect::<Vec<_>>(),
+                &exact_changed_patch_labels(held_out),
+            )?,
+        )
+    } else {
+        None
+    };
 
     let mut changed_norms = Vec::new();
     let mut unchanged_norms = Vec::new();
@@ -3333,6 +3429,8 @@ fn evaluate_factual_branches(
                         left.partial_cmp(right)
                             .unwrap_or_else(|| left_index.cmp(right_index))
                     })
+                    // Decoder classes are the official IDs directly; class 0
+                    // is intentionally unused, matching training cross-entropy.
                     .map(|(index, _)| index as u8);
                 if predicted_action == Some(branch.transition.action.id) {
                     unique_changed_effect_action_correct += 1;
@@ -3388,6 +3486,7 @@ fn evaluate_factual_branches(
             .and_then(|(changed, unchanged)| {
                 (unchanged > f64::EPSILON).then_some(changed / unchanged)
             }),
+        board_probe,
         by_family,
         by_action_id,
     })
@@ -4468,12 +4567,13 @@ mod tests {
             .factual_branches
             .as_ref()
             .expect("world-core-v2 factual evaluation");
-        assert_eq!(factual.groups, eval_cfg.synthetic_episodes);
+        assert_eq!(factual.groups, eval_cfg.synthetic_episodes * 4);
         assert_eq!(factual.branches, factual.changed + factual.unchanged);
         assert_eq!(factual.action6_coordinate_n, factual.action6);
         assert!(factual.action6_coordinate_rmse_normalized.is_some());
         assert!(factual.action6_coordinate_rmse_pixels.is_some());
         assert!(!factual.population_fingerprint.is_empty());
+        assert!(factual.board_probe.is_some());
         assert!(eval
             .synthetic_dynamics
             .one_step_latent_mse

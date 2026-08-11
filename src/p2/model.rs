@@ -106,14 +106,27 @@ pub struct ModelConfig {
     /// Use a spatial ACTION6 coordinate field instead of the legacy coordinate broadcast.
     #[serde(default)]
     pub spatial_action_field: bool,
+    /// Preserve the global ACTION6 coordinate broadcast and add the spatial
+    /// field as a bounded residual. False preserves historical V2 semantics.
+    #[serde(default)]
+    pub spatial_action_residual: bool,
+    #[serde(default = "default_spatial_action_residual_scale")]
+    pub spatial_action_residual_scale: f64,
     /// Instantiate the action-faithful world-core-v2 heads. V2 checkpoints are
     /// intentionally incompatible with legacy training checkpoints.
     #[serde(default)]
     pub world_core_v2: bool,
+    /// Explicit experiment schema marker. V3 retains the V2 heads/topology.
+    #[serde(default)]
+    pub world_core_v3: bool,
 }
 
 fn default_sigreg_projector_dim() -> usize {
     128
+}
+
+fn default_spatial_action_residual_scale() -> f64 {
+    0.25
 }
 
 impl Default for ModelConfig {
@@ -132,7 +145,10 @@ impl Default for ModelConfig {
             sigreg_projector: false,
             sigreg_projector_dim: default_sigreg_projector_dim(),
             spatial_action_field: false,
+            spatial_action_residual: false,
+            spatial_action_residual_scale: default_spatial_action_residual_scale(),
             world_core_v2: false,
+            world_core_v3: false,
         }
     }
 }
@@ -167,6 +183,18 @@ impl ModelConfig {
         }
         if self.sigreg_projector && self.sigreg_projector_dim < 2 {
             bail!("sigreg_projector_dim must be >= 2 when the projector is enabled");
+        }
+        if self.world_core_v3 && !self.world_core_v2 {
+            bail!("world_core_v3 requires the world_core_v2 base topology");
+        }
+        if self.spatial_action_residual && (!self.world_core_v3 || !self.spatial_action_field) {
+            bail!("spatial_action_residual requires world_core_v3 and spatial_action_field");
+        }
+        if !self.spatial_action_residual_scale.is_finite()
+            || self.spatial_action_residual_scale <= 0.0
+            || self.spatial_action_residual_scale > 1.0
+        {
+            bail!("spatial_action_residual_scale must be finite and in (0,1]");
         }
         Ok(())
     }
@@ -747,27 +775,40 @@ impl WorldModel {
             .forward(&self.action_emb.forward(&actions)?)?;
         let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
         let conditioned = state.broadcast_add(&action_bias)?;
+        let mut coords = self.coord_proj.forward(action_coords)?;
+        if self.config.world_core_v2 {
+            let coordinate_active = actions
+                .eq(6u32)?
+                .to_dtype(coords.dtype())?
+                .reshape((b, 1))?
+                .broadcast_as(coords.dims())?;
+            coords = coords.mul(&coordinate_active)?;
+        }
+        let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
         if !self.config.spatial_action_field {
-            let mut coords = self.coord_proj.forward(action_coords)?;
-            if self.config.world_core_v2 {
-                let coordinate_active = actions
-                    .eq(6u32)?
-                    .to_dtype(coords.dtype())?
-                    .reshape((b, 1))?
-                    .broadcast_as(coords.dims())?;
-                coords = coords.mul(&coordinate_active)?;
-            }
-            let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
             return conditioned.broadcast_add(&coord_bias).map_err(Into::into);
         }
 
         let field = self.spatial_action_field(&actions, action_coords)?;
-        let projection = self
+        let mut projection = self
             .spatial_action_proj
             .as_ref()
             .expect("spatial_action_proj is present when spatial_action_field is enabled")
             .forward(&field)?;
-        conditioned.add(&projection).map_err(Into::into)
+        if self.config.spatial_action_residual {
+            let active = actions
+                .eq(6u32)?
+                .to_dtype(projection.dtype())?
+                .reshape((b, 1, 1, 1))?
+                .broadcast_as(projection.dims())?;
+            projection = projection.mul(&active)?;
+            conditioned
+                .broadcast_add(&coord_bias)?
+                .add(&projection.affine(self.config.spatial_action_residual_scale, 0.0)?)
+                .map_err(Into::into)
+        } else {
+            conditioned.add(&projection).map_err(Into::into)
+        }
     }
 
     /// ACTION6 coordinate conditioning over the latent grid.
@@ -1604,6 +1645,81 @@ mod tests {
         assert!(
             max_abs_diff(&conditioned, &origin)? < 1e-6,
             "legacy conditioning must be uniform across the latent grid"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_spatial_residual_preserves_global_coordinate_bias() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            world_core_v2: true,
+            world_core_v3: true,
+            spatial_action_field: true,
+            spatial_action_residual: true,
+            spatial_action_residual_scale: 0.25,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let state = Tensor::zeros(
+            (1, model.config.hidden_dim, LATENT_GRID, LATENT_GRID),
+            DType::F32,
+            &device,
+        )?;
+        let actions = Tensor::from_vec(vec![6u32], (1,), &device)?;
+        let coords = Tensor::from_vec(vec![0.25f32, 0.75], (1, 2), &device)?;
+
+        let action = model
+            .action_proj
+            .forward(&model.action_emb.forward(&actions)?)?
+            .reshape((1, model.config.hidden_dim, 1, 1))?;
+        let conditioned = state.broadcast_add(&action)?;
+        let global =
+            model
+                .coord_proj
+                .forward(&coords)?
+                .reshape((1, model.config.hidden_dim, 1, 1))?;
+        let spatial = model
+            .spatial_action_proj
+            .as_ref()
+            .expect("V3 has a spatial projection")
+            .forward(&model.spatial_action_field(&actions, &coords)?)?;
+        let expected = conditioned
+            .broadcast_add(&global)?
+            .add(&spatial.affine(0.25, 0.0)?)?;
+        let actual = model.add_action(&state, &actions, &coords)?;
+        assert!(max_abs_diff(&actual, &expected)? < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_spatial_residual_ignores_placeholder_coordinates_for_simple_actions() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            world_core_v2: true,
+            world_core_v3: true,
+            spatial_action_field: true,
+            spatial_action_residual: true,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let state = Tensor::zeros(
+            (1, model.config.hidden_dim, LATENT_GRID, LATENT_GRID),
+            DType::F32,
+            &device,
+        )?;
+        let actions = Tensor::from_vec(vec![5u32], (1,), &device)?;
+        let first = Tensor::from_vec(vec![0.0f32, 0.0], (1, 2), &device)?;
+        let second = Tensor::from_vec(vec![1.0f32, 1.0], (1, 2), &device)?;
+        assert!(
+            max_abs_diff(
+                &model.add_action(&state, &actions, &first)?,
+                &model.add_action(&state, &actions, &second)?,
+            )? < 1e-6
         );
         Ok(())
     }

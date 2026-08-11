@@ -22,7 +22,7 @@ pub const RIDGE: f64 = 1e-2;
 /// A held-out target decoder MSE at or below this fixed value is required for trusted metrics.
 pub const FIXED_TARGET_DECODER_MSE_CEILING: f64 = 1e-3;
 /// A patch is predicted changed when its predicted-vs-current histogram MSE exceeds this value.
-pub const FIXED_PREDICTION_DELTA_THRESHOLD: f64 = 0.25;
+pub const FIXED_PREDICTION_DELTA_THRESHOLD: f64 = 0.01;
 
 /// A fitted linear probe from standardized C-dimensional patch latents to palette histograms.
 ///
@@ -47,7 +47,8 @@ pub struct BoardTransitionMetrics {
     /// Baseline MSE from literally copying the current board histogram.
     pub literal_current_copy_mse: f64,
     /// `(literal_current_copy_mse - predicted_next_histogram_mse) / literal_current_copy_mse`.
-    pub improvement_fraction: f64,
+    /// Absent when the exact copy baseline has zero error.
+    pub improvement_fraction: Option<f64>,
     pub changed_patch_precision: f64,
     pub changed_patch_recall: f64,
     pub changed_patch_f1: f64,
@@ -90,9 +91,12 @@ impl FixedBoardProbe {
         for (feature, value) in input_std.iter_mut().enumerate() {
             *value = (*value / row_count as f64).sqrt();
             ensure!(
-                value.is_finite() && *value > 1e-12,
-                "latent feature {feature} has zero or non-finite training variance"
+                value.is_finite(),
+                "latent feature {feature} has non-finite variance"
             );
+            // A dead channel is evidence rather than an evaluator failure. Its
+            // standardized value remains zero and ridge assigns it no weight.
+            *value = value.max(1e-6);
         }
 
         let mut output_mean = [0.0_f64; PALETTE_SIZE];
@@ -219,13 +223,9 @@ impl FixedBoardProbe {
         let target_latent_decoder_mse = mean_histogram_mse(&decoded_targets, &target_histograms)?;
         let predicted_next_histogram_mse = mean_histogram_mse(&decoded_next, &target_histograms)?;
         let literal_current_copy_mse = mean_histogram_mse(&current_histograms, &target_histograms)?;
-        let improvement_fraction = if literal_current_copy_mse > 0.0 {
-            (literal_current_copy_mse - predicted_next_histogram_mse) / literal_current_copy_mse
-        } else if predicted_next_histogram_mse == 0.0 {
-            0.0
-        } else {
-            f64::NEG_INFINITY
-        };
+        let improvement_fraction = (literal_current_copy_mse > 0.0).then_some(
+            (literal_current_copy_mse - predicted_next_histogram_mse) / literal_current_copy_mse,
+        );
 
         let mut true_positive = 0usize;
         let mut false_positive = 0usize;
@@ -606,9 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonfinite_and_undersized_training_rows() {
+    fn accepts_dead_features_but_rejects_nonfinite_and_undersized_rows() {
         let board = frame(|_, _| 0);
         let rows = vec![vec![0.0, 1.0]; PATCH_COUNT];
+        assert!(FixedBoardProbe::fit(&rows, &[board.clone()]).is_ok());
+        let rows = vec![vec![0.0; PATCH_COUNT]; PATCH_COUNT];
         assert!(FixedBoardProbe::fit(&rows, &[board.clone()]).is_err());
         let mut rows = vec![vec![0.0]; PATCH_COUNT];
         rows[0][0] = f32::NAN;

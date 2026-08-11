@@ -2,12 +2,13 @@
 
 use crate::p2::data::{BranchGroup, FactualActionBranch, TransitionSample};
 use crate::p2::model::{pool_latent, WorldModel};
-use crate::p2::representation::{vicreg_latent_health, VicRegConfig};
+use crate::p2::representation::{vicreg_displacement_health, vicreg_latent_health, VicRegConfig};
 use anyhow::{ensure, Result};
 use candle_core::{Tensor, D};
 use serde::{Deserialize, Serialize};
 
 pub const WORLD_CORE_V2_SCHEMA: &str = "world_core_v2";
+pub const WORLD_CORE_V3_SCHEMA: &str = "world_core_v3";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchLearningConfig {
@@ -31,6 +32,13 @@ pub struct BranchLearningConfig {
     pub spatial_health: Option<VicRegConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pooled_health: Option<VicRegConfig>,
+    /// Scale-normalized, group-centered predicted-displacement health. Unlike
+    /// the legacy absolute-state health objectives, this is evaluated only on
+    /// distinct changed factual outcomes from a shared source state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_health: Option<VicRegConfig>,
+    #[serde(default = "default_displacement_norm_floor")]
+    pub displacement_norm_floor: f32,
 }
 
 fn default_outcome_pull_weight() -> f64 {
@@ -54,6 +62,9 @@ fn default_changed_margin_weight() -> f64 {
 fn default_changed_margin() -> f64 {
     0.1
 }
+fn default_displacement_norm_floor() -> f32 {
+    0.05
+}
 
 impl Default for BranchLearningConfig {
     fn default() -> Self {
@@ -68,6 +79,8 @@ impl Default for BranchLearningConfig {
             changed_margin: default_changed_margin(),
             spatial_health: None,
             pooled_health: None,
+            displacement_health: None,
+            displacement_norm_floor: default_displacement_norm_floor(),
         }
     }
 }
@@ -97,7 +110,10 @@ impl BranchLearningConfig {
             self.changed_margin.is_finite() && self.changed_margin > 0.0,
             "changed_margin must be finite and > 0"
         );
-        if self.spatial_health.is_some() || self.pooled_health.is_some() {
+        if self.spatial_health.is_some()
+            || self.pooled_health.is_some()
+            || self.displacement_health.is_some()
+        {
             ensure!(
                 grad_accum == 1,
                 "world-core-v2 representation health requires grad_accum=1 so the nonlinear population objective sees the full physical batch"
@@ -109,11 +125,20 @@ impl BranchLearningConfig {
         if let Some(config) = self.pooled_health {
             config.validate()?;
         }
+        if let Some(config) = self.displacement_health {
+            config.validate()?;
+        }
+        ensure!(
+            self.displacement_norm_floor.is_finite() && self.displacement_norm_floor > 0.0,
+            "displacement_norm_floor must be finite and > 0"
+        );
         Ok(())
     }
 
     pub fn any_health_enabled(&self) -> bool {
-        self.spatial_health.is_some() || self.pooled_health.is_some()
+        self.spatial_health.is_some()
+            || self.pooled_health.is_some()
+            || self.displacement_health.is_some()
     }
 }
 
@@ -128,6 +153,8 @@ pub struct BranchLearningAudit {
     pub action_recovery_branches: usize,
     pub spatial_population_rows: usize,
     pub pooled_population_rows: usize,
+    pub displacement_population_rows: usize,
+    pub unique_changed_outcomes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +169,8 @@ pub struct BranchLearningLoss {
     pub spatial_covariance: Tensor,
     pub pooled_variance: Tensor,
     pub pooled_covariance: Tensor,
+    pub displacement_variance: Tensor,
+    pub displacement_covariance: Tensor,
     pub audit: BranchLearningAudit,
 }
 
@@ -208,7 +237,9 @@ pub fn branch_learning_loss(
             spatial_variance: zero.clone(),
             spatial_covariance: zero.clone(),
             pooled_variance: zero.clone(),
-            pooled_covariance: zero,
+            pooled_covariance: zero.clone(),
+            displacement_variance: zero.clone(),
+            displacement_covariance: zero,
             audit: BranchLearningAudit::default(),
         });
     }
@@ -246,6 +277,9 @@ pub fn branch_learning_loss(
     let mut action_recovery = zero.clone();
     let mut coordinate_recovery = zero.clone();
     let mut changed_margin = zero.clone();
+    let mut displacement_variance = zero.clone();
+    let mut displacement_covariance = zero.clone();
+    let mut displacement_total = zero.clone();
 
     if factual_curriculum {
         let groups = validated_groups(samples)?;
@@ -256,9 +290,16 @@ pub fn branch_learning_loss(
         let mut unchanged = Vec::new();
         let mut action6 = Vec::new();
         let mut recoverable = Vec::new();
+        let mut displacement_by_action: Vec<Vec<Tensor>> = (0..8).map(|_| Vec::new()).collect();
+        let mut unique_changed_outcomes = 0usize;
         let mut offset = 0usize;
         for group in &groups {
             let branches = group.branches();
+            let group_displacement = displacement.narrow(0, offset, branches.len())?;
+            let group_centered = config
+                .displacement_health
+                .map(|_| group_displacement.broadcast_sub(&group_displacement.mean_keepdim(0)?))
+                .transpose()?;
             for (local, branch) in branches.iter().enumerate() {
                 let global = offset + local;
                 if branch.board_effect.changed {
@@ -277,6 +318,17 @@ pub fn branch_learning_loss(
                         == 1;
                 if unique_changed_effect {
                     recoverable.push(global as u32);
+                }
+                let first_changed_outcome = branch.board_effect.changed
+                    && !branches[..local]
+                        .iter()
+                        .any(|previous| branch.outcome_equivalent(previous));
+                if first_changed_outcome {
+                    unique_changed_outcomes += 1;
+                    if let Some(group_centered) = &group_centered {
+                        let row = group_centered.narrow(0, local, 1)?;
+                        displacement_by_action[branch.transition.action.id as usize].push(row);
+                    }
                 }
                 for other in local + 1..branches.len() {
                     let left = displacement.narrow(0, global, 1)?;
@@ -298,6 +350,7 @@ pub fn branch_learning_loss(
         audit.changed_branches = changed.len();
         audit.action6_branches = action6.len();
         audit.action_recovery_branches = recoverable.len();
+        audit.unique_changed_outcomes = unique_changed_outcomes;
         outcome_pull = mean_or_zero(pull_terms, &zero)?;
         outcome_push = mean_or_zero(push_terms, &zero)?;
 
@@ -353,9 +406,40 @@ pub fn branch_learning_loss(
             index_rows(&displacement_norm, &unchanged)?.mean_all()?
         };
         changed_margin = changed_loss.add(&copy_loss)?;
+
+        if let Some(health) = config.displacement_health {
+            let per_action = displacement_by_action
+                .iter()
+                .filter(|rows| !rows.is_empty())
+                .map(Vec::len)
+                .min()
+                .unwrap_or(0);
+            let mut normalized_strata = Vec::new();
+            for rows in displacement_by_action
+                .iter()
+                .filter(|rows| !rows.is_empty())
+            {
+                let stratum = Tensor::cat(&rows.iter().take(per_action).collect::<Vec<_>>(), 0)?;
+                let rms = stratum
+                    .sqr()?
+                    .mean_all()?
+                    .sqrt()?
+                    .clamp(config.displacement_norm_floor as f64, f64::INFINITY)?;
+                normalized_strata.push(stratum.broadcast_div(&rms)?);
+            }
+            let normalized_rows = normalized_strata.len().saturating_mul(per_action);
+            if normalized_rows >= 2 {
+                let population = Tensor::cat(&normalized_strata.iter().collect::<Vec<_>>(), 0)?;
+                let loss = vicreg_displacement_health(&population, health)?;
+                audit.displacement_population_rows = loss.rows;
+                displacement_variance = loss.variance;
+                displacement_covariance = loss.covariance;
+                displacement_total = loss.weighted_total;
+            }
+        }
     }
 
-    let mut total = spatial_total.add(&pooled_total)?;
+    let mut total = spatial_total.add(&pooled_total)?.add(&displacement_total)?;
     for (weight, loss) in [
         (config.outcome_pull_weight, &outcome_pull),
         (config.outcome_push_weight, &outcome_push),
@@ -378,6 +462,8 @@ pub fn branch_learning_loss(
         spatial_covariance,
         pooled_variance,
         pooled_covariance,
+        displacement_variance,
+        displacement_covariance,
         audit,
     })
 }

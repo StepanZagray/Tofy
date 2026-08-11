@@ -21,6 +21,12 @@
 - After code edits, run lint/compile checks when possible.
 - Resolve all errors and warnings.
 
+## Research
+- Always use the repository's `research` skill at `.agents/skills/research/SKILL.md`
+  when analyzing or comparing experiments or experiment results, and whenever the user asks to
+  research, investigate, or produce a source-backed report.
+- Follow the skill's global-library workflow and use the `ml/tofy` scope for Tofy research.
+
 ## Delegation
 - Capable primary agents should delegate bounded, independent coding, documentation, analysis, and research work when doing so improves speed or supplies an independent review.
 - Keep delegated tasks narrow, safe, and verifiable. The primary agent owns scope, safety, integration decisions, review of every delegated change, and final validation.
