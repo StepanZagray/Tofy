@@ -103,6 +103,9 @@ pub struct ModelConfig {
     /// Projected embedding width used only when `sigreg_projector` is enabled.
     #[serde(default = "default_sigreg_projector_dim")]
     pub sigreg_projector_dim: usize,
+    /// Use a spatial ACTION6 coordinate field instead of the legacy coordinate broadcast.
+    #[serde(default)]
+    pub spatial_action_field: bool,
 }
 
 fn default_sigreg_projector_dim() -> usize {
@@ -124,6 +127,7 @@ impl Default for ModelConfig {
             bf16_conv: false,
             sigreg_projector: false,
             sigreg_projector_dim: default_sigreg_projector_dim(),
+            spatial_action_field: false,
         }
     }
 }
@@ -440,6 +444,8 @@ pub struct WorldModel {
     action_emb: Embedding,
     action_proj: Linear,
     coord_proj: Linear,
+    /// Optional `B×4×8×8` ACTION6 coordinate field projection.
+    spatial_action_proj: Option<Conv2d>,
     goal_proj: Linear,
     block: GridResidualBlock,
     event_head: Linear,
@@ -466,12 +472,25 @@ impl WorldModel {
                 )
             })
             .transpose()?;
+        let spatial_action_proj = cfg
+            .spatial_action_field
+            .then(|| {
+                conv2d(
+                    4,
+                    cfg.hidden_dim,
+                    1,
+                    Default::default(),
+                    vb.pp("spatial_action_proj"),
+                )
+            })
+            .transpose()?;
         Ok(Self {
             pixel_emb: embedding(PALETTE_SIZE, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
             encoder: GridEncoder::new(cfg.hidden_dim, vb.pp("encoder"))?,
             action_emb: embedding(ACTION_VOCAB, cfg.action_dim, vb.pp("action_emb"))?,
             action_proj: linear(cfg.action_dim, cfg.hidden_dim, vb.pp("action_proj"))?,
             coord_proj: linear(2, cfg.hidden_dim, vb.pp("coord_proj"))?,
+            spatial_action_proj,
             goal_proj: linear(cfg.goal_dim, cfg.hidden_dim, vb.pp("goal_proj"))?,
             block: GridResidualBlock::new(cfg.hidden_dim, vb.pp("block"))?,
             event_head: linear(cfg.hidden_dim * 2, cfg.num_events, vb.pp("event_head"))?,
@@ -675,11 +694,61 @@ impl WorldModel {
         let action = self
             .action_proj
             .forward(&self.action_emb.forward(&actions)?)?;
-        let coords = self.coord_proj.forward(action_coords)?;
-        let bias = action
-            .add(&coords)?
-            .reshape((b, self.config.hidden_dim, 1, 1))?;
-        state.broadcast_add(&bias).map_err(Into::into)
+        let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
+        let conditioned = state.broadcast_add(&action_bias)?;
+        if !self.config.spatial_action_field {
+            let coords = self.coord_proj.forward(action_coords)?;
+            let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
+            return conditioned.broadcast_add(&coord_bias).map_err(Into::into);
+        }
+
+        let field = self.spatial_action_field(&actions, action_coords)?;
+        let projection = self
+            .spatial_action_proj
+            .as_ref()
+            .expect("spatial_action_proj is present when spatial_action_field is enabled")
+            .forward(&field)?;
+        conditioned.add(&projection).map_err(Into::into)
+    }
+
+    /// ACTION6 coordinate conditioning over the latent grid.
+    ///
+    /// Coordinates are normalized to `[0, 1]`. The four channels are a localized
+    /// impulse, relative x/y offsets, and an ACTION6-active mask. Simple actions
+    /// produce an all-zero field even though their placeholder coordinates are
+    /// still shape-checked by [`Self::add_action`].
+    fn spatial_action_field(&self, actions: &Tensor, action_coords: &Tensor) -> Result<Tensor> {
+        let b = actions.dim(0)?;
+        if action_coords.dims2()? != (b, 2) {
+            bail!("action_coords must have shape [B,2]");
+        }
+        let coords = action_coords.to_dtype(DType::F32)?;
+        let x = coords.narrow(1, 0, 1)?.reshape((b, 1, 1, 1))?;
+        let y = coords.narrow(1, 1, 1)?.reshape((b, 1, 1, 1))?;
+        let axis = Tensor::arange(0f32, LATENT_GRID as f32, coords.device())?
+            .affine(1.0 / (LATENT_GRID - 1) as f64, 0.0)?;
+        let grid_x = axis.reshape((1, 1, 1, LATENT_GRID))?;
+        let grid_y = axis.reshape((1, 1, LATENT_GRID, 1))?;
+        let dx = grid_x
+            .broadcast_sub(&x)?
+            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+        let dy = grid_y
+            .broadcast_sub(&y)?
+            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+        let active = actions
+            .eq(6u32)?
+            .to_dtype(DType::F32)?
+            .reshape((b, 1, 1, 1))?
+            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+        let impulse = dx
+            .sqr()?
+            .add(&dy.sqr()?)?
+            .affine(-16.0, 0.0)?
+            .exp()?
+            .broadcast_mul(&active)?;
+        let dx = dx.broadcast_mul(&active)?;
+        let dy = dy.broadcast_mul(&active)?;
+        Tensor::cat(&[&impulse, &dx, &dy, &active], 1).map_err(Into::into)
     }
 
     /// Encode state pixels and action IDs into the dynamics input `x` (goal-free).
@@ -1320,6 +1389,7 @@ mod tests {
             inner_steps: 2,
             outer_steps: 2,
             num_events: DEFAULT_NUM_EVENTS,
+            spatial_action_field: false,
             ..Default::default()
         }
     }
@@ -1364,6 +1434,88 @@ mod tests {
             .flatten_all()?
             .to_vec1::<f32>()?;
         Ok(d.into_iter().fold(0.0f32, f32::max))
+    }
+
+    #[test]
+    fn action6_spatial_field_is_nonuniform_and_coordinate_sensitive() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            spatial_action_field: true,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let actions = Tensor::from_vec(vec![6u32], (1,), &device)?;
+        let upper_left = Tensor::from_vec(vec![0.0f32, 0.0], (1, 2), &device)?;
+        let lower_right = Tensor::from_vec(vec![1.0f32, 1.0], (1, 2), &device)?;
+
+        let field = model.spatial_action_field(&actions, &upper_left)?;
+        assert_eq!(field.dims(), &[1, 4, LATENT_GRID, LATENT_GRID]);
+        let impulse = field.narrow(1, 0, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        let impulse_min = impulse.iter().copied().fold(f32::INFINITY, f32::min);
+        let impulse_max = impulse.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            impulse_max - impulse_min > 0.5,
+            "ACTION6 impulse should vary across the latent grid, got range {}",
+            impulse_max - impulse_min
+        );
+
+        let shifted = model.spatial_action_field(&actions, &lower_right)?;
+        assert!(
+            max_abs_diff(&field, &shifted)? > 0.5,
+            "ACTION6 field should change with coordinates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_action6_has_no_spatial_coordinate_field() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            spatial_action_field: true,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let actions = Tensor::from_vec(vec![5u32], (1,), &device)?;
+        let coords = Tensor::from_vec(vec![0.25f32, 0.75], (1, 2), &device)?;
+
+        let field = model.spatial_action_field(&actions, &coords)?;
+        assert!(
+            field
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|value| value.abs() < 1e-6),
+            "non-ACTION6 spatial field must be all zeros"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_spatial_action_field_preserves_uniform_coordinate_broadcast() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = make_model(&device)?;
+        let state = Tensor::zeros(
+            (1, model.config.hidden_dim, LATENT_GRID, LATENT_GRID),
+            DType::F32,
+            &device,
+        )?;
+        let actions = Tensor::from_vec(vec![6u32], (1,), &device)?;
+        let coords = Tensor::from_vec(vec![0.25f32, 0.75], (1, 2), &device)?;
+
+        let conditioned = model.add_action(&state, &actions, &coords)?;
+        let origin = conditioned
+            .narrow(2, 0, 1)?
+            .narrow(3, 0, 1)?
+            .broadcast_as(conditioned.dims())?;
+        assert!(
+            max_abs_diff(&conditioned, &origin)? < 1e-6,
+            "legacy conditioning must be uniform across the latent grid"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1495,6 +1647,7 @@ mod tests {
             outer_steps: 1,
             sigreg_projector: true,
             sigreg_projector_dim: 6,
+            spatial_action_field: false,
             ..ModelConfig::default()
         };
         let varmap = VarMap::new();
