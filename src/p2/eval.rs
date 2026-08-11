@@ -5,10 +5,11 @@ use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::arc3::{import_recordings_dir, summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
-    generate_curriculum, generate_hazard_one_step, TransitionSample, ORACLE_LATENT_DIM,
+    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, BranchGroup,
+    TransitionSample, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, PtrmConfig, RecursionStepProbe, WorldModel,
+    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionStepProbe, WorldModel,
     EVENT_GOAL_FAILED,
 };
 use crate::p2::representation::{
@@ -40,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v11";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v12";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -599,6 +600,48 @@ pub struct Arc3RecordingBenchmark {
     pub runs: Vec<RecordingRunSummary>,
 }
 
+/// Counts for a factual-branch population stratum. The strata use the exact
+/// board-only effect relation carried by `FactualActionBranch`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactualBranchStratumCounts {
+    pub branches: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+    pub recoverable: usize,
+    pub action6: usize,
+}
+
+/// Held-out same-state factual-action evaluation for world-core-v2 only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactualBranchMetrics {
+    /// Stable FNV-1a fingerprint of the generated, ordered branch population.
+    pub population_fingerprint: String,
+    pub groups: usize,
+    pub branches: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+    pub recoverable: usize,
+    pub action6: usize,
+    /// Anchors with at least one equivalent and one distinct candidate.
+    pub outcome_equivalence_anchors: usize,
+    /// Nearest-displacement outcome-equivalence accuracy on eligible anchors.
+    pub outcome_equivalence_retrieval_accuracy: Option<f64>,
+    /// Changed, board-effect-unique branches eligible for action recovery.
+    pub unique_changed_effect_action_n: usize,
+    pub unique_changed_effect_action_top1: Option<f64>,
+    /// Recoverable ACTION6 branches with coordinate supervision.
+    pub action6_coordinate_n: usize,
+    pub action6_coordinate_rmse_normalized: Option<f64>,
+    pub action6_coordinate_rmse_pixels: Option<f64>,
+    pub changed_displacement_norm_mean: Option<f64>,
+    pub unchanged_displacement_norm_mean: Option<f64>,
+    pub changed_vs_unchanged_displacement_norm_auroc: Option<f64>,
+    /// `changed_mean / unchanged_mean`, only when both means are supported.
+    pub changed_to_unchanged_displacement_norm_ratio: Option<f64>,
+    pub by_family: BTreeMap<String, FactualBranchStratumCounts>,
+    pub by_action_id: BTreeMap<u8, FactualBranchStratumCounts>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub schema: String,
@@ -621,6 +664,10 @@ pub struct EvalReport {
     pub synthetic_dynamics: SplitEval,
     /// Planning / calibration / falsification / retarget held-out probes.
     pub synthetic_planner: SplitEval,
+    /// Held-out same-state factual branch metrics, available for world-core-v2
+    /// checkpoints only.
+    #[serde(default)]
+    pub factual_branches: Option<FactualBranchMetrics>,
     /// Optional transfer on imported ARC recordings (never used for training).
     pub arc3_transfer: Option<SplitEval>,
     /// Smoke / scaffolding only; not a research result.
@@ -3070,6 +3117,282 @@ fn maybe_write_episode_jsonl(path: Option<&Path>, rows: &[EpisodeRolloutRow]) ->
     Ok(())
 }
 
+const FACTUAL_BRANCH_EVAL_DOMAIN: &[u8] = b"p2.factual_branch_eval.v1";
+
+fn fnv1a_append(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+}
+
+fn factual_branch_eval_seed(seed: u64) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325;
+    fnv1a_append(&mut hash, FACTUAL_BRANCH_EVAL_DOMAIN);
+    fnv1a_append(&mut hash, &seed.to_le_bytes());
+    hash
+}
+
+fn factual_population_fingerprint(groups: &[BranchGroup], synthetic_episodes: usize) -> String {
+    let mut hash = 0xCBF2_9CE4_8422_2325;
+    fnv1a_append(&mut hash, FACTUAL_BRANCH_EVAL_DOMAIN);
+    fnv1a_append(&mut hash, &(synthetic_episodes as u64).to_le_bytes());
+    for group in groups {
+        fnv1a_append(&mut hash, &(group.branches().len() as u64).to_le_bytes());
+        for branch in group.branches() {
+            let transition = &branch.transition;
+            fnv1a_append(&mut hash, &transition.seed.to_le_bytes());
+            fnv1a_append(&mut hash, &transition.episode_id.to_le_bytes());
+            fnv1a_append(&mut hash, transition.family.as_bytes());
+            fnv1a_append(&mut hash, &[transition.action.id]);
+            fnv1a_append(&mut hash, &[transition.action.x.unwrap_or(u8::MAX)]);
+            fnv1a_append(&mut hash, &[transition.action.y.unwrap_or(u8::MAX)]);
+            fnv1a_append(&mut hash, &transition.current.pixels);
+            fnv1a_append(&mut hash, &transition.next.pixels);
+            fnv1a_append(&mut hash, &[u8::from(branch.board_effect.changed)]);
+            for cell in &branch.board_effect.changed_cells {
+                fnv1a_append(&mut hash, &cell.to_le_bytes());
+            }
+        }
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn increment_factual_stratum(
+    counts: &mut FactualBranchStratumCounts,
+    changed: bool,
+    recoverable: bool,
+    action_id: u8,
+) {
+    counts.branches += 1;
+    if changed {
+        counts.changed += 1;
+    } else {
+        counts.unchanged += 1;
+    }
+    if recoverable {
+        counts.recoverable += 1;
+    }
+    if action_id == 6 {
+        counts.action6 += 1;
+    }
+}
+
+fn mean_or_none(values: &[f32]) -> Option<f64> {
+    (!values.is_empty())
+        .then(|| values.iter().map(|value| f64::from(*value)).sum::<f64>() / values.len() as f64)
+}
+
+fn squared_distance(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let delta = f64::from(*left) - f64::from(*right);
+            delta * delta
+        })
+        .sum()
+}
+
+fn evaluate_factual_branches(
+    model: &WorldModel,
+    cfg: &EvalConfig,
+    device: &Device,
+) -> Result<FactualBranchMetrics> {
+    let seed = factual_branch_eval_seed(cfg.seed);
+    let groups = (0..cfg.synthetic_episodes)
+        .map(|episode| {
+            generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let population_fingerprint = factual_population_fingerprint(&groups, cfg.synthetic_episodes);
+    let samples = groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .branches()
+                .iter()
+                .map(|branch| branch.transition.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let mut predicted_displacements = Vec::with_capacity(samples.len());
+    let mut action_logits = Vec::with_capacity(samples.len());
+    let mut coordinate_predictions = Vec::with_capacity(samples.len());
+    for (start, end) in batch_ranges(samples.len(), cfg.physical_batch.max(1)) {
+        let batch = batch_from_samples(&samples[start..end], device)?;
+        let current = model.encode_state(&batch.frames)?;
+        let output = model.forward(
+            &batch.frames,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.goals,
+        )?;
+        let displacement = pool_latent(&output.y.sub(&current)?)?;
+        let (decoded_actions, decoded_coordinates) =
+            model.decode_action_displacement(&displacement)?;
+        predicted_displacements.extend(displacement.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        action_logits.extend(decoded_actions.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        coordinate_predictions.extend(decoded_coordinates.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+    }
+
+    let mut changed_norms = Vec::new();
+    let mut unchanged_norms = Vec::new();
+    let mut norm_scores = Vec::new();
+    let mut norm_labels = Vec::new();
+    let mut outcome_equivalence_anchors = 0usize;
+    let mut outcome_equivalence_correct = 0usize;
+    let mut unique_changed_effect_action_n = 0usize;
+    let mut unique_changed_effect_action_correct = 0usize;
+    let mut action6_coordinate_n = 0usize;
+    let mut action6_coordinate_sum_squared = 0f64;
+    let mut counts = FactualBranchStratumCounts::default();
+    let mut by_family = BTreeMap::<String, FactualBranchStratumCounts>::new();
+    let mut by_action_id = BTreeMap::<u8, FactualBranchStratumCounts>::new();
+    let mut offset = 0usize;
+    for group in &groups {
+        let branches = group.branches();
+        let recoverable = group
+            .unique_changed_effect_indices()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for (local, branch) in branches.iter().enumerate() {
+            let global = offset + local;
+            let changed = branch.board_effect.changed;
+            let is_recoverable = recoverable.contains(&local);
+            increment_factual_stratum(
+                &mut counts,
+                changed,
+                is_recoverable,
+                branch.transition.action.id,
+            );
+            increment_factual_stratum(
+                by_family
+                    .entry(branch.transition.family.clone())
+                    .or_default(),
+                changed,
+                is_recoverable,
+                branch.transition.action.id,
+            );
+            increment_factual_stratum(
+                by_action_id.entry(branch.transition.action.id).or_default(),
+                changed,
+                is_recoverable,
+                branch.transition.action.id,
+            );
+
+            let norm = (predicted_displacements[global]
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                / predicted_displacements[global].len().max(1) as f64)
+                .sqrt() as f32;
+            norm_scores.push(norm);
+            norm_labels.push(changed);
+            if changed {
+                changed_norms.push(norm);
+            } else {
+                unchanged_norms.push(norm);
+            }
+
+            let equivalent = branches
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != local)
+                .filter(|(_, other)| branch.outcome_equivalent(other))
+                .count();
+            let distinct = branches.len().saturating_sub(1 + equivalent);
+            if equivalent > 0 && distinct > 0 {
+                outcome_equivalence_anchors += 1;
+                let nearest = branches
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != local)
+                    .min_by(|(left_index, _), (right_index, _)| {
+                        squared_distance(
+                            &predicted_displacements[global],
+                            &predicted_displacements[offset + *left_index],
+                        )
+                        .partial_cmp(&squared_distance(
+                            &predicted_displacements[global],
+                            &predicted_displacements[offset + *right_index],
+                        ))
+                        .unwrap_or_else(|| left_index.cmp(right_index))
+                    })
+                    .expect("eligible factual anchor has a candidate");
+                if branch.outcome_equivalent(nearest.1) {
+                    outcome_equivalence_correct += 1;
+                }
+            }
+
+            if is_recoverable {
+                unique_changed_effect_action_n += 1;
+                let predicted_action = action_logits[global]
+                    .iter()
+                    .enumerate()
+                    .max_by(|(left_index, left), (right_index, right)| {
+                        left.partial_cmp(right)
+                            .unwrap_or_else(|| left_index.cmp(right_index))
+                    })
+                    .map(|(index, _)| index as u8);
+                if predicted_action == Some(branch.transition.action.id) {
+                    unique_changed_effect_action_correct += 1;
+                }
+                if branch.transition.action.id == 6 {
+                    let action = &branch.transition.action;
+                    let expected = [
+                        f64::from(action.x.expect("recoverable ACTION6 x")) / 63.0,
+                        f64::from(action.y.expect("recoverable ACTION6 y")) / 63.0,
+                    ];
+                    action6_coordinate_sum_squared += coordinate_predictions[global]
+                        .iter()
+                        .zip(expected)
+                        .map(|(predicted, expected)| {
+                            let delta = f64::from(*predicted) - expected;
+                            delta * delta
+                        })
+                        .sum::<f64>();
+                    action6_coordinate_n += 1;
+                }
+            }
+        }
+        offset += branches.len();
+    }
+    let changed_displacement_norm_mean = mean_or_none(&changed_norms);
+    let unchanged_displacement_norm_mean = mean_or_none(&unchanged_norms);
+    let action6_coordinate_rmse_normalized = (action6_coordinate_n > 0)
+        .then(|| (action6_coordinate_sum_squared / (action6_coordinate_n * 2) as f64).sqrt());
+    Ok(FactualBranchMetrics {
+        population_fingerprint,
+        groups: groups.len(),
+        branches: counts.branches,
+        changed: counts.changed,
+        unchanged: counts.unchanged,
+        recoverable: counts.recoverable,
+        action6: counts.action6,
+        outcome_equivalence_anchors,
+        outcome_equivalence_retrieval_accuracy: (outcome_equivalence_anchors > 0)
+            .then_some(outcome_equivalence_correct as f64 / outcome_equivalence_anchors as f64),
+        unique_changed_effect_action_n,
+        unique_changed_effect_action_top1: (unique_changed_effect_action_n > 0).then_some(
+            unique_changed_effect_action_correct as f64 / unique_changed_effect_action_n as f64,
+        ),
+        action6_coordinate_n,
+        action6_coordinate_rmse_normalized,
+        action6_coordinate_rmse_pixels: action6_coordinate_rmse_normalized
+            .map(|value| value * 63.0),
+        changed_displacement_norm_mean,
+        unchanged_displacement_norm_mean,
+        changed_vs_unchanged_displacement_norm_auroc: binary_auroc(&norm_scores, &norm_labels),
+        changed_to_unchanged_displacement_norm_ratio: changed_displacement_norm_mean
+            .zip(unchanged_displacement_norm_mean)
+            .and_then(|(changed, unchanged)| {
+                (unchanged > f64::EPSILON).then_some(changed / unchanged)
+            }),
+        by_family,
+        by_action_id,
+    })
+}
+
 /// Full evaluation: synthetic held-out (+ optional ARC recordings dir).
 pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     cfg.validate()?;
@@ -3088,6 +3411,10 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     }
     let device = resolve_device(&cfg.device)?;
     let (model, _varmap) = load_model(&train_cfg, &cfg.checkpoint, &device)?;
+    let factual_branches = train_cfg
+        .world_core_v2
+        .then(|| evaluate_factual_branches(&model, cfg, &device))
+        .transpose()?;
 
     let mut dynamics_sources = collect_synthetic_sources(
         cfg.seed,
@@ -3293,6 +3620,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         public_data_used_for_fitting: false,
         synthetic_dynamics,
         synthetic_planner,
+        factual_branches,
         arc3_transfer,
         research_claim: false,
     };
@@ -4036,6 +4364,27 @@ mod tests {
     }
 
     #[test]
+    fn factual_population_is_stable_and_domain_separated() -> Result<()> {
+        let first_seed = factual_branch_eval_seed(3);
+        assert_ne!(first_seed, 3);
+        assert_eq!(first_seed, factual_branch_eval_seed(3));
+        let groups = (0..2)
+            .map(|episode| {
+                generate_factual_branch_group(first_seed, episode, Split::HeldOutComposition)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            factual_population_fingerprint(&groups, 2),
+            factual_population_fingerprint(&groups, 2)
+        );
+        assert_ne!(
+            factual_population_fingerprint(&groups, 2),
+            factual_population_fingerprint(&groups, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tiny_eval_and_report_schema() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("tofy-p2-eval-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -4044,13 +4393,19 @@ mod tests {
         let train_cfg = TrainConfig {
             output_dir: dir.clone(),
             steps_per_lesson: 1,
-            lessons: vec!["dynamics".into()],
+            lessons: vec!["dynamics".into(), "factual_branches".into()],
             physical_batch: 2,
             grad_accum: 1,
             hidden_dim: 16,
             action_dim: 4,
             inner_steps: 1,
             outer_steps: 1,
+            sigreg_weight: 0.0,
+            world_core_v2: true,
+            branch_learning: crate::p2::branch_learning::BranchLearningConfig {
+                enabled: true,
+                ..Default::default()
+            },
             ..TrainConfig::default()
         };
 
@@ -4061,7 +4416,7 @@ mod tests {
         reinit_varmap_deterministic(&varmap, train_cfg.seed)?;
         let report = TrainReport {
             schema: TRAIN_REPORT_SCHEMA.into(),
-            world_core_schema: "legacy_p2_eval_compatible".into(),
+            world_core_schema: crate::p2::branch_learning::WORLD_CORE_V2_SCHEMA.into(),
             seed: train_cfg.seed,
             physical_batch: train_cfg.physical_batch,
             grad_accum: 1,
@@ -4088,7 +4443,7 @@ mod tests {
             checkpoint: dir.join("model.safetensors"),
             train_config: dir.join("config.json"),
             seed: 3,
-            synthetic_episodes: 1,
+            synthetic_episodes: 2,
             physical_batch: 2,
             ptrm_k: vec![1, 2],
             ptrm_noise: 0.0,
@@ -4109,6 +4464,16 @@ mod tests {
         assert!(!eval.research_claim);
         assert!(eval.synthetic_dynamics.n_samples > 0);
         assert!(eval.synthetic_planner.n_samples > 0);
+        let factual = eval
+            .factual_branches
+            .as_ref()
+            .expect("world-core-v2 factual evaluation");
+        assert_eq!(factual.groups, eval_cfg.synthetic_episodes);
+        assert_eq!(factual.branches, factual.changed + factual.unchanged);
+        assert_eq!(factual.action6_coordinate_n, factual.action6);
+        assert!(factual.action6_coordinate_rmse_normalized.is_some());
+        assert!(factual.action6_coordinate_rmse_pixels.is_some());
+        assert!(!factual.population_fingerprint.is_empty());
         assert!(eval
             .synthetic_dynamics
             .one_step_latent_mse
@@ -4161,6 +4526,12 @@ mod tests {
         let text = fs::read_to_string(&eval_cfg.output)?;
         let back: EvalReport = serde_json::from_str(&text)?;
         assert_eq!(back.schema, EVAL_REPORT_SCHEMA);
+        assert_eq!(
+            back.factual_branches
+                .as_ref()
+                .map(|metrics| &metrics.population_fingerprint),
+            Some(&factual.population_fingerprint)
+        );
         let episode_rows: Vec<EpisodeRolloutRow> =
             fs::read_to_string(eval_cfg.episode_jsonl.as_ref().expect("episode JSONL path"))?
                 .lines()
@@ -4271,6 +4642,18 @@ mod tests {
         assert_eq!(
             arc_eval.arc3_transfer.as_ref().map(|split| split.n_samples),
             Some(0)
+        );
+        let empty_factual = arc_eval
+            .factual_branches
+            .as_ref()
+            .expect("world-core-v2 report keeps factual branch metric shape");
+        assert_eq!(empty_factual.branches, 0);
+        assert_eq!(empty_factual.outcome_equivalence_retrieval_accuracy, None);
+        assert_eq!(empty_factual.unique_changed_effect_action_top1, None);
+        assert_eq!(empty_factual.action6_coordinate_rmse_normalized, None);
+        assert_eq!(
+            empty_factual.changed_vs_unchanged_displacement_norm_auroc,
+            None
         );
         let _: EvalReport = serde_json::from_str(&fs::read_to_string(&arc_cfg.output)?)?;
 

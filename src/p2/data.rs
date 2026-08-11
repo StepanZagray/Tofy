@@ -365,6 +365,26 @@ impl BranchGroup {
         &self.branches
     }
 
+    /// Changed branches whose board-only outcome identifies that action within
+    /// this same-state group. Status-strip changes deliberately do not enter
+    /// this relation.
+    pub(crate) fn unique_changed_effect_indices(&self) -> Vec<usize> {
+        self.branches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, branch)| {
+                (branch.board_effect.changed
+                    && self
+                        .branches
+                        .iter()
+                        .filter(|candidate| branch.outcome_equivalent(candidate))
+                        .count()
+                        == 1)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
     pub fn into_transitions(self) -> impl Iterator<Item = TransitionSample> {
         self.branches.into_iter().map(|branch| branch.transition)
     }
@@ -1380,6 +1400,11 @@ mod tests {
             .branches()
             .iter()
             .all(|branch| branch.board_effect.changed));
+        assert_eq!(
+            coordinate.unique_changed_effect_indices(),
+            vec![0, 1, 2, 3],
+            "distinct ACTION6 board outcomes are recoverable without status UI"
+        );
         Ok(())
     }
 
