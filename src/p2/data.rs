@@ -286,7 +286,7 @@ pub struct BranchGroup {
 }
 
 impl FactualActionBranch {
-    pub fn try_from_transition(transition: TransitionSample) -> Result<Self> {
+    pub(crate) fn try_from_transition(transition: TransitionSample) -> Result<Self> {
         ensure!(
             transition.current.width as usize == FRAME_SIDE
                 && transition.current.height as usize == FRAME_SIDE
@@ -332,7 +332,7 @@ impl FactualActionBranch {
 }
 
 impl BranchGroup {
-    pub fn try_new(branches: Vec<FactualActionBranch>) -> Result<Self> {
+    pub(crate) fn try_new(branches: Vec<FactualActionBranch>) -> Result<Self> {
         ensure!(
             branches.len() >= 2,
             "a factual branch group requires at least two branches"

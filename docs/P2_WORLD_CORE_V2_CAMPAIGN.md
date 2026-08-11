@@ -23,7 +23,7 @@ The campaign evaluates architectural direction, not the claim that ARC-AGI-3 is 
 - one final synthetic evaluation with seed `424242`, 64 episodes, `ptrm-k=1`
 - no automatic seed promotion
 
-The factual lesson alternates four-action exact-simulator Branch Groups with four-coordinate, marker-free ACTION6 Branch Groups. Board Effect excludes the deterministic bottom status row.
+The factual lesson alternates four-action exact-simulator Branch Groups with four-coordinate, marker-free ACTION6 Branch Groups. Board Effect excludes the deterministic bottom status row, and world-core-v2 replaces that strip with EMPTY before encoding so unchanged-board supervision cannot conflict with action-budget progression.
 
 ## Sequential arms
 

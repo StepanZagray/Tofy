@@ -24,6 +24,8 @@ World-core-v2:
 - learns action identity and ACTION6 coordinates from predicted Consumer Latent displacement;
 - pulls equivalent Board Effects together, separates distinct effects, and applies Changed Transition/copy margins;
 - defines Board Effect without the deterministic bottom-row status display;
+- normalizes that status strip to EMPTY before the v2 encoder, keeping board
+  dynamics free of action-budget progression while event labels retain status;
 - applies differentiable variance and off-diagonal covariance health losses directly to spatial and pooled Consumer Latents;
 - requires `grad_accum = 1` whenever representation-health losses are active;
 - persists all switches, weights, architecture identity, batch schedule, loss terms, and population counts.

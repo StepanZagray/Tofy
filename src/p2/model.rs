@@ -681,19 +681,37 @@ impl WorldModel {
         if h != FRAME_SIDE || w != FRAME_SIDE {
             bail!("embed_frames: expected {FRAME_SIDE}x{FRAME_SIDE}, got {h}x{w}");
         }
-        if c == PIXEL_EMB_DIM {
-            return Ok(frames.clone());
-        }
-        if c == 1 {
+        let embedded = if c == PIXEL_EMB_DIM {
+            frames.clone()
+        } else if c == 1 {
             let idx = frames.squeeze(1)?.to_dtype(DType::U32)?;
             let flat = idx.flatten_all()?;
             let emb = self.pixel_emb.forward(&flat)?;
-            return Ok(emb
-                .reshape((b, h, w, PIXEL_EMB_DIM))?
+            emb.reshape((b, h, w, PIXEL_EMB_DIM))?
                 .permute((0, 3, 1, 2))?
-                .contiguous()?);
+                .contiguous()?
+        } else {
+            bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
+        };
+        if !self.config.world_core_v2 {
+            return Ok(embedded);
         }
-        bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
+
+        // The synthetic status strip advances with the action budget even when
+        // the board has not changed. World-core-v2 models board dynamics only:
+        // replace that strip with the learned EMPTY embedding before the patch
+        // encoder, so branch-equivalence and copy objectives cannot conflict
+        // with an observation-side counter. Status remains available to the
+        // separately supervised event labels rather than leaking into z.
+        let board = embedded.narrow(2, 0, FRAME_SIDE - 1)?;
+        let empty_indices = Tensor::zeros((b * w,), DType::U32, frames.device())?;
+        let empty = self
+            .pixel_emb
+            .forward(&empty_indices)?
+            .reshape((b, 1, w, PIXEL_EMB_DIM))?
+            .permute((0, 3, 1, 2))?
+            .contiguous()?;
+        Tensor::cat(&[&board, &empty], 2).map_err(Into::into)
     }
 
     fn add_action(
@@ -1706,6 +1724,33 @@ mod tests {
         let next_solo = model.encode_state(&next_frames)?;
         assert!(max_abs_diff(&cur, &cur_solo)? < 1e-5);
         assert!(max_abs_diff(&next, &next_solo)? < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn world_core_v2_latent_is_invariant_to_status_strip() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.world_core_v2 = true;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = WorldModel::new(cfg, vb)?;
+        let mut first = vec![0u8; FRAME_SIDE * FRAME_SIDE];
+        first[10 * FRAME_SIDE + 10] = 3;
+        let mut second = first.clone();
+        for (column, pixel) in second[(FRAME_SIDE - 1) * FRAME_SIDE..]
+            .iter_mut()
+            .enumerate()
+        {
+            *pixel = (column % PALETTE_SIZE) as u8;
+        }
+        let first = Tensor::from_vec(first, (1, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+        let second = Tensor::from_vec(second, (1, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+
+        let first_latent = model.encode_state(&first)?;
+        let second_latent = model.encode_state(&second)?;
+
+        assert_eq!(max_abs_diff(&first_latent, &second_latent)?, 0.0);
         Ok(())
     }
 
