@@ -1,3 +1,4 @@
+pub mod agent_session;
 pub mod arc3;
 pub mod arc3_live;
 pub mod board_probe;
@@ -5,8 +6,10 @@ pub mod branch_learning;
 pub mod calibration;
 pub mod cg_profile;
 pub mod cli;
+pub mod consumer_transition;
 pub mod data;
 pub mod eval;
+pub mod experiment;
 pub mod model;
 pub mod muon;
 pub mod optimizer;

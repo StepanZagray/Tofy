@@ -32,6 +32,10 @@ _Avoid_: Coordinate bias, action token
 The learned state representation directly consumed by transition prediction, recurrence, and planning.
 _Avoid_: Projection head, regularizer embedding
 
+**Consumer Transition**:
+The current, predicted-next, and factual target Consumer Latents for one Action-Conditioned Transition, including their predicted displacement.
+_Avoid_: Latent tuple, transition tensors
+
 **Representation Health**:
 The conjunction of non-vanishing variation, adequate dimensional diversity, finite values, and retained information at every consumer seam.
 _Avoid_: Non-collapse score, latent quality
@@ -39,3 +43,19 @@ _Avoid_: Non-collapse score, latent quality
 **Changed Transition**:
 A factual action branch with a non-empty board effect.
 _Avoid_: Non-noop frame
+
+**Raw Observation Identity**:
+An immutable identity over every observed pixel and observation field, used for audit and corruption detection.
+_Avoid_: State key, board hash
+
+**Mechanics State Identity**:
+A game- and level-scoped identity over task mechanics that may equate observations differing only in proven presentation or status progression.
+_Avoid_: Raw hash, visual identity
+
+**Factual Memory**:
+The append-only history of confirmed observations, confirmed actions, and their observed results; predictions never enter it.
+_Avoid_: Replay buffer, imagined memory
+
+**Ambiguous Action Attempt**:
+An at-most-once action submission whose application status cannot be confirmed from the transport result.
+_Avoid_: Failed action, confirmed transition

@@ -3,11 +3,13 @@
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::arc3::{import_recordings_dir, summarize_recordings_dir, RecordingRunSummary};
-use crate::p2::board_probe::{BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT};
+use crate::p2::board_probe::{
+    BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
+};
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
     generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, BranchGroup,
-    TransitionSample, ORACLE_LATENT_DIM,
+    FactualBatch, TransitionSample, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionStepProbe, WorldModel,
@@ -612,6 +614,54 @@ pub struct FactualBranchStratumCounts {
     pub action6: usize,
 }
 
+/// Persisted branch-level evidence. Aggregate metrics must reconcile exactly
+/// with these rows, making action/outcome confounds visible after a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactualBranchRowMetric {
+    pub row_index: usize,
+    pub group_index: usize,
+    pub group_key: String,
+    pub family: String,
+    pub action_id: u8,
+    pub action_x: Option<u8>,
+    pub action_y: Option<u8>,
+    pub changed: bool,
+    pub changed_cells: Vec<u16>,
+    pub status_changed_cells: Vec<u16>,
+    pub outcome_class: usize,
+    pub recoverable: bool,
+    pub predicted_displacement_norm: f64,
+    pub predicted_action_id: Option<u8>,
+    pub predicted_action_x_normalized: f32,
+    pub predicted_action_y_normalized: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactualBranchGroupMetric {
+    pub group_index: usize,
+    pub group_key: String,
+    pub row_start: usize,
+    pub row_end: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+    pub outcome_classes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupBootstrapInterval {
+    pub estimate: f64,
+    pub lower_95: f64,
+    pub upper_95: f64,
+    pub resamples: usize,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactualBranchBootstrap {
+    pub changed_norm_gap: Option<GroupBootstrapInterval>,
+    pub action_recovery_top1: Option<GroupBootstrapInterval>,
+}
+
 /// Held-out same-state factual-action evaluation for world-core-v2 only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactualBranchMetrics {
@@ -644,6 +694,17 @@ pub struct FactualBranchMetrics {
     pub board_probe: Option<BoardTransitionMetrics>,
     pub by_family: BTreeMap<String, FactualBranchStratumCounts>,
     pub by_action_id: BTreeMap<u8, FactualBranchStratumCounts>,
+    #[serde(default)]
+    pub rows: Vec<FactualBranchRowMetric>,
+    #[serde(default)]
+    pub group_summaries: Vec<FactualBranchGroupMetric>,
+    /// Exact reconciliation of persisted rows with all top-level counts.
+    #[serde(default)]
+    pub rows_reconciled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_bootstrap: Option<FactualBranchBootstrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub majority_action_baseline_top1: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3197,50 +3258,71 @@ fn squared_distance(left: &[f32], right: &[f32]) -> f64 {
         .sum()
 }
 
-fn patch_rows(latent: &Tensor) -> Result<Vec<Vec<f32>>> {
-    let (batch, channels, height, width) = latent.dims4()?;
-    if channels == 0 || height != 8 || width != 8 {
-        bail!("board probe requires BxCx8x8 spatial latents");
-    }
-    let values = latent
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let mut rows = Vec::with_capacity(batch * PATCH_COUNT);
-    for sample in 0..batch {
-        for y in 0..8 {
-            for x in 0..8 {
-                rows.push(
-                    (0..channels)
-                        .map(|channel| values[((sample * channels + channel) * 8 + y) * 8 + x])
-                        .collect(),
-                );
-            }
-        }
-    }
-    Ok(rows)
+fn factual_changed_norm_gap(rows: &[&FactualBranchRowMetric]) -> Option<f64> {
+    let changed = rows
+        .iter()
+        .filter(|row| row.changed)
+        .map(|row| row.predicted_displacement_norm)
+        .collect::<Vec<_>>();
+    let unchanged = rows
+        .iter()
+        .filter(|row| !row.changed)
+        .map(|row| row.predicted_displacement_norm)
+        .collect::<Vec<_>>();
+    (!changed.is_empty() && !unchanged.is_empty()).then(|| {
+        changed.iter().sum::<f64>() / changed.len() as f64
+            - unchanged.iter().sum::<f64>() / unchanged.len() as f64
+    })
 }
 
-fn exact_changed_patch_labels(samples: &[TransitionSample]) -> Vec<bool> {
-    samples
+fn factual_action_top1(rows: &[&FactualBranchRowMetric]) -> Option<f64> {
+    let eligible = rows
         .iter()
-        .flat_map(|sample| {
-            (0..8).flat_map(move |patch_y| {
-                (0..8).map(move |patch_x| {
-                    let y_start = patch_y * 8;
-                    let y_end = ((patch_y + 1) * 8).min(63);
-                    let x_start = patch_x * 8;
-                    let x_end = (patch_x + 1) * 8;
-                    (y_start..y_end).any(|y| {
-                        (x_start..x_end).any(|x| {
-                            let index = y * 64 + x;
-                            sample.current.pixels[index] != sample.next.pixels[index]
-                        })
-                    })
-                })
-            })
-        })
-        .collect()
+        .filter(|row| row.recoverable)
+        .collect::<Vec<_>>();
+    (!eligible.is_empty()).then(|| {
+        eligible
+            .iter()
+            .filter(|row| row.predicted_action_id == Some(row.action_id))
+            .count() as f64
+            / eligible.len() as f64
+    })
+}
+
+fn group_bootstrap_interval(
+    rows: &[FactualBranchRowMetric],
+    groups: &[FactualBranchGroupMetric],
+    seed: u64,
+    metric: fn(&[&FactualBranchRowMetric]) -> Option<f64>,
+) -> Option<GroupBootstrapInterval> {
+    const RESAMPLES: usize = 1000;
+    let observed_rows = rows.iter().collect::<Vec<_>>();
+    let estimate = metric(&observed_rows)?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut values = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut sampled = Vec::new();
+        for _ in 0..groups.len() {
+            let group = &groups[rng.random_range(0..groups.len())];
+            sampled.extend(rows[group.row_start..group.row_end].iter());
+        }
+        if let Some(value) = metric(&sampled) {
+            values.push(value);
+        }
+    }
+    if values.len() < RESAMPLES * 9 / 10 {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let lower = values[((values.len() as f64 * 0.025).floor() as usize).min(values.len() - 1)];
+    let upper = values[((values.len() as f64 * 0.975).floor() as usize).min(values.len() - 1)];
+    Some(GroupBootstrapInterval {
+        estimate,
+        lower_95: lower,
+        upper_95: upper,
+        resamples: values.len(),
+        unit: "branch_group".into(),
+    })
 }
 
 fn evaluate_factual_branches(
@@ -3253,28 +3335,60 @@ fn evaluate_factual_branches(
     // branches are cheap one-step groups, so use four times as many to keep the
     // frozen overnight population at 256 groups when synthetic_episodes=64.
     let factual_group_count = cfg.synthetic_episodes.saturating_mul(4);
-    let groups = (0..factual_group_count)
+    if factual_group_count == 0 {
+        return Ok(FactualBranchMetrics {
+            population_fingerprint: factual_population_fingerprint(&[], 0),
+            groups: 0,
+            branches: 0,
+            changed: 0,
+            unchanged: 0,
+            recoverable: 0,
+            action6: 0,
+            outcome_equivalence_anchors: 0,
+            outcome_equivalence_retrieval_accuracy: None,
+            unique_changed_effect_action_n: 0,
+            unique_changed_effect_action_top1: None,
+            action6_coordinate_n: 0,
+            action6_coordinate_rmse_normalized: None,
+            action6_coordinate_rmse_pixels: None,
+            changed_displacement_norm_mean: None,
+            unchanged_displacement_norm_mean: None,
+            changed_vs_unchanged_displacement_norm_auroc: None,
+            changed_to_unchanged_displacement_norm_ratio: None,
+            board_probe: None,
+            by_family: BTreeMap::new(),
+            by_action_id: BTreeMap::new(),
+            rows: Vec::new(),
+            group_summaries: Vec::new(),
+            rows_reconciled: true,
+            group_bootstrap: None,
+            majority_action_baseline_top1: None,
+        });
+    }
+    let generated_groups = (0..factual_group_count)
         .map(|episode| {
             generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
         })
         .collect::<Result<Vec<_>>>()?;
+    // Canonicalize once, before inference and metric construction. Rebuilding
+    // batches independently would reorder branch actions for model input while
+    // leaving labels in generator order, silently misaligning evidence rows.
+    let factual_batch = FactualBatch::from_groups(generated_groups)?;
+    let groups = factual_batch.groups().to_vec();
     let population_fingerprint = factual_population_fingerprint(&groups, factual_group_count);
-    let samples = groups
-        .iter()
-        .flat_map(|group| {
-            group
-                .branches()
-                .iter()
-                .map(|branch| branch.transition.clone())
-        })
-        .collect::<Vec<_>>();
+    let samples = factual_batch.rows().to_vec();
 
     let mut predicted_displacements = Vec::with_capacity(samples.len());
     let mut action_logits = Vec::with_capacity(samples.len());
     let mut coordinate_predictions = Vec::with_capacity(samples.len());
-    let mut target_patch_latents = Vec::new();
-    let mut predicted_patch_latents = Vec::new();
-    for (start, end) in batch_ranges(samples.len(), cfg.physical_batch.max(1)) {
+    let mut target_patch_latents: Option<BoardProbeRows> = None;
+    let mut predicted_patch_latents: Option<BoardProbeRows> = None;
+    let factual_eval_batch = cfg
+        .physical_batch
+        .max(crate::p2::data::FACTUAL_BRANCHES_PER_GROUP)
+        / crate::p2::data::FACTUAL_BRANCHES_PER_GROUP
+        * crate::p2::data::FACTUAL_BRANCHES_PER_GROUP;
+    for (start, end) in batch_ranges(samples.len(), factual_eval_batch) {
         let batch = batch_from_samples(&samples[start..end], device)?;
         let current = model.encode_state(&batch.frames)?;
         let output = model.forward(
@@ -3290,8 +3404,18 @@ fn evaluate_factual_branches(
         predicted_displacements.extend(displacement.to_dtype(DType::F32)?.to_vec2::<f32>()?);
         action_logits.extend(decoded_actions.to_dtype(DType::F32)?.to_vec2::<f32>()?);
         coordinate_predictions.extend(decoded_coordinates.to_dtype(DType::F32)?.to_vec2::<f32>()?);
-        target_patch_latents.extend(patch_rows(&target)?);
-        predicted_patch_latents.extend(patch_rows(&output.y)?);
+        let target_rows = BoardProbeRows::from_spatial_latent(&target)?;
+        let predicted_rows = BoardProbeRows::from_spatial_latent(&output.y)?;
+        if let Some(rows) = &mut target_patch_latents {
+            rows.append(target_rows);
+        } else {
+            target_patch_latents = Some(target_rows);
+        }
+        if let Some(rows) = &mut predicted_patch_latents {
+            rows.append(predicted_rows);
+        } else {
+            predicted_patch_latents = Some(predicted_rows);
+        }
     }
 
     let board_probe = if groups.len() >= 2 {
@@ -3304,29 +3428,32 @@ fn evaluate_factual_branches(
             .map(|group| group.branches().len())
             .sum::<usize>();
         let fit_rows = fit_samples * PATCH_COUNT;
-        let probe = FixedBoardProbe::fit(
-            &target_patch_latents[..fit_rows],
+        let target_patch_latents = target_patch_latents
+            .as_ref()
+            .expect("non-empty factual rows");
+        let predicted_patch_latents = predicted_patch_latents
+            .as_ref()
+            .expect("non-empty factual rows");
+        let probe = FixedBoardProbe::fit_spatial(
+            &target_patch_latents.slice(0..fit_rows)?,
             &samples[..fit_samples]
                 .iter()
                 .map(|sample| sample.next.clone())
                 .collect::<Vec<_>>(),
         )?;
         let held_out = &samples[fit_samples..];
-        Some(
-            probe.summarize_held_out(
-                &target_patch_latents[fit_rows..],
-                &predicted_patch_latents[fit_rows..],
-                &held_out
-                    .iter()
-                    .map(|sample| sample.current.clone())
-                    .collect::<Vec<_>>(),
-                &held_out
-                    .iter()
-                    .map(|sample| sample.next.clone())
-                    .collect::<Vec<_>>(),
-                &exact_changed_patch_labels(held_out),
-            )?,
-        )
+        let transitions = BoardProbeTransitions::try_new(
+            held_out
+                .iter()
+                .map(|sample| sample.current.clone())
+                .collect(),
+            held_out.iter().map(|sample| sample.next.clone()).collect(),
+        )?;
+        Some(probe.summarize_transitions(
+            &target_patch_latents.slice(fit_rows..target_patch_latents.as_rows().len())?,
+            &predicted_patch_latents.slice(fit_rows..predicted_patch_latents.as_rows().len())?,
+            &transitions,
+        )?)
     } else {
         None
     };
@@ -3344,9 +3471,19 @@ fn evaluate_factual_branches(
     let mut counts = FactualBranchStratumCounts::default();
     let mut by_family = BTreeMap::<String, FactualBranchStratumCounts>::new();
     let mut by_action_id = BTreeMap::<u8, FactualBranchStratumCounts>::new();
+    let mut rows = Vec::with_capacity(samples.len());
+    let mut group_summaries = Vec::with_capacity(groups.len());
     let mut offset = 0usize;
-    for group in &groups {
+    for (group_index, group) in groups.iter().enumerate() {
         let branches = group.branches();
+        let source = &branches[0].transition;
+        let group_key = format!(
+            "{}:{}:{}:{}",
+            source.seed,
+            source.episode_id,
+            source.family,
+            crate::p2::data::BranchGroupId::from_transition_for_eval(source).current_fingerprint
+        );
         let recoverable = group
             .unique_changed_effect_indices()
             .into_iter()
@@ -3382,6 +3519,36 @@ fn evaluate_factual_branches(
                 .sum::<f64>()
                 / predicted_displacements[global].len().max(1) as f64)
                 .sqrt() as f32;
+            let predicted_action = action_logits[global]
+                .iter()
+                .enumerate()
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.partial_cmp(right)
+                        .unwrap_or_else(|| left_index.cmp(right_index))
+                })
+                .map(|(index, _)| index as u8);
+            let outcome_class = branches
+                .iter()
+                .position(|candidate| branch.outcome_equivalent(candidate))
+                .expect("branch is equivalent to itself");
+            rows.push(FactualBranchRowMetric {
+                row_index: global,
+                group_index,
+                group_key: group_key.clone(),
+                family: branch.transition.family.clone(),
+                action_id: branch.transition.action.id,
+                action_x: branch.transition.action.x,
+                action_y: branch.transition.action.y,
+                changed,
+                changed_cells: branch.board_effect.changed_cells.clone(),
+                status_changed_cells: branch.status_changed_cells.clone(),
+                outcome_class,
+                recoverable: is_recoverable,
+                predicted_displacement_norm: f64::from(norm),
+                predicted_action_id: predicted_action,
+                predicted_action_x_normalized: coordinate_predictions[global][0],
+                predicted_action_y_normalized: coordinate_predictions[global][1],
+            });
             norm_scores.push(norm);
             norm_labels.push(changed);
             if changed {
@@ -3422,16 +3589,6 @@ fn evaluate_factual_branches(
 
             if is_recoverable {
                 unique_changed_effect_action_n += 1;
-                let predicted_action = action_logits[global]
-                    .iter()
-                    .enumerate()
-                    .max_by(|(left_index, left), (right_index, right)| {
-                        left.partial_cmp(right)
-                            .unwrap_or_else(|| left_index.cmp(right_index))
-                    })
-                    // Decoder classes are the official IDs directly; class 0
-                    // is intentionally unused, matching training cross-entropy.
-                    .map(|(index, _)| index as u8);
                 if predicted_action == Some(branch.transition.action.id) {
                     unique_changed_effect_action_correct += 1;
                 }
@@ -3453,12 +3610,63 @@ fn evaluate_factual_branches(
                 }
             }
         }
+        let changed = branches
+            .iter()
+            .filter(|branch| branch.board_effect.changed)
+            .count();
+        let outcome_classes = branches
+            .iter()
+            .enumerate()
+            .filter(|(index, branch)| {
+                !branches[..*index]
+                    .iter()
+                    .any(|previous| branch.outcome_equivalent(previous))
+            })
+            .count();
+        group_summaries.push(FactualBranchGroupMetric {
+            group_index,
+            group_key,
+            row_start: offset,
+            row_end: offset + branches.len(),
+            changed,
+            unchanged: branches.len() - changed,
+            outcome_classes,
+        });
         offset += branches.len();
     }
     let changed_displacement_norm_mean = mean_or_none(&changed_norms);
     let unchanged_displacement_norm_mean = mean_or_none(&unchanged_norms);
     let action6_coordinate_rmse_normalized = (action6_coordinate_n > 0)
         .then(|| (action6_coordinate_sum_squared / (action6_coordinate_n * 2) as f64).sqrt());
+    let group_bootstrap = Some(FactualBranchBootstrap {
+        changed_norm_gap: group_bootstrap_interval(
+            &rows,
+            &group_summaries,
+            seed ^ 0xB007_0001,
+            factual_changed_norm_gap,
+        ),
+        action_recovery_top1: group_bootstrap_interval(
+            &rows,
+            &group_summaries,
+            seed ^ 0xB007_0002,
+            factual_action_top1,
+        ),
+    });
+    let recoverable_action_counts = rows.iter().filter(|row| row.recoverable).fold(
+        BTreeMap::<u8, usize>::new(),
+        |mut counts, row| {
+            *counts.entry(row.action_id).or_default() += 1;
+            counts
+        },
+    );
+    let majority_action_baseline_top1 = (!recoverable_action_counts.is_empty()).then(|| {
+        recoverable_action_counts
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0) as f64
+            / recoverable_action_counts.values().sum::<usize>() as f64
+    });
     Ok(FactualBranchMetrics {
         population_fingerprint,
         groups: groups.len(),
@@ -3489,6 +3697,14 @@ fn evaluate_factual_branches(
         board_probe,
         by_family,
         by_action_id,
+        rows_reconciled: rows.len() == counts.branches
+            && rows.iter().filter(|row| row.changed).count() == counts.changed
+            && rows.iter().filter(|row| !row.changed).count() == counts.unchanged
+            && rows.iter().filter(|row| row.recoverable).count() == counts.recoverable,
+        rows,
+        group_summaries,
+        group_bootstrap,
+        majority_action_baseline_top1,
     })
 }
 
@@ -4516,6 +4732,7 @@ mod tests {
         let report = TrainReport {
             schema: TRAIN_REPORT_SCHEMA.into(),
             world_core_schema: crate::p2::branch_learning::WORLD_CORE_V2_SCHEMA.into(),
+            experiment: train_cfg.resolved_experiment()?,
             seed: train_cfg.seed,
             physical_batch: train_cfg.physical_batch,
             grad_accum: 1,

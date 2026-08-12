@@ -5,6 +5,7 @@
 //! checkpoint selection, or curriculum hooks back to `p2::train`.
 
 use crate::gpu_lock::GpuSessionGuard;
+use crate::p2::agent_session::AgentSession;
 use crate::p2::data::{ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::eval::load_model;
 use crate::p2::model::{
@@ -884,6 +885,8 @@ pub struct LiveGameReport {
     pub duration_ms: u128,
     pub trace: Vec<LiveActionTrace>,
     pub ambiguous_attempted_action: Option<AmbiguousAttemptedAction>,
+    #[serde(default)]
+    pub agent_session: AgentSession,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -954,8 +957,12 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         let mut ambiguous_attempted_action = None;
         let mut error = None;
         let mut stop_reason = "reset_failed".to_string();
+        let mut agent_session = AgentSession::default();
         let mut last = match api.reset(&game.game_id, &card_id) {
-            Ok(observation) => Some(observation),
+            Ok(observation) => {
+                agent_session.observe(&observation)?;
+                Some(observation)
+            }
             Err(err) => {
                 error = Some(format!("{err:#}"));
                 None
@@ -1004,6 +1011,11 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             ) {
                 Ok(next) => next,
                 Err(MutationError::Ambiguous(mutation)) => {
+                    agent_session.record_ambiguous(
+                        observation,
+                        decision.chosen.action.clone(),
+                        mutation.clone(),
+                    )?;
                     error = Some(format!("action {}: {mutation}", trace.len() + 1));
                     stop_reason = "ambiguous_mutation".into();
                     ambiguous_attempted_action = Some(AmbiguousAttemptedAction {
@@ -1022,6 +1034,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                     break;
                 }
             };
+            agent_session.record_confirmed(observation, decision.chosen.action.clone(), &next)?;
             trace.push(LiveActionTrace {
                 index: trace.len(),
                 available_actions: observation.available_actions.clone(),
@@ -1057,6 +1070,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             duration_ms: started.elapsed().as_millis(),
             trace,
             ambiguous_attempted_action,
+            agent_session,
         });
     }
 

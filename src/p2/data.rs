@@ -14,6 +14,7 @@ use crate::search::shortest_path;
 use anyhow::{anyhow, bail, ensure, Result};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Official ARC-AGI-3 frame side length.
 pub const FRAME_SIDE: usize = 64;
@@ -283,6 +284,148 @@ pub struct FactualActionBranch {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BranchGroup {
     branches: Vec<FactualActionBranch>,
+}
+
+/// Every generated factual lesson is one four-action comparison. Keeping this
+/// contract next to the data interface prevents the trainer from silently
+/// accepting a truncated group as an independent batch.
+pub const FACTUAL_BRANCHES_PER_GROUP: usize = 4;
+
+/// Stable identity of one same-state factual comparison.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BranchGroupId {
+    pub seed: u64,
+    pub episode_id: u64,
+    pub family: String,
+    pub current_fingerprint: String,
+}
+
+/// A complete factual population in canonical group/action order.
+///
+/// This is the only adapter from flat curriculum rows into branch learning.
+/// Construction is order-independent and rejects missing or duplicated rows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FactualBatch {
+    groups: Vec<BranchGroup>,
+    group_ids: Vec<BranchGroupId>,
+    rows: Vec<TransitionSample>,
+    group_ranges: Vec<std::ops::Range<usize>>,
+}
+
+fn frame_fingerprint(frame: &ArcFrame) -> String {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for byte in frame
+        .width
+        .to_le_bytes()
+        .into_iter()
+        .chain(frame.height.to_le_bytes())
+        .chain(frame.pixels.iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+impl BranchGroupId {
+    fn from_transition(transition: &TransitionSample) -> Self {
+        Self {
+            seed: transition.seed,
+            episode_id: transition.episode_id,
+            family: transition.family.clone(),
+            current_fingerprint: frame_fingerprint(&transition.current),
+        }
+    }
+
+    pub(crate) fn from_transition_for_eval(transition: &TransitionSample) -> Self {
+        Self::from_transition(transition)
+    }
+}
+
+impl FactualBatch {
+    pub fn from_groups(mut groups: Vec<BranchGroup>) -> Result<Self> {
+        ensure!(!groups.is_empty(), "factual batch is empty");
+        for group in &groups {
+            ensure!(
+                group.branches.len() == FACTUAL_BRANCHES_PER_GROUP,
+                "factual group must contain exactly {FACTUAL_BRANCHES_PER_GROUP} branches, got {}",
+                group.branches.len()
+            );
+        }
+        groups.sort_by_key(|group| BranchGroupId::from_transition(&group.branches[0].transition));
+
+        let mut group_ids = Vec::with_capacity(groups.len());
+        let mut rows = Vec::with_capacity(groups.len() * FACTUAL_BRANCHES_PER_GROUP);
+        let mut group_ranges = Vec::with_capacity(groups.len());
+        for group in &mut groups {
+            group.branches.sort_by_key(|branch| {
+                let action = &branch.transition.action;
+                (action.id, action.x, action.y)
+            });
+            let id = BranchGroupId::from_transition(&group.branches[0].transition);
+            let start = rows.len();
+            rows.extend(
+                group
+                    .branches
+                    .iter()
+                    .map(|branch| branch.transition.clone()),
+            );
+            group_ranges.push(start..rows.len());
+            group_ids.push(id);
+        }
+        Ok(Self {
+            groups,
+            group_ids,
+            rows,
+            group_ranges,
+        })
+    }
+
+    pub fn from_rows(rows: &[TransitionSample]) -> Result<Self> {
+        ensure!(!rows.is_empty(), "factual batch is empty");
+        let mut grouped = BTreeMap::<BranchGroupId, Vec<FactualActionBranch>>::new();
+        for transition in rows {
+            ensure!(
+                transition.family.starts_with("factual_"),
+                "non-factual row {} cannot enter a factual batch",
+                transition.family
+            );
+            grouped
+                .entry(BranchGroupId::from_transition(transition))
+                .or_default()
+                .push(FactualActionBranch::try_from_transition(
+                    transition.clone(),
+                )?);
+        }
+        let groups = grouped
+            .into_values()
+            .map(|branches| {
+                ensure!(
+                    branches.len() == FACTUAL_BRANCHES_PER_GROUP,
+                    "incomplete factual group: expected {FACTUAL_BRANCHES_PER_GROUP} branches, got {}",
+                    branches.len()
+                );
+                BranchGroup::try_new(branches)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_groups(groups)
+    }
+
+    pub fn groups(&self) -> &[BranchGroup] {
+        &self.groups
+    }
+
+    pub fn group_ids(&self) -> &[BranchGroupId] {
+        &self.group_ids
+    }
+
+    pub fn rows(&self) -> &[TransitionSample] {
+        &self.rows
+    }
+
+    pub fn group_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.group_ranges
+    }
 }
 
 impl FactualActionBranch {
@@ -796,6 +939,30 @@ fn generate_simulator_branch_group(
         let action = actions[(episode_id as usize + prefix) % actions.len()];
         state = apply_action(&sim, &state, action);
     }
+    // Freeze an explicit within-action balance schedule for held-out factual
+    // evidence. Each direction is targeted in turn, alternating between a
+    // traversable and blocked source cell; all four branches still share the
+    // same exact observation. This removes the old ACTION1/3=no-change and
+    // ACTION2/4=change confound from evaluator populations.
+    if split == Split::HeldOutComposition {
+        let ordinal = episode_id / 2;
+        let target_dir = Dir::ALL[(ordinal as usize) % Dir::ALL.len()];
+        let want_changed = (ordinal / Dir::ALL.len() as u64).is_multiple_of(2);
+        let target_action = Action::Move(target_dir);
+        let candidate = (0..scenario.height as i8)
+            .flat_map(|y| (0..scenario.width as i8).map(move |x| Pos::new(x, y)))
+            .filter(|position| !scenario.is_blocked(*position))
+            .find(|position| {
+                let mut candidate = state.clone();
+                candidate.pos = *position;
+                let next = apply_action(&sim, &candidate, target_action);
+                (next.pos != candidate.pos) == want_changed
+            });
+        if let Some(position) = candidate {
+            state.pos = position;
+            state.undo_stack.clear();
+        }
+    }
     let branches = legal_actions(&scenario)
         .into_iter()
         .filter(|action| !matches!(action, Action::Undo))
@@ -877,7 +1044,7 @@ pub fn generate_factual_branch_group(
     episode_id: u64,
     split: Split,
 ) -> Result<BranchGroup> {
-    if episode_id % 2 == 0 {
+    if episode_id.is_multiple_of(2) {
         generate_simulator_branch_group(seed, episode_id, split)
     } else {
         generate_coordinate_branch_group(seed, episode_id, split)
@@ -1404,6 +1571,49 @@ mod tests {
             coordinate.unique_changed_effect_indices(),
             vec![0, 1, 2, 3],
             "distinct ACTION6 board outcomes are recoverable without status UI"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn factual_batch_reconstructs_shuffled_complete_groups_and_rejects_halves() -> Result<()> {
+        let groups = vec![
+            generate_factual_branch_group(17, 2, Split::Train)?,
+            generate_factual_branch_group(17, 3, Split::Train)?,
+        ];
+        let expected = FactualBatch::from_groups(groups)?;
+        let mut shuffled = expected.rows().to_vec();
+        shuffled.reverse();
+        shuffled.rotate_left(3);
+        let reconstructed = FactualBatch::from_rows(&shuffled)?;
+        assert_eq!(reconstructed.group_ids(), expected.group_ids());
+        assert_eq!(reconstructed.rows(), expected.rows());
+        assert_eq!(reconstructed.group_ranges(), &[0..4, 4..8]);
+        assert!(FactualBatch::from_rows(&shuffled[..2]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn held_out_simulator_population_has_both_outcomes_within_each_action() -> Result<()> {
+        let mut outcomes = BTreeMap::<u8, (bool, bool)>::new();
+        for episode in (0..128).step_by(2) {
+            for branch in
+                generate_factual_branch_group(0xFA_C7_EA_11, episode, Split::HeldOutComposition)?
+                    .branches()
+            {
+                let entry = outcomes.entry(branch.transition.action.id).or_default();
+                if branch.board_effect.changed {
+                    entry.0 = true;
+                } else {
+                    entry.1 = true;
+                }
+            }
+        }
+        assert!(
+            outcomes
+                .values()
+                .all(|&(changed, unchanged)| changed && unchanged),
+            "each evaluated simple action needs changed and unchanged examples: {outcomes:?}"
         );
         Ok(())
     }

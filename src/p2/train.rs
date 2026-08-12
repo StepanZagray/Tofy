@@ -2,13 +2,14 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
-use crate::p2::branch_learning::{
-    branch_learning_loss, BranchLearningAudit, BranchLearningConfig, WORLD_CORE_V2_SCHEMA,
-    WORLD_CORE_V3_SCHEMA,
-};
+use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, BranchLearningConfig};
 use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCapture};
+use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
-    generate_curriculum, ArcFrame, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
+    generate_curriculum, ArcFrame, FactualBatch, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
+};
+use crate::p2::experiment::{
+    ExperimentRequest, ResolvedExperiment, SigregPopulation, SigregStatistic,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -19,14 +20,13 @@ use crate::p2::optimizer::{
     accumulate_parameter_gradients, clip_gradients_gpu, CheckpointHybridOptimizer,
 };
 use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest, PrefetchScope};
-use crate::p2::sigreg::sigreg_epps_pulley_seeded;
+use crate::p2::sigreg::{sigreg_epps_pulley_seeded, sigreg_quantile_seeded};
 use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_graph::{ExecutionStep, SpanKind};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::{VarBuilder, VarMap};
-use clap::ValueEnum;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -72,14 +72,7 @@ const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
 pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v8";
 pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v5";
 
-/// Which population receives SIGReg. `TemporalResidual` removes a local temporal
-/// mean before the existing post-RMS spatial-cell statistic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum SigregTarget {
-    Marginal,
-    TemporalResidual,
-}
+pub type SigregTarget = SigregPopulation;
 
 fn default_sigreg_target() -> SigregTarget {
     SigregTarget::Marginal
@@ -233,6 +226,9 @@ pub struct TrainConfig {
     /// Marginal control or per-window temporally centered residual population.
     #[serde(default = "default_sigreg_target")]
     pub sigreg_target: SigregTarget,
+    /// Distribution-matching statistic applied to the resolved SIGReg population.
+    #[serde(default)]
+    pub sigreg_statistic: SigregStatistic,
     /// Ordered transition window size. Ignored by the legacy marginal fallback.
     #[serde(default = "default_sigreg_temporal_window")]
     pub sigreg_temporal_window: usize,
@@ -410,6 +406,7 @@ impl Default for TrainConfig {
             muon_rms_scale: MUON_RMS_SCALE,
             sigreg_max_rows: 4096,
             sigreg_target: SigregTarget::Marginal,
+            sigreg_statistic: SigregStatistic::EppsPulley,
             sigreg_temporal_window: 8,
             sigreg_global_mix: 0.0,
             prefetch_batches: true,
@@ -424,6 +421,29 @@ impl Default for TrainConfig {
 }
 
 impl TrainConfig {
+    pub fn resolved_experiment(&self) -> Result<ResolvedExperiment> {
+        ResolvedExperiment::resolve(ExperimentRequest {
+            world_core_v2: self.world_core_v2,
+            world_core_v3: self.world_core_v3,
+            spatial_action_field: self.spatial_action_field,
+            spatial_action_residual: self.spatial_action_residual,
+            spatial_action_residual_scale: self.spatial_action_residual_scale,
+            branch_learning_enabled: self.branch_learning.enabled,
+            displacement_health_enabled: self.branch_learning.displacement_health.is_some(),
+            sigreg_weight: self.sigreg_weight,
+            sigreg_statistic: self.sigreg_statistic,
+            sigreg_population: self.sigreg_target,
+            sigreg_temporal_window: self.sigreg_temporal_window,
+            sigreg_global_mix: self.sigreg_global_mix,
+            sigreg_spatial: self.sigreg_spatial,
+            sigreg_spatial_pool: self.sigreg_spatial_pool,
+            sigreg_pre_rms_spatial: self.sigreg_pre_rms_spatial,
+            sigreg_projector: self.sigreg_projector,
+            sigreg_projector_dim: self.sigreg_projector_dim,
+            lessons: &self.lessons,
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.steps_per_lesson == 0 {
             bail!("steps_per_lesson must be > 0");
@@ -465,33 +485,6 @@ impl TrainConfig {
         if self.sigreg_projections == 0 || self.sigreg_knots < 3 {
             bail!("sigreg_projections >= 1 and sigreg_knots >= 3 required");
         }
-        if self.sigreg_projector && self.sigreg_projector_dim < 2 {
-            bail!("sigreg_projector_dim must be >= 2 when --sigreg-projector is enabled");
-        }
-        if self.sigreg_target == SigregTarget::TemporalResidual {
-            if self.sigreg_temporal_window < 2 {
-                bail!("sigreg_temporal_window must be >= 2 for temporal-residual SIGReg");
-            }
-            if !self.sigreg_spatial || self.sigreg_pre_rms_spatial || self.sigreg_projector {
-                bail!(
-                    "temporal-residual SIGReg requires post-RMS spatial SIGReg without pre-RMS or projector geometry"
-                );
-            }
-            if !(self.sigreg_global_mix.is_finite()
-                && (0.0..=1.0).contains(&self.sigreg_global_mix))
-            {
-                bail!("sigreg_global_mix must be finite and in [0,1]");
-            }
-        } else if self.sigreg_global_mix != 0.0 {
-            bail!("sigreg_global_mix requires temporal-residual SIGReg");
-        }
-        if self.sigreg_pre_rms_spatial
-            && (!self.sigreg_spatial || self.sigreg_spatial_pool || self.sigreg_projector)
-        {
-            bail!(
-                "sigreg_pre_rms_spatial requires spatial=true, spatial_pool=false, and projector=false"
-            );
-        }
         if !(self.q_mse_threshold.is_finite() && self.q_mse_threshold >= 0.0) {
             bail!("q_mse_threshold must be finite and >= 0");
         }
@@ -502,37 +495,16 @@ impl TrainConfig {
             bail!("train_z_noise must be finite and >= 0");
         }
         self.branch_learning.validate(self.grad_accum)?;
-        if self.world_core_v2 != self.branch_learning.enabled {
-            bail!("world_core_v2 and branch_learning.enabled must match");
-        }
-        if self.world_core_v3 && !self.world_core_v2 {
-            bail!("world_core_v3 requires the world_core_v2 base topology");
-        }
-        if self.spatial_action_field && !self.world_core_v2 {
-            bail!("spatial_action_field requires world_core_v2");
-        }
-        if self.spatial_action_residual && (!self.world_core_v3 || !self.spatial_action_field) {
-            bail!("spatial_action_residual requires world_core_v3 and spatial_action_field");
-        }
-        if !self.spatial_action_residual_scale.is_finite()
-            || self.spatial_action_residual_scale <= 0.0
-            || self.spatial_action_residual_scale > 1.0
-        {
-            bail!("spatial_action_residual_scale must be finite and in (0,1]");
-        }
-        if !self.world_core_v3 && self.branch_learning.displacement_health.is_some() {
-            bail!("displacement_health requires world_core_v3");
-        }
-        if self.world_core_v2 && self.sigreg_weight > 0.0 {
-            bail!("world_core_v2 uses consumer-latent health; set sigreg_weight=0");
-        }
-        if self.world_core_v2
+        let resolved = self.resolved_experiment()?;
+        if resolved.factual_learning
             && !self
-                .lessons
-                .iter()
-                .any(|lesson| lesson == "factual_branches")
+                .physical_batch
+                .is_multiple_of(crate::p2::data::FACTUAL_BRANCHES_PER_GROUP)
         {
-            bail!("world_core_v2 training requires a factual_branches lesson");
+            bail!(
+                "action-faithful physical_batch must be a multiple of {} so factual groups cannot be truncated",
+                crate::p2::data::FACTUAL_BRANCHES_PER_GROUP
+            );
         }
         Ok(())
     }
@@ -639,6 +611,8 @@ pub struct TrainReport {
     pub schema: String,
     #[serde(default = "default_legacy_world_core_schema")]
     pub world_core_schema: String,
+    #[serde(default)]
+    pub experiment: ResolvedExperiment,
     pub seed: u64,
     pub physical_batch: usize,
     pub grad_accum: usize,
@@ -703,6 +677,8 @@ struct TrainingContract {
     sigreg_projections: usize,
     sigreg_knots: usize,
     sigreg_weight: f64,
+    #[serde(default)]
+    experiment: Option<ResolvedExperiment>,
     event_weight: f64,
     q_weight: f64,
     rollout_weight: f64,
@@ -786,6 +762,10 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_projections: cfg.sigreg_projections,
             sigreg_knots: cfg.sigreg_knots,
             sigreg_weight: cfg.sigreg_weight,
+            experiment: Some(
+                cfg.resolved_experiment()
+                    .expect("validated training config resolves an experiment"),
+            ),
             event_weight: cfg.event_weight,
             q_weight: cfg.q_weight,
             rollout_weight: cfg.rollout_weight,
@@ -1134,6 +1114,7 @@ pub struct BatchTensors {
     pub goals: Tensor,
     pub event_targets: Tensor,
     pub event_mask: Tensor,
+    pub factual: Option<FactualBatch>,
 }
 
 pub struct OrderedTraceTensors {
@@ -1248,19 +1229,25 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
     if samples.is_empty() {
         bail!("empty batch");
     }
+    let factual = samples
+        .iter()
+        .all(|sample| sample.family.starts_with("factual_"))
+        .then(|| FactualBatch::from_rows(samples))
+        .transpose()?;
+    let rows = factual.as_ref().map_or(samples, FactualBatch::rows);
     let (frames, next_frames) = rayon::join(
-        || sample_frames_to_indices(samples, false, device),
-        || sample_frames_to_indices(samples, true, device),
+        || sample_frames_to_indices(rows, false, device),
+        || sample_frames_to_indices(rows, true, device),
     );
     let frames = frames?;
     let next_frames = next_frames?;
-    let (actions, action_coords) = action_tensors_from_samples(samples, device)?;
-    let goals: Vec<f32> = samples
+    let (actions, action_coords) = action_tensors_from_samples(rows, device)?;
+    let goals: Vec<f32> = rows
         .iter()
         .flat_map(|s| s.goal_features.values.iter().copied())
         .collect();
-    let goals = Tensor::from_vec(goals, (samples.len(), GOAL_FEATURES_DIM), device)?;
-    let (event_targets, event_mask) = event_targets_and_mask(samples, device)?;
+    let goals = Tensor::from_vec(goals, (rows.len(), GOAL_FEATURES_DIM), device)?;
+    let (event_targets, event_mask) = event_targets_and_mask(rows, device)?;
     Ok(BatchTensors {
         frames,
         next_frames,
@@ -1269,6 +1256,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         goals,
         event_targets,
         event_mask,
+        factual,
     })
 }
 
@@ -2204,9 +2192,16 @@ fn checked_training_losses(tensors: &[[Tensor; 24]]) -> Result<Vec<CheckedTraini
         .collect())
 }
 
-/// Randomly subsample SIGReg rows to cap activation memory.
+/// Randomly subsample the population axis to cap activation memory.
+/// Rank-3 `T×B×D` populations retain every temporal position and sample the
+/// same `B` indices at each position, preserving the estimator's semantics.
 pub fn subsample_sigreg_rows(stack: &Tensor, max_rows: usize, seed: u64) -> Result<Tensor> {
-    let n = stack.dim(0)?;
+    let axis = match stack.rank() {
+        2 => 0,
+        3 => 1,
+        rank => bail!("SIGReg population must be rank 2 or 3, got rank {rank}"),
+    };
+    let n = stack.dim(axis)?;
     if max_rows == 0 || n <= max_rows {
         return Ok(stack.clone());
     }
@@ -2216,7 +2211,7 @@ pub fn subsample_sigreg_rows(stack: &Tensor, max_rows: usize, seed: u64) -> Resu
     indices.partial_shuffle(&mut rng, max_rows);
     indices.truncate(max_rows);
     let idx = Tensor::from_vec(indices, (max_rows,), stack.device())?;
-    stack.index_select(&idx, 0).map_err(Into::into)
+    stack.index_select(&idx, axis).map_err(Into::into)
 }
 
 /// Stack current/next latents for SIGReg (flattened or per spatial cell).
@@ -2251,6 +2246,15 @@ fn smooth_cap_nonnegative(raw: &Tensor, cap: f64) -> Result<Tensor> {
 
 fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
+}
+
+fn sigreg_loss_for_stack(stack: &Tensor, cfg: &TrainConfig, seed: u64) -> Result<Tensor> {
+    match cfg.sigreg_statistic {
+        SigregStatistic::EppsPulley => {
+            sigreg_epps_pulley_seeded(stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)
+        }
+        SigregStatistic::Quantile => sigreg_quantile_seeded(stack, cfg.sigreg_projections, seed),
+    }
 }
 
 /// Select the preregistered SIGReg representation without changing dynamics latents.
@@ -2292,7 +2296,7 @@ pub fn sigreg_losses_for_encoded_pair(
 ) -> Result<(Tensor, Tensor)> {
     let stack =
         sigreg_stack_for_encoded_pair(cur_z, next_z, cur_raw, next_raw, projected, cfg, seed)?;
-    let raw = sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+    let raw = sigreg_loss_for_stack(&stack, cfg, seed)?;
     let bounded = bounded_sigreg_loss(&raw)?;
     Ok((raw, bounded))
 }
@@ -2353,19 +2357,21 @@ pub fn sigreg_stack_for_ordered_windows(
         pooled
     };
     let (_, _, _, pooled_height, pooled_width) = centered.dims5()?;
-    let rows = if cfg.sigreg_spatial {
+    let population = if cfg.sigreg_spatial {
         centered.permute((0, 1, 3, 4, 2))?.reshape((
-            windows.window * windows.windows * pooled_height * pooled_width,
+            windows.window,
+            windows.windows * pooled_height * pooled_width,
             channels,
         ))?
     } else {
         centered.reshape((
-            windows.window * windows.windows,
+            windows.window,
+            windows.windows,
             channels * pooled_height * pooled_width,
         ))?
     };
     subsample_sigreg_rows(
-        &rows,
+        &population,
         effective_sigreg_max_rows(cfg),
         seed.wrapping_add(0x5196_0001),
     )
@@ -2407,9 +2413,9 @@ pub fn sigreg_global_stack_for_ordered_windows(
     let pooled = ordered.mean(4)?.mean(3)?;
     let temporal_mean = pooled.sum(0)?.affine(1.0 / windows.window as f64, 0.0)?;
     let centered = pooled.broadcast_sub(&temporal_mean.broadcast_as(pooled.dims())?)?;
-    let rows = centered.reshape((windows.window * windows.windows, channels))?;
+    let population = centered.reshape((windows.window, windows.windows, channels))?;
     subsample_sigreg_rows(
-        &rows,
+        &population,
         effective_sigreg_max_rows(cfg),
         seed.wrapping_add(0x5196_6001),
     )
@@ -2425,19 +2431,13 @@ fn sigreg_losses_for_ordered_windows(
     if mix == 0.0 {
         let stack =
             sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
-        let raw =
-            sigreg_epps_pulley_seeded(&stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+        let raw = sigreg_loss_for_stack(&stack, cfg, seed)?;
         let bounded = bounded_sigreg_loss(&raw)?;
         return Ok((raw, bounded));
     }
 
     let global_stack = sigreg_global_stack_for_ordered_windows(latents, windows, cfg, seed)?;
-    let global_raw = sigreg_epps_pulley_seeded(
-        &global_stack,
-        cfg.sigreg_projections,
-        cfg.sigreg_knots,
-        seed.wrapping_add(0x0061_0BA1),
-    )?;
+    let global_raw = sigreg_loss_for_stack(&global_stack, cfg, seed.wrapping_add(0x0061_0BA1))?;
     let global_bounded = bounded_sigreg_loss(&global_raw)?;
     if mix == 1.0 {
         return Ok((global_raw, global_bounded));
@@ -2445,8 +2445,7 @@ fn sigreg_losses_for_ordered_windows(
 
     let cell_stack =
         sigreg_stack_for_ordered_windows(latents, windows, cfg.sigreg_target, cfg, seed)?;
-    let cell_raw =
-        sigreg_epps_pulley_seeded(&cell_stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)?;
+    let cell_raw = sigreg_loss_for_stack(&cell_stack, cfg, seed)?;
     let cell_bounded = bounded_sigreg_loss(&cell_raw)?;
     let cell_weight = 1.0 - mix;
     Ok((
@@ -2489,6 +2488,7 @@ pub fn leworld_loss(
     leworld_loss_with_sigreg_windows(model, batch, None, None, cfg, depth, sigreg_seed, weights)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn leworld_loss_with_sigreg_windows(
     model: &WorldModel,
     batch: &BatchTensors,
@@ -2608,27 +2608,23 @@ fn leworld_loss_with_sigreg_windows(
     };
 
     let branch = if cfg.world_core_v2 {
-        let samples = samples.ok_or_else(|| {
+        let _ = samples.ok_or_else(|| {
             anyhow::anyhow!("world-core-v2 loss requires factual sample provenance")
         })?;
+        let transition = ConsumerTransition::try_new(cur_z.clone(), out.y.clone(), next_z.clone())?;
         branch_learning_loss(
             model,
-            samples,
-            &cur_z,
-            &out.y,
-            &next_z,
+            batch.factual.as_ref(),
+            &transition,
             &cfg.branch_learning,
-            samples
-                .first()
-                .is_some_and(|sample| sample.family.starts_with("factual_")),
+            batch.factual.is_some(),
         )?
     } else {
+        let transition = ConsumerTransition::try_new(cur_z.clone(), out.y.clone(), next_z.clone())?;
         branch_learning_loss(
             model,
-            &[],
-            &cur_z,
-            &out.y,
-            &next_z,
+            None,
+            &transition,
             &BranchLearningConfig::default(),
             false,
         )?
@@ -3286,6 +3282,12 @@ fn load_training_checkpoint(
         bail!("unsupported trainer state schema {}", state.schema);
     }
     let requested = TrainingContract::from(cfg);
+    // Older V5 bundles predate the derived experiment field. Their legacy
+    // contract already carries every input used to resolve it, and those fields
+    // are compared below; hydrate only the absent derived value for exact resume.
+    if state.contract.experiment.is_none() {
+        state.contract.experiment = requested.experiment.clone();
+    }
     if state.contract != requested {
         let migration = cfg
             .allow_batch_schedule_migration
@@ -3410,13 +3412,14 @@ fn build_report(
 ) -> TrainReport {
     TrainReport {
         schema: TRAIN_REPORT_SCHEMA.into(),
-        world_core_schema: if cfg.world_core_v3 {
-            WORLD_CORE_V3_SCHEMA.into()
-        } else if cfg.world_core_v2 {
-            WORLD_CORE_V2_SCHEMA.into()
-        } else {
-            "legacy_p2_eval_compatible".into()
-        },
+        world_core_schema: cfg
+            .resolved_experiment()
+            .expect("validated training config resolves an experiment")
+            .report_schema
+            .clone(),
+        experiment: cfg
+            .resolved_experiment()
+            .expect("validated training config resolves an experiment"),
         seed: cfg.seed,
         physical_batch: cfg.physical_batch,
         grad_accum: cfg.grad_accum,
@@ -4327,7 +4330,7 @@ mod tests {
             &cfg,
             7,
         )?;
-        assert_eq!(actual.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+        assert_eq!(actual.to_vec3::<f32>()?, expected.to_vec3::<f32>()?);
         Ok(())
     }
 
@@ -4365,7 +4368,7 @@ mod tests {
         )?;
         // Target selection is after the shared `B×C×H×W` encoder result.
         assert_eq!(control.dims(), treatment.dims());
-        assert_eq!(control.dims(), &[32, 3]);
+        assert_eq!(control.dims(), &[4, 8, 3]);
         Ok(())
     }
 
@@ -4393,8 +4396,8 @@ mod tests {
             &device,
         )?;
         let rows = sigreg_global_stack_for_ordered_windows(&latents, &windows, &cfg, 19)?;
-        assert_eq!(rows.dims(), &[4, 2]);
-        let centered = rows.reshape((2, 2, 2))?.sum(0)?.to_vec2::<f32>()?;
+        assert_eq!(rows.dims(), &[2, 2, 2]);
+        let centered = rows.sum(0)?.to_vec2::<f32>()?;
         assert!(centered.iter().flatten().all(|value| value.abs() < 1e-6));
         Ok(())
     }
@@ -4485,9 +4488,14 @@ mod tests {
         let shifted = base.add(&offsets)?;
         let actual = sigreg_global_stack_for_ordered_windows(&base, &windows, &cfg, 23)?;
         let expected = sigreg_global_stack_for_ordered_windows(&shifted, &windows, &cfg, 23)?;
-        let actual = actual.to_vec2::<f32>()?;
-        let expected = expected.to_vec2::<f32>()?;
-        for (actual, expected) in actual.iter().flatten().zip(expected.iter().flatten()) {
+        let actual = actual.to_vec3::<f32>()?;
+        let expected = expected.to_vec3::<f32>()?;
+        for (actual, expected) in actual
+            .iter()
+            .flatten()
+            .flatten()
+            .zip(expected.iter().flatten().flatten())
+        {
             assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
         }
         Ok(())
@@ -5649,6 +5657,7 @@ mod tests {
         let report = TrainReport {
             schema: TRAIN_REPORT_SCHEMA.into(),
             world_core_schema: "legacy_p2_eval_compatible".into(),
+            experiment: ResolvedExperiment::default(),
             seed: 1,
             physical_batch: 2,
             grad_accum: 1,
@@ -5882,6 +5891,12 @@ mod tests {
         let base = resume_test_config(PathBuf::from("unused"));
         let base_contract = TrainingContract::from(&base);
         let mut changed = Vec::new();
+        let make_v2 = |cfg: &mut TrainConfig| {
+            cfg.world_core_v2 = true;
+            cfg.branch_learning.enabled = true;
+            cfg.sigreg_weight = 0.0;
+            cfg.lessons.push("factual_branches".into());
+        };
 
         let mut cfg = base.clone();
         cfg.ptrm_rank_every += 1;
@@ -5919,18 +5934,20 @@ mod tests {
         cfg.sigreg_global_mix = 0.5;
         changed.push(("sigreg_global_mix", cfg));
         let mut cfg = base.clone();
-        cfg.world_core_v2 = true;
-        cfg.branch_learning.enabled = true;
+        make_v2(&mut cfg);
         changed.push(("world_core_v2", cfg));
         let mut cfg = base.clone();
-        cfg.world_core_v2 = true;
+        make_v2(&mut cfg);
         cfg.world_core_v3 = true;
-        cfg.branch_learning.enabled = true;
         changed.push(("world_core_v3", cfg));
         let mut cfg = base.clone();
+        make_v2(&mut cfg);
         cfg.spatial_action_field = true;
         changed.push(("spatial_action_field", cfg));
         let mut cfg = base.clone();
+        make_v2(&mut cfg);
+        cfg.world_core_v3 = true;
+        cfg.spatial_action_field = true;
         cfg.spatial_action_residual = true;
         changed.push(("spatial_action_residual", cfg));
         let mut cfg = base.clone();

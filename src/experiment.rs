@@ -25,7 +25,7 @@ struct Cli {
 enum Commands {
     /// P2: train the recursive world model through synthetic curriculum lessons
     #[command(name = "p2-train")]
-    P2Train(P2TrainArgs),
+    P2Train(Box<P2TrainArgs>),
     /// P2: held-out synthetic world-model and PTRM evaluation
     #[command(name = "p2-eval")]
     P2Eval(P2EvalArgs),
@@ -44,7 +44,7 @@ enum Commands {
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::P2Train(args) => run_p2_train(args)?,
+        Commands::P2Train(args) => run_p2_train(*args)?,
         Commands::P2Eval(args) => run_p2_eval(args)?,
         Commands::P2Arc3Eval(args) => run_p2_arc3_eval(args)?,
         Commands::P2Arc3LiveEval(args) => run_p2_arc3_live_eval(args)?,

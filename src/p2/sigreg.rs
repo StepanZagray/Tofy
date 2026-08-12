@@ -143,6 +143,96 @@ pub fn sigreg_epps_pulley_seeded(
         .map_err(Into::into)
 }
 
+/// QQWorld rank-matched Gaussian regularization (Eq. 6 in arXiv:2607.28415).
+///
+/// Accepts `B×D` or `T×B×D`. Rank-3 inputs form an independent ranking
+/// population at every temporal position. The loss sums over batch ranks and
+/// averages over time and random projection directions, matching the paper's
+/// per-slice definition without a cross-batch queue.
+pub fn sigreg_quantile_seeded(x: &Tensor, num_slices: usize, seed: u64) -> Result<Tensor> {
+    let device = x.device();
+    let x = match x.rank() {
+        2 => x.unsqueeze(0)?,
+        3 => x.clone(),
+        rank => bail!("QQ regularization expects B×D or T×B×D, got rank {rank}"),
+    }
+    .to_dtype(candle_core::DType::F32)?;
+    let (time, batch, dim) = x.dims3()?;
+    if time == 0 {
+        bail!("QQ regularization requires at least one timestep");
+    }
+    validate_sigreg_args(num_slices, 3, batch, dim)?;
+    let projection = sigreg_projection(dim, num_slices, seed, device)?;
+    let projected = x
+        .reshape((time * batch, dim))?
+        .matmul(&projection)?
+        .reshape((time, batch, num_slices))?
+        .permute((0, 2, 1))?
+        .contiguous()?; // T×S×B: rank only across the physical population.
+    let (ordered, _) = projected.sort_last_dim(true)?;
+    let quantiles = (1..=batch)
+        .map(|rank| inverse_standard_normal((rank as f64 - 0.5) / batch as f64) as f32)
+        .collect::<Vec<_>>();
+    let target = Tensor::from_vec(quantiles, (1, 1, batch), device)?;
+    ordered
+        .broadcast_sub(&target)?
+        .sqr()?
+        .sum(D::Minus1)?
+        .mean_all()
+        .map_err(Into::into)
+}
+
+// Peter J. Acklam's rational approximation. The target is constant and is
+// computed on the host, so this adds no approximation to model gradients.
+fn inverse_standard_normal(p: f64) -> f64 {
+    debug_assert!(p > 0.0 && p < 1.0);
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    const LOW: f64 = 0.02425;
+    const HIGH: f64 = 1.0 - LOW;
+    if p < LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= HIGH {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +279,27 @@ mod tests {
         assert!(!flat.is_empty());
         assert!(flat.iter().all(|v| v.is_finite()));
         assert!(flat.iter().any(|v| *v != 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn qq_matches_ranked_gaussian_quantiles_and_backpropagates() -> Result<()> {
+        let device = Device::Cpu;
+        let quantiles = (1..=8)
+            .map(|rank| inverse_standard_normal((rank as f64 - 0.5) / 8.0) as f32)
+            .collect::<Vec<_>>();
+        let variable = Var::new(quantiles.as_slice(), &device)?;
+        let loss = sigreg_quantile_seeded(&variable.reshape((8, 1))?, 1, 17)?;
+        assert!(loss.to_scalar::<f32>()? < 1e-10);
+        let displaced = variable.affine(2.0, 0.5)?.reshape((8, 1))?;
+        let displaced_loss = sigreg_quantile_seeded(&displaced, 1, 17)?;
+        assert!(displaced_loss.to_scalar::<f32>()? > 0.1);
+        let gradients = displaced_loss.backward()?;
+        let gradient = gradients.get(&variable).expect("QQ must backpropagate");
+        assert!(gradient
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|value| value.is_finite()));
         Ok(())
     }
 }

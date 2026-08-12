@@ -1,6 +1,7 @@
 //! Factual same-state branch objectives for world-core-v2.
 
-use crate::p2::data::{BranchGroup, FactualActionBranch, TransitionSample};
+use crate::p2::consumer_transition::ConsumerTransition;
+use crate::p2::data::FactualBatch;
 use crate::p2::model::{pool_latent, WorldModel};
 use crate::p2::representation::{vicreg_displacement_health, vicreg_latent_health, VicRegConfig};
 use anyhow::{ensure, Result};
@@ -188,43 +189,19 @@ fn index_rows(rows: &Tensor, indices: &[u32]) -> Result<Tensor> {
     rows.index_select(&index, 0).map_err(Into::into)
 }
 
-fn validated_groups(samples: &[TransitionSample]) -> Result<Vec<BranchGroup>> {
-    ensure!(!samples.is_empty(), "factual branch batch is empty");
-    let mut groups = Vec::new();
-    let mut start = 0;
-    while start < samples.len() {
-        let source = &samples[start];
-        let mut end = start + 1;
-        while end < samples.len()
-            && samples[end].seed == source.seed
-            && samples[end].episode_id == source.episode_id
-            && samples[end].current == source.current
-        {
-            end += 1;
-        }
-        let branches = samples[start..end]
-            .iter()
-            .cloned()
-            .map(FactualActionBranch::try_from_transition)
-            .collect::<Result<Vec<_>>>()?;
-        groups.push(BranchGroup::try_new(branches)?);
-        start = end;
-    }
-    Ok(groups)
-}
-
 /// Compute all world-core-v2 objectives on the exact consumer latents used by
 /// recurrence and prediction. Branch relations are active only for the named
 /// factual curriculum; representation health can be active on every lesson.
 pub fn branch_learning_loss(
     model: &WorldModel,
-    samples: &[TransitionSample],
-    current: &Tensor,
-    predicted: &Tensor,
-    target: &Tensor,
+    factual: Option<&FactualBatch>,
+    transition: &ConsumerTransition,
     config: &BranchLearningConfig,
     factual_curriculum: bool,
 ) -> Result<BranchLearningLoss> {
+    let current = transition.current();
+    let predicted = transition.predicted();
+    let target = transition.target();
     let zero = current.zeros_like()?.sum_all()?;
     if !config.enabled {
         return Ok(BranchLearningLoss {
@@ -248,8 +225,8 @@ pub fn branch_learning_loss(
         "world-core-v2 consumer latent shapes must match"
     );
     ensure!(
-        current.dim(0)? == samples.len(),
-        "consumer latent batch does not match factual samples"
+        factual.is_none_or(|batch| transition.batch_len().ok() == Some(batch.rows().len())),
+        "consumer latent batch does not match factual batch"
     );
 
     let spatial_population = Tensor::cat(&[current, predicted, target], 0)?;
@@ -282,7 +259,10 @@ pub fn branch_learning_loss(
     let mut displacement_total = zero.clone();
 
     if factual_curriculum {
-        let groups = validated_groups(samples)?;
+        let factual =
+            factual.ok_or_else(|| anyhow::anyhow!("factual curriculum requires a FactualBatch"))?;
+        let groups = factual.groups();
+        let samples = factual.rows();
         let displacement = pool_latent(&predicted.sub(current)?)?;
         let mut pull_terms = Vec::new();
         let mut push_terms = Vec::new();
@@ -293,7 +273,7 @@ pub fn branch_learning_loss(
         let mut displacement_by_action: Vec<Vec<Tensor>> = (0..8).map(|_| Vec::new()).collect();
         let mut unique_changed_outcomes = 0usize;
         let mut offset = 0usize;
-        for group in &groups {
+        for group in groups {
             let branches = group.branches();
             let group_displacement = displacement.narrow(0, offset, branches.len())?;
             let group_centered = config
@@ -330,11 +310,11 @@ pub fn branch_learning_loss(
                         displacement_by_action[branch.transition.action.id as usize].push(row);
                     }
                 }
-                for other in local + 1..branches.len() {
+                for (other, other_branch) in branches.iter().enumerate().skip(local + 1) {
                     let left = displacement.narrow(0, global, 1)?;
                     let right = displacement.narrow(0, offset + other, 1)?;
                     let distance = left.sub(&right)?.sqr()?.mean_all()?.sqrt()?;
-                    if branch.outcome_equivalent(&branches[other]) {
+                    if branch.outcome_equivalent(other_branch) {
                         pull_terms.push(distance.sqr()?);
                         audit.equivalent_pairs += 1;
                     } else {

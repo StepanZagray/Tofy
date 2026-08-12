@@ -1,6 +1,6 @@
 # ADR 0001: Action-faithful world-core-v2
 
-Status: Accepted (2026-08-11)
+Status: Superseded for new training by ADR 0002 (2026-08-12); retained for legacy evaluation
 
 ## Context
 

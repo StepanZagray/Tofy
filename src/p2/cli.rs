@@ -6,6 +6,7 @@
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
+use crate::p2::experiment::SigregStatistic;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
@@ -158,6 +159,10 @@ pub struct P2TrainArgs {
 
     #[arg(long, default_value_t = 128)]
     pub sigreg_projector_dim: usize,
+
+    /// Distribution-matching statistic for the resolved SIGReg population.
+    #[arg(long, value_enum, default_value_t = SigregStatistic::EppsPulley)]
+    pub sigreg_statistic: SigregStatistic,
 
     #[arg(long, default_value_t = false)]
     pub stop_grad_q_y: bool,
@@ -332,6 +337,7 @@ impl P2TrainArgs {
             sigreg_pre_rms_spatial: self.sigreg_pre_rms_spatial,
             sigreg_projector: self.sigreg_projector,
             sigreg_projector_dim: self.sigreg_projector_dim,
+            sigreg_statistic: self.sigreg_statistic,
             stop_grad_q_y: self.stop_grad_q_y,
             q_quantile_targets: self.q_quantile_targets,
             train_z_noise: self.train_z_noise,

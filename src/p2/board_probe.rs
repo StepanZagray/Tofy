@@ -7,6 +7,7 @@
 //! decoder MSE is at most that ceiling.
 
 use anyhow::{bail, ensure, Result};
+use candle_core::{DType, Tensor};
 use serde::{Deserialize, Serialize};
 
 use crate::p2::data::{ArcFrame, FRAME_SIDE};
@@ -23,6 +24,99 @@ pub const RIDGE: f64 = 1e-2;
 pub const FIXED_TARGET_DECODER_MSE_CEILING: f64 = 1e-3;
 /// A patch is predicted changed when its predicted-vs-current histogram MSE exceeds this value.
 pub const FIXED_PREDICTION_DELTA_THRESHOLD: f64 = 0.01;
+
+/// Opaque row-major patch population. The board-probe module owns the
+/// `B×C×8×8 -> (B*64)×C` mapping used by fit and held-out scoring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoardProbeRows(Vec<Vec<f32>>);
+
+impl BoardProbeRows {
+    pub fn from_spatial_latent(latent: &Tensor) -> Result<Self> {
+        let (batch, channels, height, width) = latent.dims4()?;
+        ensure!(
+            channels > 0 && height == PATCHES_PER_SIDE && width == PATCHES_PER_SIDE,
+            "board probe requires BxCx8x8 spatial latents"
+        );
+        let values = latent
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut rows = Vec::with_capacity(batch * PATCH_COUNT);
+        for sample in 0..batch {
+            for y in 0..PATCHES_PER_SIDE {
+                for x in 0..PATCHES_PER_SIDE {
+                    rows.push(
+                        (0..channels)
+                            .map(|channel| {
+                                values[((sample * channels + channel) * PATCHES_PER_SIDE + y)
+                                    * PATCHES_PER_SIDE
+                                    + x]
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Ok(Self(rows))
+    }
+
+    pub fn as_rows(&self) -> &[Vec<f32>] {
+        &self.0
+    }
+
+    pub fn append(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self> {
+        ensure!(
+            range.end <= self.0.len(),
+            "board probe row slice is out of bounds"
+        );
+        Ok(Self(self.0[range].to_vec()))
+    }
+}
+
+/// Held-out board facts aligned with a [`BoardProbeRows`] population.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoardProbeTransitions {
+    current: Vec<ArcFrame>,
+    target: Vec<ArcFrame>,
+    exact_changed_patches: Vec<bool>,
+}
+
+impl BoardProbeTransitions {
+    pub fn try_new(current: Vec<ArcFrame>, target: Vec<ArcFrame>) -> Result<Self> {
+        ensure!(!target.is_empty(), "held-out frames must not be empty");
+        ensure!(
+            current.len() == target.len(),
+            "current and target frame counts differ"
+        );
+        let mut exact_changed_patches = Vec::with_capacity(target.len() * PATCH_COUNT);
+        for (before, after) in current.iter().zip(&target) {
+            ensure_fixed_frame(before)?;
+            ensure_fixed_frame(after)?;
+            for patch_y in 0..PATCHES_PER_SIDE {
+                for patch_x in 0..PATCHES_PER_SIDE {
+                    let y_start = patch_y * PATCHES_PER_SIDE;
+                    let y_end = ((patch_y + 1) * PATCHES_PER_SIDE).min(FRAME_SIDE - 1);
+                    let x_start = patch_x * PATCHES_PER_SIDE;
+                    let x_end = (patch_x + 1) * PATCHES_PER_SIDE;
+                    exact_changed_patches.push((y_start..y_end).any(|y| {
+                        (x_start..x_end).any(|x| {
+                            before.pixels[y * FRAME_SIDE + x] != after.pixels[y * FRAME_SIDE + x]
+                        })
+                    }));
+                }
+            }
+        }
+        Ok(Self {
+            current,
+            target,
+            exact_changed_patches,
+        })
+    }
+}
 
 /// A fitted linear probe from standardized C-dimensional patch latents to palette histograms.
 ///
@@ -65,6 +159,10 @@ pub struct BoardTransitionMetrics {
 }
 
 impl FixedBoardProbe {
+    pub fn fit_spatial(train_latents: &BoardProbeRows, train_targets: &[ArcFrame]) -> Result<Self> {
+        Self::fit(train_latents.as_rows(), train_targets)
+    }
+
     /// Fits only the supplied training rows.  Each frame contributes 64 patch targets in row order.
     pub fn fit(train_latents: &[Vec<f32>], train_targets: &[ArcFrame]) -> Result<Self> {
         let targets = histograms_for_frames(train_targets)?;
@@ -167,12 +265,11 @@ impl FixedBoardProbe {
             .iter()
             .map(|row| {
                 let mut prediction = self.output_mean;
-                for feature in 0..self.input_dim {
-                    let standardized = (row[feature] as f64 - self.input_mean[feature] as f64)
+                for (feature, value) in row.iter().enumerate() {
+                    let standardized = (*value as f64 - self.input_mean[feature] as f64)
                         / self.input_std[feature] as f64;
-                    for palette_id in 0..PALETTE_SIZE {
-                        prediction[palette_id] +=
-                            (standardized * self.weights[feature][palette_id] as f64) as f32;
+                    for (palette_id, output) in prediction.iter_mut().enumerate() {
+                        *output += (standardized * self.weights[feature][palette_id] as f64) as f32;
                     }
                 }
                 ensure!(
@@ -278,6 +375,21 @@ impl FixedBoardProbe {
             target_decoder_mse_ceiling: FIXED_TARGET_DECODER_MSE_CEILING,
             trusted: target_latent_decoder_mse <= FIXED_TARGET_DECODER_MSE_CEILING,
         })
+    }
+
+    pub fn summarize_transitions(
+        &self,
+        target_latents: &BoardProbeRows,
+        predicted_next_latents: &BoardProbeRows,
+        transitions: &BoardProbeTransitions,
+    ) -> Result<BoardTransitionMetrics> {
+        self.summarize_held_out(
+            target_latents.as_rows(),
+            predicted_next_latents.as_rows(),
+            &transitions.current,
+            &transitions.target,
+            &transitions.exact_changed_patches,
+        )
     }
 }
 
@@ -419,8 +531,9 @@ fn solve_gaussian(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f6
         for row in (pivot + 1)..n {
             let factor = matrix[row][pivot] / diagonal;
             matrix[row][pivot] = 0.0;
-            for column in (pivot + 1)..n {
-                matrix[row][column] -= factor * matrix[pivot][column];
+            let pivot_tail = matrix[pivot][pivot + 1..].to_vec();
+            for (value, pivot_value) in matrix[row][pivot + 1..].iter_mut().zip(pivot_tail) {
+                *value -= factor * pivot_value;
             }
             rhs[row] -= factor * rhs[pivot];
         }
@@ -547,7 +660,7 @@ mod tests {
             .summarize_held_out(
                 &latent_rows(&held_out, &[1.0, 1.0]),
                 &latent_rows(&held_out, &[1.0, 1.0]),
-                &[current.clone()],
+                std::slice::from_ref(&current),
                 &held_out,
                 &exact_labels,
             )
@@ -583,7 +696,7 @@ mod tests {
         let current = frame(|_, _| 0);
         let target = frame(|x, y| if x < 8 && y < 8 { 1 } else { 0 });
         let probe = FixedBoardProbe::fit(&latent_rows(&train, &[1.0, 1.0]), &train).unwrap();
-        let target_latents = latent_rows(&[target.clone()], &[1.0, 1.0]);
+        let target_latents = latent_rows(std::slice::from_ref(&target), &[1.0, 1.0]);
         let labels = (0..PATCH_COUNT).map(|patch| patch == 0).collect::<Vec<_>>();
         let metrics = probe
             .summarize_held_out(
@@ -609,9 +722,9 @@ mod tests {
     fn accepts_dead_features_but_rejects_nonfinite_and_undersized_rows() {
         let board = frame(|_, _| 0);
         let rows = vec![vec![0.0, 1.0]; PATCH_COUNT];
-        assert!(FixedBoardProbe::fit(&rows, &[board.clone()]).is_ok());
+        assert!(FixedBoardProbe::fit(&rows, std::slice::from_ref(&board)).is_ok());
         let rows = vec![vec![0.0; PATCH_COUNT]; PATCH_COUNT];
-        assert!(FixedBoardProbe::fit(&rows, &[board.clone()]).is_err());
+        assert!(FixedBoardProbe::fit(&rows, std::slice::from_ref(&board)).is_err());
         let mut rows = vec![vec![0.0]; PATCH_COUNT];
         rows[0][0] = f32::NAN;
         assert!(FixedBoardProbe::fit(&rows, &[board]).is_err());
