@@ -243,6 +243,44 @@ and binary hashes. The launcher cannot run seeds 2/3; promotion remains locked u
 the update-1,000 gate is analyzed. Factual-graph/executable-world-model work is not
 part of this experiment.
 
+#### Architecture-v1 EP/TC/QQ seed-1 result (2026-08-12)
+
+The corrected three-arm campaign completed at Tofy revision
+`229052e8a18a19cf62ab31285488f83ee2cb8bcf`, `candle_graph` revision
+`6b79028c72d76c8e861849842b1f0717c9e2d88a`, and binary SHA-256
+`b52bdf02260d2725e6d58a48bace57ba14250f1caff615bfa223f1f2ecdbe8e3`.
+All arms used seed 1, 1,000 sequential updates, physical batch `1024`, accumulation
+`1`, hidden width 128, `8x2` recurrence, SIGReg weight `0.003`, held-out seed
+`424242`, and 64 synthetic episodes. The A40 probe selected the largest tested
+stable physical population, and all training/evaluation processes exited cleanly.
+
+| Arm | Pooled variance | Rank fraction | Action shuffle [95% CI] | Changed improvement [95% CI] | H8 normalized | Promotion |
+|---|---:|---:|---:|---:|---:|---|
+| marginal EP | 0.000450 | 0.01261 | 0.999 [0.999, 0.999] | -7.095 [-7.860, -6.455] | 5.045 | rejected |
+| temporal EP | 0.012123 | 0.01584 | 1.217 [1.107, 1.330] | 0.922 [0.910, 0.932] | 18.356 | rejected |
+| temporal QQ | 0.014409 | 0.01616 | 1.404 [1.258, 1.550] | 0.867 [0.852, 0.884] | 19.450 | rejected |
+
+All three passed the variance floor and produced 64/64 finite H8 rows. All failed
+the same preregistered `>=0.10` effective-rank requirement: the best arm had only
+`2.07/128` effective dimensions. Temporal centering therefore repaired scale but
+not dimensional breadth. Marginal EP's low raw MSE was degenerate: on changed
+transitions it was `8.10x` worse than literal copy-forward and shuffled actions did
+not hurt prediction. Temporal EP and QQ learned real changed/action signal, but
+their open-loop H8 predictions remained `18.36x` and `19.45x` copy-forward.
+
+QQ is the most interesting negative arm: it had the strongest aggregate and
+random-one-step action intervention (`1.135`, lower CI `1.076`) and retained more
+spatial rank than temporal EP, while still collapsing after pooling and failing at
+H8. This does not promote QQ. It rejects another statistic-only or longer-training
+sweep in this shared legacy topology and moves the next falsifiable test to the
+spatial-to-pooled consumer seam with explicit fixed-space/semantic grounding.
+
+The automatic gate correctly recorded `complete_no_promotion` and skipped V3 action
+and dense-horizon stages. No factual-branch, board-probe, ARC transfer, official
+scorecard, H16, or multi-seed result exists for these arms. Exact artifacts are at
+`runs/p2/architecture-v1-20260812T125926Z/` on the named RunPod workspace; the
+durable analysis is indexed under `ml/tofy/insights/architecture-v1-geometry.md`.
+
 #### Prior failed overnight attempt (2026-08-08/09; incomplete)
 
 The seed-1 pilot did not reach its decision gate. Both arms trained from fresh
