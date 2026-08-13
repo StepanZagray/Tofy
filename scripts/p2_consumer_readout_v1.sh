@@ -124,7 +124,8 @@ if [[ -z "$physical_batch" ]]; then
 fi
 
 run_smoke() {
-  local topology="$1" smoke_dir="$run_root/integrity-$topology"
+  local topology="$1"
+  local smoke_dir="$run_root/integrity-$topology"
   "$tofy_bin" p2-train --device cuda:0 --seed 1 --lessons q_calibration \
     --steps-per-lesson "$train_steps" --max-steps-this-run 3 \
     --physical-batch "$physical_batch" --grad-accum "$grad_accum" --checkpoint-every-steps 0 \
@@ -233,7 +234,8 @@ write_decision() {
 }
 
 run_arm() {
-  local topology="$1" arm="consumer_readout_${topology//-/_}"
+  local topology="$1"
+  local arm="consumer_readout_${topology//-/_}"
   local arm_dir="$run_root/seed-1/$arm" sampler_pid update checkpoint eval_dir
   mkdir -p -- "$arm_dir/telemetry"
   jq -nc --arg topology "${topology//-/_}" --arg git_sha "$git_sha" --arg binary_sha "$binary_sha" \
