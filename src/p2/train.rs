@@ -9,7 +9,8 @@ use crate::p2::data::{
     generate_curriculum, ArcFrame, FactualBatch, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::experiment::{
-    ExperimentRequest, ResolvedExperiment, SigregPopulation, SigregStatistic,
+    ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
+    SigregStatistic,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -69,8 +70,10 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v8";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v5";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v9";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v6";
+const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub type SigregTarget = SigregPopulation;
 
@@ -151,7 +154,7 @@ pub struct TrainConfig {
     pub max_steps_this_run: Option<usize>,
     /// One-based representative optimizer update captured by candle-graph.
     pub profile_update: u64,
-    /// Run PTRM ranking loss every N optimizer steps on sequential/retarget (`1` = every step).
+    /// Run PTRM ranking loss every N optimizer steps (`1` = every step, `0` = disabled).
     #[serde(default = "default_ptrm_rank_every")]
     pub ptrm_rank_every: usize,
     /// Sample inner/outer recursion depth uniformly in `1..=configured` each optimizer step.
@@ -246,6 +249,9 @@ pub struct TrainConfig {
     /// and scale-normalized factual displacement health.
     #[serde(default)]
     pub world_core_v3: bool,
+    /// Planning-head aggregation at the final spatial prediction seam.
+    #[serde(default)]
+    pub consumer_readout: ConsumerReadoutTopology,
     /// Localized ACTION6 conditioning, independently switchable inside V2.
     #[serde(default)]
     pub spatial_action_field: bool,
@@ -412,6 +418,7 @@ impl Default for TrainConfig {
             prefetch_batches: true,
             world_core_v2: false,
             world_core_v3: false,
+            consumer_readout: ConsumerReadoutTopology::GlobalMean,
             spatial_action_field: false,
             spatial_action_residual: false,
             spatial_action_residual_scale: default_spatial_action_residual_scale(),
@@ -428,6 +435,7 @@ impl TrainConfig {
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
             spatial_action_residual_scale: self.spatial_action_residual_scale,
+            consumer_readout: self.consumer_readout,
             branch_learning_enabled: self.branch_learning.enabled,
             displacement_health_enabled: self.branch_learning.displacement_health.is_some(),
             sigreg_weight: self.sigreg_weight,
@@ -488,9 +496,6 @@ impl TrainConfig {
         if !(self.q_mse_threshold.is_finite() && self.q_mse_threshold >= 0.0) {
             bail!("q_mse_threshold must be finite and >= 0");
         }
-        if self.ptrm_rank_every == 0 {
-            bail!("ptrm_rank_every must be >= 1 (use 1 for every step)");
-        }
         if !self.train_z_noise.is_finite() || self.train_z_noise < 0.0 {
             bail!("train_z_noise must be finite and >= 0");
         }
@@ -528,6 +533,7 @@ impl TrainConfig {
             spatial_action_residual_scale: self.spatial_action_residual_scale,
             world_core_v2: self.world_core_v2,
             world_core_v3: self.world_core_v3,
+            consumer_readout: self.consumer_readout,
         }
     }
 }
@@ -619,6 +625,10 @@ pub struct TrainReport {
     pub lr: f64,
     pub weight_decay: f64,
     pub parameter_count: usize,
+    /// Ordered provenance fingerprint of every generated training row consumed
+    /// by completed optimizer updates.
+    pub training_population_fingerprint: String,
+    pub training_population_rows: u64,
     pub device: String,
     pub lessons: Vec<LessonReport>,
     pub status: TrainStatus,
@@ -654,6 +664,10 @@ pub struct GradientPressureDiagnostics {
     pub encoder_next_latent_l2: f64,
     pub encoder_sigreg_weighted_l2: f64,
     pub sigreg_to_next_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_readout_weighted_l2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readout_to_next_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_next_latent_l2: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -835,11 +849,59 @@ struct TrainerState {
     completed_lessons: Vec<LessonReport>,
     active_sums: LessonLossMeans,
     parameter_names: Vec<String>,
+    #[serde(default = "default_training_population_hash")]
+    training_population_hash: u64,
+    #[serde(default)]
+    training_population_rows: u64,
     #[serde(default)]
     batch_schedule_migrations: Vec<BatchScheduleMigration>,
     profile: ProfileState,
     #[serde(default)]
     gradient_pressure: Option<GradientPressureDiagnostics>,
+}
+
+fn default_training_population_hash() -> u64 {
+    FNV1A64_OFFSET
+}
+
+fn update_training_population(state: &mut TrainerState, samples: &[TransitionSample]) {
+    fn bytes(hash: &mut u64, value: &[u8]) {
+        for byte in value {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+
+    for sample in samples {
+        bytes(
+            &mut state.training_population_hash,
+            &sample.seed.to_le_bytes(),
+        );
+        bytes(
+            &mut state.training_population_hash,
+            &sample.episode_id.to_le_bytes(),
+        );
+        bytes(
+            &mut state.training_population_hash,
+            &sample.transition_index.to_le_bytes(),
+        );
+        bytes(
+            &mut state.training_population_hash,
+            sample.family.as_bytes(),
+        );
+        bytes(
+            &mut state.training_population_hash,
+            &[0xff, sample.action.id],
+        );
+        bytes(
+            &mut state.training_population_hash,
+            &[
+                sample.action.x.unwrap_or(u8::MAX),
+                sample.action.y.unwrap_or(u8::MAX),
+            ],
+        );
+        state.training_population_rows += 1;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3426,6 +3488,8 @@ fn build_report(
         lr: cfg.lr,
         weight_decay: cfg.weight_decay,
         parameter_count,
+        training_population_fingerprint: format!("fnv1a64:{:016x}", state.training_population_hash),
+        training_population_rows: state.training_population_rows,
         device: cfg.device.clone(),
         lessons: state.completed_lessons.clone(),
         status,
@@ -3506,6 +3570,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             completed_lessons: Vec::with_capacity(cfg.lessons.len()),
             active_sums: LessonLossMeans::default(),
             parameter_names,
+            training_population_hash: default_training_population_hash(),
+            training_population_rows: 0,
             batch_schedule_migrations: Vec::new(),
             profile: ProfileState::Pending,
             gradient_pressure: None,
@@ -3669,6 +3735,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     )
                 })?
             };
+            update_training_population(&mut state, &samples);
             if micro == 0 && use_prefetch {
                 top_up_prefetch(
                     &mut prefetched_through_step,
@@ -3833,26 +3900,51 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             if micro == 0
                 && state.gradient_pressure.is_none()
                 && state.global_step.saturating_add(1) == pressure_update
-                && (loss_weights.sigreg > 0.0 || cfg.branch_learning.displacement_health.is_some())
+                && (loss_weights.sigreg > 0.0
+                    || (loss_weights.q > 0.0 && !cfg.stop_grad_q_y)
+                    || cfg.branch_learning.displacement_health.is_some())
             {
                 // Read-only attribution: these stores are discarded before the
                 // normal total-loss backward and never reach the optimizer.
-                if loss_weights.sigreg > 0.0 {
+                if loss_weights.sigreg > 0.0 || (loss_weights.q > 0.0 && !cfg.stop_grad_q_y) {
                     let next_grads = micro_losses.next_latent.backward()?;
                     let next_norm =
                         gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
                     drop(next_grads);
-                    let sigreg_grads = micro_losses
-                        .sigreg_bounded
-                        .affine(loss_weights.sigreg, 0.0)?
-                        .backward()?;
-                    let sigreg_norm =
-                        gradient_l2_for_parameter_prefix(&sigreg_grads, &varmap, "encoder.")?;
+                    let sigreg_norm = if loss_weights.sigreg > 0.0 {
+                        let grads = micro_losses
+                            .sigreg_bounded
+                            .affine(loss_weights.sigreg, 0.0)?
+                            .backward()?;
+                        Some(gradient_l2_for_parameter_prefix(
+                            &grads, &varmap, "encoder.",
+                        )?)
+                    } else {
+                        None
+                    };
+                    let readout_norm = if loss_weights.q > 0.0 && !cfg.stop_grad_q_y {
+                        let combined_readout = micro_losses
+                            .q
+                            .affine(loss_weights.q, 0.0)?
+                            .add(&micro_losses.q_surprise.affine(Q_SURPRISE_WEIGHT, 0.0)?)?;
+                        let grads = combined_readout.backward()?;
+                        Some(gradient_l2_for_parameter_prefix(
+                            &grads, &varmap, "encoder.",
+                        )?)
+                    } else {
+                        None
+                    };
                     state.gradient_pressure = Some(GradientPressureDiagnostics {
                         update: pressure_update,
                         encoder_next_latent_l2: next_norm,
-                        encoder_sigreg_weighted_l2: sigreg_norm,
-                        sigreg_to_next_ratio: (next_norm > 0.0).then_some(sigreg_norm / next_norm),
+                        encoder_sigreg_weighted_l2: sigreg_norm.unwrap_or(0.0),
+                        sigreg_to_next_ratio: sigreg_norm
+                            .filter(|_| next_norm > 0.0)
+                            .map(|norm| norm / next_norm),
+                        encoder_readout_weighted_l2: readout_norm,
+                        readout_to_next_ratio: readout_norm
+                            .filter(|_| next_norm > 0.0)
+                            .map(|norm| norm / next_norm),
                         model_next_latent_l2: None,
                         displacement_health_weighted_l2: None,
                         displacement_health_to_next_ratio: None,
@@ -3876,6 +3968,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         encoder_next_latent_l2: 0.0,
                         encoder_sigreg_weighted_l2: 0.0,
                         sigreg_to_next_ratio: None,
+                        encoder_readout_weighted_l2: None,
+                        readout_to_next_ratio: None,
                         model_next_latent_l2: Some(next_norm),
                         displacement_health_weighted_l2: Some(health_norm),
                         displacement_health_to_next_ratio: (next_norm > 0.0)
@@ -5664,6 +5758,8 @@ mod tests {
             lr: 1e-3,
             weight_decay: 0.01,
             parameter_count: 10,
+            training_population_fingerprint: "fnv1a64:0000000000000000".into(),
+            training_population_rows: 0,
             device: "cpu".into(),
             lessons: vec![],
             status: TrainStatus::Completed,

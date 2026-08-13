@@ -6,6 +6,7 @@ pub mod branch_learning;
 pub mod calibration;
 pub mod cg_profile;
 pub mod cli;
+pub mod consumer_readout;
 pub mod consumer_transition;
 pub mod data;
 pub mod eval;

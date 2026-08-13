@@ -6,7 +6,7 @@
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
-use crate::p2::experiment::SigregStatistic;
+use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic};
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
@@ -104,7 +104,7 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 2)]
     pub profile_update: u64,
 
-    /// PTRM ranking loss cadence on sequential/retarget (`1` = every step).
+    /// PTRM ranking loss cadence (`1` = every step, `0` = disabled).
     #[arg(long, default_value_t = 4)]
     pub ptrm_rank_every: usize,
 
@@ -223,6 +223,10 @@ pub struct P2TrainArgs {
     /// Train the V3 factual world core while retaining the V2 parameter topology.
     #[arg(long, default_value_t = false)]
     pub world_core_v3: bool,
+
+    /// Planning-head readout from the final BxCx8x8 prediction.
+    #[arg(long, value_enum, default_value_t = ConsumerReadoutTopology::GlobalMean)]
+    pub consumer_readout: ConsumerReadoutTopology,
 
     /// Add localized ACTION6 fields while retaining global action identity.
     #[arg(long, default_value_t = false)]
@@ -356,6 +360,7 @@ impl P2TrainArgs {
             prefetch_batches: self.prefetch_batches,
             world_core_v2: self.world_core_v2 || self.world_core_v3,
             world_core_v3: self.world_core_v3,
+            consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
             spatial_action_residual_scale: self.spatial_action_residual_scale,

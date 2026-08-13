@@ -24,6 +24,17 @@ pub enum SigregPopulation {
     TemporalResidual,
 }
 
+/// The learned planning heads consume one `B×C` summary of the final spatial
+/// prediction. This identity is deliberately separate from recurrence and
+/// representation-health topology: both remain spatial in every variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerReadoutTopology {
+    #[default]
+    GlobalMean,
+    SpatialQuery,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldCoreFamily {
@@ -89,6 +100,8 @@ pub struct SigregDefinition {
 pub struct ResolvedExperiment {
     pub family: WorldCoreFamily,
     pub action_conditioning: ActionConditioning,
+    #[serde(default)]
+    pub consumer_readout: ConsumerReadoutTopology,
     pub sigreg: SigregDefinition,
     pub factual_learning: bool,
     pub report_schema: String,
@@ -99,6 +112,7 @@ impl Default for ResolvedExperiment {
         Self {
             family: WorldCoreFamily::Legacy,
             action_conditioning: ActionConditioning::Global,
+            consumer_readout: ConsumerReadoutTopology::GlobalMean,
             sigreg: SigregDefinition {
                 enabled: false,
                 statistic: SigregStatistic::EppsPulley,
@@ -124,6 +138,7 @@ pub struct ExperimentRequest<'a> {
     pub spatial_action_field: bool,
     pub spatial_action_residual: bool,
     pub spatial_action_residual_scale: f64,
+    pub consumer_readout: ConsumerReadoutTopology,
     pub branch_learning_enabled: bool,
     pub displacement_health_enabled: bool,
     pub sigreg_weight: f64,
@@ -239,6 +254,7 @@ impl ResolvedExperiment {
         Ok(Self {
             family,
             action_conditioning,
+            consumer_readout: request.consumer_readout,
             sigreg: SigregDefinition {
                 enabled: request.sigreg_weight > 0.0,
                 statistic: request.sigreg_statistic,
@@ -268,6 +284,7 @@ mod tests {
             spatial_action_field: false,
             spatial_action_residual: false,
             spatial_action_residual_scale: 0.25,
+            consumer_readout: ConsumerReadoutTopology::GlobalMean,
             branch_learning_enabled: false,
             displacement_health_enabled: false,
             sigreg_weight: 0.003,

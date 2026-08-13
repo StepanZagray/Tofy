@@ -10,6 +10,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::p2::consumer_readout::ConsumerReadout;
+use crate::p2::experiment::ConsumerReadoutTopology;
 use crate::p2::representation::RepresentationSeam;
 
 /// Fixed observation resolution required by the pixel encoder.
@@ -119,6 +121,9 @@ pub struct ModelConfig {
     /// Explicit experiment schema marker. V3 retains the V2 heads/topology.
     #[serde(default)]
     pub world_core_v3: bool,
+    /// Readout used only by Q/event/reliability planning heads.
+    #[serde(default)]
+    pub consumer_readout: ConsumerReadoutTopology,
 }
 
 fn default_sigreg_projector_dim() -> usize {
@@ -149,6 +154,7 @@ impl Default for ModelConfig {
             spatial_action_residual_scale: default_spatial_action_residual_scale(),
             world_core_v2: false,
             world_core_v3: false,
+            consumer_readout: ConsumerReadoutTopology::GlobalMean,
         }
     }
 }
@@ -486,6 +492,7 @@ pub struct WorldModel {
     q_head: Linear,
     /// Calibrated reliability / error prediction (Phase D).
     reliability_head: Linear,
+    consumer_readout: ConsumerReadout,
     /// Direct one-step prefix delta from pooled state + action.
     prefix_head: Linear,
     spatial_prefix_head: Option<Conv2d>,
@@ -554,6 +561,11 @@ impl WorldModel {
             event_head: linear(cfg.hidden_dim * 2, cfg.num_events, vb.pp("event_head"))?,
             q_head: linear(cfg.hidden_dim, 1, vb.pp("q_head"))?,
             reliability_head: linear(cfg.hidden_dim, 1, vb.pp("reliability_head"))?,
+            consumer_readout: ConsumerReadout::new(
+                cfg.consumer_readout,
+                cfg.hidden_dim,
+                vb.pp("consumer_readout"),
+            )?,
             prefix_head: linear(cfg.hidden_dim * 2, cfg.hidden_dim, vb.pp("prefix_head"))?,
             spatial_prefix_head,
             action_decoder,
@@ -690,6 +702,10 @@ impl WorldModel {
             (
                 RepresentationSeam::PredictionFinalPooled,
                 pool_latent(&prediction)?.detach(),
+            ),
+            (
+                RepresentationSeam::PredictionFinalConsumerReadout,
+                self.consumer_readout.forward(&prediction)?.detach(),
             ),
             (
                 RepresentationSeam::PredictionFinalSpatial,
@@ -896,19 +912,19 @@ impl WorldModel {
     }
 
     fn heads(&self, y: &Tensor, goal_h: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let pooled = pool_latent(y)?;
-        let event_in = Tensor::cat(&[&pooled, goal_h], D::Minus1)?;
+        let readout = self.consumer_readout.forward(y)?;
+        let event_in = Tensor::cat(&[&readout, goal_h], D::Minus1)?;
         let event_logits = self.event_head.forward(&event_in)?;
-        let q_logit = self.q_head.forward(&pooled)?;
-        let reliability_logit = self.reliability_head.forward(&pooled)?;
+        let q_logit = self.q_head.forward(&readout)?;
+        let reliability_logit = self.reliability_head.forward(&readout)?;
         Ok((event_logits, q_logit, reliability_logit))
     }
 
     /// Event logits from detached or live `y` (training may stop-grad events only).
     pub fn event_logits_from(&self, y: &Tensor, goal_features: &Tensor) -> Result<Tensor> {
         let goal_h = self.project_goal(goal_features)?;
-        let pooled = pool_latent(y)?;
-        let event_in = Tensor::cat(&[&pooled, &goal_h], D::Minus1)?;
+        let readout = self.consumer_readout.forward(y)?;
+        let event_in = Tensor::cat(&[&readout, &goal_h], D::Minus1)?;
         self.event_head.forward(&event_in).map_err(Into::into)
     }
 
@@ -1086,13 +1102,15 @@ impl WorldModel {
 
     /// Q logit from a (possibly detached) latent state.
     pub fn q_logit_from_y(&self, y: &Tensor) -> Result<Tensor> {
-        let pooled = pool_latent(y)?;
-        self.q_head.forward(&pooled).map_err(Into::into)
+        self.q_head
+            .forward(&self.consumer_readout.forward(y)?)
+            .map_err(Into::into)
     }
 
     pub fn reliability_logit_from_y(&self, y: &Tensor) -> Result<Tensor> {
-        let pooled = pool_latent(y)?;
-        self.reliability_head.forward(&pooled).map_err(Into::into)
+        self.reliability_head
+            .forward(&self.consumer_readout.forward(y)?)
+            .map_err(Into::into)
     }
 
     /// Direct prefix prediction: residual delta on spatial latent from `(z, action)`.
@@ -1508,6 +1526,7 @@ impl WorldModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p2::train::reinit_varmap_deterministic;
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::{VarBuilder, VarMap};
 
@@ -1531,6 +1550,51 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
         let model = WorldModel::new(cfg, vb)?;
         Ok((model, varmap))
+    }
+
+    #[test]
+    fn readout_variants_preserve_shared_parameter_initialization() -> Result<()> {
+        let device = Device::Cpu;
+        let global_vars = VarMap::new();
+        let global_model = WorldModel::new(
+            tiny_cfg(),
+            VarBuilder::from_varmap(&global_vars, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&global_vars, 41)?;
+
+        let mut spatial_cfg = tiny_cfg();
+        spatial_cfg.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        let spatial_vars = VarMap::new();
+        let spatial_model = WorldModel::new(
+            spatial_cfg,
+            VarBuilder::from_varmap(&spatial_vars, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&spatial_vars, 41)?;
+
+        let global = global_vars.data().lock().unwrap();
+        let spatial = spatial_vars.data().lock().unwrap();
+        for (name, tensor) in global.iter() {
+            let counterpart = spatial
+                .get(name)
+                .unwrap_or_else(|| panic!("spatial arm is missing shared parameter {name}"));
+            assert_eq!(
+                tensor.as_tensor().flatten_all()?.to_vec1::<f32>()?,
+                counterpart.as_tensor().flatten_all()?.to_vec1::<f32>()?,
+                "shared initialization differs for {name}"
+            );
+        }
+        assert!(spatial
+            .keys()
+            .any(|name| name.starts_with("consumer_readout.")));
+        assert_eq!(
+            global_model.consumer_readout.topology(),
+            ConsumerReadoutTopology::GlobalMean
+        );
+        assert_eq!(
+            spatial_model.consumer_readout.topology(),
+            ConsumerReadoutTopology::SpatialQuery
+        );
+        Ok(())
     }
 
     fn sample_batch(
@@ -1731,7 +1795,7 @@ mod tests {
         let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
         let next = frames.clone();
         let output = model.representation_diagnostic(&frames, &next, &actions, &coords, &goals)?;
-        assert_eq!(output.seams.len(), 10);
+        assert_eq!(output.seams.len(), 11);
         for seam in [
             RepresentationSeam::EncoderPreRmsPooled,
             RepresentationSeam::EncoderPostRmsPooled,
@@ -1740,6 +1804,7 @@ mod tests {
             RepresentationSeam::ActionConditionedInputSpatial,
             RepresentationSeam::RecursionOuterOneSpatial,
             RepresentationSeam::PredictionFinalPooled,
+            RepresentationSeam::PredictionFinalConsumerReadout,
             RepresentationSeam::PredictionFinalSpatial,
             RepresentationSeam::TargetPostRmsPooled,
             RepresentationSeam::TargetPostRmsSpatial,

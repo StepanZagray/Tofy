@@ -225,6 +225,7 @@ pub enum RepresentationSeam {
     ActionConditionedInputSpatial,
     RecursionOuterOneSpatial,
     PredictionFinalPooled,
+    PredictionFinalConsumerReadout,
     PredictionFinalSpatial,
     TargetPostRmsPooled,
     TargetPostRmsSpatial,
@@ -251,6 +252,7 @@ pub fn seam_rows(tensor: &Tensor, seam: RepresentationSeam) -> Result<Tensor> {
         RepresentationSeam::EncoderPreRmsPooled
         | RepresentationSeam::EncoderPostRmsPooled
         | RepresentationSeam::PredictionFinalPooled
+        | RepresentationSeam::PredictionFinalConsumerReadout
         | RepresentationSeam::TargetPostRmsPooled => {
             if tensor.rank() != 2 {
                 bail!(

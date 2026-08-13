@@ -12,8 +12,8 @@ use crate::p2::data::{
     FactualBatch, TransitionSample, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionStepProbe, WorldModel,
-    EVENT_GOAL_FAILED,
+    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
+    RecursionStepProbe, WorldModel, EVENT_GOAL_FAILED,
 };
 use crate::p2::representation::{
     RepresentationRowCollector, RepresentationSeam, RepresentationSeamCollector,
@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v12";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v13";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +69,15 @@ pub struct HorizonRolloutStats {
     /// Model MSE divided by copy-forward MSE at the same horizon (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalized_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_median: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_p95: Option<f64>,
+    /// Mean of the worst 5% normalized errors (at least one row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_cvar95: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction_beating_copy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,10 +237,6 @@ impl QEvalAccum {
         };
         let balanced_accuracy = if tpr.is_finite() && tnr.is_finite() {
             Some((tpr + tnr) / 2.0)
-        } else if tpr.is_finite() {
-            Some(tpr)
-        } else if tnr.is_finite() {
-            Some(tnr)
         } else {
             None
         };
@@ -241,7 +246,7 @@ impl QEvalAccum {
             accuracy: Some(self.correct as f64 / self.n as f64),
             positive_label_rate: Some(positive_label_rate),
             balanced_accuracy,
-            saturated: positive_label_rate > 0.9,
+            saturated: !(0.1..=0.9).contains(&positive_label_rate),
         }
     }
 }
@@ -707,6 +712,16 @@ pub struct FactualBranchMetrics {
     pub majority_action_baseline_top1: Option<f64>,
 }
 
+/// Model-family-independent semantic probe on a deterministic held-out
+/// synthetic transition population.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardProbeEvaluation {
+    pub population_fingerprint: String,
+    pub fit_frames: usize,
+    pub held_out_frames: usize,
+    pub metrics: BoardTransitionMetrics,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub schema: String,
@@ -729,6 +744,10 @@ pub struct EvalReport {
     pub synthetic_dynamics: SplitEval,
     /// Planning / calibration / falsification / retarget held-out probes.
     pub synthetic_planner: SplitEval,
+    /// Eval-only patch/palette grounding probe on the same model-independent
+    /// population for every consumer-readout arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_probe: Option<BoardProbeEvaluation>,
     /// Held-out same-state factual branch metrics, available for world-core-v2
     /// checkpoints only.
     #[serde(default)]
@@ -825,6 +844,117 @@ fn collect_synthetic_sources(
         sources[kind_index].1.extend(samples);
     }
     Ok(sources)
+}
+
+fn sample_population_fingerprint(samples: &[TransitionSample]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for sample in samples {
+        for byte in sample
+            .seed
+            .to_le_bytes()
+            .into_iter()
+            .chain(sample.episode_id.to_le_bytes())
+            .chain(sample.transition_index.to_le_bytes())
+            .chain(sample.family.bytes())
+            .chain([
+                0xff,
+                sample.action.id,
+                sample.action.x.unwrap_or(u8::MAX),
+                sample.action.y.unwrap_or(u8::MAX),
+            ])
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn board_probe_rows_for_samples(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    physical_batch: usize,
+    device: &Device,
+) -> Result<(BoardProbeRows, BoardProbeRows)> {
+    let mut target_rows: Option<BoardProbeRows> = None;
+    let mut predicted_rows: Option<BoardProbeRows> = None;
+    for (start, end) in batch_ranges(samples.len(), physical_batch) {
+        let batch = batch_from_samples(&samples[start..end], device)?;
+        let target = BoardProbeRows::from_spatial_latent(&model.encode_state(&batch.next_frames)?)?;
+        let current = model.encode_state(&batch.frames)?;
+        let predicted = BoardProbeRows::from_spatial_latent(
+            &model
+                .training_latents_from_encoded_state(
+                    &current,
+                    &batch.actions,
+                    &batch.action_coords,
+                    RecursionDepth {
+                        inner_steps: model.config().inner_steps,
+                        outer_steps: model.config().outer_steps,
+                    },
+                    0.0,
+                    None,
+                    RecursionOpts::EVAL,
+                )?
+                .y,
+        )?;
+        if let Some(rows) = &mut target_rows {
+            rows.append(target);
+        } else {
+            target_rows = Some(target);
+        }
+        if let Some(rows) = &mut predicted_rows {
+            rows.append(predicted);
+        } else {
+            predicted_rows = Some(predicted);
+        }
+    }
+    Ok((
+        target_rows.ok_or_else(|| anyhow::anyhow!("board probe fit population is empty"))?,
+        predicted_rows
+            .ok_or_else(|| anyhow::anyhow!("board probe prediction population is empty"))?,
+    ))
+}
+
+fn evaluate_board_probe(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    physical_batch: usize,
+    device: &Device,
+) -> Result<Option<BoardProbeEvaluation>> {
+    let (fit, held_out): (Vec<_>, Vec<_>) = samples
+        .iter()
+        .cloned()
+        .partition(|sample| sample.episode_id % 3 == 0);
+    if fit.is_empty() || held_out.is_empty() {
+        return Ok(None);
+    }
+    let (fit_target_rows, _) = board_probe_rows_for_samples(model, &fit, physical_batch, device)?;
+    let (held_out_target_rows, held_out_predicted_rows) =
+        board_probe_rows_for_samples(model, &held_out, physical_batch, device)?;
+    let probe = FixedBoardProbe::fit_spatial(
+        &fit_target_rows,
+        &fit.iter()
+            .map(|sample| sample.next.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let transitions = BoardProbeTransitions::try_new(
+        held_out
+            .iter()
+            .map(|sample| sample.current.clone())
+            .collect(),
+        held_out.iter().map(|sample| sample.next.clone()).collect(),
+    )?;
+    Ok(Some(BoardProbeEvaluation {
+        population_fingerprint: sample_population_fingerprint(samples),
+        fit_frames: fit.len(),
+        held_out_frames: held_out.len(),
+        metrics: probe.summarize_transitions(
+            &held_out_target_rows,
+            &held_out_predicted_rows,
+            &transitions,
+        )?,
+    }))
 }
 
 fn flatten_sources(sources: &[(String, Vec<TransitionSample>)]) -> Vec<TransitionSample> {
@@ -1272,6 +1402,24 @@ fn summarize_horizon(values: &[f32], normalized: &[f32], seed: u64) -> HorizonRo
     let mut sorted = finite.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let (ci95_low, ci95_high) = bootstrap_ci95(&finite, seed);
+    let mut normalized_sorted = normalized
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    normalized_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail_start = ((normalized_sorted.len() as f64 * 0.95).floor() as usize)
+        .min(normalized_sorted.len().saturating_sub(1));
+    let normalized_cvar95 = (!normalized_sorted.is_empty())
+        .then(|| mean(&normalized_sorted[tail_start..]))
+        .flatten();
+    let fraction_beating_copy = (!normalized_sorted.is_empty()).then(|| {
+        normalized_sorted
+            .iter()
+            .filter(|value| **value <= 1.0)
+            .count() as f64
+            / normalized_sorted.len() as f64
+    });
     HorizonRolloutStats {
         n: values.len(),
         finite_n: finite.len(),
@@ -1284,6 +1432,10 @@ fn summarize_horizon(values: &[f32], normalized: &[f32], seed: u64) -> HorizonRo
         ci95_high,
         max: sorted.last().map(|v| *v as f64),
         normalized_mean: mean(normalized),
+        normalized_median: median(&normalized_sorted),
+        normalized_p95: percentile(&normalized_sorted, 0.95),
+        normalized_cvar95,
+        fraction_beating_copy,
     }
 }
 
@@ -3742,6 +3894,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     ));
     let dynamics_samples = flatten_sources(&dynamics_sources);
     let dynamics_source_lengths = source_lengths(&dynamics_sources);
+    let board_probe = evaluate_board_probe(&model, &dynamics_samples, cfg.physical_batch, &device)?;
     let dynamics_rollout_samples =
         collect_dynamics_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
 
@@ -3935,6 +4088,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         public_data_used_for_fitting: false,
         synthetic_dynamics,
         synthetic_planner,
+        board_probe,
         factual_branches,
         arc3_transfer,
         research_claim: false,
@@ -3964,6 +4118,33 @@ mod tests {
     use crate::p2::train::{
         reinit_varmap_deterministic, save_checkpoint, TrainReport, TRAIN_REPORT_SCHEMA,
     };
+
+    #[test]
+    fn q_metrics_require_both_classes_and_reject_extreme_label_rates() {
+        let all_negative = QEvalAccum {
+            n: 10,
+            correct: 10,
+            tn: 10,
+            ..Default::default()
+        }
+        .finalize();
+        assert!(all_negative.saturated);
+        assert_eq!(all_negative.balanced_accuracy, None);
+
+        let both_classes = QEvalAccum {
+            n: 10,
+            correct: 8,
+            positive_labels: 4,
+            tp: 3,
+            tn: 5,
+            fp: 1,
+            fn_: 1,
+            ..Default::default()
+        }
+        .finalize();
+        assert!(!both_classes.saturated);
+        assert!(both_classes.balanced_accuracy.is_some());
+    }
 
     fn action_diagnostic_sample(action: ArcAction, episode_id: u64) -> Result<TransitionSample> {
         let current = ArcFrame::new(1, 1, vec![episode_id as u8])?;
@@ -4739,6 +4920,8 @@ mod tests {
             lr: train_cfg.lr,
             weight_decay: train_cfg.weight_decay,
             parameter_count: 1,
+            training_population_fingerprint: "fnv1a64:0000000000000000".into(),
+            training_population_rows: 0,
             device: "cpu".into(),
             lessons: vec![],
             status: crate::p2::train::TrainStatus::Completed,
