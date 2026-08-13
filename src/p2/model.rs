@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use crate::p2::consumer_readout::ConsumerReadout;
 use crate::p2::data::TransitionSample;
 use crate::p2::experiment::ConsumerReadoutTopology;
-use crate::p2::grounding::{PatchGroundingLoss, PatchHistogramGrounding};
+use crate::p2::grounding::{PatchGroundingLoss, PatchGroundingMode, PatchHistogramGrounding};
 use crate::p2::representation::RepresentationSeam;
 
 /// Fixed observation resolution required by the pixel encoder.
@@ -592,9 +592,10 @@ impl WorldModel {
         predicted: &Tensor,
         target: &Tensor,
         samples: &[TransitionSample],
+        mode: PatchGroundingMode,
     ) -> Result<PatchGroundingLoss> {
         self.patch_histogram_grounding
-            .loss(predicted, target, samples)
+            .loss(predicted, target, samples, mode)
     }
 
     /// Encode palette-index frames into the shared latent space.

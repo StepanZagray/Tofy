@@ -8,8 +8,21 @@ use crate::p2::model::{FRAME_SIDE, LATENT_GRID, PALETTE_SIZE};
 use anyhow::{ensure, Result};
 use candle_core::{DType, Tensor, D};
 use candle_nn::{linear, Linear, Module, VarBuilder};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 
 const PATCH_SIDE: usize = FRAME_SIDE / LATENT_GRID;
+
+/// Which half of the patch-histogram grounding bundle contributes gradients.
+/// The shared decoder and both raw losses exist in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchGroundingMode {
+    Target,
+    Predicted,
+    #[default]
+    Both,
+}
 
 #[derive(Debug)]
 pub struct PatchGroundingLoss {
@@ -38,6 +51,7 @@ impl PatchHistogramGrounding {
         predicted: &Tensor,
         target: &Tensor,
         samples: &[TransitionSample],
+        mode: PatchGroundingMode,
     ) -> Result<PatchGroundingLoss> {
         let (batch, hidden, height, width) = predicted.dims4()?;
         ensure!(
@@ -64,8 +78,9 @@ impl PatchHistogramGrounding {
 
         let target_loss = self.soft_cross_entropy(target, &histograms, &weights)?;
         let predicted_loss = self.soft_cross_entropy(predicted, &histograms, &weights)?;
+        let total = combine_losses(target_loss, predicted_loss, mode)?;
         Ok(PatchGroundingLoss {
-            total: target_loss.add(&predicted_loss)?.affine(0.5, 0.0)?,
+            total,
             changed_patches: changed_count,
             unchanged_patches: unchanged_count,
         })
@@ -86,6 +101,14 @@ impl PatchHistogramGrounding {
         let log_probs = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
         let per_patch = log_probs.mul(histograms)?.sum(D::Minus1)?.neg()?;
         per_patch.mul(weights)?.sum_all().map_err(Into::into)
+    }
+}
+
+fn combine_losses(target: Tensor, predicted: Tensor, mode: PatchGroundingMode) -> Result<Tensor> {
+    match mode {
+        PatchGroundingMode::Target => Ok(target),
+        PatchGroundingMode::Predicted => Ok(predicted),
+        PatchGroundingMode::Both => target.add(&predicted)?.affine(0.5, 0.0).map_err(Into::into),
     }
 }
 
@@ -239,5 +262,35 @@ mod tests {
             .iter()
             .sum();
         assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grounding_modes_select_exact_bundle_components() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let target = Tensor::new(2f32, &device)?;
+        let predicted = Tensor::new(6f32, &device)?;
+        assert_eq!(
+            combine_losses(
+                target.clone(),
+                predicted.clone(),
+                PatchGroundingMode::Target
+            )?
+            .to_scalar::<f32>()?,
+            2.0
+        );
+        assert_eq!(
+            combine_losses(
+                target.clone(),
+                predicted.clone(),
+                PatchGroundingMode::Predicted
+            )?
+            .to_scalar::<f32>()?,
+            6.0
+        );
+        assert_eq!(
+            combine_losses(target, predicted, PatchGroundingMode::Both)?.to_scalar::<f32>()?,
+            4.0
+        );
+        Ok(())
     }
 }

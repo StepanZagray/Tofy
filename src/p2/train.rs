@@ -12,6 +12,7 @@ use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
     SigregStatistic,
 };
+use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
     WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, PALETTE_SIZE, PREFIX_HORIZONS,
@@ -133,6 +134,10 @@ pub struct TrainConfig {
     /// Training-only shared patch-histogram grounding objective.
     #[serde(default)]
     pub patch_grounding_weight: f64,
+    /// Selects target anchoring, predicted-next supervision, or their original
+    /// equal mixture without changing model topology.
+    #[serde(default)]
+    pub patch_grounding_mode: PatchGroundingMode,
     /// Model initialization seed. None resolves to `seed`.
     #[serde(default)]
     pub init_seed: Option<u64>,
@@ -382,6 +387,7 @@ impl Default for TrainConfig {
             sigreg_knots: 5,
             sigreg_weight: 0.003,
             patch_grounding_weight: 0.0,
+            patch_grounding_mode: PatchGroundingMode::Both,
             init_seed: None,
             event_weight: 0.1,
             q_weight: 0.1,
@@ -453,6 +459,7 @@ impl TrainConfig {
             displacement_health_enabled: self.branch_learning.displacement_health.is_some(),
             sigreg_weight: self.sigreg_weight,
             patch_grounding_weight: self.patch_grounding_weight,
+            patch_grounding_mode: self.patch_grounding_mode,
             sigreg_statistic: self.sigreg_statistic,
             sigreg_population: self.sigreg_target,
             sigreg_temporal_window: self.sigreg_temporal_window,
@@ -743,6 +750,8 @@ struct TrainingContract {
     #[serde(default)]
     patch_grounding_weight: f64,
     #[serde(default)]
+    patch_grounding_mode: PatchGroundingMode,
+    #[serde(default)]
     init_seed: Option<u64>,
     #[serde(default)]
     experiment: Option<ResolvedExperiment>,
@@ -831,6 +840,7 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_knots: cfg.sigreg_knots,
             sigreg_weight: cfg.sigreg_weight,
             patch_grounding_weight: cfg.patch_grounding_weight,
+            patch_grounding_mode: cfg.patch_grounding_mode,
             init_seed: cfg.init_seed,
             experiment: Some(
                 cfg.resolved_experiment()
@@ -2769,7 +2779,7 @@ fn leworld_loss_with_sigreg_windows(
         let samples = samples.ok_or_else(|| {
             anyhow::anyhow!("patch grounding requires transition sample provenance")
         })?;
-        model.patch_histogram_grounding_loss(&out.y, &next_z, samples)?
+        model.patch_histogram_grounding_loss(&out.y, &next_z, samples, cfg.patch_grounding_mode)?
     } else {
         crate::p2::grounding::PatchGroundingLoss {
             total: zero.clone(),

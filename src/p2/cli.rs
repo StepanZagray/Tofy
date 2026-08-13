@@ -7,6 +7,7 @@ use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic};
+use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
@@ -56,6 +57,11 @@ pub struct P2TrainArgs {
     /// Weight for the shared 8x8-patch colour-histogram grounding objective.
     #[arg(long, default_value_t = 0.0)]
     pub patch_grounding_weight: f64,
+
+    /// Active branch of the grounding bundle. `both` preserves the original
+    /// equal target/prediction mixture.
+    #[arg(long, value_enum, default_value_t = PatchGroundingMode::Both)]
+    pub patch_grounding_mode: PatchGroundingMode,
 
     /// Model initialization seed; defaults to `seed`. Calibration uses a fixed
     /// init seed while varying data seeds across read-only one-update probes.
@@ -323,6 +329,7 @@ impl P2TrainArgs {
             sigreg_knots: self.sigreg_knots,
             sigreg_weight: self.sigreg_weight,
             patch_grounding_weight: self.patch_grounding_weight,
+            patch_grounding_mode: self.patch_grounding_mode,
             init_seed: self.init_seed,
             event_weight: self.event_weight,
             q_weight: self.q_weight,

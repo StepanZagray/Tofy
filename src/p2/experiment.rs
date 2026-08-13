@@ -4,6 +4,8 @@ use anyhow::{bail, ensure, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::p2::grounding::PatchGroundingMode;
+
 pub const LEGACY_SCHEMA: &str = "legacy_p2_eval_compatible";
 pub const WORLD_CORE_V2_SCHEMA: &str = "world_core_v2";
 pub const WORLD_CORE_V3_SCHEMA: &str = "world_core_v3";
@@ -105,6 +107,8 @@ pub struct ResolvedExperiment {
     pub sigreg: SigregDefinition,
     #[serde(default)]
     pub patch_grounding_weight: f64,
+    #[serde(default)]
+    pub patch_grounding_mode: PatchGroundingMode,
     pub factual_learning: bool,
     pub report_schema: String,
 }
@@ -128,6 +132,7 @@ impl Default for ResolvedExperiment {
                 projector_dim: 128,
             },
             patch_grounding_weight: 0.0,
+            patch_grounding_mode: PatchGroundingMode::Both,
             factual_learning: false,
             report_schema: LEGACY_SCHEMA.into(),
         }
@@ -146,6 +151,7 @@ pub struct ExperimentRequest<'a> {
     pub displacement_health_enabled: bool,
     pub sigreg_weight: f64,
     pub patch_grounding_weight: f64,
+    pub patch_grounding_mode: PatchGroundingMode,
     pub sigreg_statistic: SigregStatistic,
     pub sigreg_population: SigregPopulation,
     pub sigreg_temporal_window: usize,
@@ -272,6 +278,7 @@ impl ResolvedExperiment {
                 projector_dim: request.sigreg_projector_dim,
             },
             patch_grounding_weight: request.patch_grounding_weight,
+            patch_grounding_mode: request.patch_grounding_mode,
             factual_learning,
             report_schema: family.schema().into(),
         })
@@ -294,6 +301,7 @@ mod tests {
             displacement_health_enabled: false,
             sigreg_weight: 0.003,
             patch_grounding_weight: 0.0,
+            patch_grounding_mode: PatchGroundingMode::Both,
             sigreg_statistic: SigregStatistic::EppsPulley,
             sigreg_population: SigregPopulation::Marginal,
             sigreg_temporal_window: 8,
