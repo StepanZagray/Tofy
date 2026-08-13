@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::p2::consumer_readout::ConsumerReadout;
+use crate::p2::data::TransitionSample;
 use crate::p2::experiment::ConsumerReadoutTopology;
+use crate::p2::grounding::{PatchGroundingLoss, PatchHistogramGrounding};
 use crate::p2::representation::RepresentationSeam;
 
 /// Fixed observation resolution required by the pixel encoder.
@@ -500,6 +502,8 @@ pub struct WorldModel {
     coordinate_decoder: Option<Linear>,
     /// Optional pre-RMS `B×C` → `B×D` projection used only by SIGReg.
     sigreg_projector: Option<Linear>,
+    /// Present in every arm; its loss is switched by the training contract.
+    patch_histogram_grounding: PatchHistogramGrounding,
 }
 
 impl WorldModel {
@@ -571,12 +575,26 @@ impl WorldModel {
             action_decoder,
             coordinate_decoder,
             sigreg_projector,
+            patch_histogram_grounding: PatchHistogramGrounding::new(
+                cfg.hidden_dim,
+                vb.pp("grounding_head"),
+            )?,
             config: cfg,
         })
     }
 
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    pub fn patch_histogram_grounding_loss(
+        &self,
+        predicted: &Tensor,
+        target: &Tensor,
+        samples: &[TransitionSample],
+    ) -> Result<PatchGroundingLoss> {
+        self.patch_histogram_grounding
+            .loss(predicted, target, samples)
     }
 
     /// Encode palette-index frames into the shared latent space.

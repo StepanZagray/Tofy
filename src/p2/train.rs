@@ -18,7 +18,7 @@ use crate::p2::model::{
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
-    accumulate_parameter_gradients, clip_gradients_gpu, CheckpointHybridOptimizer,
+    accumulate_parameter_gradients, clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
 };
 use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest, PrefetchScope};
 use crate::p2::sigreg::{sigreg_epps_pulley_seeded, sigreg_quantile_seeded};
@@ -31,6 +31,7 @@ use candle_nn::{VarBuilder, VarMap};
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,6 +130,12 @@ pub struct TrainConfig {
     pub sigreg_projections: usize,
     pub sigreg_knots: usize,
     pub sigreg_weight: f64,
+    /// Training-only shared patch-histogram grounding objective.
+    #[serde(default)]
+    pub patch_grounding_weight: f64,
+    /// Model initialization seed. None resolves to `seed`.
+    #[serde(default)]
+    pub init_seed: Option<u64>,
     pub event_weight: f64,
     pub q_weight: f64,
     /// Weight for open-loop latent error on sequential/retarget lessons.
@@ -154,6 +161,9 @@ pub struct TrainConfig {
     pub max_steps_this_run: Option<usize>,
     /// One-based representative optimizer update captured by candle-graph.
     pub profile_update: u64,
+    /// One-based read-only loss-gradient attribution probes.
+    #[serde(default)]
+    pub pressure_updates: Vec<u64>,
     /// Run PTRM ranking loss every N optimizer steps (`1` = every step, `0` = disabled).
     #[serde(default = "default_ptrm_rank_every")]
     pub ptrm_rank_every: usize,
@@ -371,6 +381,8 @@ impl Default for TrainConfig {
             sigreg_projections: 8,
             sigreg_knots: 5,
             sigreg_weight: 0.003,
+            patch_grounding_weight: 0.0,
+            init_seed: None,
             event_weight: 0.1,
             q_weight: 0.1,
             rollout_weight: 0.1,
@@ -386,6 +398,7 @@ impl Default for TrainConfig {
             checkpoint_every_steps: 100,
             max_steps_this_run: None,
             profile_update: 2,
+            pressure_updates: Vec::new(),
             ptrm_rank_every: 4,
             randomize_depth: false,
             steady_gpu: false,
@@ -439,6 +452,7 @@ impl TrainConfig {
             branch_learning_enabled: self.branch_learning.enabled,
             displacement_health_enabled: self.branch_learning.displacement_health.is_some(),
             sigreg_weight: self.sigreg_weight,
+            patch_grounding_weight: self.patch_grounding_weight,
             sigreg_statistic: self.sigreg_statistic,
             sigreg_population: self.sigreg_target,
             sigreg_temporal_window: self.sigreg_temporal_window,
@@ -471,6 +485,9 @@ impl TrainConfig {
         if self.profile_update == 0 {
             bail!("profile_update is one-based and must be > 0");
         }
+        if self.pressure_updates.contains(&0) {
+            bail!("pressure_updates are one-based and must be > 0");
+        }
         for lesson in &self.lessons {
             lesson_to_curriculum(lesson)?;
         }
@@ -482,6 +499,7 @@ impl TrainConfig {
         }
         for (name, weight) in [
             ("sigreg_weight", self.sigreg_weight),
+            ("patch_grounding_weight", self.patch_grounding_weight),
             ("event_weight", self.event_weight),
             ("q_weight", self.q_weight),
             ("rollout_weight", self.rollout_weight),
@@ -545,6 +563,18 @@ pub struct LessonLossMeans {
     pub rollout: f64,
     pub sigreg_raw: f64,
     pub sigreg_bounded: f64,
+    #[serde(default)]
+    pub patch_grounding: f64,
+    #[serde(default)]
+    pub grounding_changed_patches: f64,
+    #[serde(default)]
+    pub grounding_unchanged_patches: f64,
+    #[serde(default)]
+    pub pre_clip_gradient_norm: f64,
+    #[serde(default)]
+    pub gradient_clip_scale: f64,
+    #[serde(default)]
+    pub clipped_updates: f64,
     pub event: f64,
     pub q: f64,
     #[serde(default)]
@@ -628,6 +658,9 @@ pub struct TrainReport {
     /// Ordered provenance fingerprint of every generated training row consumed
     /// by completed optimizer updates.
     pub training_population_fingerprint: String,
+    /// Cryptographic chain over provenance plus complete current/next frames.
+    #[serde(default)]
+    pub training_content_fingerprint: String,
     pub training_population_rows: u64,
     pub device: String,
     pub lessons: Vec<LessonReport>,
@@ -650,6 +683,8 @@ pub struct TrainReport {
     /// Its gradients are discarded and never reach the optimizer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient_pressure: Option<GradientPressureDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gradient_pressure_samples: Vec<GradientPressureDiagnostics>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
 }
@@ -664,6 +699,18 @@ pub struct GradientPressureDiagnostics {
     pub encoder_next_latent_l2: f64,
     pub encoder_sigreg_weighted_l2: f64,
     pub sigreg_to_next_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_grounding_weighted_l2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_to_next_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_head_weighted_l2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigreg_next_cosine: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_next_cosine: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_sigreg_cosine: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_readout_weighted_l2: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -686,11 +733,17 @@ struct TrainingContract {
     physical_batch: usize,
     grad_accum: usize,
     profile_update: u64,
+    #[serde(default)]
+    pressure_updates: Vec<u64>,
     lr: f64,
     weight_decay: f64,
     sigreg_projections: usize,
     sigreg_knots: usize,
     sigreg_weight: f64,
+    #[serde(default)]
+    patch_grounding_weight: f64,
+    #[serde(default)]
+    init_seed: Option<u64>,
     #[serde(default)]
     experiment: Option<ResolvedExperiment>,
     event_weight: f64,
@@ -771,11 +824,14 @@ impl From<&TrainConfig> for TrainingContract {
             physical_batch: cfg.physical_batch,
             grad_accum: cfg.grad_accum,
             profile_update: cfg.profile_update,
+            pressure_updates: cfg.pressure_updates.clone(),
             lr: cfg.lr,
             weight_decay: cfg.weight_decay,
             sigreg_projections: cfg.sigreg_projections,
             sigreg_knots: cfg.sigreg_knots,
             sigreg_weight: cfg.sigreg_weight,
+            patch_grounding_weight: cfg.patch_grounding_weight,
+            init_seed: cfg.init_seed,
             experiment: Some(
                 cfg.resolved_experiment()
                     .expect("validated training config resolves an experiment"),
@@ -852,12 +908,16 @@ struct TrainerState {
     #[serde(default = "default_training_population_hash")]
     training_population_hash: u64,
     #[serde(default)]
+    training_content_hash: [u8; 32],
+    #[serde(default)]
     training_population_rows: u64,
     #[serde(default)]
     batch_schedule_migrations: Vec<BatchScheduleMigration>,
     profile: ProfileState,
     #[serde(default)]
     gradient_pressure: Option<GradientPressureDiagnostics>,
+    #[serde(default)]
+    gradient_pressure_samples: Vec<GradientPressureDiagnostics>,
 }
 
 fn default_training_population_hash() -> u64 {
@@ -873,6 +933,30 @@ fn update_training_population(state: &mut TrainerState, samples: &[TransitionSam
     }
 
     for sample in samples {
+        let mut digest = Sha256::new();
+        digest.update(state.training_content_hash);
+        digest.update(sample.seed.to_le_bytes());
+        digest.update(sample.episode_id.to_le_bytes());
+        digest.update(sample.transition_index.to_le_bytes());
+        digest.update((sample.family.len() as u64).to_le_bytes());
+        digest.update(sample.family.as_bytes());
+        digest.update([sample.action.id]);
+        digest.update([
+            sample.action.x.unwrap_or(u8::MAX),
+            sample.action.y.unwrap_or(u8::MAX),
+        ]);
+        for value in sample.goal_features.values {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+        digest.update([option_bool_byte(sample.noop)]);
+        digest.update([option_bool_byte(sample.goal_satisfied)]);
+        digest.update([option_bool_byte(sample.goal_failed)]);
+        digest.update([option_bool_byte(sample.exhausted)]);
+        digest.update((sample.current.pixels.len() as u64).to_le_bytes());
+        digest.update(&sample.current.pixels);
+        digest.update((sample.next.pixels.len() as u64).to_le_bytes());
+        digest.update(&sample.next.pixels);
+        state.training_content_hash = digest.finalize().into();
         bytes(
             &mut state.training_population_hash,
             &sample.seed.to_le_bytes(),
@@ -902,6 +986,23 @@ fn update_training_population(state: &mut TrainerState, samples: &[TransitionSam
         );
         state.training_population_rows += 1;
     }
+}
+
+fn option_bool_byte(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2108,12 +2209,69 @@ fn gradient_l2_all_parameters(grads: &GradStore, varmap: &VarMap) -> Result<f64>
     Ok(norm)
 }
 
+fn gradient_cosine_for_parameter_prefix(
+    left: &GradStore,
+    right: &GradStore,
+    varmap: &VarMap,
+    prefix: &str,
+) -> Result<f64> {
+    let data = varmap.data().lock().unwrap();
+    let mut dot: Option<Tensor> = None;
+    let mut left_sq: Option<Tensor> = None;
+    let mut right_sq: Option<Tensor> = None;
+    for (name, var) in data.iter().filter(|(name, _)| name.starts_with(prefix)) {
+        let tensor = var.as_tensor();
+        let (Some(left), Some(right)) = (left.get(tensor), right.get(tensor)) else {
+            continue;
+        };
+        let left = left.to_dtype(DType::F32)?;
+        let right = right.to_dtype(DType::F32)?;
+        let product = left.mul(&right)?.sum_all()?;
+        let l2 = left.sqr()?.sum_all()?;
+        let r2 = right.sqr()?.sum_all()?;
+        dot = Some(match dot {
+            None => product,
+            Some(value) => value.add(&product)?,
+        });
+        left_sq = Some(match left_sq {
+            None => l2,
+            Some(value) => value.add(&l2)?,
+        });
+        right_sq = Some(match right_sq {
+            None => r2,
+            Some(value) => value.add(&r2)?,
+        });
+        let _ = name;
+    }
+    let dot = dot
+        .ok_or_else(|| anyhow::anyhow!("no paired gradients found for parameter prefix {prefix}"))?
+        .to_scalar::<f32>()? as f64;
+    let left_norm = left_sq
+        .expect("paired gradients have left norm")
+        .sqrt()?
+        .to_scalar::<f32>()? as f64;
+    let right_norm = right_sq
+        .expect("paired gradients have right norm")
+        .sqrt()?
+        .to_scalar::<f32>()? as f64;
+    if !(dot.is_finite() && left_norm.is_finite() && right_norm.is_finite()) {
+        bail!("gradient cosine for {prefix} is not finite");
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return Ok(0.0);
+    }
+    Ok((dot / (left_norm * right_norm)).clamp(-1.0, 1.0))
+}
+
 #[derive(Debug, Clone)]
 pub struct LossBreakdown {
     pub total: Tensor,
     pub next_latent: Tensor,
     pub sigreg_raw: Tensor,
     pub sigreg_bounded: Tensor,
+    pub patch_grounding: Tensor,
+    pub grounding_changed_patches: usize,
+    pub grounding_unchanged_patches: usize,
     pub event: Tensor,
     pub q: Tensor,
     pub q_surprise: Tensor,
@@ -2142,6 +2300,7 @@ struct CheckedTrainingLosses {
     rollout: f32,
     sigreg_raw: f32,
     sigreg_bounded: f32,
+    patch_grounding: f32,
     event: f32,
     q: f32,
     prefix: f32,
@@ -2165,12 +2324,13 @@ fn training_loss_tensors(
     rollout: &Tensor,
     prefix_multi: &Tensor,
     total: &Tensor,
-) -> [Tensor; 24] {
+) -> [Tensor; 25] {
     [
         losses.next_latent.detach(),
         rollout.detach(),
         losses.sigreg_raw.detach(),
         losses.sigreg_bounded.detach(),
+        losses.patch_grounding.detach(),
         losses.event.detach(),
         losses.q.detach(),
         losses.q_surprise.detach(),
@@ -2194,12 +2354,13 @@ fn training_loss_tensors(
     ]
 }
 
-fn checked_training_losses(tensors: &[[Tensor; 24]]) -> Result<Vec<CheckedTrainingLosses>> {
-    const NAMES: [&str; 24] = [
+fn checked_training_losses(tensors: &[[Tensor; 25]]) -> Result<Vec<CheckedTrainingLosses>> {
+    const NAMES: [&str; 25] = [
         "next_latent",
         "rollout",
         "sigreg_raw",
         "sigreg_bounded",
+        "patch_grounding",
         "event",
         "q",
         "q_surprise",
@@ -2227,29 +2388,30 @@ fn checked_training_losses(tensors: &[[Tensor; 24]]) -> Result<Vec<CheckedTraini
         .collect::<Vec<_>>();
     let values = ensure_all_finite(&named)?;
     Ok(values
-        .chunks_exact(24)
+        .chunks_exact(25)
         .map(|values| CheckedTrainingLosses {
-            total: values[23],
+            total: values[24],
             next_latent: values[0],
             rollout: values[1],
             sigreg_raw: values[2],
             sigreg_bounded: values[3],
-            event: values[4],
-            q: values[5],
-            prefix: values[8],
-            reliability: values[10],
-            branch_total: values[11],
-            outcome_pull: values[12],
-            outcome_push: values[13],
-            action_recovery: values[14],
-            coordinate_recovery: values[15],
-            changed_margin: values[16],
-            spatial_variance: values[17],
-            spatial_covariance: values[18],
-            pooled_variance: values[19],
-            pooled_covariance: values[20],
-            displacement_variance: values[21],
-            displacement_covariance: values[22],
+            patch_grounding: values[4],
+            event: values[5],
+            q: values[6],
+            prefix: values[9],
+            reliability: values[11],
+            branch_total: values[12],
+            outcome_pull: values[13],
+            outcome_push: values[14],
+            action_recovery: values[15],
+            coordinate_recovery: values[16],
+            changed_margin: values[17],
+            spatial_variance: values[18],
+            spatial_covariance: values[19],
+            pooled_variance: values[20],
+            pooled_covariance: values[21],
+            displacement_variance: values[22],
+            displacement_covariance: values[23],
         })
         .collect())
 }
@@ -2603,6 +2765,18 @@ fn leworld_loss_with_sigreg_windows(
 
     let device = batch.frames.device();
     let zero = Tensor::zeros((), DType::F32, device)?;
+    let grounding = if cfg.patch_grounding_weight > 0.0 {
+        let samples = samples.ok_or_else(|| {
+            anyhow::anyhow!("patch grounding requires transition sample provenance")
+        })?;
+        model.patch_histogram_grounding_loss(&out.y, &next_z, samples)?
+    } else {
+        crate::p2::grounding::PatchGroundingLoss {
+            total: zero.clone(),
+            changed_patches: 0,
+            unchanged_patches: 0,
+        }
+    };
     let (sigreg_raw, sigreg_bounded) = if weights.sigreg == 0.0 {
         (zero.clone(), zero.clone())
     } else {
@@ -2702,6 +2876,7 @@ fn leworld_loss_with_sigreg_windows(
     let mut total = next_latent.clone();
     for (weight, loss) in [
         (weights.sigreg, &sigreg_bounded),
+        (cfg.patch_grounding_weight, &grounding.total),
         (weights.event, &event),
         (weights.q, &q),
         (weights.reliability, &reliability),
@@ -2748,6 +2923,9 @@ fn leworld_loss_with_sigreg_windows(
         next_latent,
         sigreg_raw,
         sigreg_bounded,
+        patch_grounding: grounding.total,
+        grounding_changed_patches: grounding.changed_patches,
+        grounding_unchanged_patches: grounding.unchanged_patches,
         event: event_raw,
         q: q_raw,
         q_surprise,
@@ -3435,6 +3613,12 @@ fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
         rollout: sums.rollout / n,
         sigreg_raw: sums.sigreg_raw / n,
         sigreg_bounded: sums.sigreg_bounded / n,
+        patch_grounding: sums.patch_grounding / n,
+        grounding_changed_patches: sums.grounding_changed_patches / n,
+        grounding_unchanged_patches: sums.grounding_unchanged_patches / n,
+        pre_clip_gradient_norm: sums.pre_clip_gradient_norm / n,
+        gradient_clip_scale: sums.gradient_clip_scale / n,
+        clipped_updates: sums.clipped_updates / n,
         event: sums.event / n,
         q: sums.q / n,
         prefix: sums.prefix / n,
@@ -3489,6 +3673,7 @@ fn build_report(
         weight_decay: cfg.weight_decay,
         parameter_count,
         training_population_fingerprint: format!("fnv1a64:{:016x}", state.training_population_hash),
+        training_content_fingerprint: format!("sha256:{}", hex_bytes(&state.training_content_hash)),
         training_population_rows: state.training_population_rows,
         device: cfg.device.clone(),
         lessons: state.completed_lessons.clone(),
@@ -3502,6 +3687,7 @@ fn build_report(
         config_path: cfg.output_dir.join("config.json"),
         profile: state.profile.clone(),
         gradient_pressure: state.gradient_pressure.clone(),
+        gradient_pressure_samples: state.gradient_pressure_samples.clone(),
         research_claim: false,
     }
 }
@@ -3556,7 +3742,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     let mut state = if let Some(bundle) = &resumed_from {
         load_training_checkpoint(bundle, cfg, &mut varmap, &mut optimizer)?
     } else {
-        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
         if cfg.world_core_v3 {
             zero_v3_spatial_residual(&varmap)?;
         }
@@ -3571,10 +3757,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             active_sums: LessonLossMeans::default(),
             parameter_names,
             training_population_hash: default_training_population_hash(),
+            training_content_hash: [0; 32],
             training_population_rows: 0,
             batch_schedule_migrations: Vec::new(),
             profile: ProfileState::Pending,
             gradient_pressure: None,
+            gradient_pressure_samples: Vec::new(),
         }
     };
     let mut latest_checkpoint = resumed_from.clone();
@@ -3896,31 +4084,45 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 micro_losses.branch_audit.displacement_population_rows as f64 * inv;
             step_metrics.unique_changed_outcomes +=
                 micro_losses.branch_audit.unique_changed_outcomes as f64 * inv;
-            let pressure_update = cfg.profile_update.saturating_sub(1).max(1);
-            if micro == 0
-                && state.gradient_pressure.is_none()
-                && state.global_step.saturating_add(1) == pressure_update
-                && (loss_weights.sigreg > 0.0
-                    || (loss_weights.q > 0.0 && !cfg.stop_grad_q_y)
-                    || cfg.branch_learning.displacement_health.is_some())
-            {
+            step_metrics.grounding_changed_patches +=
+                micro_losses.grounding_changed_patches as f64 * inv;
+            step_metrics.grounding_unchanged_patches +=
+                micro_losses.grounding_unchanged_patches as f64 * inv;
+            let pressure_update = state.global_step.saturating_add(1);
+            let pressure_scheduled = if cfg.pressure_updates.is_empty() {
+                pressure_update == cfg.profile_update.saturating_sub(1).max(1)
+                    && state.gradient_pressure_samples.is_empty()
+            } else {
+                cfg.pressure_updates.contains(&pressure_update)
+                    && !state
+                        .gradient_pressure_samples
+                        .iter()
+                        .any(|sample| sample.update == pressure_update)
+            };
+            if micro == 0 && pressure_scheduled {
                 // Read-only attribution: these stores are discarded before the
                 // normal total-loss backward and never reach the optimizer.
-                if loss_weights.sigreg > 0.0 || (loss_weights.q > 0.0 && !cfg.stop_grad_q_y) {
+                if loss_weights.sigreg > 0.0
+                    || cfg.patch_grounding_weight > 0.0
+                    || (loss_weights.q > 0.0 && !cfg.stop_grad_q_y)
+                    || cfg.branch_learning.displacement_health.is_none()
+                {
                     let next_grads = micro_losses.next_latent.backward()?;
                     let next_norm =
                         gradient_l2_for_parameter_prefix(&next_grads, &varmap, "encoder.")?;
-                    drop(next_grads);
-                    let sigreg_norm = if loss_weights.sigreg > 0.0 {
+                    let (sigreg_norm, sigreg_grads) = if loss_weights.sigreg > 0.0 {
                         let grads = micro_losses
                             .sigreg_bounded
                             .affine(loss_weights.sigreg, 0.0)?
                             .backward()?;
-                        Some(gradient_l2_for_parameter_prefix(
-                            &grads, &varmap, "encoder.",
-                        )?)
+                        (
+                            Some(gradient_l2_for_parameter_prefix(
+                                &grads, &varmap, "encoder.",
+                            )?),
+                            Some(grads),
+                        )
                     } else {
-                        None
+                        (None, None)
                     };
                     let readout_norm = if loss_weights.q > 0.0 && !cfg.stop_grad_q_y {
                         let combined_readout = micro_losses
@@ -3934,13 +4136,72 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     } else {
                         None
                     };
-                    state.gradient_pressure = Some(GradientPressureDiagnostics {
+                    let (grounding_norm, grounding_head_norm, grounding_grads) =
+                        if cfg.patch_grounding_weight > 0.0 {
+                            let grads = micro_losses
+                                .patch_grounding
+                                .affine(cfg.patch_grounding_weight, 0.0)?
+                                .backward()?;
+                            (
+                                Some(gradient_l2_for_parameter_prefix(
+                                    &grads, &varmap, "encoder.",
+                                )?),
+                                Some(gradient_l2_for_parameter_prefix(
+                                    &grads,
+                                    &varmap,
+                                    "grounding_head.",
+                                )?),
+                                Some(grads),
+                            )
+                        } else {
+                            (None, None, None)
+                        };
+                    let sigreg_next_cosine = sigreg_grads
+                        .as_ref()
+                        .map(|grads| {
+                            gradient_cosine_for_parameter_prefix(
+                                grads,
+                                &next_grads,
+                                &varmap,
+                                "encoder.",
+                            )
+                        })
+                        .transpose()?;
+                    let grounding_next_cosine = grounding_grads
+                        .as_ref()
+                        .map(|grads| {
+                            gradient_cosine_for_parameter_prefix(
+                                grads,
+                                &next_grads,
+                                &varmap,
+                                "encoder.",
+                            )
+                        })
+                        .transpose()?;
+                    let grounding_sigreg_cosine = grounding_grads
+                        .as_ref()
+                        .zip(sigreg_grads.as_ref())
+                        .map(|(grounding, sigreg)| {
+                            gradient_cosine_for_parameter_prefix(
+                                grounding, sigreg, &varmap, "encoder.",
+                            )
+                        })
+                        .transpose()?;
+                    let diagnostic = GradientPressureDiagnostics {
                         update: pressure_update,
                         encoder_next_latent_l2: next_norm,
                         encoder_sigreg_weighted_l2: sigreg_norm.unwrap_or(0.0),
                         sigreg_to_next_ratio: sigreg_norm
                             .filter(|_| next_norm > 0.0)
                             .map(|norm| norm / next_norm),
+                        encoder_grounding_weighted_l2: grounding_norm,
+                        grounding_to_next_ratio: grounding_norm
+                            .filter(|_| next_norm > 0.0)
+                            .map(|norm| norm / next_norm),
+                        grounding_head_weighted_l2: grounding_head_norm,
+                        sigreg_next_cosine,
+                        grounding_next_cosine,
+                        grounding_sigreg_cosine,
                         encoder_readout_weighted_l2: readout_norm,
                         readout_to_next_ratio: readout_norm
                             .filter(|_| next_norm > 0.0)
@@ -3948,7 +4209,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         model_next_latent_l2: None,
                         displacement_health_weighted_l2: None,
                         displacement_health_to_next_ratio: None,
-                    });
+                    };
+                    state.gradient_pressure = Some(diagnostic.clone());
+                    state.gradient_pressure_samples.push(diagnostic);
                 } else if let Some(health) = cfg.branch_learning.displacement_health {
                     let next_grads = micro_losses.next_latent.backward()?;
                     let next_norm = gradient_l2_all_parameters(&next_grads, &varmap)?;
@@ -3963,18 +4226,26 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                         )?;
                     let health_grads = weighted_health.backward()?;
                     let health_norm = gradient_l2_all_parameters(&health_grads, &varmap)?;
-                    state.gradient_pressure = Some(GradientPressureDiagnostics {
+                    let diagnostic = GradientPressureDiagnostics {
                         update: pressure_update,
                         encoder_next_latent_l2: 0.0,
                         encoder_sigreg_weighted_l2: 0.0,
                         sigreg_to_next_ratio: None,
+                        encoder_grounding_weighted_l2: None,
+                        grounding_to_next_ratio: None,
+                        grounding_head_weighted_l2: None,
+                        sigreg_next_cosine: None,
+                        grounding_next_cosine: None,
+                        grounding_sigreg_cosine: None,
                         encoder_readout_weighted_l2: None,
                         readout_to_next_ratio: None,
                         model_next_latent_l2: Some(next_norm),
                         displacement_health_weighted_l2: Some(health_norm),
                         displacement_health_to_next_ratio: (next_norm > 0.0)
                             .then_some(health_norm / next_norm),
-                    });
+                    };
+                    state.gradient_pressure = Some(diagnostic.clone());
+                    state.gradient_pressure_samples.push(diagnostic);
                 }
             }
             let scaled_micro = micro_total.affine(inv, 0.0)?;
@@ -4003,6 +4274,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             step_metrics.rollout += micro_vals.rollout as f64 * inv;
             step_metrics.sigreg_raw += micro_vals.sigreg_raw as f64 * inv;
             step_metrics.sigreg_bounded += micro_vals.sigreg_bounded as f64 * inv;
+            step_metrics.patch_grounding += micro_vals.patch_grounding as f64 * inv;
             step_metrics.event += micro_vals.event as f64 * inv;
             step_metrics.q += micro_vals.q as f64 * inv;
             step_metrics.prefix += micro_vals.prefix as f64 * inv;
@@ -4022,7 +4294,10 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
         let mut grads = accumulated_grads
             .ok_or_else(|| anyhow::anyhow!("grad_accum produced no microbatches"))?;
-        clip_gradients_gpu(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        let clip_stats = clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        step_metrics.pre_clip_gradient_norm = clip_stats.pre_clip_norm;
+        step_metrics.gradient_clip_scale = clip_stats.scale;
+        step_metrics.clipped_updates = f64::from(clip_stats.scale < 1.0);
         if cg_profile.active() {
             let _cg =
                 cg_profile.phase("gradients", SpanKind::Module, Some(ExecutionStep::Backward));
@@ -4050,6 +4325,14 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 state.active_sums.rollout += step_metrics.rollout;
                 state.active_sums.sigreg_raw += step_metrics.sigreg_raw;
                 state.active_sums.sigreg_bounded += step_metrics.sigreg_bounded;
+                state.active_sums.patch_grounding += step_metrics.patch_grounding;
+                state.active_sums.grounding_changed_patches +=
+                    step_metrics.grounding_changed_patches;
+                state.active_sums.grounding_unchanged_patches +=
+                    step_metrics.grounding_unchanged_patches;
+                state.active_sums.pre_clip_gradient_norm += step_metrics.pre_clip_gradient_norm;
+                state.active_sums.gradient_clip_scale += step_metrics.gradient_clip_scale;
+                state.active_sums.clipped_updates += step_metrics.clipped_updates;
                 state.active_sums.event += step_metrics.event;
                 state.active_sums.q += step_metrics.q;
                 state.active_sums.prefix += step_metrics.prefix;
@@ -5048,7 +5331,7 @@ mod tests {
         let before = leworld_loss(&model, &batch, &cfg, depth, cfg.seed, weights)?;
         let v0 = ensure_finite("before", &before.total)?;
         let mut grads = before.total.backward()?;
-        clip_gradients_gpu(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        crate::p2::optimizer::clip_gradients_gpu(&mut grads, &varmap, MAX_GRAD_NORM)?;
         opt.step(&grads)?;
         let after = leworld_loss(
             &model,
@@ -5466,6 +5749,9 @@ mod tests {
             next_latent: zero.clone(),
             sigreg_raw: zero.clone(),
             sigreg_bounded: zero.clone(),
+            patch_grounding: zero.clone(),
+            grounding_changed_patches: 0,
+            grounding_unchanged_patches: 0,
             event: zero.clone(),
             q: zero.clone(),
             q_surprise: zero.clone(),
@@ -5759,6 +6045,7 @@ mod tests {
             weight_decay: 0.01,
             parameter_count: 10,
             training_population_fingerprint: "fnv1a64:0000000000000000".into(),
+            training_content_fingerprint: "sha256:00".into(),
             training_population_rows: 0,
             device: "cpu".into(),
             lessons: vec![],
@@ -5772,6 +6059,7 @@ mod tests {
             config_path: PathBuf::from("c.json"),
             profile: ProfileState::Pending,
             gradient_pressure: None,
+            gradient_pressure_samples: vec![],
             research_claim: false,
         };
         let s = serde_json::to_string(&report)?;

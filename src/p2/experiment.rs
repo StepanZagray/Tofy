@@ -103,6 +103,8 @@ pub struct ResolvedExperiment {
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
     pub sigreg: SigregDefinition,
+    #[serde(default)]
+    pub patch_grounding_weight: f64,
     pub factual_learning: bool,
     pub report_schema: String,
 }
@@ -125,6 +127,7 @@ impl Default for ResolvedExperiment {
                 legacy_loss_projector: false,
                 projector_dim: 128,
             },
+            patch_grounding_weight: 0.0,
             factual_learning: false,
             report_schema: LEGACY_SCHEMA.into(),
         }
@@ -142,6 +145,7 @@ pub struct ExperimentRequest<'a> {
     pub branch_learning_enabled: bool,
     pub displacement_health_enabled: bool,
     pub sigreg_weight: f64,
+    pub patch_grounding_weight: f64,
     pub sigreg_statistic: SigregStatistic,
     pub sigreg_population: SigregPopulation,
     pub sigreg_temporal_window: usize,
@@ -267,6 +271,7 @@ impl ResolvedExperiment {
                 legacy_loss_projector: request.sigreg_projector,
                 projector_dim: request.sigreg_projector_dim,
             },
+            patch_grounding_weight: request.patch_grounding_weight,
             factual_learning,
             report_schema: family.schema().into(),
         })
@@ -288,6 +293,7 @@ mod tests {
             branch_learning_enabled: false,
             displacement_health_enabled: false,
             sigreg_weight: 0.003,
+            patch_grounding_weight: 0.0,
             sigreg_statistic: SigregStatistic::EppsPulley,
             sigreg_population: SigregPopulation::Marginal,
             sigreg_temporal_window: 8,

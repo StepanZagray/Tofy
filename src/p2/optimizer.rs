@@ -275,6 +275,21 @@ pub fn accumulate_parameter_gradients(
 
 /// GPU-side global L2 gradient clip (no host download of full grad vectors).
 pub fn clip_gradients_gpu(grads: &mut GradStore, varmap: &VarMap, max_norm: f64) -> Result<()> {
+    clip_gradients_gpu_with_stats(grads, varmap, max_norm).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientClipStats {
+    pub pre_clip_norm: f64,
+    pub scale: f64,
+}
+
+/// Clip gradients and expose the global scale that mediates treatment effects.
+pub fn clip_gradients_gpu_with_stats(
+    grads: &mut GradStore,
+    varmap: &VarMap,
+    max_norm: f64,
+) -> Result<GradientClipStats> {
     let mut sum_sq: Option<Tensor> = None;
     for var in varmap.all_vars() {
         let t = var.as_tensor();
@@ -287,14 +302,20 @@ pub fn clip_gradients_gpu(grads: &mut GradStore, varmap: &VarMap, max_norm: f64)
         }
     }
     let Some(sum_sq) = sum_sq else {
-        return Ok(());
+        return Ok(GradientClipStats {
+            pre_clip_norm: 0.0,
+            scale: 1.0,
+        });
     };
     let norm = sum_sq.sqrt()?.to_scalar::<f32>()? as f64;
     if !norm.is_finite() {
         bail!("gradient norm is not finite: {norm}");
     }
     if norm <= max_norm {
-        return Ok(());
+        return Ok(GradientClipStats {
+            pre_clip_norm: norm,
+            scale: 1.0,
+        });
     }
     let scale = max_norm / norm;
     for var in varmap.all_vars() {
@@ -303,7 +324,10 @@ pub fn clip_gradients_gpu(grads: &mut GradStore, varmap: &VarMap, max_norm: f64)
             grads.insert(t, g.affine(scale, 0.0)?);
         }
     }
-    Ok(())
+    Ok(GradientClipStats {
+        pre_clip_norm: norm,
+        scale,
+    })
 }
 
 #[cfg(test)]

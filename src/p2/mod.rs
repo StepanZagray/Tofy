@@ -11,6 +11,7 @@ pub mod consumer_transition;
 pub mod data;
 pub mod eval;
 pub mod experiment;
+pub mod grounding;
 pub mod model;
 pub mod muon;
 pub mod optimizer;

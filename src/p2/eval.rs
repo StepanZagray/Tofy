@@ -4921,6 +4921,7 @@ mod tests {
             weight_decay: train_cfg.weight_decay,
             parameter_count: 1,
             training_population_fingerprint: "fnv1a64:0000000000000000".into(),
+            training_content_fingerprint: "sha256:00".into(),
             training_population_rows: 0,
             device: "cpu".into(),
             lessons: vec![],
@@ -4934,6 +4935,7 @@ mod tests {
             config_path: dir.join("config.json"),
             profile: crate::p2::cg_profile::ProfileState::Pending,
             gradient_pressure: None,
+            gradient_pressure_samples: vec![],
             research_claim: false,
         };
         save_checkpoint(&varmap, &train_cfg, &report)?;

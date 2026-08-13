@@ -53,6 +53,15 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 0.003)]
     pub sigreg_weight: f64,
 
+    /// Weight for the shared 8x8-patch colour-histogram grounding objective.
+    #[arg(long, default_value_t = 0.0)]
+    pub patch_grounding_weight: f64,
+
+    /// Model initialization seed; defaults to `seed`. Calibration uses a fixed
+    /// init seed while varying data seeds across read-only one-update probes.
+    #[arg(long)]
+    pub init_seed: Option<u64>,
+
     #[arg(long, default_value_t = 0.1)]
     pub event_weight: f64,
 
@@ -103,6 +112,10 @@ pub struct P2TrainArgs {
     /// One-based optimizer update captured as a candle-graph evidence bundle.
     #[arg(long, default_value_t = 2)]
     pub profile_update: u64,
+
+    /// One-based optimizer updates for read-only loss-gradient pressure probes.
+    #[arg(long, value_delimiter = ',')]
+    pub pressure_updates: Vec<u64>,
 
     /// PTRM ranking loss cadence (`1` = every step, `0` = disabled).
     #[arg(long, default_value_t = 4)]
@@ -309,6 +322,8 @@ impl P2TrainArgs {
             sigreg_projections: self.sigreg_projections,
             sigreg_knots: self.sigreg_knots,
             sigreg_weight: self.sigreg_weight,
+            patch_grounding_weight: self.patch_grounding_weight,
+            init_seed: self.init_seed,
             event_weight: self.event_weight,
             q_weight: self.q_weight,
             rollout_weight: self.rollout_weight,
@@ -324,6 +339,7 @@ impl P2TrainArgs {
             checkpoint_every_steps: self.checkpoint_every_steps,
             max_steps_this_run: self.max_steps_this_run,
             profile_update: self.profile_update,
+            pressure_updates: self.pressure_updates.clone(),
             ptrm_rank_every: self.ptrm_rank_every,
             randomize_depth: self.randomize_depth,
             steady_gpu: self.steady_gpu,
