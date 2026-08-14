@@ -3704,7 +3704,7 @@ fn build_report(
 
 fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport) -> Result<()> {
     save_checkpoint(varmap, cfg, report)?;
-    let _ = report;
+    crate::p2::evidence::publish_training_evidence(&cfg.output_dir, report)?;
     Ok(())
 }
 
@@ -3854,6 +3854,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             state: &state.profile,
             output_dir: &cfg.output_dir,
             device: &cfg.device,
+            measured_region_device_synchronized: device.is_cuda(),
             lesson,
             physical_batch: cfg.physical_batch,
             grad_accum: cfg.grad_accum,

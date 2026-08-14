@@ -6,7 +6,16 @@ other update.
 
 ## Artifact bundle
 
-The default update 2 publishes atomically under:
+Every completed or paused run publishes `OUTPUT/evidence_manifest.json`
+(`tofy/p2/evidence/1`) as the run-level entry point. It records comparison invariants and treatment,
+terminal state, source/binary provenance, a digest of ordered gradient-pressure samples, and
+SHA-256/byte-length bindings for the exported model, exact resume checkpoint, config, report, and
+immutable representative trace. Run-owned paths are relative, so the bundle remains relocatable.
+The manifest excludes itself and excludes derived profile reports and optional Nsight output,
+because the Nsight wrapper can regenerate those after training; they remain reproducible from the
+bound trace and explicitly listed profile paths in `train_report.json`.
+
+The default update 2 profile publishes atomically under:
 
 ```text
 OUTPUT/profile/update-000000000002/
@@ -23,15 +32,17 @@ OUTPUT/profile/update-000000000002/
 The root measured region is device-synchronized once before and once after the complete update.
 Generation, staging, forward, backward, gradient inspection, optimizer, and metrics retain typed
 semantic spans; the trace therefore uses `timing_mode=host` and records
-`root_device_synchronized=true`, rather than overstating every nested duration as synchronized.
+`measured_region_device_synchronized=true`, rather than overstating every nested duration as
+synchronized. This flag is derived from the resolved Candle device, not from its display label.
 Nsight supplies kernel durations. Gradient norms use one batched device read. Batch frames, loss storage, and every
 parameter gradient are captured. Tensor metadata is not misrepresented as allocation lifetime.
 
 ## Agent workflow
 
-Start with the bounded packet, not raw JSONL:
+Start with the run manifest, then the bounded packet—not raw JSONL:
 
 ```bash
+sed -n '1,240p' runs/p2/example/evidence_manifest.json
 sed -n '1,220p' runs/p2/example/profile/update-000000000002/EVIDENCE.md
 cargo candle-graph summary runs/p2/example/profile/update-000000000002/application.jsonl
 cargo candle-graph query runs/p2/example/profile/update-000000000002/application.jsonl --kind gradients

@@ -10,6 +10,7 @@ pub mod consumer_readout;
 pub mod consumer_transition;
 pub mod data;
 pub mod eval;
+pub(crate) mod evidence;
 pub mod experiment;
 pub mod grounding;
 pub mod model;

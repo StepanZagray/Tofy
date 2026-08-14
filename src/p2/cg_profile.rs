@@ -51,6 +51,7 @@ pub struct CaptureSpec<'a> {
     pub state: &'a ProfileState,
     pub output_dir: &'a Path,
     pub device: &'a str,
+    pub measured_region_device_synchronized: bool,
     pub lesson: &'a str,
     pub physical_batch: usize,
     pub grad_accum: usize,
@@ -103,11 +104,10 @@ impl RepresentativeUpdateCapture {
             .tag("hidden_dim", spec.hidden_dim.to_string())
             .tag("inner_steps", spec.inner_steps.to_string())
             .tag("outer_steps", spec.outer_steps.to_string())
-            .tag("precision", spec.precision)
-            .tag(
-                "root_device_synchronized",
-                spec.device.starts_with("cuda").to_string(),
-            );
+            .tag("precision", spec.precision);
+        if spec.measured_region_device_synchronized {
+            run = run.measured_region_device_synchronized();
+        }
         if let Ok(revision) = std::env::var("TOFY_SOURCE_REVISION") {
             run = run.tag("source_revision", revision);
         }
@@ -275,6 +275,7 @@ mod tests {
             state: &pending,
             output_dir: &dir,
             device: "cpu",
+            measured_region_device_synchronized: false,
             lesson: "dynamics",
             physical_batch: 2,
             grad_accum: 1,
