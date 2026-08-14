@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA: &str = "p2.semantic_access.fixed_coarse.v1";
 pub const POPULATION_SEED: u64 = 424_244;
 pub const SYNTHETIC_EPISODES: usize = 64;
-const FEATURE_WIDTH: usize = 64;
+const FEATURE_WIDTH: usize = 256;
 const INPUTS_PER_FEATURE: usize = 8;
 const FEATURE_SEEDS: [u64; 3] = [
     0x000f_4958_4544_0001,
@@ -34,6 +34,7 @@ const PARAMETER_CAP: usize = 100_000;
 const CONTROL_MSE_CEILING: f64 = 0.04;
 const CONTROL_MIN_REDUCTION: f64 = 0.90;
 const CONTROL_MIN_ABSOLUTE_IMPROVEMENT: f64 = 0.01;
+const CONTROL_INTERACTION_SCALE: f32 = 32.0;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -64,6 +65,7 @@ pub struct Protocol {
     pub observable_control_mse_ceiling: f64,
     pub observable_control_min_fractional_reduction: f64,
     pub observable_control_min_absolute_improvement: f64,
+    pub observable_control_interaction_scale: f64,
     pub model_weights_frozen: bool,
     pub optimizer_used: bool,
     pub inferential_claims_enabled: bool,
@@ -484,6 +486,7 @@ pub fn run(cfg: &Config) -> Result<Report> {
             observable_control_mse_ceiling: CONTROL_MSE_CEILING,
             observable_control_min_fractional_reduction: CONTROL_MIN_REDUCTION,
             observable_control_min_absolute_improvement: CONTROL_MIN_ABSOLUTE_IMPROVEMENT,
+            observable_control_interaction_scale: f64::from(CONTROL_INTERACTION_SCALE),
             model_weights_frozen: true,
             optimizer_used: false,
             inferential_claims_enabled: false,
@@ -639,7 +642,7 @@ fn qualify_same_path(
             for (channel, value) in row.iter_mut().enumerate().skip(PALETTE_SIZE) {
                 *value = if channel.is_multiple_of(2) { u } else { v };
             }
-            control_targets[index][0] += 8.0 * u * v;
+            control_targets[index][0] += CONTROL_INTERACTION_SCALE * u * v;
             row
         })
         .collect::<Vec<_>>();
@@ -1250,7 +1253,7 @@ mod tests {
     #[test]
     fn local_and_contextual_have_equal_evaluator_capacity() {
         assert_eq!(learned_parameter_count(128), learned_parameter_count(128));
-        assert_eq!(fixed_nonzero_coefficient_count(), 1_728);
+        assert_eq!(fixed_nonzero_coefficient_count(), 6_912);
         assert!(learned_parameter_count(128) + fixed_nonzero_coefficient_count() < PARAMETER_CAP);
     }
 
@@ -1277,7 +1280,7 @@ mod tests {
                 .map(|channel| if channel.is_multiple_of(2) { u } else { v })
                 .collect::<Vec<_>>();
             let mut target = [0.0; PALETTE_SIZE];
-            target[0] = 8.0 * u * v;
+            target[0] = CONTROL_INTERACTION_SCALE * u * v;
             features.push(row);
             targets.push(target);
         }

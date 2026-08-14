@@ -603,10 +603,19 @@ therefore did not access the final scoring partition. This is evidence that the 
 MLP selector remains a measurement bottleneck, not evidence that the corresponding model
 representations lack the coarse target.
 
-The next campaign replaces only that learned selector with a deterministic evaluator:
-a fixed 64-wide sparse signed-ReLU map at each of three sealed seeds, a closed-form ridge
+The initial fixed-map control calibration ran at revision
+`d445b9ff9b35850db75bb59245d96ef5f4de3802`, binary SHA-256
+`9fcb16e17f6050b335f3680a54b5d4657407423e6c64ce2bde4d9d3233a58c0b`, under
+`runs/p2/semantic-access-fixed-coarse-20260814T130337Z`. All artifacts verify and
+no final score was accessed. Its deterministic results were identical on all six arms:
+the 64-wide map reduced control error by 89.0% locally and 77.1% contextually, below the
+sealed 90% gate, while the original absolute-improvement threshold exceeded the control's
+entire ridge error. This is a negative evaluator-calibration result, not a model result.
+
+The resealed campaign replaces only that learned selector with a deterministic evaluator:
+a fixed 256-wide sparse signed-ReLU map at each of three sealed seeds, a closed-form ridge
 readout per seed, and an arithmetic mean of predictions with no seed selection. Local and
-contextual families have the same 5,184 learned coefficients (and 1,728 fixed nonzero map
+contextual families have the same 14,400 learned coefficients (and 6,912 fixed nonzero map
 coefficients), while contextual projection compute remains larger because its input is 3x
 wider. Tofy weights are frozen and no optimizer is used. The same B1b population fingerprint,
 episode-disjoint split, six counterbalanced arms, local/contextual families, target/predicted
@@ -614,7 +623,10 @@ fits, transfer seam, all-arm qualification gate, and one-shot final policy are r
 This isolates whether B1b's result was caused by optimizer/patience censoring. It does not
 test whether this decoder is optimal, and it cannot by itself support a model-level claim.
 
-The final invocation is bound to the exact selection-report SHA-256. The nonlinear control
+Only the model-independent control was used to recalibrate: width increases from 64 to 256,
+and its interaction scale increases from 8 to 32 so the unchanged absolute threshold is
+measurable. No real-route or final metric was observed. The final invocation is bound to the
+exact selection-report SHA-256. The nonlinear control
 coordinates are derived from row-local observable content rather than global row order. All
 three seeds and the ensemble must remain finite; the aggregate control must meet the sealed
 MSE and improvement thresholds. If any arm fails qualification, no final invocation begins.

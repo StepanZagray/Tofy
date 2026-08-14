@@ -81,7 +81,7 @@ jq -nc --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg git_sha "$git_sha" \
     previous_root_manifest_sha256:$previous_manifest_sha,expected_population_fingerprint:$fingerprint,
     gpu_name:$gpu,arms:["S0G0","ScalG0","ScurG0","S0G1","ScalG1","ScurG1"],
     frozen_protocol:{population_seed:424244,episodes_per_source:64,physical_batch:256,
-      feature_map:"rand-0.9_chacha8_seeded_sparse_signed_relu_v1_with_fixed_bias",feature_width:64,
+      feature_map:"rand-0.9_chacha8_seeded_sparse_signed_relu_v1_with_fixed_bias",feature_width:256,
       inputs_per_feature:8,feature_seeds:[4302768118693889,4302768118693890,4302768118693891],
       seed_aggregation:"arithmetic_mean_predictions_no_seed_selection",ridge:0.01,
       model_weights_frozen:true,optimizer_used:false,
@@ -109,12 +109,13 @@ validate_report() {
     and .population_seed==424244 and .synthetic_episodes_per_source==64
     and .population_fingerprint==$fingerprint and (.target_latents_sha256|test("^sha256:[0-9a-f]{64}$"))
     and (.predicted_latents_sha256|test("^sha256:[0-9a-f]{64}$"))
-    and .protocol.physical_batch==256 and .protocol.feature_width==64
+    and .protocol.physical_batch==256 and .protocol.feature_width==256
     and .protocol.inputs_per_feature==8
     and .protocol.feature_seeds==[4302768118693889,4302768118693890,4302768118693891]
     and .protocol.seed_aggregation=="arithmetic_mean_predictions_no_seed_selection"
-    and .protocol.ridge==0.01 and .protocol.learned_parameter_count_per_family==5184
-    and .protocol.fixed_nonzero_coefficient_count_per_family==1728
+    and .protocol.ridge==0.01 and .protocol.learned_parameter_count_per_family==14400
+    and .protocol.fixed_nonzero_coefficient_count_per_family==6912
+    and .protocol.observable_control_interaction_scale==32
     and .protocol.model_weights_frozen==true and .protocol.optimizer_used==false
     and .protocol.inferential_claims_enabled==false and .model_weights_updated==false
     and .final_partition_used_for_decoder_selection==false and .model_level_conclusion_permitted==false
@@ -122,8 +123,8 @@ validate_report() {
     and (.families|length)==2
     and ([.families[].name]|sort)==["contextual_3x3_global","local"]
     and ([.families[].input_dim]|sort)==[128,384]
-    and ([.families[].learned_parameter_count]|all(.==5184))
-    and ([.families[].fixed_nonzero_coefficient_count]|all(.==1728))
+    and ([.families[].learned_parameter_count]|all(.==14400))
+    and ([.families[].fixed_nonzero_coefficient_count]|all(.==6912))
     and ([.families[].qualification.per_seed|length]|all(.==3))
     and ([.families[].qualification.per_seed[].feature_map_sha256]|all(test("^sha256:[0-9a-f]{64}$")))
     and ([.families[]|if .qualification.passed then (.route_selection_diagnostics|length)==2
