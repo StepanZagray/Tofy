@@ -655,6 +655,42 @@ P2_SEMANTIC_EVAL_BATCH=256 \
 bash scripts/p2_semantic_access_fixed_campaign.sh
 ```
 
+V3 ran at revision `6c4f24d702c943df2d54530be8189cdc7c11f47d` under
+`runs/p2/semantic-access-fixed-coarse-v3-20260814T131829Z`. All six arms passed
+the deterministic control and completed selection, but the first final invocation
+failed exact selection replay before scoring. V3 is therefore selection-only and its
+consumed final population is excluded.
+
+The repaired V4 campaign completed at revision
+`403eff1d8fef8aca09dfec0580f4b3e167344947`, binary SHA-256
+`472d88fab4dd10551ae0450114355e3daa5c6922e5cde4f7dd2ca665a9304d78`, under
+`runs/p2/semantic-access-fixed-coarse-v4-20260814T144249Z`. Root, external-input,
+selection, and per-arm manifests verify. Primary and replay selection reports and
+fitted states are byte-identical for all six arms. Six sealed final reports cover
+`S0G1` and `ScurG1` on fresh paired population seeds 424245--424247, each with 1,408
+frames and 90,112 patch rows; final data were not used to select or fit the evaluator.
+
+The preregistered episode-macro result is a strong checkpoint-conditional negative for
+adding current SIGReg (`0.003` versus `0.0`) at fixed G1, training seed 1, and update 500.
+Relative to `S0G1`, `ScurG1` MSE is `60.20x` worse for the primary local true-next
+route, `9.70x` worse after a predicted-latent-specific refit,
+and `3.62x` worse when transferring the target fit to predicted latents. The two
+contextual within-domain ratios are also adverse (`34.64x` true-next and `10.53x`
+predicted refit). These orderings hold on all 966 paired seed-episodes. Contextual
+target-to-predicted transfer reverses (`0.250x`), but the nonlinear evaluator makes
+`S0G1` dramatically worse than its own ridge baseline on that cross-domain route;
+it is treated as transfer-distribution-shift evidence, not a `ScurG1` advantage.
+
+This frozen audit trained no Tofy weights. It covers one training initialization at
+update 500, while the three seeds resample only evaluation populations. It supports a
+descriptive simple effect of the tested SIGReg setting at G1, not training-seed,
+checkpoint-time, mechanism-level, or model-level generalization. In particular, 100%
+clipping in the nonzero-SIGReg parent arms is a plausible optimization mediator. The next
+frozen test is a sealed, coordinate-aware exact-cell sentinel with new selection/final
+seeds and the same three
+representation routes; only after that sentinel should a multi-training-seed,
+pressure-controlled SIGReg experiment be considered.
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
