@@ -22,11 +22,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: &str = "p2.semantic_access.v1_1_stage_b1";
+pub const SCHEMA: &str = "p2.semantic_access.v1_1_stage_b1b";
 pub const POPULATION_SEED: u64 = 424_244;
 pub const SYNTHETIC_EPISODES: usize = 64;
 const HIDDEN: usize = 64;
-const MAX_STEPS: usize = 1_200;
+const MAX_STEPS: usize = 4_800;
 const EVAL_EVERY: usize = 25;
 const PATIENCE_EVALS: usize = 8;
 const LEARNING_RATE: f64 = 1e-3;

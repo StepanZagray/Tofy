@@ -552,6 +552,47 @@ P2_SEMANTIC_PERMUTATIONS=39 \
 bash scripts/p2_semantic_access_campaign.sh
 ```
 
+### Semantic Access V1.1 Stage B1 selector calibration (2026-08-14)
+
+Stage B1 completed selection-only on the A40 at revision
+`05a51f54b00fac1ede6cde4483f3be062bf74e6c`, binary SHA-256
+`d8136923064bbfb7aa96c111c7ff81d307507fee9c8582d3a153b494d8f27ebe`,
+under `runs/p2/semantic-access-v1_1-stage-b1-20260814T110814Z`. All 22 campaign
+artifacts verify. The fresh population fingerprint was
+`sha256:b3eb7968bcb9da8e7d97403e87f6492b2f545e9f3b28336b323e03ae3c207f42`.
+All 12 same-path nonlinear controls qualified at step 150, with local and contextual
+selection MSE `0.03893` and `0.03151` (93.0% and 94.3% reductions). This repairs the
+V1 calibration ambiguity: the registered residual-MLP fitting path can learn a known
+nonlinear observable.
+
+The real route selectors were budget-censored. Only the `S0G1` contextual target fit
+converged before the 1,200-step cap (selected step 275, stopped step 475). The other
+23 fits did not meet the predeclared plateau rule; most semantic-pressure fits still
+improved by roughly 5--9% over their final 200 optimizer steps. The global fail-closed
+gate therefore recorded `selector_invalid_no_final_partition_scored`; no final row was
+scored and no seam or model-level result is claimed. The negative result is about the
+selector budget, not semantic accessibility.
+
+Stage B1b changes only the maximum decoder budget from 1,200 to 4,800 optimizer steps.
+It preserves the frozen model/population/splits, decoder architecture, AdamW schedule,
+physical evaluation batch `256`, decoder batch `4096`, accumulation `1`, minibatch order,
+25-step evaluation cadence, eight-evaluation patience, controls, and all-six-arm gate.
+This post-B1 calibration uses only the selection partition; the final partition remains
+sealed until every B1b selector converges.
+
+```bash
+TOFY_BIN=/workspace/Personal/Tofy/target/semantic-access-v1_1-stage-b1b/release/tofy \
+P2_AUDIT_PARENT_ROOT=/workspace/Personal/Tofy/runs/p2/pressure-grounding-v1-20260813T200848Z \
+P2_PREVIOUS_SEMANTIC_ROOT=/workspace/Personal/Tofy/runs/p2/semantic-access-v1-20260814T092508Z \
+P2_SEMANTIC_V11_ROOT=/workspace/Personal/Tofy/runs/p2/semantic-access-v1_1-stage-b1b-<UTC> \
+P2_EXPECTED_SHA=<reviewed-b1b-commit> \
+P2_EXPECTED_BINARY_SHA=<reviewed-b1b-binary-sha256> \
+P2_EXPECTED_PARENT_SHA=ccc87452a0a0cac4dd9358bc689a2d3d85691b6b \
+P2_EXPECTED_PARENT_BINARY_SHA=cb1e7bded0da2fcfc645521283251db4e8fa3477eec2f57429365c88b9dacfec \
+P2_SEMANTIC_EVAL_BATCH=256 \
+bash scripts/p2_semantic_access_v11_campaign.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**

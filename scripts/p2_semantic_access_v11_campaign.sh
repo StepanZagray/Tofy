@@ -81,14 +81,14 @@ jq -nc --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg git_sha "$git_sha" \
   --arg parent_binary_sha "$P2_EXPECTED_PARENT_BINARY_SHA" --arg gpu "${gpu_names[0]}" \
   --arg previous "$previous_fingerprint" --arg previous_root "$previous_root" \
   --argjson eval_batch "$eval_batch" \
-  '{schema:"p2.semantic_access_campaign.v1_1_stage_b1",status:"running",started_utc:$started,
+  '{schema:"p2.semantic_access_campaign.v1_1_stage_b1b",status:"running",started_utc:$started,
     git_sha:$git_sha,binary_sha256:$binary_sha,parent_root:$parent_root,parent_git_sha:$parent_sha,
     parent_binary_sha256:$parent_binary_sha,
     gpu_name:$gpu,arms:["S0G0","ScalG0","ScurG0","S0G1","ScalG1","ScurG1"],
     previous_semantic_root:$previous_root,previous_population_fingerprint:$previous,
     frozen_protocol:{checkpoint_update:500,population_seed:424244,episodes_per_source:64,
       physical_batch:$eval_batch,decoder_batch:4096,decoder_gradient_accumulation:1,decoder_hidden:64,
-      max_optimizer_steps:1200,evaluate_every_steps:25,patience_evaluations:8,
+      max_optimizer_steps:4800,evaluate_every_steps:25,patience_evaluations:8,
       target_routes:["true_next_encoder_fit","target_fit_transfer_to_predicted_next","predicted_next_refit"],
       inference:"descriptive_only",final_used_for_selection:false},
     promotion:"locked_pending_analysis"}' >"$run_root/campaign.json"
@@ -170,11 +170,11 @@ audit_arm() {
     fi
   fi
   jq -e '
-    .schema=="p2.semantic_access.v1_1_stage_b1"
+    .schema=="p2.semantic_access.v1_1_stage_b1b"
     and .population_seed==424244 and .synthetic_episodes_per_source==64
     and .model_weights_updated==false and .final_partition_used_for_decoder_selection==false
     and .protocol.inferential_claims_enabled==false and .protocol.model_weights_frozen==true
-    and .protocol.max_optimizer_steps==1200 and .protocol.decoder_hidden==64
+    and .protocol.max_optimizer_steps==4800 and .protocol.decoder_hidden==64
     and .protocol.decoder_batch==4096 and .protocol.decoder_gradient_accumulation==1
     and .protocol.physical_batch==$eval_batch
     and .protocol.evaluate_every_steps==25 and .protocol.patience_evaluations==8
@@ -251,7 +251,7 @@ for report in "${selection_reports[@]}"; do
   }
 done
 if ! jq -e -s 'all(.evaluator_status=="qualified")' "${selection_reports[@]}" >/dev/null; then
-  jq -s '{schema:"p2.semantic_access_summary.v1_1_stage_b1",phase:"selection_only",
+  jq -s '{schema:"p2.semantic_access_summary.v1_1_stage_b1b",phase:"selection_only",
     evaluator_status:"invalid",decision:"selector_invalid_no_final_partition_scored",
     arms:map({checkpoint:.checkpoint,evaluator_status,families})}' \
     "${selection_reports[@]}" >"$run_root/summary.json"
@@ -305,7 +305,7 @@ jq -s '
     model_level_conclusion_permitted:.report.model_level_conclusion_permitted,
     qualifications:(.report.families|map({name,qualification})),
     routes:(.report.families|map({name,routes}))}) as $rows
-  | {schema:"p2.semantic_access_summary.v1_1_stage_b1",arms:$rows,
+  | {schema:"p2.semantic_access_summary.v1_1_stage_b1b",arms:$rows,
       evaluator_status:(if ($rows|all(.evaluator_status=="qualified")) then "qualified" else "invalid" end),
       decision:(if ($rows|all(.evaluator_status=="qualified"))
         then "qualified_seam_matrix_ready_for_analysis"
