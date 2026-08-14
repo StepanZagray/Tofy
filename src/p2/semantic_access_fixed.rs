@@ -322,7 +322,9 @@ pub fn run(cfg: &Config) -> Result<Report> {
     ];
 
     let mut families = Vec::new();
-    for (name, target_features, predicted_features, target_base, predicted_base) in family_data {
+    for (name, target_features, _predicted_features, target_base, _predicted_base) in
+        family_data.iter().copied()
+    {
         let qualification = qualify_same_path(
             target_features[0].len(),
             name == "contextual_3x3_global",
@@ -330,38 +332,45 @@ pub fn run(cfg: &Config) -> Result<Report> {
             &train,
             &selection,
         )?;
-        let mut diagnostics = Vec::new();
-        if qualification.passed {
-            let target_fit = fit_ensemble(target_features, target_base, &targets, &train)?;
-            let predicted_fit = fit_ensemble(predicted_features, predicted_base, &targets, &train)?;
-            diagnostics.push(selection_diagnostic(
-                "target_next_fit",
-                &target_fit,
-                target_features,
-                target_base,
-                &targets,
-                &selection,
-            )?);
-            diagnostics.push(selection_diagnostic(
-                "predicted_next_fit",
-                &predicted_fit,
-                predicted_features,
-                predicted_base,
-                &targets,
-                &selection,
-            )?);
-        }
         families.push(FamilyReport {
             name: name.into(),
             input_dim: target_features[0].len(),
             learned_parameter_count: learned_parameter_count(target_base[0].len()),
             fixed_nonzero_coefficient_count: fixed_nonzero_coefficient_count(),
             qualification,
-            route_selection_diagnostics: diagnostics,
+            route_selection_diagnostics: Vec::new(),
             routes: Vec::new(),
         });
     }
     let controls_qualified = families.iter().all(|family| family.qualification.passed);
+    if controls_qualified {
+        for (index, (_name, target_features, predicted_features, target_base, predicted_base)) in
+            family_data.iter().copied().enumerate()
+        {
+            let target_fit = fit_ensemble(target_features, target_base, &targets, &train)?;
+            let predicted_fit = fit_ensemble(predicted_features, predicted_base, &targets, &train)?;
+            families[index]
+                .route_selection_diagnostics
+                .push(selection_diagnostic(
+                    "target_next_fit",
+                    &target_fit,
+                    target_features,
+                    target_base,
+                    &targets,
+                    &selection,
+                )?);
+            families[index]
+                .route_selection_diagnostics
+                .push(selection_diagnostic(
+                    "predicted_next_fit",
+                    &predicted_fit,
+                    predicted_features,
+                    predicted_base,
+                    &targets,
+                    &selection,
+                )?);
+        }
+    }
     let diagnostics_finite = controls_qualified
         && families.iter().all(|family| {
             family.route_selection_diagnostics.len() == 2
@@ -474,7 +483,7 @@ pub fn run(cfg: &Config) -> Result<Report> {
         protocol: Protocol {
             device: cfg.device.clone(),
             physical_batch: cfg.physical_batch,
-            feature_map: "rand-0.9_chacha8_seeded_sparse_signed_relu_v1_with_fixed_bias".into(),
+            feature_map: "rand-0.9_chacha8_seeded_mixed_sparse_relu_quadratic_v2".into(),
             feature_width: FEATURE_WIDTH,
             inputs_per_feature: INPUTS_PER_FEATURE,
             feature_seeds: FEATURE_SEEDS.to_vec(),
@@ -858,7 +867,24 @@ impl SparseReluMap {
             .map(|row| {
                 self.features
                     .iter()
-                    .map(|feature| {
+                    .enumerate()
+                    .map(|(feature_index, feature)| {
+                        if feature_index % 2 == 1 {
+                            let midpoint = INPUTS_PER_FEATURE / 2;
+                            let left = feature.indices[..midpoint]
+                                .iter()
+                                .zip(&feature.signs[..midpoint])
+                                .map(|(&index, &sign)| row[index] * sign)
+                                .sum::<f32>()
+                                / (midpoint as f32).sqrt();
+                            let right = feature.indices[midpoint..]
+                                .iter()
+                                .zip(&feature.signs[midpoint..])
+                                .map(|(&index, &sign)| row[index] * sign)
+                                .sum::<f32>()
+                                / ((INPUTS_PER_FEATURE - midpoint) as f32).sqrt();
+                            return left * right;
+                        }
                         let projected = feature
                             .indices
                             .iter()

@@ -81,7 +81,7 @@ jq -nc --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg git_sha "$git_sha" \
     previous_root_manifest_sha256:$previous_manifest_sha,expected_population_fingerprint:$fingerprint,
     gpu_name:$gpu,arms:["S0G0","ScalG0","ScurG0","S0G1","ScalG1","ScurG1"],
     frozen_protocol:{population_seed:424244,episodes_per_source:64,physical_batch:256,
-      feature_map:"rand-0.9_chacha8_seeded_sparse_signed_relu_v1_with_fixed_bias",feature_width:256,
+      feature_map:"rand-0.9_chacha8_seeded_mixed_sparse_relu_quadratic_v2",feature_width:256,
       inputs_per_feature:8,feature_seeds:[4302768118693889,4302768118693890,4302768118693891],
       seed_aggregation:"arithmetic_mean_predictions_no_seed_selection",ridge:0.01,
       model_weights_frozen:true,optimizer_used:false,
@@ -127,8 +127,9 @@ validate_report() {
     and ([.families[].fixed_nonzero_coefficient_count]|all(.==6912))
     and ([.families[].qualification.per_seed|length]|all(.==3))
     and ([.families[].qualification.per_seed[].feature_map_sha256]|all(test("^sha256:[0-9a-f]{64}$")))
-    and ([.families[]|if .qualification.passed then (.route_selection_diagnostics|length)==2
-      else (.route_selection_diagnostics|length)==0 end]|all)
+    and (if .evaluator_status=="qualified" then
+      ([.families[].route_selection_diagnostics|length]|all(.==2))
+      else ([.families[].route_selection_diagnostics|length]|all(.==0)) end)
     and ([.families[].route_selection_diagnostics[].per_seed|length]|all(.==3))
     and (if $phase=="selection" then .execution_phase=="selection_only"
       and .final_partition_scored==false and .descriptive_seam_interpretation_permitted==false

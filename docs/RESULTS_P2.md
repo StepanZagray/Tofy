@@ -612,8 +612,18 @@ the 64-wide map reduced control error by 89.0% locally and 77.1% contextually, b
 sealed 90% gate, while the original absolute-improvement threshold exceeded the control's
 entire ridge error. This is a negative evaluator-calibration result, not a model result.
 
-The resealed campaign replaces only that learned selector with a deterministic evaluator:
-a fixed 256-wide sparse signed-ReLU map at each of three sealed seeds, a closed-form ridge
+The width/scale calibration then ran at revision
+`0c6e5c661ce3f805b6808d4d13e7c510893b94b8`, binary SHA-256
+`4a67c418431f8f6e69389402c9c779ac4de86eda37338f2fd2de00f0d18837bc`, under
+`runs/p2/semantic-access-fixed-coarse-v2-20260814T131119Z`. Its manifest verifies and
+no final score was accessed. Contextual control passed at 90.02%, but local control fell
+to 86.47%, confirming unstable pure-ReLU random-feature approximation rather than a
+capacity-only problem. It also exposed that a passing family could emit selection diagnostics
+before the global two-family control gate. Those diagnostics are treated as calibration-tainted
+and are not used to design the next map; the code now gates all real diagnostics globally.
+
+The third campaign uses a deterministic evaluator: a fixed 256-wide mixed sparse ReLU and
+quadratic sketch at each of three sealed seeds, a closed-form ridge
 readout per seed, and an arithmetic mean of predictions with no seed selection. Local and
 contextual families have the same 14,400 learned coefficients (and 6,912 fixed nonzero map
 coefficients), while contextual projection compute remains larger because its input is 3x
@@ -623,9 +633,10 @@ fits, transfer seam, all-arm qualification gate, and one-shot final policy are r
 This isolates whether B1b's result was caused by optimizer/patience censoring. It does not
 test whether this decoder is optimal, and it cannot by itself support a model-level claim.
 
-Only the model-independent control was used to recalibrate: width increases from 64 to 256,
-and its interaction scale increases from 8 to 32 so the unchanged absolute threshold is
-measurable. No real-route or final metric was observed. The final invocation is bound to the
+Only the model-independent control was used to choose the mixed quadratic map; the accidentally
+emitted contextual diagnostics are explicitly excluded. Width remains 256 and interaction scale
+32 so the unchanged absolute threshold is measurable. No final metric was observed. The final
+invocation is bound to the
 exact selection-report SHA-256. The nonlinear control
 coordinates are derived from row-local observable content rather than global row order. All
 three seeds and the ensemble must remain finite; the aggregate control must meet the sealed
