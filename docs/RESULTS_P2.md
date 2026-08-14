@@ -737,6 +737,54 @@ TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
 bash scripts/p2_sigreg_pressure_geometry_v1.sh
 ```
 
+### SIGReg cell dose-response V1 preregistration (2026-08-14)
+
+The completed pressure × geometry screen showed that one-update calibration does not
+control the later optimization trajectory. Both nominally matched arms clipped every
+update, all five arms failed effective rank and action conditioning, and the
+lower-dose cell arm developed catastrophic H8 tails from update 125 to 250. The next
+serial A40 campaign therefore does not make a geometry or clipping-mediation claim.
+It estimates a replicated cell-TC-QQ dose response and the location of the realized
+pressure/clipping transition.
+
+Seeds 2 and 3 each train `S0` plus weights `0.00004`, `0.00008`, `0.00016`, and
+`0.00032305295536180014` for 250 fresh updates, with evaluations at 125 and 250.
+The arm order ascends for seed 2 and descends for seed 3. Every arm uses physical
+batch `1024`, accumulation `1`, identical topology and lesson settings, and nine
+pressure samples at updates `1,31,62,93,124,155,186,217,249`. Seed-local content,
+rows, parameter counts, normalized configs, evaluation populations, and all checkpoint
+artifacts are verified; every arm uses the same fresh evaluation seed `424248`, and
+cross-seed configs must differ only in seed/output identity.
+
+The primary analysis relates configured dose and normalized trapezoidal realized
+pressure-trajectory AUC to
+effective-rank fraction, changed-transition improvement, H4/H8 normalized mean and
+CVaR95, fraction beating copy, action-shuffle ratio, Q balance, and board-probe trust.
+Clipping is interpreted relative to same-seed S0 rather than an absolute `25%` threshold.
+A low-pressure candidate must clip on at most 10 percentage points more than S0, retain
+at least 75% of S0's mean clip scale, have pressure AUC/median at most `0.10`, and have
+maximum sampled pressure at most `0.25`. No weight is selected unless direction and
+failure mode agree across both seeds. No arm is promoted unless both seeds at both
+checkpoints pass non-collapse, changed-transition improvement, action conditioning,
+non-saturated balanced Q (`balanced_accuracy > 0.5`), H4/H8 normalized mean and CVaR95
+at most `1`, and semantic trust. Automatic promotion remains locked pending causal
+analysis. Each train is bounded to 90 minutes and each evaluation attempt to 30 minutes;
+the launcher fails closed rather than automatically resuming a partially completed arm.
+This experiment may select a future controller target; it cannot by itself prove
+clipping mediation or paper fidelity.
+
+The preceding five-arm campaign averaged about 52.3 minutes per arm including evaluation.
+Ten arms plus six additional pressure probes per arm are expected to require roughly
+8 hours 45 minutes to 9 hours on the A40.
+
+```bash
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_sigreg_cell_dose_response_v1.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
