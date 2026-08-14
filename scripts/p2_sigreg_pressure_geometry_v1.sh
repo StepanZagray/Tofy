@@ -15,7 +15,7 @@ checkpoint_every="${P2_SIGREG_CHECKPOINT_EVERY:-125}"
 : "${P2_EXPECTED_SHA:?set the reviewed Tofy commit}"
 : "${P2_EXPECTED_CANDLE_SHA:?set the reviewed candle_graph commit}"
 : "${P2_EXPECTED_BINARY_SHA:?set the reviewed release binary SHA-256}"
-for command in git jq nvidia-smi sha256sum awk realpath date mkdir mv env cmp; do
+for command in git jq nvidia-smi sha256sum awk realpath date mkdir mv env cmp sleep; do
   command -v "$command" >/dev/null || { printf 'missing command: %s\n' "$command" >&2; exit 2; }
 done
 [[ -x "$tofy_bin" ]] || { printf 'missing release binary: %s\n' "$tofy_bin" >&2; exit 2; }
@@ -79,11 +79,20 @@ finish_campaign() {
 }
 
 sample_gpu() {
+  local delay_pid=""
+  trap 'if [[ -n "$delay_pid" ]] && kill -0 "$delay_pid" 2>/dev/null; then
+    kill "$delay_pid" 2>/dev/null || true
+    wait "$delay_pid" 2>/dev/null || true
+  fi
+  exit 0' TERM INT
   while true; do
     printf '%s,' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw \
       --format=csv,noheader,nounits
-    read -r -t "$gpu_interval" < /dev/null || true
+    sleep "$gpu_interval" &
+    delay_pid=$!
+    wait "$delay_pid" || true
+    delay_pid=""
   done
 }
 
