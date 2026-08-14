@@ -593,6 +593,45 @@ P2_SEMANTIC_EVAL_BATCH=256 \
 bash scripts/p2_semantic_access_v11_campaign.sh
 ```
 
+### Semantic Access deterministic fixed-feature coarse probe (2026-08-14)
+
+B1b completed selection-only at revision `0a721caa78799ea413ab4cfba983ef820e618271`
+under `runs/p2/semantic-access-v1_1-stage-b1b-20260814T112232Z`. Its 22 recorded
+artifacts verify, all 12 nonlinear controls passed, and 7/24 real selectors converged;
+the other 17 remained censored at the preregistered 4,800-step ceiling. The global gate
+therefore did not access the final scoring partition. This is evidence that the iterative
+MLP selector remains a measurement bottleneck, not evidence that the corresponding model
+representations lack the coarse target.
+
+The next campaign replaces only that learned selector with a deterministic evaluator:
+a fixed 64-wide sparse signed-ReLU map at each of three sealed seeds, a closed-form ridge
+readout per seed, and an arithmetic mean of predictions with no seed selection. Local and
+contextual families have the same 5,184 learned coefficients (and 1,728 fixed nonzero map
+coefficients), while contextual projection compute remains larger because its input is 3x
+wider. Tofy weights are frozen and no optimizer is used. The same B1b population fingerprint,
+episode-disjoint split, six counterbalanced arms, local/contextual families, target/predicted
+fits, transfer seam, all-arm qualification gate, and one-shot final policy are retained.
+This isolates whether B1b's result was caused by optimizer/patience censoring. It does not
+test whether this decoder is optimal, and it cannot by itself support a model-level claim.
+
+The final invocation is bound to the exact selection-report SHA-256. The nonlinear control
+coordinates are derived from row-local observable content rather than global row order. All
+three seeds and the ensemble must remain finite; the aggregate control must meet the sealed
+MSE and improvement thresholds. If any arm fails qualification, no final invocation begins.
+
+```bash
+TOFY_BIN=/workspace/Personal/Tofy/target/semantic-access-fixed-coarse/release/tofy \
+P2_AUDIT_PARENT_ROOT=/workspace/Personal/Tofy/runs/p2/pressure-grounding-v1-20260813T200848Z \
+P2_PREVIOUS_SEMANTIC_ROOT=/workspace/Personal/Tofy/runs/p2/semantic-access-v1_1-stage-b1b-20260814T112232Z \
+P2_SEMANTIC_FIXED_ROOT=/workspace/Personal/Tofy/runs/p2/semantic-access-fixed-coarse-<UTC> \
+P2_EXPECTED_SHA=<reviewed-fixed-probe-commit> \
+P2_EXPECTED_BINARY_SHA=<reviewed-fixed-probe-binary-sha256> \
+P2_EXPECTED_PARENT_SHA=ccc87452a0a0cac4dd9358bc689a2d3d85691b6b \
+P2_EXPECTED_PARENT_BINARY_SHA=cb1e7bded0da2fcfc645521283251db4e8fa3477eec2f57429365c88b9dacfec \
+P2_SEMANTIC_EVAL_BATCH=256 \
+bash scripts/p2_semantic_access_fixed_campaign.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**

@@ -5,8 +5,9 @@
 
 use crate::p2::cli::{
     run_p2_arc3_eval, run_p2_arc3_live_eval, run_p2_eval, run_p2_semantic_access_audit,
-    run_p2_semantic_access_v11, run_p2_train, P2Arc3EvalArgs, P2Arc3LiveEvalArgs, P2EvalArgs,
-    P2SemanticAccessAuditArgs, P2SemanticAccessV11Args, P2TrainArgs,
+    run_p2_semantic_access_fixed, run_p2_semantic_access_v11, run_p2_train, P2Arc3EvalArgs,
+    P2Arc3LiveEvalArgs, P2EvalArgs, P2SemanticAccessAuditArgs, P2SemanticAccessFixedArgs,
+    P2SemanticAccessV11Args, P2TrainArgs,
 };
 use crate::p2::view::{run_p2_view, P2ViewArgs};
 use anyhow::Result;
@@ -36,6 +37,9 @@ enum Commands {
     /// P2: qualified frozen target/predicted-next semantic seam audit
     #[command(name = "p2-semantic-access-v11-audit")]
     P2SemanticAccessV11(P2SemanticAccessV11Args),
+    /// P2: deterministic nonlinear coarse target/predicted-next seam audit
+    #[command(name = "p2-semantic-access-fixed-audit")]
+    P2SemanticAccessFixed(P2SemanticAccessFixedArgs),
     /// P2: held-out transfer evaluation on official-toolkit ARC recordings
     #[command(name = "p2-arc3-eval")]
     P2Arc3Eval(P2Arc3EvalArgs),
@@ -55,6 +59,7 @@ pub fn run_cli() -> Result<()> {
         Commands::P2Eval(args) => run_p2_eval(args)?,
         Commands::P2SemanticAccessAudit(args) => run_p2_semantic_access_audit(args)?,
         Commands::P2SemanticAccessV11(args) => run_p2_semantic_access_v11(args)?,
+        Commands::P2SemanticAccessFixed(args) => run_p2_semantic_access_fixed(args)?,
         Commands::P2Arc3Eval(args) => run_p2_arc3_eval(args)?,
         Commands::P2Arc3LiveEval(args) => run_p2_arc3_live_eval(args)?,
         Commands::P2View(args) => run_p2_view(args)?,
