@@ -691,6 +691,52 @@ seeds and the same three
 representation routes; only after that sentinel should a multi-training-seed,
 pressure-controlled SIGReg experiment be considered.
 
+### SIGReg pressure × population-geometry V1 preregistration (2026-08-14)
+
+The next serial A40 campaign does not claim to reproduce LeWorldModel, TC-SIGReg, or
+QQWorld. It tests the Tofy-specific temporally centered QQ objective while separating
+the known optimization-pressure mediator from the population construction. Every arm
+uses physical batch `1024`, accumulation `1`, fixed `8×2` recursion, the same
+`q_calibration` lesson and data order within training seed, 250 fresh updates, and
+evaluations at updates 125 and 250.
+Recent paired runs took 4.72--4.76 seconds per update on this A40, so the five
+training arms alone are expected to take about 99 minutes; calibration, checkpoint
+evaluation, and integrity checks extend the wall-clock runtime beyond that.
+
+- `S0`: no SIGReg.
+- `cell-high` and `global-high`: the cell and global populations at the historical
+  weight `0.003`; seed 1 only, completing the nominal-dose population contrast while
+  replicating the known cell-pressure condition.
+- `cell-matched`: the same cell population with a per-initialization weight calibrated
+  across eight independent data batches to a shared initial median SIGReg/next-latent
+  encoder gradient ratio at most `0.01` and maximum `0.02`.
+- `global-matched`: globally pooled frame rows with exactly the same achieved median
+  gradient-pressure target and maximum bound. It is
+  closer to frame-level population semantics but remains post-RMS and lacks a consumed
+  BN-MLP projector, so it is not labeled paper-faithful.
+
+Seed 1 runs the control plus the complete `population × low/current pressure` panel.
+SIGReg pressure is sampled at updates 1, 124, and 249; every checkpoint, optimizer state,
+trainer state, configuration, evaluation, and episode file is checksummed. If lower
+pressure repairs the cell arm, the historical negative is primarily dose/clipping-mediated.
+If the pressure-matched global arm beats the cell arm, population geometry is the stronger
+seed-1 candidate. If both remain adverse without sustained clipping, the next change must
+be a consumed pre-RMS frame embedding rather than another dose sweep. No seed-1 arm is
+promoted; replication waits for the pressure gate and the registered exact-cell sentinel.
+
+Pressure attribution is valid only when the matched arms clip on at most 25% of updates,
+the current-dose arms clip on at least 75%, and the within-population difference is at
+least 50 percentage points. Otherwise the geometry metrics remain descriptive and the
+pressure mechanism is not identified.
+
+```bash
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_sigreg_pressure_geometry_v1.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
