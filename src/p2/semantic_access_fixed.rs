@@ -2,12 +2,14 @@
 //!
 //! Frozen Tofy representations are mapped through presealed sparse ReLU features.
 //! Only closed-form ridge readouts are fitted, so optimizer budget and patience
-//! cannot censor the evaluator. Final rows remain globally sealed until every
-//! checkpoint passes the same-path control and finite-selection gates.
+//! cannot censor the evaluator. Selection persists the exact fitted state; a
+//! fresh final population is materialized only after every arm and replay seal passes.
 
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::board_probe::{histograms_for_frames, FixedBoardProbe, PALETTE_SIZE, PATCH_COUNT};
-use crate::p2::eval::collect_frozen_board_probe_population_with_predictions;
+use crate::p2::eval::{
+    collect_frozen_board_probe_population_partition_with_predictions, SemanticAccessPopulation,
+};
 use crate::p2::train::load_train_config;
 use anyhow::{ensure, Context, Result};
 use rand::{Rng, SeedableRng};
@@ -20,8 +22,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: &str = "p2.semantic_access.fixed_coarse.v1";
+pub const SCHEMA: &str = "p2.semantic_access.fixed_coarse.v2";
+const STATE_SCHEMA: &str = "p2.semantic_access.fixed_coarse.selection_state.v1";
+const CAMPAIGN_SEAL_SCHEMA: &str = "p2.semantic_access.fixed_coarse.selection_seal.v1";
 pub const POPULATION_SEED: u64 = 424_244;
+pub const FINAL_POPULATION_SEED: u64 = 424_245;
 pub const SYNTHETIC_EPISODES: usize = 64;
 const FEATURE_WIDTH: usize = 256;
 const INPUTS_PER_FEATURE: usize = 8;
@@ -46,6 +51,14 @@ pub struct Config {
     pub required_population_fingerprint: Option<String>,
     pub selection_reference: Option<PathBuf>,
     pub selection_reference_sha256: Option<String>,
+    pub fitted_state_output: Option<PathBuf>,
+    pub fitted_state_reference: Option<PathBuf>,
+    pub fitted_state_reference_sha256: Option<String>,
+    pub campaign_selection_seal: Option<PathBuf>,
+    pub campaign_selection_seal_sha256: Option<String>,
+    pub arm: Option<String>,
+    pub final_population_seed: Option<u64>,
+    pub final_access_marker: Option<PathBuf>,
     pub output: PathBuf,
 }
 
@@ -147,8 +160,15 @@ pub struct Report {
     pub population_seed: u64,
     pub synthetic_episodes_per_source: usize,
     pub population_fingerprint: String,
+    pub source_population_fingerprint: String,
     pub target_latents_sha256: String,
     pub predicted_latents_sha256: String,
+    pub fitted_state_sha256: Option<String>,
+    pub selection_reference_sha256: Option<String>,
+    pub final_population_seed: Option<u64>,
+    pub final_population_fingerprint: Option<String>,
+    pub final_target_latents_sha256: Option<String>,
+    pub final_predicted_latents_sha256: Option<String>,
     pub target: String,
     pub protocol: Protocol,
     pub split: SplitManifest,
@@ -170,33 +190,33 @@ struct Partitions {
     final_frames: Vec<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Standardization {
     mean: Vec<f32>,
     std: Vec<f32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct SparseFeature {
     indices: Vec<usize>,
     signs: Vec<f32>,
     bias: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct SparseReluMap {
     input_dim: usize,
     seed: u64,
     features: Vec<SparseFeature>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct SeedFit {
     map: SparseReluMap,
     residual: FixedBoardProbe,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct FittedEnsemble {
     base: FixedBoardProbe,
     input_standardization: Standardization,
@@ -209,15 +229,45 @@ struct EnsemblePrediction {
     ensemble: Vec<[f32; PALETTE_SIZE]>,
 }
 
-struct SelectionReplay<'a> {
-    families: &'a [FamilyReport],
-    population_fingerprint: &'a str,
-    checkpoint_sha256: &'a str,
-    train_config_sha256: &'a str,
-    target_latents_sha256: &'a str,
-    predicted_latents_sha256: &'a str,
-    split: &'a SplitManifest,
-    evaluator_status: &'a str,
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct FittedFamilyState {
+    name: String,
+    target_fit: FittedEnsemble,
+    predicted_fit: FittedEnsemble,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct SelectionState {
+    schema: String,
+    checkpoint_sha256: String,
+    train_config_sha256: String,
+    source_population_fingerprint: String,
+    population_fingerprint: String,
+    target_latents_sha256: String,
+    predicted_latents_sha256: String,
+    split: SplitManifest,
+    families: Vec<FittedFamilyState>,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CampaignArmSeal {
+    selection_report_sha256: String,
+    fitted_state_sha256: String,
+    replay_selection_report_sha256: String,
+    replay_fitted_state_sha256: String,
+    checkpoint_sha256: String,
+    train_config_sha256: String,
+    evaluator_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CampaignSelectionSeal {
+    schema: String,
+    final_arms: Vec<String>,
+    final_population_seeds: Vec<u64>,
+    synthetic_episodes_per_source: usize,
+    arms: BTreeMap<String, CampaignArmSeal>,
 }
 
 pub fn run(cfg: &Config) -> Result<Report> {
@@ -227,20 +277,14 @@ pub fn run(cfg: &Config) -> Result<Report> {
         "output already exists: {}",
         cfg.output.display()
     );
-    if !cfg.selection_only {
-        let reference = cfg
-            .selection_reference
-            .as_deref()
-            .context("final phase requires a phase-1 selection reference")?;
-        let expected = cfg
-            .selection_reference_sha256
-            .as_deref()
-            .context("final phase requires the sealed selection-reference SHA-256")?;
-        ensure!(
-            sha256_file(reference)? == expected,
-            "selection-reference SHA-256 mismatch before population construction"
-        );
+    if cfg.selection_only {
+        run_selection(cfg)
+    } else {
+        run_final(cfg)
     }
+}
+
+fn run_selection(cfg: &Config) -> Result<Report> {
     let checkpoint_sha256 = sha256_file(&cfg.checkpoint)?;
     let train_config_sha256 = sha256_file(&cfg.train_config)?;
     let train_cfg = load_train_config(&cfg.train_config)?;
@@ -249,18 +293,19 @@ pub fn run(cfg: &Config) -> Result<Report> {
     } else {
         None
     };
-    let population = collect_frozen_board_probe_population_with_predictions(
+    let population = collect_frozen_board_probe_population_partition_with_predictions(
         &cfg.checkpoint,
         &cfg.train_config,
         POPULATION_SEED,
         SYNTHETIC_EPISODES,
         cfg.physical_batch,
         &cfg.device,
+        SemanticAccessPopulation::SelectionFit,
     )?;
     ensure!(
         cfg.required_population_fingerprint
             .as_ref()
-            .is_some_and(|required| required == &population.population_fingerprint),
+            .is_some_and(|required| required == &population.source_population_fingerprint),
         "population fingerprint does not match the checksum-verified B1b population"
     );
     ensure!(
@@ -290,19 +335,10 @@ pub fn run(cfg: &Config) -> Result<Report> {
             .map(|sample| sample.next.clone())
             .collect::<Vec<_>>(),
     )?;
-    let mut row_source = Vec::with_capacity(targets.len());
-    let mut row_episode = Vec::with_capacity(targets.len());
-    for (frame, sample) in population.samples.iter().enumerate() {
-        for _ in 0..PATCH_COUNT {
-            row_source.push(population.source_by_sample[frame].clone());
-            row_episode.push(sample.episode_id);
-        }
-    }
     let parts = partitions(&population.samples);
-    validate_partitions(&parts)?;
+    validate_selection_partitions(&parts)?;
     let train = frame_rows(&parts.train_frames);
     let selection = frame_rows(&parts.selection_frames);
-    let final_rows = frame_rows(&parts.final_frames);
     let fit = train.iter().chain(&selection).copied().collect::<Vec<_>>();
     let family_data = [
         (
@@ -390,84 +426,52 @@ pub fn run(cfg: &Config) -> Result<Report> {
     } else {
         "qualified"
     };
-    if !cfg.selection_only {
-        verify_selection_reference(
-            cfg.selection_reference
-                .as_deref()
-                .context("final phase requires a phase-1 selection reference")?,
-            cfg.selection_reference_sha256
-                .as_deref()
-                .context("final phase requires the sealed selection-reference SHA-256")?,
-            SelectionReplay {
-                families: &families,
-                population_fingerprint: &population.population_fingerprint,
-                checkpoint_sha256: &checkpoint_sha256,
-                train_config_sha256: &train_config_sha256,
-                target_latents_sha256: &target_latents_sha256,
-                predicted_latents_sha256: &predicted_latents_sha256,
-                split: &SplitManifest {
-                train_frames: parts.train_frames.len(),
-                selection_frames: parts.selection_frames.len(),
-                final_frames: parts.final_frames.len(),
-                train_rows: train.len(),
-                selection_rows: selection.len(),
-                final_rows: final_rows.len(),
-                rule: "final: episode_id%3!=0; selection: episode_id%9==0; train: episode_id%9 in {3,6}".into(),
-                },
-                evaluator_status,
-            },
-        )?;
-    }
-    if evaluator_status == "qualified" && !cfg.selection_only {
-        for (index, (name, target_features, predicted_features, target_base, predicted_base)) in
-            family_data.iter().enumerate()
+    let split = SplitManifest {
+        train_frames: parts.train_frames.len(),
+        selection_frames: parts.selection_frames.len(),
+        final_frames: 0,
+        train_rows: train.len(),
+        selection_rows: selection.len(),
+        final_rows: 0,
+        rule: "selection population only: selection episode_id%9==0; train episode_id%9 in {3,6}; no final rows encoded".into(),
+    };
+    let fitted_state_sha256 = if evaluator_status == "qualified" {
+        let mut fitted_families = Vec::with_capacity(family_data.len());
+        for (name, target_features, predicted_features, target_base, predicted_base) in family_data
         {
-            let target_fit = fit_ensemble(target_features, target_base, &targets, &fit)?;
-            let predicted_fit = fit_ensemble(predicted_features, predicted_base, &targets, &fit)?;
-            families[index].routes = vec![
-                score_route(
-                    "true_next_encoder_fit",
-                    &target_fit,
-                    target_features,
-                    target_base,
-                    &targets,
-                    &final_rows,
-                    &row_source,
-                    &row_episode,
-                )?,
-                score_route(
-                    "target_fit_transfer_to_predicted_next",
-                    &target_fit,
-                    predicted_features,
-                    predicted_base,
-                    &targets,
-                    &final_rows,
-                    &row_source,
-                    &row_episode,
-                )?,
-                score_route(
-                    "predicted_next_refit",
-                    &predicted_fit,
-                    predicted_features,
-                    predicted_base,
-                    &targets,
-                    &final_rows,
-                    &row_source,
-                    &row_episode,
-                )?,
-            ];
-            ensure!(
-                families[index].name == *name,
-                "family order changed during final scoring"
-            );
+            fitted_families.push(FittedFamilyState {
+                name: name.into(),
+                target_fit: fit_ensemble(target_features, target_base, &targets, &fit)?,
+                predicted_fit: fit_ensemble(predicted_features, predicted_base, &targets, &fit)?,
+            });
         }
-    }
+        let mut state = SelectionState {
+            schema: STATE_SCHEMA.into(),
+            checkpoint_sha256: checkpoint_sha256.clone(),
+            train_config_sha256: train_config_sha256.clone(),
+            source_population_fingerprint: population.source_population_fingerprint.clone(),
+            population_fingerprint: population.population_fingerprint.clone(),
+            target_latents_sha256: target_latents_sha256.clone(),
+            predicted_latents_sha256: predicted_latents_sha256.clone(),
+            split: split.clone(),
+            families: fitted_families,
+            payload_sha256: String::new(),
+        };
+        state.payload_sha256 = selection_state_payload_sha256(&state);
+        let path = cfg
+            .fitted_state_output
+            .as_deref()
+            .context("qualified selection requires --fitted-state-output")?;
+        write_json_create_new(path, &state)?;
+        Some(sha256_file(path)?)
+    } else {
+        None
+    };
     ensure!(
         sha256_file(&cfg.checkpoint)? == checkpoint_sha256
             && sha256_file(&cfg.train_config)? == train_config_sha256,
         "checkpoint or training config changed during audit"
     );
-    let final_scored = evaluator_status == "qualified" && !cfg.selection_only;
     let report = Report {
         schema: SCHEMA.into(),
         checkpoint: cfg.checkpoint.clone(),
@@ -477,8 +481,15 @@ pub fn run(cfg: &Config) -> Result<Report> {
         population_seed: POPULATION_SEED,
         synthetic_episodes_per_source: SYNTHETIC_EPISODES,
         population_fingerprint: population.population_fingerprint,
+        source_population_fingerprint: population.source_population_fingerprint,
         target_latents_sha256,
         predicted_latents_sha256,
+        fitted_state_sha256,
+        selection_reference_sha256: None,
+        final_population_seed: None,
+        final_population_fingerprint: None,
+        final_target_latents_sha256: None,
+        final_predicted_latents_sha256: None,
         target: "descriptive_16_colour_counts_per_8x8_patch_status_row_excluded".into(),
         protocol: Protocol {
             device: cfg.device.clone(),
@@ -501,36 +512,243 @@ pub fn run(cfg: &Config) -> Result<Report> {
             inferential_claims_enabled: false,
             selection_rule: "episode-disjoint evaluator qualification; no tuned hyperparameters; final scored once after all-arm qualification".into(),
         },
-        split: SplitManifest {
-            train_frames: parts.train_frames.len(),
-            selection_frames: parts.selection_frames.len(),
-            final_frames: parts.final_frames.len(),
-            train_rows: train.len(),
-            selection_rows: selection.len(),
-            final_rows: final_rows.len(),
-            rule: "final: episode_id%3!=0; selection: episode_id%9==0; train: episode_id%9 in {3,6}".into(),
-        },
+        split,
         evaluator_status: evaluator_status.into(),
-        execution_phase: if cfg.selection_only {
-            "selection_only"
-        } else {
-            "final_score"
-        }
-        .into(),
+        execution_phase: "selection_only".into(),
         families,
         model_weights_updated: false,
         final_partition_used_for_decoder_selection: false,
-        final_partition_scored: final_scored,
-        descriptive_seam_interpretation_permitted: final_scored,
+        final_partition_scored: false,
+        descriptive_seam_interpretation_permitted: false,
         model_level_conclusion_permitted: false,
         next_stage: if evaluator_status != "qualified" {
             "repair_deterministic_evaluator_only_without_final_access"
-        } else if cfg.selection_only {
-            "run_registered_final_phase_only_after_all_six_arms_qualify"
         } else {
-            "analyze_coarse_transfer_then_run_coordinate_aware_exact_cell_sentinel"
+            "seal_byte_identical_all_arm_replay_then_run_fresh_final_panel"
         }
         .into(),
+    };
+    write_json_create_new(&cfg.output, &report)?;
+    Ok(report)
+}
+
+fn run_final(cfg: &Config) -> Result<Report> {
+    let selection_path = cfg
+        .selection_reference
+        .as_deref()
+        .context("final phase requires --selection-reference")?;
+    let selection_sha = cfg
+        .selection_reference_sha256
+        .as_deref()
+        .context("final phase requires --selection-reference-sha256")?;
+    let state_path = cfg
+        .fitted_state_reference
+        .as_deref()
+        .context("final phase requires --fitted-state-reference")?;
+    let state_sha = cfg
+        .fitted_state_reference_sha256
+        .as_deref()
+        .context("final phase requires --fitted-state-reference-sha256")?;
+    let campaign_seal_path = cfg
+        .campaign_selection_seal
+        .as_deref()
+        .context("final phase requires --campaign-selection-seal")?;
+    let campaign_seal_sha = cfg
+        .campaign_selection_seal_sha256
+        .as_deref()
+        .context("final phase requires --campaign-selection-seal-sha256")?;
+    let arm = cfg.arm.as_deref().context("final phase requires --arm")?;
+    let final_seed = cfg
+        .final_population_seed
+        .context("final phase requires --final-population-seed")?;
+
+    verify_file_sha(selection_path, selection_sha, "selection report")?;
+    verify_file_sha(state_path, state_sha, "fitted state")?;
+    verify_file_sha(
+        campaign_seal_path,
+        campaign_seal_sha,
+        "campaign selection seal",
+    )?;
+    let selection: Report = read_json(selection_path)?;
+    let state: SelectionState = read_json(state_path)?;
+    let campaign_seal: CampaignSelectionSeal = read_json(campaign_seal_path)?;
+    verify_final_preflight(
+        cfg,
+        arm,
+        final_seed,
+        selection_sha,
+        state_sha,
+        &selection,
+        &state,
+        &campaign_seal,
+    )?;
+
+    let checkpoint_sha256 = sha256_file(&cfg.checkpoint)?;
+    let train_config_sha256 = sha256_file(&cfg.train_config)?;
+    let train_cfg = load_train_config(&cfg.train_config)?;
+    let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
+        Some(GpuSessionGuard::acquire(&train_cfg.output_dir)?)
+    } else {
+        None
+    };
+    create_final_access_marker(
+        cfg.final_access_marker
+            .as_deref()
+            .context("final phase requires --final-access-marker")?,
+        arm,
+        final_seed,
+        selection_sha,
+        state_sha,
+        campaign_seal_sha,
+    )?;
+
+    let population = collect_frozen_board_probe_population_partition_with_predictions(
+        &cfg.checkpoint,
+        &cfg.train_config,
+        final_seed,
+        SYNTHETIC_EPISODES,
+        cfg.physical_batch,
+        &cfg.device,
+        SemanticAccessPopulation::FreshFinal,
+    )?;
+    ensure!(
+        population.samples.len() == population.source_by_sample.len(),
+        "source labels do not align with fresh final frames"
+    );
+    let target_local = population.target_rows.as_rows().to_vec();
+    let predicted_local = population
+        .predicted_rows
+        .as_ref()
+        .context("fresh final population omitted predicted-next rows")?
+        .as_rows()
+        .to_vec();
+    ensure!(
+        target_local.len() == predicted_local.len()
+            && target_local.len() == population.samples.len() * PATCH_COUNT,
+        "fresh final target/predicted rows do not align"
+    );
+    let target_contextual = contextual_features(&target_local)?;
+    let predicted_contextual = contextual_features(&predicted_local)?;
+    let targets = histograms_for_frames(
+        &population
+            .samples
+            .iter()
+            .map(|sample| sample.next.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let final_rows = (0..targets.len()).collect::<Vec<_>>();
+    let mut row_source = Vec::with_capacity(targets.len());
+    let mut row_episode = Vec::with_capacity(targets.len());
+    for (frame, sample) in population.samples.iter().enumerate() {
+        for _ in 0..PATCH_COUNT {
+            row_source.push(population.source_by_sample[frame].clone());
+            row_episode.push(sample.episode_id);
+        }
+    }
+    let family_data = [
+        (
+            "local",
+            &target_local,
+            &predicted_local,
+            &target_local,
+            &predicted_local,
+        ),
+        (
+            "contextual_3x3_global",
+            &target_contextual,
+            &predicted_contextual,
+            &target_local,
+            &predicted_local,
+        ),
+    ];
+    let mut families = selection.families.clone();
+    for (index, (name, target_features, predicted_features, target_base, predicted_base)) in
+        family_data.iter().copied().enumerate()
+    {
+        let fitted = state
+            .families
+            .get(index)
+            .context("fitted-state family count changed")?;
+        ensure!(
+            fitted.name == name && families[index].name == name,
+            "fitted-state family order changed"
+        );
+        families[index].routes = vec![
+            score_route(
+                "true_next_encoder_fit",
+                &fitted.target_fit,
+                target_features,
+                target_base,
+                &targets,
+                &final_rows,
+                &row_source,
+                &row_episode,
+            )?,
+            score_route(
+                "target_fit_transfer_to_predicted_next",
+                &fitted.target_fit,
+                predicted_features,
+                predicted_base,
+                &targets,
+                &final_rows,
+                &row_source,
+                &row_episode,
+            )?,
+            score_route(
+                "predicted_next_refit",
+                &fitted.predicted_fit,
+                predicted_features,
+                predicted_base,
+                &targets,
+                &final_rows,
+                &row_source,
+                &row_episode,
+            )?,
+        ];
+    }
+    ensure!(
+        sha256_file(&cfg.checkpoint)? == checkpoint_sha256
+            && sha256_file(&cfg.train_config)? == train_config_sha256,
+        "checkpoint or training config changed during final audit"
+    );
+    let mut split = state.split.clone();
+    split.final_frames = population.samples.len();
+    split.final_rows = final_rows.len();
+    split.rule = format!(
+        "selection seed {POPULATION_SEED} train+selection fit; every row from fresh final seed {final_seed} scored exactly once"
+    );
+    let report = Report {
+        schema: SCHEMA.into(),
+        checkpoint: cfg.checkpoint.clone(),
+        checkpoint_sha256,
+        train_config: cfg.train_config.clone(),
+        train_config_sha256,
+        population_seed: POPULATION_SEED,
+        synthetic_episodes_per_source: SYNTHETIC_EPISODES,
+        population_fingerprint: state.population_fingerprint.clone(),
+        source_population_fingerprint: state.source_population_fingerprint.clone(),
+        target_latents_sha256: state.target_latents_sha256.clone(),
+        predicted_latents_sha256: state.predicted_latents_sha256.clone(),
+        fitted_state_sha256: Some(state_sha.into()),
+        selection_reference_sha256: Some(selection_sha.into()),
+        final_population_seed: Some(final_seed),
+        final_population_fingerprint: Some(population.population_fingerprint),
+        final_target_latents_sha256: Some(sha256_rows(&target_local)),
+        final_predicted_latents_sha256: Some(sha256_rows(&predicted_local)),
+        target: selection.target,
+        protocol: selection.protocol,
+        split,
+        evaluator_status: "qualified".into(),
+        execution_phase: "final_score".into(),
+        families,
+        model_weights_updated: false,
+        final_partition_used_for_decoder_selection: false,
+        final_partition_scored: true,
+        descriptive_seam_interpretation_permitted: true,
+        model_level_conclusion_permitted: false,
+        next_stage:
+            "analyze_paired_population_seed_transfer_then_run_coordinate_aware_exact_cell_sentinel"
+                .into(),
     };
     write_json_create_new(&cfg.output, &report)?;
     Ok(report)
@@ -548,20 +766,57 @@ fn validate_config(cfg: &Config) -> Result<()> {
         cfg.train_config.display()
     );
     ensure!(cfg.physical_batch > 0, "physical batch must be positive");
-    ensure!(
-        cfg.required_population_fingerprint
-            .as_ref()
-            .is_some_and(|value| value.starts_with("sha256:")),
-        "fixed coarse audit requires the checksum-verified B1b population fingerprint"
-    );
-    ensure!(
-        cfg.selection_only || cfg.selection_reference.is_some(),
-        "final scoring requires --selection-reference from all-arm qualification"
-    );
-    ensure!(
-        cfg.selection_only || cfg.selection_reference_sha256.is_some(),
-        "final scoring requires --selection-reference-sha256"
-    );
+    if cfg.selection_only {
+        ensure!(
+            cfg.required_population_fingerprint
+                .as_ref()
+                .is_some_and(|value| value.starts_with("sha256:")),
+            "selection requires the checksum-verified source-population fingerprint"
+        );
+        let state_output = cfg
+            .fitted_state_output
+            .as_deref()
+            .context("selection requires --fitted-state-output")?;
+        ensure!(!state_output.exists(), "fitted-state output already exists");
+    } else {
+        ensure!(
+            cfg.selection_reference.is_some(),
+            "final scoring requires --selection-reference"
+        );
+        ensure!(
+            cfg.selection_reference_sha256.is_some(),
+            "final scoring requires --selection-reference-sha256"
+        );
+        ensure!(
+            cfg.fitted_state_reference.is_some(),
+            "final scoring requires --fitted-state-reference"
+        );
+        ensure!(
+            cfg.fitted_state_reference_sha256.is_some(),
+            "final scoring requires --fitted-state-reference-sha256"
+        );
+        ensure!(
+            cfg.campaign_selection_seal.is_some(),
+            "final scoring requires --campaign-selection-seal"
+        );
+        ensure!(
+            cfg.campaign_selection_seal_sha256.is_some(),
+            "final scoring requires --campaign-selection-seal-sha256"
+        );
+        ensure!(cfg.arm.is_some(), "final scoring requires --arm");
+        ensure!(
+            cfg.final_population_seed.is_some(),
+            "final scoring requires --final-population-seed"
+        );
+        let marker = cfg
+            .final_access_marker
+            .as_deref()
+            .context("final scoring requires --final-access-marker")?;
+        ensure!(
+            !marker.exists(),
+            "final-access marker already exists; retry forbidden"
+        );
+    }
     ensure!(
         learned_parameter_count(128) + fixed_nonzero_coefficient_count() <= PARAMETER_CAP,
         "deterministic evaluator exceeds parameter cap"
@@ -569,48 +824,240 @@ fn validate_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn verify_selection_reference(
-    path: &Path,
-    expected_sha256: &str,
-    current: SelectionReplay<'_>,
+#[allow(clippy::too_many_arguments)]
+fn verify_final_preflight(
+    cfg: &Config,
+    arm: &str,
+    final_seed: u64,
+    selection_sha: &str,
+    state_sha: &str,
+    selection: &Report,
+    state: &SelectionState,
+    campaign_seal: &CampaignSelectionSeal,
 ) -> Result<()> {
     ensure!(
-        expected_sha256.len() == 64
-            && expected_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "selection-reference SHA-256 must be 64 lowercase hexadecimal characters"
+        selection.schema == SCHEMA,
+        "selection.schema mismatch: expected={SCHEMA} actual={}",
+        selection.schema
     );
     ensure!(
-        sha256_file(path)? == expected_sha256,
-        "selection-reference SHA-256 mismatch"
+        selection.execution_phase == "selection_only",
+        "selection.execution_phase mismatch: expected=selection_only actual={}",
+        selection.execution_phase
     );
-    let reference: Report = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read selection reference {}", path.display()))?,
-    )?;
     ensure!(
-        reference.schema == SCHEMA
-            && reference.execution_phase == "selection_only"
-            && !reference.final_partition_scored
-            && reference.population_fingerprint == current.population_fingerprint
-            && reference.checkpoint_sha256 == current.checkpoint_sha256
-            && reference.train_config_sha256 == current.train_config_sha256
-            && reference.target_latents_sha256 == current.target_latents_sha256
-            && reference.predicted_latents_sha256 == current.predicted_latents_sha256
-            && reference.split == *current.split
-            && reference.evaluator_status == current.evaluator_status
-            && reference.families.len() == current.families.len(),
-        "selection reference identity or status mismatch"
+        selection.evaluator_status == "qualified",
+        "selection.evaluator_status mismatch: expected=qualified actual={}",
+        selection.evaluator_status
     );
-    for (current, prior) in current.families.iter().zip(&reference.families) {
+    ensure!(
+        !selection.final_partition_scored,
+        "selection.final_partition_scored must be false"
+    );
+    ensure!(
+        selection.fitted_state_sha256.as_deref() == Some(state_sha),
+        "selection.fitted_state_sha256 mismatch: expected={state_sha} actual={:?}",
+        selection.fitted_state_sha256
+    );
+    ensure!(
+        state.schema == STATE_SCHEMA,
+        "state.schema mismatch: expected={STATE_SCHEMA} actual={}",
+        state.schema
+    );
+    let actual_payload_sha = selection_state_payload_sha256(state);
+    ensure!(
+        state.payload_sha256 == actual_payload_sha,
+        "state.payload_sha256 mismatch: expected={} actual={actual_payload_sha}",
+        state.payload_sha256
+    );
+    ensure!(
+        campaign_seal.schema == CAMPAIGN_SEAL_SCHEMA,
+        "campaign_seal.schema mismatch: expected={CAMPAIGN_SEAL_SCHEMA} actual={}",
+        campaign_seal.schema
+    );
+    ensure!(
+        campaign_seal.final_population_seeds == vec![424_245, 424_246, 424_247],
+        "campaign_seal.final_population_seeds mismatch: expected=[424245,424246,424247] actual={:?}",
+        campaign_seal.final_population_seeds
+    );
+    ensure!(
+        campaign_seal.final_arms == vec!["S0G1", "ScurG1"],
+        "campaign_seal.final_arms mismatch: expected=[S0G1,ScurG1] actual={:?}",
+        campaign_seal.final_arms
+    );
+    ensure!(
+        campaign_seal.final_population_seeds.contains(&final_seed),
+        "final_population_seed {final_seed} is not sealed"
+    );
+    ensure!(
+        campaign_seal.synthetic_episodes_per_source == SYNTHETIC_EPISODES,
+        "campaign_seal.synthetic_episodes_per_source mismatch"
+    );
+    let expected_arms = ["S0G0", "S0G1", "ScalG0", "ScalG1", "ScurG0", "ScurG1"];
+    ensure!(
+        ["S0G1", "ScurG1"].contains(&arm),
+        "arm {arm} is not in the sealed endpoint final panel"
+    );
+    ensure!(
+        campaign_seal.arms.len() == expected_arms.len()
+            && expected_arms
+                .iter()
+                .all(|name| campaign_seal.arms.contains_key(*name)),
+        "campaign seal must bind all six registered arms"
+    );
+    ensure!(
+        campaign_seal
+            .arms
+            .values()
+            .all(|entry| entry.evaluator_status == "qualified"),
+        "campaign seal contains an unqualified arm"
+    );
+    ensure!(
+        campaign_seal.arms.values().all(|entry| {
+            entry.selection_report_sha256 == entry.replay_selection_report_sha256
+                && entry.fitted_state_sha256 == entry.replay_fitted_state_sha256
+        }),
+        "campaign seal contains a non-identical selection replay"
+    );
+    let arm_seal = campaign_seal
+        .arms
+        .get(arm)
+        .with_context(|| format!("arm {arm} missing from campaign seal"))?;
+    ensure!(
+        arm_seal.selection_report_sha256 == selection_sha,
+        "campaign_seal.arms.{arm}.selection_report_sha256 mismatch"
+    );
+    ensure!(
+        arm_seal.fitted_state_sha256 == state_sha,
+        "campaign_seal.arms.{arm}.fitted_state_sha256 mismatch"
+    );
+    ensure!(
+        arm_seal.replay_selection_report_sha256 == arm_seal.selection_report_sha256,
+        "campaign_seal.arms.{arm} selection replay is not byte-identical"
+    );
+    ensure!(
+        arm_seal.replay_fitted_state_sha256 == arm_seal.fitted_state_sha256,
+        "campaign_seal.arms.{arm} fitted-state replay is not byte-identical"
+    );
+    let checkpoint_sha = sha256_file(&cfg.checkpoint)?;
+    let train_config_sha = sha256_file(&cfg.train_config)?;
+    ensure!(
+        arm_seal.checkpoint_sha256 == checkpoint_sha,
+        "campaign_seal.arms.{arm}.checkpoint_sha256 mismatch"
+    );
+    ensure!(
+        arm_seal.train_config_sha256 == train_config_sha,
+        "campaign_seal.arms.{arm}.train_config_sha256 mismatch"
+    );
+    ensure!(
+        selection.checkpoint_sha256 == checkpoint_sha && state.checkpoint_sha256 == checkpoint_sha,
+        "checkpoint identity differs across report/state/current input"
+    );
+    ensure!(
+        selection.train_config_sha256 == train_config_sha
+            && state.train_config_sha256 == train_config_sha,
+        "train-config identity differs across report/state/current input"
+    );
+    ensure!(
+        selection.source_population_fingerprint == state.source_population_fingerprint,
+        "source_population_fingerprint differs between report and state"
+    );
+    ensure!(
+        selection.population_fingerprint == state.population_fingerprint,
+        "population_fingerprint differs between report and state"
+    );
+    ensure!(
+        selection.target_latents_sha256 == state.target_latents_sha256,
+        "target_latents_sha256 differs between report and state"
+    );
+    ensure!(
+        selection.predicted_latents_sha256 == state.predicted_latents_sha256,
+        "predicted_latents_sha256 differs between report and state"
+    );
+    ensure!(
+        selection.split == state.split,
+        "split differs between report and state"
+    );
+    ensure!(
+        selection.families.len() == state.families.len(),
+        "family count differs between report and state"
+    );
+    ensure!(
+        selection.population_seed == POPULATION_SEED
+            && selection.synthetic_episodes_per_source == SYNTHETIC_EPISODES
+            && selection.protocol.feature_width == FEATURE_WIDTH
+            && selection.protocol.inputs_per_feature == INPUTS_PER_FEATURE
+            && selection.protocol.feature_seeds == FEATURE_SEEDS
+            && selection.protocol.ridge == crate::p2::board_probe::RIDGE
+            && selection.protocol.model_weights_frozen
+            && !selection.protocol.optimizer_used,
+        "selection protocol differs from the compiled sealed protocol"
+    );
+    for (report_family, state_family) in selection.families.iter().zip(&state.families) {
         ensure!(
-            current.name == prior.name
-                && current.qualification == prior.qualification
-                && current.route_selection_diagnostics == prior.route_selection_diagnostics,
-            "selection diagnostics changed before final scoring for family {}",
-            current.name
+            report_family.name == state_family.name,
+            "family order differs: report={} state={}",
+            report_family.name,
+            state_family.name
         );
     }
+    Ok(())
+}
+
+fn verify_file_sha(path: &Path, expected: &str, label: &str) -> Result<()> {
+    ensure!(
+        expected.len() == 64
+            && expected
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "{label} SHA-256 must be 64 lowercase hexadecimal characters"
+    );
+    let actual = sha256_file(path)?;
+    ensure!(
+        actual == expected,
+        "{label} SHA-256 mismatch: expected={expected} actual={actual}"
+    );
+    Ok(())
+}
+
+fn selection_state_payload_sha256(state: &SelectionState) -> String {
+    let mut payload = state.clone();
+    payload.payload_sha256.clear();
+    let encoded = serde_json::to_vec(&payload).expect("selection state is serializable");
+    format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    serde_json::from_slice(&fs::read(path).with_context(|| format!("read {}", path.display()))?)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+fn create_final_access_marker(
+    path: &Path,
+    arm: &str,
+    final_seed: u64,
+    selection_sha: &str,
+    state_sha: &str,
+    campaign_seal_sha: &str,
+) -> Result<()> {
+    let marker = serde_json::json!({
+        "schema": "p2.semantic_access.fixed_coarse.final_access.v1",
+        "arm": arm,
+        "final_population_seed": final_seed,
+        "selection_report_sha256": selection_sha,
+        "fitted_state_sha256": state_sha,
+        "campaign_selection_seal_sha256": campaign_seal_sha
+    });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create one-shot final-access marker {}", path.display()))?;
+    file.write_all(&serde_json::to_vec_pretty(&marker)?)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -1111,12 +1558,14 @@ fn partitions(samples: &[crate::p2::data::TransitionSample]) -> Partitions {
     result
 }
 
-fn validate_partitions(parts: &Partitions) -> Result<()> {
+fn validate_selection_partitions(parts: &Partitions) -> Result<()> {
     ensure!(
-        !parts.train_frames.is_empty()
-            && !parts.selection_frames.is_empty()
-            && !parts.final_frames.is_empty(),
-        "episode split contains an empty partition"
+        !parts.train_frames.is_empty() && !parts.selection_frames.is_empty(),
+        "selection population contains an empty train or selection partition"
+    );
+    ensure!(
+        parts.final_frames.is_empty(),
+        "selection collector encoded forbidden final rows"
     );
     let mut all = BTreeSet::new();
     for index in parts
@@ -1238,7 +1687,7 @@ fn sha256_rows(rows: &[Vec<f32>]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn write_json_create_new(path: &Path, report: &Report) -> Result<()> {
+fn write_json_create_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1251,7 +1700,7 @@ fn write_json_create_new(path: &Path, report: &Report) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     let mut file = options.open(&staging)?;
-    file.write_all(&serde_json::to_vec_pretty(report)?)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.sync_all()?;
     fs::rename(staging, path)?;
     Ok(())
@@ -1334,6 +1783,118 @@ mod tests {
                 && ridge - ensemble >= CONTROL_MIN_ABSOLUTE_IMPROVEMENT,
             "ridge={ridge} ensemble={ensemble} per_seed={per_seed:?} reduction={reduction}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn selection_state_round_trip_preserves_fit_bits_and_payload_seal() -> Result<()> {
+        let rows = (0usize..640)
+            .map(|row| {
+                (0usize..128)
+                    .map(|channel| ((row * 17 + channel * 13) % 101) as f32 / 50.0 - 1.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let targets = rows
+            .iter()
+            .map(|row| {
+                let mut target = [0.0; PALETTE_SIZE];
+                target[0] = row[3] * row[71];
+                target[1] = row[11].max(0.0);
+                target
+            })
+            .collect::<Vec<_>>();
+        let fit_rows = (0..512).collect::<Vec<_>>();
+        let fitted = fit_ensemble(&rows, &rows, &targets, &fit_rows)?;
+        let mut state = SelectionState {
+            schema: STATE_SCHEMA.into(),
+            checkpoint_sha256: "a".repeat(64),
+            train_config_sha256: "b".repeat(64),
+            source_population_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            population_fingerprint: format!("sha256:{}", "d".repeat(64)),
+            target_latents_sha256: format!("sha256:{}", "e".repeat(64)),
+            predicted_latents_sha256: format!("sha256:{}", "f".repeat(64)),
+            split: SplitManifest {
+                train_frames: 3,
+                selection_frames: 2,
+                final_frames: 0,
+                train_rows: 192,
+                selection_rows: 128,
+                final_rows: 0,
+                rule: "test".into(),
+            },
+            families: vec![FittedFamilyState {
+                name: "local".into(),
+                target_fit: fitted.clone(),
+                predicted_fit: fitted,
+            }],
+            payload_sha256: String::new(),
+        };
+        state.payload_sha256 = selection_state_payload_sha256(&state);
+        let encoded = serde_json::to_vec_pretty(&state)?;
+        let decoded: SelectionState = serde_json::from_slice(&encoded)?;
+        assert_eq!(
+            state.payload_sha256,
+            selection_state_payload_sha256(&decoded)
+        );
+        assert!(state == decoded);
+
+        let held_out = (512..640).collect::<Vec<_>>();
+        let before = predict_ensemble(
+            &state.families[0].target_fit,
+            &select_rows(&rows, &held_out),
+            &select_rows(&rows, &held_out),
+        )?;
+        let after = predict_ensemble(
+            &decoded.families[0].target_fit,
+            &select_rows(&rows, &held_out),
+            &select_rows(&rows, &held_out),
+        )?;
+        assert_eq!(before.ensemble, after.ensemble);
+        Ok(())
+    }
+
+    #[test]
+    fn selection_state_payload_seal_detects_float_mutation() -> Result<()> {
+        let rows = (0usize..300)
+            .map(|row| vec![(row % 17) as f32 / 16.0; 128])
+            .collect::<Vec<_>>();
+        let mut targets = vec![[0.0; PALETTE_SIZE]; rows.len()];
+        for (row, target) in targets.iter_mut().enumerate() {
+            target[0] = (row % 11) as f32 / 10.0;
+        }
+        let fit_rows = (0..rows.len()).collect::<Vec<_>>();
+        let fitted = fit_ensemble(&rows, &rows, &targets, &fit_rows)?;
+        let mut state = SelectionState {
+            schema: STATE_SCHEMA.into(),
+            checkpoint_sha256: "a".repeat(64),
+            train_config_sha256: "b".repeat(64),
+            source_population_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            population_fingerprint: format!("sha256:{}", "d".repeat(64)),
+            target_latents_sha256: format!("sha256:{}", "e".repeat(64)),
+            predicted_latents_sha256: format!("sha256:{}", "f".repeat(64)),
+            split: SplitManifest {
+                train_frames: 1,
+                selection_frames: 1,
+                final_frames: 0,
+                train_rows: 1,
+                selection_rows: 1,
+                final_rows: 0,
+                rule: "test".into(),
+            },
+            families: vec![FittedFamilyState {
+                name: "local".into(),
+                target_fit: fitted.clone(),
+                predicted_fit: fitted,
+            }],
+            payload_sha256: String::new(),
+        };
+        state.payload_sha256 = selection_state_payload_sha256(&state);
+        let sealed = state.payload_sha256.clone();
+        state.families[0].target_fit.input_standardization.mean[0] = f32::from_bits(
+            state.families[0].target_fit.input_standardization.mean[0].to_bits() + 1,
+        );
+        assert_ne!(sealed, selection_state_payload_sha256(&state));
         Ok(())
     }
 }

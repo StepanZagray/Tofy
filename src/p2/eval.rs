@@ -855,7 +855,18 @@ pub(crate) struct FrozenBoardProbePopulation {
     pub source_by_sample: Vec<String>,
     pub target_rows: BoardProbeRows,
     pub predicted_rows: Option<BoardProbeRows>,
+    /// Fingerprint before an audit-specific partition filter is applied.
+    pub source_population_fingerprint: String,
     pub population_fingerprint: String,
+}
+
+/// Which rows a semantic-access process is permitted to encode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SemanticAccessPopulation {
+    /// Preserve the historical fit population while excluding the old held-out rows.
+    SelectionFit,
+    /// Encode every row from a fresh, domain-separated population seed.
+    FreshFinal,
 }
 
 pub(crate) fn collect_frozen_board_probe_population(
@@ -874,6 +885,7 @@ pub(crate) fn collect_frozen_board_probe_population(
         physical_batch,
         device_spec,
         false,
+        SemanticAccessPopulation::FreshFinal,
     )
 }
 
@@ -893,6 +905,28 @@ pub(crate) fn collect_frozen_board_probe_population_with_predictions(
         physical_batch,
         device_spec,
         true,
+        SemanticAccessPopulation::FreshFinal,
+    )
+}
+
+pub(crate) fn collect_frozen_board_probe_population_partition_with_predictions(
+    checkpoint: &Path,
+    train_config: &Path,
+    seed: u64,
+    synthetic_episodes: usize,
+    physical_batch: usize,
+    device_spec: &str,
+    population: SemanticAccessPopulation,
+) -> Result<FrozenBoardProbePopulation> {
+    collect_frozen_board_probe_population_inner(
+        checkpoint,
+        train_config,
+        seed,
+        synthetic_episodes,
+        physical_batch,
+        device_spec,
+        true,
+        population,
     )
 }
 
@@ -905,6 +939,7 @@ fn collect_frozen_board_probe_population_inner(
     physical_batch: usize,
     device_spec: &str,
     include_predictions: bool,
+    partition: SemanticAccessPopulation,
 ) -> Result<FrozenBoardProbePopulation> {
     let train_cfg = load_train_config(train_config)?;
     let device = resolve_device(device_spec)?;
@@ -918,6 +953,12 @@ fn collect_frozen_board_probe_population_inner(
         "hazard_one_step".into(),
         collect_hazard_samples(seed, synthetic_episodes)?,
     ));
+    let source_population_fingerprint = semantic_population_fingerprint(&flatten_sources(&sources));
+    if partition == SemanticAccessPopulation::SelectionFit {
+        for (_, samples) in &mut sources {
+            samples.retain(|sample| sample.episode_id.is_multiple_of(3));
+        }
+    }
     let samples = flatten_sources(&sources);
     let source_by_sample = sources
         .iter()
@@ -945,6 +986,7 @@ fn collect_frozen_board_probe_population_inner(
         )
     };
     Ok(FrozenBoardProbePopulation {
+        source_population_fingerprint,
         population_fingerprint: semantic_population_fingerprint(&samples),
         samples,
         source_by_sample,

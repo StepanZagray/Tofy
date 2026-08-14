@@ -691,6 +691,22 @@ pub struct P2SemanticAccessFixedArgs {
     #[arg(long)]
     pub selection_reference_sha256: Option<String>,
     #[arg(long)]
+    pub fitted_state_output: Option<PathBuf>,
+    #[arg(long)]
+    pub fitted_state_reference: Option<PathBuf>,
+    #[arg(long)]
+    pub fitted_state_reference_sha256: Option<String>,
+    #[arg(long)]
+    pub campaign_selection_seal: Option<PathBuf>,
+    #[arg(long)]
+    pub campaign_selection_seal_sha256: Option<String>,
+    #[arg(long)]
+    pub arm: Option<String>,
+    #[arg(long)]
+    pub final_population_seed: Option<u64>,
+    #[arg(long)]
+    pub final_access_marker: Option<PathBuf>,
+    #[arg(long)]
     pub output: PathBuf,
 }
 
@@ -704,6 +720,14 @@ pub fn run_p2_semantic_access_fixed(args: P2SemanticAccessFixedArgs) -> Result<(
         required_population_fingerprint: args.require_population_fingerprint,
         selection_reference: args.selection_reference,
         selection_reference_sha256: args.selection_reference_sha256,
+        fitted_state_output: args.fitted_state_output,
+        fitted_state_reference: args.fitted_state_reference,
+        fitted_state_reference_sha256: args.fitted_state_reference_sha256,
+        campaign_selection_seal: args.campaign_selection_seal,
+        campaign_selection_seal_sha256: args.campaign_selection_seal_sha256,
+        arm: args.arm,
+        final_population_seed: args.final_population_seed,
+        final_access_marker: args.final_access_marker,
         output: args.output,
     })?;
     println!(
