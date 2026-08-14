@@ -10,6 +10,7 @@ use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic};
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
+use crate::p2::semantic_access::{run_semantic_access_audit, SemanticAccessConfig};
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
@@ -567,6 +568,60 @@ pub fn run_p2_eval(args: P2EvalArgs) -> Result<()> {
             .as_ref()
             .and_then(|m| m.latent_covariance_frobenius),
         report.arc3_recording_runs.as_ref().map(|b| b.n_runs),
+    );
+    Ok(())
+}
+
+/// `p2-semantic-access-audit` — frozen target-latent accessibility audit.
+#[derive(Debug, Clone, Args)]
+pub struct P2SemanticAccessAuditArgs {
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+    #[arg(long)]
+    pub train_config: PathBuf,
+    #[arg(long, default_value_t = 424243)]
+    pub seed: u64,
+    #[arg(long, default_value_t = 64)]
+    pub synthetic_episodes: usize,
+    #[arg(long, default_value_t = 256)]
+    pub physical_batch: usize,
+    #[arg(long, default_value = "cuda:0")]
+    pub device: String,
+    #[arg(long, default_value_t = 64)]
+    pub decoder_hidden: usize,
+    #[arg(long, default_value_t = 40)]
+    pub decoder_epochs: usize,
+    #[arg(long, default_value_t = 6)]
+    pub decoder_patience: usize,
+    #[arg(long, default_value_t = 4096)]
+    pub decoder_batch: usize,
+    /// Fixed permutation count. At least 39 is required for the two-family gate.
+    #[arg(long, default_value_t = 39)]
+    pub permutations: usize,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+pub fn run_p2_semantic_access_audit(args: P2SemanticAccessAuditArgs) -> Result<()> {
+    let report = run_semantic_access_audit(&SemanticAccessConfig {
+        checkpoint: args.checkpoint,
+        train_config: args.train_config,
+        seed: args.seed,
+        synthetic_episodes: args.synthetic_episodes,
+        physical_batch: args.physical_batch,
+        device: args.device,
+        hidden_dim: args.decoder_hidden,
+        max_epochs: args.decoder_epochs,
+        patience: args.decoder_patience,
+        decoder_batch: args.decoder_batch,
+        permutation_seeds: (0..args.permutations)
+            .map(|index| 0x5345_4d41_4e54_0000u64.wrapping_add(index as u64))
+            .collect(),
+        output: args.output,
+    })?;
+    println!(
+        "p2-semantic-access-audit complete trusted={} fingerprint={}",
+        report.any_bounded_decoder_trusted, report.population_fingerprint
     );
     Ok(())
 }

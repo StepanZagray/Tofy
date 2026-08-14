@@ -34,6 +34,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -844,6 +845,83 @@ fn collect_synthetic_sources(
         sources[kind_index].1.extend(samples);
     }
     Ok(sources)
+}
+
+/// Immutable checkpoint-derived population used by bounded semantic-access audits.
+/// Evaluation owns model loading and synthetic population construction so audit
+/// decoders never gain access to trainer state or checkpoint gradients.
+pub(crate) struct FrozenBoardProbePopulation {
+    pub samples: Vec<TransitionSample>,
+    pub source_by_sample: Vec<String>,
+    pub target_rows: BoardProbeRows,
+    pub population_fingerprint: String,
+}
+
+pub(crate) fn collect_frozen_board_probe_population(
+    checkpoint: &Path,
+    train_config: &Path,
+    seed: u64,
+    synthetic_episodes: usize,
+    physical_batch: usize,
+    device_spec: &str,
+) -> Result<FrozenBoardProbePopulation> {
+    let train_cfg = load_train_config(train_config)?;
+    let device = resolve_device(device_spec)?;
+    let (model, _varmap) = load_model(&train_cfg, checkpoint, &device)?;
+    let mut sources = collect_synthetic_sources(
+        seed,
+        synthetic_episodes,
+        &["random_one_step", "exploration"],
+    )?;
+    sources.push((
+        "hazard_one_step".into(),
+        collect_hazard_samples(seed, synthetic_episodes)?,
+    ));
+    let samples = flatten_sources(&sources);
+    let source_by_sample = sources
+        .iter()
+        .flat_map(|(source, rows)| std::iter::repeat_n(source.clone(), rows.len()))
+        .collect::<Vec<_>>();
+    let mut target_rows: Option<BoardProbeRows> = None;
+    for (start, end) in batch_ranges(samples.len(), physical_batch) {
+        let batch = batch_from_samples(&samples[start..end], &device)?;
+        let rows = BoardProbeRows::from_spatial_latent(&model.encode_state(&batch.next_frames)?)?;
+        if let Some(all) = &mut target_rows {
+            all.append(rows);
+        } else {
+            target_rows = Some(rows);
+        }
+    }
+    Ok(FrozenBoardProbePopulation {
+        population_fingerprint: semantic_population_fingerprint(&samples),
+        samples,
+        source_by_sample,
+        target_rows: target_rows
+            .ok_or_else(|| anyhow::anyhow!("semantic-access population is empty"))?,
+    })
+}
+
+fn semantic_population_fingerprint(samples: &[TransitionSample]) -> String {
+    let mut digest = Sha256::new();
+    for sample in samples {
+        digest.update(sample.seed.to_le_bytes());
+        digest.update(sample.episode_id.to_le_bytes());
+        digest.update(sample.transition_index.to_le_bytes());
+        digest.update((sample.family.len() as u64).to_le_bytes());
+        digest.update(sample.family.as_bytes());
+        digest.update([
+            sample.action.id,
+            sample.action.x.unwrap_or(u8::MAX),
+            sample.action.y.unwrap_or(u8::MAX),
+        ]);
+        for frame in [&sample.current, &sample.next] {
+            digest.update(frame.width.to_le_bytes());
+            digest.update(frame.height.to_le_bytes());
+            digest.update((frame.pixels.len() as u64).to_le_bytes());
+            digest.update(&frame.pixels);
+        }
+    }
+    format!("sha256:{:x}", digest.finalize())
 }
 
 fn sample_population_fingerprint(samples: &[TransitionSample]) -> String {

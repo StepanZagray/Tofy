@@ -460,6 +460,40 @@ at `2026-08-08T11:18:01Z` without interference.
 This remains an inherited recovery/stability run, not a clean result, and it was
 never used to initialize the SIGReg/action A/B.
 
+### Pressure × Grounding V1 negative screen and exact-logical recovery (2026-08-14)
+
+The seed-1 parent at revision `ccc87452a0a0cac4dd9358bc689a2d3d85691b6b`
+trained all six `SIGReg dose × bundled grounding` arms for 500 updates at physical
+batch `1024`, accumulation `1`. Its registered final `ScurG0` evaluation aborted with
+a CUDA `index_select` device assertion and allocator corruption, so the historical
+campaign remains `failed_integrity_or_infrastructure`. A separately recorded
+exact-logical-endpoint retry used the registered binary/config/checkpoint, seed `424243`,
+64 episodes, eval batch `256`, and diagnostic `CUDA_LAUNCH_BLOCKING=1` exited zero
+and passed fresh hashes, population identity, and finite-H8 checks. The child
+Grounding Mechanism V1 queue stopped on the parent status and trained zero arms.
+
+No cell is promoted. Calibrated-SIGReg cells acquired update-500 learned-latent action
+ratios `1.2389` and `1.2875` with lower confidence bounds above one, and normalized
+H8 medians `0.8964` and `0.8674`. Those cells still had normalized H8 p95 `146.3`
+and `140.3`, consumer-rank fractions about `0.0178`, and target-decoder MSE `0.7928`
+and `0.6817` against the frozen `0.001` semantic-trust ceiling. Every predicted-board
+histogram was vastly worse than literal board copy.
+
+Initialization calibration did not control training pressure. Calibrated SIGReg
+later reached `5.33–8.97×` the next-latent encoder gradient and current SIGReg reached
+`1.73–4.99×`; every nonzero-SIGReg arm clipped 100% of optimizer updates, with mean
+clip scales about `0.0125` and `0.038`. Bundled grounding lowered target-decoder MSE
+in every matched pair but never passed the registered coarse-probe trust gate, and
+its predicted/H8 effects reversed by pressure stratum. The fixed mechanism queue
+must not be relaunched unchanged inside
+this clipping regime. The next highest-information experiment is an all-six-checkpoint
+frozen decoder audit: local ridge, fixed local MLP, and a bounded contextual decoder,
+with nested validation, exact stratified permutations, and positive/marginal controls.
+Its result selects between a richer state target and a prospective pressure-controlled
+SIGReg experiment without pretending a small local decoder proves state absence.
+Exact analysis is preserved at
+`ml/tofy/insights/pressure-grounding-v1-results.md` in the research library.
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**

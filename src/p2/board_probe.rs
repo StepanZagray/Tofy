@@ -166,6 +166,13 @@ impl FixedBoardProbe {
     /// Fits only the supplied training rows.  Each frame contributes 64 patch targets in row order.
     pub fn fit(train_latents: &[Vec<f32>], train_targets: &[ArcFrame]) -> Result<Self> {
         let targets = histograms_for_frames(train_targets)?;
+        Self::fit_histograms(train_latents, &targets)
+    }
+
+    pub(crate) fn fit_histograms(
+        train_latents: &[Vec<f32>],
+        targets: &[[f32; PALETTE_SIZE]],
+    ) -> Result<Self> {
         validate_fit_latents(train_latents, targets.len())?;
         let input_dim = train_latents[0].len();
         let row_count = train_latents.len();
@@ -198,7 +205,7 @@ impl FixedBoardProbe {
         }
 
         let mut output_mean = [0.0_f64; PALETTE_SIZE];
-        for target in &targets {
+        for target in targets {
             for palette_id in 0..PALETTE_SIZE {
                 output_mean[palette_id] += target[palette_id] as f64;
             }
@@ -209,7 +216,7 @@ impl FixedBoardProbe {
 
         let mut gram = vec![vec![0.0_f64; input_dim]; input_dim];
         let mut rhs = vec![[0.0_f64; PALETTE_SIZE]; input_dim];
-        for (row, target) in train_latents.iter().zip(&targets) {
+        for (row, target) in train_latents.iter().zip(targets) {
             let standardized: Vec<f64> = (0..input_dim)
                 .map(|feature| (row[feature] as f64 - input_mean[feature]) / input_std[feature])
                 .collect();
@@ -412,7 +419,7 @@ pub fn frame_patch_histograms(frame: &ArcFrame) -> Result<Vec<[f32; PALETTE_SIZE
     Ok(histograms)
 }
 
-fn histograms_for_frames(frames: &[ArcFrame]) -> Result<Vec<[f32; PALETTE_SIZE]>> {
+pub(crate) fn histograms_for_frames(frames: &[ArcFrame]) -> Result<Vec<[f32; PALETTE_SIZE]>> {
     let mut result = Vec::with_capacity(frames.len() * PATCH_COUNT);
     for frame in frames {
         result.extend(frame_patch_histograms(frame)?);
