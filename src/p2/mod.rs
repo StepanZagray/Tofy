@@ -19,6 +19,7 @@ pub mod prefetch;
 pub mod representation;
 pub mod rhae;
 pub mod semantic_access;
+pub mod semantic_access_v11;
 pub mod sigreg;
 pub mod train;
 pub mod view;

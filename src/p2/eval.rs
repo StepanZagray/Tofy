@@ -854,6 +854,7 @@ pub(crate) struct FrozenBoardProbePopulation {
     pub samples: Vec<TransitionSample>,
     pub source_by_sample: Vec<String>,
     pub target_rows: BoardProbeRows,
+    pub predicted_rows: Option<BoardProbeRows>,
     pub population_fingerprint: String,
 }
 
@@ -864,6 +865,46 @@ pub(crate) fn collect_frozen_board_probe_population(
     synthetic_episodes: usize,
     physical_batch: usize,
     device_spec: &str,
+) -> Result<FrozenBoardProbePopulation> {
+    collect_frozen_board_probe_population_inner(
+        checkpoint,
+        train_config,
+        seed,
+        synthetic_episodes,
+        physical_batch,
+        device_spec,
+        false,
+    )
+}
+
+pub(crate) fn collect_frozen_board_probe_population_with_predictions(
+    checkpoint: &Path,
+    train_config: &Path,
+    seed: u64,
+    synthetic_episodes: usize,
+    physical_batch: usize,
+    device_spec: &str,
+) -> Result<FrozenBoardProbePopulation> {
+    collect_frozen_board_probe_population_inner(
+        checkpoint,
+        train_config,
+        seed,
+        synthetic_episodes,
+        physical_batch,
+        device_spec,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_frozen_board_probe_population_inner(
+    checkpoint: &Path,
+    train_config: &Path,
+    seed: u64,
+    synthetic_episodes: usize,
+    physical_batch: usize,
+    device_spec: &str,
+    include_predictions: bool,
 ) -> Result<FrozenBoardProbePopulation> {
     let train_cfg = load_train_config(train_config)?;
     let device = resolve_device(device_spec)?;
@@ -882,22 +923,33 @@ pub(crate) fn collect_frozen_board_probe_population(
         .iter()
         .flat_map(|(source, rows)| std::iter::repeat_n(source.clone(), rows.len()))
         .collect::<Vec<_>>();
-    let mut target_rows: Option<BoardProbeRows> = None;
-    for (start, end) in batch_ranges(samples.len(), physical_batch) {
-        let batch = batch_from_samples(&samples[start..end], &device)?;
-        let rows = BoardProbeRows::from_spatial_latent(&model.encode_state(&batch.next_frames)?)?;
-        if let Some(all) = &mut target_rows {
-            all.append(rows);
-        } else {
-            target_rows = Some(rows);
+    let (target_rows, predicted_rows) = if include_predictions {
+        let (target, predicted) =
+            board_probe_rows_for_samples(&model, &samples, physical_batch, &device)?;
+        (target, Some(predicted))
+    } else {
+        let mut target_rows: Option<BoardProbeRows> = None;
+        for (start, end) in batch_ranges(samples.len(), physical_batch) {
+            let batch = batch_from_samples(&samples[start..end], &device)?;
+            let rows =
+                BoardProbeRows::from_spatial_latent(&model.encode_state(&batch.next_frames)?)?;
+            if let Some(all) = &mut target_rows {
+                all.append(rows);
+            } else {
+                target_rows = Some(rows);
+            }
         }
-    }
+        (
+            target_rows.ok_or_else(|| anyhow::anyhow!("semantic-access population is empty"))?,
+            None,
+        )
+    };
     Ok(FrozenBoardProbePopulation {
         population_fingerprint: semantic_population_fingerprint(&samples),
         samples,
         source_by_sample,
-        target_rows: target_rows
-            .ok_or_else(|| anyhow::anyhow!("semantic-access population is empty"))?,
+        target_rows,
+        predicted_rows,
     })
 }
 

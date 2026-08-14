@@ -494,6 +494,64 @@ SIGReg experiment without pretending a small local decoder proves state absence.
 Exact analysis is preserved at
 `ml/tofy/insights/pressure-grounding-v1-results.md` in the research library.
 
+### Semantic Access V1 frozen audit (2026-08-14)
+
+The recommended six-checkpoint audit completed on the A40 at revision
+`997883fe94e4b191a0b5d6f35dee6c58f92c6817`, binary SHA-256
+`7d9dcc22e986d3609d32837fb9b3db930b54f80d312259e84d7a0646417ed2ab`,
+under `runs/p2/semantic-access-v1-20260814T092508Z`. All six primary CUDA paths
+exited successfully, every root/per-arm checksum verified, and no model weights were
+updated. The common population used seed `424243`, 64 episodes per source, evaluation
+batch `256`, decoder batch `4096`, 39 registered episode derangements, and an
+episode-disjoint 71/37/214 train/selection/final split.
+
+| Arm | Descriptive ridge MSE | Local MLP MSE / rank | Contextual MLP MSE / rank | Registered trust |
+|---|---:|---:|---:|---|
+| `S0G0` | 0.02052 | 4.26364 / 0.050 | 1.48385 / 0.025 | no |
+| `S0G1` | 0.01301 | 4.35486 / 0.025 | 1.09325 / 0.025 | no |
+| `ScalG0` | 0.79255 | 73.44678 / 0.875 | 6.54460 / 0.025 | no |
+| `ScalG1` | 0.68159 | 71.23297 / 0.975 | 6.30179 / 1.000 | no |
+| `ScurG0` | 0.88550 | 41.54501 / 1.000 | 4.30441 / 0.025 | no |
+| `ScurG1` | 0.76245 | 30.58390 / 0.625 | 4.38978 / 0.050 | no |
+
+The registered all-negative gate is valid and the preserved launcher decision is
+`richer_exact_semantic_grounding`; no metric is promoted to Best So Far. Scientifically,
+that string is not a causal result. Every MLP selected its maximum 40 epochs and was
+far worse than ridge, while the positive control used target histograms through ridge
+rather than the MLP path. The derangement ranks are not demonstrated exact permutation
+p-values, and the target is coarse patch composition from the encoded true-next frame,
+not predicted-next state. Descriptively, no-SIGReg ridge is 38.6–58.6 times better than
+matched nonzero-SIGReg checkpoints, and grounding improves all three ridge pairs by
+36.6%, 14.0%, and 13.9%.
+
+The next experiment is evaluation-only Semantic Access V1.1 on a fresh population.
+Stage B1 first qualifies a ridge-nested residual MLP with target normalization, a
+same-fitting-path observable control, matched optimizer-step budgets, and fail-closed
+convergence checks. Only after every selector converges does it score true-next encoder,
+target-decoder transfer to predicted-next, and predicted-only decoder seams for the
+coarse patch target. This is a descriptive localization stage: it has no null p-values
+and cannot authorize a model-level conclusion. If it qualifies, the preregistered next
+stage is the coordinate-aware exact-cell target; otherwise only the evaluator is repaired.
+The campaign enforces this globally: it runs selection-only on all six checkpoints first,
+and no checkpoint scores the final partition unless all six qualify. Final invocations
+must reproduce their checksum-verified selection diagnostics exactly before scoring.
+Together the gated stages choose among probe repair, trajectory-pressure control,
+predictor alignment, exact-cell grounding, and action/rollout work before another
+model-training campaign.
+
+```bash
+TOFY_BIN=/workspace/Personal/Tofy/target/semantic-access-v1/release/tofy \
+P2_AUDIT_PARENT_ROOT=/workspace/Personal/Tofy/runs/p2/pressure-grounding-v1-20260813T200848Z \
+P2_SEMANTIC_AUDIT_ROOT=/workspace/Personal/Tofy/runs/p2/semantic-access-v1-20260814T092508Z \
+P2_EXPECTED_SHA=997883fe94e4b191a0b5d6f35dee6c58f92c6817 \
+P2_EXPECTED_BINARY_SHA=7d9dcc22e986d3609d32837fb9b3db930b54f80d312259e84d7a0646417ed2ab \
+P2_EXPECTED_PARENT_SHA=ccc87452a0a0cac4dd9358bc689a2d3d85691b6b \
+P2_EXPECTED_PARENT_BINARY_SHA=cb1e7bded0da2fcfc645521283251db4e8fa3477eec2f57429365c88b9dacfec \
+P2_SEMANTIC_EVAL_BATCH=256 P2_SEMANTIC_DECODER_BATCH=4096 \
+P2_SEMANTIC_PERMUTATIONS=39 \
+bash scripts/p2_semantic_access_campaign.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**

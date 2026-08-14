@@ -11,6 +11,9 @@ use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::semantic_access::{run_semantic_access_audit, SemanticAccessConfig};
+use crate::p2::semantic_access_v11::{
+    run as run_semantic_access_v11, Config as SemanticAccessV11Config,
+};
 use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
@@ -622,6 +625,45 @@ pub fn run_p2_semantic_access_audit(args: P2SemanticAccessAuditArgs) -> Result<(
     println!(
         "p2-semantic-access-audit complete trusted={} fingerprint={}",
         report.any_bounded_decoder_trusted, report.population_fingerprint
+    );
+    Ok(())
+}
+
+/// `p2-semantic-access-v11-audit` — sealed, qualified target/prediction seam audit.
+#[derive(Debug, Clone, Args)]
+pub struct P2SemanticAccessV11Args {
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+    #[arg(long)]
+    pub train_config: PathBuf,
+    #[arg(long, default_value_t = 256)]
+    pub physical_batch: usize,
+    #[arg(long, default_value = "cuda:0")]
+    pub device: String,
+    #[arg(long)]
+    pub selection_only: bool,
+    #[arg(long)]
+    pub forbid_population_fingerprint: Option<String>,
+    #[arg(long)]
+    pub selection_reference: Option<PathBuf>,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+pub fn run_p2_semantic_access_v11(args: P2SemanticAccessV11Args) -> Result<()> {
+    let report = run_semantic_access_v11(&SemanticAccessV11Config {
+        checkpoint: args.checkpoint,
+        train_config: args.train_config,
+        physical_batch: args.physical_batch,
+        device: args.device,
+        selection_only: args.selection_only,
+        forbidden_population_fingerprint: args.forbid_population_fingerprint,
+        selection_reference: args.selection_reference,
+        output: args.output,
+    })?;
+    println!(
+        "p2-semantic-access-v11-audit complete evaluator_status={} fingerprint={}",
+        report.evaluator_status, report.population_fingerprint
     );
     Ok(())
 }
