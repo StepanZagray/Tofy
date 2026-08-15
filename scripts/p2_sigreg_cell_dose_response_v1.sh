@@ -5,6 +5,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
+eval_validator="$script_dir/p2_validate_eval.sh"
 tofy_bin="${TOFY_BIN:-$repo_root/target/release/tofy}"
 candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 run_root="${P2_SIGREG_CELL_DOSE_ROOT:-$repo_root/runs/p2/sigreg-cell-dose-response-v1-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -14,10 +15,11 @@ eval_batch="${P2_SIGREG_EVAL_BATCH:-256}"
 : "${P2_EXPECTED_SHA:?set the reviewed Tofy commit}"
 : "${P2_EXPECTED_CANDLE_SHA:?set the reviewed candle_graph commit}"
 : "${P2_EXPECTED_BINARY_SHA:?set the reviewed release binary SHA-256}"
-for command in git jq nvidia-smi sha256sum awk realpath date mkdir mv env cmp sleep timeout wc find sort xargs; do
+for command in bash git jq nvidia-smi sha256sum awk realpath date mkdir mv env cmp sleep timeout find sort xargs; do
   command -v "$command" >/dev/null || { printf 'missing command: %s\n' "$command" >&2; exit 2; }
 done
 [[ -x "$tofy_bin" ]] || { printf 'missing release binary: %s\n' "$tofy_bin" >&2; exit 2; }
+[[ -r "$eval_validator" ]] || { printf 'missing evaluation validator: %s\n' "$eval_validator" >&2; exit 2; }
 [[ "$eval_batch" =~ ^[1-9][0-9]*$ && "$gpu_interval" =~ ^[1-9][0-9]*$ ]] || {
   printf 'evaluation batch and telemetry interval must be positive integers\n' >&2; exit 2;
 }
@@ -99,41 +101,6 @@ run_tracked() {
   if wait "$active_pid"; then rc=0; else rc=$?; fi
   active_pid=""
   return "$rc"
-}
-
-validate_eval() {
-  local report="$1" episodes="$2" expected_seed="$3"
-  jq -e --argjson expected_seed "$expected_seed" '
-    def finite_number: type=="number" and .>-1e300 and .<1e300;
-    .schema=="p2.eval_report.v13" and .seed==$expected_seed
-    and (.board_probe.population_fingerprint|type=="string" and length>0)
-    and (.board_probe.metrics.trusted|type=="boolean")
-    and (.synthetic_dynamics.n_samples|type=="number" and .>0)
-    and (.synthetic_dynamics.representation.effective_rank_fraction|finite_number)
-    and (.synthetic_dynamics.representation.noncollapse_pass|type=="boolean")
-    and (.synthetic_dynamics.changed_transitions.improvement_fraction|finite_number)
-    and (.synthetic_dynamics.changed_transitions.improvement_ci95_low|finite_number)
-    and (.synthetic_dynamics.changed_transitions.ten_percent_improvement_pass|type=="boolean")
-    and (.synthetic_dynamics.action_diagnostics.aggregate.shuffle.ratio|finite_number)
-    and (.synthetic_dynamics.action_diagnostics.aggregate.shuffle.ratio_ci95_low|finite_number)
-    and (.synthetic_dynamics.action_diagnostics.aggregate.shuffle.action_conditioning_pass|type=="boolean")
-    and (.synthetic_dynamics.rollout.h4.n==128)
-    and (.synthetic_dynamics.rollout.h4.finite_n==.synthetic_dynamics.rollout.h4.n)
-    and (.synthetic_dynamics.rollout.h8.n==64)
-    and (.synthetic_dynamics.rollout.h8.finite_n==.synthetic_dynamics.rollout.h8.n)
-    and (.synthetic_dynamics.rollout.h4.normalized_mean|finite_number)
-    and (.synthetic_dynamics.rollout.h4.normalized_cvar95|finite_number)
-    and (.synthetic_dynamics.rollout.h8.normalized_mean|finite_number)
-    and (.synthetic_dynamics.rollout.h8.normalized_cvar95|finite_number)
-    and (.synthetic_dynamics.rollout.h8.fraction_beating_copy|finite_number)
-    and (.synthetic_dynamics.q.n|type=="number" and .>0)
-    and (.synthetic_dynamics.q.brier|finite_number)
-    and (.synthetic_dynamics.q.positive_label_rate|finite_number)
-    and (.synthetic_dynamics.q.saturated|type=="boolean")
-    and ((.synthetic_dynamics.q.balanced_accuracy==null)
-      or (.synthetic_dynamics.q.balanced_accuracy|finite_number))' "$report" >/dev/null
-  jq -e . "$episodes" >/dev/null
-  [[ "$(wc -l <"$episodes")" -eq 450 ]]
 }
 
 cleanup() {
@@ -249,7 +216,7 @@ run_arm() {
     )
     if run_tracked "$eval_dir/eval.log" timeout --signal=TERM --kill-after=60s 30m \
       "${eval_cmd[@]}" && \
-      validate_eval "$eval_dir/eval_report.json" "$eval_dir/episodes.jsonl" "$eval_seed"; then
+      bash "$eval_validator" "$eval_dir/eval_report.json" "$eval_dir/episodes.jsonl" "$eval_seed"; then
       :
     else
       [[ ! -e "$eval_dir/eval_report.json" ]] ||
@@ -258,7 +225,7 @@ run_arm() {
         mv -- "$eval_dir/episodes.jsonl" "$eval_dir/episodes.failed-attempt-1.jsonl"
       run_tracked "$eval_dir/eval.retry.log" timeout --signal=TERM --kill-after=60s 30m \
         env CUDA_LAUNCH_BLOCKING=1 "${eval_cmd[@]}"
-      validate_eval "$eval_dir/eval_report.json" "$eval_dir/episodes.jsonl" "$eval_seed"
+      bash "$eval_validator" "$eval_dir/eval_report.json" "$eval_dir/episodes.jsonl" "$eval_seed"
     fi
     (
       cd "$run_root"
