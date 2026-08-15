@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Re-evaluate the completed cell-TC-QQ dose campaign with the deconfounded
 # changed-conditioning-only action metric. This is a frozen-checkpoint premise audit;
-# it performs no training and must pass the registered cross-binary replay envelope.
+# it performs no training and must pass registered, metric-scoped replay gates.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 eval_validator="$script_dir/p2_validate_eval.sh"
+replay_validator="$script_dir/p2_validate_replay.sh"
 tofy_bin="${TOFY_BIN:-$repo_root/target/release/tofy}"
 candle_root="${P2_CANDLE_ROOT:-$repo_root/../candle_graph}"
 source_run="${P2_ACTION_PREMISE_SOURCE_RUN:?set the completed dose-response run root}"
@@ -17,15 +18,20 @@ updates_spec="${P2_ACTION_PREMISE_UPDATES:-125 250}"
 scope_note="${P2_ACTION_PREMISE_SCOPE_NOTE:-}"
 gpu_interval="${P2_GPU_SAMPLE_INTERVAL:-15}"
 eval_seed=424248
+binary_build_command="${P2_BINARY_BUILD_COMMAND:?set the exact binary build command}"
 
 : "${P2_EXPECTED_SHA:?set the reviewed Tofy commit}"
 : "${P2_EXPECTED_SOURCE_SHA:?set the source campaign Tofy commit}"
 : "${P2_EXPECTED_CANDLE_SHA:?set the reviewed candle_graph commit}"
 : "${P2_EXPECTED_BINARY_SHA:?set the reviewed release binary SHA-256}"
-for command in awk bash cmp cut date find git grep jq mkdir mv nvidia-smi paste realpath sha256sum sleep sort timeout wc xargs; do
+: "${P2_EXPECTED_BINARY_SOURCE_SHA:?set the Tofy commit used to build the binary}"
+for command in awk bash date find git grep jq mkdir mv nvidia-smi realpath setsid sha256sum sleep sort timeout wc xargs; do
   command -v "$command" >/dev/null || { printf 'missing command: %s\n' "$command" >&2; exit 2; }
 done
 [[ "$eval_batch" =~ ^[1-9][0-9]*$ && "$gpu_interval" =~ ^[1-9][0-9]*$ ]] || exit 2
+[[ "$binary_build_command" == "cargo build --release --locked --features cudnn" ]] || {
+  printf 'unexpected binary build command\n' >&2; exit 2;
+}
 case "$updates_spec" in
   "125 250")
     checkpoints_json='[125,250]'; evaluation_count=20
@@ -37,7 +43,7 @@ case "$updates_spec" in
     ;;
   *) printf 'P2_ACTION_PREMISE_UPDATES must be "125 250" or "250"\n' >&2; exit 2 ;;
 esac
-[[ -x "$tofy_bin" && -r "$eval_validator" && -d "$source_run" ]] || exit 2
+[[ -x "$tofy_bin" && -r "$eval_validator" && -r "$replay_validator" && -d "$source_run" ]] || exit 2
 
 source_run="$(realpath "$source_run")"
 device_smoke_run="$(realpath "$device_smoke_run")"
@@ -56,10 +62,15 @@ source_manifest_sha="$(sha256sum "$source_manifest" | awk '{print $1}')"
 [[ "$(jq -r .binary_sha256 "$device_smoke_run/campaign.json")" == "$binary_sha" ]] || {
   printf 'device smoke binary SHA mismatch\n' >&2; exit 2;
 }
+[[ "$(jq -r .git_sha "$device_smoke_run/campaign.json")" == "$P2_EXPECTED_BINARY_SOURCE_SHA" ]] || {
+  printf 'device smoke binary-source SHA mismatch\n' >&2; exit 2;
+}
 smoke_report="$device_smoke_run/seed-2/S0/eval-update-125/eval_report.json"
 smoke_log="$device_smoke_run/seed-2/S0/eval-update-125/eval.log"
 [[ -s "$smoke_report" && -s "$smoke_log" ]] || { printf 'incomplete device smoke\n' >&2; exit 2; }
 grep -q 'p2-eval smoke complete' "$smoke_log" || { printf 'device smoke did not finish\n' >&2; exit 2; }
+smoke_report_sha="$(sha256sum "$smoke_report" | awk '{print $1}')"
+smoke_log_sha="$(sha256sum "$smoke_log" | awk '{print $1}')"
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || { printf 'dirty Tofy checkout\n' >&2; exit 2; }
 [[ -z "$(git -C "$candle_root" status --porcelain)" ]] || { printf 'dirty candle_graph checkout\n' >&2; exit 2; }
 [[ "$source_status" == complete || "$source_status" == complete_pending_analysis ]] || {
@@ -87,6 +98,14 @@ started_epoch="$(date +%s)"
 campaign_finalized=false
 telemetry_pid=""
 active_pid=""
+active_pgid=""
+
+assert_binary_unchanged() {
+  [[ "$(sha256sum "$tofy_bin" | awk '{print $1}')" == "$binary_sha" ]] || {
+    printf 'launch binary changed during campaign\n' >&2
+    return 1
+  }
+}
 
 finish_campaign() {
   local status="$1"
@@ -126,81 +145,46 @@ stop_telemetry() {
 run_tracked() {
   local log_path="$1" rc
   shift
-  "$@" >"$log_path" 2>&1 &
+  assert_binary_unchanged
+  setsid "$@" >"$log_path" 2>&1 &
   active_pid=$!
+  active_pgid="$active_pid"
+  printf '%s\n' "$active_pid" >"${log_path}.pid"
   if wait "$active_pid"; then rc=0; else rc=$?; fi
+  printf '%s\n' "$rc" >"${log_path}.exit-code"
+  if kill -0 -- "-$active_pgid" 2>/dev/null; then
+    printf 'evaluation process group still active after wait: %s\n' "$active_pgid" >&2
+    return 1
+  fi
   active_pid=""
+  active_pgid=""
+  assert_binary_unchanged
   return "$rc"
-}
-
-# Rebuilt CUDA/cuDNN binaries are not guaranteed to be bitwise reproducible. Keep
-# replay fail-closed by requiring the same JSON shape, exact identity/count fields,
-# and a narrow envelope for numeric outputs. Boolean/string/null decisions remain
-# exact in the structure comparison.
-validate_numeric_replay() {
-  local reference="$1" candidate="$2" prefix="$3"
-  local absolute_limit="${4:-0.000001}" relative_limit="${5:-0.01}"
-  jq -S 'walk(if type=="number" then "__NUMBER__" else . end)' \
-    "$reference" >"$prefix.reference-structure.json"
-  jq -S 'walk(if type=="number" then "__NUMBER__" else . end)' \
-    "$candidate" >"$prefix.candidate-structure.json"
-  cmp -s "$prefix.reference-structure.json" "$prefix.candidate-structure.json"
-
-  jq -r 'paths(numbers) as $p | getpath($p) as $v
-    | select(($p[-1]|tostring)|test("^(n|counts?|.*_counts?|changed_conditionings|seed|.*_seed|id|.*_id|index|.*_index|update|step|episode_id|episodes|horizon|members|x|y)$"))
-    | [($p|map(tostring)|join("/")), ($v|tostring)] | @tsv' \
-    "$reference" | sort >"$prefix.reference-integers.tsv"
-  jq -r 'paths(numbers) as $p | getpath($p) as $v
-    | select(($p[-1]|tostring)|test("^(n|counts?|.*_counts?|changed_conditionings|seed|.*_seed|id|.*_id|index|.*_index|update|step|episode_id|episodes|horizon|members|x|y)$"))
-    | [($p|map(tostring)|join("/")), ($v|tostring)] | @tsv' \
-    "$candidate" | sort >"$prefix.candidate-integers.tsv"
-  cmp -s "$prefix.reference-integers.tsv" "$prefix.candidate-integers.tsv"
-
-  jq -r 'paths(numbers) as $p
-    | [($p|map(tostring)|join("/")), (getpath($p)|tostring)] | @tsv' \
-    "$reference" | sort >"$prefix.reference-numbers.tsv"
-  jq -r 'paths(numbers) as $p
-    | [($p|map(tostring)|join("/")), (getpath($p)|tostring)] | @tsv' \
-    "$candidate" | sort >"$prefix.candidate-numbers.tsv"
-  cut -f1 "$prefix.reference-numbers.tsv" >"$prefix.reference-number-paths.txt"
-  cut -f1 "$prefix.candidate-numbers.tsv" >"$prefix.candidate-number-paths.txt"
-  cmp -s "$prefix.reference-number-paths.txt" "$prefix.candidate-number-paths.txt"
-  paste "$prefix.reference-numbers.tsv" "$prefix.candidate-numbers.tsv" |
-    awk -F '\t' -v abs_limit="$absolute_limit" -v rel_limit="$relative_limit" '
-      function abs(x) { return x < 0 ? -x : x }
-      BEGIN { max_abs=0; max_rel=0 }
-      $1 != $3 { print "numeric path mismatch: " $1 " != " $3 > "/dev/stderr"; bad=1; next }
-      {
-        reference=$2+0; candidate=$4+0; difference=abs(candidate-reference)
-        reference_scale=abs(reference); relative_scale=reference_scale
-        if (relative_scale<0.000000000001) relative_scale=0.000000000001
-        relative=difference/relative_scale
-        if (difference>max_abs) max_abs=difference
-        if (relative>max_rel) max_rel=relative
-        allowed=abs_limit + rel_limit*reference_scale
-        if (difference>allowed) {
-          print "numeric drift exceeds envelope at " $1 ": reference=" reference \
-            " candidate=" candidate " abs=" difference " rel=" relative \
-            " allowed=" allowed > "/dev/stderr"
-          bad=1
-        }
-      }
-      END {
-        print "absolute_limit=" abs_limit
-        print "relative_limit=" rel_limit
-        print "maximum_absolute_drift=" max_abs
-        print "maximum_relative_drift=" max_rel
-        if (bad) exit 1
-      }' >"$prefix.numeric-drift.txt"
 }
 
 cleanup() {
   local rc="$?"
-  if [[ -n "$active_pid" ]] && kill -0 "$active_pid" 2>/dev/null; then
-    kill "$active_pid" 2>/dev/null || true
+  if [[ -n "$active_pgid" ]] && kill -0 -- "-$active_pgid" 2>/dev/null; then
+    kill -TERM -- "-$active_pgid" 2>/dev/null || true
+    for _ in {1..50}; do
+      kill -0 -- "-$active_pgid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 -- "-$active_pgid" 2>/dev/null; then
+      kill -KILL -- "-$active_pgid" 2>/dev/null || true
+      for _ in {1..50}; do
+        kill -0 -- "-$active_pgid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
     wait "$active_pid" 2>/dev/null || true
+    if kill -0 -- "-$active_pgid" 2>/dev/null; then
+      printf 'failed to terminate evaluation process group: %s\n' "$active_pgid" >&2
+      rc=125
+    fi
   fi
   active_pid=""
+  active_pgid=""
   stop_telemetry
   if [[ "$campaign_finalized" != true && -s "$run_root/campaign.json" ]]; then
     jq --arg status failed_integrity_or_evaluation \
@@ -221,14 +205,22 @@ jq -nc --arg started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg source_run "$source_run" --arg device_smoke_run "$device_smoke_run" \
   --arg candle_sha "$candle_sha" \
   --arg source_manifest_sha "$source_manifest_sha" \
-  --arg binary_sha "$binary_sha" --arg gpu "$gpu_name" --argjson eval_batch "$eval_batch" \
+  --arg binary_sha "$binary_sha" --arg binary_source_sha "$P2_EXPECTED_BINARY_SOURCE_SHA" \
+  --arg binary_build_command "$binary_build_command" \
+  --arg smoke_report_sha "$smoke_report_sha" --arg smoke_log_sha "$smoke_log_sha" \
+  --arg gpu "$gpu_name" --argjson eval_batch "$eval_batch" \
   --arg scope_note "$scope_note" --argjson checkpoints "$checkpoints_json" \
   --argjson evaluations "$evaluation_count" \
   '{schema:"p2.action_premise_rescore.v1",status:"running",started_utc:$started_utc,
     git_sha:$git_sha,source_git_sha:$source_git_sha,source_run:$source_run,
     device_smoke_run:$device_smoke_run,evidence_class:"exploratory_evaluator_calibration",
     source_root_manifest_sha256:$source_manifest_sha,candle_git_sha:$candle_sha,
-    binary_sha256:$binary_sha,gpu_name:$gpu,evaluation_seed:424248,
+    binary_sha256:$binary_sha,binary_source_git_sha:$binary_source_sha,
+    binary_build_command:$binary_build_command,binary_features:["cudnn"],
+    device_smoke_evidence_class:"completed_exact-binary evaluation from a later-failed integrity campaign",
+    device_smoke_report_sha256:$smoke_report_sha,device_smoke_log_sha256:$smoke_log_sha,
+    evaluator_schema:"p2.eval_report.v13",
+    gpu_name:$gpu,evaluation_seed:424248,
     physical_evaluation_batch:$eval_batch,
     training_seeds:[2,3],arms:["S0","w004","w008","w016","w0323"],
     checkpoints:$checkpoints,evaluations:$evaluations,training:false,scope_note:$scope_note,
@@ -265,30 +257,43 @@ for seed in 2 3; do
         .synthetic_dynamics.action_diagnostics.changed_conditioning_only as $m
         | ($m.n|type=="number" and .>0 and floor==.)
           and $m.changed_conditionings==$m.n and $m.changed_fraction==1
-          and ($m.true_action_mse|finite_number) and ($m.shuffled_action_mse|finite_number)
+          and ($m.true_action_mse|finite_number and .>=0)
+          and ($m.shuffled_action_mse|finite_number and .>=0)
           and ($m.ratio|finite_number) and ($m.ratio_ci95_low|finite_number)
           and ($m.ratio_ci95_high|finite_number)
-          and ($m.action_conditioning_pass|type=="boolean")' \
+          and $m.true_action_mse>0
+          and (($m.ratio-($m.shuffled_action_mse/$m.true_action_mse))|fabs)<1e-9
+          and $m.ratio_ci95_low<=$m.ratio and $m.ratio<=$m.ratio_ci95_high
+          and ($m.action_conditioning_pass|type=="boolean")
+          and ($m.action_conditioning_pass
+            == ($m.ratio>=1.1 and $m.ratio_ci95_low>1.0))' \
         "$output/eval_report.json" >/dev/null
 
       jq -S 'del(.synthetic_dynamics.action_diagnostics.changed_conditioning_only,
         .synthetic_planner.action_diagnostics.changed_conditioning_only)' \
         "$output/eval_report.json" >"$output/report-without-new-metric.json"
       jq -S . "$source_eval/eval_report.json" >"$output/source-report-normalized.json"
-      validate_numeric_replay "$output/source-report-normalized.json" \
-        "$output/report-without-new-metric.json" "$output/report-replay" 0.000001 0.10
+      [[ "$(jq -r .board_probe.population_fingerprint "$output/eval_report.json")" \
+        == "$(jq -r .board_probe.population_fingerprint "$source_eval/eval_report.json")" ]] || exit 1
+      # Full-report numeric fields include unrelated eigendecomposition and fitted
+      # probe outputs that are nondeterministic across CUDA builds. Gate their
+      # schema, decisions, identities, counts, and numeric paths, but apply numeric
+      # envelopes only to the action and rollout scopes needed by this audit.
+      bash "$replay_validator" structure-identity \
+        "$output/source-report-normalized.json" "$output/report-without-new-metric.json" \
+        "$output/report-replay"
       jq -S '{synthetic_dynamics:.synthetic_dynamics.action_diagnostics,
         synthetic_planner:.synthetic_planner.action_diagnostics}' \
         "$output/source-report-normalized.json" >"$output/source-action-replay.json"
       jq -S '{synthetic_dynamics:.synthetic_dynamics.action_diagnostics,
         synthetic_planner:.synthetic_planner.action_diagnostics}' \
         "$output/report-without-new-metric.json" >"$output/candidate-action-replay.json"
-      validate_numeric_replay "$output/source-action-replay.json" \
+      bash "$replay_validator" numeric "$output/source-action-replay.json" \
         "$output/candidate-action-replay.json" "$output/action-replay" 0.000001 0.001
       jq -sS . "$source_eval/episodes.jsonl" >"$output/source-episodes-normalized.json"
       jq -sS . "$output/episodes.jsonl" >"$output/episodes-normalized.json"
-      validate_numeric_replay "$output/source-episodes-normalized.json" \
-        "$output/episodes-normalized.json" "$output/episode-replay"
+      bash "$replay_validator" numeric "$output/source-episodes-normalized.json" \
+        "$output/episodes-normalized.json" "$output/episode-replay" 0.000001 0.01
 
       jq -cn --argjson seed "$seed" --arg arm "$arm" --argjson update "$update" \
         --slurpfile candidate "$output/eval_report.json" \
@@ -316,8 +321,9 @@ for seed in 2 3; do
         --arg at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '{stage:$stage,status:"passed",at_utc:$at_utc,
           replay_structure_exact:true,replay_registered_identity_count_fields_exact:true,
+          replay_full_report_numeric_gate:false,
+          replay_full_report_numeric_gate_reason:"unrelated CUDA-sensitive eigendecomposition and fitted-probe outputs are outside the action-premise claim",
           replay_float_absolute_tolerance:0.000001,
-          replay_full_report_relative_tolerance:0.10,
           replay_action_diagnostics_relative_tolerance:0.001,
           replay_episode_relative_tolerance:0.01,
           legacy_summary_values_from_sealed_source:true}' \
@@ -337,6 +343,9 @@ done < <(find "$run_root" -name eval_report.json -type f | sort)
 
 (cd "$source_run" && sha256sum --quiet -c root-sha256.txt)
 [[ "$(sha256sum "$source_manifest" | awk '{print $1}')" == "$source_manifest_sha" ]] || exit 1
+assert_binary_unchanged
+[[ "$(sha256sum "$smoke_report" | awk '{print $1}')" == "$smoke_report_sha" \
+  && "$(sha256sum "$smoke_log" | awk '{print $1}')" == "$smoke_log_sha" ]] || exit 1
 stop_telemetry
 finish_campaign complete_pending_analysis
 (
@@ -345,5 +354,8 @@ finish_campaign complete_pending_analysis
     >ROOT_SHA256SUMS
   sha256sum --quiet -c ROOT_SHA256SUMS
 )
+assert_binary_unchanged
+sha256sum "$run_root/ROOT_SHA256SUMS" >"${run_root}.ROOT_SHA256SUMS.sha256"
+assert_binary_unchanged
 campaign_finalized=true
 printf 'action-premise rescore complete: %s\n' "$run_root"
