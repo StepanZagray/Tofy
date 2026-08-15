@@ -139,6 +139,7 @@ run_tracked() {
 # exact in the structure comparison.
 validate_numeric_replay() {
   local reference="$1" candidate="$2" prefix="$3"
+  local absolute_limit="${4:-0.000001}" relative_limit="${5:-0.01}"
   jq -S 'walk(if type=="number" then "__NUMBER__" else . end)' \
     "$reference" >"$prefix.reference-structure.json"
   jq -S 'walk(if type=="number" then "__NUMBER__" else . end)' \
@@ -165,9 +166,9 @@ validate_numeric_replay() {
   cut -f1 "$prefix.candidate-numbers.tsv" >"$prefix.candidate-number-paths.txt"
   cmp -s "$prefix.reference-number-paths.txt" "$prefix.candidate-number-paths.txt"
   paste "$prefix.reference-numbers.tsv" "$prefix.candidate-numbers.tsv" |
-    awk -F '\t' '
+    awk -F '\t' -v abs_limit="$absolute_limit" -v rel_limit="$relative_limit" '
       function abs(x) { return x < 0 ? -x : x }
-      BEGIN { abs_limit=0.000001; rel_limit=0.01; max_abs=0; max_rel=0 }
+      BEGIN { max_abs=0; max_rel=0 }
       $1 != $3 { print "numeric path mismatch: " $1 " != " $3 > "/dev/stderr"; bad=1; next }
       {
         reference=$2+0; candidate=$4+0; difference=abs(candidate-reference)
@@ -275,23 +276,34 @@ for seed in 2 3; do
         "$output/eval_report.json" >"$output/report-without-new-metric.json"
       jq -S . "$source_eval/eval_report.json" >"$output/source-report-normalized.json"
       validate_numeric_replay "$output/source-report-normalized.json" \
-        "$output/report-without-new-metric.json" "$output/report-replay"
+        "$output/report-without-new-metric.json" "$output/report-replay" 0.000001 0.10
+      jq -S '{synthetic_dynamics:.synthetic_dynamics.action_diagnostics,
+        synthetic_planner:.synthetic_planner.action_diagnostics}' \
+        "$output/source-report-normalized.json" >"$output/source-action-replay.json"
+      jq -S '{synthetic_dynamics:.synthetic_dynamics.action_diagnostics,
+        synthetic_planner:.synthetic_planner.action_diagnostics}' \
+        "$output/report-without-new-metric.json" >"$output/candidate-action-replay.json"
+      validate_numeric_replay "$output/source-action-replay.json" \
+        "$output/candidate-action-replay.json" "$output/action-replay" 0.000001 0.001
       jq -sS . "$source_eval/episodes.jsonl" >"$output/source-episodes-normalized.json"
       jq -sS . "$output/episodes.jsonl" >"$output/episodes-normalized.json"
       validate_numeric_replay "$output/source-episodes-normalized.json" \
         "$output/episodes-normalized.json" "$output/episode-replay"
 
-      jq -c --argjson seed "$seed" --arg arm "$arm" --argjson update "$update" '
-        .synthetic_dynamics as $d
+      jq -cn --argjson seed "$seed" --arg arm "$arm" --argjson update "$update" \
+        --slurpfile candidate "$output/eval_report.json" \
+        --slurpfile source "$source_eval/eval_report.json" '
+        $candidate[0].synthetic_dynamics as $candidate_d
+        | $source[0].synthetic_dynamics as $source_d
         | {seed:$seed,arm:$arm,update:$update,
-           changed_conditioning_only:$d.action_diagnostics.changed_conditioning_only,
-           aggregate:$d.action_diagnostics.aggregate.shuffle,
-           changed_transition:$d.action_diagnostics.by_transition_kind.changed_transition,
-           effective_rank_fraction:$d.representation.effective_rank_fraction,
-           changed_transition_improvement:$d.changed_transitions.improvement_fraction,
-           h4_normalized_mean:$d.rollout.h4.normalized_mean,
-           h8_normalized_mean:$d.rollout.h8.normalized_mean}' \
-        "$output/eval_report.json" >>"$run_root/metrics.jsonl"
+           changed_conditioning_only:$candidate_d.action_diagnostics.changed_conditioning_only,
+           aggregate:$source_d.action_diagnostics.aggregate.shuffle,
+           changed_transition:$source_d.action_diagnostics.by_transition_kind.changed_transition,
+           effective_rank_fraction:$source_d.representation.effective_rank_fraction,
+           changed_transition_improvement:$source_d.changed_transitions.improvement_fraction,
+           h4_normalized_mean:$source_d.rollout.h4.normalized_mean,
+           h8_normalized_mean:$source_d.rollout.h8.normalized_mean}' \
+        >>"$run_root/metrics.jsonl"
       (
         cd "$run_root"
         sha256sum \
@@ -304,7 +316,11 @@ for seed in 2 3; do
         --arg at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '{stage:$stage,status:"passed",at_utc:$at_utc,
           replay_structure_exact:true,replay_registered_identity_count_fields_exact:true,
-          replay_float_absolute_tolerance:0.000001,replay_float_relative_tolerance:0.01}' \
+          replay_float_absolute_tolerance:0.000001,
+          replay_full_report_relative_tolerance:0.10,
+          replay_action_diagnostics_relative_tolerance:0.001,
+          replay_episode_relative_tolerance:0.01,
+          legacy_summary_values_from_sealed_source:true}' \
         >>"$run_root/stages.jsonl"
     done
   done

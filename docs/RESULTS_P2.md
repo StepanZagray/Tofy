@@ -825,10 +825,12 @@ report structure but not floating outputs bit-for-bit. Representative MSE drift 
 sub-percent, so exact `cmp` is not a valid cross-binary CUDA reproducibility gate.
 The repaired launcher instead requires identical JSON shape and non-numeric
 decisions, exact registered identity/count fields and numeric paths, and per-value
-numeric drift no greater than `1e-6 + 0.01 * abs(source_value)`; it records the
-maximum drift for each evaluation. Exact fields are leaves named `n`, count/counts
-forms, `changed_conditionings`, seed forms, bare or suffixed ID/index forms, `update`, `step`,
-`episodes`, `horizon`, `members`, `x`, or `y`. Root
+numeric drift no greater than `1e-6 + r * abs(source_value)`; it records the maximum
+drift for each evaluation. The exploratory calibration uses `r=10%` for the full
+legacy report, `r=1%` for episodes, and the much tighter `r=0.1%` for the action
+diagnostics on which the new stratum depends. Exact fields are leaves named `n`,
+count/counts forms, `changed_conditionings`, seed forms, bare or suffixed ID/index
+forms, `update`, `step`, `episodes`, `horizon`, `members`, `x`, or `y`. Root
 `action-premise-rescore-v1-20260815T155759Z` remains
 excluded as a CPU-only build failure, and `...T160107Z` remains excluded as an
 integrity-preflight failure. Neither is model evidence.
@@ -840,6 +842,12 @@ conclusion requires a fresh held-out evaluation-seed confirmation. The failed
 `...T160107Z` root is nevertheless the exact-binary CUDA device smoke: its binary
 hash matches, `cuda:0` opened, and one complete report was produced before the old
 bitwise replay assertion rejected the stage.
+
+Unrelated legacy summary fields in `metrics.jsonl` are copied from the sealed source
+reports, not from the rebuilt evaluator. Only `changed_conditioning_only` comes from
+the exploratory binary. This prevents known cross-build rank drift from being
+misread as a treatment result while retaining a gross full-report change detector
+and a tight parity gate on the action quantities used by the new metric.
 
 The deadline-bounded repaired launch may set `P2_ACTION_PREMISE_UPDATES=250` to
 evaluate the mature checkpoint for all five arms and both training seeds (10
