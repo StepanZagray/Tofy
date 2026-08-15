@@ -22,10 +22,85 @@
 - Resolve all errors and warnings.
 
 ## Research
-- Always use the repository's `research` skill at `.agents/skills/research/SKILL.md`
-  when analyzing or comparing experiments or experiment results, and whenever the user asks to
-  research, investigate, or produce a source-backed report.
+- Always use the globally installed `research` skill (the local-memory workflow under
+  `~/.agents/skills/research/`) when analyzing or comparing experiments or experiment results,
+  and whenever the user asks to research, investigate, or produce a source-backed report.
 - Follow the skill's global-library workflow and use the `ml/tofy` scope for Tofy research.
+- For every completed experiment analysis, preserve a concise insight under
+  `ml/tofy/insights/` with exact run identifiers and revisions, positive and negative results,
+  metric or causal confounds, the resulting decision, and the next falsifiable experiment.
+  Link it from `ml/tofy/insights/INDEX.md` and the Tofy scope index.
+
+## Scientific experiment contract
+- Define the exact claim before implementing or launching an experiment. Specify the task or
+  environment distribution, objective, comparator class, compute budget, and meaning of
+  "better", "optimal", or "proved". An empirical run can falsify or support a bounded claim;
+  it cannot prove global method optimality or guarantee ARC-AGI performance.
+- Before spending compute, investigate whether the claim can be derived mathematically. State
+  assumptions, try to construct counterexamples, and separate proved local properties from
+  unsupported system-level conclusions. When a proof is unavailable, label the proposal as an
+  empirical hypothesis and test the weakest prerequisite with the cheapest decisive diagnostic.
+- Prefer current primary sources and check for newer work before relying on a method. Record the
+  exact paper/specification version, theorem assumptions, and evidence scope. Do not treat paper
+  popularity, agent agreement, or a related benchmark result as proof for Tofy.
+- Call an experiment "paper-faithful" only after recording a fidelity matrix covering the
+  representation seam, preprocessing, sample/population construction, temporal or spatial
+  statistics, projection distribution/count, loss and reduction, caps, optimizer, clipping,
+  model class, data-generating process, action coverage, evaluator, and hardware/software
+  environment. Any material mismatch must be named; classify the method as an adaptation and do
+  not transfer the paper's theorem or empirical claim without a new justification.
+- Preregister the intervention, baseline, invariants, seeds, checkpoints, metrics, uncertainty
+  calculation, multiplicity policy, promotion/rejection thresholds, stop rule, maximum runtime,
+  data-access boundary, and next decision. Never choose a metric, checkpoint, seed subset, or
+  threshold after observing results without labeling the analysis exploratory and confirming it
+  in a fresh run.
+- Prefer premise checks and frozen-checkpoint rescoring before retraining. Validate evaluator
+  sensitivity with positive/negative controls, confirm the tested population contains the needed
+  classes or genuinely changed pairs, and keep semantic grounding, non-collapse, action use,
+  rollout fidelity, and planner/Q validity as independent gates.
+
+## Fair experiment execution
+- Change one causal factor at a time when feasible. Match initialization, data order, update and
+  token/sample budget, effective and physical batch, optimizer schedule, clipping, checkpoint
+  selection, evaluator episodes, and hardware across arms. Record unavoidable differences and
+  measure component gradient pressure/cosines when a loss intervention competes with other
+  objectives.
+- Use multiple seeds for promotion claims. A single seed is a screen only. Report absolute
+  performance, copy/null/control baselines, confidence intervals where appropriate, and negative
+  or contradictory outcomes; do not promote a method merely because it is less bad than another
+  failing arm.
+- Freeze and validate evaluators before the treatment comparison. For evaluator-only changes,
+  require identical checkpoints and inputs and, when possible, exact parity for all legacy report
+  fields and episode streams so the new metric is the only changed quantity.
+- For conditioning interventions, report total rows, eligible rows, genuinely changed tuples,
+  and outcome-changing tuples. Distinguish action-tuple sensitivity from correct alternative-state
+  prediction; a changed input with the same simulator outcome is not a causal positive example.
+- Estimate runtime from measured stage durations and reserve time for integrity checks and
+  analysis. Auto-sequence a dependent experiment only when its branch can be selected by a
+  preregistered machine-checkable rule; otherwise stop after the parent result for analysis.
+
+## Experiment provenance and launch safety
+- Launch only from a reviewed, pushed commit in a clean checkout. Record the exact Tofy revision,
+  sibling dependency revisions, build command and feature flags, binary SHA-256, configuration,
+  hardware, physical batch/accumulation pair, source-run identity, and evaluation seed in the run.
+- Run a bounded device smoke test on the exact launch binary before a long campaign. Verify the
+  required accelerator backend is compiled (P2 RunPod builds normally require
+  `cargo build --release --locked --features cudnn`), the expected device opens, and one minimal
+  evaluation reaches its metric/integrity checks. A successful CPU build is not a CUDA preflight.
+- Before an automatic handoff, test repository fetch authentication and exact-commit availability,
+  verify the parent run is sealed and its manifest passes, and never replace a binary still used by
+  an active process. Use a separately hashed binary or wait for the parent to exit.
+- Give every run a never-reused root and explicit lifecycle state such as `running`,
+  `complete_pending_analysis`, or `failed_integrity_or_evaluation`. Fail closed on hash, source,
+  evaluator, or environment mismatches. Preserve failed-launch provenance, but exclude it from
+  model evidence and never silently reuse a partial root.
+- Classify artifacts as completed evidence, selection-only, exploratory, implementation smoke, or
+  failed infrastructure/integrity. Only completed evidence may satisfy a registered promotion gate;
+  selection-only or exploratory findings require fresh held-out confirmation.
+- Stop telemetry and child processes before sealing results. Hash the finalized artifact tree and
+  verify it. Treat this as point-in-time integrity, not immutable storage; record the manifest
+  digest outside the run root during analysis. Keep intentionally active remote sessions named and
+  supervised; terminate and verify cleanup of every other process started by an agent.
 
 ## Delegation
 - Capable primary agents should delegate bounded, independent coding, documentation, analysis, and research work when doing so improves speed or supplies an independent review.

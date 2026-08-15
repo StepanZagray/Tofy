@@ -796,17 +796,20 @@ the paired rows whose full action tuple changed, requires its `n` and
 `changed_conditionings` to agree, and reports a paired bootstrap ratio interval.
 
 This is a frozen-checkpoint evaluator experiment, not a training campaign. The new
-binary must reproduce every legacy evaluation field and every episode JSONL byte
-exactly after deleting only the new metric. Checkpoint/config hashes, evaluation
-population, seed `424248`, synthetic episode count, physical evaluation batch, and
-PTRM settings remain fixed. If the changed-only confidence interval remains near one,
-the next causal experiment crosses the selected TC-QQ dose with same-state
-counterfactual action separation. If it shows real action sensitivity, the prior
-aggregate was confounded and no action-loss experiment is justified yet. This
-rescore cannot establish semantic, Q, rollout, or ARC optimality.
+binary must reproduce the legacy report and episode structure, all non-numeric
+decisions and identity/count fields exactly, and all numeric outputs within the
+registered cross-binary CUDA replay envelope after deleting only the new metric.
+Checkpoint/config hashes, evaluation population, seed `424248`, synthetic episode
+count, physical evaluation batch, and PTRM settings remain fixed. If the
+changed-only confidence interval remains near one, the next causal experiment
+crosses the selected TC-QQ dose with same-state counterfactual action separation.
+If it shows real action sensitivity, the prior aggregate was confounded and no
+action-loss experiment is justified yet. This rescore cannot establish semantic,
+Q, rollout, or ARC optimality.
 
 ```bash
 P2_ACTION_PREMISE_SOURCE_RUN=<completed-dose-run> \
+P2_ACTION_PREMISE_DEVICE_SMOKE_RUN=<exact-binary-device-smoke-run> \
 P2_EXPECTED_SOURCE_SHA=1aa235ceb5bd1ec8cf60a9554ed31d738f7cd96b \
 P2_EXPECTED_SHA=<reviewed-sha> \
 P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
@@ -814,6 +817,36 @@ P2_EXPECTED_BINARY_SHA=<reviewed-binary-sha256> \
 TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
 bash scripts/p2_action_premise_rescore_v1.sh
 ```
+
+The first CUDA/cuDNN attempt at root
+`action-premise-rescore-v1-20260815T160107Z` completed one evaluation but failed
+closed before accepting a stage: the rebuilt binary reproduced the population and
+report structure but not floating outputs bit-for-bit. Representative MSE drift was
+sub-percent, so exact `cmp` is not a valid cross-binary CUDA reproducibility gate.
+The repaired launcher instead requires identical JSON shape and non-numeric
+decisions, exact registered identity/count fields and numeric paths, and per-value
+numeric drift no greater than `1e-6 + 0.01 * abs(source_value)`; it records the
+maximum drift for each evaluation. Exact fields are leaves named `n`, count/counts
+forms, `changed_conditionings`, seed forms, bare or suffixed ID/index forms, `update`, `step`,
+`episodes`, `horizon`, `members`, `x`, or `y`. Root
+`action-premise-rescore-v1-20260815T155759Z` remains
+excluded as a CPU-only build failure, and `...T160107Z` remains excluded as an
+integrity-preflight failure. Neither is model evidence.
+
+Because the numeric envelope was selected after inspecting only the failed legacy
+replay difference, the repaired panel is classified
+`exploratory_evaluator_calibration`; it cannot satisfy a promotion gate. Any model
+conclusion requires a fresh held-out evaluation-seed confirmation. The failed
+`...T160107Z` root is nevertheless the exact-binary CUDA device smoke: its binary
+hash matches, `cuda:0` opened, and one complete report was produced before the old
+bitwise replay assertion rejected the stage.
+
+The deadline-bounded repaired launch may set `P2_ACTION_PREMISE_UPDATES=250` to
+evaluate the mature checkpoint for all five arms and both training seeds (10
+evaluations). This scope was selected after the parity preflight failed but before
+any changed-only treatment metric was inspected. It preserves the decisive final
+dose-by-seed comparison while dropping the secondary update-125 trajectory question;
+the run must record this scope note and cannot support a learning-trajectory claim.
 
 ## Best So Far
 
