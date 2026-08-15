@@ -785,6 +785,36 @@ TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
 bash scripts/p2_sigreg_cell_dose_response_v1.sh
 ```
 
+### Action-identifiability premise rescore V1 (2026-08-15)
+
+The cell-dose campaign's action-shuffle aggregate includes source-local derangements
+whose shuffled full `(id,x,y)` tuple can equal the true tuple. Those rows are valid for
+artifact accounting but dilute the intervention ratio toward one. Before any new
+training, the premise rescore evaluates all 20 existing `seed × dose × checkpoint`
+artifacts with a dedicated `changed_conditioning_only` stratum. It includes exactly
+the paired rows whose full action tuple changed, requires its `n` and
+`changed_conditionings` to agree, and reports a paired bootstrap ratio interval.
+
+This is a frozen-checkpoint evaluator experiment, not a training campaign. The new
+binary must reproduce every legacy evaluation field and every episode JSONL byte
+exactly after deleting only the new metric. Checkpoint/config hashes, evaluation
+population, seed `424248`, synthetic episode count, physical evaluation batch, and
+PTRM settings remain fixed. If the changed-only confidence interval remains near one,
+the next causal experiment crosses the selected TC-QQ dose with same-state
+counterfactual action separation. If it shows real action sensitivity, the prior
+aggregate was confounded and no action-loss experiment is justified yet. This
+rescore cannot establish semantic, Q, rollout, or ARC optimality.
+
+```bash
+P2_ACTION_PREMISE_SOURCE_RUN=<completed-dose-run> \
+P2_EXPECTED_SOURCE_SHA=1aa235ceb5bd1ec8cf60a9554ed31d738f7cd96b \
+P2_EXPECTED_SHA=<reviewed-sha> \
+P2_EXPECTED_CANDLE_SHA=<reviewed-candle-sha> \
+P2_EXPECTED_BINARY_SHA=<reviewed-binary-sha256> \
+TOFY_BIN=/workspace/Personal/Tofy/target/release/tofy \
+bash scripts/p2_action_premise_rescore_v1.sh
+```
+
 ## Best So Far
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**

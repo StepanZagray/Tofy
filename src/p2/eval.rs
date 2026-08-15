@@ -433,6 +433,10 @@ pub struct TransitionKindDiagnostics {
 pub struct ActionDiagnostics {
     pub aggregate: ActionSourceDiagnostics,
     pub by_source: BTreeMap<String, ActionSourceDiagnostics>,
+    /// Primary deconfounded action intervention: only paired rows whose shuffled
+    /// full `(id,x,y)` tuple differs from the true conditioning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_conditioning_only: Option<ActionShuffleMetrics>,
     /// Paired action-shuffle errors grouped by the target transition's action ID.
     /// Missing from older reports; only source-local permutations with at least
     /// two rows contribute, matching `aggregate.shuffle`.
@@ -2679,6 +2683,13 @@ fn action_diagnostics_from_pairs(
         &paired,
         seed.wrapping_add(0x0005_7A7A),
     )?;
+    let changed_conditioning_indices = paired
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_paired)| {
+            (is_paired && samples[index].action != shuffled[index].action).then_some(index)
+        })
+        .collect::<Vec<_>>();
     Ok(ActionDiagnostics {
         aggregate: ActionSourceDiagnostics {
             shuffle: summarize_action_shuffle(
@@ -2690,6 +2701,14 @@ fn action_diagnostics_from_pairs(
             coverage: action_coverage(samples),
         },
         by_source,
+        changed_conditioning_only: summarize_action_stratum(
+            samples,
+            shuffled,
+            true_errors,
+            shuffled_errors,
+            &changed_conditioning_indices,
+            seed.wrapping_add(0xC4A6_710A),
+        )?,
         by_target_action_id: Some(by_target_action_id),
         by_target_action_kind: Some(by_target_action_kind),
         by_transition_kind: Some(by_transition_kind),
@@ -4787,6 +4806,14 @@ mod tests {
             seed,
         )?;
 
+        let changed_only = diagnostics
+            .changed_conditioning_only
+            .as_ref()
+            .expect("changed conditioning rows");
+        assert_eq!(changed_only.n, 4);
+        assert_eq!(changed_only.changed_conditionings, changed_only.n);
+        assert_eq!(changed_only.changed_fraction, Some(1.0));
+
         // The pre-stratification aggregate and source summaries use exactly the
         // same eligible rows and seeds as before.
         let expected_aggregate = ActionSourceDiagnostics {
@@ -4922,9 +4949,41 @@ mod tests {
             "by_source": diagnostics.by_source,
         });
         let decoded: ActionDiagnostics = serde_json::from_value(legacy)?;
+        assert!(decoded.changed_conditioning_only.is_none());
         assert!(decoded.by_target_action_id.is_none());
         assert!(decoded.by_target_action_kind.is_none());
         assert!(decoded.by_transition_kind.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn changed_conditioning_action_metric_excludes_unchanged_action_tuples() -> Result<()> {
+        let samples = vec![
+            action_diagnostic_sample(ArcAction::new(1, None, None)?, 0)?,
+            action_diagnostic_sample(ArcAction::new(1, None, None)?, 1)?,
+            action_diagnostic_sample(ArcAction::new(6, Some(12), Some(24))?, 2)?,
+        ];
+        let shuffled = shuffled_action_samples(&samples, &[1, 2, 0])?;
+        let diagnostics = action_diagnostics_from_pairs(
+            &samples,
+            &shuffled,
+            &[1.0, 2.0, 3.0],
+            &[100.0, 4.0, 6.0],
+            &[("paired".into(), 0, 3)],
+            29,
+        )?;
+
+        assert_eq!(diagnostics.aggregate.shuffle.n, 3);
+        assert_eq!(diagnostics.aggregate.shuffle.changed_conditionings, 2);
+        let changed_only = diagnostics
+            .changed_conditioning_only
+            .expect("changed conditioning rows");
+        assert_eq!(changed_only.n, 2);
+        assert_eq!(changed_only.changed_conditionings, 2);
+        assert_eq!(changed_only.changed_fraction, Some(1.0));
+        assert_eq!(changed_only.true_action_mse, Some(2.5));
+        assert_eq!(changed_only.shuffled_action_mse, Some(5.0));
+        assert_eq!(changed_only.ratio, Some(2.0));
         Ok(())
     }
 
