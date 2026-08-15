@@ -8,8 +8,8 @@ use crate::p2::board_probe::{
 };
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
-    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, BranchGroup,
-    FactualBatch, TransitionSample, ORACLE_LATENT_DIM,
+    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, ArcAction,
+    BranchGroup, FactualBatch, TransitionSample, FACTUAL_BRANCHES_PER_GROUP, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v13";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v14";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -728,6 +728,136 @@ pub struct BoardProbeEvaluation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualInterval {
+    pub estimate: f64,
+    pub lower_95: f64,
+    pub upper_95: f64,
+    pub lower_98_75: f64,
+    pub upper_98_75: f64,
+    pub groups: usize,
+    pub pairs: usize,
+    pub resamples: usize,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualGroupIdentity {
+    pub group_index: usize,
+    pub family: String,
+    /// `movement` for exact-simulator groups and `coordinate` for synthetic
+    /// ACTION6 groups. The two populations are never pooled into simulator
+    /// claims.
+    pub population: String,
+    /// Canonical SHA-256 over dimensions, pixels, actions, public goals, and
+    /// board-outcome classes. Provenance seed and episode identifiers are
+    /// deliberately excluded.
+    pub content_fingerprint: String,
+    pub current_sha256: String,
+    pub next_sha256: Vec<String>,
+    pub actions: Vec<ArcAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualPairLedgerRow {
+    pub group: OutcomeCounterfactualGroupIdentity,
+    pub left_branch_index: usize,
+    pub right_branch_index: usize,
+    pub left_action: ArcAction,
+    pub right_action: ArcAction,
+    pub left_outcome_class: usize,
+    pub right_outcome_class: usize,
+    pub left_changed: bool,
+    pub right_changed: bool,
+    pub left_changed_cells: Vec<u16>,
+    pub right_changed_cells: Vec<u16>,
+    pub target_pair_mse: f64,
+    pub concordant_loss: f64,
+    pub crossed_loss: f64,
+    pub margin: f64,
+    pub eligible: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualActionAnchors {
+    pub changed: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualPopulationGates {
+    pub eligible_simulator_groups: usize,
+    pub eligible_simulator_groups_at_least_100: bool,
+    pub movement_action_anchors: BTreeMap<u8, OutcomeCounterfactualActionAnchors>,
+    pub each_movement_action_at_least_16_changed_and_16_unchanged: bool,
+    pub simulator_changed_changed_pairs: usize,
+    pub simulator_changed_changed_pairs_at_least_100: bool,
+    pub target_collapse_failure: bool,
+    pub population_pass: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualStateScrambledControl {
+    pub available: bool,
+    pub estimate: Option<f64>,
+    pub groups: usize,
+    pub pairs: usize,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualControls {
+    pub pixel_oracle_estimate: Option<f64>,
+    pub pixel_oracle_exactly_one: bool,
+    pub latent_oracle_estimate: Option<f64>,
+    pub latent_oracle_at_least_0_99: bool,
+    pub target_collapse_failure: bool,
+    pub target_collapsed_pairs: usize,
+    pub swapped_oracle_estimate: Option<f64>,
+    pub swapped_oracle_at_most_negative_0_99: bool,
+    pub action_masked_max_abs_margin: Option<f64>,
+    pub action_masked_max_abs_at_most_1e_6: bool,
+    pub identity_max_abs_margin: Option<f64>,
+    pub identity_max_abs_at_most_1e_6: bool,
+    pub outcome_equivalent_pairs: usize,
+    pub outcome_equivalent_max_abs_margin: Option<f64>,
+    pub outcome_equivalent_max_abs_at_most_1e_6: bool,
+    pub state_scrambled_same_action_template: OutcomeCounterfactualStateScrambledControl,
+    pub required_controls_pass: bool,
+}
+
+/// Model-family-independent same-state outcome counterfactual evaluation.
+/// Predictions and targets are full spatial displacements from the one shared
+/// encoded current state in each factual branch group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeCounterfactualMetrics {
+    pub population_fingerprint: String,
+    pub groups: usize,
+    pub movement_groups: usize,
+    pub coordinate_groups: usize,
+    pub unordered_pairs: usize,
+    pub eligible_pairs: usize,
+    pub outcome_equivalent_pairs: usize,
+    pub changed_changed_pairs: usize,
+    pub changed_unchanged_pairs: usize,
+    pub epsilon: f64,
+    pub material_threshold: f64,
+    pub overall: Option<OutcomeCounterfactualInterval>,
+    pub movement: Option<OutcomeCounterfactualInterval>,
+    pub coordinate: Option<OutcomeCounterfactualInterval>,
+    pub changed_changed: Option<OutcomeCounterfactualInterval>,
+    pub changed_unchanged: Option<OutcomeCounterfactualInterval>,
+    /// True iff the exact-simulator movement estimate and its lower 95% bound
+    /// both strictly exceed `material_threshold`. Synthetic coordinate groups
+    /// are reported separately and never contribute to this claim.
+    pub action_separation_pass: bool,
+    pub controls: OutcomeCounterfactualControls,
+    pub population_gates: OutcomeCounterfactualPopulationGates,
+    pub pair_ledger: Vec<OutcomeCounterfactualPairLedgerRow>,
+    pub ledger_reconciled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub schema: String,
     pub mode: EvalMode,
@@ -757,6 +887,9 @@ pub struct EvalReport {
     /// checkpoints only.
     #[serde(default)]
     pub factual_branches: Option<FactualBranchMetrics>,
+    /// Full-mode, model-family-independent same-state counterfactual metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_counterfactuals: Option<OutcomeCounterfactualMetrics>,
     /// Optional transfer on imported ARC recordings (never used for training).
     pub arc3_transfer: Option<SplitEval>,
     /// Smoke / scaffolding only; not a research result.
@@ -3668,6 +3801,685 @@ fn group_bootstrap_interval(
     })
 }
 
+const OUTCOME_COUNTERFACTUAL_EPSILON: f64 = f64::MIN_POSITIVE;
+const OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD: f64 = 0.10;
+const OUTCOME_COUNTERFACTUAL_BOOTSTRAP_RESAMPLES: usize = 10_000;
+const OUTCOME_COUNTERFACTUAL_TARGET_COLLAPSE_MSE: f64 = 1e-12;
+
+fn vector_mse(left: &[f32], right: &[f32]) -> f64 {
+    assert_eq!(left.len(), right.len(), "counterfactual vector dimensions");
+    if left.is_empty() {
+        return 0.0;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let delta = f64::from(*left) - f64::from(*right);
+            delta * delta
+        })
+        .sum::<f64>()
+        / left.len() as f64
+}
+
+fn outcome_counterfactual_margin(
+    left_prediction: &[f32],
+    right_prediction: &[f32],
+    left_target: &[f32],
+    right_target: &[f32],
+) -> (f64, f64, f64) {
+    let concordant =
+        vector_mse(left_prediction, left_target) + vector_mse(right_prediction, right_target);
+    let crossed =
+        vector_mse(left_prediction, right_target) + vector_mse(right_prediction, left_target);
+    let margin = (crossed - concordant) / (crossed + concordant + OUTCOME_COUNTERFACTUAL_EPSILON);
+    (concordant, crossed, margin)
+}
+
+fn append_sha256_field(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn finish_sha256(hash: Sha256) -> String {
+    format!("sha256:{:x}", hash.finalize())
+}
+
+fn frame_content_sha256(frame: &crate::p2::data::ArcFrame) -> String {
+    let mut hash = Sha256::new();
+    append_sha256_field(&mut hash, &frame.width.to_le_bytes());
+    append_sha256_field(&mut hash, &frame.height.to_le_bytes());
+    append_sha256_field(&mut hash, &frame.pixels);
+    finish_sha256(hash)
+}
+
+fn canonical_outcome_classes(group: &BranchGroup) -> Vec<usize> {
+    let branches = group.branches();
+    branches
+        .iter()
+        .map(|branch| {
+            branches
+                .iter()
+                .position(|candidate| branch.outcome_equivalent(candidate))
+                .expect("branch is outcome-equivalent to itself")
+        })
+        .collect()
+}
+
+fn outcome_group_content_sha256(group: &BranchGroup, outcome_classes: &[usize]) -> String {
+    let mut hash = Sha256::new();
+    let first = &group.branches()[0].transition;
+    append_sha256_field(&mut hash, &first.current.width.to_le_bytes());
+    append_sha256_field(&mut hash, &first.current.height.to_le_bytes());
+    append_sha256_field(&mut hash, &first.current.pixels);
+    for (branch, outcome_class) in group.branches().iter().zip(outcome_classes) {
+        let transition = &branch.transition;
+        append_sha256_field(&mut hash, &transition.next.width.to_le_bytes());
+        append_sha256_field(&mut hash, &transition.next.height.to_le_bytes());
+        append_sha256_field(&mut hash, &transition.next.pixels);
+        append_sha256_field(&mut hash, &[transition.action.id]);
+        append_sha256_field(&mut hash, &[transition.action.x.unwrap_or(u8::MAX)]);
+        append_sha256_field(&mut hash, &[transition.action.y.unwrap_or(u8::MAX)]);
+        for goal in transition.goal_features.values {
+            append_sha256_field(&mut hash, &goal.to_bits().to_le_bytes());
+        }
+        append_sha256_field(&mut hash, &(*outcome_class as u64).to_le_bytes());
+        append_sha256_field(&mut hash, &[u8::from(branch.board_effect.changed)]);
+        for cell in &branch.board_effect.changed_cells {
+            append_sha256_field(&mut hash, &cell.to_le_bytes());
+        }
+    }
+    finish_sha256(hash)
+}
+
+fn outcome_population_fingerprint(group_fingerprints: &[String]) -> String {
+    let mut canonical = group_fingerprints.to_vec();
+    canonical.sort();
+    let mut hash = Sha256::new();
+    append_sha256_field(&mut hash, b"p2.outcome_counterfactual.content.v1");
+    for fingerprint in canonical {
+        append_sha256_field(&mut hash, fingerprint.as_bytes());
+    }
+    finish_sha256(hash)
+}
+
+fn outcome_percentile(sorted: &[f64], probability: f64) -> f64 {
+    let index = (probability * (sorted.len() - 1) as f64).floor() as usize;
+    sorted[index]
+}
+
+fn outcome_interval_from_group_means(
+    group_means: &[(usize, f64, usize)],
+    seed: u64,
+) -> Option<OutcomeCounterfactualInterval> {
+    if group_means.is_empty() {
+        return None;
+    }
+    let estimate =
+        group_means.iter().map(|(_, value, _)| value).sum::<f64>() / group_means.len() as f64;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut bootstrap = Vec::with_capacity(OUTCOME_COUNTERFACTUAL_BOOTSTRAP_RESAMPLES);
+    for _ in 0..OUTCOME_COUNTERFACTUAL_BOOTSTRAP_RESAMPLES {
+        let sum = (0..group_means.len())
+            .map(|_| group_means[rng.random_range(0..group_means.len())].1)
+            .sum::<f64>();
+        bootstrap.push(sum / group_means.len() as f64);
+    }
+    bootstrap.sort_by(f64::total_cmp);
+    Some(OutcomeCounterfactualInterval {
+        estimate,
+        lower_95: outcome_percentile(&bootstrap, 0.025),
+        upper_95: outcome_percentile(&bootstrap, 0.975),
+        lower_98_75: outcome_percentile(&bootstrap, 0.00625),
+        upper_98_75: outcome_percentile(&bootstrap, 0.99375),
+        groups: group_means.len(),
+        pairs: group_means.iter().map(|(_, _, pairs)| pairs).sum(),
+        resamples: OUTCOME_COUNTERFACTUAL_BOOTSTRAP_RESAMPLES,
+        unit: "whole_branch_group".into(),
+    })
+}
+
+fn ledger_group_means(
+    ledger: &[OutcomeCounterfactualPairLedgerRow],
+    include: impl Fn(&OutcomeCounterfactualPairLedgerRow) -> bool,
+) -> Vec<(usize, f64, usize)> {
+    let mut values = BTreeMap::<usize, Vec<f64>>::new();
+    for row in ledger.iter().filter(|row| row.eligible && include(row)) {
+        values
+            .entry(row.group.group_index)
+            .or_default()
+            .push(row.margin);
+    }
+    values
+        .into_iter()
+        .map(|(group, values)| {
+            let pairs = values.len();
+            (group, values.iter().sum::<f64>() / pairs as f64, pairs)
+        })
+        .collect()
+}
+
+fn outcome_interval_reconciles(
+    interval: &Option<OutcomeCounterfactualInterval>,
+    group_means: &[(usize, f64, usize)],
+) -> bool {
+    match (interval, group_means.is_empty()) {
+        (None, true) => true,
+        (Some(interval), false) => {
+            let estimate = group_means.iter().map(|(_, value, _)| value).sum::<f64>()
+                / group_means.len() as f64;
+            interval.groups == group_means.len()
+                && interval.pairs == group_means.iter().map(|(_, _, pairs)| pairs).sum::<usize>()
+                && (interval.estimate - estimate).abs() <= 1e-12
+        }
+        _ => false,
+    }
+}
+
+fn equal_weight_control_mean(values: &[(usize, f64)]) -> Option<f64> {
+    let mut groups = BTreeMap::<usize, Vec<f64>>::new();
+    for (group, value) in values {
+        groups.entry(*group).or_default().push(*value);
+    }
+    (!groups.is_empty()).then(|| {
+        groups
+            .values()
+            .map(|values| values.iter().sum::<f64>() / values.len() as f64)
+            .sum::<f64>()
+            / groups.len() as f64
+    })
+}
+
+fn pixel_displacement(branch: &crate::p2::data::FactualActionBranch) -> Vec<f32> {
+    branch
+        .transition
+        .next
+        .pixels
+        .iter()
+        .zip(&branch.transition.current.pixels)
+        .map(|(next, current)| f32::from(*next) - f32::from(*current))
+        .collect()
+}
+
+fn empty_outcome_counterfactual_metrics() -> OutcomeCounterfactualMetrics {
+    let controls = OutcomeCounterfactualControls {
+        pixel_oracle_estimate: None,
+        pixel_oracle_exactly_one: false,
+        latent_oracle_estimate: None,
+        latent_oracle_at_least_0_99: false,
+        target_collapse_failure: false,
+        target_collapsed_pairs: 0,
+        swapped_oracle_estimate: None,
+        swapped_oracle_at_most_negative_0_99: false,
+        action_masked_max_abs_margin: None,
+        action_masked_max_abs_at_most_1e_6: false,
+        identity_max_abs_margin: None,
+        identity_max_abs_at_most_1e_6: false,
+        outcome_equivalent_pairs: 0,
+        outcome_equivalent_max_abs_margin: None,
+        outcome_equivalent_max_abs_at_most_1e_6: false,
+        state_scrambled_same_action_template: OutcomeCounterfactualStateScrambledControl {
+            available: false,
+            estimate: None,
+            groups: 0,
+            pairs: 0,
+            reason: Some("unavailable: fewer than two eligible movement groups".into()),
+        },
+        required_controls_pass: false,
+    };
+    OutcomeCounterfactualMetrics {
+        population_fingerprint: outcome_population_fingerprint(&[]),
+        groups: 0,
+        movement_groups: 0,
+        coordinate_groups: 0,
+        unordered_pairs: 0,
+        eligible_pairs: 0,
+        outcome_equivalent_pairs: 0,
+        changed_changed_pairs: 0,
+        changed_unchanged_pairs: 0,
+        epsilon: OUTCOME_COUNTERFACTUAL_EPSILON,
+        material_threshold: OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD,
+        overall: None,
+        movement: None,
+        coordinate: None,
+        changed_changed: None,
+        changed_unchanged: None,
+        action_separation_pass: false,
+        controls,
+        population_gates: OutcomeCounterfactualPopulationGates {
+            eligible_simulator_groups: 0,
+            eligible_simulator_groups_at_least_100: false,
+            movement_action_anchors: BTreeMap::new(),
+            each_movement_action_at_least_16_changed_and_16_unchanged: false,
+            simulator_changed_changed_pairs: 0,
+            simulator_changed_changed_pairs_at_least_100: false,
+            target_collapse_failure: false,
+            population_pass: false,
+        },
+        pair_ledger: Vec::new(),
+        ledger_reconciled: true,
+    }
+}
+
+fn evaluate_outcome_counterfactuals(
+    model: &WorldModel,
+    cfg: &EvalConfig,
+    device: &Device,
+) -> Result<OutcomeCounterfactualMetrics> {
+    let seed = factual_branch_eval_seed(cfg.seed);
+    let group_count = cfg.synthetic_episodes.saturating_mul(4);
+    if group_count == 0 {
+        return Ok(empty_outcome_counterfactual_metrics());
+    }
+    let generated_groups = (0..group_count)
+        .map(|episode| {
+            generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let factual_batch = FactualBatch::from_groups(generated_groups)?;
+    let groups = factual_batch.groups();
+    let samples = factual_batch.rows();
+    let eval_batch = cfg.physical_batch.max(FACTUAL_BRANCHES_PER_GROUP)
+        / FACTUAL_BRANCHES_PER_GROUP
+        * FACTUAL_BRANCHES_PER_GROUP;
+    let mut predicted_displacements = Vec::<Vec<f32>>::with_capacity(samples.len());
+    let mut target_displacements = Vec::<Vec<f32>>::with_capacity(samples.len());
+    for (start, end) in batch_ranges(samples.len(), eval_batch) {
+        let batch = batch_from_samples(&samples[start..end], device)?;
+        let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+        let output = model.forward(
+            &batch.frames,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.goals,
+        )?;
+        let (_, channels, height, width) = encoded.current.dims4()?;
+        let mut shared_currents = Vec::new();
+        for local_group in (0..end - start).step_by(FACTUAL_BRANCHES_PER_GROUP) {
+            shared_currents.push(encoded.current.narrow(0, local_group, 1)?.broadcast_as((
+                FACTUAL_BRANCHES_PER_GROUP,
+                channels,
+                height,
+                width,
+            ))?);
+        }
+        let shared_refs = shared_currents.iter().collect::<Vec<_>>();
+        let shared_current = Tensor::cat(&shared_refs, 0)?;
+        let predicted = flatten_latent(&output.y.sub(&shared_current)?)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?;
+        let target = flatten_latent(&encoded.next.sub(&shared_current)?)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?;
+        predicted_displacements.extend(predicted);
+        target_displacements.extend(target);
+    }
+
+    let mut ledger = Vec::with_capacity(groups.len() * 6);
+    let mut group_fingerprints = Vec::with_capacity(groups.len());
+    let mut pixel_oracle_values = Vec::new();
+    let mut latent_oracle_values = Vec::new();
+    let mut swapped_oracle_values = Vec::new();
+    let mut action_masked_values = Vec::new();
+    let mut identity_values = Vec::new();
+    let mut target_collapsed_pairs = 0usize;
+    let mut movement_action_anchors = BTreeMap::<u8, OutcomeCounterfactualActionAnchors>::new();
+    let mut offset = 0usize;
+    for (group_index, group) in groups.iter().enumerate() {
+        let branches = group.branches();
+        let source = &branches[0].transition;
+        let is_movement = source.episode_id.is_multiple_of(2);
+        let population = if is_movement {
+            "movement"
+        } else {
+            "coordinate"
+        };
+        let outcome_classes = canonical_outcome_classes(group);
+        let content_fingerprint = outcome_group_content_sha256(group, &outcome_classes);
+        group_fingerprints.push(content_fingerprint.clone());
+        let identity = OutcomeCounterfactualGroupIdentity {
+            group_index,
+            family: source.family.clone(),
+            population: population.into(),
+            content_fingerprint,
+            current_sha256: frame_content_sha256(&source.current),
+            next_sha256: branches
+                .iter()
+                .map(|branch| frame_content_sha256(&branch.transition.next))
+                .collect(),
+            actions: branches
+                .iter()
+                .map(|branch| branch.transition.action.clone())
+                .collect(),
+        };
+        if is_movement {
+            for branch in branches {
+                let anchors = movement_action_anchors
+                    .entry(branch.transition.action.id)
+                    .or_default();
+                if branch.board_effect.changed {
+                    anchors.changed += 1;
+                } else {
+                    anchors.unchanged += 1;
+                }
+            }
+        }
+        let pixel_displacements = branches.iter().map(pixel_displacement).collect::<Vec<_>>();
+        let identity_prediction = vec![0.0f32; target_displacements[offset].len()];
+        for left in 0..branches.len() {
+            for right in left + 1..branches.len() {
+                let global_left = offset + left;
+                let global_right = offset + right;
+                let (concordant_loss, crossed_loss, margin) = outcome_counterfactual_margin(
+                    &predicted_displacements[global_left],
+                    &predicted_displacements[global_right],
+                    &target_displacements[global_left],
+                    &target_displacements[global_right],
+                );
+                let target_pair_mse = vector_mse(
+                    &target_displacements[global_left],
+                    &target_displacements[global_right],
+                );
+                let eligible = outcome_classes[left] != outcome_classes[right];
+                if eligible {
+                    let (_, _, pixel_oracle) = outcome_counterfactual_margin(
+                        &pixel_displacements[left],
+                        &pixel_displacements[right],
+                        &pixel_displacements[left],
+                        &pixel_displacements[right],
+                    );
+                    let (_, _, latent_oracle) = outcome_counterfactual_margin(
+                        &target_displacements[global_left],
+                        &target_displacements[global_right],
+                        &target_displacements[global_left],
+                        &target_displacements[global_right],
+                    );
+                    let (_, _, swapped_oracle) = outcome_counterfactual_margin(
+                        &target_displacements[global_right],
+                        &target_displacements[global_left],
+                        &target_displacements[global_left],
+                        &target_displacements[global_right],
+                    );
+                    let (_, _, action_masked) = outcome_counterfactual_margin(
+                        &predicted_displacements[offset],
+                        &predicted_displacements[offset],
+                        &target_displacements[global_left],
+                        &target_displacements[global_right],
+                    );
+                    let (_, _, identity_margin) = outcome_counterfactual_margin(
+                        &identity_prediction,
+                        &identity_prediction,
+                        &target_displacements[global_left],
+                        &target_displacements[global_right],
+                    );
+                    pixel_oracle_values.push((group_index, pixel_oracle));
+                    latent_oracle_values.push((group_index, latent_oracle));
+                    swapped_oracle_values.push((group_index, swapped_oracle));
+                    action_masked_values.push((group_index, action_masked));
+                    identity_values.push((group_index, identity_margin));
+                    if target_pair_mse <= OUTCOME_COUNTERFACTUAL_TARGET_COLLAPSE_MSE {
+                        target_collapsed_pairs += 1;
+                    }
+                }
+                ledger.push(OutcomeCounterfactualPairLedgerRow {
+                    group: identity.clone(),
+                    left_branch_index: left,
+                    right_branch_index: right,
+                    left_action: branches[left].transition.action.clone(),
+                    right_action: branches[right].transition.action.clone(),
+                    left_outcome_class: outcome_classes[left],
+                    right_outcome_class: outcome_classes[right],
+                    left_changed: branches[left].board_effect.changed,
+                    right_changed: branches[right].board_effect.changed,
+                    left_changed_cells: branches[left].board_effect.changed_cells.clone(),
+                    right_changed_cells: branches[right].board_effect.changed_cells.clone(),
+                    target_pair_mse,
+                    concordant_loss,
+                    crossed_loss,
+                    margin,
+                    eligible,
+                    reason: if eligible {
+                        "distinct_canonical_board_outcomes".into()
+                    } else {
+                        "outcome_equivalent".into()
+                    },
+                });
+            }
+        }
+        offset += branches.len();
+    }
+
+    let overall_group_means = ledger_group_means(&ledger, |_| true);
+    let movement_group_means =
+        ledger_group_means(&ledger, |row| row.group.population == "movement");
+    let coordinate_group_means =
+        ledger_group_means(&ledger, |row| row.group.population == "coordinate");
+    let changed_changed_group_means =
+        ledger_group_means(&ledger, |row| row.left_changed && row.right_changed);
+    let changed_unchanged_group_means =
+        ledger_group_means(&ledger, |row| row.left_changed != row.right_changed);
+    let overall = outcome_interval_from_group_means(&overall_group_means, seed ^ 0xCF00_0001);
+    let movement = outcome_interval_from_group_means(&movement_group_means, seed ^ 0xCF00_0002);
+    let coordinate = outcome_interval_from_group_means(&coordinate_group_means, seed ^ 0xCF00_0003);
+    let changed_changed =
+        outcome_interval_from_group_means(&changed_changed_group_means, seed ^ 0xCF00_0004);
+    let changed_unchanged =
+        outcome_interval_from_group_means(&changed_unchanged_group_means, seed ^ 0xCF00_0005);
+    let eligible_pairs = ledger.iter().filter(|row| row.eligible).count();
+    let outcome_equivalent_pairs = ledger.len() - eligible_pairs;
+    let changed_changed_pairs = ledger
+        .iter()
+        .filter(|row| row.eligible && row.left_changed && row.right_changed)
+        .count();
+    let changed_unchanged_pairs = ledger
+        .iter()
+        .filter(|row| row.eligible && row.left_changed != row.right_changed)
+        .count();
+    let equivalent_max_abs = ledger
+        .iter()
+        .filter(|row| !row.eligible)
+        .map(|row| row.margin.abs())
+        .reduce(f64::max);
+    let action_masked_max_abs = action_masked_values
+        .iter()
+        .map(|(_, value)| value.abs())
+        .reduce(f64::max);
+    let identity_max_abs = identity_values
+        .iter()
+        .map(|(_, value)| value.abs())
+        .reduce(f64::max);
+    let pixel_oracle_estimate = equal_weight_control_mean(&pixel_oracle_values);
+    let latent_oracle_estimate = equal_weight_control_mean(&latent_oracle_values);
+    let swapped_oracle_estimate = equal_weight_control_mean(&swapped_oracle_values);
+    let movement_group_indices = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, group)| {
+            group.branches()[0]
+                .transition
+                .episode_id
+                .is_multiple_of(2)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let movement_template = movement_group_indices.first().map(|index| {
+        groups[*index]
+            .branches()
+            .iter()
+            .map(|branch| branch.transition.action.clone())
+            .collect::<Vec<_>>()
+    });
+    let templates_match = movement_template.as_ref().is_some_and(|template| {
+        movement_group_indices.iter().all(|index| {
+            groups[*index]
+                .branches()
+                .iter()
+                .map(|branch| &branch.transition.action)
+                .eq(template.iter())
+        })
+    });
+    let mut state_scrambled_values = Vec::new();
+    if movement_group_indices.len() >= 2 && templates_match {
+        for (position, destination_group) in movement_group_indices.iter().copied().enumerate() {
+            let source_group =
+                movement_group_indices[(position + 1) % movement_group_indices.len()];
+            let destination_classes = canonical_outcome_classes(&groups[destination_group]);
+            let destination_offset = destination_group * FACTUAL_BRANCHES_PER_GROUP;
+            let source_offset = source_group * FACTUAL_BRANCHES_PER_GROUP;
+            for left in 0..FACTUAL_BRANCHES_PER_GROUP {
+                for right in left + 1..FACTUAL_BRANCHES_PER_GROUP {
+                    if destination_classes[left] == destination_classes[right] {
+                        continue;
+                    }
+                    let (_, _, margin) = outcome_counterfactual_margin(
+                        &predicted_displacements[source_offset + left],
+                        &predicted_displacements[source_offset + right],
+                        &target_displacements[destination_offset + left],
+                        &target_displacements[destination_offset + right],
+                    );
+                    state_scrambled_values.push((destination_group, margin));
+                }
+            }
+        }
+    }
+    let state_scrambled_estimate = equal_weight_control_mean(&state_scrambled_values);
+    let state_scrambled_groups = state_scrambled_values
+        .iter()
+        .map(|(group, _)| *group)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let state_scrambled_same_action_template = OutcomeCounterfactualStateScrambledControl {
+        available: state_scrambled_estimate.is_some(),
+        estimate: state_scrambled_estimate,
+        groups: state_scrambled_groups,
+        pairs: state_scrambled_values.len(),
+        reason: if state_scrambled_estimate.is_some() {
+            None
+        } else if !templates_match {
+            Some("unavailable: movement groups do not share an identical action template".into())
+        } else {
+            Some("unavailable: fewer than two eligible movement groups".into())
+        },
+    };
+    let target_collapse_failure = target_collapsed_pairs > 0;
+    let pixel_oracle_exactly_one = !pixel_oracle_values.is_empty()
+        && pixel_oracle_values.iter().all(|(_, value)| *value == 1.0);
+    let latent_oracle_at_least_0_99 =
+        !target_collapse_failure && latent_oracle_estimate.is_some_and(|value| value >= 0.99);
+    let swapped_oracle_at_most_negative_0_99 =
+        swapped_oracle_estimate.is_some_and(|value| value <= -0.99);
+    let action_masked_pass = action_masked_max_abs.is_some_and(|value| value <= 1e-6);
+    let identity_pass = identity_max_abs.is_some_and(|value| value <= 1e-6);
+    let equivalent_pass = equivalent_max_abs.is_some_and(|value| value <= 1e-6);
+    let required_controls_pass = pixel_oracle_exactly_one
+        && latent_oracle_at_least_0_99
+        && swapped_oracle_at_most_negative_0_99
+        && action_masked_pass
+        && identity_pass
+        && equivalent_pass;
+    let controls = OutcomeCounterfactualControls {
+        pixel_oracle_estimate,
+        pixel_oracle_exactly_one,
+        latent_oracle_estimate,
+        latent_oracle_at_least_0_99,
+        target_collapse_failure,
+        target_collapsed_pairs,
+        swapped_oracle_estimate,
+        swapped_oracle_at_most_negative_0_99,
+        action_masked_max_abs_margin: action_masked_max_abs,
+        action_masked_max_abs_at_most_1e_6: action_masked_pass,
+        identity_max_abs_margin: identity_max_abs,
+        identity_max_abs_at_most_1e_6: identity_pass,
+        outcome_equivalent_pairs,
+        outcome_equivalent_max_abs_margin: equivalent_max_abs,
+        outcome_equivalent_max_abs_at_most_1e_6: equivalent_pass,
+        state_scrambled_same_action_template,
+        required_controls_pass,
+    };
+    let eligible_simulator_groups = movement_group_means.len();
+    let simulator_changed_changed_pairs = ledger
+        .iter()
+        .filter(|row| {
+            row.eligible
+                && row.group.population == "movement"
+                && row.left_changed
+                && row.right_changed
+        })
+        .count();
+    let eligible_simulator_groups_at_least_100 = eligible_simulator_groups >= 100;
+    let each_movement_action_at_least_16_changed_and_16_unchanged = (1..=4).all(|action| {
+        movement_action_anchors
+            .get(&action)
+            .is_some_and(|anchors| anchors.changed >= 16 && anchors.unchanged >= 16)
+    });
+    let simulator_changed_changed_pairs_at_least_100 = simulator_changed_changed_pairs >= 100;
+    let population_pass = eligible_simulator_groups_at_least_100
+        && each_movement_action_at_least_16_changed_and_16_unchanged
+        && simulator_changed_changed_pairs_at_least_100
+        && !target_collapse_failure;
+    let population_gates = OutcomeCounterfactualPopulationGates {
+        eligible_simulator_groups,
+        eligible_simulator_groups_at_least_100,
+        movement_action_anchors,
+        each_movement_action_at_least_16_changed_and_16_unchanged,
+        simulator_changed_changed_pairs,
+        simulator_changed_changed_pairs_at_least_100,
+        target_collapse_failure,
+        population_pass,
+    };
+    let movement_groups = groups
+        .iter()
+        .filter(|group| group.branches()[0].transition.episode_id.is_multiple_of(2))
+        .count();
+    let action_separation_pass = movement.as_ref().is_some_and(|interval| {
+        interval.estimate > OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD
+            && interval.lower_95 > OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD
+    });
+    let ledger_reconciled = ledger.len() == groups.len() * 6
+        && eligible_pairs + outcome_equivalent_pairs == ledger.len()
+        && ledger.iter().all(|row| {
+            row.group.actions.len() == FACTUAL_BRANCHES_PER_GROUP
+                && row.group.next_sha256.len() == FACTUAL_BRANCHES_PER_GROUP
+                && row.left_branch_index < row.right_branch_index
+                && row.right_branch_index < FACTUAL_BRANCHES_PER_GROUP
+                && row.group.actions[row.left_branch_index] == row.left_action
+                && row.group.actions[row.right_branch_index] == row.right_action
+                && row.eligible == (row.left_outcome_class != row.right_outcome_class)
+                && (row.margin
+                    - (row.crossed_loss - row.concordant_loss)
+                        / (row.crossed_loss + row.concordant_loss + OUTCOME_COUNTERFACTUAL_EPSILON))
+                    .abs()
+                    <= 1e-12
+        })
+        && outcome_interval_reconciles(&overall, &overall_group_means)
+        && outcome_interval_reconciles(&movement, &movement_group_means)
+        && outcome_interval_reconciles(&coordinate, &coordinate_group_means)
+        && outcome_interval_reconciles(&changed_changed, &changed_changed_group_means)
+        && outcome_interval_reconciles(&changed_unchanged, &changed_unchanged_group_means);
+    Ok(OutcomeCounterfactualMetrics {
+        population_fingerprint: outcome_population_fingerprint(&group_fingerprints),
+        groups: groups.len(),
+        movement_groups,
+        coordinate_groups: groups.len() - movement_groups,
+        unordered_pairs: ledger.len(),
+        eligible_pairs,
+        outcome_equivalent_pairs,
+        changed_changed_pairs,
+        changed_unchanged_pairs,
+        epsilon: OUTCOME_COUNTERFACTUAL_EPSILON,
+        material_threshold: OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD,
+        overall,
+        movement,
+        coordinate,
+        changed_changed,
+        changed_unchanged,
+        action_separation_pass,
+        controls,
+        population_gates,
+        pair_ledger: ledger,
+        ledger_reconciled,
+    })
+}
+
 fn evaluate_factual_branches(
     model: &WorldModel,
     cfg: &EvalConfig,
@@ -4069,6 +4881,9 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     }
     let device = resolve_device(&cfg.device)?;
     let (model, _varmap) = load_model(&train_cfg, &cfg.checkpoint, &device)?;
+    let outcome_counterfactuals = (cfg.mode == EvalMode::Full)
+        .then(|| evaluate_outcome_counterfactuals(&model, cfg, &device))
+        .transpose()?;
     let factual_branches = train_cfg
         .world_core_v2
         .then(|| evaluate_factual_branches(&model, cfg, &device))
@@ -4281,6 +5096,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         synthetic_planner,
         board_probe,
         factual_branches,
+        outcome_counterfactuals,
         arc3_transfer,
         research_claim: false,
     };
@@ -5112,6 +5928,117 @@ mod tests {
     }
 
     #[test]
+    fn outcome_counterfactual_margin_algebra_distinguishes_concordant_and_swapped() {
+        let left_prediction = [1.0f32, 0.0];
+        let right_prediction = [0.0f32, 1.0];
+        let left_target = [1.0f32, 0.0];
+        let right_target = [0.0f32, 1.0];
+        let (_, _, concordant) = outcome_counterfactual_margin(
+            &left_prediction,
+            &right_prediction,
+            &left_target,
+            &right_target,
+        );
+        let (_, _, swapped) = outcome_counterfactual_margin(
+            &right_prediction,
+            &left_prediction,
+            &left_target,
+            &right_target,
+        );
+        assert_eq!(concordant, 1.0);
+        assert_eq!(swapped, -1.0);
+    }
+
+    #[test]
+    fn outcome_counterfactual_enumeration_keeps_populations_and_equivalence_distinct() -> Result<()>
+    {
+        let seed = factual_branch_eval_seed(19);
+        let movement = generate_factual_branch_group(seed, 0, Split::HeldOutComposition)?;
+        let coordinate = generate_factual_branch_group(seed, 1, Split::HeldOutComposition)?;
+        assert_eq!(movement.branches().len(), FACTUAL_BRANCHES_PER_GROUP);
+        assert_eq!(coordinate.branches().len(), FACTUAL_BRANCHES_PER_GROUP);
+        assert!(movement.branches()[0]
+            .transition
+            .family
+            .starts_with("factual_branch"));
+        assert_eq!(
+            coordinate.branches()[0].transition.family,
+            "factual_coordinate_branch"
+        );
+        let coordinate_classes = canonical_outcome_classes(&coordinate);
+        assert_eq!(
+            coordinate_classes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!((0..4).flat_map(|left| left + 1..4).count(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn outcome_counterfactual_negative_controls_are_exactly_neutral() {
+        let prediction = [0.25f32, -0.5];
+        let left_target = [1.0f32, 0.0];
+        let right_target = [0.0f32, 1.0];
+        let (_, _, masked) =
+            outcome_counterfactual_margin(&prediction, &prediction, &left_target, &right_target);
+        let identity = [0.0f32, 0.0];
+        let (_, _, identity_margin) =
+            outcome_counterfactual_margin(&identity, &identity, &left_target, &right_target);
+        let (_, _, equivalent) =
+            outcome_counterfactual_margin(&left_target, &right_target, &left_target, &left_target);
+        assert_eq!(masked, 0.0);
+        assert_eq!(identity_margin, 0.0);
+        assert_eq!(equivalent, 0.0);
+    }
+
+    #[test]
+    fn outcome_counterfactual_bootstrap_is_deterministic_and_whole_group() {
+        let groups = vec![(0, -0.5, 2), (1, 0.5, 4), (2, 1.0, 1)];
+        let first = outcome_interval_from_group_means(&groups, 7).expect("interval");
+        let second = outcome_interval_from_group_means(&groups, 7).expect("interval");
+        assert_eq!(first.estimate, 1.0 / 3.0);
+        assert_eq!(first.lower_95, second.lower_95);
+        assert_eq!(first.upper_98_75, second.upper_98_75);
+        assert_eq!(first.groups, 3);
+        assert_eq!(first.pairs, 7);
+        assert_eq!(first.resamples, 10_000);
+        assert_eq!(first.unit, "whole_branch_group");
+    }
+
+    #[test]
+    fn outcome_content_fingerprint_excludes_seed_and_episode_provenance() -> Result<()> {
+        let group = generate_factual_branch_group(
+            factual_branch_eval_seed(23),
+            1,
+            Split::HeldOutComposition,
+        )?;
+        let mut changed_json = serde_json::to_value(&group)?;
+        for branch in changed_json["branches"]
+            .as_array_mut()
+            .expect("serialized branches")
+        {
+            branch["transition"]["seed"] = serde_json::json!(u64::MAX);
+            branch["transition"]["episode_id"] = serde_json::json!(999_999u64);
+        }
+        let changed: BranchGroup = serde_json::from_value(changed_json)?;
+        let original_classes = canonical_outcome_classes(&group);
+        let changed_classes = canonical_outcome_classes(&changed);
+        assert_eq!(
+            outcome_group_content_sha256(&group, &original_classes),
+            outcome_group_content_sha256(&changed, &changed_classes)
+        );
+        assert_eq!(
+            frame_content_sha256(&group.branches()[0].transition.current),
+            frame_content_sha256(&changed.branches()[0].transition.current)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tiny_eval_and_report_schema() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("tofy-p2-eval-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -5207,6 +6134,46 @@ mod tests {
         assert!(factual.action6_coordinate_rmse_pixels.is_some());
         assert!(!factual.population_fingerprint.is_empty());
         assert!(factual.board_probe.is_some());
+        let counterfactuals = eval
+            .outcome_counterfactuals
+            .as_ref()
+            .expect("full evaluation outcome counterfactuals");
+        assert_eq!(counterfactuals.groups, eval_cfg.synthetic_episodes * 4);
+        assert_eq!(
+            counterfactuals.movement_groups,
+            counterfactuals.coordinate_groups
+        );
+        assert_eq!(counterfactuals.unordered_pairs, counterfactuals.groups * 6);
+        assert_eq!(
+            counterfactuals.eligible_pairs + counterfactuals.outcome_equivalent_pairs,
+            counterfactuals.unordered_pairs
+        );
+        assert!(counterfactuals.ledger_reconciled);
+        assert_eq!(
+            counterfactuals.overall.as_ref().map(|row| row.resamples),
+            Some(10_000)
+        );
+        assert!(counterfactuals.controls.pixel_oracle_exactly_one);
+        assert!(counterfactuals.controls.latent_oracle_at_least_0_99);
+        assert!(
+            counterfactuals
+                .controls
+                .swapped_oracle_at_most_negative_0_99
+        );
+        assert!(counterfactuals.controls.action_masked_max_abs_at_most_1e_6);
+        assert!(counterfactuals.controls.identity_max_abs_at_most_1e_6);
+        let state_scrambled = &counterfactuals
+            .controls
+            .state_scrambled_same_action_template;
+        assert!(state_scrambled.available);
+        assert!(state_scrambled.estimate.is_some());
+        assert_eq!(state_scrambled.groups, counterfactuals.movement_groups);
+        assert!(state_scrambled.pairs > 0);
+        assert!(counterfactuals.pair_ledger.iter().all(|row| {
+            row.group.actions.len() == 4
+                && row.group.next_sha256.len() == 4
+                && row.group.content_fingerprint.starts_with("sha256:")
+        }));
         assert!(eval
             .synthetic_dynamics
             .one_step_latent_mse
@@ -5260,11 +6227,24 @@ mod tests {
         let back: EvalReport = serde_json::from_str(&text)?;
         assert_eq!(back.schema, EVAL_REPORT_SCHEMA);
         assert_eq!(
+            back.outcome_counterfactuals
+                .as_ref()
+                .map(|metrics| &metrics.population_fingerprint),
+            Some(&counterfactuals.population_fingerprint)
+        );
+        assert_eq!(
             back.factual_branches
                 .as_ref()
                 .map(|metrics| &metrics.population_fingerprint),
             Some(&factual.population_fingerprint)
         );
+        let mut compatible_value = serde_json::to_value(&eval)?;
+        compatible_value
+            .as_object_mut()
+            .expect("serialized report object")
+            .remove("outcome_counterfactuals");
+        let compatible: EvalReport = serde_json::from_value(compatible_value)?;
+        assert!(compatible.outcome_counterfactuals.is_none());
         let episode_rows: Vec<EpisodeRolloutRow> =
             fs::read_to_string(eval_cfg.episode_jsonl.as_ref().expect("episode JSONL path"))?
                 .lines()
@@ -5314,6 +6294,7 @@ mod tests {
             .representation_seams
             .is_some());
         assert!(representation_eval.synthetic_dynamics.events.is_none());
+        assert!(representation_eval.outcome_counterfactuals.is_none());
         assert!(representation_eval.synthetic_dynamics.q.is_none());
         assert!(representation_eval.synthetic_dynamics.ptrm.is_none());
         assert!(representation_eval.synthetic_dynamics.rollout.is_none());
@@ -5362,6 +6343,7 @@ mod tests {
         assert!(rollout_eval.synthetic_dynamics.rollout.is_some());
         assert!(rollout_eval.synthetic_dynamics.closed_loop.is_some());
         assert!(rollout_eval.synthetic_dynamics.copy_forward.is_some());
+        assert!(rollout_eval.outcome_counterfactuals.is_none());
 
         let recordings = dir.join("empty-recordings");
         fs::create_dir_all(&recordings)?;
@@ -5388,7 +6370,49 @@ mod tests {
             empty_factual.changed_vs_unchanged_displacement_norm_auroc,
             None
         );
+        let empty_counterfactuals = arc_eval
+            .outcome_counterfactuals
+            .as_ref()
+            .expect("full mode keeps the outcome counterfactual block shape");
+        assert_eq!(empty_counterfactuals.groups, 0);
+        assert!(empty_counterfactuals.ledger_reconciled);
         let _: EvalReport = serde_json::from_str(&fs::read_to_string(&arc_cfg.output)?)?;
+
+        let legacy_dir = dir.join("legacy");
+        let legacy_cfg = TrainConfig {
+            output_dir: legacy_dir.clone(),
+            lessons: vec!["dynamics".into()],
+            world_core_v2: false,
+            branch_learning: crate::p2::branch_learning::BranchLearningConfig::default(),
+            ..train_cfg.clone()
+        };
+        let legacy_varmap = VarMap::new();
+        let legacy_vb = VarBuilder::from_varmap(&legacy_varmap, DType::F32, &device);
+        let _legacy_model = WorldModel::new(legacy_cfg.model_config(), legacy_vb)?;
+        reinit_varmap_deterministic(&legacy_varmap, legacy_cfg.seed)?;
+        let mut legacy_report = report.clone();
+        legacy_report.world_core_schema = "legacy_p2_eval_compatible".into();
+        legacy_report.experiment = legacy_cfg.resolved_experiment()?;
+        legacy_report.latest_checkpoint = legacy_dir.join("checkpoints/step-000000000000");
+        legacy_report.checkpoint = legacy_dir.join("model.safetensors");
+        legacy_report.config_path = legacy_dir.join("config.json");
+        save_checkpoint(&legacy_varmap, &legacy_cfg, &legacy_report)?;
+        let legacy_eval = evaluate(&EvalConfig {
+            checkpoint: legacy_dir.join("model.safetensors"),
+            train_config: legacy_dir.join("config.json"),
+            synthetic_episodes: 1,
+            ensemble_members: 0,
+            episode_jsonl: None,
+            output: legacy_dir.join("eval.json"),
+            ..eval_cfg.clone()
+        })?;
+        assert!(legacy_eval.factual_branches.is_none());
+        let legacy_counterfactuals = legacy_eval
+            .outcome_counterfactuals
+            .expect("legacy checkpoint full counterfactual evaluation");
+        assert_eq!(legacy_counterfactuals.groups, 4);
+        assert_eq!(legacy_counterfactuals.pair_ledger.len(), 24);
+        assert!(legacy_counterfactuals.ledger_reconciled);
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

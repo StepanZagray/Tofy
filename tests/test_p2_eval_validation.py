@@ -30,7 +30,8 @@ def horizon_metrics(counts: dict[int, int]) -> dict[str, object]:
 
 def report() -> dict[str, object]:
     return {
-        "schema": "p2.eval_report.v13",
+        "schema": "p2.eval_report.v14",
+        "mode": "full",
         "seed": EXPECTED_SEED,
         "board_probe": {
             "population_fingerprint": "fnv1a64:test",
@@ -83,6 +84,118 @@ def report() -> dict[str, object]:
         "synthetic_planner": {
             "rollout": horizon_metrics(COUNTS["synthetic_planner"]),
         },
+        "outcome_counterfactuals": outcome_counterfactuals(),
+    }
+
+
+def counterfactual_interval(groups: int, pairs: int) -> dict[str, object]:
+    return {
+        "estimate": 0.05,
+        "lower_95": 0.01,
+        "upper_95": 0.09,
+        "lower_98_75": 0.0,
+        "upper_98_75": 0.1,
+        "groups": groups,
+        "pairs": pairs,
+        "resamples": 10_000,
+        "unit": "whole_branch_group",
+    }
+
+
+def outcome_counterfactuals() -> dict[str, object]:
+    digest = "sha256:" + "1" * 64
+    ledger = []
+    for group_index in range(256):
+        population = "movement" if group_index % 2 == 0 else "coordinate"
+        group = {
+            "group_index": group_index,
+            "family": "factual_branch",
+            "population": population,
+            "content_fingerprint": digest,
+            "current_sha256": digest,
+            "next_sha256": [digest] * 4,
+            "actions": [{"id": action} for action in range(1, 5)],
+        }
+        for left in range(4):
+            for right in range(left + 1, 4):
+                changed_unchanged = left == 0 and right == 1
+                ledger.append(
+                    {
+                        "group": group,
+                        "left_branch_index": left,
+                        "right_branch_index": right,
+                        "left_action": {"id": left + 1},
+                        "right_action": {"id": right + 1},
+                        "left_outcome_class": left,
+                        "right_outcome_class": right,
+                        "left_changed": not changed_unchanged,
+                        "right_changed": True,
+                        "left_changed_cells": [] if changed_unchanged else [0],
+                        "right_changed_cells": [1],
+                        "target_pair_mse": 1.0,
+                        "concordant_loss": 0.95,
+                        "crossed_loss": 1.05,
+                        "margin": 0.05,
+                        "eligible": True,
+                        "reason": "distinct_canonical_board_outcomes",
+                    }
+                )
+    anchors = {str(action): {"changed": 64, "unchanged": 64} for action in range(1, 5)}
+    return {
+        "population_fingerprint": digest,
+        "groups": 256,
+        "movement_groups": 128,
+        "coordinate_groups": 128,
+        "unordered_pairs": 1536,
+        "eligible_pairs": 1536,
+        "outcome_equivalent_pairs": 0,
+        "changed_changed_pairs": 1280,
+        "changed_unchanged_pairs": 256,
+        "epsilon": 1e-30,
+        "material_threshold": 0.1,
+        "overall": counterfactual_interval(256, 1536),
+        "movement": counterfactual_interval(128, 768),
+        "coordinate": counterfactual_interval(128, 768),
+        "changed_changed": counterfactual_interval(256, 1280),
+        "changed_unchanged": counterfactual_interval(256, 256),
+        "action_separation_pass": False,
+        "controls": {
+            "pixel_oracle_estimate": 1.0,
+            "pixel_oracle_exactly_one": True,
+            "latent_oracle_estimate": 1.0,
+            "latent_oracle_at_least_0_99": True,
+            "target_collapse_failure": False,
+            "target_collapsed_pairs": 0,
+            "swapped_oracle_estimate": -1.0,
+            "swapped_oracle_at_most_negative_0_99": True,
+            "action_masked_max_abs_margin": 0.0,
+            "action_masked_max_abs_at_most_1e_6": True,
+            "identity_max_abs_margin": 0.0,
+            "identity_max_abs_at_most_1e_6": True,
+            "outcome_equivalent_pairs": 0,
+            "outcome_equivalent_max_abs_margin": 0.0,
+            "outcome_equivalent_max_abs_at_most_1e_6": True,
+            "state_scrambled_same_action_template": {
+                "available": True,
+                "estimate": 0.0,
+                "groups": 128,
+                "pairs": 768,
+                "reason": None,
+            },
+            "required_controls_pass": True,
+        },
+        "population_gates": {
+            "eligible_simulator_groups": 128,
+            "eligible_simulator_groups_at_least_100": True,
+            "movement_action_anchors": anchors,
+            "each_movement_action_at_least_16_changed_and_16_unchanged": True,
+            "simulator_changed_changed_pairs": 640,
+            "simulator_changed_changed_pairs_at_least_100": True,
+            "target_collapse_failure": False,
+            "population_pass": True,
+        },
+        "pair_ledger": ledger,
+        "ledger_reconciled": True,
     }
 
 
