@@ -106,6 +106,19 @@ fn vicreg_row_indices(rows: usize, maximum_rows: usize) -> Result<Vec<u32>> {
         .collect()
 }
 
+fn validate_vicreg_row_indices(rows: usize, positions: &[u32]) -> Result<()> {
+    if let Some(max_position) = positions.iter().copied().max() {
+        if max_position as usize >= rows {
+            bail!(
+                "VICReg row selection index {max_position} is out of bounds for source with \
+                 {rows} rows (requested_rows={})",
+                positions.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Compute VICReg-style variance and covariance health penalties for latents.
 ///
 /// The input remains on its current autograd path: F32 conversion, reshape,
@@ -125,6 +138,7 @@ pub fn vicreg_latent_health(latents: &Tensor, config: VicRegConfig) -> Result<Vi
     }
 
     let selected_indices = vicreg_row_indices(row_count, config.maximum_rows)?;
+    validate_vicreg_row_indices(row_count, &selected_indices)?;
     let selected_rows = selected_indices.len();
     let indices = Tensor::from_vec(selected_indices, (selected_rows,), rows.device())?;
     let rows = rows.index_select(&indices, 0)?;
@@ -178,6 +192,7 @@ pub fn vicreg_displacement_health(latents: &Tensor, config: VicRegConfig) -> Res
     let row_count = rows.dim(0)?;
     let channels = rows.dim(1)?;
     let selected_indices = vicreg_row_indices(row_count, config.maximum_rows)?;
+    validate_vicreg_row_indices(row_count, &selected_indices)?;
     let selected_rows = selected_indices.len();
     let indices = Tensor::from_vec(selected_indices, (selected_rows,), rows.device())?;
     let rows = rows.index_select(&indices, 0)?;
@@ -333,6 +348,26 @@ fn row_rank(eval_seed: u64, sampling_key: u64, row_id: u64) -> RowRank {
     }
 }
 
+fn validate_selected_positions(
+    source_rows: usize,
+    positions: &[u32],
+    rows_seen: usize,
+    selected_rows: usize,
+    incoming_rows: usize,
+) -> Result<()> {
+    if let Some(max_position) = positions.iter().copied().max() {
+        if max_position as usize >= source_rows {
+            bail!(
+                "representation row selection index {max_position} is out of bounds for source \
+                 with {source_rows} rows (rows_seen={rows_seen}, selected_rows={selected_rows}, \
+                 incoming_rows={incoming_rows}, requested_rows={})",
+                positions.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A bounded device-resident sample of one representation population.
 ///
 /// Ranking rows by their stable identifiers makes selection independent of physical batches.
@@ -429,6 +464,13 @@ impl RepresentationRowCollector {
                     .map_err(|_| anyhow::anyhow!("representation row index overflow"))
             })
             .collect::<Result<_>>()?;
+        validate_selected_positions(
+            source.dim(0)?,
+            &positions,
+            self.rows_seen,
+            selected_len,
+            row_count,
+        )?;
         let indices = Tensor::from_vec(positions, (ranked_positions.len(),), rows.device())?;
         self.selected = Some(source.index_select(&indices, 0)?);
         self.selected_ranks = ranked_positions.into_iter().map(|(rank, _)| rank).collect();
@@ -783,6 +825,26 @@ mod tests {
         assert_eq!(direct.mean_variance, batched.mean_variance);
         assert_eq!(direct.effective_rank, batched.effective_rank);
         Ok(())
+    }
+
+    #[test]
+    fn row_selection_bounds_diagnostic_reports_full_context() {
+        let error = validate_selected_positions(4, &[0, 3, 4], 8, 2, 2).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "representation row selection index 4 is out of bounds for source with 4 rows \
+             (rows_seen=8, selected_rows=2, incoming_rows=2, requested_rows=3)"
+        );
+    }
+
+    #[test]
+    fn vicreg_row_selection_bounds_diagnostic_reports_context() {
+        let error = validate_vicreg_row_indices(4, &[0, 3, 4]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "VICReg row selection index 4 is out of bounds for source with 4 rows \
+             (requested_rows=3)"
+        );
     }
 
     #[test]
