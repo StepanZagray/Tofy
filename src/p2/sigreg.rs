@@ -91,6 +91,16 @@ pub fn sigreg_epps_pulley_seeded(
     num_points: usize,
     seed: u64,
 ) -> Result<Tensor> {
+    sigreg_epps_pulley_seeded_impl(x, num_slices, num_points, seed, false)
+}
+
+fn sigreg_epps_pulley_seeded_impl(
+    x: &Tensor,
+    num_slices: usize,
+    num_points: usize,
+    seed: u64,
+    include_zero_knot: bool,
+) -> Result<Tensor> {
     let device = x.device();
     let work_dtype = candle_core::DType::F32;
     // Normalize to T×B×D then B×T×D for the batch-mean Epps–Pulley path.
@@ -114,7 +124,14 @@ pub fn sigreg_epps_pulley_seeded(
         .reshape((batch, time, num_slices))?
         .unsqueeze(3)?; // [B, T, M, 1]
 
-    let knots = sigreg_knots(num_points);
+    // At t=0 the empirical characteristic function is exactly (1, 0), as is
+    // the standard-normal target, so both the loss and its derivative vanish.
+    // Keep the reference path for parity tests, but do not allocate or evaluate
+    // that B×T×M slice during training.
+    let knots = sigreg_knots(num_points)
+        .into_iter()
+        .skip(if include_zero_knot { 0 } else { 1 })
+        .collect::<Vec<_>>();
     let knot_values = knots.iter().map(|&(t, _, _)| t).collect::<Vec<_>>();
     let normal_cf = knots
         .iter()
@@ -279,6 +296,48 @@ mod tests {
         assert!(!flat.is_empty());
         assert!(flat.iter().all(|v| v.is_finite()));
         assert!(flat.iter().any(|v| *v != 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn omitting_zero_knot_preserves_loss_and_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let values: Vec<f32> = (0..48).map(|i| (i as f32 * 0.19 - 2.0).sin()).collect();
+        let optimized_var = Var::new(values.as_slice(), &device)?;
+        let reference_var = Var::new(values.as_slice(), &device)?;
+        let optimized = sigreg_epps_pulley_seeded_impl(
+            &optimized_var.as_tensor().reshape((8, 6))?,
+            12,
+            17,
+            29,
+            false,
+        )?;
+        let reference = sigreg_epps_pulley_seeded_impl(
+            &reference_var.as_tensor().reshape((8, 6))?,
+            12,
+            17,
+            29,
+            true,
+        )?;
+        let optimized_value = optimized.to_scalar::<f32>()?;
+        let reference_value = reference.to_scalar::<f32>()?;
+        assert!((optimized_value - reference_value).abs() <= 1e-5);
+
+        let optimized_grads = optimized.backward()?;
+        let reference_grads = reference.backward()?;
+        let optimized_grad = optimized_grads
+            .get(&optimized_var)
+            .expect("optimized SIGReg gradient")
+            .to_vec1::<f32>()?;
+        let reference_grad = reference_grads
+            .get(&reference_var)
+            .expect("reference SIGReg gradient")
+            .to_vec1::<f32>()?;
+        assert_eq!(optimized_grad.len(), reference_grad.len());
+        assert!(optimized_grad
+            .iter()
+            .zip(reference_grad.iter())
+            .all(|(left, right)| (left - right).abs() <= 1e-5));
         Ok(())
     }
 

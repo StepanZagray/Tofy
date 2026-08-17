@@ -844,6 +844,19 @@ impl WorldModel {
         actions: &Tensor,
         action_coords: &Tensor,
     ) -> Result<Tensor> {
+        self.add_action_with_canonical(state, None, actions, action_coords)
+    }
+
+    /// Shared action-conditioning implementation. Full V4 training supplies
+    /// the already-required canonical state so action conditioning, SIGReg,
+    /// and the prediction objective reuse one autograd node.
+    fn add_action_with_canonical(
+        &self,
+        state: &Tensor,
+        canonical: Option<&Tensor>,
+        actions: &Tensor,
+        action_coords: &Tensor,
+    ) -> Result<Tensor> {
         let b = state.dim(0)?;
         if state.dims4()? != (b, self.config.hidden_dim, LATENT_GRID, LATENT_GRID) {
             bail!(
@@ -871,26 +884,35 @@ impl WorldModel {
             .forward(&self.action_emb.forward(&actions)?)?;
         let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
         let conditioned = state.broadcast_add(&action_bias)?;
-        let mut coords = self.coord_proj.forward(action_coords)?;
-        if self.config.world_core_v2 {
-            let coordinate_active = actions
-                .eq(6u32)?
-                .to_dtype(coords.dtype())?
-                .reshape((b, 1))?
-                .broadcast_as(coords.dims())?;
-            coords = coords.mul(&coordinate_active)?;
-        }
-        let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
+        let coord_bias = if !self.config.spatial_action_field || self.config.spatial_action_residual
+        {
+            let mut coords = self.coord_proj.forward(action_coords)?;
+            if self.config.world_core_v2 {
+                let coordinate_active = actions
+                    .eq(6u32)?
+                    .to_dtype(coords.dtype())?
+                    .reshape((b, 1))?
+                    .broadcast_as(coords.dims())?;
+                coords = coords.mul(&coordinate_active)?;
+            }
+            Some(coords.reshape((b, self.config.hidden_dim, 1, 1))?)
+        } else {
+            None
+        };
         let conditioned = if self.config.world_core_v4 {
-            let canonical =
-                self.canonical_representation(state)?
-                    .reshape((b, self.config.hidden_dim, 1, 1))?;
+            let canonical = match canonical {
+                Some(canonical) => canonical.clone(),
+                None => self.canonical_representation(state)?,
+            }
+            .reshape((b, self.config.hidden_dim, 1, 1))?;
             conditioned.broadcast_add(&canonical)?
         } else {
             conditioned
         };
         if !self.config.spatial_action_field {
-            return conditioned.broadcast_add(&coord_bias).map_err(Into::into);
+            return conditioned
+                .broadcast_add(coord_bias.as_ref().expect("non-spatial coordinate bias"))
+                .map_err(Into::into);
         }
 
         let field = self.spatial_action_field(&actions, action_coords)?;
@@ -907,7 +929,11 @@ impl WorldModel {
                 .broadcast_as(projection.dims())?;
             projection = projection.mul(&active)?;
             conditioned
-                .broadcast_add(&coord_bias)?
+                .broadcast_add(
+                    coord_bias
+                        .as_ref()
+                        .expect("residual spatial coordinate bias"),
+                )?
                 .add(&projection.affine(self.config.spatial_action_residual_scale, 0.0)?)
                 .map_err(Into::into)
         } else {
@@ -1088,15 +1114,23 @@ impl WorldModel {
         }
         let mut z = z.clone();
         let mut y = y.clone();
+        let xy = if self.config.world_core_v4 {
+            Some(x.add(&y)?)
+        } else {
+            None
+        };
         for _ in 0..inner_steps {
             let step_seed = noise_seed_base.map(|s| s.wrapping_add(*noise_counter));
             *noise_counter = noise_counter.wrapping_add(1);
             z = self.maybe_noise_z(&z, sigma, step_seed)?;
-            let inp = x.add(&y)?.add(&z)?;
+            let inp = match &xy {
+                Some(xy) => xy.add(&z)?,
+                None => x.add(&y)?.add(&z)?,
+            };
             z = self.block.forward(&inp)?;
         }
         let inp = if self.config.world_core_v4 {
-            x.add(&y)?.add(&z)?
+            xy.expect("Full V4 x+y was prepared").add(&z)?
         } else {
             y.add(&z)?
         };
@@ -1401,6 +1435,34 @@ impl WorldModel {
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
         let x = self.add_action(cur_state, actions, action_coords)?;
+        let y_init = self.config.warm_start_y.then(|| cur_state.clone());
+        self.run_latent_recursion(&x, z_noise_sigma, noise_seed, depth, y_init, recursion)
+    }
+
+    /// Full V4 training recursion with a caller-owned canonical current state.
+    /// This keeps the canonical representation as the single consumed state
+    /// across conditioning and objective terms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_v4_training_latents_from_encoded_state(
+        &self,
+        cur_state: &Tensor,
+        current_canonical: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
+        if !self.config.world_core_v4 {
+            bail!("Full V4 training recursion requires world_core_v4");
+        }
+        let x = self.add_action_with_canonical(
+            cur_state,
+            Some(current_canonical),
+            actions,
+            action_coords,
+        )?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(&x, z_noise_sigma, noise_seed, depth, y_init, recursion)
     }
@@ -2291,6 +2353,51 @@ mod tests {
             assert_eq!(
                 with_heads.y.flatten_all()?.to_vec1::<f32>()?,
                 without_heads.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_v4_cached_canonical_recursion_matches_uncached_path_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            world_core_v4: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            residual_y_update: true,
+            warm_start_y: true,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
+        let (frames, actions, coords, _) = sample_batch(&device, 3, model.config.goal_dim)?;
+        let current = model.encode_state(&frames)?;
+        let current_canonical = model.canonical_representation(&current)?;
+        let depth = RecursionDepth::from_config(model.config());
+        let opts = RecursionOpts::training(true);
+        let uncached = model.training_latents_from_encoded_state(
+            &current, &actions, &coords, depth, 0.0, None, opts,
+        )?;
+        let cached = model.full_v4_training_latents_from_encoded_state(
+            &current,
+            &current_canonical,
+            &actions,
+            &coords,
+            depth,
+            0.0,
+            None,
+            opts,
+        )?;
+        assert_eq!(
+            uncached.y.flatten_all()?.to_vec1::<f32>()?,
+            cached.y.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(uncached.steps.len(), cached.steps.len());
+        for (uncached, cached) in uncached.steps.iter().zip(&cached.steps) {
+            assert_eq!(
+                uncached.flatten_all()?.to_vec1::<f32>()?,
+                cached.flatten_all()?.to_vec1::<f32>()?
             );
         }
         Ok(())

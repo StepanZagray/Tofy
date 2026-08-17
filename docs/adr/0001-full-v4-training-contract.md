@@ -3,7 +3,7 @@
 - Status: accepted for local implementation and accelerator preflight
 - Date: 2026-08-16
 - Successor schema: `world_core_v4_full_training`
-- Training report: `p2.train_report.v10`
+- Training report: `p2.train_report.v11`
 - Evaluation report: `p2.eval_report.v15`
 
 ## Claim and evidence boundary
@@ -27,7 +27,9 @@ The recipe fixes:
 
 - hidden width 128, action embedding width 32, two inner and two outer steps;
 - hybrid optimizer settings (`lr=1e-3`, weight decay `0.01`, Muon momentum
-  `0.95`, repository RMS scale), F32 convolution, and shuffled episodes;
+  `0.95`, repository RMS scale), with DeepSeek-V4-equivalent normalized-buffer
+  Nesterov, simultaneous decoupled Muon decay, and checkpointed per-parameter
+  Adam clocks; F32 convolution; and shuffled episodes;
 - convolutional 64x64 palette encoder with the status row replaced before
   encoding;
 - `SpatialQuery` as one canonical `B x C` state;
@@ -38,7 +40,8 @@ The recipe fixes:
 - final-step spatial Huber plus canonical Huber prediction loss;
 - exact per-pixel palette grounding of encoded current and target states only,
   excluding the bottom status row;
-- marginal Epps-Pulley with 1024 seeded projections, 17 integration knots,
+- marginal Epps-Pulley with 1024 seeded projections, the original 17-knot
+  quadrature (the analytically zero `t=0` term is omitted from tensor work),
   weight 0.1, no row subsampling, and no smooth cap;
 - sequential open-loop Huber training with the implemented `2 -> 4 -> 8 -> max`
   horizon progression;
@@ -60,7 +63,7 @@ tested only after a mature V4 checkpoint fails a preregistered prerequisite.
 |---|---|---|
 | Joint encoder gradients | Current and target states share one trainable encoder/readout; neither is EMA or stop-gradient during world stages | Compatible with LeWorldModel v3 |
 | Prediction loss | Spatial and canonical Huber | Tofy adaptation; LeWorldModel uses next-embedding MSE |
-| EP estimator | Marginal Epps-Pulley, 1024 seeded projections, 17 knots, weight 0.1, no row cap/cap function | Component-faithful to the audited LeWorldModel implementation |
+| EP estimator | Marginal Epps-Pulley, 1024 seeded projections, original 17-knot weights with the identically-zero `t=0` term omitted from execution, weight 0.1, no row cap/cap function | Algebraically component-faithful to the audited LeWorldModel implementation; F32 reduction order remains an implementation detail |
 | Projector/readout | Shared in-stream `SpatialQuery`, per-sample RMS, consumed by transition and heads | Tofy adaptation; LeWorldModel uses separate loss-side encoder/predictor projectors over a global CLS token |
 | Temporal population | Marginal current/target rows | Deliberate baseline; TC-LeWM's centered residuals require valid ordered same-trajectory windows not present in `random_one_step` |
 | Exact semantics | Current and target gameplay pixels, status row masked | Tofy/ARC adaptation motivated by PSG-JEPA-style static-state grounding; no source theorem transfers |
@@ -111,8 +114,8 @@ Before a full accelerator run:
 5. confirm finite losses, nonzero world gradients in world stages, observer-only
    gradients in the last two stages, exact-decoder status masking, and report
    schema/provenance;
-6. only then start fresh full training. No pre-V4 checkpoint may be resumed into
-   V4.
+6. only then start fresh full training. No pre-V4 checkpoint or optimizer state
+   predating trainer-state schema v8 may be resumed into V4.
 
 `scripts/p2_arc3_train_eval.sh` enforces the clean revision and binary hash,
 requires preserved evidence for the explicitly measured physical batch, verifies

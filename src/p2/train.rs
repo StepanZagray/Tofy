@@ -74,8 +74,8 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v10";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v7";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v11";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v8";
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -2959,6 +2959,322 @@ fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
+/// Fixed Full V4 objective behind one recipe-specific interface.
+///
+/// The legacy objective remains an adapter for historical recipes. This module
+/// owns Full V4's lesson split, canonical-state reuse, frozen observer semantics,
+/// and fine-grained device attribution so those facts do not leak through the
+/// generic loss implementation.
+struct FullV4Objective<'a> {
+    model: &'a WorldModel,
+    batch: &'a BatchTensors,
+    cfg: &'a TrainConfig,
+    depth: RecursionDepth,
+    sigreg_seed: u64,
+    weights: LessonLossWeights,
+    profile: Option<&'a RepresentativeUpdateCapture>,
+}
+
+impl FullV4Objective<'_> {
+    fn phase<T>(
+        &self,
+        name: &str,
+        step: Option<ExecutionStep>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        match self.profile {
+            Some(profile) => profile.synchronized_phase(
+                self.batch.frames.device(),
+                name,
+                SpanKind::Module,
+                step,
+                f,
+            ),
+            None => f(),
+        }
+    }
+
+    fn compute(&self) -> Result<LossBreakdown> {
+        if self.cfg.recipe != TrainingRecipe::FullV4 {
+            bail!("FullV4Objective requires the Full V4 recipe");
+        }
+        if self.weights.rollout > 0.0 || self.weights.prefix > 0.0 || self.weights.ptrm_rank {
+            // Rollout is owned by the update loop and Full V4 excludes prefix
+            // and PTRM objectives. Fail closed if the resolved recipe drifts.
+            if self.weights.prefix > 0.0 || self.weights.ptrm_rank {
+                bail!("Full V4 objective received an excluded prefix or PTRM loss");
+            }
+        }
+        if self.weights.world > 0.0 || self.weights.sigreg > 0.0 {
+            self.world_lesson()
+        } else {
+            self.observer_lesson()
+        }
+    }
+
+    fn world_lesson(&self) -> Result<LossBreakdown> {
+        let encoded = self.phase(
+            "objective.encode_pair",
+            Some(ExecutionStep::Forward),
+            || {
+                self.model
+                    .encode_state_pair_for_training(&self.batch.frames, &self.batch.next_frames)
+            },
+        )?;
+        let current_canonical = self.phase(
+            "objective.current_canonical",
+            Some(ExecutionStep::Forward),
+            || self.model.canonical_representation(&encoded.current),
+        )?;
+        let target_canonical = self.phase(
+            "objective.target_canonical",
+            Some(ExecutionStep::Forward),
+            || self.model.canonical_representation(&encoded.next),
+        )?;
+        let out = self.phase("objective.recurrence", Some(ExecutionStep::Forward), || {
+            self.model.full_v4_training_latents_from_encoded_state(
+                &encoded.current,
+                &current_canonical,
+                &self.batch.actions,
+                &self.batch.action_coords,
+                self.depth,
+                0.0,
+                Some(self.sigreg_seed.wrapping_add(0x7E57)),
+                RecursionOpts::training(true),
+            )
+        })?;
+        let predicted_canonical = self.phase(
+            "objective.predicted_canonical",
+            Some(ExecutionStep::Forward),
+            || self.model.canonical_representation(&out.y),
+        )?;
+        let next_latent = self.phase(
+            "objective.world_prediction",
+            Some(ExecutionStep::Forward),
+            || {
+                let spatial = candle_nn::loss::huber(&out.y, &encoded.next, 1.0)?;
+                let canonical =
+                    candle_nn::loss::huber(&predicted_canonical, &target_canonical, 1.0)?;
+                spatial.add(&canonical).map_err(Into::into)
+            },
+        )?;
+        let grounding = self.phase(
+            "objective.exact_grounding",
+            Some(ExecutionStep::Forward),
+            || {
+                let current = self
+                    .model
+                    .exact_grounding_loss(&encoded.current, &self.batch.frames)?;
+                let target = self
+                    .model
+                    .exact_grounding_loss(&encoded.next, &self.batch.next_frames)?;
+                current.add(&target)?.affine(0.5, 0.0).map_err(Into::into)
+            },
+        )?;
+        let (sigreg_raw, sigreg_bounded) = if self.weights.sigreg > 0.0 {
+            let raw = self.phase("objective.sigreg", Some(ExecutionStep::Forward), || {
+                let population =
+                    Tensor::stack(&[current_canonical.clone(), target_canonical.clone()], 0)?;
+                sigreg_epps_pulley_seeded(
+                    &population,
+                    self.cfg.sigreg_projections,
+                    self.cfg.sigreg_knots,
+                    self.sigreg_seed,
+                )
+            })?;
+            (raw.clone(), raw)
+        } else {
+            let zero = Tensor::zeros((), DType::F32, self.batch.frames.device())?;
+            (zero.clone(), zero)
+        };
+        let mut total = next_latent.affine(self.weights.world, 0.0)?;
+        if self.weights.sigreg > 0.0 {
+            total = total.add(&sigreg_bounded.affine(self.weights.sigreg, 0.0)?)?;
+        }
+        total = total
+            .add(&grounding.affine(self.cfg.exact_grounding_weight * self.weights.world, 0.0)?)?;
+        self.breakdown(
+            total,
+            next_latent,
+            sigreg_raw,
+            sigreg_bounded,
+            grounding,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn observer_lesson(&self) -> Result<LossBreakdown> {
+        let device = self.batch.frames.device();
+        if self.weights.event == 0.0 && self.weights.q == 0.0 && self.weights.reliability == 0.0 {
+            let zero = Tensor::zeros((), DType::F32, device)?;
+            return self.breakdown(
+                zero.clone(),
+                zero.clone(),
+                zero.clone(),
+                zero.clone(),
+                zero,
+                None,
+                None,
+                None,
+            );
+        }
+        let current = self.phase(
+            "objective.encode_current",
+            Some(ExecutionStep::Forward),
+            || self.model.encode_state(&self.batch.frames),
+        )?;
+        let current_canonical = self.phase(
+            "objective.current_canonical",
+            Some(ExecutionStep::Forward),
+            || self.model.canonical_representation(&current),
+        )?;
+        let out = self.phase("objective.recurrence", Some(ExecutionStep::Forward), || {
+            self.model.full_v4_training_latents_from_encoded_state(
+                &current,
+                &current_canonical,
+                &self.batch.actions,
+                &self.batch.action_coords,
+                self.depth,
+                0.0,
+                Some(self.sigreg_seed.wrapping_add(0x7E57)),
+                RecursionOpts::training(true),
+            )
+        })?;
+        let predicted_canonical = self.phase(
+            "objective.predicted_canonical",
+            Some(ExecutionStep::Forward),
+            || self.model.canonical_representation(&out.y),
+        )?;
+        let detached_canonical = predicted_canonical.detach();
+        let exact_targets = if self.weights.q > 0.0 || self.weights.reliability > 0.0 {
+            Some(self.phase(
+                "objective.exact_observer_targets",
+                Some(ExecutionStep::Forward),
+                || {
+                    self.model.exact_transition_correctness(
+                        &out.y.detach(),
+                        &self.batch.frames,
+                        &self.batch.next_frames,
+                    )
+                },
+            )?)
+        } else {
+            None
+        };
+        let event = if self.weights.event > 0.0 {
+            Some(
+                self.phase("objective.event_head", Some(ExecutionStep::Forward), || {
+                    let logits = self
+                        .model
+                        .event_logits_from_canonical(&detached_canonical, &self.batch.goals)?;
+                    let slot_weights = event_slot_weight_tensor(device)?;
+                    masked_bce_with_slot_weights(
+                        &logits,
+                        &self.batch.event_targets,
+                        &self.batch.event_mask,
+                        Some(&slot_weights),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let q = if self.weights.q > 0.0 {
+            Some(
+                self.phase("objective.q_head", Some(ExecutionStep::Forward), || {
+                    let logits = self.model.q_logit_from_canonical(&detached_canonical)?;
+                    bce_with_logits(&logits, exact_targets.as_ref().expect("Full V4 Q labels"))
+                })?,
+            )
+        } else {
+            None
+        };
+        let reliability = if self.weights.reliability > 0.0 {
+            Some(self.phase(
+                "objective.reliability_head",
+                Some(ExecutionStep::Forward),
+                || {
+                    let logits = self
+                        .model
+                        .reliability_logit_from_canonical(&detached_canonical)?;
+                    bce_with_logits(
+                        &logits,
+                        exact_targets.as_ref().expect("Full V4 reliability labels"),
+                    )
+                },
+            )?)
+        } else {
+            None
+        };
+        let mut total = Tensor::zeros((), DType::F32, device)?;
+        for (weight, loss) in [
+            (self.weights.event, event.as_ref()),
+            (self.weights.q, q.as_ref()),
+            (self.weights.reliability, reliability.as_ref()),
+        ] {
+            if let Some(loss) = loss {
+                total = total.add(&loss.affine(weight, 0.0)?)?;
+            }
+        }
+        let zero = Tensor::zeros((), DType::F32, device)?;
+        self.breakdown(
+            total,
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero,
+            event,
+            q,
+            reliability,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn breakdown(
+        &self,
+        total: Tensor,
+        next_latent: Tensor,
+        sigreg_raw: Tensor,
+        sigreg_bounded: Tensor,
+        grounding: Tensor,
+        event: Option<Tensor>,
+        q: Option<Tensor>,
+        reliability: Option<Tensor>,
+    ) -> Result<LossBreakdown> {
+        let zero = Tensor::zeros((), DType::F32, self.batch.frames.device())?;
+        Ok(LossBreakdown {
+            total,
+            next_latent,
+            sigreg_raw,
+            sigreg_bounded,
+            patch_grounding: grounding,
+            grounding_changed_patches: 0,
+            grounding_unchanged_patches: 0,
+            event: event.unwrap_or_else(|| zero.clone()),
+            q: q.unwrap_or_else(|| zero.clone()),
+            q_surprise: zero.clone(),
+            ptrm_rank: zero.clone(),
+            prefix: zero.clone(),
+            reliability: reliability.unwrap_or_else(|| zero.clone()),
+            branch_total: zero.clone(),
+            outcome_pull: zero.clone(),
+            outcome_push: zero.clone(),
+            action_recovery: zero.clone(),
+            coordinate_recovery: zero.clone(),
+            changed_margin: zero.clone(),
+            spatial_variance: zero.clone(),
+            spatial_covariance: zero.clone(),
+            pooled_variance: zero.clone(),
+            pooled_covariance: zero.clone(),
+            displacement_variance: zero.clone(),
+            displacement_covariance: zero,
+            branch_audit: BranchLearningAudit::default(),
+        })
+    }
+}
+
 /// LeWorld loss: mean next-latent MSE over outer steps + SIGReg + masked aux heads.
 pub fn leworld_loss(
     model: &WorldModel,
@@ -2968,7 +3284,17 @@ pub fn leworld_loss(
     sigreg_seed: u64,
     weights: LessonLossWeights,
 ) -> Result<LossBreakdown> {
-    leworld_loss_with_sigreg_windows(model, batch, None, None, cfg, depth, sigreg_seed, weights)
+    leworld_loss_with_sigreg_windows(
+        model,
+        batch,
+        None,
+        None,
+        cfg,
+        depth,
+        sigreg_seed,
+        weights,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2981,7 +3307,20 @@ fn leworld_loss_with_sigreg_windows(
     depth: RecursionDepth,
     sigreg_seed: u64,
     weights: LessonLossWeights,
+    profile: Option<&RepresentativeUpdateCapture>,
 ) -> Result<LossBreakdown> {
+    if cfg.recipe == TrainingRecipe::FullV4 {
+        return FullV4Objective {
+            model,
+            batch,
+            cfg,
+            depth,
+            sigreg_seed,
+            weights,
+            profile,
+        }
+        .compute();
+    }
     let z_noise = if cfg.train_z_noise > 0.0 {
         let mut rng = rand::rngs::StdRng::seed_from_u64(sigreg_seed.wrapping_add(0x5A5A_5A5A));
         if rng.random::<f64>() < 0.5 {
@@ -4417,26 +4756,31 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let mut step_metrics = LessonLossMeans::default();
         let mut rollout_trace_cache: Option<Vec<TransitionSample>> = None;
         for micro in 0..accum {
-            let samples = {
-                let _cg = cg_profile.phase("generate", SpanKind::Module, None);
-                timed(prof, &device, &mut profile.generate, || {
-                    let _span = tracing::info_span!("generate").entered();
-                    collect_one_micro_sample_batch(
-                        micro,
-                        accum,
-                        use_prefetch,
-                        if use_prefetch {
-                            prefetcher.as_mut()
-                        } else {
-                            None
-                        },
-                        cfg,
-                        curriculum,
-                        state.global_step,
-                        &mut episode_cache,
-                    )
-                })?
-            };
+            let samples = cg_profile.synchronized_phase(
+                &device,
+                "generate",
+                SpanKind::Module,
+                None,
+                || {
+                    timed(prof, &device, &mut profile.generate, || {
+                        let _span = tracing::info_span!("generate").entered();
+                        collect_one_micro_sample_batch(
+                            micro,
+                            accum,
+                            use_prefetch,
+                            if use_prefetch {
+                                prefetcher.as_mut()
+                            } else {
+                                None
+                            },
+                            cfg,
+                            curriculum,
+                            state.global_step,
+                            &mut episode_cache,
+                        )
+                    })
+                },
+            )?;
             update_training_population(&mut state, &samples);
             if micro == 0 && use_prefetch {
                 top_up_prefetch(
@@ -4474,112 +4818,128 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     }
                 });
             }
-            let (batch, ordered_trace, sigreg_windows) = {
-                let cg = cg_profile.phase("stage", SpanKind::Module, None);
-                let staged = timed(prof, &device, &mut profile.stage, || {
-                    let _span = tracing::info_span!("stage").entered();
-                    let batch = batch_from_samples(&samples, &device)?;
-                    // Both arms derive their population from these exact ordered rows.
-                    // Target selection happens only after the shared encoder pass.
-                    let sigreg_windows = if cfg.sigreg_target == SigregTarget::Marginal
-                        && cfg.sigreg_temporal_window < 2
-                    {
-                        // The window is deliberately ignored for legacy marginal configs.
-                        None
-                    } else {
-                        ordered_sigreg_windows(&samples, cfg.sigreg_temporal_window)?
-                    };
-                    let ordered_trace = if micro == 0 && run_rollout_this_step {
-                        rollout_trace_cache
-                            .as_deref()
-                            .map(|trace| ordered_trace_from_samples(trace, &device))
-                            .transpose()?
-                    } else {
-                        None
-                    };
-                    Ok((batch, ordered_trace, sigreg_windows))
-                })?;
-                if let Some(range) = cg.as_ref() {
-                    cg_profile.record_tensor(range, "batch.frames", &staged.0.frames, None)?;
-                }
-                staged
-            };
+            let (batch, ordered_trace, sigreg_windows) = cg_profile.synchronized_phase_with_range(
+                &device,
+                "stage",
+                SpanKind::Module,
+                None,
+                |range| {
+                    let staged = timed(prof, &device, &mut profile.stage, || {
+                        let _span = tracing::info_span!("stage").entered();
+                        let batch = batch_from_samples(&samples, &device)?;
+                        // Both arms derive their population from these exact ordered rows.
+                        // Target selection happens only after the shared encoder pass.
+                        let sigreg_windows = if cfg.sigreg_target == SigregTarget::Marginal
+                            && cfg.sigreg_temporal_window < 2
+                        {
+                            // The window is deliberately ignored for legacy marginal configs.
+                            None
+                        } else {
+                            ordered_sigreg_windows(&samples, cfg.sigreg_temporal_window)?
+                        };
+                        let ordered_trace = if micro == 0 && run_rollout_this_step {
+                            rollout_trace_cache
+                                .as_deref()
+                                .map(|trace| ordered_trace_from_samples(trace, &device))
+                                .transpose()?
+                        } else {
+                            None
+                        };
+                        Ok((batch, ordered_trace, sigreg_windows))
+                    })?;
+                    if let Some(range) = range {
+                        cg_profile.record_tensor(range, "batch.frames", &staged.0.frames, None)?;
+                    }
+                    Ok(staged)
+                },
+            )?;
             let micro_sigreg_seed = sigreg_seed.wrapping_add(micro as u64);
             let run_rollout = micro == 0
                 && loss_weights.rollout > 0.0
                 && matches!(lesson.as_str(), "sequential" | "retarget");
-            let (micro_losses, micro_rollout, micro_prefix_multi, micro_total) = {
-                let cg =
-                    cg_profile.phase("forward", SpanKind::Function, Some(ExecutionStep::Forward));
-                let result = timed(prof, &device, &mut profile.forward, || {
-                    let _span = tracing::info_span!("forward").entered();
-                    let losses = leworld_loss_with_sigreg_windows(
-                        &model,
-                        &batch,
-                        sigreg_windows.as_ref(),
-                        Some(&samples),
-                        cfg,
-                        depth,
-                        micro_sigreg_seed,
-                        loss_weights,
-                    )?;
-                    let rollout_trace = if run_rollout {
-                        ordered_trace.as_ref()
-                    } else {
-                        None
-                    };
-                    let zero = Tensor::zeros((), DType::F32, &device)?;
-                    let rollout = if let Some(trace) = rollout_trace {
-                        let horizon = if cfg.phased_training {
-                            rollout_horizon_for_lesson(
-                                lesson,
-                                state.step_in_lesson,
-                                active_lesson_steps,
-                            )
-                        } else if lesson == "retarget" {
-                            RETARGET_MAX_ROLLOUT_HORIZON
-                        } else {
-                            8
-                        };
-                        open_loop_latent_loss(
-                            &model,
-                            trace,
-                            horizon,
-                            depth,
-                            rollout_teacher_mix(lesson, state.step_in_lesson, active_lesson_steps),
-                            cfg.seed.wrapping_add(state.global_step),
-                        )?
-                    } else {
-                        zero.clone()
-                    };
-                    let prefix_multi = if let Some(trace) = rollout_trace {
-                        if loss_weights.prefix > 0.0 {
-                            prefix_multi_horizon_loss(&model, trace)?
-                        } else {
-                            zero.clone()
+            let (micro_losses, micro_rollout, micro_prefix_multi, micro_total) = cg_profile
+                .synchronized_phase_with_range(
+                    &device,
+                    "forward",
+                    SpanKind::Function,
+                    Some(ExecutionStep::Forward),
+                    |range| {
+                        let result = timed(prof, &device, &mut profile.forward, || {
+                            let _span = tracing::info_span!("forward").entered();
+                            let losses = leworld_loss_with_sigreg_windows(
+                                &model,
+                                &batch,
+                                sigreg_windows.as_ref(),
+                                Some(&samples),
+                                cfg,
+                                depth,
+                                micro_sigreg_seed,
+                                loss_weights,
+                                Some(&cg_profile),
+                            )?;
+                            let rollout_trace = if run_rollout {
+                                ordered_trace.as_ref()
+                            } else {
+                                None
+                            };
+                            let zero = Tensor::zeros((), DType::F32, &device)?;
+                            let rollout = if let Some(trace) = rollout_trace {
+                                let horizon = if cfg.phased_training {
+                                    rollout_horizon_for_lesson(
+                                        lesson,
+                                        state.step_in_lesson,
+                                        active_lesson_steps,
+                                    )
+                                } else if lesson == "retarget" {
+                                    RETARGET_MAX_ROLLOUT_HORIZON
+                                } else {
+                                    8
+                                };
+                                open_loop_latent_loss(
+                                    &model,
+                                    trace,
+                                    horizon,
+                                    depth,
+                                    rollout_teacher_mix(
+                                        lesson,
+                                        state.step_in_lesson,
+                                        active_lesson_steps,
+                                    ),
+                                    cfg.seed.wrapping_add(state.global_step),
+                                )?
+                            } else {
+                                zero.clone()
+                            };
+                            let prefix_multi = if let Some(trace) = rollout_trace {
+                                if loss_weights.prefix > 0.0 {
+                                    prefix_multi_horizon_loss(&model, trace)?
+                                } else {
+                                    zero.clone()
+                                }
+                            } else {
+                                zero
+                            };
+                            let mut total = losses.total.clone();
+                            if loss_weights.rollout > 0.0 {
+                                total = total.add(&rollout.affine(loss_weights.rollout, 0.0)?)?;
+                            }
+                            if loss_weights.prefix > 0.0 && rollout_trace.is_some() {
+                                total =
+                                    total.add(&prefix_multi.affine(loss_weights.prefix, 0.0)?)?;
+                            }
+                            Ok((losses, rollout, prefix_multi, total))
+                        })?;
+                        if let Some(range) = range {
+                            cg_profile.record_tensor(
+                                range,
+                                "loss.total",
+                                &result.3,
+                                Some(ExecutionStep::Forward),
+                            )?;
                         }
-                    } else {
-                        zero
-                    };
-                    let mut total = losses.total.clone();
-                    if loss_weights.rollout > 0.0 {
-                        total = total.add(&rollout.affine(loss_weights.rollout, 0.0)?)?;
-                    }
-                    if loss_weights.prefix > 0.0 && rollout_trace.is_some() {
-                        total = total.add(&prefix_multi.affine(loss_weights.prefix, 0.0)?)?;
-                    }
-                    Ok((losses, rollout, prefix_multi, total))
-                })?;
-                if let Some(range) = cg.as_ref() {
-                    cg_profile.record_tensor(
-                        range,
-                        "loss.total",
-                        &result.3,
-                        Some(ExecutionStep::Forward),
-                    )?;
-                }
-                result
-            };
+                        Ok(result)
+                    },
+                )?;
             step_metrics.branch_groups += micro_losses.branch_audit.groups as f64 * inv;
             step_metrics.changed_branches +=
                 micro_losses.branch_audit.changed_branches as f64 * inv;
@@ -4763,17 +5123,18 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 }
             }
             let scaled_micro = micro_total.affine(inv, 0.0)?;
-            let micro_grads = {
-                let _cg = cg_profile.phase(
-                    "backward",
-                    SpanKind::Function,
-                    Some(ExecutionStep::Backward),
-                );
-                timed(prof, &device, &mut profile.backward, || {
-                    let _span = tracing::info_span!("backward").entered();
-                    scaled_micro.backward().map_err(Into::into)
-                })?
-            };
+            let micro_grads = cg_profile.synchronized_phase(
+                &device,
+                "backward",
+                SpanKind::Function,
+                Some(ExecutionStep::Backward),
+                || {
+                    timed(prof, &device, &mut profile.backward, || {
+                        let _span = tracing::info_span!("backward").entered();
+                        scaled_micro.backward().map_err(Into::into)
+                    })
+                },
+            )?;
             accumulate_parameter_gradients(&mut accumulated_grads, micro_grads, &varmap)?;
             metric_tensors.push(training_loss_tensors(
                 &micro_losses,
@@ -4782,7 +5143,14 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 &micro_total,
             ));
         }
-        for micro_vals in checked_training_losses(&metric_tensors)? {
+        let checked_losses = cg_profile.synchronized_phase(
+            &device,
+            "loss_readback",
+            SpanKind::Module,
+            None,
+            || checked_training_losses(&metric_tensors),
+        )?;
+        for micro_vals in checked_losses {
             step_metrics.total += micro_vals.total as f64 * inv;
             step_metrics.next_latent += micro_vals.next_latent as f64 * inv;
             step_metrics.rollout += micro_vals.rollout as f64 * inv;
@@ -4808,30 +5176,40 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
         let mut grads = accumulated_grads
             .ok_or_else(|| anyhow::anyhow!("grad_accum produced no microbatches"))?;
-        let clip_stats = clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        let clip_stats = cg_profile.synchronized_phase(
+            &device,
+            "gradient_clip",
+            SpanKind::Module,
+            Some(ExecutionStep::Backward),
+            || clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM),
+        )?;
         step_metrics.pre_clip_gradient_norm = clip_stats.pre_clip_norm;
         step_metrics.gradient_clip_scale = clip_stats.scale;
         step_metrics.clipped_updates = f64::from(clip_stats.scale < 1.0);
         if cg_profile.active() {
-            let _cg =
-                cg_profile.phase("gradients", SpanKind::Module, Some(ExecutionStep::Backward));
-            cg_profile.record_gradients(&varmap, &grads)?;
+            cg_profile.synchronized_phase(
+                &device,
+                "gradients",
+                SpanKind::Module,
+                Some(ExecutionStep::Backward),
+                || cg_profile.record_gradients(&varmap, &grads),
+            )?;
         }
-        {
-            let _cg = cg_profile.phase(
-                "optimizer",
-                SpanKind::Function,
-                Some(ExecutionStep::Optimizer),
-            );
-            timed(prof, &device, &mut profile.optimizer, || {
-                let _span = tracing::info_span!("optimizer").entered();
-                optimizer.step(&grads)
-            })?;
-        }
+        cg_profile.synchronized_phase(
+            &device,
+            "optimizer",
+            SpanKind::Function,
+            Some(ExecutionStep::Optimizer),
+            || {
+                timed(prof, &device, &mut profile.optimizer, || {
+                    let _span = tracing::info_span!("optimizer").entered();
+                    optimizer.step(&grads)
+                })
+            },
+        )?;
         drop(grads);
 
-        {
-            let _cg = cg_profile.phase("metrics", SpanKind::Module, None);
+        cg_profile.synchronized_phase(&device, "metrics", SpanKind::Module, None, || {
             timed(prof, &device, &mut profile.metrics, || {
                 let _span = tracing::info_span!("metrics").entered();
                 state.active_sums.total += step_metrics.total;
@@ -4875,8 +5253,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     step_metrics.displacement_population_rows;
                 state.active_sums.unique_changed_outcomes += step_metrics.unique_changed_outcomes;
                 Ok(())
-            })?;
-        }
+            })
+        })?;
         if cg_profile.active() {
             sync_cuda_device(&device)?;
         }
@@ -6553,6 +6931,7 @@ mod tests {
             },
             7,
             lesson_loss_weights("factual_branches", &cfg, 0, 0),
+            None,
         )?;
         assert_eq!(losses.branch_audit.groups, 1);
         assert_eq!(losses.branch_audit.branches, 4);

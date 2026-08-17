@@ -1,7 +1,7 @@
 //! One representative optimizer-update evidence bundle for candle-graph.
 
 use anyhow::{bail, Context, Result};
-use candle_core::{backprop::GradStore, DType, Tensor};
+use candle_core::{backprop::GradStore, DType, Device, Tensor};
 use candle_graph::instrument::candle::{self, CandleCapture};
 use candle_graph::trace::schema::GradientState;
 use candle_graph::{ExecutionStep, ProfileRun, SpanKind, TraceSession};
@@ -171,6 +171,69 @@ impl RepresentativeUpdateCapture {
         })
     }
 
+    /// Run one profiled phase with CUDA synchronized at both ends.
+    ///
+    /// Candle operations enqueue asynchronously, so an ordinary host span can
+    /// charge a module's device work to the next scalar readback. This interface
+    /// is deliberately active only for the selected representative update: it
+    /// gives the evidence packet device-complete module spans without slowing
+    /// the rest of training.
+    pub fn synchronized_phase<T>(
+        &self,
+        device: &Device,
+        name: &str,
+        kind: SpanKind,
+        step: Option<ExecutionStep>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.synchronized_phase_with_range(device, name, kind, step, |_| f())
+    }
+
+    pub fn synchronized_phase_with_range<T>(
+        &self,
+        device: &Device,
+        name: &str,
+        kind: SpanKind,
+        step: Option<ExecutionStep>,
+        f: impl FnOnce(Option<&ProfileRange<'_>>) -> Result<T>,
+    ) -> Result<T> {
+        self.synchronized_phase_with(
+            name,
+            kind,
+            step,
+            || {
+                if device.is_cuda() {
+                    device.synchronize()?;
+                }
+                Ok(())
+            },
+            f,
+        )
+    }
+
+    fn synchronized_phase_with<T>(
+        &self,
+        name: &str,
+        kind: SpanKind,
+        step: Option<ExecutionStep>,
+        mut synchronize: impl FnMut() -> Result<()>,
+        f: impl FnOnce(Option<&ProfileRange<'_>>) -> Result<T>,
+    ) -> Result<T> {
+        if !self.active() {
+            return f(None);
+        }
+        synchronize()?;
+        let range = self.phase(name, kind, step);
+        let result = f(range.as_ref());
+        let final_sync = synchronize();
+        drop(range);
+        match (result, final_sync) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
     pub fn record_tensor(
         &self,
         range: &ProfileRange<'_>,
@@ -263,6 +326,7 @@ impl RepresentativeUpdateCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn selected_update_is_one_based() -> Result<()> {
@@ -285,6 +349,51 @@ mod tests {
             precision: "f32",
         })?;
         assert!(!inactive.active());
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronized_phase_brackets_body_even_when_body_fails() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tofy-profile-synchronized-phase-{}",
+            std::process::id()
+        ));
+        let pending = ProfileState::Pending;
+        let capture = RepresentativeUpdateCapture::begin(CaptureSpec {
+            completed_updates: 0,
+            selected_update: 1,
+            state: &pending,
+            output_dir: &dir,
+            device: "cpu",
+            measured_region_device_synchronized: false,
+            lesson: "test",
+            physical_batch: 2,
+            grad_accum: 1,
+            hidden_dim: 16,
+            inner_steps: 1,
+            outer_steps: 1,
+            precision: "f32",
+        })?;
+        let events = RefCell::new(Vec::new());
+        let error = capture
+            .synchronized_phase_with(
+                "test_phase",
+                SpanKind::Module,
+                None,
+                || {
+                    events.borrow_mut().push("sync");
+                    Ok(())
+                },
+                |_| -> Result<()> {
+                    events.borrow_mut().push("body");
+                    bail!("expected body failure")
+                },
+            )
+            .expect_err("body failure must propagate");
+        assert!(error.to_string().contains("expected body failure"));
+        assert_eq!(*events.borrow(), ["sync", "body", "sync"]);
+        drop(capture);
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }

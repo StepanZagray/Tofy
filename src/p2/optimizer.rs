@@ -125,9 +125,6 @@ impl CheckpointHybridOptimizer {
                     let second = moment_data
                         .get(&format!("second_moment.{}", p.name))
                         .expect("adam second moment");
-                    let step = moment_data
-                        .get(&format!("adam.step.{}", p.name))
-                        .expect("adam parameter step");
                     let next_step = p
                         .adam_step
                         .expect("adam parameter host step")
@@ -153,7 +150,6 @@ impl CheckpointHybridOptimizer {
                     p.var.set(&next_theta)?;
                     first.set(&next_m)?;
                     second.set(&next_v)?;
-                    step.set(&Tensor::new(next_step, p.var.device())?)?;
                     p.adam_step = Some(next_step);
                 }
                 OptKind::Muon => {
@@ -191,6 +187,19 @@ impl CheckpointHybridOptimizer {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        // Adam clocks are hot-loop host state. Materialize them only at a
+        // checkpoint boundary so training does not allocate and upload one
+        // scalar tensor per Adam parameter on every update.
+        let moment_data = self.moments.data().lock().unwrap();
+        for p in &self.params {
+            if let Some(step) = p.adam_step {
+                let checkpoint_step = moment_data
+                    .get(&format!("adam.step.{}", p.name))
+                    .expect("adam parameter step");
+                checkpoint_step.set(&Tensor::new(step, checkpoint_step.device())?)?;
+            }
+        }
+        drop(moment_data);
         self.moments
             .save(path)
             .with_context(|| format!("save optimizer {}", path.display()))
@@ -483,18 +492,21 @@ mod tests {
             &Tensor::new(&[0.9f32, -0.9], &device)?,
             1e-6,
         )?;
-        let moment_data = optimizer.moments.data().lock().unwrap();
         assert_eq!(
-            moment_data["adam.step.always.bias"]
-                .as_tensor()
-                .to_scalar::<u32>()?,
-            2
+            optimizer
+                .params
+                .iter()
+                .find(|parameter| parameter.name == "always.bias")
+                .and_then(|parameter| parameter.adam_step),
+            Some(2)
         );
         assert_eq!(
-            moment_data["adam.step.late.bias"]
-                .as_tensor()
-                .to_scalar::<u32>()?,
-            1
+            optimizer
+                .params
+                .iter()
+                .find(|parameter| parameter.name == "late.bias")
+                .and_then(|parameter| parameter.adam_step),
+            Some(1)
         );
         Ok(())
     }
