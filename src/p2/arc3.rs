@@ -5,7 +5,9 @@
 //! where the later event's `action_input` caused its settled frame.
 
 use crate::domain::Split;
-use crate::p2::data::{ArcAction, ArcFrame, GoalFeatures, TransitionSample, FRAME_SIDE};
+use crate::p2::data::{
+    ArcAction, ArcFrame, GoalFeatures, TransitionProvenance, TransitionSample, FRAME_SIDE,
+};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -299,6 +301,17 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
             seed: 0,
             episode_id: curr.line as u64,
             transition_index: idx as u64,
+            provenance: TransitionProvenance {
+                content_width: FRAME_SIDE as u16,
+                content_height: (FRAME_SIDE - 1) as u16,
+                source_kind: format!("arc3_recording:{}", curr.game_id),
+                trajectory_id: format!(
+                    "arc3/{}/{}/{}",
+                    curr.game_id,
+                    curr.guid,
+                    curr.source_path.display()
+                ),
+            },
             oracle_latent: None,
         });
     }

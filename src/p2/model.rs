@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use crate::p2::consumer_readout::ConsumerReadout;
 use crate::p2::data::TransitionSample;
 use crate::p2::experiment::ConsumerReadoutTopology;
-use crate::p2::grounding::{PatchGroundingLoss, PatchGroundingMode, PatchHistogramGrounding};
+use crate::p2::grounding::{
+    ExactPatchGrounding, PatchGroundingLoss, PatchGroundingMode, PatchHistogramGrounding,
+};
 use crate::p2::representation::RepresentationSeam;
 
 /// Fixed observation resolution required by the pixel encoder.
@@ -123,6 +125,10 @@ pub struct ModelConfig {
     /// Explicit experiment schema marker. V3 retains the V2 heads/topology.
     #[serde(default)]
     pub world_core_v3: bool,
+    /// Paper-grounded successor recipe. Unlike V2/V3, V4 does not enable the
+    /// experimental factual-branch heads.
+    #[serde(default)]
+    pub world_core_v4: bool,
     /// Readout used only by Q/event/reliability planning heads.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -156,6 +162,7 @@ impl Default for ModelConfig {
             spatial_action_residual_scale: default_spatial_action_residual_scale(),
             world_core_v2: false,
             world_core_v3: false,
+            world_core_v4: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
         }
     }
@@ -194,6 +201,15 @@ impl ModelConfig {
         }
         if self.world_core_v3 && !self.world_core_v2 {
             bail!("world_core_v3 requires the world_core_v2 base topology");
+        }
+        if self.world_core_v4 && (self.world_core_v2 || self.world_core_v3) {
+            bail!("world_core_v4 cannot be composed with V2/V3");
+        }
+        if self.world_core_v4
+            && (!self.spatial_action_field
+                || self.consumer_readout != ConsumerReadoutTopology::SpatialQuery)
+        {
+            bail!("world_core_v4 requires spatial action fields and SpatialQuery readout");
         }
         if self.spatial_action_residual && (!self.world_core_v3 || !self.spatial_action_field) {
             bail!("spatial_action_residual requires world_core_v3 and spatial_action_field");
@@ -504,6 +520,7 @@ pub struct WorldModel {
     sigreg_projector: Option<Linear>,
     /// Present in every arm; its loss is switched by the training contract.
     patch_histogram_grounding: PatchHistogramGrounding,
+    exact_patch_grounding: Option<ExactPatchGrounding>,
 }
 
 impl WorldModel {
@@ -579,6 +596,10 @@ impl WorldModel {
                 cfg.hidden_dim,
                 vb.pp("grounding_head"),
             )?,
+            exact_patch_grounding: cfg
+                .world_core_v4
+                .then(|| ExactPatchGrounding::new(cfg.hidden_dim, vb.pp("exact_grounding_head")))
+                .transpose()?,
             config: cfg,
         })
     }
@@ -596,6 +617,42 @@ impl WorldModel {
     ) -> Result<PatchGroundingLoss> {
         self.patch_histogram_grounding
             .loss(predicted, target, samples, mode)
+    }
+
+    pub fn exact_grounding_loss(&self, latents: &Tensor, frames: &Tensor) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
+            .loss(latents, frames)
+    }
+
+    /// Decode a spatial state into `B×63×64×16` palette logits. This is the
+    /// canonical semantic seam used by Full V4 evaluation; it never includes
+    /// the synthetic status row.
+    pub fn exact_gameplay_logits(&self, latents: &Tensor) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
+            .gameplay_logits(latents)
+    }
+
+    pub fn exact_transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
+            .transition_correctness(predicted, current_frames, next_frames)
+    }
+
+    /// Full V4's single canonical BxC state. It is both regularized and
+    /// consumed by transition/observer heads; this is a Tofy adaptation, not
+    /// the separate loss-only projectors used by LeWorldModel.
+    pub fn canonical_representation(&self, spatial: &Tensor) -> Result<Tensor> {
+        rms_norm_latent(&self.consumer_readout.forward(spatial)?)
     }
 
     /// Encode palette-index frames into the shared latent space.
@@ -724,7 +781,11 @@ impl WorldModel {
             ),
             (
                 RepresentationSeam::PredictionFinalConsumerReadout,
-                self.consumer_readout.forward(&prediction)?.detach(),
+                if self.config.world_core_v4 {
+                    self.canonical_representation(&prediction)?.detach()
+                } else {
+                    self.consumer_readout.forward(&prediction)?.detach()
+                },
             ),
             (
                 RepresentationSeam::PredictionFinalSpatial,
@@ -756,7 +817,7 @@ impl WorldModel {
         } else {
             bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
         };
-        if !self.config.world_core_v2 {
+        if !(self.config.world_core_v2 || self.config.world_core_v4) {
             return Ok(embedded);
         }
 
@@ -820,6 +881,14 @@ impl WorldModel {
             coords = coords.mul(&coordinate_active)?;
         }
         let coord_bias = coords.reshape((b, self.config.hidden_dim, 1, 1))?;
+        let conditioned = if self.config.world_core_v4 {
+            let canonical =
+                self.canonical_representation(state)?
+                    .reshape((b, self.config.hidden_dim, 1, 1))?;
+            conditioned.broadcast_add(&canonical)?
+        } else {
+            conditioned
+        };
         if !self.config.spatial_action_field {
             return conditioned.broadcast_add(&coord_bias).map_err(Into::into);
         }
@@ -931,7 +1000,11 @@ impl WorldModel {
     }
 
     fn heads(&self, y: &Tensor, goal_h: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let readout = self.consumer_readout.forward(y)?;
+        let readout = if self.config.world_core_v4 {
+            self.canonical_representation(y)?
+        } else {
+            self.consumer_readout.forward(y)?
+        };
         let event_in = Tensor::cat(&[&readout, goal_h], D::Minus1)?;
         let event_logits = self.event_head.forward(&event_in)?;
         let q_logit = self.q_head.forward(&readout)?;
@@ -942,9 +1015,33 @@ impl WorldModel {
     /// Event logits from detached or live `y` (training may stop-grad events only).
     pub fn event_logits_from(&self, y: &Tensor, goal_features: &Tensor) -> Result<Tensor> {
         let goal_h = self.project_goal(goal_features)?;
-        let readout = self.consumer_readout.forward(y)?;
+        let readout = if self.config.world_core_v4 {
+            self.canonical_representation(y)?
+        } else {
+            self.consumer_readout.forward(y)?
+        };
         let event_in = Tensor::cat(&[&readout, &goal_h], D::Minus1)?;
         self.event_head.forward(&event_in).map_err(Into::into)
+    }
+
+    /// Observer-only V4 head seams. Callers detach `canonical` before these
+    /// methods so SpatialQuery and the world core remain frozen.
+    pub fn event_logits_from_canonical(
+        &self,
+        canonical: &Tensor,
+        goal_features: &Tensor,
+    ) -> Result<Tensor> {
+        let goal_h = self.project_goal(goal_features)?;
+        let event_in = Tensor::cat(&[canonical, &goal_h], D::Minus1)?;
+        self.event_head.forward(&event_in).map_err(Into::into)
+    }
+
+    pub fn q_logit_from_canonical(&self, canonical: &Tensor) -> Result<Tensor> {
+        self.q_head.forward(canonical).map_err(Into::into)
+    }
+
+    pub fn reliability_logit_from_canonical(&self, canonical: &Tensor) -> Result<Tensor> {
+        self.reliability_head.forward(canonical).map_err(Into::into)
     }
 
     /// Inject noise into `z`, with `sigma` interpreted **relative to the current
@@ -998,7 +1095,11 @@ impl WorldModel {
             let inp = x.add(&y)?.add(&z)?;
             z = self.block.forward(&inp)?;
         }
-        let inp = y.add(&z)?;
+        let inp = if self.config.world_core_v4 {
+            x.add(&y)?.add(&z)?
+        } else {
+            y.add(&z)?
+        };
         y = self.block.forward(&inp)?;
         Ok((y, z))
     }
@@ -1121,15 +1222,21 @@ impl WorldModel {
 
     /// Q logit from a (possibly detached) latent state.
     pub fn q_logit_from_y(&self, y: &Tensor) -> Result<Tensor> {
-        self.q_head
-            .forward(&self.consumer_readout.forward(y)?)
-            .map_err(Into::into)
+        let readout = if self.config.world_core_v4 {
+            self.canonical_representation(y)?
+        } else {
+            self.consumer_readout.forward(y)?
+        };
+        self.q_head.forward(&readout).map_err(Into::into)
     }
 
     pub fn reliability_logit_from_y(&self, y: &Tensor) -> Result<Tensor> {
-        self.reliability_head
-            .forward(&self.consumer_readout.forward(y)?)
-            .map_err(Into::into)
+        let readout = if self.config.world_core_v4 {
+            self.canonical_representation(y)?
+        } else {
+            self.consumer_readout.forward(y)?
+        };
+        self.reliability_head.forward(&readout).map_err(Into::into)
     }
 
     /// Direct prefix prediction: residual delta on spatial latent from `(z, action)`.

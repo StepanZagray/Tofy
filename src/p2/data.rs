@@ -235,6 +235,63 @@ fn family_index(goal: &Goal) -> u8 {
 }
 
 /// One supervised transition for world-model / event-head training.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionProvenance {
+    /// Width of the semantic board region. Pixels outside this rectangle are padding/UI.
+    pub content_width: u16,
+    /// Height of the semantic board region. The ARC status row is never part of this region.
+    pub content_height: u16,
+    /// Generator/import population that produced the transition (stable across goal retargeting).
+    pub source_kind: String,
+    /// Stable trajectory identity. Unlike `family`, this does not change when a goal is retargeted.
+    pub trajectory_id: String,
+}
+
+impl TransitionProvenance {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=FRAME_SIDE as u16).contains(&self.content_width),
+            "content_width must be in 1..={FRAME_SIDE}"
+        );
+        ensure!(
+            (1..FRAME_SIDE as u16).contains(&self.content_height),
+            "content_height must be in 1..{}",
+            FRAME_SIDE - 1
+        );
+        ensure!(
+            !self.source_kind.is_empty(),
+            "source_kind must not be empty"
+        );
+        ensure!(
+            !self.trajectory_id.is_empty(),
+            "trajectory_id must not be empty"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn simulator(scenario: &Scenario, source_kind: impl Into<String>) -> Self {
+        let source_kind = source_kind.into();
+        Self {
+            content_width: u16::from(scenario.width),
+            content_height: u16::from(scenario.height),
+            trajectory_id: format!(
+                "sim/{source_kind}/{:?}/{}/{}",
+                scenario.split, scenario.seed, scenario.episode_id
+            ),
+            source_kind,
+        }
+    }
+
+    pub(crate) fn full_frame(seed: u64, episode_id: u64, split: Split, source_kind: &str) -> Self {
+        Self {
+            content_width: FRAME_SIDE as u16,
+            content_height: (FRAME_SIDE - 1) as u16,
+            source_kind: source_kind.into(),
+            trajectory_id: format!("synthetic/{source_kind}/{split:?}/{seed}/{episode_id}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransitionSample {
     pub current: ArcFrame,
@@ -255,6 +312,7 @@ pub struct TransitionSample {
     /// Monotonic index within `(seed, episode_id)` for rollout ordering.
     #[serde(default)]
     pub transition_index: u64,
+    pub provenance: TransitionProvenance,
     /// Exact-simulator features for identifiability eval; absent for ARC recordings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_latent: Option<Vec<f32>>,
@@ -296,7 +354,7 @@ pub const FACTUAL_BRANCHES_PER_GROUP: usize = 4;
 pub struct BranchGroupId {
     pub seed: u64,
     pub episode_id: u64,
-    pub family: String,
+    pub trajectory_id: String,
     pub current_fingerprint: String,
 }
 
@@ -332,7 +390,7 @@ impl BranchGroupId {
         Self {
             seed: transition.seed,
             episode_id: transition.episode_id,
-            family: transition.family.clone(),
+            trajectory_id: transition.provenance.trajectory_id.clone(),
             current_fingerprint: frame_fingerprint(&transition.current),
         }
     }
@@ -695,6 +753,7 @@ pub fn sample_from_transition(
         seed: scenario.seed,
         episode_id: scenario.episode_id,
         transition_index,
+        provenance: TransitionProvenance::simulator(scenario, goal_family(goal)),
         oracle_latent: Some(oracle_latent(scenario, before)),
     })
 }
@@ -723,6 +782,7 @@ pub fn sample_from_transition_goal_free(
         seed: scenario.seed,
         episode_id: scenario.episode_id,
         transition_index,
+        provenance: TransitionProvenance::simulator(scenario, family),
         oracle_latent: Some(oracle_latent(scenario, before)),
     })
 }
@@ -823,6 +883,12 @@ pub fn generate_coordinate_one_step(
             seed,
             episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
             transition_index: step as u64,
+            provenance: TransitionProvenance::full_frame(
+                seed,
+                episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+                split,
+                "coordinate_action",
+            ),
             oracle_latent: Some(oracle_latent_from_frame(&current)),
             current,
         });
@@ -868,6 +934,12 @@ pub fn generate_interact_one_step(
             seed,
             episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
             transition_index: step as u64,
+            provenance: TransitionProvenance::full_frame(
+                seed,
+                episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+                split,
+                "action5_interact",
+            ),
         });
     }
     Ok(out)
@@ -1029,6 +1101,12 @@ fn generate_coordinate_branch_group(
                 seed,
                 episode_id,
                 transition_index: index as u64,
+                provenance: TransitionProvenance::full_frame(
+                    seed,
+                    episode_id,
+                    split,
+                    "factual_coordinate_branch",
+                ),
                 oracle_latent: Some(oracle_latent_from_frame(&current)),
             })
         })
@@ -1288,6 +1366,11 @@ pub fn generate_p1c_hard_retarget_multistep(
         }
     }
 
+    for sample in &mut out {
+        sample.provenance.source_kind = "p1c_hard_retarget".into();
+        sample.provenance.trajectory_id =
+            format!("curriculum/p1c_hard_retarget/{split:?}/{seed}/{source_episode_id}");
+    }
     ensure!(!out.is_empty(), "hard retarget produced no transitions");
     Ok(out)
 }
@@ -1299,7 +1382,7 @@ pub fn generate_curriculum(
     episode_id: u64,
     split: Split,
 ) -> Result<Vec<TransitionSample>> {
-    match kind {
+    let mut samples = match kind {
         "factual_branches" => Ok(generate_factual_branch_group(seed, episode_id, split)?
             .into_transitions()
             .collect()),
@@ -1319,7 +1402,23 @@ pub fn generate_curriculum(
         "p1c_falsification" => generate_p1c_falsification_episode(seed, episode_id, split),
         "p1c_hard_retarget" => generate_p1c_hard_retarget_multistep(seed, episode_id, split, 3),
         other => bail!("unknown curriculum kind {other}"),
+    }?;
+    for sample in &mut samples {
+        // A curriculum kind is the stable trajectory source. The mixed
+        // one-step curriculum keeps its deliberately distinct movement,
+        // hazard, ACTION5 and ACTION6 lanes so they cannot collide/group.
+        let trajectory_source = if kind == "random_one_step" {
+            sample.provenance.source_kind.as_str()
+        } else {
+            sample.provenance.source_kind = kind.into();
+            kind
+        };
+        sample.provenance.trajectory_id = format!(
+            "curriculum/{trajectory_source}/{:?}/{}/{}/{}",
+            sample.split, sample.seed, sample.episode_id, episode_id
+        );
     }
+    Ok(samples)
 }
 
 #[cfg(test)]

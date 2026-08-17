@@ -10,7 +10,7 @@ use crate::p2::data::{
 };
 use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
-    SigregStatistic,
+    SigregStatistic, TrainingRecipe,
 };
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::model::{
@@ -33,7 +33,9 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -72,8 +74,8 @@ const SIGREG_LOSS_CAP: f64 = 10_000.0;
 const MAX_GRAD_NORM: f64 = 1.0;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v9";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v6";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v10";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v7";
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -120,6 +122,8 @@ static PAUSE_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainConfig {
+    #[serde(default)]
+    pub recipe: TrainingRecipe,
     pub seed: u64,
     pub lessons: Vec<String>,
     pub steps_per_lesson: usize,
@@ -138,6 +142,9 @@ pub struct TrainConfig {
     /// equal mixture without changing model topology.
     #[serde(default)]
     pub patch_grounding_mode: PatchGroundingMode,
+    /// Full V4 exact gameplay-pixel grounding on encoded current/next states.
+    #[serde(default)]
+    pub exact_grounding_weight: f64,
     /// Model initialization seed. None resolves to `seed`.
     #[serde(default)]
     pub init_seed: Option<u64>,
@@ -264,6 +271,8 @@ pub struct TrainConfig {
     /// and scale-normalized factual displacement health.
     #[serde(default)]
     pub world_core_v3: bool,
+    #[serde(default)]
+    pub world_core_v4: bool,
     /// Planning-head aggregation at the final spatial prediction seam.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -376,6 +385,7 @@ fn persist_train_config(cfg: &TrainConfig) -> TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
+            recipe: TrainingRecipe::LegacyExperimental,
             seed: 1,
             lessons: DEFAULT_LESSONS.iter().map(|s| (*s).to_string()).collect(),
             steps_per_lesson: 2,
@@ -388,6 +398,7 @@ impl Default for TrainConfig {
             sigreg_weight: 0.003,
             patch_grounding_weight: 0.0,
             patch_grounding_mode: PatchGroundingMode::Both,
+            exact_grounding_weight: 0.0,
             init_seed: None,
             event_weight: 0.1,
             q_weight: 0.1,
@@ -437,6 +448,7 @@ impl Default for TrainConfig {
             prefetch_batches: true,
             world_core_v2: false,
             world_core_v3: false,
+            world_core_v4: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
             spatial_action_field: false,
             spatial_action_residual: false,
@@ -449,8 +461,10 @@ impl Default for TrainConfig {
 impl TrainConfig {
     pub fn resolved_experiment(&self) -> Result<ResolvedExperiment> {
         ResolvedExperiment::resolve(ExperimentRequest {
+            recipe: self.recipe,
             world_core_v2: self.world_core_v2,
             world_core_v3: self.world_core_v3,
+            world_core_v4: self.world_core_v4,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
             spatial_action_residual_scale: self.spatial_action_residual_scale,
@@ -460,6 +474,7 @@ impl TrainConfig {
             sigreg_weight: self.sigreg_weight,
             patch_grounding_weight: self.patch_grounding_weight,
             patch_grounding_mode: self.patch_grounding_mode,
+            exact_grounding_weight: self.exact_grounding_weight,
             sigreg_statistic: self.sigreg_statistic,
             sigreg_population: self.sigreg_target,
             sigreg_temporal_window: self.sigreg_temporal_window,
@@ -507,6 +522,7 @@ impl TrainConfig {
         for (name, weight) in [
             ("sigreg_weight", self.sigreg_weight),
             ("patch_grounding_weight", self.patch_grounding_weight),
+            ("exact_grounding_weight", self.exact_grounding_weight),
             ("event_weight", self.event_weight),
             ("q_weight", self.q_weight),
             ("rollout_weight", self.rollout_weight),
@@ -525,6 +541,9 @@ impl TrainConfig {
             bail!("train_z_noise must be finite and >= 0");
         }
         self.branch_learning.validate(self.grad_accum)?;
+        if self.recipe == TrainingRecipe::FullV4 {
+            self.validate_full_v4()?;
+        }
         let resolved = self.resolved_experiment()?;
         if resolved.factual_learning
             && !self
@@ -558,8 +577,150 @@ impl TrainConfig {
             spatial_action_residual_scale: self.spatial_action_residual_scale,
             world_core_v2: self.world_core_v2,
             world_core_v3: self.world_core_v3,
+            world_core_v4: self.world_core_v4,
             consumer_readout: self.consumer_readout,
         }
+    }
+
+    /// Resolve the one supported V4 training contract. Runtime/provenance
+    /// values (seed, steps, batch, device, output, checkpoints) remain caller
+    /// controlled; model and objective choices do not.
+    pub fn apply_full_v4_recipe(&mut self) {
+        self.recipe = TrainingRecipe::FullV4;
+        self.lessons = DEFAULT_LESSONS.iter().map(|s| (*s).to_string()).collect();
+        self.grad_accum = 1;
+        self.sigreg_projections = 1024;
+        self.sigreg_knots = 17;
+        self.sigreg_weight = 0.1;
+        self.sigreg_max_rows = 0;
+        self.sigreg_target = SigregTarget::Marginal;
+        self.sigreg_statistic = SigregStatistic::EppsPulley;
+        self.sigreg_global_mix = 0.0;
+        self.sigreg_spatial = false;
+        self.sigreg_spatial_pool = false;
+        self.sigreg_pre_rms_spatial = false;
+        self.sigreg_projector = false;
+        self.patch_grounding_weight = 0.0;
+        self.exact_grounding_weight = 0.1;
+        self.event_weight = 0.1;
+        self.q_weight = 0.1;
+        self.rollout_weight = 0.1;
+        self.reliability_weight = 0.1;
+        self.prefix_weight = 0.0;
+        self.ptrm_rank_every = 0;
+        self.randomize_depth = false;
+        self.supervise_last_outer_only = true;
+        self.phased_training = true;
+        self.stop_grad_event_y = true;
+        self.stop_grad_q_y = true;
+        self.q_quantile_targets = false;
+        self.train_z_noise = 0.0;
+        self.baseline_d1 = false;
+        self.residual_y_update = true;
+        self.warm_start_y = true;
+        self.hidden_dim = 128;
+        self.action_dim = 32;
+        self.inner_steps = 2;
+        self.outer_steps = 2;
+        self.lr = 1e-3;
+        self.weight_decay = 0.01;
+        self.muon_momentum = 0.95;
+        self.muon_rms_scale = MUON_RMS_SCALE;
+        self.bf16_conv = false;
+        self.shuffled_episodes = true;
+        self.world_core_v2 = false;
+        self.world_core_v3 = false;
+        self.world_core_v4 = true;
+        self.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        self.spatial_action_field = true;
+        self.spatial_action_residual = false;
+        self.branch_learning = BranchLearningConfig::default();
+    }
+
+    fn validate_full_v4(&self) -> Result<()> {
+        let expected_lessons = DEFAULT_LESSONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>();
+        ensure_full_v4(self.lessons == expected_lessons, "canonical lesson order")?;
+        ensure_full_v4(self.grad_accum == 1, "grad_accum=1")?;
+        ensure_full_v4(
+            self.sigreg_projections == 1024
+                && self.sigreg_knots == 17
+                && self.sigreg_weight == 0.1
+                && self.sigreg_max_rows == 0
+                && self.sigreg_target == SigregTarget::Marginal
+                && self.sigreg_statistic == SigregStatistic::EppsPulley
+                && self.sigreg_global_mix == 0.0
+                && !self.sigreg_spatial
+                && !self.sigreg_spatial_pool
+                && !self.sigreg_pre_rms_spatial
+                && !self.sigreg_projector,
+            "uncapped marginal EP(1024 projections, 17 knots, weight 0.1)",
+        )?;
+        ensure_full_v4(
+            self.hidden_dim == 128
+                && self.action_dim == 32
+                && self.inner_steps == 2
+                && self.outer_steps == 2,
+            "hidden=128, action=32, inner=2, outer=2 architecture",
+        )?;
+        ensure_full_v4(
+            self.lr == 1e-3
+                && self.weight_decay == 0.01
+                && self.muon_momentum == 0.95
+                && self.muon_rms_scale == MUON_RMS_SCALE
+                && !self.bf16_conv
+                && self.shuffled_episodes,
+            "fixed optimizer, precision, and episode-order contract",
+        )?;
+        ensure_full_v4(
+            self.patch_grounding_weight == 0.0 && self.exact_grounding_weight == 0.1,
+            "exact current/target grounding at weight 0.1",
+        )?;
+        ensure_full_v4(
+            self.event_weight == 0.1
+                && self.q_weight == 0.1
+                && self.rollout_weight == 0.1
+                && self.reliability_weight == 0.1
+                && self.phased_training,
+            "fixed auxiliary coefficients and phased schedule",
+        )?;
+        ensure_full_v4(
+            self.world_core_v4
+                && !self.world_core_v2
+                && !self.world_core_v3
+                && self.consumer_readout == ConsumerReadoutTopology::SpatialQuery
+                && self.spatial_action_field
+                && !self.spatial_action_residual,
+            "exclusive V4 topology with SpatialQuery and spatial action conditioning",
+        )?;
+        ensure_full_v4(
+            self.residual_y_update
+                && self.warm_start_y
+                && self.supervise_last_outer_only
+                && !self.randomize_depth
+                && self.train_z_noise == 0.0,
+            "fixed deterministic residual recurrence",
+        )?;
+        ensure_full_v4(
+            self.stop_grad_event_y
+                && self.stop_grad_q_y
+                && !self.q_quantile_targets
+                && self.ptrm_rank_every == 0
+                && self.prefix_weight == 0.0
+                && !self.branch_learning.enabled,
+            "frozen observer stages and excluded experimental objectives",
+        )?;
+        Ok(())
+    }
+}
+
+fn ensure_full_v4(condition: bool, invariant: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        bail!("full-v4 recipe invariant violated: {invariant}")
     }
 }
 
@@ -732,6 +893,8 @@ pub struct GradientPressureDiagnostics {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TrainingContract {
+    #[serde(default)]
+    recipe: TrainingRecipe,
     seed: u64,
     lessons: Vec<String>,
     steps_per_lesson: usize,
@@ -751,6 +914,8 @@ struct TrainingContract {
     patch_grounding_weight: f64,
     #[serde(default)]
     patch_grounding_mode: PatchGroundingMode,
+    #[serde(default)]
+    exact_grounding_weight: f64,
     #[serde(default)]
     init_seed: Option<u64>,
     #[serde(default)]
@@ -807,6 +972,8 @@ struct TrainingContract {
     #[serde(default)]
     world_core_v3: bool,
     #[serde(default)]
+    world_core_v4: bool,
+    #[serde(default)]
     spatial_action_residual: bool,
     #[serde(default = "default_spatial_action_residual_scale")]
     spatial_action_residual_scale: f64,
@@ -826,6 +993,7 @@ impl From<&TrainConfig> for TrainingContract {
     fn from(cfg: &TrainConfig) -> Self {
         let adam = adam_params(cfg);
         Self {
+            recipe: cfg.recipe,
             seed: cfg.seed,
             lessons: cfg.lessons.clone(),
             steps_per_lesson: cfg.steps_per_lesson,
@@ -841,6 +1009,7 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_weight: cfg.sigreg_weight,
             patch_grounding_weight: cfg.patch_grounding_weight,
             patch_grounding_mode: cfg.patch_grounding_mode,
+            exact_grounding_weight: cfg.exact_grounding_weight,
             init_seed: cfg.init_seed,
             experiment: Some(
                 cfg.resolved_experiment()
@@ -881,6 +1050,7 @@ impl From<&TrainConfig> for TrainingContract {
             sigreg_global_mix: cfg.sigreg_global_mix,
             world_core_v2: cfg.world_core_v2,
             world_core_v3: cfg.world_core_v3,
+            world_core_v4: cfg.world_core_v4,
             spatial_action_field: cfg.spatial_action_field,
             spatial_action_residual: cfg.spatial_action_residual,
             spatial_action_residual_scale: cfg.spatial_action_residual_scale,
@@ -950,6 +1120,12 @@ fn update_training_population(state: &mut TrainerState, samples: &[TransitionSam
         digest.update(sample.transition_index.to_le_bytes());
         digest.update((sample.family.len() as u64).to_le_bytes());
         digest.update(sample.family.as_bytes());
+        digest.update(sample.provenance.content_width.to_le_bytes());
+        digest.update(sample.provenance.content_height.to_le_bytes());
+        digest.update((sample.provenance.source_kind.len() as u64).to_le_bytes());
+        digest.update(sample.provenance.source_kind.as_bytes());
+        digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
+        digest.update(sample.provenance.trajectory_id.as_bytes());
         digest.update([sample.action.id]);
         digest.update([
             sample.action.x.unwrap_or(u8::MAX),
@@ -1030,6 +1206,23 @@ struct LatestCheckpoint {
     schema: String,
     directory: String,
     global_step: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointArtifactDigest {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointBundleManifest {
+    schema: String,
+    global_step: u64,
+    artifacts: Vec<CheckpointArtifactDigest>,
+    /// Hashes over named raw safetensor payloads. Comparing `world` between
+    /// lesson-boundary bundles proves whether an observer-only stage moved it.
+    parameter_groups: BTreeMap<String, String>,
 }
 
 /// Map a lesson name to a `generate_curriculum` kind. Never ARC recordings.
@@ -1402,6 +1595,9 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
     if samples.is_empty() {
         bail!("empty batch");
     }
+    for sample in samples {
+        sample.provenance.validate()?;
+    }
     let factual = samples
         .iter()
         .all(|sample| sample.family.starts_with("factual_"))
@@ -1753,6 +1949,9 @@ pub fn sample_recursion_depth(cfg: &TrainConfig, global_step: u64) -> RecursionD
 /// Effective auxiliary loss weights for the current lesson and step.
 #[derive(Debug, Clone, Copy)]
 pub struct LessonLossWeights {
+    /// Weight on all world/representation objectives. Full V4 observer lessons
+    /// set this to zero and route only detached representations to their heads.
+    pub world: f64,
     pub sigreg: f64,
     pub event: f64,
     pub q: f64,
@@ -1772,6 +1971,7 @@ pub fn lesson_loss_weights(
     let lesson_steps = steps_for_lesson(cfg, lesson);
     if !cfg.phased_training {
         return LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: cfg.event_weight,
             q: cfg.q_weight,
@@ -1793,6 +1993,7 @@ pub fn lesson_loss_weights(
     let rank_k = ptrm_rank_k_for_lesson(lesson);
     match lesson {
         "dynamics" => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: 0.0,
             q: 0.0,
@@ -1803,6 +2004,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "factual_branches" => LessonLossWeights {
+            world: 1.0,
             sigreg: 0.0,
             event: 0.0,
             q: 0.0,
@@ -1813,6 +2015,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "exploration" => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: 0.0,
             q: 0.0,
@@ -1823,6 +2026,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "sequential" => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: 0.0,
             q: 0.0,
@@ -1833,7 +2037,16 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "q_calibration" => LessonLossWeights {
-            sigreg: cfg.sigreg_weight,
+            world: if cfg.recipe == TrainingRecipe::FullV4 {
+                0.0
+            } else {
+                1.0
+            },
+            sigreg: if cfg.recipe == TrainingRecipe::FullV4 {
+                0.0
+            } else {
+                cfg.sigreg_weight
+            },
             event: cfg.event_weight * aux_warm,
             q: cfg.q_weight * aux_warm,
             rollout: 0.0,
@@ -1843,6 +2056,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "events" => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: cfg.event_weight * aux_warm,
             q: 0.0,
@@ -1853,7 +2067,16 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "falsification" => LessonLossWeights {
-            sigreg: cfg.sigreg_weight,
+            world: if cfg.recipe == TrainingRecipe::FullV4 {
+                0.0
+            } else {
+                1.0
+            },
+            sigreg: if cfg.recipe == TrainingRecipe::FullV4 {
+                0.0
+            } else {
+                cfg.sigreg_weight
+            },
             event: cfg.event_weight * aux_warm,
             q: cfg.q_weight * aux_warm,
             rollout: 0.0,
@@ -1863,6 +2086,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         "retarget" => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: cfg.event_weight,
             q: cfg.q_weight,
@@ -1873,6 +2097,7 @@ pub fn lesson_loss_weights(
             ptrm_rank_k: rank_k,
         },
         _ => LessonLossWeights {
+            world: 1.0,
             sigreg: cfg.sigreg_weight,
             event: cfg.event_weight,
             q: cfg.q_weight,
@@ -2535,6 +2760,30 @@ pub fn sigreg_losses_for_encoded_pair(
     Ok((raw, bounded))
 }
 
+/// Resolve the persisted training representation before scoring SIGReg. Full
+/// V4 regularizes its consumed canonical state; historical recipes retain
+/// their recorded latent/projector geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn model_sigreg_losses_for_encoded_pair(
+    model: &WorldModel,
+    cur_z: &Tensor,
+    next_z: &Tensor,
+    cur_raw: &Tensor,
+    next_raw: &Tensor,
+    projected: Option<&Tensor>,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<(Tensor, Tensor)> {
+    if cfg.recipe == TrainingRecipe::FullV4 {
+        let current = model.canonical_representation(cur_z)?;
+        let next = model.canonical_representation(next_z)?;
+        let stack = Tensor::stack(&[current, next], 0)?;
+        let raw = sigreg_loss_for_stack(&stack, cfg, seed)?;
+        return Ok((raw.clone(), raw));
+    }
+    sigreg_losses_for_encoded_pair(cur_z, next_z, cur_raw, next_raw, projected, cfg, seed)
+}
+
 /// Apply the existing post-RMS spatial SIGReg geometry to an ordered population.
 /// The encoder is deliberately called before target selection, so marginal and
 /// temporal-residual arms have identical frame batches and encoder call shapes.
@@ -2756,7 +3005,17 @@ fn leworld_loss_with_sigreg_windows(
         RecursionOpts::training(cfg.supervise_last_outer_only),
     )?;
 
-    let next_latent = if cfg.supervise_last_outer_only {
+    let device = batch.frames.device();
+    let zero = Tensor::zeros((), DType::F32, device)?;
+    let next_latent = if weights.world == 0.0 {
+        zero.clone()
+    } else if cfg.recipe == TrainingRecipe::FullV4 {
+        let spatial = candle_nn::loss::huber(&out.y, &next_z, 1.0)?;
+        let predicted_canonical = model.canonical_representation(&out.y)?;
+        let target_canonical = model.canonical_representation(&next_z)?;
+        let canonical = candle_nn::loss::huber(&predicted_canonical, &target_canonical, 1.0)?;
+        spatial.add(&canonical)?
+    } else if cfg.supervise_last_outer_only {
         out.y.sub(&next_z)?.sqr()?.mean_all()?
     } else {
         let mut pred_acc: Option<Tensor> = None;
@@ -2773,9 +3032,15 @@ fn leworld_loss_with_sigreg_windows(
             .affine(1.0 / n_steps, 0.0)?
     };
 
-    let device = batch.frames.device();
-    let zero = Tensor::zeros((), DType::F32, device)?;
-    let grounding = if cfg.patch_grounding_weight > 0.0 {
+    let grounding = if cfg.recipe == TrainingRecipe::FullV4 && weights.world > 0.0 {
+        let current = model.exact_grounding_loss(&cur_z, &batch.frames)?;
+        let target = model.exact_grounding_loss(&next_z, &batch.next_frames)?;
+        crate::p2::grounding::PatchGroundingLoss {
+            total: current.add(&target)?.affine(0.5, 0.0)?,
+            changed_patches: 0,
+            unchanged_patches: 0,
+        }
+    } else if cfg.patch_grounding_weight > 0.0 {
         let samples = samples.ok_or_else(|| {
             anyhow::anyhow!("patch grounding requires transition sample provenance")
         })?;
@@ -2790,14 +3055,9 @@ fn leworld_loss_with_sigreg_windows(
     let (sigreg_raw, sigreg_bounded) = if weights.sigreg == 0.0 {
         (zero.clone(), zero.clone())
     } else {
-        match sigreg_windows {
-            Some(windows) if !cfg.sigreg_pre_rms_spatial && !cfg.sigreg_projector => {
-                sigreg_losses_for_ordered_windows(&cur_z, windows, cfg, sigreg_seed)?
-            }
-            None if cfg.sigreg_target == SigregTarget::TemporalResidual => bail!(
-                "temporal-residual SIGReg requires at least one complete ordered transition window"
-            ),
-            _ => sigreg_losses_for_encoded_pair(
+        if cfg.recipe == TrainingRecipe::FullV4 {
+            model_sigreg_losses_for_encoded_pair(
+                model,
                 &cur_z,
                 &next_z,
                 &encoded.current_raw,
@@ -2805,18 +3065,41 @@ fn leworld_loss_with_sigreg_windows(
                 encoded.projected_sigreg.as_ref(),
                 cfg,
                 sigreg_seed,
-            )?,
+            )?
+        } else {
+            match sigreg_windows {
+                Some(windows) if !cfg.sigreg_pre_rms_spatial && !cfg.sigreg_projector => {
+                    sigreg_losses_for_ordered_windows(&cur_z, windows, cfg, sigreg_seed)?
+                }
+                None if cfg.sigreg_target == SigregTarget::TemporalResidual => bail!(
+                "temporal-residual SIGReg requires at least one complete ordered transition window"
+            ),
+                _ => sigreg_losses_for_encoded_pair(
+                    &cur_z,
+                    &next_z,
+                    &encoded.current_raw,
+                    &encoded.next_raw,
+                    encoded.projected_sigreg.as_ref(),
+                    cfg,
+                    sigreg_seed,
+                )?,
+            }
         }
     };
 
     let (event_raw, event) = if weights.event > 0.0 {
         let slot_weights = event_slot_weight_tensor(device)?;
-        let event_y = if cfg.stop_grad_event_y {
-            out.y.detach()
+        let event_logits = if cfg.recipe == TrainingRecipe::FullV4 {
+            let canonical = model.canonical_representation(&out.y)?.detach();
+            model.event_logits_from_canonical(&canonical, &batch.goals)?
         } else {
-            out.y.clone()
+            let event_y = if cfg.stop_grad_event_y {
+                out.y.detach()
+            } else {
+                out.y.clone()
+            };
+            model.event_logits_from(&event_y, &batch.goals)?
         };
-        let event_logits = model.event_logits_from(&event_y, &batch.goals)?;
         let raw = masked_bce_with_slot_weights(
             &event_logits,
             &batch.event_targets,
@@ -2828,15 +3111,38 @@ fn leworld_loss_with_sigreg_windows(
         (zero.clone(), zero.clone())
     };
 
+    let exact_observer_targets =
+        if cfg.recipe == TrainingRecipe::FullV4 && (weights.q > 0.0 || weights.reliability > 0.0) {
+            Some(model.exact_transition_correctness(
+                &out.y.detach(),
+                &batch.frames,
+                &batch.next_frames,
+            )?)
+        } else {
+            None
+        };
+
     let (q_raw, q, q_logit, q_mse_per_sample) = if weights.q > 0.0 {
-        let q_y = if cfg.stop_grad_q_y {
+        let q_y = if cfg.recipe == TrainingRecipe::FullV4 || cfg.stop_grad_q_y {
             out.y.detach()
         } else {
             out.y.clone()
         };
-        let q_logit = model.q_logit_from_y(&q_y)?;
+        let q_logit = if cfg.recipe == TrainingRecipe::FullV4 {
+            let canonical = model.canonical_representation(&q_y)?.detach();
+            model.q_logit_from_canonical(&canonical)?
+        } else {
+            model.q_logit_from_y(&q_y)?
+        };
         let per = latent_mse_per_sample(&q_y, &next_z)?;
-        let q_targets = q_targets_from_mse(&per.detach(), cfg)?;
+        let q_targets = if cfg.recipe == TrainingRecipe::FullV4 {
+            exact_observer_targets
+                .as_ref()
+                .expect("Full V4 observer labels were prepared")
+                .clone()
+        } else {
+            q_targets_from_mse(&per.detach(), cfg)?
+        };
         let raw = bce_with_logits(&q_logit, &q_targets)?;
         (raw.clone(), raw, Some(q_logit), Some(per))
     } else {
@@ -2844,9 +3150,22 @@ fn leworld_loss_with_sigreg_windows(
     };
 
     let (rel_raw, reliability) = if weights.reliability > 0.0 {
-        let per = latent_mse_per_sample(&out.y.detach(), &next_z)?.detach();
-        let q_targets = q_targets_from_mse(&per, cfg)?;
-        let reliability_logit = model.reliability_logit_from_y(&out.y.detach())?;
+        let detached_y = out.y.detach();
+        let q_targets = if cfg.recipe == TrainingRecipe::FullV4 {
+            exact_observer_targets
+                .as_ref()
+                .expect("Full V4 observer labels were prepared")
+                .clone()
+        } else {
+            let per = latent_mse_per_sample(&detached_y, &next_z)?.detach();
+            q_targets_from_mse(&per, cfg)?
+        };
+        let reliability_logit = if cfg.recipe == TrainingRecipe::FullV4 {
+            let canonical = model.canonical_representation(&detached_y)?.detach();
+            model.reliability_logit_from_canonical(&canonical)?
+        } else {
+            model.reliability_logit_from_y(&detached_y)?
+        };
         let raw = bce_with_logits(&reliability_logit, &q_targets)?;
         (raw.clone(), raw)
     } else {
@@ -2883,10 +3202,21 @@ fn leworld_loss_with_sigreg_windows(
         (zero.clone(), zero.clone())
     };
 
-    let mut total = next_latent.clone();
+    let mut total = if weights.world > 0.0 {
+        next_latent.affine(weights.world, 0.0)?
+    } else {
+        zero.clone()
+    };
     for (weight, loss) in [
         (weights.sigreg, &sigreg_bounded),
-        (cfg.patch_grounding_weight, &grounding.total),
+        (
+            if cfg.recipe == TrainingRecipe::FullV4 {
+                cfg.exact_grounding_weight * weights.world
+            } else {
+                cfg.patch_grounding_weight
+            },
+            &grounding.total,
+        ),
         (weights.event, &event),
         (weights.q, &q),
         (weights.reliability, &reliability),
@@ -3450,6 +3780,8 @@ fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
         "trainer_state.json",
         "model.safetensors",
         "optimizer.safetensors",
+        "config.json",
+        "bundle-manifest.json",
     ] {
         if !bundle.join(required).is_file() {
             bail!(
@@ -3458,7 +3790,147 @@ fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
             );
         }
     }
+    verify_checkpoint_bundle(&bundle)?;
     Ok(bundle)
+}
+
+fn sha256_file(path: &Path) -> Result<CheckpointArtifactDigest> {
+    let mut file =
+        File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        bytes += read as u64;
+    }
+    Ok(CheckpointArtifactDigest {
+        path: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .into(),
+        bytes,
+        sha256: format!("sha256:{:x}", digest.finalize()),
+    })
+}
+
+fn checkpoint_parameter_group(name: &str) -> &'static str {
+    if name.starts_with("exact_grounding_head.") {
+        "exact_decoder"
+    } else if name.starts_with("event_head.")
+        || name.starts_with("q_head.")
+        || name.starts_with("reliability_head.")
+        || name.starts_with("goal_proj.")
+        || name.starts_with("action_decoder.")
+        || name.starts_with("coordinate_decoder.")
+    {
+        "observers"
+    } else if name.starts_with("grounding_head.") || name.starts_with("sigreg_projector.") {
+        "auxiliary_decoders"
+    } else {
+        "world"
+    }
+}
+
+fn model_parameter_group_hashes(path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut length_bytes = [0u8; 8];
+    file.read_exact(&mut length_bytes)
+        .with_context(|| format!("read safetensors header length from {}", path.display()))?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    if header_len > 64 * 1024 * 1024 {
+        bail!("implausible safetensors header length {header_len}");
+    }
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)
+        .with_context(|| format!("read safetensors header from {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&header)
+        .with_context(|| format!("parse safetensors header from {}", path.display()))?;
+    let tensors = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("safetensors header is not an object"))?;
+    let mut entries = tensors
+        .iter()
+        .filter(|(name, _)| name.as_str() != "__metadata__")
+        .map(|(name, tensor)| {
+            let offsets = tensor
+                .get("data_offsets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("tensor {name} has no data_offsets"))?;
+            if offsets.len() != 2 {
+                bail!("tensor {name} has invalid data_offsets");
+            }
+            Ok((
+                name.clone(),
+                offsets[0]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("tensor {name} start is not u64"))?,
+                offsets[1]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("tensor {name} end is not u64"))?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let data_start = 8 + header_len;
+    let mut digests = BTreeMap::<String, Sha256>::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for (name, start, end) in entries {
+        if end < start {
+            bail!("tensor {name} has reversed offsets");
+        }
+        let group = checkpoint_parameter_group(&name).to_string();
+        let digest = digests.entry(group).or_default();
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((end - start).to_le_bytes());
+        file.seek(SeekFrom::Start(data_start + start))?;
+        let mut remaining = end - start;
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..take])?;
+            digest.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+    }
+    Ok(digests
+        .into_iter()
+        .map(|(group, digest)| (group, format!("sha256:{:x}", digest.finalize())))
+        .collect())
+}
+
+pub(crate) fn verify_checkpoint_bundle(bundle: &Path) -> Result<()> {
+    let manifest: CheckpointBundleManifest = read_json(&bundle.join("bundle-manifest.json"))?;
+    if manifest.schema != "p2.checkpoint_bundle.v1" {
+        bail!("unsupported checkpoint bundle schema {}", manifest.schema);
+    }
+    for expected in &manifest.artifacts {
+        if expected.path.contains('/') || expected.path.contains('\\') || expected.path == "." {
+            bail!("unsafe checkpoint artifact path {}", expected.path);
+        }
+        let actual = sha256_file(&bundle.join(&expected.path))?;
+        if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+            bail!(
+                "checkpoint artifact integrity mismatch for {}",
+                bundle.join(&expected.path).display()
+            );
+        }
+    }
+    let actual_groups = model_parameter_group_hashes(&bundle.join("model.safetensors"))?;
+    if actual_groups != manifest.parameter_groups {
+        bail!(
+            "checkpoint parameter-group integrity mismatch in {}",
+            bundle.display()
+        );
+    }
+    Ok(())
 }
 
 fn save_training_checkpoint(
@@ -3497,10 +3969,36 @@ fn save_training_checkpoint(
     optimizer
         .save(&optimizer_path)
         .with_context(|| format!("save {}", optimizer_path.display()))?;
-    write_json_atomic(&staging.join("trainer_state.json"), state)?;
-    write_json_atomic(&output_dir.join("config.json"), &persist_train_config(cfg))?;
+    let trainer_state_path = staging.join("trainer_state.json");
+    let bundle_config_path = staging.join("config.json");
+    let persisted_config = persist_train_config(cfg);
+    write_json_atomic(&trainer_state_path, state)?;
+    write_json_atomic(&bundle_config_path, &persisted_config)?;
+    write_json_atomic(&output_dir.join("config.json"), &persisted_config)?;
+    let artifacts = [
+        &model_path,
+        &optimizer_path,
+        &trainer_state_path,
+        &bundle_config_path,
+    ]
+    .into_iter()
+    .map(|path| sha256_file(path))
+    .collect::<Result<Vec<_>>>()?;
+    let bundle_manifest_path = staging.join("bundle-manifest.json");
+    write_json_atomic(
+        &bundle_manifest_path,
+        &CheckpointBundleManifest {
+            schema: "p2.checkpoint_bundle.v1".into(),
+            global_step: state.global_step,
+            artifacts,
+            parameter_groups: model_parameter_group_hashes(&model_path)?,
+        },
+    )?;
     File::open(&model_path)?.sync_all()?;
     File::open(&optimizer_path)?.sync_all()?;
+    File::open(&trainer_state_path)?.sync_all()?;
+    File::open(&bundle_config_path)?.sync_all()?;
+    File::open(&bundle_manifest_path)?.sync_all()?;
     File::open(&staging)?.sync_all()?;
     fs::rename(&staging, &final_dir).with_context(|| {
         format!(
@@ -3777,6 +4275,11 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     };
     let mut latest_checkpoint = resumed_from.clone();
     let mut latest_checkpoint_step = resumed_from.as_ref().map(|_| state.global_step);
+    if resumed_from.is_none() {
+        let initial = save_training_checkpoint(&varmap, &optimizer, &state, cfg)?;
+        latest_checkpoint = Some(initial);
+        latest_checkpoint_step = Some(0);
+    }
     let mut updates_this_run = 0usize;
     if resumed_from.is_some() {
         device.synchronize()?;
@@ -4392,7 +4895,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         state.step_in_lesson += 1;
         updates_this_run += 1;
 
-        if state.step_in_lesson == active_lesson_steps {
+        let lesson_boundary = state.step_in_lesson == active_lesson_steps;
+        if lesson_boundary {
             state.completed_lessons.push(LessonReport {
                 lesson: lesson.clone(),
                 curriculum: curriculum.to_string(),
@@ -4416,6 +4920,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let requested_pause = PAUSE_REQUESTED.load(Ordering::SeqCst)
             || cfg.max_steps_this_run == Some(updates_this_run);
         let periodic = published_profile
+            || lesson_boundary
             || (cfg.checkpoint_every_steps > 0
                 && state.global_step % cfg.checkpoint_every_steps as u64 == 0);
         if complete || requested_pause || periodic {
@@ -4594,6 +5099,12 @@ mod tests {
             seed: 0,
             episode_id: 0,
             transition_index: 0,
+            provenance: crate::p2::data::TransitionProvenance::full_frame(
+                0,
+                0,
+                Split::Train,
+                "test",
+            ),
             oracle_latent: None,
         }
     }
@@ -5395,6 +5906,7 @@ mod tests {
             },
             cfg.seed,
             LessonLossWeights {
+                world: 1.0,
                 rollout: 0.0,
                 sigreg: 0.0,
                 event: 1.0,
@@ -5472,6 +5984,7 @@ mod tests {
             },
             cfg.seed,
             LessonLossWeights {
+                world: 1.0,
                 rollout: 0.0,
                 sigreg: 0.0,
                 event: 0.0,
@@ -5539,6 +6052,7 @@ mod tests {
             },
             cfg.seed,
             LessonLossWeights {
+                world: 1.0,
                 rollout: 0.0,
                 sigreg: 1.0,
                 event: 0.0,
@@ -5620,6 +6134,190 @@ mod tests {
         assert!(ret_w.rollout > 0.0);
         assert!(ret_w.rollout < seq_w_late.rollout);
         assert!(ret_w.ptrm_rank);
+    }
+
+    #[test]
+    fn full_v4_recipe_is_resolved_and_rejects_drift() -> Result<()> {
+        let mut cfg = TrainConfig::default();
+        cfg.apply_full_v4_recipe();
+        cfg.validate()?;
+        let resolved = cfg.resolved_experiment()?;
+        assert_eq!(resolved.family, crate::p2::experiment::WorldCoreFamily::V4);
+        assert_eq!(cfg.sigreg_projections, 1024);
+        assert_eq!(cfg.sigreg_knots, 17);
+        assert_eq!(cfg.sigreg_max_rows, 0);
+        assert_eq!(cfg.consumer_readout, ConsumerReadoutTopology::SpatialQuery);
+
+        cfg.sigreg_target = SigregTarget::TemporalResidual;
+        assert!(cfg.validate().is_err());
+        cfg.apply_full_v4_recipe();
+        cfg.hidden_dim = 64;
+        assert!(cfg.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn full_v4_observer_lessons_disable_world_objectives() {
+        let mut cfg = TrainConfig::default();
+        cfg.apply_full_v4_recipe();
+        for lesson in ["q_calibration", "falsification"] {
+            let weights = lesson_loss_weights(lesson, &cfg, 1, 1);
+            assert_eq!(weights.world, 0.0);
+            assert_eq!(weights.sigreg, 0.0);
+            assert_eq!(weights.rollout, 0.0);
+            assert_eq!(weights.prefix, 0.0);
+            assert!(!weights.ptrm_rank);
+        }
+    }
+
+    #[test]
+    fn full_v4_q_observer_has_no_world_core_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = TrainConfig::default();
+        cfg.apply_full_v4_recipe();
+        cfg.physical_batch = 2;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let batch = batch_from_samples(&[toy_sample(3), toy_sample(7)], &device)?;
+        let losses = leworld_loss(
+            &model,
+            &batch,
+            &cfg,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+            cfg.seed,
+            LessonLossWeights {
+                world: 0.0,
+                sigreg: 0.0,
+                event: 0.0,
+                q: 1.0,
+                rollout: 0.0,
+                prefix: 0.0,
+                reliability: 0.0,
+                ptrm_rank: false,
+                ptrm_rank_k: 1,
+            },
+        )?;
+        let grads = losses.total.backward()?;
+        let data = varmap.data().lock().unwrap();
+        assert!(grads.get(data["q_head.weight"].as_tensor()).is_some());
+        let world_names = [
+            "encoder.patch.weight",
+            "block.c1.weight",
+            "consumer_readout.query_score.weight",
+            "exact_grounding_head.decoder.weight",
+        ];
+        for name in world_names {
+            assert!(
+                grads.get(data[name].as_tensor()).is_none(),
+                "observer loss leaked a gradient into {name}"
+            );
+        }
+        let world_before = world_names
+            .iter()
+            .map(|name| {
+                data[*name]
+                    .as_tensor()
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map(|values| ((*name).to_string(), values))
+                    .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q_before = data["q_head.weight"]
+            .as_tensor()
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        drop(data);
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            ParamsAdamW {
+                lr: cfg.lr,
+                weight_decay: cfg.weight_decay,
+                ..ParamsAdamW::default()
+            },
+            cfg.muon_momentum,
+            cfg.muon_rms_scale,
+        )?;
+        optimizer.step(&grads)?;
+        let data = varmap.data().lock().unwrap();
+        for (name, before) in world_before {
+            let after = data[&name].as_tensor().flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(before, after, "observer optimizer step changed {name}");
+        }
+        let q_after = data["q_head.weight"]
+            .as_tensor()
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_ne!(
+            q_before, q_after,
+            "observer optimizer did not update Q head"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_v4_world_objective_reaches_canonical_and_exact_grounding() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = TrainConfig::default();
+        cfg.apply_full_v4_recipe();
+        cfg.physical_batch = 2;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, cfg.seed)?;
+        let mut coordinate = toy_sample(7);
+        coordinate.action = ArcAction::new(6, Some(31), Some(47))?;
+        let batch = batch_from_samples(&[toy_sample(3), coordinate], &device)?;
+        let losses = leworld_loss(
+            &model,
+            &batch,
+            &cfg,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+            cfg.seed,
+            LessonLossWeights {
+                world: 1.0,
+                sigreg: cfg.sigreg_weight,
+                event: 0.0,
+                q: 0.0,
+                rollout: 0.0,
+                prefix: 0.0,
+                reliability: 0.0,
+                ptrm_rank: false,
+                ptrm_rank_k: 1,
+            },
+        )?;
+        assert!(losses.total.to_scalar::<f32>()?.is_finite());
+        assert_eq!(
+            losses.sigreg_raw.to_scalar::<f32>()?,
+            losses.sigreg_bounded.to_scalar::<f32>()?,
+            "Full V4 must not silently cap EP"
+        );
+        let grads = losses.total.backward()?;
+        let data = varmap.data().lock().unwrap();
+        for name in [
+            "encoder.patch.weight",
+            "spatial_action_proj.weight",
+            "consumer_readout.query_score.weight",
+            "exact_grounding_head.decoder.weight",
+        ] {
+            let grad = grads
+                .get(data[name].as_tensor())
+                .unwrap_or_else(|| panic!("missing Full V4 gradient for {name}"));
+            assert!(grad.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        }
+        Ok(())
     }
 
     #[test]

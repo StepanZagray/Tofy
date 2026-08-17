@@ -37,6 +37,134 @@ pub struct PatchHistogramGrounding {
     decoder: Linear,
 }
 
+/// Exact, position-preserving decoder used by Full V4. Each spatial token
+/// predicts the 8x8 palette indices in its corresponding observation patch.
+/// The synthetic status row is removed before both loss and correctness are
+/// computed.
+pub struct ExactPatchGrounding {
+    decoder: Linear,
+}
+
+impl ExactPatchGrounding {
+    pub fn new(hidden_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(Self {
+            decoder: linear(
+                hidden_dim,
+                PATCH_SIDE * PATCH_SIDE * PALETTE_SIZE,
+                vb.pp("decoder"),
+            )?,
+        })
+    }
+
+    /// `B×63×64×16` logits in gameplay-pixel order. The full 1024-way token
+    /// projection is immediately rearranged and the status row is discarded.
+    pub fn gameplay_logits(&self, latents: &Tensor) -> Result<Tensor> {
+        let (batch, hidden, height, width) = latents.dims4()?;
+        ensure!(
+            height == LATENT_GRID && width == LATENT_GRID,
+            "exact grounding expects {LATENT_GRID}x{LATENT_GRID} spatial latents"
+        );
+        let tokens = latents
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((batch * height * width, hidden))?;
+        let patch_logits = self.decoder.forward(&tokens)?.to_dtype(DType::F32)?;
+        patch_logits
+            .reshape((
+                batch,
+                LATENT_GRID,
+                LATENT_GRID,
+                PATCH_SIDE,
+                PATCH_SIDE,
+                PALETTE_SIZE,
+            ))?
+            .permute((0, 1, 3, 2, 4, 5))?
+            .contiguous()?
+            .reshape((batch, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE))?
+            .narrow(1, 0, FRAME_SIDE - 1)
+            .map_err(Into::into)
+    }
+
+    pub fn loss(&self, latents: &Tensor, frames: &Tensor) -> Result<Tensor> {
+        let batch = latents.dim(0)?;
+        ensure!(
+            frames.dims4()? == (batch, 1, FRAME_SIDE, FRAME_SIDE),
+            "exact grounding frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}"
+        );
+        let logits = self
+            .gameplay_logits(latents)?
+            .reshape((batch * (FRAME_SIDE - 1) * FRAME_SIDE, PALETTE_SIZE))?;
+        let labels = frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .contiguous()?
+            .flatten_all()?
+            .to_dtype(DType::U32)?;
+        candle_nn::loss::cross_entropy(&logits, &labels).map_err(Into::into)
+    }
+
+    /// Frozen, pixel-derived transition labels for observer heads. A positive
+    /// requires >=99% gameplay accuracy and, when the transition changes any
+    /// gameplay pixels, >=90% accuracy on those changed pixels.
+    pub fn transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        let predicted = self
+            .gameplay_logits(predicted)?
+            .detach()
+            .argmax(D::Minus1)?;
+        let current = current_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        let target = next_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        transition_correctness_from_gameplay(&predicted, &current, &target)
+    }
+}
+
+fn transition_correctness_from_gameplay(
+    predicted: &Tensor,
+    current: &Tensor,
+    target: &Tensor,
+) -> Result<Tensor> {
+    let batch = predicted.dim(0)?;
+    ensure!(
+        current.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE)
+            && target.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
+        "exact correctness inputs must share a Bx63x64 gameplay grid"
+    );
+    ensure!(
+        predicted.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
+        "exact decoder produced an invalid gameplay grid"
+    );
+    let correct = predicted.eq(target)?.to_dtype(DType::F32)?;
+    let changed = current.ne(target)?.to_dtype(DType::F32)?;
+    let correct_flat = correct.reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?;
+    let changed_flat = changed.reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?;
+    let overall_ok = correct_flat
+        .mean_keepdim(D::Minus1)?
+        .ge(0.99)?
+        .to_dtype(DType::F32)?;
+    let changed_count = changed_flat.sum_keepdim(D::Minus1)?;
+    let changed_accuracy = correct_flat
+        .mul(&changed_flat)?
+        .sum_keepdim(D::Minus1)?
+        .div(&changed_count.clamp(1.0, f64::INFINITY)?)?;
+    let no_change = changed_count.eq(0f32)?.to_dtype(DType::F32)?;
+    let changed_ok = changed_accuracy
+        .ge(0.9)?
+        .to_dtype(DType::F32)?
+        .add(&no_change)?
+        .clamp(0.0, 1.0)?;
+    overall_ok.mul(&changed_ok).map_err(Into::into)
+}
+
 impl PatchHistogramGrounding {
     pub fn new(hidden_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
@@ -197,6 +325,7 @@ mod tests {
     use super::*;
     use crate::domain::Split;
     use crate::p2::data::{ArcAction, ArcFrame, GoalFeatures};
+    use candle_nn::{VarBuilder, VarMap};
 
     fn sample(current: Vec<u8>, next: Vec<u8>) -> TransitionSample {
         TransitionSample {
@@ -213,6 +342,12 @@ mod tests {
             seed: 1,
             episode_id: 1,
             transition_index: 0,
+            provenance: crate::p2::data::TransitionProvenance::full_frame(
+                1,
+                1,
+                Split::Train,
+                "test",
+            ),
             oracle_latent: None,
         }
     }
@@ -241,6 +376,79 @@ mod tests {
             "grounding_head.decoder.weight",
             &[PALETTE_SIZE, 128],
         ));
+    }
+
+    #[test]
+    fn exact_grounding_ignores_status_only_differences() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let vars = VarMap::new();
+        let head =
+            ExactPatchGrounding::new(4, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        let latents = Tensor::zeros((1, 4, LATENT_GRID, LATENT_GRID), DType::F32, &device)?;
+        let clean = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
+        let status = Tensor::ones((1, 1, 1, FRAME_SIDE), DType::U32, &device)?;
+        let changed = Tensor::cat(&[&clean.narrow(2, 0, FRAME_SIDE - 1)?, &status], 2)?;
+        let clean_loss = head.loss(&latents, &clean)?.to_scalar::<f32>()?;
+        let changed_loss = head.loss(&latents, &changed)?.to_scalar::<f32>()?;
+        assert!((clean_loss - changed_loss).abs() < 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_correctness_enforces_overall_and_changed_pixel_thresholds() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+        let current_values = vec![0u32; pixels];
+        let mut target_values = current_values.clone();
+        target_values[..10].fill(1);
+        let current = Tensor::from_vec(
+            current_values.clone(),
+            (1, FRAME_SIDE - 1, FRAME_SIDE),
+            &device,
+        )?;
+        let target = Tensor::from_vec(
+            target_values.clone(),
+            (1, FRAME_SIDE - 1, FRAME_SIDE),
+            &device,
+        )?;
+
+        let mut eighty_percent_changed = target_values.clone();
+        eighty_percent_changed[8..10].fill(0);
+        let predicted = Tensor::from_vec(
+            eighty_percent_changed,
+            (1, FRAME_SIDE - 1, FRAME_SIDE),
+            &device,
+        )?;
+        assert_eq!(
+            transition_correctness_from_gameplay(&predicted, &current, &target)?
+                .to_vec2::<f32>()?[0][0],
+            0.0
+        );
+
+        let mut ninety_percent_changed = target_values;
+        ninety_percent_changed[9] = 0;
+        let predicted = Tensor::from_vec(
+            ninety_percent_changed,
+            (1, FRAME_SIDE - 1, FRAME_SIDE),
+            &device,
+        )?;
+        assert_eq!(
+            transition_correctness_from_gameplay(&predicted, &current, &target)?
+                .to_vec2::<f32>()?[0][0],
+            1.0
+        );
+
+        let no_change_target = current.clone();
+        let mut too_many_errors = current_values;
+        too_many_errors[..41].fill(1);
+        let predicted =
+            Tensor::from_vec(too_many_errors, (1, FRAME_SIDE - 1, FRAME_SIDE), &device)?;
+        assert_eq!(
+            transition_correctness_from_gameplay(&predicted, &current, &no_change_target)?
+                .to_vec2::<f32>()?[0][0],
+            0.0
+        );
+        Ok(())
     }
 
     #[test]

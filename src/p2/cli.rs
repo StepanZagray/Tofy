@@ -6,7 +6,7 @@
 use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
-use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic};
+use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
@@ -25,6 +25,11 @@ use std::path::PathBuf;
 /// `p2-train` — synthetic curriculum only (no ARC public recordings).
 #[derive(Debug, Clone, Args)]
 pub struct P2TrainArgs {
+    /// Immutable successor recipe. `full-v4` resolves all model/objective
+    /// choices while leaving runtime, seed, batch, and output controls intact.
+    #[arg(long, value_enum, default_value_t = TrainingRecipe::LegacyExperimental)]
+    pub recipe: TrainingRecipe,
+
     #[arg(long, default_value_t = 2)]
     pub seed: u64,
 
@@ -324,7 +329,8 @@ impl P2TrainArgs {
         } else {
             self.lessons.clone()
         };
-        TrainConfig {
+        let mut cfg = TrainConfig {
+            recipe: self.recipe,
             seed: self.seed,
             lessons,
             steps_per_lesson: self.steps_per_lesson,
@@ -337,6 +343,7 @@ impl P2TrainArgs {
             sigreg_weight: self.sigreg_weight,
             patch_grounding_weight: self.patch_grounding_weight,
             patch_grounding_mode: self.patch_grounding_mode,
+            exact_grounding_weight: 0.0,
             init_seed: self.init_seed,
             event_weight: self.event_weight,
             q_weight: self.q_weight,
@@ -390,6 +397,7 @@ impl P2TrainArgs {
             prefetch_batches: self.prefetch_batches,
             world_core_v2: self.world_core_v2 || self.world_core_v3,
             world_core_v3: self.world_core_v3,
+            world_core_v4: false,
             consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
@@ -432,7 +440,11 @@ impl P2TrainArgs {
                     }),
                 displacement_norm_floor: self.displacement_norm_floor,
             },
+        };
+        if self.recipe == TrainingRecipe::FullV4 {
+            cfg.apply_full_v4_recipe();
         }
+        cfg
     }
 }
 
@@ -467,6 +479,10 @@ pub struct P2EvalArgs {
 
     #[arg(long, default_value_t = 2)]
     pub seed: u64,
+
+    /// Unseen seed for the training-composition (IID) evaluation population.
+    #[arg(long, default_value_t = 3)]
+    pub iid_seed: u64,
 
     #[arg(long, default_value_t = 4)]
     pub synthetic_episodes: usize,
@@ -515,6 +531,7 @@ impl P2EvalArgs {
             checkpoint: self.checkpoint.clone(),
             train_config: self.train_config.clone(),
             seed: self.seed,
+            iid_seed: self.iid_seed,
             synthetic_episodes: self.synthetic_episodes,
             physical_batch: self.physical_batch,
             ptrm_k: self.ptrm_k.clone(),
@@ -780,6 +797,7 @@ impl P2Arc3EvalArgs {
             checkpoint: self.checkpoint.clone(),
             train_config: self.train_config.clone(),
             seed: self.seed,
+            iid_seed: self.seed.wrapping_add(1),
             synthetic_episodes: 0,
             physical_batch: self.physical_batch,
             ptrm_k: self.ptrm_k.clone(),

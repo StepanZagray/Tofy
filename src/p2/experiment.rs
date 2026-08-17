@@ -9,6 +9,17 @@ use crate::p2::grounding::PatchGroundingMode;
 pub const LEGACY_SCHEMA: &str = "legacy_p2_eval_compatible";
 pub const WORLD_CORE_V2_SCHEMA: &str = "world_core_v2";
 pub const WORLD_CORE_V3_SCHEMA: &str = "world_core_v3";
+pub const WORLD_CORE_V4_SCHEMA: &str = "world_core_v4_full_training";
+
+/// A persisted training recipe, separate from historical research switches.
+/// `FullV4` is resolved before validation and cannot be composed with V2/V3.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingRecipe {
+    #[default]
+    LegacyExperimental,
+    FullV4,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +55,7 @@ pub enum WorldCoreFamily {
     Legacy,
     V2,
     V3,
+    V4,
 }
 
 impl WorldCoreFamily {
@@ -56,6 +68,7 @@ impl WorldCoreFamily {
             Self::Legacy => LEGACY_SCHEMA,
             Self::V2 => WORLD_CORE_V2_SCHEMA,
             Self::V3 => WORLD_CORE_V3_SCHEMA,
+            Self::V4 => WORLD_CORE_V4_SCHEMA,
         }
     }
 }
@@ -100,6 +113,8 @@ pub struct SigregDefinition {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedExperiment {
+    #[serde(default)]
+    pub recipe: TrainingRecipe,
     pub family: WorldCoreFamily,
     pub action_conditioning: ActionConditioning,
     #[serde(default)]
@@ -109,6 +124,8 @@ pub struct ResolvedExperiment {
     pub patch_grounding_weight: f64,
     #[serde(default)]
     pub patch_grounding_mode: PatchGroundingMode,
+    #[serde(default)]
+    pub exact_grounding_weight: f64,
     pub factual_learning: bool,
     pub report_schema: String,
 }
@@ -116,6 +133,7 @@ pub struct ResolvedExperiment {
 impl Default for ResolvedExperiment {
     fn default() -> Self {
         Self {
+            recipe: TrainingRecipe::LegacyExperimental,
             family: WorldCoreFamily::Legacy,
             action_conditioning: ActionConditioning::Global,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
@@ -133,6 +151,7 @@ impl Default for ResolvedExperiment {
             },
             patch_grounding_weight: 0.0,
             patch_grounding_mode: PatchGroundingMode::Both,
+            exact_grounding_weight: 0.0,
             factual_learning: false,
             report_schema: LEGACY_SCHEMA.into(),
         }
@@ -141,8 +160,10 @@ impl Default for ResolvedExperiment {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExperimentRequest<'a> {
+    pub recipe: TrainingRecipe,
     pub world_core_v2: bool,
     pub world_core_v3: bool,
+    pub world_core_v4: bool,
     pub spatial_action_field: bool,
     pub spatial_action_residual: bool,
     pub spatial_action_residual_scale: f64,
@@ -152,6 +173,7 @@ pub struct ExperimentRequest<'a> {
     pub sigreg_weight: f64,
     pub patch_grounding_weight: f64,
     pub patch_grounding_mode: PatchGroundingMode,
+    pub exact_grounding_weight: f64,
     pub sigreg_statistic: SigregStatistic,
     pub sigreg_population: SigregPopulation,
     pub sigreg_temporal_window: usize,
@@ -166,13 +188,23 @@ pub struct ExperimentRequest<'a> {
 
 impl ResolvedExperiment {
     pub fn resolve(request: ExperimentRequest<'_>) -> Result<Self> {
-        let family = match (request.world_core_v2, request.world_core_v3) {
-            (false, false) => WorldCoreFamily::Legacy,
-            (true, false) => WorldCoreFamily::V2,
-            (true, true) => WorldCoreFamily::V3,
-            (false, true) => bail!("world_core_v3 requires the world_core_v2 base topology"),
+        let family = match (
+            request.world_core_v2,
+            request.world_core_v3,
+            request.world_core_v4,
+        ) {
+            (false, false, false) => WorldCoreFamily::Legacy,
+            (true, false, false) => WorldCoreFamily::V2,
+            (true, true, false) => WorldCoreFamily::V3,
+            (false, false, true) => WorldCoreFamily::V4,
+            (false, true, false) => bail!("world_core_v3 requires the world_core_v2 base topology"),
+            _ => bail!("world-core-v4 is an exclusive successor topology"),
         };
-        let factual_learning = family.is_action_faithful();
+        ensure!(
+            (request.recipe == TrainingRecipe::FullV4) == (family == WorldCoreFamily::V4),
+            "full-v4 recipe and world-core-v4 topology must be selected together"
+        );
+        let factual_learning = matches!(family, WorldCoreFamily::V2 | WorldCoreFamily::V3);
         ensure!(
             request.branch_learning_enabled == factual_learning,
             "resolved world-core family and branch_learning.enabled must match"
@@ -207,7 +239,10 @@ impl ResolvedExperiment {
         ) {
             (false, false) => ActionConditioning::Global,
             (true, false) => {
-                ensure!(factual_learning, "spatial action fields require V2/V3");
+                ensure!(
+                    factual_learning || family == WorldCoreFamily::V4,
+                    "spatial action fields require V2/V3/V4"
+                );
                 ActionConditioning::SpatialField
             }
             (true, true) => {
@@ -262,6 +297,7 @@ impl ResolvedExperiment {
         }
 
         Ok(Self {
+            recipe: request.recipe,
             family,
             action_conditioning,
             consumer_readout: request.consumer_readout,
@@ -279,6 +315,7 @@ impl ResolvedExperiment {
             },
             patch_grounding_weight: request.patch_grounding_weight,
             patch_grounding_mode: request.patch_grounding_mode,
+            exact_grounding_weight: request.exact_grounding_weight,
             factual_learning,
             report_schema: family.schema().into(),
         })
@@ -291,8 +328,10 @@ mod tests {
 
     fn request<'a>(lessons: &'a [String]) -> ExperimentRequest<'a> {
         ExperimentRequest {
+            recipe: TrainingRecipe::LegacyExperimental,
             world_core_v2: false,
             world_core_v3: false,
+            world_core_v4: false,
             spatial_action_field: false,
             spatial_action_residual: false,
             spatial_action_residual_scale: 0.25,
@@ -302,6 +341,7 @@ mod tests {
             sigreg_weight: 0.003,
             patch_grounding_weight: 0.0,
             patch_grounding_mode: PatchGroundingMode::Both,
+            exact_grounding_weight: 0.0,
             sigreg_statistic: SigregStatistic::EppsPulley,
             sigreg_population: SigregPopulation::Marginal,
             sigreg_temporal_window: 8,
@@ -335,6 +375,26 @@ mod tests {
         let resolved = ResolvedExperiment::resolve(request(&lessons))?;
         let json = serde_json::to_string(&resolved)?;
         assert_eq!(resolved, serde_json::from_str(&json)?);
+        Ok(())
+    }
+
+    #[test]
+    fn full_v4_resolves_as_an_exclusive_successor() -> Result<()> {
+        let lessons = vec!["dynamics".into()];
+        let mut request = request(&lessons);
+        request.recipe = TrainingRecipe::FullV4;
+        request.world_core_v4 = true;
+        request.spatial_action_field = true;
+        request.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        request.sigreg_weight = 0.1;
+        request.exact_grounding_weight = 0.1;
+        let resolved = ResolvedExperiment::resolve(request)?;
+        assert_eq!(resolved.family, WorldCoreFamily::V4);
+        assert!(!resolved.factual_learning);
+        assert_eq!(resolved.report_schema, WORLD_CORE_V4_SCHEMA);
+
+        request.world_core_v2 = true;
+        assert!(ResolvedExperiment::resolve(request).is_err());
         Ok(())
     }
 }

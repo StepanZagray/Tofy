@@ -22,12 +22,17 @@ use crate::p2::representation::{
 use crate::p2::rhae::{
     benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
 };
+use crate::p2::semantic_eval::{
+    aggregate_decoder_metrics, collision_census, evaluate_semantics, latent_semantic_metrics,
+    CollisionCensus, SemanticDecoderMetrics, SemanticEvaluation,
+};
 use crate::p2::train::{
     action_tensors_from_samples, batch_from_samples, load_train_config, load_varmap_exact,
-    resolve_device, sigreg_losses_for_encoded_pair, BatchTensors, TrainConfig,
+    model_sigreg_losses_for_encoded_pair, resolve_device, verify_checkpoint_bundle, BatchTensors,
+    TrainConfig,
 };
 use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{ops, VarBuilder, VarMap};
 use clap::ValueEnum;
 use rand::Rng;
@@ -40,12 +45,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v14";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v15";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +91,8 @@ pub struct EvalConfig {
     pub checkpoint: PathBuf,
     pub train_config: PathBuf,
     pub seed: u64,
+    /// Unseen seed on the training-composition (7x7) distribution.
+    pub iid_seed: u64,
     pub synthetic_episodes: usize,
     pub physical_batch: usize,
     pub ptrm_k: Vec<usize>,
@@ -125,6 +132,7 @@ impl Default for EvalConfig {
             checkpoint: PathBuf::from("runs/p2/smoke/model.safetensors"),
             train_config: PathBuf::from("runs/p2/smoke/config.json"),
             seed: 2,
+            iid_seed: 3,
             synthetic_episodes: 4,
             physical_batch: 2,
             ptrm_k: vec![1, 2, 4],
@@ -468,7 +476,7 @@ pub struct EnsembleMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeRolloutRow {
-    /// Stable episode-rollout row schema. The evaluation report remains v9 in P0-A.
+    /// Stable episode-rollout row schema. The top-level report is v15.
     pub schema: String,
     /// Evaluation population that supplied this factual episode.
     pub source: String,
@@ -482,6 +490,12 @@ pub struct EpisodeRolloutRow {
     pub copy_forward_mse: Option<f64>,
     /// `open_mse / copy_forward_mse` only for finite denominators above `1e-8`.
     pub normalized_open_mse: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_semantic: Option<SemanticDecoderMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_semantic: Option<SemanticDecoderMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_copy_semantic: Option<SemanticDecoderMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +507,9 @@ struct EpisodeRolloutResult {
     open_mse: Option<f64>,
     closed_mse: Option<f64>,
     copy_forward_mse: Option<f64>,
+    open_semantic: Option<SemanticDecoderMetrics>,
+    closed_semantic: Option<SemanticDecoderMetrics>,
+    learned_copy_semantic: Option<SemanticDecoderMetrics>,
 }
 
 impl EpisodeRolloutResult {
@@ -515,6 +532,9 @@ impl EpisodeRolloutResult {
             closed_mse: self.closed_mse,
             copy_forward_mse: self.copy_forward_mse,
             normalized_open_mse,
+            open_semantic: self.open_semantic,
+            closed_semantic: self.closed_semantic,
+            learned_copy_semantic: self.learned_copy_semantic,
         }
     }
 }
@@ -539,6 +559,9 @@ fn episode_rollout_result<T: Borrow<TransitionSample>>(
         open_mse: Some(open_mse),
         closed_mse: Some(closed_mse),
         copy_forward_mse: Some(copy_forward_mse),
+        open_semantic: None,
+        closed_semantic: None,
+        learned_copy_semantic: None,
     }
 }
 
@@ -575,6 +598,12 @@ pub struct SplitEval {
     pub source: String,
     pub n_samples: usize,
     pub one_step_latent_mse: Option<f64>,
+    /// Full V4 exact-decoder metrics and controls, split by semantic mask/source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticEvaluation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_rollout: Option<SemanticRolloutMetrics>,
+    pub collision_census: CollisionCensus,
     pub representation: Option<RepresentationDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub representation_seams: Option<RepresentationSeamMap>,
@@ -603,6 +632,13 @@ pub struct SplitEval {
     pub recursion_probes: Option<RecursionProbeSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticRolloutMetrics {
+    pub open: BTreeMap<usize, SemanticDecoderMetrics>,
+    pub closed: BTreeMap<usize, SemanticDecoderMetrics>,
+    pub learned_copy: BTreeMap<usize, SemanticDecoderMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,8 +678,19 @@ pub struct FactualBranchRowMetric {
     pub recoverable: bool,
     pub predicted_displacement_norm: f64,
     pub predicted_action_id: Option<u8>,
-    pub predicted_action_x_normalized: f32,
-    pub predicted_action_y_normalized: f32,
+    pub predicted_action_x_normalized: Option<f32>,
+    pub predicted_action_y_normalized: Option<f32>,
+    /// NLL of this action-conditioned prediction under its factual board outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factual_outcome_nll: Option<f64>,
+    /// Distinct same-state outcomes tied for minimum NLL (class indices).
+    #[serde(default)]
+    pub best_outcome_classes: Vec<usize>,
+    /// `1/ties` when the factual class is among the minima, otherwise zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factual_outcome_retrieval_credit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factual_outcome_chance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,7 +719,15 @@ pub struct FactualBranchBootstrap {
     pub action_recovery_top1: Option<GroupBootstrapInterval>,
 }
 
-/// Held-out same-state factual-action evaluation for world-core-v2 only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactualSemanticOutcomeStratum {
+    pub n: usize,
+    pub retrieval_accuracy: Option<f64>,
+    pub chance: Option<f64>,
+    pub factual_nll_mean: Option<f64>,
+}
+
+/// Held-out same-state factual-action evaluation for spatial-action world cores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactualBranchMetrics {
     /// Stable FNV-1a fingerprint of the generated, ordered branch population.
@@ -715,6 +770,13 @@ pub struct FactualBranchMetrics {
     pub group_bootstrap: Option<FactualBranchBootstrap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub majority_action_baseline_top1: Option<f64>,
+    /// Primary Full V4 test: each supplied action must select its factual
+    /// semantic outcome among all distinct outcomes of the same current state.
+    pub semantic_outcome_retrieval_n: usize,
+    pub semantic_outcome_retrieval_accuracy: Option<f64>,
+    pub semantic_outcome_chance: Option<f64>,
+    pub semantic_factual_nll_mean: Option<f64>,
+    pub semantic_outcome_by_family: BTreeMap<String, FactualSemanticOutcomeStratum>,
 }
 
 /// Model-family-independent semantic probe on a deterministic held-out
@@ -862,9 +924,14 @@ pub struct EvalReport {
     pub schema: String,
     pub mode: EvalMode,
     pub seed: u64,
+    pub iid_seed: u64,
+    pub identity: EvaluationIdentity,
     pub checkpoint: PathBuf,
     pub device: String,
     pub q_mse_threshold: f64,
+    /// Full V4 uses exact decoder-derived gameplay-pixel correctness; legacy
+    /// checkpoints retain their frozen latent-MSE threshold labels.
+    pub q_label_definition: String,
     pub ptrm_k: Vec<usize>,
     pub ptrm_noise: f64,
     /// Official ARC-AGI-3 RHAE (0–100%) when `--scorecard-json` is supplied.
@@ -879,12 +946,15 @@ pub struct EvalReport {
     pub synthetic_dynamics: SplitEval,
     /// Planning / calibration / falsification / retarget held-out probes.
     pub synthetic_planner: SplitEval,
+    /// Unseen-seed training-composition control. This distinguishes ordinary
+    /// generalization from the existing held-out-composition OOD population.
+    pub synthetic_iid_dynamics: SplitEval,
+    pub synthetic_iid_planner: SplitEval,
     /// Eval-only patch/palette grounding probe on the same model-independent
     /// population for every consumer-readout arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_probe: Option<BoardProbeEvaluation>,
-    /// Held-out same-state factual branch metrics, available for world-core-v2
-    /// checkpoints only.
+    /// Held-out same-state factual branch metrics for V2 and Full V4.
     #[serde(default)]
     pub factual_branches: Option<FactualBranchMetrics>,
     /// Full-mode, model-family-independent same-state counterfactual metric.
@@ -894,6 +964,70 @@ pub struct EvalReport {
     pub arc3_transfer: Option<SplitEval>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluationIdentity {
+    pub command: Vec<String>,
+    pub command_sha256: String,
+    pub checkpoint_sha256: String,
+    pub train_config_sha256: String,
+    pub eval_config_sha256: String,
+    pub evaluator_binary: PathBuf,
+    pub evaluator_binary_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_bundle_manifest_sha256: Option<String>,
+    pub population_sha256: BTreeMap<String, String>,
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn evaluation_identity(
+    cfg: &EvalConfig,
+    populations: BTreeMap<String, String>,
+) -> Result<EvaluationIdentity> {
+    let evaluator_binary = std::env::current_exe().context("resolve evaluator binary")?;
+    let bundle_manifest = cfg
+        .checkpoint
+        .parent()
+        .map(|parent| parent.join("bundle-manifest.json"))
+        .filter(|path| path.is_file());
+    let command = std::env::args().collect::<Vec<_>>();
+    let command_sha256 = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&command).context("serialize evaluator argv")?)
+    );
+    Ok(EvaluationIdentity {
+        command,
+        command_sha256,
+        checkpoint_sha256: file_sha256(&cfg.checkpoint)?,
+        train_config_sha256: file_sha256(&cfg.train_config)?,
+        eval_config_sha256: format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(cfg).context("serialize eval config for identity")?)
+        ),
+        evaluator_binary_sha256: file_sha256(&evaluator_binary)?,
+        evaluator_binary,
+        checkpoint_bundle_manifest_sha256: bundle_manifest
+            .as_deref()
+            .map(file_sha256)
+            .transpose()?,
+        population_sha256: populations,
+    })
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -911,6 +1045,24 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn write_eval_digest(path: &Path) -> Result<()> {
+    let digest = file_sha256(path)?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow::anyhow!("unexpected digest format"))?;
+    let sidecar = PathBuf::from(format!("{}.sha256", path.display()));
+    let tmp = PathBuf::from(format!("{}.tmp", sidecar.display()));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("evaluation output has no file name"))?;
+    fs::write(&tmp, format!("{digest}  {file_name}\n"))
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &sidecar)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), sidecar.display()))?;
     Ok(())
 }
 
@@ -955,6 +1107,7 @@ fn collect_synthetic_sources(
     seed: u64,
     episodes: usize,
     kinds: &[&str],
+    split: Split,
 ) -> Result<Vec<(String, Vec<TransitionSample>)>> {
     let jobs: Vec<(usize, usize, &str)> = kinds
         .iter()
@@ -968,7 +1121,7 @@ fn collect_synthetic_sources(
             let episode_id = (kind_index as u64)
                 .wrapping_mul(1_000_003)
                 .wrapping_add(ep as u64);
-            let samples = generate_curriculum(kind, seed, episode_id, Split::HeldOutComposition)?;
+            let samples = generate_curriculum(kind, seed, episode_id, split)?;
             Ok((job_idx, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1085,10 +1238,11 @@ fn collect_frozen_board_probe_population_inner(
         seed,
         synthetic_episodes,
         &["random_one_step", "exploration"],
+        Split::HeldOutComposition,
     )?;
     sources.push((
         "hazard_one_step".into(),
-        collect_hazard_samples(seed, synthetic_episodes)?,
+        collect_hazard_samples(seed, synthetic_episodes, Split::HeldOutComposition)?,
     ));
     let source_population_fingerprint = semantic_population_fingerprint(&flatten_sources(&sources));
     if partition == SemanticAccessPopulation::SelectionFit {
@@ -1140,6 +1294,12 @@ fn semantic_population_fingerprint(samples: &[TransitionSample]) -> String {
         digest.update(sample.transition_index.to_le_bytes());
         digest.update((sample.family.len() as u64).to_le_bytes());
         digest.update(sample.family.as_bytes());
+        digest.update(sample.provenance.content_width.to_le_bytes());
+        digest.update(sample.provenance.content_height.to_le_bytes());
+        digest.update((sample.provenance.source_kind.len() as u64).to_le_bytes());
+        digest.update(sample.provenance.source_kind.as_bytes());
+        digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
+        digest.update(sample.provenance.trajectory_id.as_bytes());
         digest.update([
             sample.action.id,
             sample.action.x.unwrap_or(u8::MAX),
@@ -1280,27 +1440,30 @@ fn source_lengths(sources: &[(String, Vec<TransitionSample>)]) -> Vec<(String, u
         .collect()
 }
 
-fn collect_hazard_samples(seed: u64, episodes: usize) -> Result<Vec<TransitionSample>> {
+fn collect_hazard_samples(
+    seed: u64,
+    episodes: usize,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
     if episodes == 0 {
         return Ok(Vec::new());
     }
     let mut parts: Vec<(usize, Vec<TransitionSample>)> = (0..episodes)
         .into_par_iter()
         .map(|ep| {
-            generate_hazard_one_step(
-                seed.wrapping_add(0xFA17),
-                ep as u64,
-                Split::HeldOutComposition,
-                4,
-            )
-            .map(|samples| (ep, samples))
+            generate_hazard_one_step(seed.wrapping_add(0xFA17), ep as u64, split, 4)
+                .map(|samples| (ep, samples))
         })
         .collect::<Result<_>>()?;
     parts.sort_by_key(|(ep, _)| *ep);
     Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
 }
 
-fn collect_dynamics_rollout_samples(seed: u64, episodes: usize) -> Result<Vec<TransitionSample>> {
+fn collect_dynamics_rollout_samples(
+    seed: u64,
+    episodes: usize,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
     let jobs: Vec<(usize, usize, &str)> = ["random_one_step", "exploration"]
         .iter()
         .enumerate()
@@ -1313,7 +1476,7 @@ fn collect_dynamics_rollout_samples(seed: u64, episodes: usize) -> Result<Vec<Tr
             let episode_id = (kind_index as u64)
                 .wrapping_mul(1_000_003)
                 .wrapping_add(ep as u64);
-            let samples = generate_curriculum(kind, seed, episode_id, Split::HeldOutComposition)?;
+            let samples = generate_curriculum(kind, seed, episode_id, split)?;
             Ok((job_idx, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1321,7 +1484,11 @@ fn collect_dynamics_rollout_samples(seed: u64, episodes: usize) -> Result<Vec<Tr
     Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
 }
 
-fn collect_planner_rollout_samples(seed: u64, episodes: usize) -> Result<Vec<TransitionSample>> {
+fn collect_planner_rollout_samples(
+    seed: u64,
+    episodes: usize,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
     let jobs: Vec<(usize, usize, &str)> = ["sequential", "p1c_hard_retarget"]
         .iter()
         .enumerate()
@@ -1334,7 +1501,7 @@ fn collect_planner_rollout_samples(seed: u64, episodes: usize) -> Result<Vec<Tra
             let episode_id = (kind_index as u64)
                 .wrapping_mul(1_000_003)
                 .wrapping_add(ep as u64);
-            let samples = generate_curriculum(kind, seed, episode_id, Split::HeldOutComposition)?;
+            let samples = generate_curriculum(kind, seed, episode_id, split)?;
             Ok((job_idx, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2278,20 +2445,28 @@ fn eval_events(
 }
 
 fn eval_q(q_logit: &Tensor, mse: &[f32], threshold: f64) -> Result<QEvalAccum> {
+    let labels = mse
+        .iter()
+        .map(|m| if (*m as f64) < threshold { 1.0 } else { 0.0 })
+        .collect::<Vec<_>>();
+    eval_q_labels(q_logit, &labels)
+}
+
+fn eval_q_labels(q_logit: &Tensor, labels: &[f32]) -> Result<QEvalAccum> {
     let probs = ops::sigmoid(q_logit)?
         .to_dtype(DType::F32)?
         .flatten_all()?
         .to_vec1::<f32>()?;
-    if probs.len() != mse.len() {
-        bail!("Q batch {} != mse {}", probs.len(), mse.len());
+    if probs.len() != labels.len() {
+        bail!("Q batch {} != label batch {}", probs.len(), labels.len());
     }
     let mut out = QEvalAccum {
         n: probs.len(),
         ..Default::default()
     };
-    for (p, m) in probs.iter().zip(mse.iter()) {
-        let y = if (*m as f64) < threshold { 1.0 } else { 0.0 };
+    for (p, y) in probs.iter().zip(labels.iter().copied()) {
         let p = *p as f64;
+        let y = y as f64;
         out.brier_sum += (p - y).powi(2);
         let pred = if p >= 0.5 { 1.0 } else { 0.0 };
         if (pred - y).abs() < 0.5 {
@@ -2465,6 +2640,7 @@ struct BatchEvalPartial {
     hazard_false_negatives: usize,
     q_acc: QEvalAccum,
     q_probs: Vec<f32>,
+    q_labels: Vec<bool>,
     reliability_probs: Vec<f32>,
     recursion_probes: Vec<RecursionStepProbe>,
     ptrm_acc: BTreeMap<usize, (f64, f64, f64, f64, usize)>,
@@ -2507,7 +2683,8 @@ fn eval_one_batch(
     let next_z = encoded.next;
     let sigreg = (chunk.len() >= 2)
         .then(|| {
-            sigreg_losses_for_encoded_pair(
+            model_sigreg_losses_for_encoded_pair(
+                model,
                 &current_z,
                 &next_z,
                 &encoded.current_raw,
@@ -2587,7 +2764,27 @@ fn eval_one_batch(
             }
         }
 
-        partial.q_acc = eval_q(&out.q_logit, &mses, cfg.q_mse_threshold)?;
+        let exact_q_labels = (train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FullV4)
+            .then(|| -> Result<Vec<f32>> {
+                Ok(model
+                    .exact_transition_correctness(&out.y, &batch.frames, &batch.next_frames)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?)
+            })
+            .transpose()?;
+        partial.q_acc = if let Some(labels) = &exact_q_labels {
+            eval_q_labels(&out.q_logit, labels)?
+        } else {
+            eval_q(&out.q_logit, &mses, cfg.q_mse_threshold)?
+        };
+        partial.q_labels = exact_q_labels.map_or_else(
+            || {
+                mses.iter()
+                    .map(|m| f64::from(*m) < cfg.q_mse_threshold)
+                    .collect()
+            },
+            |labels| labels.into_iter().map(|label| label >= 0.5).collect(),
+        );
         partial.q_probs = candle_nn::ops::sigmoid(&out.q_logit.to_dtype(DType::F32)?)?
             .flatten_all()?
             .to_vec1::<f32>()?;
@@ -2638,47 +2835,52 @@ fn eval_one_batch(
             }
         }
 
-        for &k in &cfg.ptrm_k {
-            let outer_steps = model
-                .config()
-                .outer_steps
-                .checked_mul(k)
-                .ok_or_else(|| anyhow::anyhow!("matched-compute outer_steps overflow"))?;
-            let deterministic = model.forward_with_outer_steps(
-                &batch.frames,
-                &batch.actions,
-                &batch.action_coords,
-                &batch.goals,
-                outer_steps,
-            )?;
-            let values = per_sample_mse(&deterministic.y, &next_z)?;
-            let entry = partial
-                .matched_acc
-                .entry(k)
-                .or_insert((0.0, 0, outer_steps));
-            entry.0 += values.iter().map(|value| f64::from(*value)).sum::<f64>();
-            entry.1 += values.len();
-        }
+        // Full V4 deliberately excludes PTRM training. Its Q target is exact
+        // gameplay-pixel correctness, whereas this historical diagnostic uses
+        // latent-MSE oracles. Do not emit incomparable selection metrics.
+        if train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FullV4 {
+            for &k in &cfg.ptrm_k {
+                let outer_steps = model
+                    .config()
+                    .outer_steps
+                    .checked_mul(k)
+                    .ok_or_else(|| anyhow::anyhow!("matched-compute outer_steps overflow"))?;
+                let deterministic = model.forward_with_outer_steps(
+                    &batch.frames,
+                    &batch.actions,
+                    &batch.action_coords,
+                    &batch.goals,
+                    outer_steps,
+                )?;
+                let values = per_sample_mse(&deterministic.y, &next_z)?;
+                let entry = partial
+                    .matched_acc
+                    .entry(k)
+                    .or_insert((0.0, 0, outer_steps));
+                entry.0 += values.iter().map(|value| f64::from(*value)).sum::<f64>();
+                entry.1 += values.len();
+            }
 
-        let ptrm = ptrm_metrics(
-            model,
-            &batch,
-            &next_z,
-            &cfg.ptrm_k,
-            cfg.ptrm_noise,
-            cfg.q_mse_threshold,
-            cfg.seed.wrapping_add(bi as u64),
-        )?;
-        for m in ptrm {
-            let e = partial
-                .ptrm_acc
-                .entry(m.k)
-                .or_insert((0.0, 0.0, 0.0, 0.0, 0));
-            e.0 += m.pass_at_k * m.n as f64;
-            e.1 += m.best_q_at_k * m.n as f64;
-            e.2 += m.disagreement * m.n as f64;
-            e.3 += m.q_oracle_rank_accuracy.unwrap_or(0.0) * m.n as f64;
-            e.4 += m.n;
+            let ptrm = ptrm_metrics(
+                model,
+                &batch,
+                &next_z,
+                &cfg.ptrm_k,
+                cfg.ptrm_noise,
+                cfg.q_mse_threshold,
+                cfg.seed.wrapping_add(bi as u64),
+            )?;
+            for m in ptrm {
+                let e = partial
+                    .ptrm_acc
+                    .entry(m.k)
+                    .or_insert((0.0, 0.0, 0.0, 0.0, 0));
+                e.0 += m.pass_at_k * m.n as f64;
+                e.1 += m.best_q_at_k * m.n as f64;
+                e.2 += m.disagreement * m.n as f64;
+                e.3 += m.q_oracle_rank_accuracy.unwrap_or(0.0) * m.n as f64;
+                e.4 += m.n;
+            }
         }
     }
     Ok(partial)
@@ -2703,6 +2905,7 @@ fn merge_batch_partial(merged: &mut BatchEvalPartial, partial: BatchEvalPartial)
     merged.hazard_false_negatives += partial.hazard_false_negatives;
     merged.q_acc.merge(partial.q_acc);
     merged.q_probs.extend(partial.q_probs);
+    merged.q_labels.extend(partial.q_labels);
     merged.reliability_probs.extend(partial.reliability_probs);
     merged.recursion_probes.extend(partial.recursion_probes);
     merged.ensemble_disagreement += partial.ensemble_disagreement;
@@ -3019,13 +3222,14 @@ fn eval_rollout_group(
             })? as f64;
         let horizon = idx + 1;
         if matches!(horizon, 4 | 8 | 16) {
-            rows.push(episode_rollout_result(
-                steps,
-                horizon,
-                open_mse,
-                closed_mse,
-                copy_forward_mse,
-            ));
+            let mut row =
+                episode_rollout_result(steps, horizon, open_mse, closed_mse, copy_forward_mse);
+            if model.config().world_core_v4 && matches!(horizon, 4 | 8) {
+                row.open_semantic = Some(latent_semantic_metrics(model, &open_pred, sample)?);
+                row.closed_semantic = Some(latent_semantic_metrics(model, &closed_pred, sample)?);
+                row.learned_copy_semantic = Some(latent_semantic_metrics(model, &z0, sample)?);
+            }
+            rows.push(row);
         }
     }
     Ok(rows)
@@ -3043,6 +3247,60 @@ enum RolloutMetric {
     Open,
     Closed,
     CopyForward,
+}
+
+fn aggregate_rollout_semantics(
+    rows: &[EpisodeRolloutRow],
+    read: fn(&EpisodeRolloutRow) -> Option<&SemanticDecoderMetrics>,
+) -> BTreeMap<usize, SemanticDecoderMetrics> {
+    [4usize, 8]
+        .into_iter()
+        .filter_map(|horizon| {
+            let metrics = rows
+                .iter()
+                .filter(|row| row.horizon == horizon)
+                .filter_map(read)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!metrics.is_empty()).then(|| (horizon, aggregate_decoder_metrics(metrics)))
+        })
+        .collect()
+}
+
+fn attach_rollout_metrics(split: &mut SplitEval, rows: &[EpisodeRolloutRow], seed: u64) {
+    split.rollout = Some(rollout_metrics_from_rows(
+        rows,
+        RolloutMetric::Open,
+        seed ^ 0x01,
+    ));
+    split.closed_loop = Some(rollout_metrics_from_rows(
+        rows,
+        RolloutMetric::Closed,
+        seed ^ 0xC1,
+    ));
+    split.copy_forward = Some(rollout_metrics_from_rows(
+        rows,
+        RolloutMetric::CopyForward,
+        seed ^ 0xCF,
+    ));
+    if let (Some(open), Some(closed)) = (split.rollout.as_mut(), split.closed_loop.as_ref()) {
+        if let (Some(o8), Some(c8)) = (open.mse_8, closed.mse_8) {
+            if c8 > 0.0 {
+                open.open_closed_ratio_8 = Some(o8 / c8);
+            }
+        }
+    }
+    let semantic_rollout = SemanticRolloutMetrics {
+        open: aggregate_rollout_semantics(rows, |row| row.open_semantic.as_ref()),
+        closed: aggregate_rollout_semantics(rows, |row| row.closed_semantic.as_ref()),
+        learned_copy: aggregate_rollout_semantics(rows, |row| row.learned_copy_semantic.as_ref()),
+    };
+    if !semantic_rollout.open.is_empty()
+        || !semantic_rollout.closed.is_empty()
+        || !semantic_rollout.learned_copy.is_empty()
+    {
+        split.semantic_rollout = Some(semantic_rollout);
+    }
 }
 
 fn rollout_metrics_from_rows(
@@ -3105,8 +3363,8 @@ fn rollout_metrics_from_rows(
     }
 }
 
-fn eval_q_surprise(q_probs: &[f32], mses: &[f32], threshold: f64) -> QSurpriseMetrics {
-    let n = q_probs.len().min(mses.len());
+fn eval_q_surprise_labels(q_probs: &[f32], reliable: &[bool]) -> QSurpriseMetrics {
+    let n = q_probs.len().min(reliable.len());
     if n == 0 {
         return QSurpriseMetrics {
             n: 0,
@@ -3115,15 +3373,13 @@ fn eval_q_surprise(q_probs: &[f32], mses: &[f32], threshold: f64) -> QSurpriseMe
             confident_error_rate: None,
         };
     }
-    let thr = threshold as f32;
     let mut unreliable_q = Vec::new();
     let mut reliable_q = Vec::new();
     let mut confident_errors = 0usize;
     let mut unreliable_count = 0usize;
     for i in 0..n {
         let q = q_probs[i];
-        let mse = mses[i];
-        if mse > thr {
+        if !reliable[i] {
             unreliable_q.push(q);
             unreliable_count += 1;
             if q > 0.5 {
@@ -3142,16 +3398,29 @@ fn eval_q_surprise(q_probs: &[f32], mses: &[f32], threshold: f64) -> QSurpriseMe
     }
 }
 
-/// Group by stable episode identity. `family` can change during retarget traces.
-fn group_rollouts(samples: &[TransitionSample]) -> BTreeMap<(u64, u64), Vec<&TransitionSample>> {
-    let mut map: BTreeMap<(u64, u64), Vec<&TransitionSample>> = BTreeMap::new();
+/// Group by the explicit trajectory identity. `family` and source strata may
+/// change during retarget traces and are not valid sequence keys.
+fn group_rollouts(
+    samples: &[TransitionSample],
+) -> Result<BTreeMap<String, Vec<&TransitionSample>>> {
+    let mut map: BTreeMap<String, Vec<&TransitionSample>> = BTreeMap::new();
     for s in samples {
-        map.entry((s.seed, s.episode_id)).or_default().push(s);
+        map.entry(s.provenance.trajectory_id.clone())
+            .or_default()
+            .push(s);
     }
-    for steps in map.values_mut() {
+    for (trajectory, steps) in &mut map {
         steps.sort_by_key(|s| s.transition_index);
+        for pair in steps.windows(2) {
+            if pair[1].transition_index != pair[0].transition_index + 1 {
+                bail!("trajectory {trajectory} has a transition-index gap or duplicate");
+            }
+            if pair[0].next != pair[1].current {
+                bail!("trajectory {trajectory} has discontinuous rendered frames");
+            }
+        }
     }
-    map
+    Ok(map)
 }
 
 fn eval_episode_rollouts(
@@ -3162,7 +3431,7 @@ fn eval_episode_rollouts(
     device: &Device,
     source: &str,
 ) -> Result<Vec<EpisodeRolloutRow>> {
-    let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)
+    let groups: Vec<Vec<TransitionSample>> = group_rollouts(samples)?
         .into_values()
         .filter(|steps| steps.len() >= 4)
         .map(|steps| steps.iter().map(|s| (*s).clone()).collect())
@@ -3196,10 +3465,14 @@ fn eval_episode_rollouts(
 }
 
 fn empty_split(source: &str, n_samples: usize) -> SplitEval {
+    let no_samples = Vec::new();
     SplitEval {
         source: source.into(),
         n_samples,
         one_step_latent_mse: None,
+        semantic: None,
+        semantic_rollout: None,
+        collision_census: collision_census(&no_samples, &[]),
         representation: None,
         representation_seams: None,
         changed_transitions: None,
@@ -3359,7 +3632,9 @@ fn eval_sample_set(
             }
         })
         .collect();
-    let ptrm = (cfg.mode == EvalMode::Full).then_some(ptrm);
+    let ptrm = (cfg.mode == EvalMode::Full
+        && train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FullV4)
+        .then_some(ptrm);
     let deterministic_matched_compute: Vec<_> = matched_acc
         .into_iter()
         .map(|(k, (sum, n, outer_steps))| MatchedComputeMetrics {
@@ -3369,15 +3644,13 @@ fn eval_sample_set(
             one_step_latent_mse: (n > 0).then_some(sum / n as f64),
         })
         .collect();
-    let deterministic_matched_compute =
-        (cfg.mode == EvalMode::Full).then_some(deterministic_matched_compute);
+    let deterministic_matched_compute = (cfg.mode == EvalMode::Full
+        && train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FullV4)
+        .then_some(deterministic_matched_compute);
 
     let q_surprise = (cfg.mode == EvalMode::Full)
-        .then(|| eval_q_surprise(&merged.q_probs, &mse_all, cfg.q_mse_threshold));
-    let labels: Vec<bool> = mse_all
-        .iter()
-        .map(|m| f64::from(*m) <= cfg.q_mse_threshold)
-        .collect();
+        .then(|| eval_q_surprise_labels(&merged.q_probs, &merged.q_labels));
+    let labels = merged.q_labels.clone();
     let (calibration, calibration_gates) = if cfg.mode == EvalMode::Full
         && merged.reliability_probs.len() == labels.len()
         && !labels.is_empty()
@@ -3407,10 +3680,11 @@ fn eval_sample_set(
         .flatten();
     let ensemble = (cfg.mode == EvalMode::Full && merged.ensemble_n > 0).then(|| {
         let mean_disagreement = Some(merged.ensemble_disagreement / merged.ensemble_n as f64);
-        let high_error: Vec<bool> = mse_all
+        let high_error: Vec<bool> = merged
+            .q_labels
             .iter()
-            .take(merged.ensemble_n.min(mse_all.len()))
-            .map(|m| f64::from(*m) > cfg.q_mse_threshold)
+            .take(merged.ensemble_n.min(merged.q_labels.len()))
+            .map(|reliable| !reliable)
             .collect();
         let uncertainty: Vec<f32> = (0..high_error.len())
             .map(|index| merged.reliability_probs.get(index).copied().unwrap_or(0.5))
@@ -3459,11 +3733,27 @@ fn eval_sample_set(
         .as_deref()
         .map(|rows| rollout_metrics_from_rows(rows, RolloutMetric::Closed, cfg.seed ^ 0xC1));
     let identifiability = eval_identifiability(samples, &encoder_embeddings);
+    let semantic = train_cfg
+        .world_core_v4
+        .then(|| {
+            evaluate_semantics(
+                model,
+                samples,
+                action_sources.unwrap_or(&fallback_sources),
+                cfg.physical_batch,
+                device,
+            )
+        })
+        .transpose()?;
+    let collision_census = collision_census(samples, action_sources.unwrap_or(&fallback_sources));
 
     Ok(SplitEval {
         source: source.into(),
         n_samples: samples.len(),
         one_step_latent_mse: mean(&mse_all),
+        semantic,
+        semantic_rollout: None,
+        collision_census,
         representation,
         representation_seams: Some(representation_seams),
         changed_transitions,
@@ -3675,28 +3965,28 @@ fn factual_branch_eval_seed(seed: u64) -> u64 {
 }
 
 fn factual_population_fingerprint(groups: &[BranchGroup], synthetic_episodes: usize) -> String {
-    let mut hash = 0xCBF2_9CE4_8422_2325;
-    fnv1a_append(&mut hash, FACTUAL_BRANCH_EVAL_DOMAIN);
-    fnv1a_append(&mut hash, &(synthetic_episodes as u64).to_le_bytes());
+    let mut hash = Sha256::new();
+    hash.update(FACTUAL_BRANCH_EVAL_DOMAIN);
+    hash.update((synthetic_episodes as u64).to_le_bytes());
     for group in groups {
-        fnv1a_append(&mut hash, &(group.branches().len() as u64).to_le_bytes());
+        hash.update((group.branches().len() as u64).to_le_bytes());
         for branch in group.branches() {
             let transition = &branch.transition;
-            fnv1a_append(&mut hash, &transition.seed.to_le_bytes());
-            fnv1a_append(&mut hash, &transition.episode_id.to_le_bytes());
-            fnv1a_append(&mut hash, transition.family.as_bytes());
-            fnv1a_append(&mut hash, &[transition.action.id]);
-            fnv1a_append(&mut hash, &[transition.action.x.unwrap_or(u8::MAX)]);
-            fnv1a_append(&mut hash, &[transition.action.y.unwrap_or(u8::MAX)]);
-            fnv1a_append(&mut hash, &transition.current.pixels);
-            fnv1a_append(&mut hash, &transition.next.pixels);
-            fnv1a_append(&mut hash, &[u8::from(branch.board_effect.changed)]);
+            hash.update(transition.seed.to_le_bytes());
+            hash.update(transition.episode_id.to_le_bytes());
+            hash.update(transition.family.as_bytes());
+            hash.update([transition.action.id]);
+            hash.update([transition.action.x.unwrap_or(u8::MAX)]);
+            hash.update([transition.action.y.unwrap_or(u8::MAX)]);
+            hash.update(&transition.current.pixels);
+            hash.update(&transition.next.pixels);
+            hash.update([u8::from(branch.board_effect.changed)]);
             for cell in &branch.board_effect.changed_cells {
-                fnv1a_append(&mut hash, &cell.to_le_bytes());
+                hash.update(cell.to_le_bytes());
             }
         }
     }
-    format!("fnv1a64:{hash:016x}")
+    format!("sha256:{:x}", hash.finalize())
 }
 
 fn increment_factual_stratum(
@@ -3754,7 +4044,7 @@ fn factual_changed_norm_gap(rows: &[&FactualBranchRowMetric]) -> Option<f64> {
 fn factual_action_top1(rows: &[&FactualBranchRowMetric]) -> Option<f64> {
     let eligible = rows
         .iter()
-        .filter(|row| row.recoverable)
+        .filter(|row| row.recoverable && row.predicted_action_id.is_some())
         .collect::<Vec<_>>();
     (!eligible.is_empty()).then(|| {
         eligible
@@ -4518,6 +4808,11 @@ fn evaluate_factual_branches(
             rows_reconciled: true,
             group_bootstrap: None,
             majority_action_baseline_top1: None,
+            semantic_outcome_retrieval_n: 0,
+            semantic_outcome_retrieval_accuracy: None,
+            semantic_outcome_chance: None,
+            semantic_factual_nll_mean: None,
+            semantic_outcome_by_family: BTreeMap::new(),
         });
     }
     let generated_groups = (0..factual_group_count)
@@ -4538,6 +4833,7 @@ fn evaluate_factual_branches(
     let mut coordinate_predictions = Vec::with_capacity(samples.len());
     let mut target_patch_latents: Option<BoardProbeRows> = None;
     let mut predicted_patch_latents: Option<BoardProbeRows> = None;
+    let mut predicted_gameplay_log_probs = Vec::<Vec<f32>>::new();
     let factual_eval_batch = cfg
         .physical_batch
         .max(crate::p2::data::FACTUAL_BRANCHES_PER_GROUP)
@@ -4554,11 +4850,26 @@ fn evaluate_factual_branches(
         )?;
         let target = model.encode_state(&batch.next_frames)?;
         let displacement = pool_latent(&output.y.sub(&current)?)?;
-        let (decoded_actions, decoded_coordinates) =
-            model.decode_action_displacement(&displacement)?;
         predicted_displacements.extend(displacement.to_dtype(DType::F32)?.to_vec2::<f32>()?);
-        action_logits.extend(decoded_actions.to_dtype(DType::F32)?.to_vec2::<f32>()?);
-        coordinate_predictions.extend(decoded_coordinates.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        if model.config().world_core_v2 {
+            let (decoded_actions, decoded_coordinates) =
+                model.decode_action_displacement(&displacement)?;
+            action_logits.extend(decoded_actions.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+            coordinate_predictions
+                .extend(decoded_coordinates.to_dtype(DType::F32)?.to_vec2::<f32>()?);
+        }
+        if model.config().world_core_v4 {
+            predicted_gameplay_log_probs.extend(
+                ops::log_softmax(&model.exact_gameplay_logits(&output.y)?, D::Minus1)?
+                    .reshape((
+                        end - start,
+                        (crate::p2::data::FRAME_SIDE - 1)
+                            * crate::p2::data::FRAME_SIDE
+                            * crate::p2::model::PALETTE_SIZE,
+                    ))?
+                    .to_vec2::<f32>()?,
+            );
+        }
         let target_rows = BoardProbeRows::from_spatial_latent(&target)?;
         let predicted_rows = BoardProbeRows::from_spatial_latent(&output.y)?;
         if let Some(rows) = &mut target_patch_latents {
@@ -4628,15 +4939,28 @@ fn evaluate_factual_branches(
     let mut by_action_id = BTreeMap::<u8, FactualBranchStratumCounts>::new();
     let mut rows = Vec::with_capacity(samples.len());
     let mut group_summaries = Vec::with_capacity(groups.len());
+    let mut semantic_outcome_retrieval_credit = 0.0f64;
+    let mut semantic_outcome_chance_sum = 0.0f64;
+    let mut semantic_factual_nll_sum = 0.0f64;
+    let mut semantic_outcome_retrieval_n = 0usize;
     let mut offset = 0usize;
     for (group_index, group) in groups.iter().enumerate() {
         let branches = group.branches();
+        let mut outcome_representatives = Vec::<usize>::new();
+        for (candidate, branch) in branches.iter().enumerate() {
+            if !outcome_representatives
+                .iter()
+                .any(|representative| branch.outcome_equivalent(&branches[*representative]))
+            {
+                outcome_representatives.push(candidate);
+            }
+        }
         let source = &branches[0].transition;
         let group_key = format!(
             "{}:{}:{}:{}",
             source.seed,
             source.episode_id,
-            source.family,
+            source.provenance.trajectory_id,
             crate::p2::data::BranchGroupId::from_transition_for_eval(source).current_fingerprint
         );
         let recoverable = group
@@ -4674,18 +4998,73 @@ fn evaluate_factual_branches(
                 .sum::<f64>()
                 / predicted_displacements[global].len().max(1) as f64)
                 .sqrt() as f32;
-            let predicted_action = action_logits[global]
+            let predicted_action = action_logits.get(global).and_then(|logits| {
+                logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(left_index, left), (right_index, right)| {
+                        left.partial_cmp(right)
+                            .unwrap_or_else(|| left_index.cmp(right_index))
+                    })
+                    .map(|(index, _)| index as u8)
+            });
+            let outcome_class = outcome_representatives
                 .iter()
-                .enumerate()
-                .max_by(|(left_index, left), (right_index, right)| {
-                    left.partial_cmp(right)
-                        .unwrap_or_else(|| left_index.cmp(right_index))
-                })
-                .map(|(index, _)| index as u8);
-            let outcome_class = branches
-                .iter()
-                .position(|candidate| branch.outcome_equivalent(candidate))
-                .expect("branch is equivalent to itself");
+                .position(|representative| branch.outcome_equivalent(&branches[*representative]))
+                .expect("branch is equivalent to its representative");
+            let (
+                factual_outcome_nll,
+                best_outcome_classes,
+                factual_outcome_retrieval_credit,
+                factual_outcome_chance,
+            ) = if model.config().world_core_v4 {
+                let log_probs = &predicted_gameplay_log_probs[global];
+                let width = usize::from(branch.transition.provenance.content_width)
+                    .min(crate::p2::data::FRAME_SIDE);
+                let height = usize::from(branch.transition.provenance.content_height)
+                    .min(crate::p2::data::FRAME_SIDE - 1);
+                let mut class_nll = Vec::with_capacity(outcome_representatives.len());
+                for representative in &outcome_representatives {
+                    let target = &branches[*representative].transition.next.pixels;
+                    let mut sum = 0.0f64;
+                    let mut count = 0usize;
+                    for y in 0..height {
+                        for x in 0..width {
+                            let pixel = y * crate::p2::data::FRAME_SIDE + x;
+                            sum -= f64::from(
+                                log_probs[pixel * crate::p2::model::PALETTE_SIZE
+                                    + target[pixel] as usize],
+                            );
+                            count += 1;
+                        }
+                    }
+                    class_nll.push(if count > 0 {
+                        sum / count as f64
+                    } else {
+                        f64::INFINITY
+                    });
+                }
+                let best = class_nll.iter().copied().fold(f64::INFINITY, f64::min);
+                let ties = class_nll
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(class, nll)| ((nll - best).abs() <= 1e-9).then_some(class))
+                    .collect::<Vec<_>>();
+                let credit = if ties.contains(&outcome_class) {
+                    1.0 / ties.len().max(1) as f64
+                } else {
+                    0.0
+                };
+                let factual_nll = class_nll[outcome_class];
+                let chance = 1.0 / outcome_representatives.len().max(1) as f64;
+                semantic_outcome_retrieval_credit += credit;
+                semantic_outcome_chance_sum += chance;
+                semantic_factual_nll_sum += factual_nll;
+                semantic_outcome_retrieval_n += 1;
+                (Some(factual_nll), ties, Some(credit), Some(chance))
+            } else {
+                (None, Vec::new(), None, None)
+            };
             rows.push(FactualBranchRowMetric {
                 row_index: global,
                 group_index,
@@ -4701,8 +5080,16 @@ fn evaluate_factual_branches(
                 recoverable: is_recoverable,
                 predicted_displacement_norm: f64::from(norm),
                 predicted_action_id: predicted_action,
-                predicted_action_x_normalized: coordinate_predictions[global][0],
-                predicted_action_y_normalized: coordinate_predictions[global][1],
+                predicted_action_x_normalized: coordinate_predictions
+                    .get(global)
+                    .map(|coordinates| coordinates[0]),
+                predicted_action_y_normalized: coordinate_predictions
+                    .get(global)
+                    .map(|coordinates| coordinates[1]),
+                factual_outcome_nll,
+                best_outcome_classes,
+                factual_outcome_retrieval_credit,
+                factual_outcome_chance,
             });
             norm_scores.push(norm);
             norm_labels.push(changed);
@@ -4742,7 +5129,7 @@ fn evaluate_factual_branches(
                 }
             }
 
-            if is_recoverable {
+            if is_recoverable && predicted_action.is_some() {
                 unique_changed_effect_action_n += 1;
                 if predicted_action == Some(branch.transition.action.id) {
                     unique_changed_effect_action_correct += 1;
@@ -4807,13 +5194,13 @@ fn evaluate_factual_branches(
             factual_action_top1,
         ),
     });
-    let recoverable_action_counts = rows.iter().filter(|row| row.recoverable).fold(
-        BTreeMap::<u8, usize>::new(),
-        |mut counts, row| {
+    let recoverable_action_counts = rows
+        .iter()
+        .filter(|row| row.recoverable && row.predicted_action_id.is_some())
+        .fold(BTreeMap::<u8, usize>::new(), |mut counts, row| {
             *counts.entry(row.action_id).or_default() += 1;
             counts
-        },
-    );
+        });
     let majority_action_baseline_top1 = (!recoverable_action_counts.is_empty()).then(|| {
         recoverable_action_counts
             .values()
@@ -4822,6 +5209,35 @@ fn evaluate_factual_branches(
             .unwrap_or(0) as f64
             / recoverable_action_counts.values().sum::<usize>() as f64
     });
+    let mut semantic_family_rows = BTreeMap::<String, Vec<&FactualBranchRowMetric>>::new();
+    for row in &rows {
+        if row.factual_outcome_retrieval_credit.is_some() {
+            semantic_family_rows
+                .entry(row.family.clone())
+                .or_default()
+                .push(row);
+        }
+    }
+    let semantic_outcome_by_family = semantic_family_rows
+        .into_iter()
+        .map(|(family, rows)| {
+            let n = rows.len();
+            let sum = |read: fn(&FactualBranchRowMetric) -> Option<f64>| {
+                rows.iter().filter_map(|row| read(row)).sum::<f64>()
+            };
+            (
+                family,
+                FactualSemanticOutcomeStratum {
+                    n,
+                    retrieval_accuracy: (n > 0)
+                        .then_some(sum(|row| row.factual_outcome_retrieval_credit) / n as f64),
+                    chance: (n > 0).then_some(sum(|row| row.factual_outcome_chance) / n as f64),
+                    factual_nll_mean: (n > 0)
+                        .then_some(sum(|row| row.factual_outcome_nll) / n as f64),
+                },
+            )
+        })
+        .collect();
     Ok(FactualBranchMetrics {
         population_fingerprint,
         groups: groups.len(),
@@ -4860,6 +5276,14 @@ fn evaluate_factual_branches(
         group_summaries,
         group_bootstrap,
         majority_action_baseline_top1,
+        semantic_outcome_retrieval_n,
+        semantic_outcome_retrieval_accuracy: (semantic_outcome_retrieval_n > 0)
+            .then_some(semantic_outcome_retrieval_credit / semantic_outcome_retrieval_n as f64),
+        semantic_outcome_chance: (semantic_outcome_retrieval_n > 0)
+            .then_some(semantic_outcome_chance_sum / semantic_outcome_retrieval_n as f64),
+        semantic_factual_nll_mean: (semantic_outcome_retrieval_n > 0)
+            .then_some(semantic_factual_nll_sum / semantic_outcome_retrieval_n as f64),
+        semantic_outcome_by_family,
     })
 }
 
@@ -4867,12 +5291,33 @@ fn evaluate_factual_branches(
 pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     cfg.validate()?;
     let train_cfg = load_train_config(&cfg.train_config)?;
+    if let Some(bundle) = cfg.checkpoint.parent() {
+        let manifest = bundle.join("bundle-manifest.json");
+        if manifest.is_file() {
+            verify_checkpoint_bundle(bundle)?;
+            let bundled_config = bundle.join("config.json");
+            if file_sha256(&bundled_config)? != file_sha256(&cfg.train_config)? {
+                bail!(
+                    "evaluation train config {} does not match checkpoint bundle {}",
+                    cfg.train_config.display(),
+                    bundled_config.display()
+                );
+            }
+        } else if train_cfg.world_core_v4 {
+            bail!(
+                "Full V4 evaluation requires a verified checkpoint bundle manifest beside {}",
+                cfg.checkpoint.display()
+            );
+        }
+    }
     let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
         Some(GpuSessionGuard::acquire(&train_cfg.output_dir)?)
     } else {
         None
     };
-    if (cfg.q_mse_threshold - train_cfg.q_mse_threshold).abs() > f64::EPSILON {
+    if train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FullV4
+        && (cfg.q_mse_threshold - train_cfg.q_mse_threshold).abs() > f64::EPSILON
+    {
         bail!(
             "evaluation q_mse_threshold={} differs from frozen training threshold={}",
             cfg.q_mse_threshold,
@@ -4884,8 +5329,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     let outcome_counterfactuals = (cfg.mode == EvalMode::Full)
         .then(|| evaluate_outcome_counterfactuals(&model, cfg, &device))
         .transpose()?;
-    let factual_branches = train_cfg
-        .world_core_v2
+    let factual_branches = (train_cfg.world_core_v2 || train_cfg.world_core_v4)
         .then(|| evaluate_factual_branches(&model, cfg, &device))
         .transpose()?;
 
@@ -4893,16 +5337,20 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         cfg.seed,
         cfg.synthetic_episodes,
         &["random_one_step", "exploration"],
+        Split::HeldOutComposition,
     )?;
     dynamics_sources.push((
         "hazard_one_step".into(),
-        collect_hazard_samples(cfg.seed, cfg.synthetic_episodes)?,
+        collect_hazard_samples(cfg.seed, cfg.synthetic_episodes, Split::HeldOutComposition)?,
     ));
     let dynamics_samples = flatten_sources(&dynamics_sources);
     let dynamics_source_lengths = source_lengths(&dynamics_sources);
     let board_probe = evaluate_board_probe(&model, &dynamics_samples, cfg.physical_batch, &device)?;
-    let dynamics_rollout_samples =
-        collect_dynamics_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
+    let dynamics_rollout_samples = collect_dynamics_rollout_samples(
+        cfg.seed,
+        cfg.synthetic_episodes,
+        Split::HeldOutComposition,
+    )?;
 
     let planner_sources = collect_synthetic_sources(
         cfg.seed,
@@ -4913,11 +5361,45 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
             "p1c_falsification",
             "p1c_hard_retarget",
         ],
+        Split::HeldOutComposition,
     )?;
     let planner_samples = flatten_sources(&planner_sources);
     let planner_source_lengths = source_lengths(&planner_sources);
-    let planner_rollout_samples =
-        collect_planner_rollout_samples(cfg.seed, cfg.synthetic_episodes)?;
+    let planner_rollout_samples = collect_planner_rollout_samples(
+        cfg.seed,
+        cfg.synthetic_episodes,
+        Split::HeldOutComposition,
+    )?;
+
+    let mut iid_dynamics_sources = collect_synthetic_sources(
+        cfg.iid_seed,
+        cfg.synthetic_episodes,
+        &["random_one_step", "exploration"],
+        Split::Train,
+    )?;
+    iid_dynamics_sources.push((
+        "hazard_one_step".into(),
+        collect_hazard_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?,
+    ));
+    let iid_dynamics_samples = flatten_sources(&iid_dynamics_sources);
+    let iid_dynamics_source_lengths = source_lengths(&iid_dynamics_sources);
+    let iid_dynamics_rollout_samples =
+        collect_dynamics_rollout_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?;
+    let iid_planner_sources = collect_synthetic_sources(
+        cfg.iid_seed,
+        cfg.synthetic_episodes,
+        &[
+            "sequential",
+            "hypothesis_probe",
+            "p1c_falsification",
+            "p1c_hard_retarget",
+        ],
+        Split::Train,
+    )?;
+    let iid_planner_samples = flatten_sources(&iid_planner_sources);
+    let iid_planner_source_lengths = source_lengths(&iid_planner_sources);
+    let iid_planner_rollout_samples =
+        collect_planner_rollout_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?;
 
     let mut synthetic_dynamics = if cfg.mode == EvalMode::Rollout {
         empty_split("synthetic_dynamics", dynamics_samples.len())
@@ -4947,31 +5429,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         Vec::new()
     };
     if cfg.mode != EvalMode::Representation {
-        synthetic_dynamics.rollout = Some(rollout_metrics_from_rows(
-            &dynamics_rollout_rows,
-            RolloutMetric::Open,
-            cfg.seed ^ 0x01,
-        ));
-        synthetic_dynamics.closed_loop = Some(rollout_metrics_from_rows(
-            &dynamics_rollout_rows,
-            RolloutMetric::Closed,
-            cfg.seed ^ 0xC1,
-        ));
-        synthetic_dynamics.copy_forward = Some(rollout_metrics_from_rows(
-            &dynamics_rollout_rows,
-            RolloutMetric::CopyForward,
-            cfg.seed ^ 0xCF,
-        ));
-    }
-    if let (Some(open), Some(closed)) = (
-        synthetic_dynamics.rollout.as_mut(),
-        synthetic_dynamics.closed_loop.as_ref(),
-    ) {
-        if let (Some(o8), Some(c8)) = (open.mse_8, closed.mse_8) {
-            if c8 > 0.0 {
-                open.open_closed_ratio_8 = Some(o8 / c8);
-            }
-        }
+        attach_rollout_metrics(&mut synthetic_dynamics, &dynamics_rollout_rows, cfg.seed);
     }
 
     let mut synthetic_planner = if cfg.mode == EvalMode::Rollout {
@@ -5002,52 +5460,102 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         Vec::new()
     };
     if cfg.mode != EvalMode::Representation {
-        synthetic_planner.rollout = Some(rollout_metrics_from_rows(
-            &planner_rollout_rows,
-            RolloutMetric::Open,
-            cfg.seed ^ 0x01,
-        ));
-        synthetic_planner.closed_loop = Some(rollout_metrics_from_rows(
-            &planner_rollout_rows,
-            RolloutMetric::Closed,
-            cfg.seed ^ 0xC1,
-        ));
-        synthetic_planner.copy_forward = Some(rollout_metrics_from_rows(
-            &planner_rollout_rows,
-            RolloutMetric::CopyForward,
-            cfg.seed ^ 0xCF,
-        ));
-    }
-    if let (Some(open), Some(closed)) = (
-        synthetic_planner.rollout.as_mut(),
-        synthetic_planner.closed_loop.as_ref(),
-    ) {
-        if let (Some(o8), Some(c8)) = (open.mse_8, closed.mse_8) {
-            if c8 > 0.0 {
-                open.open_closed_ratio_8 = Some(o8 / c8);
-            }
-        }
+        attach_rollout_metrics(&mut synthetic_planner, &planner_rollout_rows, cfg.seed);
     }
 
-    let arc3_transfer = if cfg.mode != EvalMode::Rollout {
+    let mut synthetic_iid_dynamics = if cfg.mode == EvalMode::Rollout {
+        empty_split("synthetic_iid_dynamics", iid_dynamics_samples.len())
+    } else {
+        eval_sample_set(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &iid_dynamics_samples,
+            "synthetic_iid_dynamics",
+            Some(&iid_dynamics_source_lengths),
+            cfg,
+            &device,
+            false,
+        )?
+    };
+    let iid_dynamics_rollout_rows = if cfg.mode != EvalMode::Representation {
+        eval_episode_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &iid_dynamics_rollout_samples,
+            &device,
+            "synthetic_iid_dynamics",
+        )?
+    } else {
+        Vec::new()
+    };
+    if cfg.mode != EvalMode::Representation {
+        attach_rollout_metrics(
+            &mut synthetic_iid_dynamics,
+            &iid_dynamics_rollout_rows,
+            cfg.iid_seed,
+        );
+    }
+
+    let mut synthetic_iid_planner = if cfg.mode == EvalMode::Rollout {
+        empty_split("synthetic_iid_planner", iid_planner_samples.len())
+    } else {
+        eval_sample_set(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &iid_planner_samples,
+            "synthetic_iid_planner",
+            Some(&iid_planner_source_lengths),
+            cfg,
+            &device,
+            false,
+        )?
+    };
+    let iid_planner_rollout_rows = if cfg.mode != EvalMode::Representation {
+        eval_episode_rollouts(
+            &train_cfg,
+            &cfg.checkpoint,
+            &model,
+            &iid_planner_rollout_samples,
+            &device,
+            "synthetic_iid_planner",
+        )?
+    } else {
+        Vec::new()
+    };
+    if cfg.mode != EvalMode::Representation {
+        attach_rollout_metrics(
+            &mut synthetic_iid_planner,
+            &iid_planner_rollout_rows,
+            cfg.iid_seed,
+        );
+    }
+
+    let (arc3_transfer, arc3_population_fingerprint) = if cfg.mode != EvalMode::Rollout {
         if let Some(dir) = &cfg.arc_recordings_dir {
             let samples = import_recordings_dir(dir)?;
-            Some(eval_sample_set(
-                &train_cfg,
-                &cfg.checkpoint,
-                &model,
-                &samples,
-                "arc3_transfer",
-                None,
-                cfg,
-                &device,
-                false,
-            )?)
+            let fingerprint = semantic_population_fingerprint(&samples);
+            (
+                Some(eval_sample_set(
+                    &train_cfg,
+                    &cfg.checkpoint,
+                    &model,
+                    &samples,
+                    "arc3_transfer",
+                    None,
+                    cfg,
+                    &device,
+                    false,
+                )?),
+                Some(fingerprint),
+            )
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     let arc3_recording_runs = if cfg.mode == EvalMode::Full {
@@ -5079,13 +5587,65 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         .as_ref()
         .and_then(official_rhae_from_benchmark);
 
+    let mut population_sha256 = BTreeMap::from([
+        (
+            "synthetic_ood_dynamics_h1".into(),
+            semantic_population_fingerprint(&dynamics_samples),
+        ),
+        (
+            "synthetic_ood_dynamics_rollout".into(),
+            semantic_population_fingerprint(&dynamics_rollout_samples),
+        ),
+        (
+            "synthetic_ood_planner_h1".into(),
+            semantic_population_fingerprint(&planner_samples),
+        ),
+        (
+            "synthetic_ood_planner_rollout".into(),
+            semantic_population_fingerprint(&planner_rollout_samples),
+        ),
+        (
+            "synthetic_iid_dynamics_h1".into(),
+            semantic_population_fingerprint(&iid_dynamics_samples),
+        ),
+        (
+            "synthetic_iid_dynamics_rollout".into(),
+            semantic_population_fingerprint(&iid_dynamics_rollout_samples),
+        ),
+        (
+            "synthetic_iid_planner_h1".into(),
+            semantic_population_fingerprint(&iid_planner_samples),
+        ),
+        (
+            "synthetic_iid_planner_rollout".into(),
+            semantic_population_fingerprint(&iid_planner_rollout_samples),
+        ),
+    ]);
+    if let Some(factual) = &factual_branches {
+        population_sha256.insert(
+            "factual_same_state_branches".into(),
+            factual.population_fingerprint.clone(),
+        );
+    }
+    if let Some(fingerprint) = arc3_population_fingerprint {
+        population_sha256.insert("arc3_transfer".into(), fingerprint);
+    }
+    let identity = evaluation_identity(cfg, population_sha256)?;
+
     let report = EvalReport {
         schema: EVAL_REPORT_SCHEMA.into(),
         mode: cfg.mode,
         seed: cfg.seed,
+        iid_seed: cfg.iid_seed,
+        identity,
         checkpoint: cfg.checkpoint.clone(),
         device: cfg.device.clone(),
         q_mse_threshold: cfg.q_mse_threshold,
+        q_label_definition: if train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FullV4 {
+            "exact_gameplay_pixels:overall>=0.99,changed>=0.90,status_row_excluded".into()
+        } else {
+            format!("latent_mse<{}", cfg.q_mse_threshold)
+        },
         ptrm_k: cfg.ptrm_k.clone(),
         ptrm_noise: cfg.ptrm_noise,
         official_rhae,
@@ -5094,6 +5654,8 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         public_data_used_for_fitting: false,
         synthetic_dynamics,
         synthetic_planner,
+        synthetic_iid_dynamics,
+        synthetic_iid_planner,
         board_probe,
         factual_branches,
         outcome_counterfactuals,
@@ -5103,10 +5665,13 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     if let Some(jsonl) = cfg.episode_jsonl.as_deref() {
         let mut rows = dynamics_rollout_rows;
         rows.extend(planner_rollout_rows);
+        rows.extend(iid_dynamics_rollout_rows);
+        rows.extend(iid_planner_rollout_rows);
         sort_episode_rows(&mut rows);
         maybe_write_episode_jsonl(Some(jsonl), &rows)?;
     }
     write_json_atomic(&cfg.output, &report)?;
+    write_eval_digest(&cfg.output)?;
     Ok(report)
 }
 
@@ -5153,6 +5718,86 @@ mod tests {
         assert!(both_classes.balanced_accuracy.is_some());
     }
 
+    #[test]
+    fn full_v4_eval_uses_exact_q_labels_and_omits_legacy_ptrm_oracles() -> Result<()> {
+        let device = Device::Cpu;
+        let mut train_cfg = TrainConfig::default();
+        train_cfg.apply_full_v4_recipe();
+        train_cfg.physical_batch = 2;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            train_cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, train_cfg.seed)?;
+        let samples = (0..2)
+            .map(|episode| {
+                generate_curriculum(
+                    "random_one_step",
+                    train_cfg.seed,
+                    episode,
+                    Split::HeldOutComposition,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .take(2)
+            .collect::<Vec<_>>();
+        let eval_cfg = EvalConfig {
+            physical_batch: 2,
+            synthetic_episodes: 2,
+            ptrm_k: vec![1, 2, 4],
+            q_mse_threshold: 999.0,
+            ensemble_members: 1,
+            ..EvalConfig::default()
+        };
+        let partial = eval_one_batch(&model, &samples, 0, &train_cfg, &eval_cfg, &device)?;
+        assert_eq!(partial.q_acc.n, samples.len());
+        assert_eq!(partial.q_labels.len(), samples.len());
+        assert!(partial.ptrm_acc.is_empty());
+        assert!(partial.matched_acc.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn full_v4_factual_eval_scores_semantic_outcomes_not_only_action_ids() -> Result<()> {
+        let device = Device::Cpu;
+        let mut train_cfg = TrainConfig::default();
+        train_cfg.apply_full_v4_recipe();
+        train_cfg.hidden_dim = 16;
+        train_cfg.action_dim = 4;
+        train_cfg.inner_steps = 1;
+        train_cfg.outer_steps = 1;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            train_cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, train_cfg.seed)?;
+        let metrics = evaluate_factual_branches(
+            &model,
+            &EvalConfig {
+                seed: 17,
+                synthetic_episodes: 1,
+                physical_batch: 4,
+                ..EvalConfig::default()
+            },
+            &device,
+        )?;
+        assert_eq!(metrics.semantic_outcome_retrieval_n, metrics.branches);
+        assert!(metrics.semantic_outcome_retrieval_accuracy.is_some());
+        assert!(metrics.semantic_outcome_chance.is_some());
+        assert!(metrics
+            .semantic_factual_nll_mean
+            .is_some_and(f64::is_finite));
+        assert!(metrics
+            .rows
+            .iter()
+            .all(|row| row.factual_outcome_nll.is_some()));
+        Ok(())
+    }
+
     fn action_diagnostic_sample(action: ArcAction, episode_id: u64) -> Result<TransitionSample> {
         let current = ArcFrame::new(1, 1, vec![episode_id as u8])?;
         let next = ArcFrame::new(1, 1, vec![episode_id as u8 + 1])?;
@@ -5170,6 +5815,12 @@ mod tests {
             seed: 7,
             episode_id,
             transition_index: 0,
+            provenance: crate::p2::data::TransitionProvenance {
+                content_width: 1,
+                content_height: 1,
+                source_kind: "action_diagnostic".into(),
+                trajectory_id: format!("test/action_diagnostic/{episode_id}"),
+            },
             oracle_latent: None,
         })
     }
@@ -5185,6 +5836,9 @@ mod tests {
         sample.episode_id = episode_id;
         sample.transition_index = transition_index;
         sample.family = family.into();
+        sample.provenance.trajectory_id = format!("test/{seed}/{episode_id}");
+        sample.current = ArcFrame::new(1, 1, vec![(transition_index % 16) as u8])?;
+        sample.next = ArcFrame::new(1, 1, vec![((transition_index + 1) % 16) as u8])?;
         Ok(sample)
     }
 
@@ -5211,8 +5865,52 @@ mod tests {
             open_mse,
             closed_mse,
             copy_forward_mse,
+            open_semantic: None,
+            closed_semantic: None,
+            learned_copy_semantic: None,
         }
         .into_row(source)
+    }
+
+    fn semantic_decoder(pixel_accuracy: f64, pixels: usize) -> SemanticDecoderMetrics {
+        SemanticDecoderMetrics {
+            masks: BTreeMap::from([(
+                "content".into(),
+                crate::p2::semantic_eval::SemanticMaskMetrics {
+                    pixels,
+                    transitions: 1,
+                    mean_nll: Some(1.0 - pixel_accuracy),
+                    pixel_accuracy: Some(pixel_accuracy),
+                    exact_transition_accuracy: Some(if pixel_accuracy == 1.0 { 1.0 } else { 0.0 }),
+                    mean_transition_accuracy: Some(pixel_accuracy),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn semantic_rollout_h4_h8_are_aggregated_into_split_report() {
+        let mut h4_a = rollout_row("source", 1, 1, 4, Some(1.0), Some(1.0), Some(1.0), &[]);
+        h4_a.open_semantic = Some(semantic_decoder(0.5, 10));
+        let mut h4_b = rollout_row("source", 1, 2, 4, Some(1.0), Some(1.0), Some(1.0), &[]);
+        h4_b.open_semantic = Some(semantic_decoder(1.0, 30));
+        let mut h8 = rollout_row("source", 1, 1, 8, Some(1.0), Some(1.0), Some(1.0), &[]);
+        h8.open_semantic = Some(semantic_decoder(0.25, 20));
+        let mut split = empty_split("source", 3);
+        attach_rollout_metrics(&mut split, &[h4_a, h4_b, h8], 9);
+        let semantic = split.semantic_rollout.expect("semantic rollout summary");
+        assert_eq!(
+            semantic.open[&4].masks["content"].pixel_accuracy,
+            Some(0.875)
+        );
+        assert_eq!(
+            semantic.open[&4].masks["content"].mean_transition_accuracy,
+            Some(0.75)
+        );
+        assert_eq!(
+            semantic.open[&8].masks["content"].pixel_accuracy,
+            Some(0.25)
+        );
     }
 
     #[test]
@@ -5231,7 +5929,7 @@ mod tests {
         }
         samples.reverse();
 
-        let groups = group_rollouts(&samples);
+        let groups = group_rollouts(&samples)?;
         let rows: Vec<_> = groups
             .values()
             .flat_map(|steps| {
@@ -6102,6 +6800,7 @@ mod tests {
             checkpoint: dir.join("model.safetensors"),
             train_config: dir.join("config.json"),
             seed: 3,
+            iid_seed: 4,
             synthetic_episodes: 2,
             physical_batch: 2,
             ptrm_k: vec![1, 2],

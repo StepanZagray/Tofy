@@ -22,6 +22,7 @@ pub mod rhae;
 pub mod semantic_access;
 pub mod semantic_access_fixed;
 pub mod semantic_access_v11;
+pub mod semantic_eval;
 pub mod sigreg;
 pub mod train;
 pub mod view;
