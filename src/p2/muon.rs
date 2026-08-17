@@ -75,13 +75,13 @@ pub fn hybrid_newton_schulz(g: &Tensor) -> Result<Tensor> {
     if transposed {
         x = x.transpose(0, 1)?.contiguous()?;
     }
-    let fro = x.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()? as f64;
-    let fro = fro.max(1e-7);
-    x = x.affine(1.0 / fro, 0.0)?;
+    let fro = x.sqr()?.sum_all()?.sqrt()?.maximum(1e-7)?;
+    x = x.broadcast_div(&fro)?;
     for (a, b, c) in std::iter::repeat_n(NS_FAST, 8).chain(std::iter::repeat_n(NS_LOCK, 2)) {
         let a_mat = x.matmul(&x.transpose(D::Minus1, D::Minus2)?)?;
-        let b_term = a_mat.matmul(&x)?.affine(b, 0.0)?;
-        let c_term = a_mat.matmul(&a_mat)?.matmul(&x)?.affine(c, 0.0)?;
+        let ax = a_mat.matmul(&x)?;
+        let b_term = ax.affine(b, 0.0)?;
+        let c_term = a_mat.matmul(&ax)?.affine(c, 0.0)?;
         x = x.affine(a, 0.0)?.add(&b_term)?.add(&c_term)?;
     }
     if transposed {
@@ -103,14 +103,13 @@ pub fn muon_update(
     momentum: &Tensor,
     beta: f64,
     lr: f64,
-    _weight_decay: f64,
     gamma: f64,
 ) -> Result<(Tensor, Tensor)> {
     let g = matrix_view(grad)?;
     let new_m = momentum
         .affine(beta, 0.0)?
         .add(&g.affine(1.0 - beta, 0.0)?)?;
-    let nesterov = new_m.add(&g.affine(beta, 0.0)?)?;
+    let nesterov = new_m.affine(beta, 0.0)?.add(&g.affine(1.0 - beta, 0.0)?)?;
     let ortho = hybrid_newton_schulz(&nesterov)?;
     let update = muon_shape_rescale(&ortho, gamma)?;
     let delta = update.affine(-lr, 0.0)?;
@@ -157,5 +156,65 @@ mod tests {
         assert_eq!(weight_matrix_dims(&[128, 128, 3, 3]), Some((128, 1152)));
         assert_eq!(weight_matrix_dims(&[1, 128]), Some((1, 128)));
         assert!(!uses_muon("q_head.weight", &[1, 128]));
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor, tolerance: f32) -> Result<()> {
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "element {index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_step_nesterov_matches_deepseek_algorithm_one() -> Result<()> {
+        let device = Device::Cpu;
+        let beta = 0.8;
+        let lr = 0.3;
+        let gamma = MUON_RMS_SCALE;
+        let g1 = Tensor::new(&[[1f32, 2.0], [3.0, 5.0]], &device)?;
+        let g2 = Tensor::new(&[[-2f32, 1.0], [4.0, -3.0]], &device)?;
+        let zero = Tensor::zeros((2, 2), DType::F32, &device)?;
+
+        let (m1, delta1) = muon_update(&g1, &zero, beta, lr, gamma)?;
+        let expected_m1 = g1.affine(1.0 - beta, 0.0)?;
+        let expected_n1 = expected_m1
+            .affine(beta, 0.0)?
+            .add(&g1.affine(1.0 - beta, 0.0)?)?;
+        let expected_delta1 =
+            muon_shape_rescale(&hybrid_newton_schulz(&expected_n1)?, gamma)?.affine(-lr, 0.0)?;
+        assert_tensor_close(&m1, &expected_m1, 1e-6)?;
+        assert_tensor_close(&delta1, &expected_delta1, 1e-6)?;
+
+        let (m2, delta2) = muon_update(&g2, &m1, beta, lr, gamma)?;
+        let expected_m2 = expected_m1
+            .affine(beta, 0.0)?
+            .add(&g2.affine(1.0 - beta, 0.0)?)?;
+        let expected_n2 = expected_m2
+            .affine(beta, 0.0)?
+            .add(&g2.affine(1.0 - beta, 0.0)?)?;
+        let expected_delta2 =
+            muon_shape_rescale(&hybrid_newton_schulz(&expected_n2)?, gamma)?.affine(-lr, 0.0)?;
+        assert_tensor_close(&m2, &expected_m2, 1e-6)?;
+        assert_tensor_close(&delta2, &expected_delta2, 1e-6)?;
+
+        let old_nesterov = expected_m2.add(&g2.affine(beta, 0.0)?)?;
+        let old_delta =
+            muon_shape_rescale(&hybrid_newton_schulz(&old_nesterov)?, gamma)?.affine(-lr, 0.0)?;
+        let corrected = delta2.flatten_all()?.to_vec1::<f32>()?;
+        let old = old_delta.flatten_all()?.to_vec1::<f32>()?;
+        assert!(
+            corrected
+                .iter()
+                .zip(old)
+                .any(|(corrected, old)| (corrected - old).abs() > 1e-4),
+            "non-collinear second step must distinguish the old Nesterov formula"
+        );
+        Ok(())
     }
 }

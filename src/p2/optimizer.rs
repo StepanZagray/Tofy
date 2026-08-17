@@ -17,6 +17,7 @@ struct ParamOpt {
     name: String,
     var: Var,
     kind: OptKind,
+    adam_step: Option<u32>,
 }
 
 /// Candle AdamW + DeepSeek-V4 Muon; steps directly on `VarMap` vars (no duplicate weights).
@@ -71,10 +72,20 @@ impl CheckpointHybridOptimizer {
                     let mut md = moments.data().lock().unwrap();
                     md.insert(format!("first_moment.{name}"), first);
                     md.insert(format!("second_moment.{name}"), second);
+                    md.insert(
+                        format!("adam.step.{name}"),
+                        Var::from_tensor(&Tensor::new(0u32, var.device())?)?,
+                    );
                 }
                 OptKind::Adam
             };
-            params.push(ParamOpt { name, var, kind });
+            let adam_step = (kind == OptKind::Adam).then_some(0);
+            params.push(ParamOpt {
+                name,
+                var,
+                kind,
+                adam_step,
+            });
         }
         tracing::info!(
             "optimizer: hybrid Muon+AdamW (muon_vars={muon_count}, adamw_vars={adam_count}, momentum={muon_momentum:.4}, rms_scale={muon_rms_scale:.4})"
@@ -100,8 +111,6 @@ impl CheckpointHybridOptimizer {
         let beta1 = self.adam.beta1;
         let beta2 = self.adam.beta2;
         let eps = self.adam.eps;
-        let scale_m = 1.0 / (1.0 - beta1.powi(self.step_t as i32));
-        let scale_v = 1.0 / (1.0 - beta2.powi(self.step_t as i32));
         let moment_data = self.moments.data().lock().unwrap();
 
         for p in &mut self.params {
@@ -116,6 +125,16 @@ impl CheckpointHybridOptimizer {
                     let second = moment_data
                         .get(&format!("second_moment.{}", p.name))
                         .expect("adam second moment");
+                    let step = moment_data
+                        .get(&format!("adam.step.{}", p.name))
+                        .expect("adam parameter step");
+                    let next_step = p
+                        .adam_step
+                        .expect("adam parameter host step")
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("adam step overflow for {}", p.name))?;
+                    let scale_m = 1.0 / (1.0 - beta1.powf(next_step as f64));
+                    let scale_v = 1.0 / (1.0 - beta2.powf(next_step as f64));
                     let next_m = first
                         .as_tensor()
                         .affine(beta1, 0.0)?
@@ -134,6 +153,8 @@ impl CheckpointHybridOptimizer {
                     p.var.set(&next_theta)?;
                     first.set(&next_m)?;
                     second.set(&next_v)?;
+                    step.set(&Tensor::new(next_step, p.var.device())?)?;
+                    p.adam_step = Some(next_step);
                 }
                 OptKind::Muon => {
                     let momentum = moment_data
@@ -144,7 +165,6 @@ impl CheckpointHybridOptimizer {
                         momentum.as_tensor(),
                         self.muon_momentum,
                         lr,
-                        wd,
                         self.muon_rms_scale,
                     )?;
                     let orig = p.var.as_tensor();
@@ -152,13 +172,12 @@ impl CheckpointHybridOptimizer {
                     let view = matrix_view(orig)?;
                     let (rows, cols) = view.dims2()?;
                     let delta = delta.reshape((rows, cols))?;
-                    let updated = view.add(&delta)?;
+                    let updated = view.affine(1.0 - lr * wd, 0.0)?.add(&delta)?;
                     let next = if orig.rank() >= 3 {
                         updated.reshape(shape)?
                     } else {
                         updated
                     };
-                    let next = next.affine(1.0 - lr * wd, 0.0)?;
                     p.var.set(&next)?;
                     momentum.set(&new_m)?;
                 }
@@ -236,6 +255,16 @@ impl CheckpointHybridOptimizer {
         }
         for (var, tensor) in loaded {
             var.set(&tensor)?;
+        }
+        let moment_data = self.moments.data().lock().unwrap();
+        for p in &mut self.params {
+            if p.kind == OptKind::Adam {
+                p.adam_step = Some(
+                    moment_data[&format!("adam.step.{}", p.name)]
+                        .as_tensor()
+                        .to_scalar::<u32>()?,
+                );
+            }
         }
         self.step_t = step_t;
         Ok(())
@@ -356,6 +385,117 @@ mod tests {
         let loss = lin.forward(&x)?.sqr()?.mean_all()?;
         opt.step(&loss.backward()?)?;
         assert_eq!(opt.step_t(), 1);
+        Ok(())
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor, tolerance: f32) -> Result<()> {
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "element {index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn muon_decay_applies_before_unattenuated_update() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let initial = Tensor::new(&[[1f32, -2.0], [3.0, -4.0]], &device)?;
+        let weight = Var::from_tensor(&initial)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("block.weight".into(), weight.clone());
+        let lr = 0.2;
+        let weight_decay = 0.5;
+        let momentum = 0.9;
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            ParamsAdamW {
+                lr,
+                weight_decay,
+                ..ParamsAdamW::default()
+            },
+            momentum,
+            MUON_RMS_SCALE,
+        )?;
+        let gradient = Tensor::new(&[[2f32, 1.0], [-1.0, 3.0]], &device)?;
+        let zero = Tensor::zeros((2, 2), DType::F32, &device)?;
+        let (_, delta) = muon_update(&gradient, &zero, momentum, lr, MUON_RMS_SCALE)?;
+        let expected = initial.affine(1.0 - lr * weight_decay, 0.0)?.add(&delta)?;
+        let attenuated_update = initial.add(&delta)?.affine(1.0 - lr * weight_decay, 0.0)?;
+
+        let mut gradients = GradStore::default();
+        gradients.insert(weight.as_tensor(), gradient);
+        optimizer.step(&gradients)?;
+
+        assert_tensor_close(weight.as_tensor(), &expected, 1e-6)?;
+        let actual = weight.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+        let old = attenuated_update.flatten_all()?.to_vec1::<f32>()?;
+        assert!(actual
+            .iter()
+            .zip(old)
+            .any(|(actual, old)| (actual - old).abs() > 1e-5));
+        Ok(())
+    }
+
+    #[test]
+    fn adam_late_first_gradient_uses_parameter_local_bias_step() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let always = Var::from_tensor(&Tensor::new(&[1f32, -1.0], &device)?)?;
+        let late = Var::from_tensor(&Tensor::new(&[1f32, -1.0], &device)?)?;
+        {
+            let mut data = varmap.data().lock().unwrap();
+            data.insert("always.bias".into(), always.clone());
+            data.insert("late.bias".into(), late.clone());
+        }
+        let mut optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            ParamsAdamW {
+                lr: 0.1,
+                beta1: 0.5,
+                beta2: 0.25,
+                eps: 0.0,
+                weight_decay: 0.0,
+            },
+            0.9,
+            MUON_RMS_SCALE,
+        )?;
+
+        for _ in 0..2 {
+            let mut gradients = GradStore::default();
+            gradients.insert(always.as_tensor(), Tensor::new(&[2f32, -4.0], &device)?);
+            optimizer.step(&gradients)?;
+        }
+        let mut gradients = GradStore::default();
+        gradients.insert(late.as_tensor(), Tensor::new(&[2f32, -4.0], &device)?);
+        optimizer.step(&gradients)?;
+
+        assert_tensor_close(
+            late.as_tensor(),
+            &Tensor::new(&[0.9f32, -0.9], &device)?,
+            1e-6,
+        )?;
+        let moment_data = optimizer.moments.data().lock().unwrap();
+        assert_eq!(
+            moment_data["adam.step.always.bias"]
+                .as_tensor()
+                .to_scalar::<u32>()?,
+            2
+        );
+        assert_eq!(
+            moment_data["adam.step.late.bias"]
+                .as_tensor()
+                .to_scalar::<u32>()?,
+            1
+        );
         Ok(())
     }
 
