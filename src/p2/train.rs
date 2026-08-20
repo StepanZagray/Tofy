@@ -1432,6 +1432,28 @@ fn sample_frames_to_indices(
         .map_err(Into::into)
 }
 
+fn sample_frame_pair_to_indices(
+    samples: &[TransitionSample],
+    device: &Device,
+) -> (Result<Tensor>, Result<Tensor>) {
+    // CUDA tensor construction shares one device stream. Building both frame
+    // tensors from separate Rayon workers can race their host-to-device copies,
+    // leaving otherwise validated palette indices corrupted by the time the
+    // embedding kernel reads them. CPU construction is independent and keeps
+    // the parallel path.
+    if device.is_cuda() {
+        (
+            sample_frames_to_indices(samples, false, device),
+            sample_frames_to_indices(samples, true, device),
+        )
+    } else {
+        rayon::join(
+            || sample_frames_to_indices(samples, false, device),
+            || sample_frames_to_indices(samples, true, device),
+        )
+    }
+}
+
 fn ensure_fixed_frame(frame: &ArcFrame) -> Result<()> {
     if frame.width as usize != FRAME_SIDE || frame.height as usize != FRAME_SIDE {
         bail!(
@@ -1604,10 +1626,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         .then(|| FactualBatch::from_rows(samples))
         .transpose()?;
     let rows = factual.as_ref().map_or(samples, FactualBatch::rows);
-    let (frames, next_frames) = rayon::join(
-        || sample_frames_to_indices(rows, false, device),
-        || sample_frames_to_indices(rows, true, device),
-    );
+    let (frames, next_frames) = sample_frame_pair_to_indices(rows, device);
     let frames = frames?;
     let next_frames = next_frames?;
     let (actions, action_coords) = action_tensors_from_samples(rows, device)?;
@@ -1636,10 +1655,7 @@ pub fn ordered_trace_from_samples(
     if samples.len() < 2 {
         bail!("ordered trace requires at least two transitions");
     }
-    let (frames, next_frames) = rayon::join(
-        || sample_frames_to_indices(samples, false, device),
-        || sample_frames_to_indices(samples, true, device),
-    );
+    let (frames, next_frames) = sample_frame_pair_to_indices(samples, device);
     let (actions, action_coords) = action_tensors_from_samples(samples, device)?;
     Ok(OrderedTraceTensors {
         frames: frames?,
