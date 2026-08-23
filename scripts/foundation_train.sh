@@ -7,6 +7,7 @@
 # Env:   DEVICE (default cuda), SEED (default 2).
 # The live ARC-AGI-3 eval needs ARC_AGI_3_API_KEY in the environment or .env.
 set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 RUN_DIR="${1:?usage: foundation_train.sh <output-dir> [physical-batch] [steps-per-lesson]}"
 PHYSICAL_BATCH="${2:-2048}"
@@ -25,10 +26,13 @@ BIN=target/release/tofy
   --checkpoint-every-steps 100 \
   --output-dir "$RUN_DIR"
 
+# Eval flags mirror the proven full-v4 boundary evals so reports stay comparable.
 "$BIN" p2-eval \
   --device "$DEVICE" \
   --checkpoint "$RUN_DIR/model.safetensors" \
   --train-config "$RUN_DIR/config.json" \
+  --physical-batch 64 --synthetic-episodes 64 --ptrm-k 1,2,4,8 \
+  --seed 1000002 --iid-seed 1000003 \
   --output "$RUN_DIR/eval_report.json"
 
 # Held-out generalization check: live public ARC-AGI-3 games. The model never

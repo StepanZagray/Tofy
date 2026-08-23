@@ -31,10 +31,10 @@
 //! ## Nsight Systems (`nsys`) — CPU + GPU
 //!
 //! The representative update uses identical candle-graph and NVTX semantic labels.
-//! Capture and normalize it through the repository wrapper:
+//! Capture and normalize it by wrapping the training binary directly:
 //!
 //! ```bash
-//! P2_NSYS=auto scripts/p2_profile_nsys.sh runs/p2/example -- \
+//! nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas --sample=cpu -- \
 //!   cargo run --release --features cudnn,profiling -- p2-train \
 //!   --device cuda --output-dir runs/p2/example --profile-update 2 ...
 //! ```
