@@ -7192,7 +7192,8 @@ mod tests {
         assert!(artifacts.viewer_html.is_file());
         let evidence: candle_graph::EvidencePacket =
             serde_json::from_slice(&fs::read(&artifacts.evidence_json)?)?;
-        assert!(evidence.health.trusted);
+        assert!(evidence.health.structurally_valid);
+        assert!(evidence.health.capture_complete);
         assert!(evidence.health.coverage.forward_spans > 0);
         assert!(evidence.health.coverage.backward_spans > 0);
         assert!(evidence.health.coverage.optimizer_spans > 0);
