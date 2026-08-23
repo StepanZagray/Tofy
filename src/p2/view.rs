@@ -16,10 +16,6 @@ pub struct P2ViewArgs {
     #[arg(long, value_name = "FILE")]
     pub output: PathBuf,
 
-    /// Explicit comparison baseline trace.
-    #[arg(long, value_name = "TRACE")]
-    pub baseline: Option<PathBuf>,
-
     /// Override normalized Nsight CSV directory.
     #[arg(long, value_name = "DIR")]
     pub nsight_dir: Option<PathBuf>,
@@ -36,7 +32,7 @@ pub fn run_p2_view(args: P2ViewArgs) -> Result<()> {
     }
     let inferred_nsight = args.profile.is_dir().then(|| args.profile.join("nsight"));
     let nsight_dir = args.nsight_dir.as_deref().or(inferred_nsight.as_deref());
-    trace_cli::run_view(&trace, &args.output, args.baseline.as_deref(), nsight_dir)
+    trace_cli::run_view(&trace, &args.output, nsight_dir)
         .with_context(|| format!("render HTML from {}", trace.display()))?;
     eprintln!("wrote {}", args.output.display());
     Ok(())

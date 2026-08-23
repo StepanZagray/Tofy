@@ -301,7 +301,7 @@ impl RepresentativeUpdateCapture {
         let final_dir = self.final_dir.take().expect("active capture final dir");
         let artifacts = self.artifacts.take().expect("active capture artifacts");
         let trace = session.finish()?;
-        let evidence = candle_graph::build_evidence(&trace, None, None)?;
+        let evidence = candle_graph::build_evidence(&trace, None)?;
         fs::write(
             staging.join("evidence.json"),
             serde_json::to_vec_pretty(&evidence)?,
