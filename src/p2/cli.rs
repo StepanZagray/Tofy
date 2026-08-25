@@ -10,7 +10,7 @@ use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRe
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
-use crate::p2::train::{train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
+use crate::p2::train::{default_data_workers, train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -246,6 +246,10 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = true)]
     pub prefetch_batches: bool,
 
+    /// Foundation-v2 batch-composition workers (default: half the available CPUs, capped at 8).
+    #[arg(long)]
+    pub data_workers: Option<usize>,
+
     /// Train the intentionally checkpoint-incompatible factual world core.
     #[arg(long, default_value_t = false)]
     pub world_core_v2: bool,
@@ -405,6 +409,7 @@ impl P2TrainArgs {
             sigreg_temporal_window: self.sigreg_temporal_window,
             sigreg_global_mix: self.sigreg_global_mix,
             prefetch_batches: self.prefetch_batches,
+            data_workers: self.data_workers.unwrap_or_else(default_data_workers),
             world_core_v2: self.world_core_v2 || self.world_core_v3,
             world_core_v3: self.world_core_v3,
             world_core_v4: false,

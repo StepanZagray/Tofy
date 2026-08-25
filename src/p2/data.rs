@@ -15,6 +15,7 @@ use crate::search::shortest_path;
 use anyhow::{anyhow, bail, ensure, Result};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1682,7 +1683,6 @@ fn sampled_operator(
     split: V5DataSplit,
     rng: &mut ChaCha8Rng,
 ) -> Result<EpisodeOperator> {
-    families.validate()?;
     let family = match split {
         V5DataSplit::HeldOutOperator(family) => {
             ensure!(
@@ -2190,6 +2190,7 @@ pub fn generate_factual_branch_group(
     };
     let content_size = if split == Split::Train { 7 } else { 8 };
     let families = OperatorFamilySplit::default();
+    families.validate()?;
     let mut rng = seeded_v5_rng(seed, episode_id, data_split, 0xFAC7_0005);
     let operator = sampled_operator(&families, data_split, &mut rng)?;
     generate_v5_factual_branch_group(seed, episode_id, data_split, content_size, operator)
@@ -2735,65 +2736,205 @@ fn augment_v5_unit(
         .collect()
 }
 
-fn append_nonfactual_stream(
-    samples: &mut Vec<V5Sample>,
+const MIXED_BATCH_EPISODE_STRIDE: u64 = 1_000_003;
+const MIXED_STREAM_FRAGMENT_ROWS: usize = 4;
+
+fn mixed_stream_episode_id(batch_index: u64, unit_index: u64) -> u64 {
+    batch_index
+        .wrapping_mul(MIXED_BATCH_EPISODE_STRIDE)
+        .wrapping_add(unit_index)
+}
+
+fn compose_nonfactual_unit(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    stream: MixedStreamKind,
+    episode_id: u64,
+    maximum_rows: usize,
+) -> Result<Vec<V5Sample>> {
+    let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0x51DE_0005);
+    let size = sampled_content_size(split, &mut rng);
+    let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
+    let raw = match stream {
+        MixedStreamKind::RandomOneStep => vec![raw_random_v5_sample(
+            config.seed,
+            episode_id,
+            split,
+            size,
+            operator,
+        )?],
+        MixedStreamKind::Exploration => raw_exploration_v5_fragment(
+            config.seed,
+            episode_id,
+            split,
+            size,
+            maximum_rows.min(MIXED_STREAM_FRAGMENT_ROWS),
+        )?,
+        MixedStreamKind::SequentialFragments => {
+            let mut generated = None;
+            for retry in 0..16u64 {
+                let retry_episode = episode_id.wrapping_add(retry.wrapping_mul(10_000_019));
+                if let Ok(fragment) = raw_sequential_v5_fragment(
+                    config.seed,
+                    retry_episode,
+                    split,
+                    size,
+                    maximum_rows.min(MIXED_STREAM_FRAGMENT_ROWS),
+                ) {
+                    generated = Some(fragment);
+                    break;
+                }
+            }
+            generated.ok_or_else(|| anyhow!("could not generate v5 sequential fragment"))?
+        }
+        MixedStreamKind::HazardOneStep => {
+            vec![raw_hazard_v5_sample(config.seed, episode_id, split, size)?]
+        }
+        MixedStreamKind::FactualBranches => {
+            bail!("factual stream must be composed as whole groups")
+        }
+    };
+    let mut unit = augment_v5_unit(raw, config, split, stream, operator, episode_id)?;
+    unit.truncate(maximum_rows);
+    Ok(unit)
+}
+
+fn compose_fixed_nonfactual_stream(
     config: &MixedStreamConfig,
     split: V5DataSplit,
     stream: MixedStreamKind,
     count: usize,
     batch_index: u64,
-    episode_counter: &mut u64,
-) -> Result<()> {
-    let start_len = samples.len();
-    while samples.len() - start_len < count {
-        let remaining = count - (samples.len() - start_len);
-        let episode_id = batch_index
-            .wrapping_mul(1_000_003)
-            .wrapping_add(*episode_counter);
-        *episode_counter = episode_counter.wrapping_add(1);
-        let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0x51DE_0005);
-        let size = sampled_content_size(split, &mut rng);
-        let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
-        let raw = match stream {
-            MixedStreamKind::RandomOneStep => vec![raw_random_v5_sample(
-                config.seed,
-                episode_id,
+    first_unit_index: u64,
+) -> Result<(Vec<V5Sample>, u64)> {
+    let rows_per_unit = match stream {
+        MixedStreamKind::Exploration => MIXED_STREAM_FRAGMENT_ROWS,
+        MixedStreamKind::RandomOneStep | MixedStreamKind::HazardOneStep => 1,
+        MixedStreamKind::SequentialFragments | MixedStreamKind::FactualBranches => {
+            bail!("stream does not have a fixed row count per unit")
+        }
+    };
+    let unit_count = count.div_ceil(rows_per_unit);
+    let units = (0..unit_count)
+        .into_par_iter()
+        .map(|offset| {
+            let produced_before = offset * rows_per_unit;
+            let maximum_rows = (count - produced_before).min(rows_per_unit);
+            compose_nonfactual_unit(
+                config,
                 split,
-                size,
-                operator,
-            )?],
-            MixedStreamKind::Exploration => {
-                raw_exploration_v5_fragment(config.seed, episode_id, split, size, remaining.min(4))?
-            }
-            MixedStreamKind::SequentialFragments => {
-                let mut generated = None;
-                for retry in 0..16u64 {
-                    let retry_episode = episode_id.wrapping_add(retry.wrapping_mul(10_000_019));
-                    if let Ok(fragment) = raw_sequential_v5_fragment(
-                        config.seed,
-                        retry_episode,
-                        split,
-                        size,
-                        remaining.min(4),
-                    ) {
-                        generated = Some(fragment);
-                        break;
-                    }
-                }
-                generated.ok_or_else(|| anyhow!("could not generate v5 sequential fragment"))?
-            }
-            MixedStreamKind::HazardOneStep => {
-                vec![raw_hazard_v5_sample(config.seed, episode_id, split, size)?]
-            }
-            MixedStreamKind::FactualBranches => {
-                bail!("factual stream must be appended as whole groups")
-            }
-        };
-        let mut unit = augment_v5_unit(raw, config, split, stream, operator, episode_id)?;
-        unit.truncate(remaining);
-        samples.append(&mut unit);
+                stream,
+                mixed_stream_episode_id(batch_index, first_unit_index.wrapping_add(offset as u64)),
+                maximum_rows,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut samples = Vec::with_capacity(count);
+    for unit in units {
+        samples.extend(unit?);
     }
-    Ok(())
+    ensure!(
+        samples.len() == count,
+        "fixed-row stream {stream:?} produced {} rows for requested {count}",
+        samples.len()
+    );
+    Ok((samples, first_unit_index.wrapping_add(unit_count as u64)))
+}
+
+fn compose_sequential_stream(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    count: usize,
+    batch_index: u64,
+    first_unit_index: u64,
+) -> Result<(Vec<V5Sample>, u64)> {
+    let mut samples = Vec::with_capacity(count);
+    let mut next_unit_index = first_unit_index;
+    while samples.len() < count {
+        let remaining = count - samples.len();
+        // A fragment contributes at most four rows. Generate the minimum
+        // optimistic wave concurrently; if any plans are shorter, generate
+        // another wave starting at the first unit the serial composer would
+        // have used. Results past the exact prefix are deliberately ignored.
+        let wave_units = remaining.div_ceil(MIXED_STREAM_FRAGMENT_ROWS);
+        let units = (0..wave_units)
+            .into_par_iter()
+            .map(|offset| {
+                compose_nonfactual_unit(
+                    config,
+                    split,
+                    MixedStreamKind::SequentialFragments,
+                    mixed_stream_episode_id(
+                        batch_index,
+                        next_unit_index.wrapping_add(offset as u64),
+                    ),
+                    MIXED_STREAM_FRAGMENT_ROWS,
+                )
+            })
+            .collect::<Vec<_>>();
+        for unit in units {
+            if samples.len() == count {
+                break;
+            }
+            let mut unit = unit?;
+            ensure!(!unit.is_empty(), "sequential fragment produced no rows");
+            unit.truncate(count - samples.len());
+            samples.append(&mut unit);
+            next_unit_index = next_unit_index.wrapping_add(1);
+        }
+    }
+    Ok((samples, next_unit_index))
+}
+
+struct ComposedFactualGroup {
+    samples: Vec<V5Sample>,
+    group: BranchGroup,
+}
+
+fn compose_factual_group(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    episode_id: u64,
+) -> Result<ComposedFactualGroup> {
+    let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0xFAC7_0005);
+    let size = sampled_content_size(split, &mut rng);
+    let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
+    let raw_group =
+        generate_v5_factual_branch_group(config.seed, episode_id, split, size, operator)?;
+    let mut raw_transitions = raw_group.into_transitions().collect::<Vec<_>>();
+    raw_transitions.sort_by_key(|transition| {
+        (
+            transition.action.id,
+            transition.action.x,
+            transition.action.y,
+        )
+    });
+    let mut samples = augment_v5_unit(
+        raw_transitions,
+        config,
+        split,
+        MixedStreamKind::FactualBranches,
+        operator,
+        episode_id,
+    )?;
+    samples.sort_by_key(|sample| {
+        (
+            sample.transition.action.id,
+            sample.transition.action.x,
+            sample.transition.action.y,
+        )
+    });
+    let group = BranchGroup::try_new(
+        samples
+            .iter()
+            .map(|sample| FactualActionBranch::try_from_transition(sample.transition.clone()))
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    let group_id = BranchGroupId::from_transition(&samples[0].transition);
+    for sample in &mut samples {
+        sample.provenance.branch_group_id = Some(group_id.clone());
+    }
+    Ok(ComposedFactualGroup { samples, group })
 }
 
 /// Compose one deterministic, mixed foundation-v2 batch.
@@ -2826,84 +2967,70 @@ pub fn compose_mixed_stream_batch(
     let mut samples = Vec::with_capacity(config.batch_size);
     let mut factual_groups = Vec::new();
     let mut factual_group_ranges = Vec::new();
-    let mut episode_counter = 0u64;
+    let mut unit_index = 0u64;
 
-    append_nonfactual_stream(
-        &mut samples,
+    let (mut random_samples, next_unit_index) = compose_fixed_nonfactual_stream(
         config,
         split,
         MixedStreamKind::RandomOneStep,
         stream_counts[&MixedStreamKind::RandomOneStep],
         batch_index,
-        &mut episode_counter,
+        unit_index,
     )?;
+    samples.append(&mut random_samples);
+    unit_index = next_unit_index;
 
     let factual_group_count =
         stream_counts[&MixedStreamKind::FactualBranches] / FACTUAL_BRANCHES_PER_GROUP;
-    for _ in 0..factual_group_count {
-        let episode_id = batch_index
-            .wrapping_mul(1_000_003)
-            .wrapping_add(episode_counter);
-        episode_counter = episode_counter.wrapping_add(1);
-        let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0xFAC7_0005);
-        let size = sampled_content_size(split, &mut rng);
-        let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
-        let raw_group =
-            generate_v5_factual_branch_group(config.seed, episode_id, split, size, operator)?;
-        let mut raw_transitions = raw_group.into_transitions().collect::<Vec<_>>();
-        raw_transitions.sort_by_key(|transition| {
-            (
-                transition.action.id,
-                transition.action.x,
-                transition.action.y,
+    let composed_factual = (0..factual_group_count)
+        .into_par_iter()
+        .map(|offset| {
+            compose_factual_group(
+                config,
+                split,
+                mixed_stream_episode_id(batch_index, unit_index.wrapping_add(offset as u64)),
             )
-        });
-        let mut augmented = augment_v5_unit(
-            raw_transitions,
-            config,
-            split,
-            MixedStreamKind::FactualBranches,
-            operator,
-            episode_id,
-        )?;
-        augmented.sort_by_key(|sample| {
-            (
-                sample.transition.action.id,
-                sample.transition.action.x,
-                sample.transition.action.y,
-            )
-        });
-        let transformed_group = BranchGroup::try_new(
-            augmented
-                .iter()
-                .map(|sample| FactualActionBranch::try_from_transition(sample.transition.clone()))
-                .collect::<Result<Vec<_>>>()?,
-        )?;
-        let group_id = BranchGroupId::from_transition(&augmented[0].transition);
-        for sample in &mut augmented {
-            sample.provenance.branch_group_id = Some(group_id.clone());
-        }
+        })
+        .collect::<Vec<_>>();
+    for composed in composed_factual {
+        let mut composed = composed?;
         let start = samples.len();
-        samples.append(&mut augmented);
+        samples.append(&mut composed.samples);
         factual_group_ranges.push(start..samples.len());
-        factual_groups.push(transformed_group);
+        factual_groups.push(composed.group);
     }
+    unit_index = unit_index.wrapping_add(factual_group_count as u64);
 
-    for stream in [
+    let (mut exploration_samples, next_unit_index) = compose_fixed_nonfactual_stream(
+        config,
+        split,
         MixedStreamKind::Exploration,
-        MixedStreamKind::SequentialFragments,
+        stream_counts[&MixedStreamKind::Exploration],
+        batch_index,
+        unit_index,
+    )?;
+    samples.append(&mut exploration_samples);
+    unit_index = next_unit_index;
+
+    let (mut sequential_samples, next_unit_index) = compose_sequential_stream(
+        config,
+        split,
+        stream_counts[&MixedStreamKind::SequentialFragments],
+        batch_index,
+        unit_index,
+    )?;
+    samples.append(&mut sequential_samples);
+    unit_index = next_unit_index;
+
+    let (mut hazard_samples, _) = compose_fixed_nonfactual_stream(
+        config,
+        split,
         MixedStreamKind::HazardOneStep,
-    ] {
-        append_nonfactual_stream(
-            &mut samples,
-            config,
-            split,
-            stream,
-            stream_counts[&stream],
-            batch_index,
-            &mut episode_counter,
-        )?;
-    }
+        stream_counts[&MixedStreamKind::HazardOneStep],
+        batch_index,
+        unit_index,
+    )?;
+    samples.append(&mut hazard_samples);
     ensure!(
         samples.len() == config.batch_size,
         "mixed composer produced {} rows for requested batch {}",

@@ -1,4 +1,6 @@
 use anyhow::Result;
+use rayon::ThreadPoolBuilder;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tofy::domain::Split;
 use tofy::p2::data::{
@@ -18,6 +20,10 @@ fn test_config(batch_size: usize) -> MixedStreamConfig {
         seed: 0xDADA_0005,
         ..MixedStreamConfig::default()
     }
+}
+
+fn batch_hash(batch: &tofy::p2::data::MixedStreamBatch) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(batch)?)))
 }
 
 #[test]
@@ -229,5 +235,32 @@ fn fixed_seed_is_deterministic_and_operator_holdout_is_family_complete() -> Resu
         .samples()
         .iter()
         .all(|sample| sample.provenance.operator.family == OperatorFamily::SwapRegion));
+    Ok(())
+}
+
+#[test]
+fn mixed_stream_bytes_are_identical_across_rayon_thread_counts() -> Result<()> {
+    let config = test_config(120);
+    let serial = ThreadPoolBuilder::new().num_threads(1).build()?;
+    let parallel = ThreadPoolBuilder::new().num_threads(4).build()?;
+    for (progress, batch_index, split) in [
+        (0.35, 17, V5DataSplit::Train),
+        (0.73, 88, V5DataSplit::Train),
+        (0.0, 9, V5DataSplit::Translated7x7),
+    ] {
+        let one =
+            serial.install(|| compose_mixed_stream_batch(&config, progress, batch_index, split))?;
+        let many = parallel
+            .install(|| compose_mixed_stream_batch(&config, progress, batch_index, split))?;
+        assert_eq!(batch_hash(&one)?, batch_hash(&many)?);
+        assert_eq!(one, many);
+        if (progress, batch_index, split) == (0.35, 17, V5DataSplit::Train) {
+            // Captured from the serial composer before its parallel rewrite.
+            assert_eq!(
+                batch_hash(&one)?,
+                "4b0876551f84eee27a97e331085c7656e5d92231900e0bafc73879f106ada051"
+            );
+        }
+    }
     Ok(())
 }

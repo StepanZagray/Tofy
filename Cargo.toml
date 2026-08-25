@@ -5,7 +5,7 @@ edition = "2021"
 description = "Recursive world-model experiments for hidden-objective discovery and planning"
 
 [features]
-default = []
+default = ["jemalloc"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
 metal = ["candle-core/metal", "candle-nn/metal"]

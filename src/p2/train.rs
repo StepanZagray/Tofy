@@ -26,7 +26,9 @@ use crate::p2::optimizer::{
     accumulate_parameter_gradients, clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
     ModelEma,
 };
-use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest, PrefetchScope};
+use crate::p2::prefetch::{
+    BatchPrefetcher, MixedStreamBatchPrefetcher, PrefetchRequest, PrefetchScope,
+};
 use crate::p2::sigreg::{sigreg_epps_pulley_seeded, sigreg_quantile_seeded};
 use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var, D};
@@ -469,6 +471,9 @@ pub struct TrainConfig {
     /// Overlap CPU batch generation with GPU work.
     #[serde(default = "default_prefetch_batches")]
     pub prefetch_batches: bool,
+    /// CPU workers allowed to compose foundation-v2 batches ahead of the GPU.
+    #[serde(default = "default_data_workers")]
+    pub data_workers: usize,
     /// Intentionally checkpoint-incompatible action-faithful world core.
     #[serde(default)]
     pub world_core_v2: bool,
@@ -567,6 +572,12 @@ fn default_prefetch_batches() -> bool {
     true
 }
 
+pub fn default_data_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| (parallelism.get() / 2).clamp(1, 8))
+        .unwrap_or(1)
+}
+
 fn default_spatial_action_residual_scale() -> f64 {
     0.25
 }
@@ -651,6 +662,7 @@ impl Default for TrainConfig {
             sigreg_temporal_window: 8,
             sigreg_global_mix: 0.0,
             prefetch_batches: true,
+            data_workers: default_data_workers(),
             world_core_v2: false,
             world_core_v3: false,
             world_core_v4: false,
@@ -702,6 +714,9 @@ impl TrainConfig {
         }
         if self.grad_accum == 0 {
             bail!("grad_accum must be >= 1");
+        }
+        if self.data_workers == 0 {
+            bail!("data_workers must be >= 1");
         }
         if self.recipe == TrainingRecipe::FoundationV2 {
             if !self.lessons.is_empty() {
@@ -929,6 +944,7 @@ impl TrainConfig {
         canonical.profile_update = self.profile_update;
         canonical.pressure_updates = self.pressure_updates.clone();
         canonical.prefetch_batches = self.prefetch_batches;
+        canonical.data_workers = self.data_workers;
         if self != &canonical {
             bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
         }
@@ -5810,6 +5826,21 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         ..MixedStreamConfig::default()
     };
     let mut updates_this_run = 0usize;
+    let total_steps = state
+        .foundation_v2
+        .as_ref()
+        .expect("foundation-v2 state")
+        .total_steps;
+    let mut data_prefetcher = if cfg.prefetch_batches {
+        Some(MixedStreamBatchPrefetcher::new(
+            stream_config.clone(),
+            total_steps,
+            state.global_step,
+            cfg.data_workers,
+        )?)
+    } else {
+        None
+    };
 
     loop {
         let total_steps = state
@@ -5819,6 +5850,9 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             .total_steps;
         let complete = state.global_step >= total_steps as u64;
         if complete || PAUSE_REQUESTED.load(Ordering::SeqCst) {
+            if let Some(prefetcher) = data_prefetcher.as_mut() {
+                prefetcher.shutdown();
+            }
             if latest_checkpoint
                 .as_ref()
                 .and_then(|path| path.file_name())
@@ -5850,13 +5884,24 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             return Ok(report);
         }
 
-        let progress = state.global_step as f32 / total_steps.max(1) as f32;
-        let mixed = compose_mixed_stream_batch(
-            &stream_config,
-            progress,
-            state.global_step,
-            V5DataSplit::Train,
-        )?;
+        let mixed = if let Some(prefetcher) = data_prefetcher.as_mut() {
+            let (batch_index, batch) = prefetcher.recv_next()?;
+            if batch_index != state.global_step {
+                bail!(
+                    "foundation-v2 prefetch returned batch {batch_index} while step {} was required",
+                    state.global_step
+                );
+            }
+            batch
+        } else {
+            let progress = state.global_step as f32 / total_steps.max(1) as f32;
+            compose_mixed_stream_batch(
+                &stream_config,
+                progress,
+                state.global_step,
+                V5DataSplit::Train,
+            )?
+        };
         let consumed = mixed.transitions().cloned().collect::<Vec<_>>();
         update_training_population(&mut state, &consumed);
         let (ep_weight, rollout_enabled) = {
@@ -5953,6 +5998,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let permanent = state
             .global_step
             .is_multiple_of(FOUNDATION_V2_PERMANENT_EVERY);
+        if abort || complete || requested_pause {
+            if let Some(prefetcher) = data_prefetcher.as_mut() {
+                prefetcher.shutdown();
+            }
+        }
         if periodic || permanent || improved_best || abort || complete || requested_pause {
             sync_cuda_device(&device)?;
             if permanent {
