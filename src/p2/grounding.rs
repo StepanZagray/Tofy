@@ -4,14 +4,12 @@
 //! an identical parameter topology and name-seeded initialization.
 
 use crate::p2::data::TransitionSample;
-use crate::p2::model::{FRAME_SIDE, LATENT_GRID, PALETTE_SIZE};
+use crate::p2::model::{FRAME_SIDE, PALETTE_SIZE};
 use anyhow::{ensure, Result};
 use candle_core::{DType, Tensor, D};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-
-const PATCH_SIDE: usize = FRAME_SIDE / LATENT_GRID;
 
 /// Which half of the patch-histogram grounding bundle contributes gradients.
 /// The shared decoder and both raw losses exist in every mode.
@@ -35,54 +33,100 @@ pub struct PatchGroundingLoss {
 /// 16-colour histogram for the corresponding observation patch.
 pub struct PatchHistogramGrounding {
     decoder: Linear,
+    patch_side: usize,
+    latent_grid: usize,
 }
 
 /// Exact, position-preserving decoder used by Full V4. Each spatial token
-/// predicts the 8x8 palette indices in its corresponding observation patch.
+/// predicts the palette indices in its corresponding observation patch.
 /// The synthetic status row is removed before both loss and correctness are
 /// computed.
 pub struct ExactPatchGrounding {
     decoder: Linear,
+    copy_gate: candle_nn::Conv2d,
+    patch_side: usize,
+    latent_grid: usize,
 }
 
 impl ExactPatchGrounding {
-    pub fn new(hidden_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(hidden_dim: usize, patch_side: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        ensure!(
+            patch_side > 0 && FRAME_SIDE.is_multiple_of(patch_side),
+            "exact grounding patch side must divide {FRAME_SIDE}"
+        );
         Ok(Self {
             decoder: linear(
                 hidden_dim,
-                PATCH_SIDE * PATCH_SIDE * PALETTE_SIZE,
+                patch_side * patch_side * PALETTE_SIZE,
                 vb.pp("decoder"),
             )?,
+            copy_gate: candle_nn::conv2d(
+                hidden_dim,
+                patch_side * patch_side,
+                1,
+                Default::default(),
+                vb.pp("copy_gate"),
+            )?,
+            patch_side,
+            latent_grid: FRAME_SIDE / patch_side,
         })
     }
 
-    /// `B×63×64×16` logits in gameplay-pixel order. The full 1024-way token
+    /// `B×63×64×16` logits in gameplay-pixel order. The full per-token
     /// projection is immediately rearranged and the status row is discarded.
     pub fn gameplay_logits(&self, latents: &Tensor) -> Result<Tensor> {
         let (batch, hidden, height, width) = latents.dims4()?;
         ensure!(
-            height == LATENT_GRID && width == LATENT_GRID,
-            "exact grounding expects {LATENT_GRID}x{LATENT_GRID} spatial latents"
+            height == self.latent_grid && width == self.latent_grid,
+            "exact grounding expects {}x{} spatial latents",
+            self.latent_grid,
+            self.latent_grid
         );
         let tokens = latents
             .permute((0, 2, 3, 1))?
             .contiguous()?
             .reshape((batch * height * width, hidden))?;
         let patch_logits = self.decoder.forward(&tokens)?.to_dtype(DType::F32)?;
-        patch_logits
-            .reshape((
-                batch,
-                LATENT_GRID,
-                LATENT_GRID,
-                PATCH_SIDE,
-                PATCH_SIDE,
-                PALETTE_SIZE,
-            ))?
-            .permute((0, 1, 3, 2, 4, 5))?
-            .contiguous()?
-            .reshape((batch, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE))?
+        let patch_logits = patch_logits.reshape((
+            batch,
+            self.latent_grid,
+            self.latent_grid,
+            self.patch_side,
+            self.patch_side,
+            PALETTE_SIZE,
+        ))?;
+        patch_tokens_to_pixels(&patch_logits)?
             .narrow(1, 0, FRAME_SIDE - 1)
             .map_err(Into::into)
+    }
+
+    /// Per-gameplay-pixel copy/change logits decoded from a predicted latent.
+    pub fn copy_gate_logits(&self, latents: &Tensor) -> Result<Tensor> {
+        let (batch, _, height, width) = latents.dims4()?;
+        ensure!(
+            height == self.latent_grid && width == self.latent_grid,
+            "copy gate expects {}x{} spatial latents",
+            self.latent_grid,
+            self.latent_grid
+        );
+        let patch_logits = self.copy_gate.forward(latents)?.to_dtype(DType::F32)?;
+        let patch_logits = patch_logits.permute((0, 2, 3, 1))?.contiguous()?.reshape((
+            batch,
+            self.latent_grid,
+            self.latent_grid,
+            self.patch_side,
+            self.patch_side,
+            1,
+        ))?;
+        patch_tokens_to_pixels(&patch_logits)?
+            .squeeze(3)?
+            .narrow(1, 0, FRAME_SIDE - 1)
+            .map_err(Into::into)
+    }
+
+    /// Per-gameplay-pixel copy/change probability decoded from a predicted latent.
+    pub fn copy_gate(&self, latents: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::sigmoid(&self.copy_gate_logits(latents)?).map_err(Into::into)
     }
 
     pub fn loss(&self, latents: &Tensor, frames: &Tensor) -> Result<Tensor> {
@@ -166,9 +210,15 @@ fn transition_correctness_from_gameplay(
 }
 
 impl PatchHistogramGrounding {
-    pub fn new(hidden_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(hidden_dim: usize, patch_side: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        ensure!(
+            patch_side > 0 && FRAME_SIDE.is_multiple_of(patch_side),
+            "patch grounding patch side must divide {FRAME_SIDE}"
+        );
         Ok(Self {
             decoder: linear(hidden_dim, PALETTE_SIZE, vb.pp("decoder"))?,
+            patch_side,
+            latent_grid: FRAME_SIDE / patch_side,
         })
     }
 
@@ -187,8 +237,10 @@ impl PatchHistogramGrounding {
             "grounding target and prediction shapes must match"
         );
         ensure!(
-            height == LATENT_GRID && width == LATENT_GRID,
-            "grounding expects {LATENT_GRID}x{LATENT_GRID} spatial latents"
+            height == self.latent_grid && width == self.latent_grid,
+            "grounding expects {}x{} spatial latents",
+            self.latent_grid,
+            self.latent_grid
         );
         ensure!(
             samples.len() == batch,
@@ -196,8 +248,9 @@ impl PatchHistogramGrounding {
             samples.len()
         );
 
-        let (histograms, changed, changed_count) = patch_targets(samples)?;
-        let patch_count = batch * LATENT_GRID * LATENT_GRID;
+        let (histograms, changed, changed_count) =
+            patch_targets(samples, self.latent_grid, self.patch_side)?;
+        let patch_count = batch * self.latent_grid * self.latent_grid;
         let unchanged_count = patch_count - changed_count;
         let weights = balanced_patch_weights(&changed, changed_count, unchanged_count);
         let device = predicted.device();
@@ -240,8 +293,12 @@ fn combine_losses(target: Tensor, predicted: Tensor, mode: PatchGroundingMode) -
     }
 }
 
-fn patch_targets(samples: &[TransitionSample]) -> Result<(Vec<f32>, Vec<bool>, usize)> {
-    let patch_count = samples.len() * LATENT_GRID * LATENT_GRID;
+fn patch_targets(
+    samples: &[TransitionSample],
+    latent_grid: usize,
+    patch_side: usize,
+) -> Result<(Vec<f32>, Vec<bool>, usize)> {
+    let patch_count = samples.len() * latent_grid * latent_grid;
     let mut histograms = vec![0.0f32; patch_count * PALETTE_SIZE];
     let mut changed = vec![false; patch_count];
     let mut changed_count = 0usize;
@@ -263,19 +320,19 @@ fn patch_targets(samples: &[TransitionSample]) -> Result<(Vec<f32>, Vec<bool>, u
                 PALETTE_SIZE - 1
             );
         }
-        for patch_y in 0..LATENT_GRID {
-            for patch_x in 0..LATENT_GRID {
-                let patch = (sample_index * LATENT_GRID + patch_y) * LATENT_GRID + patch_x;
+        for patch_y in 0..latent_grid {
+            for patch_x in 0..latent_grid {
+                let patch = (sample_index * latent_grid + patch_y) * latent_grid + patch_x;
                 let mut is_changed = false;
                 let mut gameplay_pixels = 0usize;
-                for dy in 0..PATCH_SIDE {
-                    let y = patch_y * PATCH_SIDE + dy;
+                for dy in 0..patch_side {
+                    let y = patch_y * patch_side + dy;
                     // The final row is a synthetic budget/status display, not board state.
                     if y == FRAME_SIDE - 1 {
                         continue;
                     }
-                    for dx in 0..PATCH_SIDE {
-                        let x = patch_x * PATCH_SIDE + dx;
+                    for dx in 0..patch_side {
+                        let x = patch_x * patch_side + dx;
                         let pixel = y * FRAME_SIDE + x;
                         let colour = sample.next.pixels[pixel] as usize;
                         histograms[patch * PALETTE_SIZE + colour] += 1.0;
@@ -296,6 +353,27 @@ fn patch_targets(samples: &[TransitionSample]) -> Result<(Vec<f32>, Vec<bool>, u
         }
     }
     Ok((histograms, changed, changed_count))
+}
+
+/// Rearrange `[B, patch-y, patch-x, dy, dx, channels]` into pixel order.
+///
+/// Keeping this operation in one geometry seam prevents the exact palette
+/// decoder and copy gate from silently disagreeing about sub-pixel order.
+pub fn patch_tokens_to_pixels(patches: &Tensor) -> Result<Tensor> {
+    let dims = patches.dims();
+    ensure!(
+        dims.len() == 6,
+        "patch token rearrangement expects rank 6, got {}",
+        dims.len()
+    );
+    let (batch, grid_y, grid_x, patch_y, patch_x, channels) =
+        (dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]);
+    ensure!(patch_y == patch_x, "decoder patches must be square");
+    patches
+        .permute((0, 1, 3, 2, 4, 5))?
+        .contiguous()?
+        .reshape((batch, grid_y * patch_y, grid_x * patch_x, channels))
+        .map_err(Into::into)
 }
 
 fn balanced_patch_weights(
@@ -383,8 +461,8 @@ mod tests {
         let device = candle_core::Device::Cpu;
         let vars = VarMap::new();
         let head =
-            ExactPatchGrounding::new(4, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
-        let latents = Tensor::zeros((1, 4, LATENT_GRID, LATENT_GRID), DType::F32, &device)?;
+            ExactPatchGrounding::new(4, 4, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        let latents = Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?;
         let clean = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
         let status = Tensor::ones((1, 1, 1, FRAME_SIDE), DType::U32, &device)?;
         let changed = Tensor::cat(&[&clean.narrow(2, 0, FRAME_SIDE - 1)?, &status], 2)?;
@@ -456,14 +534,14 @@ mod tests {
         let current = vec![0; FRAME_SIDE * FRAME_SIDE];
         let mut next = current.clone();
         next[(FRAME_SIDE - 1) * FRAME_SIDE] = 2;
-        let (_, _, changed_count) = patch_targets(&[sample(current.clone(), next)]).unwrap();
+        let (_, _, changed_count) = patch_targets(&[sample(current.clone(), next)], 8, 8).unwrap();
         assert_eq!(changed_count, 0, "status-only change must be ignored");
 
         let mut next = current.clone();
         next[(FRAME_SIDE - 2) * FRAME_SIDE] = 1;
-        let (histograms, _, changed_count) = patch_targets(&[sample(current, next)]).unwrap();
+        let (histograms, _, changed_count) = patch_targets(&[sample(current, next)], 8, 8).unwrap();
         assert_eq!(changed_count, 1);
-        let bottom_left = (7 * LATENT_GRID) * PALETTE_SIZE;
+        let bottom_left = (7 * 8) * PALETTE_SIZE;
         assert!((histograms[bottom_left] - 55.0 / 56.0).abs() < 1e-6);
         assert!((histograms[bottom_left + 1] - 1.0 / 56.0).abs() < 1e-6);
         let sum: f32 = histograms[bottom_left..bottom_left + PALETTE_SIZE]

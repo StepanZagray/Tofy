@@ -1,6 +1,6 @@
-//! Full V4 semantic evaluation at the exact-decoder seam.
+//! Foundation-v2 semantic evaluation at the exact-decoder seam.
 
-use crate::p2::data::{palette, TransitionSample, FRAME_SIDE};
+use crate::p2::data::{palette, ArcAction, TransitionSample, FRAME_SIDE};
 use crate::p2::model::{WorldModel, PALETTE_SIZE};
 use crate::p2::train::{action_tensors_from_samples, batch_from_samples};
 use anyhow::{ensure, Result};
@@ -9,7 +9,9 @@ use candle_nn::ops;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SEMANTIC_EVAL_SCHEMA: &str = "p2.semantic_eval.v1";
+pub const SEMANTIC_EVAL_SCHEMA: &str = "p2.semantic_eval.v2";
+
+const NONCOMPARABLE_CONTENT_MASKS: [&str; 3] = ["content", "padding", "changed_content"];
 
 const MASKS: [&str; 6] = [
     "content",
@@ -49,6 +51,7 @@ pub fn aggregate_decoder_metrics(
     SemanticDecoderMetrics {
         masks: masks
             .into_iter()
+            .filter(|(name, _)| !NONCOMPARABLE_CONTENT_MASKS.contains(&name.as_str()))
             .map(|(name, rows)| {
                 let pixels = rows.iter().map(|row| row.pixels).sum::<usize>();
                 let transitions = rows.iter().map(|row| row.transitions).sum::<usize>();
@@ -88,6 +91,78 @@ pub fn aggregate_decoder_metrics(
     }
 }
 
+/// Model-independent reducer used by the report path and by action-blindness
+/// regression tests. `legal_actions[state]` is the complete candidate set for
+/// that held-out state; the callback returns the flattened predicted latent.
+pub fn action_controllability_probe<F>(
+    legal_actions: &[Vec<ArcAction>],
+    difference_threshold: f64,
+    mut predict: F,
+) -> Result<ActionControllabilityMetrics>
+where
+    F: FnMut(usize, &ArcAction) -> Result<Vec<f32>>,
+{
+    ensure!(
+        difference_threshold.is_finite() && difference_threshold >= 0.0,
+        "action-controllability threshold must be finite and non-negative"
+    );
+    let mut pair_distance_sum = 0.0f64;
+    let mut pairs = 0usize;
+    let mut eligible_states = 0usize;
+    let mut states_above_threshold = 0usize;
+    let mut prediction_count = 0usize;
+    for (state_index, actions) in legal_actions.iter().enumerate() {
+        if actions.len() < 2 {
+            continue;
+        }
+        eligible_states += 1;
+        let predictions = actions
+            .iter()
+            .map(|action| predict(state_index, action))
+            .collect::<Result<Vec<_>>>()?;
+        prediction_count += predictions.len();
+        let dimension = predictions.first().map_or(0, Vec::len);
+        ensure!(dimension > 0, "action-controllability latent is empty");
+        ensure!(
+            predictions.iter().all(|row| row.len() == dimension),
+            "action-controllability predictions have inconsistent dimensions"
+        );
+        ensure!(
+            predictions.iter().flatten().all(|value| value.is_finite()),
+            "action-controllability predictions contain a non-finite latent"
+        );
+        let mut state_above_threshold = false;
+        for left in 0..predictions.len() {
+            for right in left + 1..predictions.len() {
+                let squared = predictions[left]
+                    .iter()
+                    .zip(&predictions[right])
+                    .map(|(left, right)| {
+                        let delta = f64::from(*left) - f64::from(*right);
+                        delta * delta
+                    })
+                    .sum::<f64>();
+                let distance = (squared / dimension as f64).sqrt();
+                pair_distance_sum += distance;
+                pairs += 1;
+                state_above_threshold |= distance > difference_threshold;
+            }
+        }
+        states_above_threshold += usize::from(state_above_threshold);
+    }
+    Ok(ActionControllabilityMetrics {
+        states: legal_actions.len(),
+        states_with_action_pairs: eligible_states,
+        action_predictions: prediction_count,
+        action_pairs: pairs,
+        mean_pairwise_latent_distance: (pairs > 0).then_some(pair_distance_sum / pairs as f64),
+        difference_threshold,
+        fraction_states_above_threshold: (eligible_states > 0)
+            .then_some(states_above_threshold as f64 / eligible_states as f64),
+        action_contract: "all caller-supplied legal actions per fixed held-out state; unordered pair RMS distance over flattened predicted consumer latents".into(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticSourceMetrics {
     pub transitions: usize,
@@ -100,9 +175,53 @@ pub struct SemanticEvaluation {
     pub schema: String,
     pub mask_contract: String,
     pub reduction_contract: String,
-    pub action_mask_contract: String,
+    pub population_contract: String,
+    pub action_control_contract: String,
     pub overall: SemanticSourceMetrics,
     pub by_source: BTreeMap<String, SemanticSourceMetrics>,
+}
+
+/// Optional future action-ablation configuration. The default deliberately
+/// avoids action id 0 because no trained NULL embedding exists in foundation-v2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticControlConfig {
+    pub trained_null_action_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionControllabilityMetrics {
+    pub states: usize,
+    pub states_with_action_pairs: usize,
+    pub action_predictions: usize,
+    pub action_pairs: usize,
+    /// RMS distance per latent element, averaged over unordered action pairs.
+    pub mean_pairwise_latent_distance: Option<f64>,
+    pub difference_threshold: f64,
+    /// Fraction of pair-eligible states with at least one distance above the
+    /// fixed threshold.
+    pub fraction_states_above_threshold: Option<f64>,
+    pub action_contract: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AmbiguityHistoryMetrics {
+    pub history_length: usize,
+    pub rows: usize,
+    pub groups: usize,
+    pub repeated_groups: usize,
+    pub ambiguous_groups: usize,
+    pub rows_in_ambiguous_groups: usize,
+    pub ambiguous_group_fraction: Option<f64>,
+    /// Majority factual-successor accuracy within each visible-input group.
+    pub deterministic_exact_ceiling: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AmbiguityCeiling {
+    pub key_contract: String,
+    pub outcome_contract: String,
+    pub history_1: AmbiguityHistoryMetrics,
+    pub history_2: AmbiguityHistoryMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,14 +438,111 @@ pub fn latent_semantic_metrics(
         },
     );
     let mut variants = accum.finish().variants;
-    Ok(variants
+    let mut metrics = variants
         .remove("rollout")
-        .expect("rollout variant was inserted"))
+        .expect("rollout variant was inserted");
+    for mask in NONCOMPARABLE_CONTENT_MASKS {
+        metrics.masks.remove(mask);
+    }
+    Ok(metrics)
 }
 
 fn gameplay(frame: &crate::p2::data::ArcFrame) -> &[u8] {
     let end = ((FRAME_SIDE - 1) * FRAME_SIDE).min(frame.pixels.len());
     &frame.pixels[..end]
+}
+
+fn append_action_key(key: &mut Vec<u8>, action: &ArcAction) {
+    key.push(action.id);
+    key.push(action.x.unwrap_or(u8::MAX));
+    key.push(action.y.unwrap_or(u8::MAX));
+}
+
+fn ambiguity_history_metrics(
+    history_length: usize,
+    rows: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> AmbiguityHistoryMetrics {
+    let mut groups = BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
+    for (key, successor) in rows {
+        groups.entry(key).or_default().push(successor);
+    }
+    let rows = groups.values().map(Vec::len).sum::<usize>();
+    let repeated_groups = groups
+        .values()
+        .filter(|successors| successors.len() > 1)
+        .count();
+    let mut ambiguous_groups = 0usize;
+    let mut rows_in_ambiguous_groups = 0usize;
+    let mut deterministic_exact_correct = 0usize;
+    for successors in groups.values() {
+        let mut outcomes = BTreeMap::<&[u8], usize>::new();
+        for successor in successors {
+            *outcomes.entry(successor).or_default() += 1;
+        }
+        if outcomes.len() > 1 {
+            ambiguous_groups += 1;
+            rows_in_ambiguous_groups += successors.len();
+        }
+        deterministic_exact_correct += outcomes.values().copied().max().unwrap_or(0);
+    }
+    AmbiguityHistoryMetrics {
+        history_length,
+        rows,
+        groups: groups.len(),
+        repeated_groups,
+        ambiguous_groups,
+        rows_in_ambiguous_groups,
+        ambiguous_group_fraction: (!groups.is_empty())
+            .then_some(ambiguous_groups as f64 / groups.len() as f64),
+        deterministic_exact_ceiling: (rows > 0)
+            .then_some(deterministic_exact_correct as f64 / rows as f64),
+    }
+}
+
+/// Measure factual-successor ambiguity for a visible-state/action predictor.
+/// History two is formed only from contiguous rows sharing the explicit
+/// provenance trajectory identity; family labels are never used as sequence
+/// identity.
+pub fn ambiguity_ceiling(samples: &[TransitionSample]) -> AmbiguityCeiling {
+    let history_1_rows = samples.iter().map(|sample| {
+        let mut key = Vec::with_capacity(3 + gameplay(&sample.current).len());
+        append_action_key(&mut key, &sample.action);
+        key.extend_from_slice(gameplay(&sample.current));
+        (key, gameplay(&sample.next).to_vec())
+    });
+
+    let mut trajectories = BTreeMap::<&str, Vec<&TransitionSample>>::new();
+    for sample in samples {
+        trajectories
+            .entry(sample.provenance.trajectory_id.as_str())
+            .or_default()
+            .push(sample);
+    }
+    let mut history_2_rows = Vec::new();
+    for steps in trajectories.values_mut() {
+        steps.sort_by_key(|sample| sample.transition_index);
+        for pair in steps.windows(2) {
+            let previous = pair[0];
+            let current = pair[1];
+            if current.transition_index != previous.transition_index.saturating_add(1)
+                || gameplay(&previous.next) != gameplay(&current.current)
+            {
+                continue;
+            }
+            let mut key = Vec::with_capacity(3 + 2 * gameplay(&current.current).len());
+            append_action_key(&mut key, &current.action);
+            key.extend_from_slice(gameplay(&previous.current));
+            key.extend_from_slice(gameplay(&current.current));
+            history_2_rows.push((key, gameplay(&current.next).to_vec()));
+        }
+    }
+
+    AmbiguityCeiling {
+        key_contract: "h1=(visible current gameplay pixels, action id, ACTION6 coordinates); h2=(previous visible gameplay pixels, visible current gameplay pixels, action), with previous rows joined only by provenance.trajectory_id and contiguous transition_index".into(),
+        outcome_contract: "distinct factual successor = distinct status-row-excluded next gameplay pixels".into(),
+        history_1: ambiguity_history_metrics(1, history_1_rows),
+        history_2: ambiguity_history_metrics(2, history_2_rows),
+    }
 }
 
 fn source_labels(samples: &[TransitionSample], _source_lengths: &[(String, usize)]) -> Vec<String> {
@@ -417,21 +633,26 @@ pub fn collision_census(
     }
 }
 
-fn shuffled_samples(
-    samples: &[TransitionSample],
-    source_lengths: &[(String, usize)],
-) -> Vec<TransitionSample> {
+/// Deterministically rotate complete action tuples only among rows that share
+/// `provenance.source_kind`. Input ordering and caller-supplied source spans
+/// cannot cause cross-family action donation.
+pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
     let mut shuffled = samples.to_vec();
-    let mut start = 0usize;
-    for (_, len) in source_lengths {
-        let end = (start + *len).min(samples.len());
-        if end > start + 1 {
-            for (index, row) in shuffled.iter_mut().enumerate().take(end).skip(start) {
-                let donor = start + (index - start + 1) % (end - start);
-                row.action = samples[donor].action.clone();
-            }
+    let mut source_rows = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, sample) in samples.iter().enumerate() {
+        source_rows
+            .entry(sample.provenance.source_kind.as_str())
+            .or_default()
+            .push(index);
+    }
+    for indices in source_rows.values() {
+        if indices.len() < 2 {
+            continue;
         }
-        start = end;
+        for (position, &target) in indices.iter().enumerate() {
+            let donor = indices[(position + 1) % indices.len()];
+            shuffled[target].action = samples[donor].action.clone();
+        }
     }
     shuffled
 }
@@ -445,12 +666,30 @@ pub fn evaluate_semantics(
     physical_batch: usize,
     device: &Device,
 ) -> Result<SemanticEvaluation> {
+    evaluate_semantics_with_control(
+        model,
+        samples,
+        source_lengths,
+        physical_batch,
+        device,
+        SemanticControlConfig::default(),
+    )
+}
+
+pub fn evaluate_semantics_with_control(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    source_lengths: &[(String, usize)],
+    physical_batch: usize,
+    device: &Device,
+    control: SemanticControlConfig,
+) -> Result<SemanticEvaluation> {
     ensure!(
         model.config().world_core_v4,
         "semantic evaluation requires Full V4"
     );
     let labels = source_labels(samples, source_lengths);
-    let shuffled = shuffled_samples(samples, source_lengths);
+    let shuffled = shuffled_action_control_samples(samples);
     let mut overall = SourceAccum::default();
     let mut by_source = BTreeMap::<String, SourceAccum>::new();
     for start in (0..samples.len()).step_by(physical_batch.max(1)) {
@@ -467,16 +706,6 @@ pub fn evaluate_semantics(
                 &batch.goals,
             )?
             .y;
-        let masked_actions = Tensor::zeros((rows.len(),), DType::U32, device)?;
-        let masked_coords = Tensor::zeros((rows.len(), 2), DType::F32, device)?;
-        let masked_prediction = model
-            .forward_from_latent(
-                &current_latent,
-                &masked_actions,
-                &masked_coords,
-                &batch.goals,
-            )?
-            .y;
         let (shuffled_actions, shuffled_coords) =
             action_tensors_from_samples(&shuffled[start..end], device)?;
         let shuffled_prediction = model
@@ -487,7 +716,7 @@ pub fn evaluate_semantics(
                 &batch.goals,
             )?
             .y;
-        let decoded = [
+        let mut decoded = vec![
             (
                 "current_reconstruction",
                 model.exact_gameplay_logits(&current_latent)?,
@@ -505,14 +734,29 @@ pub fn evaluate_semantics(
                 model.exact_gameplay_logits(&current_latent)?,
             ),
             (
-                "action_masked_prediction",
-                model.exact_gameplay_logits(&masked_prediction)?,
-            ),
-            (
                 "action_shuffled_prediction",
                 model.exact_gameplay_logits(&shuffled_prediction)?,
             ),
         ];
+        if let Some(null_action_id) = control.trained_null_action_id {
+            ensure!(
+                null_action_id <= 7,
+                "trained NULL action id must be in the model embedding range 0..=7"
+            );
+            let null_actions = Tensor::from_vec(
+                vec![u32::from(null_action_id); rows.len()],
+                rows.len(),
+                device,
+            )?;
+            let null_coords = Tensor::zeros((rows.len(), 2), DType::F32, device)?;
+            let null_prediction = model
+                .forward_from_latent(&current_latent, &null_actions, &null_coords, &batch.goals)?
+                .y;
+            decoded.push((
+                "trained_null_action_prediction",
+                model.exact_gameplay_logits(&null_prediction)?,
+            ));
+        }
         let decoded = decoded
             .into_iter()
             .map(|(name, logits)| Ok((name, decoded_rows(&logits)?)))
@@ -567,12 +811,22 @@ pub fn evaluate_semantics(
             }
         }
     }
+    let mut overall = overall.finish();
+    for metrics in overall.variants.values_mut() {
+        for mask in NONCOMPARABLE_CONTENT_MASKS {
+            metrics.masks.remove(mask);
+        }
+    }
     Ok(SemanticEvaluation {
         schema: SEMANTIC_EVAL_SCHEMA.into(),
-        mask_contract: "gameplay=rows[0,63); content=[0,width)x[0,height); padding=gameplay-content; foreground=target!=EMPTY; changed=current!=target; unchanged=gameplay-changed; status=row63 excluded from decoder metrics".into(),
-        reduction_contract: "pixel aggregate plus equal-transition mean; every source is also reported independently".into(),
-        action_mask_contract: "masked uses action id 0 and zero coordinates; shuffled rotates actions only within each named source".into(),
-        overall: overall.finish(),
+        mask_contract: "gameplay=rows[0,63); content=[0,width)x[0,height); padding=gameplay-content; foreground=target!=EMPTY; changed=current!=target; unchanged=gameplay-changed; status=row63 excluded. content/padding/changed_content are omitted from overall and retained only in by_source because content rectangles are not comparable across source kinds".into(),
+        reduction_contract: "overall aggregates only source-comparable masks; by_source reports pixel aggregate plus equal-transition mean within provenance.source_kind".into(),
+        population_contract: "one_step_population; not comparable as a horizon curve with semantic_rollout, whose trajectory-filtered population is separately fingerprinted".into(),
+        action_control_contract: match control.trained_null_action_id {
+            Some(id) => format!("action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; trained_null_action_prediction uses configured trained NULL action id {id} with zero coordinates"),
+            None => "action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; no action-masked/null variant is emitted because foundation-v2 has no trained NULL action embedding".into(),
+        },
+        overall,
         by_source: by_source
             .into_iter()
             .map(|(source, metrics)| (source, metrics.finish()))
@@ -683,11 +937,25 @@ mod tests {
             "hard_copy_control",
             "zero_control",
             "direct_target_positive_control",
-            "action_masked_prediction",
             "action_shuffled_prediction",
         ] {
             assert!(metrics.overall.variants.contains_key(variant));
         }
+        assert!(!metrics
+            .overall
+            .variants
+            .contains_key("action_masked_prediction"));
+        assert!(metrics.overall.variants.values().all(|variant| {
+            NONCOMPARABLE_CONTENT_MASKS
+                .iter()
+                .all(|mask| !variant.masks.contains_key(*mask))
+        }));
+        assert!(metrics.by_source.values().all(|source| {
+            source
+                .variants
+                .values()
+                .all(|variant| variant.masks.contains_key("content"))
+        }));
         Ok(())
     }
 }

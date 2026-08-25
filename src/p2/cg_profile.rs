@@ -285,7 +285,7 @@ impl RepresentativeUpdateCapture {
             let (state, norm) = match norm_index {
                 None => (GradientState::Missing, None),
                 Some(index) if !norms[index].is_finite() => (GradientState::NonFinite, None),
-                Some(index) if norms[index] == 0.0 => (GradientState::Zero, None),
+                Some(index) if norms[index] == 0.0 => (GradientState::Zero, Some(0.0)),
                 Some(index) => (GradientState::Present, Some(norms[index] as f64)),
             };
             session.record_gradient("vb", name, state, norm)?;

@@ -6,25 +6,30 @@ use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, Bran
 use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCapture};
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
-    generate_curriculum, ArcFrame, FactualBatch, TransitionSample, FRAME_SIDE, GOAL_FEATURES_DIM,
+    compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
+    FactualBatch, MixedStreamBatch, MixedStreamConfig, MixedStreamKind, TransitionSample,
+    V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
+use crate::p2::eval::{evaluate_gate_support, GateSupportMetrics};
 use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
     SigregStatistic, TrainingRecipe,
 };
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
-    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, PALETTE_SIZE, PREFIX_HORIZONS,
+    flatten_latent, latent_mse_per_sample, zero_action_film_projections, ModelConfig, PtrmConfig,
+    RecursionDepth, RecursionOpts, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
+    PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
     accumulate_parameter_gradients, clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
+    ModelEma,
 };
 use crate::p2::prefetch::{BatchPrefetcher, PrefetchRequest, PrefetchScope};
 use crate::p2::sigreg::{sigreg_epps_pulley_seeded, sigreg_quantile_seeded};
 use anyhow::{bail, Context, Result};
-use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
+use candle_core::{backprop::GradStore, DType, Device, Tensor, Var, D};
 use candle_graph::{ExecutionStep, SpanKind};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
@@ -72,14 +77,214 @@ const Q_SURPRISE_WEIGHT: f64 = 0.1;
 const SIGREG_LOSS_CAP: f64 = 10_000.0;
 /// Global gradient L2 clip for recursive training stability.
 const MAX_GRAD_NORM: f64 = 1.0;
+const FOUNDATION_V2_EP_MIN_WEIGHT: f64 = 1e-4;
+const FOUNDATION_V2_EP_MAX_WEIGHT: f64 = 0.1;
+const FOUNDATION_V2_EP_GRADIENT_BUDGET: f64 = 0.3;
+const FOUNDATION_V2_GATE_EVERY: u64 = 1_024;
+const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
+const FOUNDATION_V2_GATE_ROWS: usize = 512;
+const FOUNDATION_V2_GATE_SEED: u64 = 0xF0A2_DA7A_0000_0005;
+const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 64;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v11";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v8";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v12";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v9";
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub type SigregTarget = SigregPopulation;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChangedPixelWeights {
+    pub content_pixels: usize,
+    pub changed_pixels: usize,
+    pub unchanged_pixels: usize,
+    pub changed_fraction: f64,
+    pub changed_weight: f64,
+    pub unchanged_weight: f64,
+}
+
+/// Resolve ADR 0003's changed/unchanged weighting from gameplay masks. PAD is
+/// excluded by `content_mask`; semantic palette zero remains a valid content
+/// pixel and is never used as a padding proxy.
+pub fn foundation_v2_loss_weights_from_masks(
+    current: &[u8],
+    target: &[u8],
+    content_mask: &[u8],
+) -> Result<ChangedPixelWeights> {
+    if current.len() != target.len() || current.len() != content_mask.len() {
+        bail!("foundation-v2 loss masks must have identical lengths");
+    }
+    let content_pixels = content_mask.iter().filter(|&&value| value != 0).count();
+    if content_pixels == 0 {
+        bail!("foundation-v2 loss requires at least one content pixel");
+    }
+    let changed_pixels = current
+        .iter()
+        .zip(target)
+        .zip(content_mask)
+        .filter(|((before, after), content)| **content != 0 && before != after)
+        .count();
+    let unchanged_pixels = content_pixels - changed_pixels;
+    let changed_fraction = changed_pixels as f64 / content_pixels as f64;
+    let ratio = if changed_pixels == 0 {
+        f64::INFINITY
+    } else {
+        (1.0 - changed_fraction) / changed_fraction
+    };
+    Ok(ChangedPixelWeights {
+        content_pixels,
+        changed_pixels,
+        unchanged_pixels,
+        changed_fraction,
+        changed_weight: ratio.clamp(1.0, 64.0),
+        unchanged_weight: 1.0,
+    })
+}
+
+/// Pure multiplicative EP controller. The returned weight targets
+/// `weight * ||g_ep|| = 0.3 * ||g_pred||`, then applies the ADR bounds.
+pub fn foundation_v2_ep_weight_update(
+    current_weight: f64,
+    ep_gradient_l2: f64,
+    prediction_gradient_l2: f64,
+) -> f64 {
+    let current = current_weight.clamp(FOUNDATION_V2_EP_MIN_WEIGHT, FOUNDATION_V2_EP_MAX_WEIGHT);
+    if !(ep_gradient_l2.is_finite() && prediction_gradient_l2.is_finite())
+        || ep_gradient_l2 < 0.0
+        || prediction_gradient_l2 < 0.0
+    {
+        return current;
+    }
+    if ep_gradient_l2 == 0.0 {
+        return FOUNDATION_V2_EP_MAX_WEIGHT;
+    }
+    let multiplier =
+        FOUNDATION_V2_EP_GRADIENT_BUDGET * prediction_gradient_l2 / (current * ep_gradient_l2);
+    (current * multiplier).clamp(FOUNDATION_V2_EP_MIN_WEIGHT, FOUNDATION_V2_EP_MAX_WEIGHT)
+}
+
+/// WSD schedule used by foundation-v2. `step` is the number of the update
+/// about to execute (0 is the untrained boundary, `total_steps` is final).
+pub fn foundation_v2_wsd_learning_rate(step: usize, total_steps: usize) -> f64 {
+    const PEAK: f64 = 1e-3;
+    const FINAL: f64 = 1e-4;
+    const WARMUP: usize = 500;
+    if total_steps == 0 {
+        return FINAL;
+    }
+    let step = step.min(total_steps);
+    if step < WARMUP {
+        return PEAK * step as f64 / WARMUP as f64;
+    }
+    let decay_steps = ((total_steps as f64) * 0.15).ceil() as usize;
+    let decay_steps = decay_steps.max(1);
+    let decay_start = total_steps.saturating_sub(decay_steps);
+    if step <= decay_start {
+        return PEAK;
+    }
+    let progress = (step - decay_start) as f64 / decay_steps as f64;
+    let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    FINAL + (PEAK - FINAL) * cosine
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GateResult {
+    pub name: String,
+    pub passed: bool,
+    pub measured: Option<f64>,
+    pub threshold: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GateEvaluation {
+    pub step: u64,
+    pub metrics: GateSupportMetrics,
+    pub running_best_before: Option<f64>,
+    pub running_best_after: Option<f64>,
+    pub gates: Vec<FoundationV2GateResult>,
+}
+
+pub fn foundation_v2_gate_evaluation(
+    step: u64,
+    metrics: GateSupportMetrics,
+    running_best: Option<f64>,
+) -> FoundationV2GateEvaluation {
+    let current_exact = metrics.one_step_changed_exact;
+    let running_best_after = match (running_best, current_exact) {
+        (Some(best), Some(current)) => Some(best.max(current)),
+        (None, Some(current)) => Some(current),
+        (best, None) => best,
+    };
+    let collapse_floor = running_best_after.map(|best| best * 0.8);
+    let foreground_active = step >= 4_096;
+    let gates = vec![
+        FoundationV2GateResult {
+            name: "positive_improvement".into(),
+            passed: metrics
+                .improvement_fraction
+                .is_some_and(|value| value > 0.0),
+            measured: metrics.improvement_fraction,
+            threshold: "> 0".into(),
+        },
+        FoundationV2GateResult {
+            name: "shuffled_action_ratio".into(),
+            passed: metrics
+                .shuffled_action_changed_pixel_ratio
+                .is_some_and(|value| value <= 0.95),
+            measured: metrics.shuffled_action_changed_pixel_ratio,
+            threshold: "<= 0.95".into(),
+        },
+        FoundationV2GateResult {
+            name: "foreground_reconstruction".into(),
+            passed: !foreground_active
+                || metrics
+                    .foreground_reconstruction_accuracy
+                    .is_some_and(|value| value >= 0.85),
+            measured: metrics.foreground_reconstruction_accuracy,
+            threshold: if foreground_active {
+                ">= 0.85".into()
+            } else {
+                "warmup PASS until step 4096".into()
+            },
+        },
+        FoundationV2GateResult {
+            name: "one_step_collapse".into(),
+            passed: current_exact
+                .zip(collapse_floor)
+                .is_some_and(|(current, floor)| current >= floor),
+            measured: current_exact,
+            threshold: collapse_floor
+                .map(|floor| format!(">= {floor:.8} (0.8 x running best)"))
+                .unwrap_or_else(|| "metric required".into()),
+        },
+    ];
+    FoundationV2GateEvaluation {
+        step,
+        metrics,
+        running_best_before: running_best,
+        running_best_after,
+        gates,
+    }
+}
+
+/// Fail closed after the same named gate fails in the two latest evaluations.
+pub fn foundation_v2_gate_history_aborts(history: &[FoundationV2GateEvaluation]) -> bool {
+    if history.len() < 2 {
+        return false;
+    }
+    let Some((latest, prior)) = history.last().zip(history.get(history.len() - 2)) else {
+        return false;
+    };
+    latest.gates.iter().any(|gate| {
+        !gate.passed
+            && prior
+                .gates
+                .iter()
+                .find(|candidate| candidate.name == gate.name)
+                .is_some_and(|candidate| !candidate.passed)
+    })
+}
 
 fn default_sigreg_target() -> SigregTarget {
     SigregTarget::Marginal
@@ -120,7 +325,7 @@ pub fn global_step_from_cursor(
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PAUSE_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainConfig {
     #[serde(default)]
     pub recipe: TrainingRecipe,
@@ -498,7 +703,11 @@ impl TrainConfig {
         if self.grad_accum == 0 {
             bail!("grad_accum must be >= 1");
         }
-        if self.lessons.is_empty() {
+        if self.recipe == TrainingRecipe::FoundationV2 {
+            if !self.lessons.is_empty() {
+                bail!("foundation-v2 does not use lesson staging");
+            }
+        } else if self.lessons.is_empty() {
             bail!("at least one lesson is required");
         }
         if self.max_steps_this_run == Some(0) {
@@ -510,8 +719,10 @@ impl TrainConfig {
         if self.pressure_updates.contains(&0) {
             bail!("pressure_updates are one-based and must be > 0");
         }
-        for lesson in &self.lessons {
-            lesson_to_curriculum(lesson)?;
+        if self.recipe != TrainingRecipe::FoundationV2 {
+            for lesson in &self.lessons {
+                lesson_to_curriculum(lesson)?;
+            }
         }
         if !(self.lr.is_finite() && self.lr > 0.0) {
             bail!("lr must be finite and > 0");
@@ -543,9 +754,12 @@ impl TrainConfig {
         self.branch_learning.validate(self.grad_accum)?;
         if self.recipe == TrainingRecipe::FullV4 {
             self.validate_full_v4()?;
+        } else if self.recipe == TrainingRecipe::FoundationV2 {
+            self.validate_foundation_v2()?;
         }
         let resolved = self.resolved_experiment()?;
-        if resolved.factual_learning
+        if self.recipe != TrainingRecipe::FoundationV2
+            && resolved.factual_learning
             && !self
                 .physical_batch
                 .is_multiple_of(crate::p2::data::FACTUAL_BRANCHES_PER_GROUP)
@@ -561,6 +775,11 @@ impl TrainConfig {
     pub fn model_config(&self) -> ModelConfig {
         ModelConfig {
             frame_side: FRAME_SIDE,
+            patch_size: if self.recipe == TrainingRecipe::FoundationV2 {
+                PATCH_SIZE
+            } else {
+                LEGACY_PATCH_SIZE
+            },
             hidden_dim: self.hidden_dim,
             action_dim: self.action_dim,
             goal_dim: GOAL_FEATURES_DIM,
@@ -578,6 +797,7 @@ impl TrainConfig {
             world_core_v2: self.world_core_v2,
             world_core_v3: self.world_core_v3,
             world_core_v4: self.world_core_v4,
+            world_core_v5: self.recipe == TrainingRecipe::FoundationV2,
             consumer_readout: self.consumer_readout,
         }
     }
@@ -635,6 +855,90 @@ impl TrainConfig {
         self.spatial_action_field = true;
         self.spatial_action_residual = false;
         self.branch_learning = BranchLearningConfig::default();
+    }
+
+    /// Resolve ADR 0003's fixed model/objective choices. Runtime controls —
+    /// seed, total steps (`steps_per_lesson` storage for compatibility), batch,
+    /// device, output, and checkpoint cadence — remain caller-owned.
+    pub fn apply_foundation_v2_recipe(&mut self) {
+        self.recipe = TrainingRecipe::FoundationV2;
+        self.lessons.clear();
+        self.grad_accum = 1;
+        self.sigreg_projections = 1024;
+        self.sigreg_knots = 17;
+        self.sigreg_weight = 0.01;
+        self.sigreg_max_rows = 0;
+        self.sigreg_target = SigregTarget::Marginal;
+        self.sigreg_statistic = SigregStatistic::EppsPulley;
+        self.sigreg_global_mix = 0.0;
+        self.sigreg_spatial = false;
+        self.sigreg_spatial_pool = false;
+        self.sigreg_pre_rms_spatial = false;
+        self.sigreg_projector = false;
+        self.patch_grounding_weight = 0.0;
+        self.exact_grounding_weight = 0.0;
+        self.event_weight = 0.1;
+        self.q_weight = 0.1;
+        self.rollout_weight = 0.02;
+        self.reliability_weight = 0.1;
+        self.prefix_weight = 0.0;
+        self.ptrm_rank_every = 0;
+        self.randomize_depth = false;
+        self.supervise_last_outer_only = true;
+        self.phased_training = false;
+        self.stop_grad_event_y = true;
+        self.stop_grad_q_y = true;
+        self.q_quantile_targets = false;
+        self.train_z_noise = 0.0;
+        self.baseline_d1 = false;
+        self.residual_y_update = true;
+        self.warm_start_y = true;
+        self.hidden_dim = 128;
+        self.action_dim = 32;
+        self.inner_steps = 2;
+        self.outer_steps = 2;
+        self.lr = 1e-3;
+        self.weight_decay = 0.01;
+        self.muon_momentum = 0.95;
+        self.muon_rms_scale = MUON_RMS_SCALE;
+        self.bf16_conv = false;
+        self.shuffled_episodes = false;
+        self.world_core_v2 = false;
+        self.world_core_v3 = false;
+        self.world_core_v4 = true;
+        self.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        self.spatial_action_field = true;
+        self.spatial_action_residual = false;
+        self.branch_learning = BranchLearningConfig::default();
+    }
+
+    fn validate_foundation_v2(&self) -> Result<()> {
+        let mut canonical = self.clone();
+        canonical.apply_foundation_v2_recipe();
+        // Preserve the runtime/provenance fields explicitly left caller-owned.
+        canonical.seed = self.seed;
+        canonical.steps_per_lesson = self.steps_per_lesson;
+        canonical.physical_batch = self.physical_batch;
+        canonical.device = self.device.clone();
+        canonical.output_dir = self.output_dir.clone();
+        canonical.resume = self.resume.clone();
+        canonical.allow_batch_schedule_migration = self.allow_batch_schedule_migration;
+        canonical.checkpoint_every_steps = self.checkpoint_every_steps;
+        canonical.max_steps_this_run = self.max_steps_this_run;
+        canonical.init_seed = self.init_seed;
+        canonical.profile_update = self.profile_update;
+        canonical.pressure_updates = self.pressure_updates.clone();
+        canonical.prefetch_batches = self.prefetch_batches;
+        if self != &canonical {
+            bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
+        }
+        if self.physical_batch < crate::p2::data::FACTUAL_BRANCHES_PER_GROUP {
+            bail!(
+                "foundation-v2 physical_batch must be at least {}",
+                crate::p2::data::FACTUAL_BRANCHES_PER_GROUP
+            );
+        }
+        Ok(())
     }
 
     fn validate_full_v4(&self) -> Result<()> {
@@ -803,11 +1107,53 @@ pub struct LessonReport {
     pub mean_losses: LessonLossMeans,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2LossMeans {
+    pub total: f64,
+    pub pred_ce: f64,
+    pub gate: f64,
+    pub latent: f64,
+    pub enc_ce: f64,
+    pub separation: f64,
+    pub pull: f64,
+    pub inverse_action: f64,
+    pub ep: f64,
+    pub rollout: f64,
+    pub event: f64,
+    pub q: f64,
+    pub reliability: f64,
+    pub pre_clip_gradient_norm: f64,
+    pub gradient_clip_scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2EpGradientSample {
+    pub step: u64,
+    pub encoder_ep_gradient_l2: f64,
+    pub encoder_prediction_gradient_l2: f64,
+    pub ep_weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2TrainingReport {
+    pub total_steps: usize,
+    pub mean_losses: FoundationV2LossMeans,
+    pub ep_weight: f64,
+    pub ep_gradient_budget: Vec<FoundationV2EpGradientSample>,
+    pub gate_history: Vec<FoundationV2GateEvaluation>,
+    pub best_changed_exact: Option<f64>,
+    pub best_checkpoint: Option<PathBuf>,
+    pub rollout_enabled: bool,
+    pub permanent_checkpoints: Vec<PathBuf>,
+    pub clip_strategy: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrainStatus {
     Completed,
     Paused,
+    Aborted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,6 +1199,8 @@ pub struct TrainReport {
     pub gradient_pressure: Option<GradientPressureDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gradient_pressure_samples: Vec<GradientPressureDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foundation_v2: Option<FoundationV2TrainingReport>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
 }
@@ -1098,6 +1446,21 @@ struct TrainerState {
     gradient_pressure: Option<GradientPressureDiagnostics>,
     #[serde(default)]
     gradient_pressure_samples: Vec<GradientPressureDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foundation_v2: Option<FoundationV2TrainerState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FoundationV2TrainerState {
+    total_steps: usize,
+    ep_weight: f64,
+    ep_gradient_budget: Vec<FoundationV2EpGradientSample>,
+    gate_history: Vec<FoundationV2GateEvaluation>,
+    best_changed_exact: Option<f64>,
+    rollout_enabled: bool,
+    loss_sums: FoundationV2LossMeans,
+    loss_steps: u64,
+    permanent_checkpoints: Vec<PathBuf>,
 }
 
 fn default_training_population_hash() -> u64 {
@@ -1584,11 +1947,11 @@ pub fn action_tensors_from_samples(
         .par_iter()
         .map(|sample| {
             let id = sample.action.id as u32;
-            if !(1..ACTION_VOCAB as u32).contains(&id) {
-                bail!("action id {id} out of official range 1..{ACTION_VOCAB}");
+            if id >= ACTION_VOCAB as u32 {
+                bail!("action id {id} out of official range 0..{ACTION_VOCAB}");
             }
             match (id, sample.action.x, sample.action.y) {
-                (6, Some(_), Some(_)) | (1..=5, None, None) | (7, None, None) => Ok(id),
+                (6, Some(_), Some(_)) | (0..=5, None, None) | (7, None, None) => Ok(id),
                 (6, _, _) => bail!("ACTION6 requires a complete coordinate pair"),
                 (_, Some(_), _) | (_, _, Some(_)) => {
                     bail!("coordinates are only valid for ACTION6")
@@ -2975,6 +3338,512 @@ fn q_targets_from_mse(per: &Tensor, cfg: &TrainConfig) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FoundationV2ObjectiveConfig {
+    pub ep_weight: f64,
+    pub sigreg_projections: usize,
+    pub sigreg_knots: usize,
+    pub sigreg_seed: u64,
+    pub rollout_enabled: bool,
+}
+
+impl Default for FoundationV2ObjectiveConfig {
+    fn default() -> Self {
+        Self {
+            ep_weight: 0.01,
+            sigreg_projections: 8,
+            sigreg_knots: 5,
+            sigreg_seed: 1,
+            rollout_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FoundationV2LossBreakdown {
+    pub total: Tensor,
+    pub non_ep_total: Tensor,
+    pub pred_ce: Tensor,
+    pub gate: Tensor,
+    pub latent: Tensor,
+    pub enc_ce: Tensor,
+    pub separation: Tensor,
+    pub pull: Tensor,
+    pub inverse_action: Tensor,
+    pub ep: Tensor,
+    pub rollout: Tensor,
+    pub event: Tensor,
+    pub q: Tensor,
+    pub reliability: Tensor,
+    pub changed_weights: ChangedPixelWeights,
+    pub factual_groups: usize,
+    pub equivalent_pairs: usize,
+    pub distinct_pairs: usize,
+    pub inverse_action_rows: usize,
+    pub rollout_fragments: usize,
+}
+
+fn masked_mean_with_count(values: &Tensor, mask: &Tensor, count: usize) -> Result<Tensor> {
+    if count == 0 {
+        return values.zeros_like()?.sum_all().map_err(Into::into);
+    }
+    values
+        .broadcast_mul(mask)?
+        .sum_all()?
+        .affine(1.0 / count as f64, 0.0)
+        .map_err(Into::into)
+}
+
+fn mean_tensors_or_zero(values: Vec<Tensor>, zero: &Tensor) -> Result<Tensor> {
+    if values.is_empty() {
+        return Ok(zero.clone());
+    }
+    Tensor::stack(&values.iter().collect::<Vec<_>>(), 0)?
+        .mean_all()
+        .map_err(Into::into)
+}
+
+fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+    let pixels = labels.elem_count();
+    let probs =
+        candle_nn::ops::softmax(logits, D::Minus1)?.affine(0.99, 0.01 / PALETTE_SIZE as f64)?;
+    probs
+        .log()?
+        .reshape((pixels, PALETTE_SIZE))?
+        .gather(&labels.contiguous()?.flatten_all()?.unsqueeze(1)?, 1)?
+        .reshape(labels.dims())?
+        .neg()
+        .map_err(Into::into)
+}
+
+fn split_weighted_ce(
+    per_pixel: &Tensor,
+    positive_mask: &Tensor,
+    negative_mask: &Tensor,
+    positive_count: usize,
+    negative_count: usize,
+    positive_weight: f64,
+) -> Result<Tensor> {
+    let positive = masked_mean_with_count(per_pixel, positive_mask, positive_count)?;
+    let negative = masked_mean_with_count(per_pixel, negative_mask, negative_count)?;
+    positive
+        .affine(positive_weight, 0.0)?
+        .add(&negative)
+        .map_err(Into::into)
+}
+
+fn foundation_v2_rollout_loss(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+) -> Result<(Tensor, usize)> {
+    let mut fragments = BTreeMap::<(u64, u64, String), Vec<&TransitionSample>>::new();
+    for sample in mixed
+        .samples()
+        .iter()
+        .filter(|sample| sample.provenance.stream == MixedStreamKind::SequentialFragments)
+    {
+        let transition = sample.transition();
+        fragments
+            .entry((
+                transition.seed,
+                transition.episode_id,
+                transition.family.clone(),
+            ))
+            .or_default()
+            .push(transition);
+    }
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for fragment in fragments.values_mut() {
+        fragment.sort_by_key(|sample| sample.transition_index);
+        if let Some(pair) = fragment
+            .windows(2)
+            .find(|pair| pair[1].transition_index == pair[0].transition_index + 1)
+        {
+            first.push(pair[0].clone());
+            second.push(pair[1].clone());
+        }
+    }
+    if first.len() < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
+        return Ok((Tensor::zeros((), DType::F32, device)?, first.len()));
+    }
+    let first_batch = batch_from_samples(&first, device)?;
+    let second_batch = batch_from_samples(&second, device)?;
+    let (current, target_h2) = model
+        .encode_state_pair_for_training(&first_batch.frames, &second_batch.next_frames)
+        .map(|encoded| (encoded.current, encoded.next))?;
+    let current_canonical = model.canonical_representation(&current)?;
+    let first_out = model.full_v4_training_latents_from_encoded_state(
+        &current,
+        &current_canonical,
+        &first_batch.actions,
+        &first_batch.action_coords,
+        RecursionDepth::from_config(model.config()),
+        0.0,
+        None,
+        RecursionOpts::training(true),
+    )?;
+    let h1_canonical = model.canonical_representation(&first_out.y)?;
+    let second_out = model.full_v4_training_latents_from_encoded_state(
+        &first_out.y,
+        &h1_canonical,
+        &second_batch.actions,
+        &second_batch.action_coords,
+        RecursionDepth::from_config(model.config()),
+        0.0,
+        None,
+        RecursionOpts::training(true),
+    )?;
+    let spatial = candle_nn::loss::huber(&second_out.y, &target_h2, 1.0)?;
+    let predicted_canonical = model.canonical_representation(&second_out.y)?;
+    let target_canonical = model.canonical_representation(&target_h2)?;
+    Ok((
+        spatial.add(&candle_nn::loss::huber(
+            &predicted_canonical,
+            &target_canonical,
+            1.0,
+        )?)?,
+        first.len(),
+    ))
+}
+
+/// Foundation-v2's single mixed-stream objective. It is intentionally not an
+/// adapter over `lesson_loss_weights`: all world and detached observer heads
+/// are active together from update zero.
+pub fn foundation_v2_training_loss(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+    objective: FoundationV2ObjectiveConfig,
+) -> Result<FoundationV2LossBreakdown> {
+    if !model.config().world_core_v4 || model.config().patch_size != PATCH_SIZE {
+        bail!("foundation-v2 loss requires the patch-4 exact-decoder topology");
+    }
+    let samples = mixed.transitions().cloned().collect::<Vec<_>>();
+    let batch = batch_from_samples(&samples, device)?;
+    let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let current_canonical = model.canonical_representation(&encoded.current)?;
+    let target_canonical = model.canonical_representation(&encoded.next)?;
+    let out = model.full_v4_training_latents_from_encoded_state(
+        &encoded.current,
+        &current_canonical,
+        &batch.actions,
+        &batch.action_coords,
+        RecursionDepth::from_config(model.config()),
+        0.0,
+        None,
+        RecursionOpts::training(true),
+    )?;
+    let predicted_canonical = model.canonical_representation(&out.y)?;
+    let batch_size = samples.len();
+    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let current_pixels = samples
+        .iter()
+        .flat_map(|sample| sample.current.pixels[..gameplay_pixels].iter().copied())
+        .collect::<Vec<_>>();
+    let target_pixels = samples
+        .iter()
+        .flat_map(|sample| sample.next.pixels[..gameplay_pixels].iter().copied())
+        .collect::<Vec<_>>();
+    let content_values = mixed
+        .content_masks()
+        .flat_map(|mask| mask.values[..gameplay_pixels].iter().copied())
+        .collect::<Vec<_>>();
+    let changed_weights =
+        foundation_v2_loss_weights_from_masks(&current_pixels, &target_pixels, &content_values)?;
+    let changed_values = current_pixels
+        .iter()
+        .zip(&target_pixels)
+        .zip(&content_values)
+        .map(|((before, after), content)| f32::from(*content != 0 && before != after))
+        .collect::<Vec<_>>();
+    let unchanged_values = changed_values
+        .iter()
+        .zip(&content_values)
+        .map(|(changed, content)| f32::from(*content != 0) - changed)
+        .collect::<Vec<_>>();
+    let content = Tensor::from_vec(
+        content_values
+            .iter()
+            .map(|&value| f32::from(value))
+            .collect(),
+        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        device,
+    )?;
+    let changed = Tensor::from_vec(
+        changed_values,
+        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        device,
+    )?;
+    let unchanged = Tensor::from_vec(
+        unchanged_values,
+        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        device,
+    )?;
+    let current_labels = batch
+        .frames
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    let target_labels = batch
+        .next_frames
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+
+    let predicted_logits = model.exact_gameplay_logits_trainable(&out.y)?;
+    let pred_per_pixel = foundation_v2_unimix_ce(&predicted_logits, &target_labels)?;
+    let pred_ce = split_weighted_ce(
+        &pred_per_pixel,
+        &changed,
+        &unchanged,
+        changed_weights.changed_pixels,
+        changed_weights.unchanged_pixels,
+        changed_weights.changed_weight,
+    )?;
+
+    let gate_logits = model.exact_copy_gate_logits_trainable(&out.y)?;
+    let gate_weights = changed.affine(changed_weights.changed_weight - 1.0, 1.0)?;
+    let gate = bce_with_logits_elem(&gate_logits, &changed)?
+        .mul(&gate_weights)?
+        .mul(&content)?
+        .sum_all()?
+        .affine(1.0 / changed_weights.content_pixels as f64, 0.0)?;
+
+    let latent = candle_nn::loss::huber(&out.y, &encoded.next, 1.0)?.add(
+        &candle_nn::loss::huber(&predicted_canonical, &target_canonical, 1.0)?,
+    )?;
+
+    let foreground_values = current_pixels
+        .iter()
+        .zip(&content_values)
+        .map(|(pixel, content)| f32::from(*content != 0 && *pixel != 0))
+        .collect::<Vec<_>>();
+    let foreground_count = foreground_values
+        .iter()
+        .filter(|&&value| value != 0.0)
+        .count();
+    let background_count = changed_weights.content_pixels - foreground_count;
+    let foreground_weight = if foreground_count == 0 {
+        64.0
+    } else {
+        ((background_count as f64) / foreground_count as f64).clamp(1.0, 64.0)
+    };
+    let foreground = Tensor::from_vec(
+        foreground_values,
+        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        device,
+    )?;
+    let background = content.sub(&foreground)?;
+    let encoded_current_ce = split_weighted_ce(
+        &foundation_v2_unimix_ce(
+            &model.exact_gameplay_logits_trainable(&encoded.current)?,
+            &current_labels,
+        )?,
+        &foreground,
+        &background,
+        foreground_count,
+        background_count,
+        foreground_weight,
+    )?;
+    let encoded_next_ce = split_weighted_ce(
+        &foundation_v2_unimix_ce(
+            &model.exact_gameplay_logits_trainable(&encoded.next)?,
+            &target_labels,
+        )?,
+        &changed,
+        &unchanged,
+        changed_weights.changed_pixels,
+        changed_weights.unchanged_pixels,
+        changed_weights.changed_weight,
+    )?;
+    let enc_ce = encoded_current_ce.add(&encoded_next_ce)?.affine(0.5, 0.0)?;
+
+    let zero = Tensor::zeros((), DType::F32, device)?;
+    let displacement = predicted_canonical.sub(&current_canonical)?;
+    let displacement_norm = displacement
+        .sqr()?
+        .sum_keepdim(D::Minus1)?
+        .sqrt()?
+        .clamp(1e-6, f64::INFINITY)?;
+    let normalized_displacement = displacement.broadcast_div(&displacement_norm)?;
+    let mut pull_terms = Vec::new();
+    let mut separation_terms = Vec::new();
+    let mut equivalent_pairs = 0usize;
+    let mut distinct_pairs = 0usize;
+    if let Some(factual) = mixed.factual() {
+        for label in factual.pairwise_board_effect_labels() {
+            let factual_range = &factual.group_ranges()[label.group_index];
+            let mixed_range = &mixed.factual_group_ranges()[label.group_index];
+            let left = mixed_range.start + (label.left_row - factual_range.start);
+            let right = mixed_range.start + (label.right_row - factual_range.start);
+            let left = normalized_displacement.narrow(0, left, 1)?;
+            let right = normalized_displacement.narrow(0, right, 1)?;
+            let mse = left.sub(&right)?.sqr()?.mean_all()?;
+            if label.equivalent {
+                pull_terms.push(mse);
+                equivalent_pairs += 1;
+            } else {
+                separation_terms.push(mse.sqrt()?.affine(-1.0, 0.3)?.relu()?);
+                distinct_pairs += 1;
+            }
+        }
+    }
+    let pull = mean_tensors_or_zero(pull_terms, &zero)?;
+    let separation = mean_tensors_or_zero(separation_terms, &zero)?;
+
+    let mut inverse_rows = Vec::<u32>::new();
+    if let Some(factual) = mixed.factual() {
+        for (group, range) in factual.groups().iter().zip(mixed.factual_group_ranges()) {
+            for (local, branch) in group.branches().iter().enumerate() {
+                if branch.board_effect.changed {
+                    inverse_rows.push((range.start + local) as u32);
+                }
+            }
+        }
+    }
+    let inverse_action = if inverse_rows.is_empty() {
+        zero.clone()
+    } else {
+        let indices = Tensor::from_vec(inverse_rows.clone(), (inverse_rows.len(),), device)?;
+        let selected = displacement.index_select(&indices, 0)?;
+        let (action_logits, coordinate_prediction) = model.decode_action_displacement(&selected)?;
+        let action_targets = Tensor::from_vec(
+            inverse_rows
+                .iter()
+                .map(|&row| u32::from(samples[row as usize].action.id))
+                .collect::<Vec<_>>(),
+            (inverse_rows.len(),),
+            device,
+        )?;
+        let action_ce = candle_nn::loss::cross_entropy(&action_logits, &action_targets)?;
+        let action6 = inverse_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(selected_row, &mixed_row)| {
+                (samples[mixed_row as usize].action.id == 6).then_some((selected_row, mixed_row))
+            })
+            .collect::<Vec<_>>();
+        if action6.is_empty() {
+            action_ce
+        } else {
+            let action6_indices = Tensor::from_vec(
+                action6
+                    .iter()
+                    .map(|(selected_row, _)| *selected_row as u32)
+                    .collect::<Vec<_>>(),
+                (action6.len(),),
+                device,
+            )?;
+            let predicted_coords = coordinate_prediction.index_select(&action6_indices, 0)?;
+            let expected_coords = Tensor::from_vec(
+                action6
+                    .iter()
+                    .flat_map(|(_, mixed_row)| {
+                        let action = &samples[*mixed_row as usize].action;
+                        [
+                            f32::from(action.x.expect("ACTION6 x")) / 63.0,
+                            f32::from(action.y.expect("ACTION6 y")) / 63.0,
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+                (action6.len(), 2),
+                device,
+            )?;
+            action_ce.add(&predicted_coords.sub(&expected_coords)?.sqr()?.mean_all()?)?
+        }
+    };
+
+    let ep_population = Tensor::stack(&[current_canonical.clone(), target_canonical.clone()], 0)?;
+    let ep = sigreg_epps_pulley_seeded(
+        &ep_population,
+        objective.sigreg_projections,
+        objective.sigreg_knots,
+        objective.sigreg_seed,
+    )?;
+
+    let detached_canonical = predicted_canonical.detach();
+    let event_logits = model.event_logits_from_canonical(&detached_canonical, &batch.goals)?;
+    let event = masked_bce_with_slot_weights(
+        &event_logits,
+        &batch.event_targets,
+        &batch.event_mask,
+        Some(&event_slot_weight_tensor(device)?),
+    )?;
+    let composed = model.composed_gameplay_decode(&out.y.detach(), &batch.frames)?;
+    let correct = composed.eq(&target_labels)?.to_dtype(DType::F32)?;
+    let changed_count_per_sample = changed.sum(2)?.sum(1)?;
+    let content_count_per_sample = content.sum(2)?.sum(1)?;
+    let changed_accuracy = correct
+        .mul(&changed)?
+        .sum(2)?
+        .sum(1)?
+        .div(&changed_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
+    let content_accuracy = correct
+        .mul(&content)?
+        .sum(2)?
+        .sum(1)?
+        .div(&content_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
+    let graded_targets = changed_count_per_sample
+        .gt(0.0)?
+        .where_cond(&changed_accuracy, &content_accuracy)?
+        .unsqueeze(1)?
+        .detach();
+    let q = bce_with_logits(
+        &model.q_logit_from_canonical(&detached_canonical)?,
+        &graded_targets,
+    )?;
+    let reliability = bce_with_logits(
+        &model.reliability_logit_from_canonical(&detached_canonical)?,
+        &graded_targets,
+    )?;
+    let (rollout, rollout_fragments) = if objective.rollout_enabled {
+        foundation_v2_rollout_loss(model, mixed, device)?
+    } else {
+        (zero.clone(), 0)
+    };
+
+    let mut non_ep_total = pred_ce.clone();
+    for (weight, loss) in [
+        (0.5, &gate),
+        (0.25, &latent),
+        (0.1, &enc_ce),
+        (0.2, &separation),
+        (0.1, &pull),
+        (0.1, &inverse_action),
+        (0.02, &rollout),
+        (0.1, &event),
+        (0.1, &q),
+        (0.1, &reliability),
+    ] {
+        non_ep_total = non_ep_total.add(&loss.affine(weight, 0.0)?)?;
+    }
+    let total = non_ep_total.add(&ep.affine(objective.ep_weight, 0.0)?)?;
+    Ok(FoundationV2LossBreakdown {
+        total,
+        non_ep_total,
+        pred_ce,
+        gate,
+        latent,
+        enc_ce,
+        separation,
+        pull,
+        inverse_action,
+        ep,
+        rollout,
+        event,
+        q,
+        reliability,
+        changed_weights,
+        factual_groups: mixed.factual_group_ranges().len(),
+        equivalent_pairs,
+        distinct_pairs,
+        inverse_action_rows: inverse_rows.len(),
+        rollout_fragments,
+    })
+}
+
 /// Fixed Full V4 objective behind one recipe-specific interface.
 ///
 /// The legacy objective remains an adapter for historical recipes. This module
@@ -3887,7 +4756,16 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
         .with_context(|| format!("create {}", cfg.output_dir.display()))?;
     let weights = cfg.output_dir.join("model.safetensors");
     let weights_tmp = cfg.output_dir.join("model.safetensors.tmp");
-    let bundle_weights = report.latest_checkpoint.join("model.safetensors");
+    // Foundation-v2's exported evaluation checkpoint is EMA by contract; the
+    // resumable bundle still retains both live and EMA weights.
+    let bundle_weights =
+        report
+            .latest_checkpoint
+            .join(if cfg.recipe == TrainingRecipe::FoundationV2 {
+                "ema.safetensors"
+            } else {
+                "model.safetensors"
+            });
     if let Some(export) = &report.export_checkpoint {
         fs::copy(export, &weights_tmp).with_context(|| {
             format!(
@@ -4291,6 +5169,7 @@ pub(crate) fn verify_checkpoint_bundle(bundle: &Path) -> Result<()> {
 fn save_training_checkpoint(
     varmap: &VarMap,
     optimizer: &CheckpointHybridOptimizer,
+    ema: Option<&ModelEma>,
     state: &TrainerState,
     cfg: &TrainConfig,
 ) -> Result<PathBuf> {
@@ -4303,7 +5182,8 @@ fn save_training_checkpoint(
     if final_dir.exists() {
         let complete = final_dir.join("model.safetensors").is_file()
             && final_dir.join("optimizer.safetensors").is_file()
-            && final_dir.join("trainer_state.json").is_file();
+            && final_dir.join("trainer_state.json").is_file()
+            && (state.foundation_v2.is_none() || final_dir.join("ema.safetensors").is_file());
         if complete {
             bail!(
                 "refusing to overwrite existing checkpoint {}",
@@ -4324,21 +5204,41 @@ fn save_training_checkpoint(
     optimizer
         .save(&optimizer_path)
         .with_context(|| format!("save {}", optimizer_path.display()))?;
+    let ema_path = ema
+        .map(|ema| -> Result<PathBuf> {
+            let path = staging.join("ema.safetensors");
+            ema.weights()
+                .save(&path)
+                .with_context(|| format!("save {}", path.display()))?;
+            Ok(path)
+        })
+        .transpose()?;
     let trainer_state_path = staging.join("trainer_state.json");
     let bundle_config_path = staging.join("config.json");
     let persisted_config = persist_train_config(cfg);
     write_json_atomic(&trainer_state_path, state)?;
+    let gate_history_path = state
+        .foundation_v2
+        .as_ref()
+        .map(|foundation| {
+            let path = staging.join("gate_history.json");
+            write_json_atomic(&path, &foundation.gate_history).map(|_| path)
+        })
+        .transpose()?;
     write_json_atomic(&bundle_config_path, &persisted_config)?;
     write_json_atomic(&output_dir.join("config.json"), &persisted_config)?;
-    let artifacts = [
-        &model_path,
-        &optimizer_path,
-        &trainer_state_path,
-        &bundle_config_path,
-    ]
-    .into_iter()
-    .map(|path| sha256_file(path))
-    .collect::<Result<Vec<_>>>()?;
+    let mut artifact_paths = vec![
+        model_path.clone(),
+        optimizer_path.clone(),
+        trainer_state_path.clone(),
+        bundle_config_path.clone(),
+    ];
+    artifact_paths.extend(ema_path.iter().cloned());
+    artifact_paths.extend(gate_history_path.iter().cloned());
+    let artifacts = artifact_paths
+        .iter()
+        .map(|path| sha256_file(path))
+        .collect::<Result<Vec<_>>>()?;
     let bundle_manifest_path = staging.join("bundle-manifest.json");
     write_json_atomic(
         &bundle_manifest_path,
@@ -4351,6 +5251,12 @@ fn save_training_checkpoint(
     )?;
     File::open(&model_path)?.sync_all()?;
     File::open(&optimizer_path)?.sync_all()?;
+    if let Some(path) = &ema_path {
+        File::open(path)?.sync_all()?;
+    }
+    if let Some(path) = &gate_history_path {
+        File::open(path)?.sync_all()?;
+    }
     File::open(&trainer_state_path)?.sync_all()?;
     File::open(&bundle_config_path)?.sync_all()?;
     File::open(&bundle_manifest_path)?.sync_all()?;
@@ -4379,6 +5285,7 @@ fn load_training_checkpoint(
     cfg: &TrainConfig,
     varmap: &mut VarMap,
     optimizer: &mut CheckpointHybridOptimizer,
+    ema: Option<&mut ModelEma>,
 ) -> Result<TrainerState> {
     let mut state: TrainerState = read_json(&bundle.join("trainer_state.json"))?;
     if state.schema != TRAINER_STATE_SCHEMA {
@@ -4425,47 +5332,175 @@ fn load_training_checkpoint(
             state.optimizer_step
         );
     }
-    let lesson_steps = resolved_lesson_steps(cfg);
-    if state.lesson_index > cfg.lessons.len()
-        || state.lesson_index == cfg.lessons.len() && state.step_in_lesson != 0
-    {
-        bail!("checkpoint lesson cursor is out of range");
-    }
-    if state.lesson_index < cfg.lessons.len()
-        && state.step_in_lesson >= lesson_steps[state.lesson_index]
-    {
-        bail!("checkpoint step_in_lesson exceeds lesson budget");
-    }
-    let expected_step =
-        global_step_from_cursor(&lesson_steps, state.lesson_index, state.step_in_lesson);
-    if state.global_step != expected_step as u64 {
-        bail!(
-            "checkpoint global step {} disagrees with lesson cursor {}",
-            state.global_step,
-            expected_step
-        );
-    }
-    if state.completed_lessons.len() != state.lesson_index {
-        bail!(
-            "checkpoint has {} completed lesson reports at lesson index {}",
-            state.completed_lessons.len(),
-            state.lesson_index
-        );
-    }
-    for (index, report) in state.completed_lessons.iter().enumerate() {
-        let lesson = &cfg.lessons[index];
-        if report.lesson != *lesson
-            || report.curriculum != lesson_to_curriculum(lesson)?
-            || report.steps != lesson_steps[index]
+    if cfg.recipe == TrainingRecipe::FoundationV2 {
+        let foundation = state
+            .foundation_v2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("foundation-v2 cannot resume a v4 trainer state"))?;
+        if state.lesson_index != 0
+            || state.step_in_lesson != 0
+            || !state.completed_lessons.is_empty()
+            || foundation.total_steps != cfg.steps_per_lesson
+            || state.global_step > foundation.total_steps as u64
         {
-            bail!("checkpoint completed lesson report {index} is inconsistent");
+            bail!("foundation-v2 checkpoint contains an invalid non-lesson cursor");
+        }
+    } else {
+        if state.foundation_v2.is_some() {
+            bail!("legacy recipes cannot resume a foundation-v2 trainer state");
+        }
+        let lesson_steps = resolved_lesson_steps(cfg);
+        if state.lesson_index > cfg.lessons.len()
+            || state.lesson_index == cfg.lessons.len() && state.step_in_lesson != 0
+        {
+            bail!("checkpoint lesson cursor is out of range");
+        }
+        if state.lesson_index < cfg.lessons.len()
+            && state.step_in_lesson >= lesson_steps[state.lesson_index]
+        {
+            bail!("checkpoint step_in_lesson exceeds lesson budget");
+        }
+        let expected_step =
+            global_step_from_cursor(&lesson_steps, state.lesson_index, state.step_in_lesson);
+        if state.global_step != expected_step as u64 {
+            bail!(
+                "checkpoint global step {} disagrees with lesson cursor {}",
+                state.global_step,
+                expected_step
+            );
+        }
+        if state.completed_lessons.len() != state.lesson_index {
+            bail!(
+                "checkpoint has {} completed lesson reports at lesson index {}",
+                state.completed_lessons.len(),
+                state.lesson_index
+            );
+        }
+        for (index, report) in state.completed_lessons.iter().enumerate() {
+            let lesson = &cfg.lessons[index];
+            if report.lesson != *lesson
+                || report.curriculum != lesson_to_curriculum(lesson)?
+                || report.steps != lesson_steps[index]
+            {
+                bail!("checkpoint completed lesson report {index} is inconsistent");
+            }
         }
     }
     let model_path = bundle.join("model.safetensors");
     let optimizer_path = bundle.join("optimizer.safetensors");
     load_varmap_exact(varmap, &model_path)?;
     optimizer.load(&optimizer_path, state.optimizer_step)?;
+    match (state.foundation_v2.is_some(), ema) {
+        (true, Some(ema)) => load_varmap_exact(ema.weights(), &bundle.join("ema.safetensors"))?,
+        (true, None) => bail!("foundation-v2 resume requires EMA state"),
+        (false, Some(_)) => bail!("legacy checkpoint unexpectedly requested EMA state"),
+        (false, None) => {}
+    }
     Ok(state)
+}
+
+fn copy_checkpoint_bundle(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination).with_context(|| format!("create {}", destination.display()))?;
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            bail!("checkpoint bundle contains a non-file artifact");
+        }
+        fs::copy(entry.path(), destination.join(entry.file_name())).with_context(|| {
+            format!(
+                "copy checkpoint artifact {} -> {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
+    }
+    verify_checkpoint_bundle(destination)
+}
+
+fn publish_permanent_checkpoint(cfg: &TrainConfig, checkpoint: &Path) -> Result<PathBuf> {
+    let destination = cfg.output_dir.join("checkpoints/permanent").join(
+        checkpoint
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint path has no directory name"))?,
+    );
+    if destination.exists() {
+        verify_checkpoint_bundle(&destination)?;
+        return Ok(destination);
+    }
+    copy_checkpoint_bundle(checkpoint, &destination)?;
+    Ok(destination)
+}
+
+fn publish_best_checkpoint(cfg: &TrainConfig, checkpoint: &Path) -> Result<PathBuf> {
+    let checkpoints = cfg.output_dir.join("checkpoints");
+    let best = checkpoints.join("best");
+    let staging = checkpoints.join(format!(".best.tmp-{}", std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .with_context(|| format!("remove incomplete {}", staging.display()))?;
+    }
+    copy_checkpoint_bundle(checkpoint, &staging)?;
+    if best.exists() {
+        let old = checkpoints.join(format!(".best.old-{}", std::process::id()));
+        if old.exists() {
+            fs::remove_dir_all(&old).with_context(|| format!("remove stale {}", old.display()))?;
+        }
+        fs::rename(&best, &old)
+            .with_context(|| format!("rotate {} -> {}", best.display(), old.display()))?;
+        fs::rename(&staging, &best)
+            .with_context(|| format!("publish {} -> {}", staging.display(), best.display()))?;
+        fs::remove_dir_all(&old).with_context(|| format!("remove replaced {}", old.display()))?;
+    } else {
+        fs::rename(&staging, &best)
+            .with_context(|| format!("publish {} -> {}", staging.display(), best.display()))?;
+    }
+    verify_checkpoint_bundle(&best)?;
+    Ok(best)
+}
+
+fn seal_foundation_v2_abort(
+    cfg: &TrainConfig,
+    checkpoint: &Path,
+    report: &TrainReport,
+) -> Result<PathBuf> {
+    let directory = cfg
+        .output_dir
+        .join("diagnostics")
+        .join(format!("abort-step-{:012}", report.global_step));
+    if directory.exists() {
+        bail!(
+            "refusing to overwrite diagnostic bundle {}",
+            directory.display()
+        );
+    }
+    fs::create_dir_all(&directory)?;
+    let checkpoint_copy = directory.join("checkpoint");
+    copy_checkpoint_bundle(checkpoint, &checkpoint_copy)?;
+    let report_path = directory.join("train_report.json");
+    let gate_history_path = directory.join("gate_history.json");
+    write_json_atomic(&report_path, report)?;
+    write_json_atomic(
+        &gate_history_path,
+        &report
+            .foundation_v2
+            .as_ref()
+            .expect("foundation-v2 abort report")
+            .gate_history,
+    )?;
+    let mut sealed = BTreeMap::new();
+    for path in [
+        &report_path,
+        &gate_history_path,
+        &checkpoint_copy.join("bundle-manifest.json"),
+    ] {
+        let digest = sha256_file(path)?;
+        sealed.insert(
+            path.strip_prefix(&directory)?.display().to_string(),
+            digest.sha256,
+        );
+    }
+    write_json_atomic(&directory.join("diagnostic-manifest.json"), &sealed)?;
+    Ok(directory)
 }
 
 fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
@@ -4511,6 +5546,30 @@ fn loss_means(sums: &LessonLossMeans, count: usize) -> LessonLossMeans {
     }
 }
 
+fn foundation_v2_loss_means(sums: &FoundationV2LossMeans, count: u64) -> FoundationV2LossMeans {
+    if count == 0 {
+        return FoundationV2LossMeans::default();
+    }
+    let n = count as f64;
+    FoundationV2LossMeans {
+        total: sums.total / n,
+        pred_ce: sums.pred_ce / n,
+        gate: sums.gate / n,
+        latent: sums.latent / n,
+        enc_ce: sums.enc_ce / n,
+        separation: sums.separation / n,
+        pull: sums.pull / n,
+        inverse_action: sums.inverse_action / n,
+        ep: sums.ep / n,
+        rollout: sums.rollout / n,
+        event: sums.event / n,
+        q: sums.q / n,
+        reliability: sums.reliability / n,
+        pre_clip_gradient_norm: sums.pre_clip_gradient_norm / n,
+        gradient_clip_scale: sums.gradient_clip_scale / n,
+    }
+}
+
 fn build_report(
     cfg: &TrainConfig,
     state: &TrainerState,
@@ -4519,6 +5578,25 @@ fn build_report(
     latest_checkpoint: PathBuf,
     resumed_from: Option<PathBuf>,
 ) -> TrainReport {
+    let foundation_v2 = state.foundation_v2.as_ref().map(|foundation| {
+        FoundationV2TrainingReport {
+            total_steps: foundation.total_steps,
+            mean_losses: foundation_v2_loss_means(&foundation.loss_sums, foundation.loss_steps),
+            ep_weight: foundation.ep_weight,
+            ep_gradient_budget: foundation.ep_gradient_budget.clone(),
+            gate_history: foundation.gate_history.clone(),
+            best_changed_exact: foundation.best_changed_exact,
+            best_checkpoint: foundation
+                .best_changed_exact
+                .map(|_| cfg.output_dir.join("checkpoints/best")),
+            rollout_enabled: foundation.rollout_enabled,
+            permanent_checkpoints: foundation.permanent_checkpoints.clone(),
+            // Documented ADR 0003 approximation: EP is first constrained by
+            // its encoder-gradient controller, then the combined gradient is
+            // clipped at 1.0. We do not claim a separately clipped EP store.
+            clip_strategy: "adaptive EP budget, then combined global L2 clip at 1.0".into(),
+        }
+    });
     TrainReport {
         schema: TRAIN_REPORT_SCHEMA.into(),
         world_core_schema: cfg
@@ -4551,6 +5629,7 @@ fn build_report(
         profile: state.profile.clone(),
         gradient_pressure: state.gradient_pressure.clone(),
         gradient_pressure_samples: state.gradient_pressure_samples.clone(),
+        foundation_v2,
         research_claim: false,
     }
 }
@@ -4561,8 +5640,386 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
     Ok(())
 }
 
+fn foundation_v2_loss_values(
+    losses: &FoundationV2LossBreakdown,
+    total: &Tensor,
+    pre_clip_gradient_norm: f64,
+    gradient_clip_scale: f64,
+) -> Result<FoundationV2LossMeans> {
+    let values = ensure_all_finite(&[
+        ("foundation_v2.total", &total.detach()),
+        ("foundation_v2.pred_ce", &losses.pred_ce.detach()),
+        ("foundation_v2.gate", &losses.gate.detach()),
+        ("foundation_v2.latent", &losses.latent.detach()),
+        ("foundation_v2.enc_ce", &losses.enc_ce.detach()),
+        ("foundation_v2.separation", &losses.separation.detach()),
+        ("foundation_v2.pull", &losses.pull.detach()),
+        (
+            "foundation_v2.inverse_action",
+            &losses.inverse_action.detach(),
+        ),
+        ("foundation_v2.ep", &losses.ep.detach()),
+        ("foundation_v2.rollout", &losses.rollout.detach()),
+        ("foundation_v2.event", &losses.event.detach()),
+        ("foundation_v2.q", &losses.q.detach()),
+        ("foundation_v2.reliability", &losses.reliability.detach()),
+    ])?;
+    Ok(FoundationV2LossMeans {
+        total: values[0] as f64,
+        pred_ce: values[1] as f64,
+        gate: values[2] as f64,
+        latent: values[3] as f64,
+        enc_ce: values[4] as f64,
+        separation: values[5] as f64,
+        pull: values[6] as f64,
+        inverse_action: values[7] as f64,
+        ep: values[8] as f64,
+        rollout: values[9] as f64,
+        event: values[10] as f64,
+        q: values[11] as f64,
+        reliability: values[12] as f64,
+        pre_clip_gradient_norm,
+        gradient_clip_scale,
+    })
+}
+
+fn add_foundation_v2_loss_sums(sums: &mut FoundationV2LossMeans, values: &FoundationV2LossMeans) {
+    sums.total += values.total;
+    sums.pred_ce += values.pred_ce;
+    sums.gate += values.gate;
+    sums.latent += values.latent;
+    sums.enc_ce += values.enc_ce;
+    sums.separation += values.separation;
+    sums.pull += values.pull;
+    sums.inverse_action += values.inverse_action;
+    sums.ep += values.ep;
+    sums.rollout += values.rollout;
+    sums.event += values.event;
+    sums.q += values.q;
+    sums.reliability += values.reliability;
+    sums.pre_clip_gradient_norm += values.pre_clip_gradient_norm;
+    sums.gradient_clip_scale += values.gradient_clip_scale;
+}
+
+fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
+    let mut cfg = requested_cfg.clone();
+    if cfg.resume.is_none() && implicit_resume_source(&cfg).is_some() {
+        cfg.resume = Some(cfg.output_dir.join("checkpoints"));
+        tracing::info!(
+            "auto-resuming foundation-v2 from {}",
+            cfg.output_dir.join("checkpoints").display()
+        );
+    }
+    cfg.validate()?;
+    fs::create_dir_all(&cfg.output_dir)
+        .with_context(|| format!("create {}", cfg.output_dir.display()))?;
+    let _train_pid = TrainPidGuard::install(&cfg.output_dir)?;
+    let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
+        Some(GpuSessionGuard::acquire(&cfg.output_dir)?)
+    } else {
+        None
+    };
+    PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+    install_pause_handler()?;
+    let device = resolve_device(&cfg.device)?;
+    let model_cfg = cfg.model_config();
+    model_cfg.validate()?;
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = WorldModel::new(model_cfg, vb)?;
+    let mut optimizer = CheckpointHybridOptimizer::new(
+        &varmap,
+        adam_params(&cfg),
+        cfg.muon_momentum,
+        cfg.muon_rms_scale,
+    )?;
+    let parameter_names = optimizer.parameter_names();
+    let parameter_count = parameter_count(&varmap);
+    let resume_source = cfg.resume.clone().or_else(|| implicit_resume_source(&cfg));
+    let resumed_from = resume_source
+        .as_deref()
+        .map(resolve_resume_checkpoint)
+        .transpose()?;
+    if resumed_from.is_none() {
+        reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
+        // FiLM identity initialization is restored exactly once after fresh
+        // deterministic init. Checkpoint loads must retain learned projections.
+        zero_action_film_projections(&varmap)?;
+    }
+    let mut ema = ModelEma::with_default_decay(&varmap)?;
+    let mut state = if let Some(bundle) = &resumed_from {
+        load_training_checkpoint(bundle, &cfg, &mut varmap, &mut optimizer, Some(&mut ema))?
+    } else {
+        TrainerState {
+            schema: TRAINER_STATE_SCHEMA.into(),
+            contract: TrainingContract::from(&cfg),
+            global_step: 0,
+            lesson_index: 0,
+            step_in_lesson: 0,
+            optimizer_step: 0,
+            completed_lessons: Vec::new(),
+            active_sums: LessonLossMeans::default(),
+            parameter_names,
+            training_population_hash: default_training_population_hash(),
+            training_content_hash: [0; 32],
+            training_population_rows: 0,
+            batch_schedule_migrations: Vec::new(),
+            profile: ProfileState::Pending,
+            gradient_pressure: None,
+            gradient_pressure_samples: Vec::new(),
+            foundation_v2: Some(FoundationV2TrainerState {
+                total_steps: cfg.steps_per_lesson,
+                ep_weight: 0.01,
+                ep_gradient_budget: Vec::new(),
+                gate_history: Vec::new(),
+                best_changed_exact: None,
+                rollout_enabled: true,
+                loss_sums: FoundationV2LossMeans::default(),
+                loss_steps: 0,
+                permanent_checkpoints: Vec::new(),
+            }),
+        }
+    };
+    let mut latest_checkpoint = if resumed_from.is_none() {
+        Some(save_training_checkpoint(
+            &varmap,
+            &optimizer,
+            Some(&ema),
+            &state,
+            &cfg,
+        )?)
+    } else {
+        resumed_from.clone()
+    };
+    let gate_batch = compose_mixed_stream_batch(
+        &MixedStreamConfig {
+            batch_size: FOUNDATION_V2_GATE_ROWS,
+            seed: FOUNDATION_V2_GATE_SEED,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        },
+        1.0,
+        0,
+        V5DataSplit::UnseenSeed7x7,
+    )?;
+    let gate_samples = gate_batch.transitions().cloned().collect::<Vec<_>>();
+    let stream_config = MixedStreamConfig {
+        batch_size: cfg.physical_batch,
+        seed: cfg.seed,
+        schedule: foundation_v2_stream_schedule,
+        ..MixedStreamConfig::default()
+    };
+    let mut updates_this_run = 0usize;
+
+    loop {
+        let total_steps = state
+            .foundation_v2
+            .as_ref()
+            .expect("foundation-v2 state")
+            .total_steps;
+        let complete = state.global_step >= total_steps as u64;
+        if complete || PAUSE_REQUESTED.load(Ordering::SeqCst) {
+            if latest_checkpoint
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                != Some(&format!("step-{:012}", state.global_step))
+            {
+                latest_checkpoint = Some(save_training_checkpoint(
+                    &varmap,
+                    &optimizer,
+                    Some(&ema),
+                    &state,
+                    &cfg,
+                )?);
+            }
+            let report = build_report(
+                &cfg,
+                &state,
+                if complete {
+                    TrainStatus::Completed
+                } else {
+                    TrainStatus::Paused
+                },
+                parameter_count,
+                latest_checkpoint.expect("foundation-v2 writes a final checkpoint"),
+                resumed_from,
+            );
+            publish_run_artifacts(&varmap, &cfg, &report)?;
+            sync_cuda_device(&device)?;
+            return Ok(report);
+        }
+
+        let progress = state.global_step as f32 / total_steps.max(1) as f32;
+        let mixed = compose_mixed_stream_batch(
+            &stream_config,
+            progress,
+            state.global_step,
+            V5DataSplit::Train,
+        )?;
+        let consumed = mixed.transitions().cloned().collect::<Vec<_>>();
+        update_training_population(&mut state, &consumed);
+        let (ep_weight, rollout_enabled) = {
+            let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
+            (foundation.ep_weight, foundation.rollout_enabled)
+        };
+        let losses = foundation_v2_training_loss(
+            &model,
+            &mixed,
+            &device,
+            FoundationV2ObjectiveConfig {
+                ep_weight,
+                sigreg_projections: cfg.sigreg_projections,
+                sigreg_knots: cfg.sigreg_knots,
+                sigreg_seed: cfg.seed.wrapping_add(state.global_step),
+                rollout_enabled,
+            },
+        )?;
+        let next_step = state.global_step + 1;
+        if next_step.is_multiple_of(128) {
+            // These two attribution stores are read-only. Their graphs are
+            // reused below for the actual combined backward pass.
+            let ep_grads = losses.ep.backward()?;
+            let pred_grads = losses.pred_ce.backward()?;
+            let ep_norm = gradient_l2_for_parameter_prefix(&ep_grads, &varmap, "encoder.")?;
+            let pred_norm = gradient_l2_for_parameter_prefix(&pred_grads, &varmap, "encoder.")?;
+            let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+            foundation.ep_weight =
+                foundation_v2_ep_weight_update(foundation.ep_weight, ep_norm, pred_norm);
+            foundation
+                .ep_gradient_budget
+                .push(FoundationV2EpGradientSample {
+                    step: next_step,
+                    encoder_ep_gradient_l2: ep_norm,
+                    encoder_prediction_gradient_l2: pred_norm,
+                    ep_weight: foundation.ep_weight,
+                });
+        }
+        let effective_ep_weight = state
+            .foundation_v2
+            .as_ref()
+            .expect("foundation-v2 state")
+            .ep_weight;
+        let total = losses
+            .non_ep_total
+            .add(&losses.ep.affine(effective_ep_weight, 0.0)?)?;
+        let mut grads = total.backward()?;
+        // ADR 0003's documented approximation: the adaptive controller bounds
+        // EP's encoder contribution first, then one combined gradient store is
+        // clipped at 1.0. There is no separately clipped EP accumulation.
+        let clip = clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        optimizer.set_learning_rate(foundation_v2_wsd_learning_rate(
+            next_step as usize,
+            total_steps,
+        ))?;
+        optimizer.step(&grads)?;
+        ema.update(&varmap)?;
+        let values = foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
+        {
+            let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+            add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
+            foundation.loss_steps += 1;
+        }
+        state.global_step = next_step;
+        state.optimizer_step = optimizer.step_t();
+        updates_this_run += 1;
+
+        let mut improved_best = false;
+        let mut abort = false;
+        if state.global_step.is_multiple_of(FOUNDATION_V2_GATE_EVERY) {
+            let metrics = ema.with_eval_weights(&varmap, || {
+                evaluate_gate_support(&model, &gate_samples, &device)
+            })?;
+            let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+            let prior_best = foundation.best_changed_exact;
+            let evaluation = foundation_v2_gate_evaluation(state.global_step, metrics, prior_best);
+            improved_best = evaluation
+                .metrics
+                .one_step_changed_exact
+                .is_some_and(|current| prior_best.is_none_or(|best| current > best));
+            foundation.best_changed_exact = evaluation.running_best_after;
+            foundation.rollout_enabled = evaluation.gates[3].passed;
+            foundation.gate_history.push(evaluation);
+            abort = foundation_v2_gate_history_aborts(&foundation.gate_history);
+        }
+
+        let complete = state.global_step >= total_steps as u64;
+        let requested_pause = PAUSE_REQUESTED.load(Ordering::SeqCst)
+            || cfg.max_steps_this_run == Some(updates_this_run);
+        let periodic = cfg.checkpoint_every_steps > 0
+            && state
+                .global_step
+                .is_multiple_of(cfg.checkpoint_every_steps as u64);
+        let permanent = state
+            .global_step
+            .is_multiple_of(FOUNDATION_V2_PERMANENT_EVERY);
+        if periodic || permanent || improved_best || abort || complete || requested_pause {
+            sync_cuda_device(&device)?;
+            if permanent {
+                state
+                    .foundation_v2
+                    .as_mut()
+                    .expect("foundation-v2 state")
+                    .permanent_checkpoints
+                    .push(
+                        cfg.output_dir
+                            .join("checkpoints/permanent")
+                            .join(format!("step-{:012}", state.global_step)),
+                    );
+            }
+            let checkpoint =
+                save_training_checkpoint(&varmap, &optimizer, Some(&ema), &state, &cfg)?;
+            if permanent {
+                publish_permanent_checkpoint(&cfg, &checkpoint)?;
+                latest_checkpoint = Some(checkpoint);
+            } else {
+                latest_checkpoint = Some(checkpoint);
+            }
+            if improved_best {
+                publish_best_checkpoint(
+                    &cfg,
+                    latest_checkpoint.as_ref().expect("saved checkpoint"),
+                )?;
+            }
+        }
+        if abort {
+            let checkpoint = latest_checkpoint.clone().expect("abort saves checkpoint");
+            let report = build_report(
+                &cfg,
+                &state,
+                TrainStatus::Aborted,
+                parameter_count,
+                checkpoint.clone(),
+                resumed_from.clone(),
+            );
+            publish_run_artifacts(&varmap, &cfg, &report)?;
+            let diagnostic = seal_foundation_v2_abort(&cfg, &checkpoint, &report)?;
+            bail!(
+                "foundation-v2 aborted after two consecutive gate failures; diagnostic bundle {}",
+                diagnostic.display()
+            );
+        }
+        if requested_pause && !complete {
+            let report = build_report(
+                &cfg,
+                &state,
+                TrainStatus::Paused,
+                parameter_count,
+                latest_checkpoint.clone().expect("pause saves checkpoint"),
+                resumed_from.clone(),
+            );
+            publish_run_artifacts(&varmap, &cfg, &report)?;
+            sync_cuda_device(&device)?;
+            return Ok(report);
+        }
+    }
+}
+
 /// Train lessons in order. SIGINT/SIGTERM pauses after the current optimizer update.
 pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
+    if cfg.recipe == TrainingRecipe::FoundationV2 {
+        return train_foundation_v2(cfg);
+    }
     let mut cfg = cfg.clone();
     let explicit_resume = cfg.resume.is_some();
     if !explicit_resume && implicit_resume_source(&cfg).is_some() {
@@ -4603,7 +6060,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         .map(resolve_resume_checkpoint)
         .transpose()?;
     let mut state = if let Some(bundle) = &resumed_from {
-        load_training_checkpoint(bundle, cfg, &mut varmap, &mut optimizer)?
+        load_training_checkpoint(bundle, cfg, &mut varmap, &mut optimizer, None)?
     } else {
         reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
         if cfg.world_core_v3 {
@@ -4626,12 +6083,13 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             profile: ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: Vec::new(),
+            foundation_v2: None,
         }
     };
     let mut latest_checkpoint = resumed_from.clone();
     let mut latest_checkpoint_step = resumed_from.as_ref().map(|_| state.global_step);
     if resumed_from.is_none() {
-        let initial = save_training_checkpoint(&varmap, &optimizer, &state, cfg)?;
+        let initial = save_training_checkpoint(&varmap, &optimizer, None, &state, cfg)?;
         latest_checkpoint = Some(initial);
         latest_checkpoint_step = Some(0);
     }
@@ -4662,8 +6120,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let complete = state.lesson_index == cfg.lessons.len();
         if complete {
             if latest_checkpoint.is_none() {
-                latest_checkpoint =
-                    Some(save_training_checkpoint(&varmap, &optimizer, &state, cfg)?);
+                latest_checkpoint = Some(save_training_checkpoint(
+                    &varmap, &optimizer, None, &state, cfg,
+                )?);
             }
             let report = build_report(
                 cfg,
@@ -4685,7 +6144,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         if PAUSE_REQUESTED.load(Ordering::SeqCst) {
             let checkpoint = match (latest_checkpoint, latest_checkpoint_step) {
                 (Some(path), Some(step)) if step == state.global_step => path,
-                _ => save_training_checkpoint(&varmap, &optimizer, &state, cfg)?,
+                _ => save_training_checkpoint(&varmap, &optimizer, None, &state, cfg)?,
             };
             let report = build_report(
                 cfg,
@@ -5325,7 +6784,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             crate::alloc::trim_host_heap();
             latest_checkpoint = Some(timed(prof, &device, &mut profile.checkpoint, || {
                 let _span = tracing::info_span!("checkpoint").entered();
-                save_training_checkpoint(&varmap, &optimizer, &state, cfg)
+                save_training_checkpoint(&varmap, &optimizer, None, &state, cfg)
             })?);
             latest_checkpoint_step = Some(state.global_step);
             if use_prefetch {
@@ -6889,7 +8348,7 @@ mod tests {
     fn world_core_v3_loss_reports_factual_and_health_populations() -> Result<()> {
         let cfg = TrainConfig {
             lessons: vec!["factual_branches".into()],
-            physical_batch: 4,
+            physical_batch: crate::p2::data::FACTUAL_BRANCHES_PER_GROUP,
             grad_accum: 1,
             sigreg_weight: 0.0,
             hidden_dim: 16,
@@ -6933,7 +8392,13 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = WorldModel::new(cfg.model_config(), vb)?;
         reinit_varmap_deterministic(&varmap, cfg.seed)?;
-        let samples = collect_batch("factual_branches", cfg.seed, 0, 4, Split::Train)?;
+        let samples = collect_batch(
+            "factual_branches",
+            cfg.seed,
+            0,
+            crate::p2::data::FACTUAL_BRANCHES_PER_GROUP,
+            Split::Train,
+        )?;
         let batch = batch_from_samples(&samples, &device)?;
         let losses = leworld_loss_with_sigreg_windows(
             &model,
@@ -6950,7 +8415,10 @@ mod tests {
             None,
         )?;
         assert_eq!(losses.branch_audit.groups, 1);
-        assert_eq!(losses.branch_audit.branches, 4);
+        assert_eq!(
+            losses.branch_audit.branches,
+            crate::p2::data::FACTUAL_BRANCHES_PER_GROUP
+        );
         assert_eq!(losses.branch_audit.spatial_population_rows, 128);
         assert_eq!(losses.branch_audit.pooled_population_rows, 12);
         assert!(losses.branch_audit.unique_changed_outcomes >= 2);
@@ -7164,6 +8632,7 @@ mod tests {
             profile: ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: vec![],
+            foundation_v2: None,
             research_claim: false,
         };
         let s = serde_json::to_string(&report)?;

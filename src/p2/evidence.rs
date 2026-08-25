@@ -410,6 +410,7 @@ mod tests {
             }),
             gradient_pressure: Some(pressure.clone()),
             gradient_pressure_samples: vec![pressure],
+            foundation_v2: None,
             research_claim: false,
         };
         write(

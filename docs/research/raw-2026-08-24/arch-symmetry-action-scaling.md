@@ -1,0 +1,46 @@
+Research complete. Findings below, prioritized.
+
+## Direction 1: Equivariance / symmetry
+
+**1a. Color-permutation augmentation (do first — trivial, established).**
+Permute the 16 palette indices per training sample (consistently across the state/next-state pair; keep any semantically pinned colors, e.g. background 0, fixed if the ARC-AGI-3 palette treats them specially).
+- *Why it helps held-out:* held-out games recolor familiar dynamics; a model that binds dynamics to specific color indices fails exactly there. Every serious ARC system relies on this: the 2024 ARC Prize winner "the ARChitects" used geometric + color-permutation augmentation with stability-under-augmentation selection (ARC Prize 2024 Technical Report, arXiv:2412.04604); TRM generates ~1000 augmentations per pair combining color permutations, dihedral transforms and translations, and the TRM analysis paper documents heavy reliance on this ("Tiny Recursive Models on ARC-AGI-1...", arXiv:2512.11847, 2025; "Less is More: Recursive Reasoning with Tiny Networks", arXiv:2510.04871, 2025).
+- *Candle cost:* near zero — an index_select on the one-hot channel axis in the data loader. *Risk:* if some colors carry fixed semantics across ARC-AGI-3 games, full permutation destroys a useful prior; use a partial permutation group. **Established.**
+
+**1b. Palette-equivariant architecture (second wave, bigger bet).**
+Treat the 16 color channels as a set: shared per-color embedding conv + symmetric pooling (DeepSets-style sum/max over color slots), or attention over color slots; on the output side, predict per-pixel logits as dot products against the same color-slot embeddings (pointer-into-palette decoder) so the whole model is permutation-equivariant end-to-end.
+- *Evidence:* "ARC-AGI Without Pretraining" (CompressARC, Liao & Gu, arXiv:2512.06104, 2025) builds layers equivariant to color permutations, D4, and translations and reaches ~20% on ARC-AGI-1 eval with no pretraining at all — strong evidence these symmetries are the dominant inductive bias for ARC-style grids. Related: SiT, "Symmetry-Invariant Transformers for Generalisation in RL" (arXiv:2406.15025, 2024).
+- *Candle cost:* moderate refactor of palette encoder + decoder head; all standard ops. *Risk:* hard equivariance costs capacity at width 128 and forbids exploiting cross-game color regularities; do 1a first and only build 1b if augmentation shows gains. **Established idea, novel in this JEPA setting.**
+
+**1c. D4 — augmentation over equivariant convs, and only with action conjugation.**
+p4m-style group convs are implementable in plain candle (stack 8 rotated/flipped kernel copies via flip/transpose; Cohen & Welling lineage) at 8x conv compute. But **ARC-AGI-3 dynamics are not D4-symmetric unless you also rotate the action space** (ACTION1-4 are directional; ACTION6 coordinates must be transformed). D4 augmentation with conjugated actions (rotate grid + relabel/transform actions consistently) is the safe version; TRM/ARChitects dihedral augmentation is the supporting evidence.
+- *Cost:* augmentation cheap; equivariant convs 8x compute at 9s/step — not worth it. *Risk:* some games may have genuinely anisotropic dynamics (gravity); conjugated augmentation is still valid (it produces a rotated-but-consistent game), but gains are less certain than color permutation. **Established for static ARC; the action-conjugation detail is your novelty.** Lower priority than 1a.
+
+## Direction 2: Action conditioning
+
+**2a. FiLM/AdaLN modulation of every recurrent step, keeping the spatial field for ACTION6 (high priority, cheap).**
+DisCo ("World Models with Discrete Camera Motion Control", arXiv:2606.07967, 2026) directly ablates injection mechanisms for discrete control: additive 87.31 FVD, concat 67.89, cross-attention 62.56, **AdaLN 56.47** — scale/shift modulation (i.e. FiLM, arXiv:1709.07871) wins over concatenation. Action-conditioned world models increasingly inject the action embedding at *every* prediction step/layer, not once at input (RynnWorld-Teleop arXiv:2607.06558; DexAC-WM "Not All Actions Are Equal", arXiv:2606.27325, 2026). Your single spatial concat at the conv input is the weakest mechanism in this ranking and gives the recurrent steps many chances to wash the action out.
+- *Concrete change:* keep the spatial x,y field for ACTION6 (2D coordinate bias is validated — the ARC-AGI-3 Agent Preview winner StochasticGoose explicitly used a convolutional coordinate head "with 2D inductive bias instead of flattened representations" for ACTION6, github.com/DriesSmit/ARC3-solution, Tufa Labs 2025), but add FiLM: embed the discrete action type, two small linears → per-channel (γ, β) applied inside each of the 2 inner + 2 outer recurrent steps.
+- *Candle cost:* trivial (a few linears + broadcast mul/add). *Why held-out exact accuracy:* changed-pixel accuracy is precisely where action information matters; if the action signal decays through recurrence the model regresses to "predict no change / average change." *Risk:* FiLM can still be ignored — add a cheap action-controllability probe (Genie's ΔPSNR-style: compare predicted next-latents across different actions on the same state; Genie, arXiv:2402.15391, 2024). **Established.**
+
+## Direction 3: Parameter scaling
+
+**3a. 560K at width 128 is very likely under-parameterized — scale 4–30x (high priority).**
+Converging evidence:
+- Pearce et al., "Scaling Laws for Pre-training Agents and World Models" (arXiv:2411.04434, NeurIPS 2025): world modeling follows clean power laws; compute-optimal sizes at 1e18–1e19 FLOPs are **22M–110M params**, and crucially the optimal-size exponent grows as the observation representation gets *less* compressed (N∝C^0.62 for 540-token frames vs C^0.49 for 256). Your raw 64x64x16 grids are maximally uncompressed — the regime that most favors parameters. Your run budget (batch 2048, 9s/step, ~1e19+ FLOPs over a full run on the A40) puts compute-optimal at tens of millions of params, ~1.5–2 orders above 560K.
+- Comparable systems: IRIS's world model is ~8M params *per single Atari game* (arXiv:2209.00588); TRM is 7M and HRM 27M for static ARC puzzles (arXiv:2510.04871; HRM arXiv:2506.21734); a 2026 study probes scale for data-efficient generalist Atari world models and finds scaling matters under limited data (arXiv:2605.08578).
+- Capacity-vs-exactness: 2025 work shows small transformers extrapolate but *fail to memorize facts/exact mappings*, with generalization-vs-memorization crossing at scale ("Too Big to Think", arXiv:2506.09099; "Model Capacity Determines Grokking...", arXiv:2605.09724) — exact per-pixel next-state prediction across many games is exactly the "needs capacity" regime.
+- *Concrete change:* width 128→256/384 and/or +depth (2–10M params); reclaim compute by dropping batch below 2048 if needed (2048 is far above typical world-model batch sizes; the gradient-noise cost is likely small).
+- *Candle cost:* config change. *Risk:* domain transfer of the coefficients (game-video tokens ≠ ARC grids) — mark the exact multiplier as extrapolated; overfitting train games is possible but augmentation (1a/1c) counteracts it. **Established trend, extrapolated numbers.**
+
+**3b. Flag (out of scope but important):** the "Executable World Models for ARC-AGI-3" paper (arXiv:2605.05138, 2026) and the ARC-AGI-3 tech report (arXiv:2603.24621) suggest exactness on held-out games is best achieved with discrete/symbolic outputs. Within your JEPA setup, an auxiliary *discrete per-pixel cross-entropy* head on next-frame colors (alongside latent Huber) may lift exact-match more than any latent-space change — latent regression + frozen decoder can plateau below the exactness the metric demands. **Novel in your setting; low cost (one conv head).**
+
+## Priority order
+1. Color-permutation augmentation (1a) — hours of work, strongest ARC evidence.
+2. FiLM per-recurrent-step action injection + keep spatial ACTION6 field (2a).
+3. Scale width/params 4–30x (3a), trading batch size for capacity.
+4. Aux discrete pixel cross-entropy head (3b).
+5. D4 augmentation with action conjugation (1c).
+6. Fully palette-equivariant encoder/decoder (1b) — only if 1a shows augmentation gains and plateaus.
+
+Sources: [ARC-AGI Without Pretraining (2512.06104)](https://arxiv.org/pdf/2512.06104), [TRM inductive-bias analysis (2512.11847)](https://arxiv.org/abs/2512.11847), [TRM (2510.04871)](https://arxiv.org/html/2510.04871v1), [ARC Prize 2024 report (2412.04604)](https://arxiv.org/pdf/2412.04604), [DisCo (2606.07967)](https://arxiv.org/pdf/2606.07967), [Not All Actions Are Equal (2606.27325)](https://arxiv.org/html/2606.27325), [RynnWorld-Teleop (2607.06558)](https://arxiv.org/pdf/2607.06558), [StochasticGoose ARC-AGI-3 winner](https://github.com/DriesSmit/ARC3-solution), [Executable World Models for ARC-AGI-3 (2605.05138)](https://arxiv.org/abs/2605.05138), [Scaling Laws for Agents and World Models (2411.04434)](https://arxiv.org/html/2411.04434), [IRIS (2209.00588)](https://arxiv.org/abs/2209.00588), [Atari WM scale probe (2605.08578)](https://arxiv.org/pdf/2605.08578), [Too Big to Think (2506.09099)](https://arxiv.org/pdf/2506.09099), [Grokking capacity (2605.09724)](https://arxiv.org/abs/2605.09724), [SiT (2406.15025)](https://arxiv.org/pdf/2406.15025).

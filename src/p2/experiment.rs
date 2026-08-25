@@ -10,6 +10,7 @@ pub const LEGACY_SCHEMA: &str = "legacy_p2_eval_compatible";
 pub const WORLD_CORE_V2_SCHEMA: &str = "world_core_v2";
 pub const WORLD_CORE_V3_SCHEMA: &str = "world_core_v3";
 pub const WORLD_CORE_V4_SCHEMA: &str = "world_core_v4_full_training";
+pub const WORLD_CORE_V5_SCHEMA: &str = "world_core_v5";
 
 /// A persisted training recipe, separate from historical research switches.
 /// `FullV4` is resolved before validation and cannot be composed with V2/V3.
@@ -19,6 +20,7 @@ pub enum TrainingRecipe {
     #[default]
     LegacyExperimental,
     FullV4,
+    FoundationV2,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -56,6 +58,7 @@ pub enum WorldCoreFamily {
     V2,
     V3,
     V4,
+    V5,
 }
 
 impl WorldCoreFamily {
@@ -69,6 +72,7 @@ impl WorldCoreFamily {
             Self::V2 => WORLD_CORE_V2_SCHEMA,
             Self::V3 => WORLD_CORE_V3_SCHEMA,
             Self::V4 => WORLD_CORE_V4_SCHEMA,
+            Self::V5 => WORLD_CORE_V5_SCHEMA,
         }
     }
 }
@@ -188,7 +192,7 @@ pub struct ExperimentRequest<'a> {
 
 impl ResolvedExperiment {
     pub fn resolve(request: ExperimentRequest<'_>) -> Result<Self> {
-        let family = match (
+        let topology_family = match (
             request.world_core_v2,
             request.world_core_v3,
             request.world_core_v4,
@@ -200,16 +204,36 @@ impl ResolvedExperiment {
             (false, true, false) => bail!("world_core_v3 requires the world_core_v2 base topology"),
             _ => bail!("world-core-v4 is an exclusive successor topology"),
         };
+        let family = match request.recipe {
+            TrainingRecipe::FullV4 => {
+                ensure!(
+                    topology_family == WorldCoreFamily::V4,
+                    "full-v4 recipe requires the world-core-v4 topology"
+                );
+                WorldCoreFamily::V4
+            }
+            TrainingRecipe::FoundationV2 => {
+                ensure!(
+                    topology_family == WorldCoreFamily::V4,
+                    "foundation-v2 recipe requires the exact-decoder topology"
+                );
+                WorldCoreFamily::V5
+            }
+            TrainingRecipe::LegacyExperimental => {
+                ensure!(
+                    topology_family != WorldCoreFamily::V4,
+                    "world-core-v4 topology requires a fixed successor recipe"
+                );
+                topology_family
+            }
+        };
+        let legacy_branch_learning = matches!(family, WorldCoreFamily::V2 | WorldCoreFamily::V3);
+        let factual_learning = legacy_branch_learning || family == WorldCoreFamily::V5;
         ensure!(
-            (request.recipe == TrainingRecipe::FullV4) == (family == WorldCoreFamily::V4),
-            "full-v4 recipe and world-core-v4 topology must be selected together"
+            request.branch_learning_enabled == legacy_branch_learning,
+            "legacy branch_learning.enabled must match the V2/V3 family"
         );
-        let factual_learning = matches!(family, WorldCoreFamily::V2 | WorldCoreFamily::V3);
-        ensure!(
-            request.branch_learning_enabled == factual_learning,
-            "resolved world-core family and branch_learning.enabled must match"
-        );
-        if factual_learning {
+        if legacy_branch_learning {
             ensure!(
                 request
                     .lessons
@@ -241,7 +265,7 @@ impl ResolvedExperiment {
             (true, false) => {
                 ensure!(
                     factual_learning || family == WorldCoreFamily::V4,
-                    "spatial action fields require V2/V3/V4"
+                    "spatial action fields require V2/V3/V4/V5"
                 );
                 ActionConditioning::SpatialField
             }

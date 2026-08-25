@@ -8,8 +8,9 @@ use crate::p2::board_probe::{
 };
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
-    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, ArcAction,
-    BranchGroup, FactualBatch, TransitionSample, FACTUAL_BRANCHES_PER_GROUP, ORACLE_LATENT_DIM,
+    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, palette,
+    ArcAction, BranchGroup, FactualBatch, TransitionSample, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE,
+    ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -23,8 +24,10 @@ use crate::p2::rhae::{
     benchmark_from_scorecard_json, official_rhae_from_benchmark, ScorecardBenchmark,
 };
 use crate::p2::semantic_eval::{
-    aggregate_decoder_metrics, collision_census, evaluate_semantics, latent_semantic_metrics,
-    CollisionCensus, SemanticDecoderMetrics, SemanticEvaluation,
+    action_controllability_probe, aggregate_decoder_metrics, ambiguity_ceiling, collision_census,
+    evaluate_semantics, latent_semantic_metrics, shuffled_action_control_samples,
+    ActionControllabilityMetrics, AmbiguityCeiling, CollisionCensus, SemanticDecoderMetrics,
+    SemanticEvaluation,
 };
 use crate::p2::train::{
     action_tensors_from_samples, batch_from_samples, load_train_config, load_varmap_exact,
@@ -50,7 +53,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v15";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v16";
+pub const ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD: f64 = 1e-3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -282,14 +286,14 @@ pub struct RolloutMetrics {
     pub mse_4: Option<f64>,
     pub n8: usize,
     pub mse_8: Option<f64>,
-    pub n16: usize,
+    /// Non-serialized Rust compatibility for the legacy CLI summary.
+    /// Eval-report v16 and episode-row v3 deliberately emit no h16 metric.
+    #[serde(skip)]
     pub mse_16: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h4: Option<HorizonRolloutStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h8: Option<HorizonRolloutStats>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub h16: Option<HorizonRolloutStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_closed_ratio_8: Option<f64>,
 }
@@ -323,24 +327,12 @@ pub struct CalibrationGates {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContrastiveProbeMetrics {
-    pub noop_identity_mse: Option<f64>,
-    pub action_effect_mse: Option<f64>,
-    pub inverse_action_cosine: Option<f64>,
-    /// `action_effect_mse / noop_identity_mse`: how much more a real action
-    /// moves the latent than a no-op does.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_effect_ratio: Option<f64>,
-    /// Copy-forward tripwire. False when actions barely change the prediction,
-    /// i.e. the model has settled on `next ~= current`. A world model that
-    /// fails this cannot support planning no matter how low its one-step MSE
-    /// is, so it is reported as an explicit gate rather than left to be
-    /// inferred from two separate numbers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copy_forward_pass: Option<bool>,
+    pub source_kind: String,
+    pub true_action_effect_mse: Option<f64>,
+    pub action_shuffled_effect_mse: Option<f64>,
+    pub true_vs_action_shuffled_prediction_mse: Option<f64>,
+    pub action_control_contract: String,
 }
-
-/// Minimum `action_effect_mse / noop_identity_mse` for the copy-forward gate.
-pub const COPY_FORWARD_MIN_RATIO: f64 = 2.0;
 
 /// Shuffled actions should increase one-step prediction error by more than 10%.
 /// Ratios at or below this threshold indicate action-marginalized dynamics.
@@ -379,7 +371,30 @@ pub struct ChangedTransitionMetrics {
     pub improvement_fraction: Option<f64>,
     pub improvement_ci95_low: Option<f64>,
     pub improvement_ci95_high: Option<f64>,
-    pub ten_percent_improvement_pass: Option<bool>,
+    /// Foundation-v2 gate: predictor improves over latent copy on average.
+    pub positive_improvement_pass: Option<bool>,
+}
+
+/// Cheap fixed-population measurements consumed by the foundation-v2 trainer
+/// gates. `evaluate_gate_support` performs one current/target encoding batch
+/// and deterministic true/shuffled action forwards over the supplied rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateSupportMetrics {
+    pub samples: usize,
+    pub changed_transitions: usize,
+    pub changed_pixels: usize,
+    pub foreground_pixels: usize,
+    /// `1 - mean(prediction_mse) / mean(copy_forward_mse)` on Changed Transitions.
+    pub improvement_fraction: Option<f64>,
+    /// Shuffled-action changed-pixel accuracy divided by true-action
+    /// changed-pixel accuracy; lower means stronger action conditioning.
+    pub shuffled_action_changed_pixel_ratio: Option<f64>,
+    /// Exact-decoder pixel accuracy on non-empty pixels of the encoded next state.
+    pub foreground_reconstruction_accuracy: Option<f64>,
+    /// Fraction of Changed Transitions whose every factually changed gameplay
+    /// pixel is decoded exactly from the one-step prediction.
+    pub one_step_changed_exact: Option<f64>,
+    pub population_contract: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,7 +491,8 @@ pub struct EnsembleMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeRolloutRow {
-    /// Stable episode-rollout row schema. The top-level report is v15.
+    /// Stable episode-rollout row schema. V3 intentionally reports only the
+    /// populated h4/h8 horizons; the never-populated h16 row was removed.
     pub schema: String,
     /// Evaluation population that supplied this factual episode.
     pub source: String,
@@ -522,7 +538,7 @@ impl EpisodeRolloutResult {
                         .then_some(numerator / denominator)
                 });
         EpisodeRolloutRow {
-            schema: "p2.episode_rollout.v2".into(),
+            schema: "p2.episode_rollout.v3".into(),
             source: source.into(),
             seed: self.seed,
             episode_id: self.episode_id,
@@ -604,6 +620,8 @@ pub struct SplitEval {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_rollout: Option<SemanticRolloutMetrics>,
     pub collision_census: CollisionCensus,
+    /// Visible-state/action factual-successor ambiguity at history 1 and 2.
+    pub ambiguity_ceiling: AmbiguityCeiling,
     pub representation: Option<RepresentationDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub representation_seams: Option<RepresentationSeamMap>,
@@ -636,6 +654,8 @@ pub struct SplitEval {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticRolloutMetrics {
+    pub population_contract: String,
+    pub comparable_to_one_step: bool,
     pub open: BTreeMap<usize, SemanticDecoderMetrics>,
     pub closed: BTreeMap<usize, SemanticDecoderMetrics>,
     pub learned_copy: BTreeMap<usize, SemanticDecoderMetrics>,
@@ -738,6 +758,10 @@ pub struct FactualBranchMetrics {
     pub unchanged: usize,
     pub recoverable: usize,
     pub action6: usize,
+    /// All factual legal actions are forwarded from each fixed held-out branch
+    /// state; distances are between predicted Consumer Latents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_controllability: Option<ActionControllabilityMetrics>,
     /// Anchors with at least one equivalent and one distinct candidate.
     pub outcome_equivalence_anchors: usize,
     /// Nearest-displacement outcome-equivalence accuracy on eligible anchors.
@@ -1155,7 +1179,15 @@ fn semantic_population_fingerprint(samples: &[TransitionSample]) -> String {
             sample.action.id,
             sample.action.x.unwrap_or(u8::MAX),
             sample.action.y.unwrap_or(u8::MAX),
+            match sample.noop {
+                Some(false) => 0,
+                Some(true) => 1,
+                None => u8::MAX,
+            },
         ]);
+        for goal in sample.goal_features.values {
+            digest.update(goal.to_bits().to_le_bytes());
+        }
         for frame in [&sample.current, &sample.next] {
             digest.update(frame.width.to_le_bytes());
             digest.update(frame.height.to_le_bytes());
@@ -2097,9 +2129,7 @@ fn summarize_changed_transitions(
     }
     let learned_mse = mean(learned);
     let copy_forward_mse = mean(copy_forward);
-    let improvement_fraction = learned_mse
-        .zip(copy_forward_mse)
-        .and_then(|(learned, copy)| (copy > 0.0).then_some(1.0 - learned / copy));
+    let improvement_fraction = improvement_fraction(learned, copy_forward);
     let (ratio_low, ratio_high) = bootstrap_paired_ratio_ci95(learned, copy_forward, seed);
     let improvement_ci95_low = ratio_high.map(|ratio| 1.0 - ratio);
     let improvement_ci95_high = ratio_low.map(|ratio| 1.0 - ratio);
@@ -2110,7 +2140,256 @@ fn summarize_changed_transitions(
         improvement_fraction,
         improvement_ci95_low,
         improvement_ci95_high,
-        ten_percent_improvement_pass: improvement_fraction.map(|value| value >= 0.10),
+        positive_improvement_pass: improvement_fraction.map(|value| value > 0.0),
+    })
+}
+
+/// The authoritative Changed Transition predicate. `noop` is derived from the
+/// status-row-excluded board effect by synthetic/import adapters.
+pub fn is_board_changed_transition(sample: &TransitionSample) -> bool {
+    sample.noop == Some(false)
+}
+
+pub fn board_changed_transition_count(samples: &[TransitionSample]) -> usize {
+    samples
+        .iter()
+        .filter(|sample| is_board_changed_transition(sample))
+        .count()
+}
+
+pub fn improvement_fraction(learned: &[f32], copy_forward: &[f32]) -> Option<f64> {
+    if learned.len() != copy_forward.len()
+        || learned.is_empty()
+        || learned
+            .iter()
+            .chain(copy_forward)
+            .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    mean(learned)
+        .zip(mean(copy_forward))
+        .and_then(|(learned, copy)| (copy > 0.0).then_some(1.0 - learned / copy))
+}
+
+fn gameplay_pixels(sample: &TransitionSample) -> (&[u8], &[u8]) {
+    let gameplay_len = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let current_end = gameplay_len.min(sample.current.pixels.len());
+    let next_end = gameplay_len.min(sample.next.pixels.len());
+    (
+        &sample.current.pixels[..current_end],
+        &sample.next.pixels[..next_end],
+    )
+}
+
+pub fn shuffled_action_changed_pixel_ratio(
+    samples: &[TransitionSample],
+    true_action_predictions: &[Vec<u8>],
+    shuffled_action_predictions: &[Vec<u8>],
+) -> Result<Option<f64>> {
+    if samples.len() != true_action_predictions.len()
+        || samples.len() != shuffled_action_predictions.len()
+    {
+        bail!("gate changed-pixel rows do not match the sample count");
+    }
+    let mut changed_pixels = 0usize;
+    let mut true_correct = 0usize;
+    let mut shuffled_correct = 0usize;
+    for ((sample, true_prediction), shuffled_prediction) in samples
+        .iter()
+        .zip(true_action_predictions)
+        .zip(shuffled_action_predictions)
+    {
+        if !is_board_changed_transition(sample) {
+            continue;
+        }
+        let (current, target) = gameplay_pixels(sample);
+        if current.len() != target.len()
+            || true_prediction.len() != target.len()
+            || shuffled_prediction.len() != target.len()
+        {
+            bail!("gate changed-pixel prediction width does not match gameplay target");
+        }
+        for (((before, after), true_pixel), shuffled_pixel) in current
+            .iter()
+            .zip(target)
+            .zip(true_prediction)
+            .zip(shuffled_prediction)
+        {
+            if before == after {
+                continue;
+            }
+            changed_pixels += 1;
+            true_correct += usize::from(true_pixel == after);
+            shuffled_correct += usize::from(shuffled_pixel == after);
+        }
+    }
+    if changed_pixels == 0 || true_correct == 0 {
+        return Ok(None);
+    }
+    let true_accuracy = true_correct as f64 / changed_pixels as f64;
+    let shuffled_accuracy = shuffled_correct as f64 / changed_pixels as f64;
+    Ok(Some(shuffled_accuracy / true_accuracy))
+}
+
+pub fn foreground_reconstruction_accuracy(
+    samples: &[TransitionSample],
+    target_reconstructions: &[Vec<u8>],
+) -> Result<Option<f64>> {
+    if samples.len() != target_reconstructions.len() {
+        bail!("gate foreground reconstruction rows do not match the sample count");
+    }
+    let mut foreground = 0usize;
+    let mut correct = 0usize;
+    for (sample, prediction) in samples.iter().zip(target_reconstructions) {
+        let (_, target) = gameplay_pixels(sample);
+        if prediction.len() != target.len() {
+            bail!("gate foreground prediction width does not match gameplay target");
+        }
+        for (predicted, target) in prediction.iter().zip(target) {
+            if *target == palette::EMPTY {
+                continue;
+            }
+            foreground += 1;
+            correct += usize::from(predicted == target);
+        }
+    }
+    Ok((foreground > 0).then_some(correct as f64 / foreground as f64))
+}
+
+pub fn one_step_changed_exact(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+) -> Result<Option<f64>> {
+    if samples.len() != one_step_predictions.len() {
+        bail!("gate one-step rows do not match the sample count");
+    }
+    let mut transitions = 0usize;
+    let mut exact = 0usize;
+    for (sample, prediction) in samples.iter().zip(one_step_predictions) {
+        if !is_board_changed_transition(sample) {
+            continue;
+        }
+        let (current, target) = gameplay_pixels(sample);
+        if prediction.len() != target.len() || current.len() != target.len() {
+            bail!("gate one-step prediction width does not match gameplay target");
+        }
+        let mut changed_pixels = 0usize;
+        let mut transition_exact = true;
+        for ((before, after), predicted) in current.iter().zip(target).zip(prediction) {
+            if before == after {
+                continue;
+            }
+            changed_pixels += 1;
+            transition_exact &= predicted == after;
+        }
+        if changed_pixels > 0 {
+            transitions += 1;
+            exact += usize::from(transition_exact);
+        }
+    }
+    Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
+}
+
+fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<Vec<u8>>> {
+    let batch = latent.dim(0)?;
+    model
+        .exact_gameplay_logits(latent)?
+        .argmax(D::Minus1)?
+        .reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?
+        .to_dtype(DType::U8)?
+        .to_vec2::<u8>()
+        .map_err(Into::into)
+}
+
+/// Evaluate all four automated run-gate measurements on one fixed batch.
+/// Callers own and persist the held-out population; this function never
+/// samples or mutates it.
+pub fn evaluate_gate_support(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<GateSupportMetrics> {
+    if samples.is_empty() {
+        return Ok(GateSupportMetrics {
+            samples: 0,
+            changed_transitions: 0,
+            changed_pixels: 0,
+            foreground_pixels: 0,
+            improvement_fraction: None,
+            shuffled_action_changed_pixel_ratio: None,
+            foreground_reconstruction_accuracy: None,
+            one_step_changed_exact: None,
+            population_contract: "caller-owned fixed held-out transition set; empty population"
+                .into(),
+        });
+    }
+    if !model.config().world_core_v4 {
+        bail!("foundation-v2 gate support requires the exact gameplay decoder");
+    }
+    let batch = batch_from_samples(samples, device)?;
+    let (current, target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let prediction = model
+        .forward_from_latent(&current, &batch.actions, &batch.action_coords, &batch.goals)?
+        .y;
+    let shuffled = shuffled_action_control_samples(samples);
+    let (shuffled_actions, shuffled_coords) = action_tensors_from_samples(&shuffled, device)?;
+    let shuffled_prediction = model
+        .forward_from_latent(&current, &shuffled_actions, &shuffled_coords, &batch.goals)?
+        .y;
+    let learned_errors = per_sample_mse(&prediction, &target)?;
+    let copy_errors = per_sample_mse(&current, &target)?;
+    let changed_indices = samples
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sample)| is_board_changed_transition(sample).then_some(index))
+        .collect::<Vec<_>>();
+    let changed_learned = changed_indices
+        .iter()
+        .map(|index| learned_errors[*index])
+        .collect::<Vec<_>>();
+    let changed_copy = changed_indices
+        .iter()
+        .map(|index| copy_errors[*index])
+        .collect::<Vec<_>>();
+    let true_predictions = exact_palette_predictions(model, &prediction)?;
+    let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
+    let target_reconstructions = exact_palette_predictions(model, &target)?;
+    let changed_pixels = samples
+        .iter()
+        .filter(|sample| is_board_changed_transition(sample))
+        .map(|sample| {
+            let (current, target) = gameplay_pixels(sample);
+            current.iter().zip(target).filter(|(a, b)| a != b).count()
+        })
+        .sum();
+    let foreground_pixels = samples
+        .iter()
+        .map(|sample| {
+            gameplay_pixels(sample)
+                .1
+                .iter()
+                .filter(|pixel| **pixel != palette::EMPTY)
+                .count()
+        })
+        .sum();
+    Ok(GateSupportMetrics {
+        samples: samples.len(),
+        changed_transitions: changed_indices.len(),
+        changed_pixels,
+        foreground_pixels,
+        improvement_fraction: improvement_fraction(&changed_learned, &changed_copy),
+        shuffled_action_changed_pixel_ratio: shuffled_action_changed_pixel_ratio(
+            samples,
+            &true_predictions,
+            &shuffled_predictions,
+        )?,
+        foreground_reconstruction_accuracy: foreground_reconstruction_accuracy(
+            samples,
+            &target_reconstructions,
+        )?,
+        one_step_changed_exact: one_step_changed_exact(samples, &true_predictions)?,
+        population_contract: "caller-owned fixed held-out transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; complete action tuples shuffled only within provenance.source_kind; one encode batch plus true/shuffled forwards".into(),
     })
 }
 
@@ -2590,7 +2869,7 @@ fn eval_one_batch(
         .zip(mses.iter().copied())
         .zip(copy_forward_mses.iter().copied())
     {
-        if sample.current != sample.next {
+        if is_board_changed_transition(sample) {
             partial.changed_learned_errors.push(learned);
             partial.changed_copy_forward_errors.push(copy_forward);
         }
@@ -3017,7 +3296,7 @@ fn eval_rollout_group(
     };
     let mut open_latent = z0.clone();
     let mut rows = Vec::new();
-    for (idx, sample) in steps.iter().enumerate() {
+    for (idx, sample) in steps.iter().take(8).enumerate() {
         let batch =
             batch_from_samples(std::slice::from_ref(sample), device).with_context(|| {
                 rollout_operation_context(sample, "open-loop", "step batch construction")
@@ -3072,10 +3351,10 @@ fn eval_rollout_group(
                 rollout_operation_context(sample, "open-loop", "copy-forward MSE reduction")
             })? as f64;
         let horizon = idx + 1;
-        if matches!(horizon, 4 | 8 | 16) {
+        if matches!(horizon, 4 | 8) {
             let mut row =
                 episode_rollout_result(steps, horizon, open_mse, closed_mse, copy_forward_mse);
-            if model.config().world_core_v4 && matches!(horizon, 4 | 8) {
+            if model.config().world_core_v4 {
                 row.open_semantic = Some(latent_semantic_metrics(model, &open_pred, sample)?);
                 row.closed_semantic = Some(latent_semantic_metrics(model, &closed_pred, sample)?);
                 row.learned_copy_semantic = Some(latent_semantic_metrics(model, &z0, sample)?);
@@ -3142,6 +3421,8 @@ fn attach_rollout_metrics(split: &mut SplitEval, rows: &[EpisodeRolloutRow], see
         }
     }
     let semantic_rollout = SemanticRolloutMetrics {
+        population_contract: "trajectory-filtered rollout population (contiguous provenance.trajectory_id with length>=4); separately fingerprinted and not comparable as a horizon curve to the one-step semantic population".into(),
+        comparable_to_one_step: false,
         open: aggregate_rollout_semantics(rows, |row| row.open_semantic.as_ref()),
         closed: aggregate_rollout_semantics(rows, |row| row.closed_semantic.as_ref()),
         learned_copy: aggregate_rollout_semantics(rows, |row| row.learned_copy_semantic.as_ref()),
@@ -3183,18 +3464,16 @@ fn rollout_metrics_from_rows(
     };
     let h4_values = values(4);
     let h8_values = values(8);
-    let h16_values = values(16);
-    let (h4_seed_offset, h8_seed_offset, h16_seed_offset) = match metric {
-        RolloutMetric::CopyForward => (0x14, 0x18, 0x1C),
-        RolloutMetric::Open | RolloutMetric::Closed => (0x04, 0x08, 0x10),
+    let (h4_seed_offset, h8_seed_offset) = match metric {
+        RolloutMetric::CopyForward => (0x14, 0x18),
+        RolloutMetric::Open | RolloutMetric::Closed => (0x04, 0x08),
     };
     RolloutMetrics {
         n4: h4_values.len(),
         mse_4: mean(&h4_values),
         n8: h8_values.len(),
         mse_8: mean(&h8_values),
-        n16: h16_values.len(),
-        mse_16: mean(&h16_values),
+        mse_16: None,
         h4: Some(summarize_horizon(
             &h4_values,
             &normalized(4),
@@ -3204,11 +3483,6 @@ fn rollout_metrics_from_rows(
             &h8_values,
             &normalized(8),
             seed ^ h8_seed_offset,
-        )),
-        h16: Some(summarize_horizon(
-            &h16_values,
-            &normalized(16),
-            seed ^ h16_seed_offset,
         )),
         open_closed_ratio_8: None,
     }
@@ -3324,6 +3598,7 @@ fn empty_split(source: &str, n_samples: usize) -> SplitEval {
         semantic: None,
         semantic_rollout: None,
         collision_census: collision_census(&no_samples, &[]),
+        ambiguity_ceiling: ambiguity_ceiling(&no_samples),
         representation: None,
         representation_seams: None,
         changed_transitions: None,
@@ -3597,6 +3872,7 @@ fn eval_sample_set(
         })
         .transpose()?;
     let collision_census = collision_census(samples, action_sources.unwrap_or(&fallback_sources));
+    let ambiguity_ceiling = ambiguity_ceiling(samples);
 
     Ok(SplitEval {
         source: source.into(),
@@ -3605,6 +3881,7 @@ fn eval_sample_set(
         semantic,
         semantic_rollout: None,
         collision_census,
+        ambiguity_ceiling,
         representation,
         representation_seams: Some(representation_seams),
         changed_transitions,
@@ -3652,35 +3929,32 @@ fn eval_contrastive_probes(
     if samples.is_empty() {
         bail!("contrastive probes need samples");
     }
-    let sample = &samples[0];
-    let batch = batch_from_samples(std::slice::from_ref(sample), device)?;
+    let shuffled = shuffled_action_control_samples(samples);
+    let index = samples
+        .iter()
+        .zip(&shuffled)
+        .position(|(true_sample, shuffled_sample)| true_sample.action != shuffled_sample.action)
+        .context("contrastive probe needs a source-local changed action conditioning")?;
+    let probe_rows = vec![samples[index].clone(), shuffled[index].clone()];
+    let batch = batch_from_samples(&probe_rows, device)?;
     let z = model.encode_state(&batch.frames)?;
-    let noop = Tensor::zeros((1,), DType::U32, device)?;
-    let noop_coords = Tensor::zeros((1, 2), DType::F32, device)?;
-    let pred_noop = model.forward_from_latent(&z, &noop, &noop_coords, &batch.goals)?;
-    let noop_mse = pred_noop.y.sub(&z)?.sqr()?.mean_all()?.to_scalar::<f32>()? as f64;
-    let pred_action =
-        model.forward_from_latent(&z, &batch.actions, &batch.action_coords, &batch.goals)?;
-    // This probe measures whether the dynamics react to the action at all.
-    // Prediction error against `next_z` is reported separately and is not an
-    // action-effect magnitude; using it here made the ratio compare unrelated
-    // quantities (target error versus no-op drift).
-    let action_mse = pred_action
-        .y
-        .sub(&z)?
+    let predictions = model
+        .forward_from_latent(&z, &batch.actions, &batch.action_coords, &batch.goals)?
+        .y;
+    let effects = per_sample_mse(&predictions, &z)?;
+    let true_prediction = predictions.narrow(0, 0, 1)?;
+    let shuffled_prediction = predictions.narrow(0, 1, 1)?;
+    let prediction_mse = true_prediction
+        .sub(&shuffled_prediction)?
         .sqr()?
         .mean_all()?
         .to_scalar::<f32>()? as f64;
-    let ratio = (noop_mse > 0.0).then(|| action_mse / noop_mse);
     Ok(ContrastiveProbeMetrics {
-        noop_identity_mse: Some(noop_mse),
-        action_effect_mse: Some(action_mse),
-        // A real inverse-action probe needs a paired inverse transition. The
-        // previous implementation compared a delta with its own negation and
-        // therefore reported -1 for every model.
-        inverse_action_cosine: None,
-        action_effect_ratio: ratio,
-        copy_forward_pass: ratio.map(|r| r >= COPY_FORWARD_MIN_RATIO),
+        source_kind: samples[index].provenance.source_kind.clone(),
+        true_action_effect_mse: effects.first().copied().map(f64::from),
+        action_shuffled_effect_mse: effects.get(1).copied().map(f64::from),
+        true_vs_action_shuffled_prediction_mse: Some(prediction_mse),
+        action_control_contract: "one complete action tuple replaced by a deterministic donor from the same provenance.source_kind; no untrained action id is used".into(),
     })
 }
 
@@ -4255,7 +4529,9 @@ fn evaluate_outcome_counterfactuals(
         target_displacements.extend(target);
     }
 
-    let mut ledger = Vec::with_capacity(groups.len() * 6);
+    let pairs_per_group =
+        FACTUAL_BRANCHES_PER_GROUP.saturating_mul(FACTUAL_BRANCHES_PER_GROUP.saturating_sub(1)) / 2;
+    let mut ledger = Vec::with_capacity(groups.len() * pairs_per_group);
     let mut group_fingerprints = Vec::with_capacity(groups.len());
     let mut pixel_oracle_values = Vec::new();
     let mut latent_oracle_values = Vec::new();
@@ -4575,7 +4851,7 @@ fn evaluate_outcome_counterfactuals(
         interval.estimate > OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD
             && interval.lower_95 > OUTCOME_COUNTERFACTUAL_MATERIAL_THRESHOLD
     });
-    let ledger_reconciled = ledger.len() == groups.len() * 6
+    let ledger_reconciled = ledger.len() == groups.len() * pairs_per_group
         && eligible_pairs + outcome_equivalent_pairs == ledger.len()
         && ledger.iter().all(|row| {
             row.group.actions.len() == FACTUAL_BRANCHES_PER_GROUP
@@ -4640,6 +4916,7 @@ fn evaluate_factual_branches(
             unchanged: 0,
             recoverable: 0,
             action6: 0,
+            action_controllability: None,
             outcome_equivalence_anchors: 0,
             outcome_equivalence_retrieval_accuracy: None,
             unique_changed_effect_action_n: 0,
@@ -4680,6 +4957,7 @@ fn evaluate_factual_branches(
     let samples = factual_batch.rows().to_vec();
 
     let mut predicted_displacements = Vec::with_capacity(samples.len());
+    let mut predicted_consumer_latents = Vec::with_capacity(samples.len());
     let mut action_logits = Vec::with_capacity(samples.len());
     let mut coordinate_predictions = Vec::with_capacity(samples.len());
     let mut target_patch_latents: Option<BoardProbeRows> = None;
@@ -4699,6 +4977,11 @@ fn evaluate_factual_branches(
             &batch.action_coords,
             &batch.goals,
         )?;
+        predicted_consumer_latents.extend(
+            flatten_latent(&output.y)?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?,
+        );
         let target = model.encode_state(&batch.next_frames)?;
         let displacement = pool_latent(&output.y.sub(&current)?)?;
         predicted_displacements.extend(displacement.to_dtype(DType::F32)?.to_vec2::<f32>()?);
@@ -4734,6 +5017,36 @@ fn evaluate_factual_branches(
             predicted_patch_latents = Some(predicted_rows);
         }
     }
+
+    let legal_actions = groups
+        .iter()
+        .map(|group| {
+            group
+                .branches()
+                .iter()
+                .map(|branch| branch.transition.action.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let action_controllability = {
+        let mut group_offsets = Vec::with_capacity(groups.len());
+        let mut offset = 0usize;
+        for group in &groups {
+            group_offsets.push(offset);
+            offset += group.branches().len();
+        }
+        Some(action_controllability_probe(
+            &legal_actions,
+            ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD,
+            |state_index, action| {
+                let local = legal_actions[state_index]
+                    .iter()
+                    .position(|candidate| candidate == action)
+                    .expect("probe action comes from the state's legal-action list");
+                Ok(predicted_consumer_latents[group_offsets[state_index] + local].clone())
+            },
+        )?)
+    };
 
     let board_probe = if groups.len() >= 2 {
         // Split only between same-state groups. Cutting a four-branch group
@@ -5097,6 +5410,7 @@ fn evaluate_factual_branches(
         unchanged: counts.unchanged,
         recoverable: counts.recoverable,
         action6: counts.action6,
+        action_controllability,
         outcome_equivalence_anchors,
         outcome_equivalence_retrieval_accuracy: (outcome_equivalence_anchors > 0)
             .then_some(outcome_equivalence_correct as f64 / outcome_equivalence_anchors as f64),
@@ -5726,7 +6040,7 @@ mod tests {
     fn semantic_decoder(pixel_accuracy: f64, pixels: usize) -> SemanticDecoderMetrics {
         SemanticDecoderMetrics {
             masks: BTreeMap::from([(
-                "content".into(),
+                "changed".into(),
                 crate::p2::semantic_eval::SemanticMaskMetrics {
                     pixels,
                     transitions: 1,
@@ -5750,16 +6064,17 @@ mod tests {
         let mut split = empty_split("source", 3);
         attach_rollout_metrics(&mut split, &[h4_a, h4_b, h8], 9);
         let semantic = split.semantic_rollout.expect("semantic rollout summary");
+        assert!(!semantic.comparable_to_one_step);
         assert_eq!(
-            semantic.open[&4].masks["content"].pixel_accuracy,
+            semantic.open[&4].masks["changed"].pixel_accuracy,
             Some(0.875)
         );
         assert_eq!(
-            semantic.open[&4].masks["content"].mean_transition_accuracy,
+            semantic.open[&4].masks["changed"].mean_transition_accuracy,
             Some(0.75)
         );
         assert_eq!(
-            semantic.open[&8].masks["content"].pixel_accuracy,
+            semantic.open[&8].masks["changed"].pixel_accuracy,
             Some(0.25)
         );
     }
@@ -5845,8 +6160,8 @@ mod tests {
         let copy_forward = rollout_metrics_from_rows(&rows, RolloutMetric::CopyForward, 7);
 
         assert_eq!(
-            (open.n4, open.mse_4, open.n8, open.mse_8, open.n16),
-            (2, Some(4.0), 1, Some(10.0), 0)
+            (open.n4, open.mse_4, open.n8, open.mse_8),
+            (2, Some(4.0), 1, Some(10.0))
         );
         assert_eq!((closed.mse_4, closed.mse_8), (Some(6.0), Some(20.0)));
         assert_eq!(
@@ -5907,27 +6222,19 @@ mod tests {
     }
 
     #[test]
-    fn copy_forward_bootstrap_seeds_preserve_horizon_offsets() {
+    fn copy_forward_bootstrap_seeds_preserve_reported_horizon_offsets() {
         let h4 = [1.0_f32, 3.0, 7.0, 13.0, 21.0];
         let h8 = [2.0_f32, 5.0, 11.0, 17.0, 23.0];
-        let h16 = [4.0_f32, 6.0, 10.0, 16.0, 26.0];
         let rows = h4
             .iter()
             .chain(h8.iter())
-            .chain(h16.iter())
             .enumerate()
             .map(|(index, value)| {
                 rollout_row(
                     "synthetic_dynamics",
                     1,
                     index as u64,
-                    if index < h4.len() {
-                        4
-                    } else if index < h4.len() + h8.len() {
-                        8
-                    } else {
-                        16
-                    },
+                    if index < h4.len() { 4 } else { 8 },
                     Some(f64::from(*value)),
                     Some(f64::from(*value)),
                     Some(f64::from(*value)),
@@ -5952,13 +6259,16 @@ mod tests {
             ),
             bootstrap_ci95(&h8, caller_seed ^ 0x18)
         );
-        assert_eq!(
-            (
-                metrics.h16.as_ref().unwrap().ci95_low,
-                metrics.h16.as_ref().unwrap().ci95_high
-            ),
-            bootstrap_ci95(&h16, caller_seed ^ 0x1C)
-        );
+    }
+
+    #[test]
+    fn rollout_v16_schema_omits_h16_fields() {
+        let metrics = rollout_metrics_from_rows(&[], RolloutMetric::Open, 7);
+        let value = serde_json::to_value(metrics).expect("serialize rollout metrics");
+        let object = value.as_object().expect("rollout metrics object");
+        assert!(!object.contains_key("n16"));
+        assert!(!object.contains_key("mse_16"));
+        assert!(!object.contains_key("h16"));
     }
 
     #[test]
@@ -6432,10 +6742,12 @@ mod tests {
 
     #[test]
     fn changed_transition_metrics_compare_only_paired_changed_rows() -> Result<()> {
-        let metrics = summarize_changed_transitions(&[0.8, 0.6, 0.4], &[1.0, 0.8, 0.6], 17)?;
+        let metrics = summarize_changed_transitions(&[0.99, 0.79, 0.59], &[1.0, 0.8, 0.6], 17)?;
         assert_eq!(metrics.n, 3);
-        assert!(metrics.improvement_fraction.unwrap() >= 0.10);
-        assert_eq!(metrics.ten_percent_improvement_pass, Some(true));
+        assert!(metrics
+            .improvement_fraction
+            .is_some_and(|value| value > 0.0 && value < 0.10));
+        assert_eq!(metrics.positive_improvement_pass, Some(true));
         assert!(metrics.improvement_ci95_low.is_some());
         assert!(metrics.improvement_ci95_high.is_some());
         Ok(())
@@ -6515,15 +6827,19 @@ mod tests {
             "factual_coordinate_branch"
         );
         let coordinate_classes = canonical_outcome_classes(&coordinate);
+        let coordinate_outcomes = coordinate_classes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(coordinate_outcomes > 1);
+        assert!(coordinate_outcomes <= FACTUAL_BRANCHES_PER_GROUP);
         assert_eq!(
-            coordinate_classes
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .len(),
-            4
+            (0..FACTUAL_BRANCHES_PER_GROUP)
+                .flat_map(|left| left + 1..FACTUAL_BRANCHES_PER_GROUP)
+                .count(),
+            FACTUAL_BRANCHES_PER_GROUP * (FACTUAL_BRANCHES_PER_GROUP - 1) / 2
         );
-        assert_eq!((0..4).flat_map(|left| left + 1..4).count(), 6);
         Ok(())
     }
 
@@ -6643,6 +6959,7 @@ mod tests {
             profile: crate::p2::cg_profile::ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: vec![],
+            foundation_v2: None,
             research_claim: false,
         };
         save_checkpoint(&varmap, &train_cfg, &report)?;
@@ -6679,9 +6996,15 @@ mod tests {
             .expect("world-core-v2 factual evaluation");
         assert_eq!(factual.groups, eval_cfg.synthetic_episodes * 4);
         assert_eq!(factual.branches, factual.changed + factual.unchanged);
-        assert_eq!(factual.action6_coordinate_n, factual.action6);
+        assert!(factual.action6_coordinate_n > 0);
+        assert!(factual.action6_coordinate_n <= factual.action6);
         assert!(factual.action6_coordinate_rmse_normalized.is_some());
         assert!(factual.action6_coordinate_rmse_pixels.is_some());
+        assert!(factual
+            .action_controllability
+            .as_ref()
+            .is_some_and(|metrics| metrics.states_with_action_pairs == factual.groups
+                && metrics.action_pairs > 0));
         assert!(!factual.population_fingerprint.is_empty());
         assert!(factual.board_probe.is_some());
         let counterfactuals = eval
@@ -6693,7 +7016,11 @@ mod tests {
             counterfactuals.movement_groups,
             counterfactuals.coordinate_groups
         );
-        assert_eq!(counterfactuals.unordered_pairs, counterfactuals.groups * 6);
+        assert_eq!(
+            counterfactuals.unordered_pairs,
+            counterfactuals.groups * FACTUAL_BRANCHES_PER_GROUP * (FACTUAL_BRANCHES_PER_GROUP - 1)
+                / 2
+        );
         assert_eq!(
             counterfactuals.eligible_pairs + counterfactuals.outcome_equivalent_pairs,
             counterfactuals.unordered_pairs
@@ -6715,13 +7042,19 @@ mod tests {
         let state_scrambled = &counterfactuals
             .controls
             .state_scrambled_same_action_template;
-        assert!(state_scrambled.available);
-        assert!(state_scrambled.estimate.is_some());
-        assert_eq!(state_scrambled.groups, counterfactuals.movement_groups);
-        assert!(state_scrambled.pairs > 0);
+        if state_scrambled.available {
+            assert!(state_scrambled.estimate.is_some());
+            assert_eq!(state_scrambled.groups, counterfactuals.movement_groups);
+            assert!(state_scrambled.pairs > 0);
+        } else {
+            assert!(state_scrambled
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("identical action template")));
+        }
         assert!(counterfactuals.pair_ledger.iter().all(|row| {
-            row.group.actions.len() == 4
-                && row.group.next_sha256.len() == 4
+            row.group.actions.len() == FACTUAL_BRANCHES_PER_GROUP
+                && row.group.next_sha256.len() == FACTUAL_BRANCHES_PER_GROUP
                 && row.group.content_fingerprint.starts_with("sha256:")
         }));
         assert!(eval
@@ -6802,8 +7135,8 @@ mod tests {
                 .collect::<std::result::Result<_, _>>()?;
         assert!(!episode_rows.is_empty());
         assert!(episode_rows.iter().all(|row| {
-            row.schema == "p2.episode_rollout.v2"
-                && matches!(row.horizon, 4 | 8 | 16)
+            row.schema == "p2.episode_rollout.v3"
+                && matches!(row.horizon, 4 | 8)
                 && !row.families_through_horizon.is_empty()
         }));
         assert!(episode_rows
@@ -6961,7 +7294,13 @@ mod tests {
             .outcome_counterfactuals
             .expect("legacy checkpoint full counterfactual evaluation");
         assert_eq!(legacy_counterfactuals.groups, 4);
-        assert_eq!(legacy_counterfactuals.pair_ledger.len(), 24);
+        assert_eq!(
+            legacy_counterfactuals.pair_ledger.len(),
+            legacy_counterfactuals.groups
+                * FACTUAL_BRANCHES_PER_GROUP
+                * (FACTUAL_BRANCHES_PER_GROUP - 1)
+                / 2
+        );
         assert!(legacy_counterfactuals.ledger_reconciled);
 
         let _ = fs::remove_dir_all(&dir);

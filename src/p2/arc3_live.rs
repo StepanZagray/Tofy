@@ -33,9 +33,11 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v1";
+pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v2";
 pub const LIVE_POLICY: &str = "model_reliable_effect_v1";
 const POLICY_LIMITATION: &str = "The checkpoint predicts transition fidelity, reliability, no-op probability, and latent action effect; it has no trained reward/value head. This exploratory policy is not a hidden-goal solver.";
+const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
+const TRIED_ACTION_KEY_CONTRACT: &str = "game id + frame dimensions + visible pixels in rows [0,63); row 63 is excluded because training uses it as synthetic status while live games may contain real content there";
 const MAX_HTTP_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -599,6 +601,9 @@ pub struct ModelPolicy<'a> {
     tried: BTreeMap<u64, BTreeSet<String>>,
 }
 
+// TODO(ADR 0003 §7): replace this confidence/effect ranking only when the
+// deferred goal/belief-conditioned Q-ranking head has a trained contract.
+
 impl<'a> ModelPolicy<'a> {
     pub fn new(
         model: &'a WorldModel,
@@ -646,6 +651,9 @@ impl<'a> ModelPolicy<'a> {
                 (n, 2),
                 self.device,
             )?;
+            // Foundation-v2 applies 30% goal dropout during training. The live
+            // goal-free query is therefore deliberately the in-distribution
+            // all-zero vector, not a fabricated hidden-goal guess.
             let goals = Tensor::zeros((n, GOAL_FEATURES_DIM), DType::F32, self.device)?;
             let state = encoded.broadcast_as((n, channels, height, width))?;
             let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
@@ -675,6 +683,8 @@ impl<'a> ModelPolicy<'a> {
             for index in 0..n {
                 let effect_scaled = f64::from(effect[index]).max(0.0);
                 let effect_unit = effect_scaled / (1.0 + effect_scaled);
+                // TODO(ADR 0003 §7): retain the searchless forward-pass policy
+                // until a goal/belief-conditioned ranking target is trained.
                 let score = 0.25 * f64::from(q[index])
                     + 0.30 * f64::from(reliability[index])
                     + 0.30 * (1.0 - f64::from(noop[index]))
@@ -733,13 +743,17 @@ impl LivePolicy for ModelPolicy<'_> {
     }
 }
 
-fn observation_hash(observation: &ArcObservation) -> u64 {
+pub fn observation_hash(observation: &ArcObservation) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     observation.game_id.hash(&mut hasher);
     let frame = &observation.frame;
     frame.width.hash(&mut hasher);
     frame.height.hash(&mut hasher);
-    frame.pixels.hash(&mut hasher);
+    let visible_rows = usize::from(frame.height).min(FRAME_SIDE - 1);
+    let visible_len = visible_rows
+        .saturating_mul(usize::from(frame.width))
+        .min(frame.pixels.len());
+    frame.pixels[..visible_len].hash(&mut hasher);
     hasher.finish()
 }
 
@@ -901,6 +915,8 @@ pub struct LiveEvalReport {
     pub base_url: String,
     pub policy: String,
     pub policy_limitation: String,
+    pub goal_feature_contract: String,
+    pub tried_action_key_contract: String,
     pub held_out_only: bool,
     pub public_data_used_for_fitting: bool,
     pub discovered_games: Vec<PublicGame>,
@@ -1100,6 +1116,8 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         base_url: settings.base_url.clone(),
         policy: LIVE_POLICY.into(),
         policy_limitation: POLICY_LIMITATION.into(),
+        goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),
+        tried_action_key_contract: TRIED_ACTION_KEY_CONTRACT.into(),
         held_out_only: true,
         public_data_used_for_fitting: false,
         discovered_games: discovered,
@@ -1514,6 +1532,21 @@ mod tests {
     }
 
     #[test]
+    fn tried_action_hash_excludes_row_63_but_keeps_visible_gameplay() {
+        let first = observation("game", "NOT_FINISHED", vec![1]);
+        let mut status_changed = first.clone();
+        status_changed.frame.pixels[63 * FRAME_SIDE + 7] = 9;
+        assert_eq!(observation_hash(&first), observation_hash(&status_changed));
+
+        let mut gameplay_changed = first.clone();
+        gameplay_changed.frame.pixels[62 * FRAME_SIDE + 7] = 9;
+        assert_ne!(
+            observation_hash(&first),
+            observation_hash(&gameplay_changed)
+        );
+    }
+
+    #[test]
     fn action_enumeration_masks_and_bounds_action6() {
         let mut obs = observation("demo", "NOT_FINISHED", vec![1, 5, 6]);
         obs.frame.pixels[10 * 64 + 20] = 3;
@@ -1673,6 +1706,11 @@ mod tests {
         assert!(report.evaluated_all_discovered_games);
         assert!(report.held_out_only);
         assert!(!report.public_data_used_for_fitting);
+        assert_eq!(report.schema, LIVE_REPORT_SCHEMA);
+        assert!(report.goal_feature_contract.contains("30% goal dropout"));
+        assert!(report
+            .tried_action_key_contract
+            .contains("row 63 is excluded"));
         assert_eq!(report.official_rhae, Some(100.0));
         assert!(report.official_scorecard_parse_error.is_none());
         assert!(report

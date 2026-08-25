@@ -18,6 +18,9 @@ const P1C_HARD_BUDGET: u16 = 256;
 const SPLIT_TRAIN_TAG: u64 = 0x5472_6169_6e00_0001;
 const SPLIT_HELD_TAG: u64 = 0x4865_6c64_4f75_7402;
 
+/// Square board sizes used by the world-core-v5 data contract.
+pub const V5_CONTENT_SIZES: [u8; 7] = [7, 8, 10, 12, 16, 24, 32];
+
 /// Stem geometry for the shared P1C false-lead transform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum P1cFalseLeadLayout {
@@ -63,6 +66,66 @@ pub fn generate(seed: u64, episode_id: u64, split: Split) -> Scenario {
         }
     }
     fallback_scenario(seed, episode_id, split, &mut rng)
+}
+
+/// Generate the existing solvable task distribution at an exact v5 board size.
+///
+/// The accepted 7x7/8x8 scenario is deterministically dilated to the requested
+/// square. Dilation preserves object identity and goal composition while
+/// spreading geometry across the larger board; the additional cells are
+/// semantic empty cells, not canvas padding. The action budget is scaled with
+/// side length so held-out 16x16 and large training boards remain traversable.
+pub fn generate_sized(seed: u64, episode_id: u64, split: Split, content_size: u8) -> Scenario {
+    assert!(
+        V5_CONTENT_SIZES.contains(&content_size),
+        "v5 content size must be one of {V5_CONTENT_SIZES:?}, got {content_size}"
+    );
+    let mut scenario = generate(seed, episode_id, split);
+    let source_width = scenario.width;
+    let source_height = scenario.height;
+    if source_width == content_size && source_height == content_size {
+        return scenario;
+    }
+
+    let scale = |position: Pos| {
+        let scale_axis = |value: i8, source: u8| -> i8 {
+            let source_span = u16::from(source.saturating_sub(1)).max(1);
+            let target_span = u16::from(content_size.saturating_sub(1));
+            let numerator =
+                u16::try_from(value).expect("scenario positions are non-negative") * target_span;
+            i8::try_from((numerator + source_span / 2) / source_span)
+                .expect("v5 content coordinates fit i8")
+        };
+        Pos::new(
+            scale_axis(position.x, source_width),
+            scale_axis(position.y, source_height),
+        )
+    };
+
+    scenario.walls = std::mem::take(&mut scenario.walls)
+        .into_iter()
+        .map(scale)
+        .collect();
+    for positions in [
+        &mut scenario.markers,
+        &mut scenario.collectibles,
+        &mut scenario.switches,
+        &mut scenario.hazards,
+        &mut scenario.resource_pickups,
+        &mut scenario.terminal_triggers,
+    ] {
+        for position in positions {
+            *position = scale(*position);
+        }
+    }
+    scenario.start = scale(scenario.start);
+    scenario.width = content_size;
+    scenario.height = content_size;
+    let source_side = source_width.max(source_height).max(1);
+    scenario.action_budget = ((u32::from(scenario.action_budget) * u32::from(content_size))
+        .div_ceil(u32::from(source_side)))
+    .min(u32::from(u16::MAX)) as u16;
+    scenario
 }
 
 /// Generate a P1C task with a guaranteed safe multi-goal falsification probe.

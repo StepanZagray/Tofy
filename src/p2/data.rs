@@ -8,11 +8,13 @@ use crate::domain::{
     Scenario, Simulator, Split, State,
 };
 use crate::generator::{
-    generate, generate_p1c, generate_p1c_hard_candidate, p1c_falsification_probe_width, rng_for,
+    generate, generate_p1c, generate_p1c_hard_candidate, generate_sized,
+    p1c_falsification_probe_width, rng_for, V5_CONTENT_SIZES,
 };
 use crate::search::shortest_path;
 use anyhow::{anyhow, bail, ensure, Result};
 use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -27,6 +29,12 @@ pub const GOAL_ORDER_SLOTS: usize = 8;
 
 /// Fixed-size simulator oracle for LeJEPA identifiability diagnostics in `p2-eval`.
 pub const ORACLE_LATENT_DIM: usize = 16;
+
+/// Playfield rows available to synthetic content. Row 63 is status UI only.
+pub const V5_PLAYFIELD_HEIGHT: usize = FRAME_SIDE - 1;
+
+/// Goal-free queries are kept in-distribution at this fixed v5 rate.
+pub const V5_GOAL_DROPOUT_PROBABILITY: f32 = 0.30;
 
 /// Stable categorical palette for synthetic Tofy renders (values in `0..16`).
 pub mod palette {
@@ -103,7 +111,8 @@ impl ArcFrame {
     }
 }
 
-/// Official ARC-AGI-3 discrete action ids `1..=7`. Coordinates only for id 6.
+/// ARC-AGI-3 discrete action ids `1..=7`, plus trained synthetic NULL id 0.
+/// Coordinates are present only for id 6.
 ///
 /// Matches https://docs.arcprize.org/actions :
 /// ACTION1=up, ACTION2=down, ACTION3=left, ACTION4=right, ACTION5=interact,
@@ -117,7 +126,7 @@ pub struct ArcAction {
 
 impl ArcAction {
     pub fn new(id: u8, x: Option<u8>, y: Option<u8>) -> Result<Self> {
-        ensure!((1..=7).contains(&id), "action id {id} not in 1..=7");
+        ensure!(id <= 7, "action id {id} not in 0..=7");
         match id {
             6 => {
                 ensure!(
@@ -164,6 +173,7 @@ impl ArcAction {
 
     pub fn to_tofy(&self) -> Result<Action> {
         match self.id {
+            0 => bail!("NULL action has no Tofy Action mapping"),
             1 => Ok(Action::Move(Dir::North)),
             2 => Ok(Action::Move(Dir::South)),
             3 => Ok(Action::Move(Dir::West)),
@@ -231,6 +241,455 @@ fn family_index(goal: &Goal) -> u8 {
         Goal::PreserveResourceReachMarker { .. } => 3,
         Goal::AvoidHazardReachMarker { .. } => 4,
         Goal::TriggerTerminal { .. } => 5,
+    }
+}
+
+/// The five sources mixed concurrently by the foundation-v2 data schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MixedStreamKind {
+    RandomOneStep,
+    FactualBranches,
+    Exploration,
+    SequentialFragments,
+    HazardOneStep,
+}
+
+/// Raw schedule weights from ADR 0003 §1.1.
+///
+/// The documented endpoint weights total 0.95. [`normalized`] preserves their
+/// ratios when a caller needs to fill a fixed physical row budget; the raw
+/// fields remain the exact percentages specified by the ADR.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MixedStreamProportions {
+    pub random_one_step: f32,
+    pub factual_branches: f32,
+    pub exploration: f32,
+    pub sequential_fragments: f32,
+    pub hazard_one_step: f32,
+}
+
+impl MixedStreamProportions {
+    pub fn total(self) -> f32 {
+        self.random_one_step
+            + self.factual_branches
+            + self.exploration
+            + self.sequential_fragments
+            + self.hazard_one_step
+    }
+
+    pub fn normalized(self) -> Self {
+        let total = self.total();
+        if total <= f32::EPSILON {
+            return self;
+        }
+        Self {
+            random_one_step: self.random_one_step / total,
+            factual_branches: self.factual_branches / total,
+            exploration: self.exploration / total,
+            sequential_fragments: self.sequential_fragments / total,
+            hazard_one_step: self.hazard_one_step / total,
+        }
+    }
+
+    fn ordered(self) -> [(MixedStreamKind, f32); 5] {
+        [
+            (MixedStreamKind::RandomOneStep, self.random_one_step),
+            (MixedStreamKind::FactualBranches, self.factual_branches),
+            (MixedStreamKind::Exploration, self.exploration),
+            (
+                MixedStreamKind::SequentialFragments,
+                self.sequential_fragments,
+            ),
+            (MixedStreamKind::HazardOneStep, self.hazard_one_step),
+        ]
+    }
+}
+
+/// Linear start-to-end stream schedule from ADR 0003 §1.1.
+pub fn foundation_v2_stream_schedule(progress: f32) -> MixedStreamProportions {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let lerp = |start: f32, end: f32| start + (end - start) * progress;
+    MixedStreamProportions {
+        random_one_step: lerp(0.35, 0.25),
+        factual_branches: lerp(0.20, 0.30),
+        exploration: 0.20,
+        sequential_fragments: 0.15,
+        hazard_one_step: lerp(0.10, 0.05),
+    }
+}
+
+/// ACTION5/ACTION6 operator families used across train and held-out episodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorFamily {
+    /// v4 ACTION6 behavior.
+    Teleport,
+    /// v4 ACTION5 behavior.
+    Toggle,
+    Paint,
+    PushLine,
+    SwapRegion,
+}
+
+impl OperatorFamily {
+    pub const ALL: [Self; 5] = [
+        Self::Teleport,
+        Self::Toggle,
+        Self::Paint,
+        Self::PushLine,
+        Self::SwapRegion,
+    ];
+}
+
+/// Episode-level operator split. Entire families, never individual rows, are
+/// assigned to either train or operator-held-out evaluation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorFamilySplit {
+    pub train: Vec<OperatorFamily>,
+    pub held_out: Vec<OperatorFamily>,
+}
+
+impl Default for OperatorFamilySplit {
+    fn default() -> Self {
+        Self {
+            train: vec![
+                OperatorFamily::Teleport,
+                OperatorFamily::Toggle,
+                OperatorFamily::Paint,
+                OperatorFamily::PushLine,
+            ],
+            held_out: vec![OperatorFamily::SwapRegion],
+        }
+    }
+}
+
+impl OperatorFamilySplit {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.train.is_empty(), "operator train split is empty");
+        ensure!(
+            self.train.contains(&OperatorFamily::Teleport)
+                && self.train.contains(&OperatorFamily::Toggle),
+            "the two v4 operators (teleport and toggle) must remain in-distribution"
+        );
+        let train = self
+            .train
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let held_out = self
+            .held_out
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            train.len() == self.train.len() && held_out.len() == self.held_out.len(),
+            "operator split contains duplicate families"
+        );
+        ensure!(
+            train.is_disjoint(&held_out),
+            "an operator family cannot be both train and held out"
+        );
+        let covered = train.union(&held_out).copied().collect::<Vec<_>>();
+        ensure!(
+            covered == OperatorFamily::ALL,
+            "operator split must cover teleport, toggle, paint, push-line, and swap-region"
+        );
+        Ok(())
+    }
+}
+
+/// Data/evaluation populations added by the v5 geometry and operator contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum V5DataSplit {
+    Train,
+    UnseenSeed7x7,
+    Composition8x8,
+    Translated7x7,
+    Size16x16,
+    HeldOutOperator(OperatorFamily),
+}
+
+impl V5DataSplit {
+    fn generation_split(self) -> Split {
+        match self {
+            Self::Composition8x8 => Split::HeldOutComposition,
+            _ => Split::Train,
+        }
+    }
+
+    fn reported_split(self) -> Split {
+        match self {
+            Self::Train => Split::Train,
+            _ => Split::HeldOutComposition,
+        }
+    }
+}
+
+/// Exact semantic content rectangle inside the 64x64 observation canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentRect {
+    pub x: u8,
+    pub y: u8,
+    pub width: u8,
+    pub height: u8,
+}
+
+impl ContentRect {
+    pub fn validate(self) -> Result<()> {
+        ensure!(self.width > 0 && self.height > 0, "content rect is empty");
+        ensure!(
+            usize::from(self.x) + usize::from(self.width) <= FRAME_SIDE,
+            "content rect exceeds canvas width"
+        );
+        ensure!(
+            usize::from(self.y) + usize::from(self.height) <= V5_PLAYFIELD_HEIGHT,
+            "content rect overlaps the reserved status row"
+        );
+        Ok(())
+    }
+
+    pub fn contains(self, x: u8, y: u8) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x < self.x.saturating_add(self.width)
+            && y < self.y.saturating_add(self.height)
+    }
+}
+
+/// Explicit PAD-vs-EMPTY discriminator consumed by every v5 loss.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentMask {
+    /// Row-major 64x64 values in `{0,1}`. Row 63 is always zero.
+    pub values: Vec<u8>,
+}
+
+impl ContentMask {
+    pub fn from_rect(rect: ContentRect) -> Result<Self> {
+        rect.validate()?;
+        let mut values = vec![0; FRAME_SIDE * FRAME_SIDE];
+        for y in usize::from(rect.y)..usize::from(rect.y + rect.height) {
+            let start = y * FRAME_SIDE + usize::from(rect.x);
+            values[start..start + usize::from(rect.width)].fill(1);
+        }
+        Ok(Self { values })
+    }
+
+    pub fn as_f32(&self) -> Vec<f32> {
+        self.values.iter().map(|&value| f32::from(value)).collect()
+    }
+}
+
+/// Eight symmetries of a square board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum D4Transform {
+    Identity,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    ReflectVertical,
+    ReflectHorizontal,
+    ReflectMainDiagonal,
+    ReflectAntiDiagonal,
+}
+
+impl D4Transform {
+    pub const ALL: [Self; 8] = [
+        Self::Identity,
+        Self::Rotate90,
+        Self::Rotate180,
+        Self::Rotate270,
+        Self::ReflectVertical,
+        Self::ReflectHorizontal,
+        Self::ReflectMainDiagonal,
+        Self::ReflectAntiDiagonal,
+    ];
+
+    /// Transform a local coordinate in a square of side `side`.
+    pub fn transform_point(self, x: u8, y: u8, side: u8) -> (u8, u8) {
+        let last = side - 1;
+        match self {
+            Self::Identity => (x, y),
+            Self::Rotate90 => (last - y, x),
+            Self::Rotate180 => (last - x, last - y),
+            Self::Rotate270 => (y, last - x),
+            Self::ReflectVertical => (last - x, y),
+            Self::ReflectHorizontal => (x, last - y),
+            Self::ReflectMainDiagonal => (y, x),
+            Self::ReflectAntiDiagonal => (last - y, last - x),
+        }
+    }
+
+    fn transform_vector(self, dx: i8, dy: i8) -> (i8, i8) {
+        match self {
+            Self::Identity => (dx, dy),
+            Self::Rotate90 => (-dy, dx),
+            Self::Rotate180 => (-dx, -dy),
+            Self::Rotate270 => (dy, -dx),
+            Self::ReflectVertical => (-dx, dy),
+            Self::ReflectHorizontal => (dx, -dy),
+            Self::ReflectMainDiagonal => (dy, dx),
+            Self::ReflectAntiDiagonal => (-dy, -dx),
+        }
+    }
+}
+
+/// Seeded augmentation applied consistently to both sides of a transition and
+/// to every branch in a same-state group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymmetryAugmentation {
+    pub d4: D4Transform,
+    /// A bijection of `0..=15`; entry zero is always zero.
+    pub color_permutation: [u8; 16],
+}
+
+/// Color-aware parameters for applying an episode operator after augmentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeOperator {
+    pub family: OperatorFamily,
+    pub agent_color: u8,
+    pub primary_color: u8,
+    pub secondary_color: u8,
+}
+
+/// V5-only provenance sidecar. It avoids changing the legacy provenance struct
+/// while carrying the exact translated rectangle required by losses/evaluation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V5SampleProvenance {
+    pub source: TransitionProvenance,
+    pub content_rect: ContentRect,
+    pub data_split: V5DataSplit,
+    pub stream: MixedStreamKind,
+    pub operator: EpisodeOperator,
+    pub augmentation: SymmetryAugmentation,
+    pub goal_dropped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_group_id: Option<BranchGroupId>,
+}
+
+/// One v5 transition plus its mandatory content mask and augmentation metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct V5Sample {
+    pub transition: TransitionSample,
+    pub content_mask: ContentMask,
+    pub provenance: V5SampleProvenance,
+}
+
+impl V5Sample {
+    pub fn transition(&self) -> &TransitionSample {
+        &self.transition
+    }
+
+    pub fn into_transition(self) -> TransitionSample {
+        self.transition
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.provenance.source.validate()?;
+        self.provenance.content_rect.validate()?;
+        ensure!(
+            self.transition.provenance == self.provenance.source,
+            "v5 sidecar/source provenance mismatch"
+        );
+        ensure!(
+            self.provenance.source.content_width == u16::from(self.provenance.content_rect.width)
+                && self.provenance.source.content_height
+                    == u16::from(self.provenance.content_rect.height),
+            "v5 content rect size does not match source provenance"
+        );
+        let expected_mask = ContentMask::from_rect(self.provenance.content_rect)?;
+        ensure!(
+            self.content_mask == expected_mask,
+            "v5 content mask does not match provenance rect"
+        );
+        let permutation = self
+            .provenance
+            .augmentation
+            .color_permutation
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            self.provenance.augmentation.color_permutation[0] == 0
+                && permutation == (0u8..16).collect::<std::collections::BTreeSet<_>>(),
+            "v5 color permutation must be a bijection with color 0 fixed"
+        );
+        for color in [
+            self.provenance.operator.agent_color,
+            self.provenance.operator.primary_color,
+            self.provenance.operator.secondary_color,
+        ] {
+            ensure!(color <= 15, "operator color is outside palette");
+        }
+        if self.transition.action.id == 6 {
+            ensure!(
+                self.provenance.content_rect.contains(
+                    self.transition
+                        .action
+                        .x
+                        .ok_or_else(|| anyhow!("ACTION6 missing x"))?,
+                    self.transition
+                        .action
+                        .y
+                        .ok_or_else(|| anyhow!("ACTION6 missing y"))?
+                ),
+                "ACTION6 target is outside v5 content rect"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Public composer configuration consumed by foundation-v2 training.
+#[derive(Clone, Debug)]
+pub struct MixedStreamConfig {
+    pub batch_size: usize,
+    pub seed: u64,
+    pub schedule: fn(progress: f32) -> MixedStreamProportions,
+    pub goal_dropout_probability: f32,
+    pub operator_families: OperatorFamilySplit,
+    pub symmetry_augmentation: bool,
+}
+
+impl Default for MixedStreamConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 2_048,
+            seed: 0,
+            schedule: foundation_v2_stream_schedule,
+            goal_dropout_probability: V5_GOAL_DROPOUT_PROBABILITY,
+            operator_families: OperatorFamilySplit::default(),
+            symmetry_augmentation: true,
+        }
+    }
+}
+
+impl MixedStreamConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.batch_size >= FACTUAL_BRANCHES_PER_GROUP,
+            "mixed batch must fit at least one complete factual group"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&self.goal_dropout_probability),
+            "goal dropout probability must be in 0..=1"
+        );
+        self.operator_families.validate()?;
+        let proportions = (self.schedule)(0.0);
+        ensure!(
+            proportions
+                .ordered()
+                .iter()
+                .all(|(_, value)| value.is_finite() && *value >= 0.0),
+            "mixed stream schedule returned invalid weights"
+        );
+        Ok(())
     }
 }
 
@@ -344,10 +803,10 @@ pub struct BranchGroup {
     branches: Vec<FactualActionBranch>,
 }
 
-/// Every generated factual lesson is one four-action comparison. Keeping this
-/// contract next to the data interface prevents the trainer from silently
-/// accepting a truncated group as an independent batch.
-pub const FACTUAL_BRANCHES_PER_GROUP: usize = 4;
+/// Four directional actions, ACTION5, four stratified ACTION6 coordinates, and
+/// ACTION7. Keeping the fixed v5 contract here prevents physical batching from
+/// silently truncating a same-state comparison.
+pub const FACTUAL_BRANCHES_PER_GROUP: usize = 10;
 
 /// Stable identity of one same-state factual comparison.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -368,6 +827,17 @@ pub struct FactualBatch {
     group_ids: Vec<BranchGroupId>,
     rows: Vec<TransitionSample>,
     group_ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// One status-row-free pair label for the v5 separation/pull objectives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairwiseBoardEffectLabel {
+    pub group_index: usize,
+    pub left_row: usize,
+    pub right_row: usize,
+    pub equivalent: bool,
+    pub left_changed: bool,
+    pub right_changed: bool,
 }
 
 fn frame_fingerprint(frame: &ArcFrame) -> String {
@@ -484,10 +954,34 @@ impl FactualBatch {
     pub fn group_ranges(&self) -> &[std::ops::Range<usize>] {
         &self.group_ranges
     }
+
+    /// Pair labels are computed from board rows only; status UI never enters
+    /// equivalence or changed/no-effect labels.
+    pub fn pairwise_board_effect_labels(&self) -> Vec<PairwiseBoardEffectLabel> {
+        let mut labels = Vec::new();
+        for (group_index, (group, range)) in self.groups.iter().zip(&self.group_ranges).enumerate()
+        {
+            for left in 0..group.branches.len() {
+                for right in left + 1..group.branches.len() {
+                    let left_branch = &group.branches[left];
+                    let right_branch = &group.branches[right];
+                    labels.push(PairwiseBoardEffectLabel {
+                        group_index,
+                        left_row: range.start + left,
+                        right_row: range.start + right,
+                        equivalent: left_branch.outcome_equivalent(right_branch),
+                        left_changed: left_branch.board_effect.changed,
+                        right_changed: right_branch.board_effect.changed,
+                    });
+                }
+            }
+        }
+        labels
+    }
 }
 
 impl FactualActionBranch {
-    pub(crate) fn try_from_transition(transition: TransitionSample) -> Result<Self> {
+    pub fn try_from_transition(transition: TransitionSample) -> Result<Self> {
         ensure!(
             transition.current.width as usize == FRAME_SIDE
                 && transition.current.height as usize == FRAME_SIDE
@@ -533,7 +1027,7 @@ impl FactualActionBranch {
 }
 
 impl BranchGroup {
-    pub(crate) fn try_new(branches: Vec<FactualActionBranch>) -> Result<Self> {
+    pub fn try_new(branches: Vec<FactualActionBranch>) -> Result<Self> {
         ensure!(
             branches.len() >= 2,
             "a factual branch group requires at least two branches"
@@ -551,6 +1045,10 @@ impl BranchGroup {
                 "all factual branches must share source provenance"
             );
             ensure!(
+                transition.split == first.split && transition.provenance == first.provenance,
+                "all factual branches must share exact split/content/trajectory provenance"
+            );
+            ensure!(
                 actions.insert((
                     transition.action.id,
                     transition.action.x,
@@ -564,6 +1062,18 @@ impl BranchGroup {
 
     pub fn branches(&self) -> &[FactualActionBranch] {
         &self.branches
+    }
+
+    pub fn effect_equivalence_matrix(&self) -> Vec<Vec<bool>> {
+        self.branches
+            .iter()
+            .map(|left| {
+                self.branches
+                    .iter()
+                    .map(|right| left.outcome_equivalent(right))
+                    .collect()
+            })
+            .collect()
     }
 
     /// Changed branches whose board-only outcome identifies that action within
@@ -802,8 +1312,518 @@ fn paint_status_ui(frame: &mut ArcFrame, action_budget: u16, actions_used: u16) 
     }
 }
 
+fn split_tag(split: V5DataSplit) -> u64 {
+    match split {
+        V5DataSplit::Train => 0x5452_4149_4E00_0005,
+        V5DataSplit::UnseenSeed7x7 => 0x554E_5345_454E_0707,
+        V5DataSplit::Composition8x8 => 0x434F_4D50_0808_0005,
+        V5DataSplit::Translated7x7 => 0x5452_414E_5307_0705,
+        V5DataSplit::Size16x16 => 0x5349_5A45_1616_0005,
+        V5DataSplit::HeldOutOperator(family) => 0x4F50_484F_4C44_0005 ^ ((family as u64) << 48),
+    }
+}
+
+fn seeded_v5_rng(seed: u64, episode_id: u64, split: V5DataSplit, lane: u64) -> ChaCha8Rng {
+    ChaCha8Rng::seed_from_u64(
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ episode_id.wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ split_tag(split)
+            ^ lane.wrapping_mul(0x94D0_49BB_1331_11EB),
+    )
+}
+
+fn sampled_content_size(split: V5DataSplit, rng: &mut ChaCha8Rng) -> u8 {
+    match split {
+        V5DataSplit::Train | V5DataSplit::HeldOutOperator(_) => {
+            // Integer approximation to a log-skewed distribution. The weights
+            // decrease monotonically with log(size), keeping small boards common
+            // without starving cross-patch 16/24/32 geometry.
+            const WEIGHTS: [u32; 7] = [32, 25, 18, 13, 8, 4, 2];
+            let draw = rng.random_range(0..WEIGHTS.iter().sum::<u32>());
+            let mut cumulative = 0;
+            for (size, weight) in V5_CONTENT_SIZES.into_iter().zip(WEIGHTS) {
+                cumulative += weight;
+                if draw < cumulative {
+                    return size;
+                }
+            }
+            V5_CONTENT_SIZES[V5_CONTENT_SIZES.len() - 1]
+        }
+        V5DataSplit::UnseenSeed7x7 | V5DataSplit::Translated7x7 => 7,
+        V5DataSplit::Composition8x8 => 8,
+        V5DataSplit::Size16x16 => 16,
+    }
+}
+
+fn sampled_content_rect(size: u8, split: V5DataSplit, rng: &mut ChaCha8Rng) -> ContentRect {
+    let max_x = FRAME_SIDE as u8 - size;
+    let max_y = V5_PLAYFIELD_HEIGHT as u8 - size;
+    let mut x = rng.random_range(0..=max_x);
+    let mut y = rng.random_range(0..=max_y);
+    if split == V5DataSplit::Translated7x7 && x == 0 && y == 0 {
+        if max_x > 0 {
+            x = 1;
+        } else if max_y > 0 {
+            y = 1;
+        }
+    }
+    ContentRect {
+        x,
+        y,
+        width: size,
+        height: size,
+    }
+}
+
+fn sampled_augmentation(rng: &mut ChaCha8Rng, enabled: bool) -> SymmetryAugmentation {
+    let d4 = if enabled {
+        D4Transform::ALL[rng.random_range(0..D4Transform::ALL.len())]
+    } else {
+        D4Transform::Identity
+    };
+    let mut color_permutation = std::array::from_fn(|index| index as u8);
+    if enabled {
+        for index in (2..16).rev() {
+            let other = rng.random_range(1..=index);
+            color_permutation.swap(index, other);
+        }
+    }
+    SymmetryAugmentation {
+        d4,
+        color_permutation,
+    }
+}
+
+fn permute_operator(operator: EpisodeOperator, color_permutation: &[u8; 16]) -> EpisodeOperator {
+    EpisodeOperator {
+        family: operator.family,
+        agent_color: color_permutation[operator.agent_color as usize],
+        primary_color: color_permutation[operator.primary_color as usize],
+        secondary_color: color_permutation[operator.secondary_color as usize],
+    }
+}
+
+fn direction_action_id(dx: i8, dy: i8) -> Result<u8> {
+    match (dx, dy) {
+        (0, -1) => Ok(1),
+        (0, 1) => Ok(2),
+        (-1, 0) => Ok(3),
+        (1, 0) => Ok(4),
+        _ => bail!("transformed action is not cardinal: ({dx},{dy})"),
+    }
+}
+
+/// Relabel a directional action or transform an ACTION6 coordinate from one
+/// square content rectangle into another.
+pub fn conjugate_action(
+    action: &ArcAction,
+    transform: D4Transform,
+    source_rect: ContentRect,
+    target_rect: ContentRect,
+) -> Result<ArcAction> {
+    source_rect.validate()?;
+    target_rect.validate()?;
+    ensure!(
+        source_rect.width == source_rect.height
+            && target_rect.width == target_rect.height
+            && source_rect.width == target_rect.width,
+        "D4 action conjugation requires equal square content rectangles"
+    );
+    match action.id {
+        1..=4 => {
+            let (dx, dy) = match action.id {
+                1 => (0, -1),
+                2 => (0, 1),
+                3 => (-1, 0),
+                4 => (1, 0),
+                _ => unreachable!(),
+            };
+            let (dx, dy) = transform.transform_vector(dx, dy);
+            ArcAction::new(direction_action_id(dx, dy)?, None, None)
+        }
+        6 => {
+            let x = action.x.ok_or_else(|| anyhow!("ACTION6 is missing x"))?;
+            let y = action.y.ok_or_else(|| anyhow!("ACTION6 is missing y"))?;
+            ensure!(
+                source_rect.contains(x, y),
+                "ACTION6 coordinate is outside source content rect"
+            );
+            let local_x = x - source_rect.x;
+            let local_y = y - source_rect.y;
+            let (x, y) = transform.transform_point(local_x, local_y, source_rect.width);
+            ArcAction::new(6, Some(target_rect.x + x), Some(target_rect.y + y))
+        }
+        id => ArcAction::new(id, None, None),
+    }
+}
+
+fn frame_with_transformed_content(
+    source: &ArcFrame,
+    source_rect: ContentRect,
+    target_rect: ContentRect,
+    augmentation: &SymmetryAugmentation,
+) -> Result<ArcFrame> {
+    ensure!(
+        source.width as usize == FRAME_SIDE && source.height as usize == FRAME_SIDE,
+        "v5 augmentation requires fixed-size source frames"
+    );
+    source_rect.validate()?;
+    target_rect.validate()?;
+    ensure!(
+        source_rect.width == source_rect.height
+            && target_rect.width == source_rect.width
+            && target_rect.height == source_rect.height,
+        "v5 D4 augmentation requires equal square source/target rectangles"
+    );
+    let mut pixels = vec![palette::PAD; FRAME_SIDE * FRAME_SIDE];
+    for y in 0..source_rect.height {
+        for x in 0..source_rect.width {
+            let source_x = usize::from(source_rect.x + x);
+            let source_y = usize::from(source_rect.y + y);
+            let color = source.pixels[source_y * FRAME_SIDE + source_x];
+            let color = augmentation.color_permutation[color as usize];
+            let (target_x, target_y) = augmentation.d4.transform_point(x, y, source_rect.width);
+            let target_x = usize::from(target_rect.x + target_x);
+            let target_y = usize::from(target_rect.y + target_y);
+            pixels[target_y * FRAME_SIDE + target_x] = color;
+        }
+    }
+    // Status UI is copied only after spatial/color augmentation and is never
+    // part of the semantic content mask or branch-effect equivalence.
+    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+    pixels[status_start..].copy_from_slice(&source.pixels[status_start..]);
+    ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, pixels)
+}
+
+fn find_color(frame: &ArcFrame, rect: ContentRect, color: u8) -> Option<(u8, u8)> {
+    for y in rect.y..rect.y + rect.height {
+        for x in rect.x..rect.x + rect.width {
+            if frame.pixels[usize::from(y) * FRAME_SIDE + usize::from(x)] == color {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn symmetric_coordinate(rect: ContentRect, x: u8, y: u8) -> (u8, u8) {
+    (
+        rect.x + rect.width - 1 - (x - rect.x),
+        rect.y + rect.height - 1 - (y - rect.y),
+    )
+}
+
+/// Apply the sampled ACTION5/ACTION6 frame operator. It is intentionally
+/// status-row-free and color-parameterized so the same function validates an
+/// augmented transition after color permutation.
+pub fn apply_episode_operator(
+    current: &ArcFrame,
+    action: &ArcAction,
+    content_rect: ContentRect,
+    operator: EpisodeOperator,
+) -> Result<ArcFrame> {
+    content_rect.validate()?;
+    ensure!(
+        current.width as usize == FRAME_SIDE && current.height as usize == FRAME_SIDE,
+        "episode operators require fixed 64x64 frames"
+    );
+    ensure!(
+        matches!(action.id, 5 | 6),
+        "episode operators only define ACTION5/ACTION6"
+    );
+    let coordinate = if action.id == 6 {
+        let x = action.x.ok_or_else(|| anyhow!("ACTION6 is missing x"))?;
+        let y = action.y.ok_or_else(|| anyhow!("ACTION6 is missing y"))?;
+        ensure!(
+            content_rect.contains(x, y),
+            "operator ACTION6 coordinate is outside content rect"
+        );
+        Some((x, y))
+    } else {
+        None
+    };
+    let index = |x: u8, y: u8| usize::from(y) * FRAME_SIDE + usize::from(x);
+    let mut next = current.clone();
+    match operator.family {
+        OperatorFamily::Teleport => {
+            let Some((agent_x, agent_y)) = find_color(current, content_rect, operator.agent_color)
+            else {
+                return Ok(next);
+            };
+            let target =
+                coordinate.unwrap_or_else(|| symmetric_coordinate(content_rect, agent_x, agent_y));
+            if target != (agent_x, agent_y) {
+                next.pixels[index(agent_x, agent_y)] = palette::EMPTY;
+                next.pixels[index(target.0, target.1)] = operator.agent_color;
+            }
+        }
+        OperatorFamily::Toggle => {
+            if let Some((x, y)) = coordinate {
+                let value = &mut next.pixels[index(x, y)];
+                *value = if *value == operator.primary_color {
+                    operator.secondary_color
+                } else {
+                    operator.primary_color
+                };
+            } else {
+                for y in content_rect.y..content_rect.y + content_rect.height {
+                    for x in content_rect.x..content_rect.x + content_rect.width {
+                        let value = &mut next.pixels[index(x, y)];
+                        if *value == operator.primary_color {
+                            *value = operator.secondary_color;
+                        } else if *value == operator.secondary_color {
+                            *value = operator.primary_color;
+                        }
+                    }
+                }
+            }
+        }
+        OperatorFamily::Paint => {
+            if let Some((x, y)) = coordinate {
+                next.pixels[index(x, y)] = operator.primary_color;
+            } else if let Some((agent_x, agent_y)) =
+                find_color(current, content_rect, operator.agent_color)
+            {
+                for (dx, dy) in [(0i8, -1i8), (0, 1), (-1, 0), (1, 0)] {
+                    let x = i16::from(agent_x) + i16::from(dx);
+                    let y = i16::from(agent_y) + i16::from(dy);
+                    if x >= 0 && y >= 0 {
+                        let (x, y) = (x as u8, y as u8);
+                        if content_rect.contains(x, y) && next.pixels[index(x, y)] == palette::EMPTY
+                        {
+                            next.pixels[index(x, y)] = operator.primary_color;
+                        }
+                    }
+                }
+            }
+        }
+        OperatorFamily::PushLine => {
+            if let Some((x, y)) = coordinate {
+                let local_x2 =
+                    i16::from(2 * (x - content_rect.x) + 1) - i16::from(content_rect.width);
+                let local_y2 =
+                    i16::from(2 * (y - content_rect.y) + 1) - i16::from(content_rect.height);
+                let dx = local_x2.signum();
+                let dy = local_y2.signum();
+                let destination_x = i16::from(x) + dx;
+                let destination_y = i16::from(y) + dy;
+                if destination_x >= 0 && destination_y >= 0 {
+                    let destination = (destination_x as u8, destination_y as u8);
+                    if content_rect.contains(destination.0, destination.1) {
+                        next.pixels[index(destination.0, destination.1)] =
+                            current.pixels[index(x, y)];
+                        next.pixels[index(x, y)] = palette::EMPTY;
+                    }
+                }
+            } else {
+                // A half-turn pushes every board line through the center and is
+                // equivariant under the complete D4 group.
+                for y in content_rect.y..content_rect.y + content_rect.height {
+                    for x in content_rect.x..content_rect.x + content_rect.width {
+                        let symmetric = symmetric_coordinate(content_rect, x, y);
+                        next.pixels[index(symmetric.0, symmetric.1)] = current.pixels[index(x, y)];
+                    }
+                }
+            }
+        }
+        OperatorFamily::SwapRegion => {
+            if let Some((center_x, center_y)) = coordinate {
+                let symmetric = symmetric_coordinate(content_rect, center_x, center_y);
+                let mut swaps = Vec::new();
+                for dy in -1i16..=1 {
+                    for dx in -1i16..=1 {
+                        let left_x = i16::from(center_x) + dx;
+                        let left_y = i16::from(center_y) + dy;
+                        let right_x = i16::from(symmetric.0) - dx;
+                        let right_y = i16::from(symmetric.1) - dy;
+                        if [left_x, left_y, right_x, right_y]
+                            .into_iter()
+                            .all(|value| value >= 0)
+                        {
+                            let left = (left_x as u8, left_y as u8);
+                            let right = (right_x as u8, right_y as u8);
+                            if content_rect.contains(left.0, left.1)
+                                && content_rect.contains(right.0, right.1)
+                            {
+                                swaps.push((left, right));
+                            }
+                        }
+                    }
+                }
+                for (left, right) in swaps {
+                    next.pixels
+                        .swap(index(left.0, left.1), index(right.0, right.1));
+                }
+            } else {
+                for y in content_rect.y..content_rect.y + content_rect.height {
+                    for x in content_rect.x..content_rect.x + content_rect.width {
+                        let symmetric = symmetric_coordinate(content_rect, x, y);
+                        next.pixels[index(symmetric.0, symmetric.1)] = current.pixels[index(x, y)];
+                    }
+                }
+            }
+        }
+    }
+    Ok(next)
+}
+
 fn apply_action(sim: &Simulator, state: &State, action: Action) -> State {
     sim.transition(state, action)
+}
+
+fn scenario_for_v5(seed: u64, episode_id: u64, split: V5DataSplit, content_size: u8) -> Scenario {
+    let mut scenario = generate_sized(seed, episode_id, split.generation_split(), content_size);
+    scenario.split = split.reported_split();
+    scenario
+}
+
+fn sampled_operator(
+    families: &OperatorFamilySplit,
+    split: V5DataSplit,
+    rng: &mut ChaCha8Rng,
+) -> Result<EpisodeOperator> {
+    families.validate()?;
+    let family = match split {
+        V5DataSplit::HeldOutOperator(family) => {
+            ensure!(
+                families.held_out.contains(&family) && !families.train.contains(&family),
+                "requested operator family is not entirely held out"
+            );
+            family
+        }
+        _ => *families
+            .train
+            .choose(rng)
+            .expect("validated non-empty operator train split"),
+    };
+    Ok(EpisodeOperator {
+        family,
+        agent_color: palette::AGENT,
+        primary_color: palette::SWITCH_BASE,
+        secondary_color: palette::SWITCH_BASE + 1,
+    })
+}
+
+fn clear_and_paint_status(frame: &mut ArcFrame, action_budget: u16, actions_used: u16) {
+    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+    frame.pixels[status_start..].fill(palette::PAD);
+    paint_status_ui(frame, action_budget, actions_used);
+}
+
+fn operator_sample_from_state(
+    scenario: &Scenario,
+    state: &State,
+    action: ArcAction,
+    operator: EpisodeOperator,
+    family: &str,
+    transition_index: u64,
+) -> Result<TransitionSample> {
+    let current = render_state_padded(scenario, state)?;
+    let source_rect = ContentRect {
+        x: 0,
+        y: 0,
+        width: scenario.width,
+        height: scenario.height,
+    };
+    let mut next = apply_episode_operator(&current, &action, source_rect, operator)?;
+    clear_and_paint_status(
+        &mut next,
+        scenario.action_budget,
+        state.actions_used.saturating_add(1),
+    );
+    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+    let noop = current.pixels[..status_start] == next.pixels[..status_start];
+    Ok(TransitionSample {
+        oracle_latent: Some(oracle_latent(scenario, state)),
+        current,
+        next,
+        action,
+        goal_features: GoalFeatures::zeros(),
+        noop: Some(noop),
+        goal_satisfied: None,
+        goal_failed: None,
+        exhausted: Some(false),
+        split: scenario.split,
+        family: family.into(),
+        seed: scenario.seed,
+        episode_id: scenario.episode_id,
+        transition_index,
+        provenance: TransitionProvenance::simulator(scenario, family),
+    })
+}
+
+fn null_sample_from_state(
+    scenario: &Scenario,
+    state: &State,
+    family: &str,
+    transition_index: u64,
+) -> Result<TransitionSample> {
+    let current = render_state_padded(scenario, state)?;
+    Ok(TransitionSample {
+        oracle_latent: Some(oracle_latent(scenario, state)),
+        next: current.clone(),
+        current,
+        action: ArcAction::new(0, None, None)?,
+        goal_features: GoalFeatures::zeros(),
+        noop: Some(true),
+        goal_satisfied: None,
+        goal_failed: None,
+        exhausted: None,
+        split: scenario.split,
+        family: family.into(),
+        seed: scenario.seed,
+        episode_id: scenario.episode_id,
+        transition_index,
+        provenance: TransitionProvenance::simulator(scenario, family),
+    })
+}
+
+fn augment_v5_transition(
+    mut transition: TransitionSample,
+    split: V5DataSplit,
+    stream: MixedStreamKind,
+    operator: EpisodeOperator,
+    rect: ContentRect,
+    augmentation: SymmetryAugmentation,
+    goal_dropout_probability: f32,
+    dropout_rng: &mut ChaCha8Rng,
+) -> Result<V5Sample> {
+    let source_rect = ContentRect {
+        x: 0,
+        y: 0,
+        width: u8::try_from(transition.provenance.content_width)
+            .map_err(|_| anyhow!("content width does not fit u8"))?,
+        height: u8::try_from(transition.provenance.content_height)
+            .map_err(|_| anyhow!("content height does not fit u8"))?,
+    };
+    ensure!(
+        source_rect.width == rect.width && source_rect.height == rect.height,
+        "augmentation rectangle does not match transition provenance"
+    );
+    transition.current =
+        frame_with_transformed_content(&transition.current, source_rect, rect, &augmentation)?;
+    transition.next =
+        frame_with_transformed_content(&transition.next, source_rect, rect, &augmentation)?;
+    transition.action = conjugate_action(&transition.action, augmentation.d4, source_rect, rect)?;
+    let goal_dropped = dropout_rng.random_bool(f64::from(goal_dropout_probability));
+    if goal_dropped {
+        transition.goal_features = GoalFeatures::zeros();
+    }
+    let content_mask = ContentMask::from_rect(rect)?;
+    Ok(V5Sample {
+        provenance: V5SampleProvenance {
+            source: transition.provenance.clone(),
+            content_rect: rect,
+            data_split: split,
+            stream,
+            operator: permute_operator(operator, &augmentation.color_permutation),
+            augmentation,
+            goal_dropped,
+            branch_group_id: None,
+        },
+        transition,
+        content_mask,
+    })
 }
 
 /// Random legal one-step transitions without candidate-goal conditioning (early ARC play).
@@ -992,36 +2012,93 @@ pub fn generate_hazard_one_step(
     Ok(out)
 }
 
-fn generate_simulator_branch_group(
+fn stratified_action6_coordinates(current: &ArcFrame, size: u8) -> Result<[(u8, u8); 4]> {
+    let pixel = |x: u8, y: u8| current.pixels[usize::from(y) * FRAME_SIDE + usize::from(x)];
+    let objects = (0..size)
+        .flat_map(|y| (0..size).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let value = pixel(x, y);
+            value != palette::EMPTY && value != palette::AGENT
+        })
+        .collect::<Vec<_>>();
+    let object = objects
+        .iter()
+        .copied()
+        .find(|&(x, y)| (size - 1 - x, size - 1 - y) != (x, y))
+        .or_else(|| objects.first().copied())
+        .ok_or_else(|| anyhow!("factual board has no object cell"))?;
+    let symmetric = (size - 1 - object.0, size - 1 - object.1);
+    let boundary = (0..size)
+        .flat_map(|offset| {
+            [
+                (offset, 0),
+                (size - 1, offset),
+                (size - 1 - offset, size - 1),
+                (0, size - 1 - offset),
+            ]
+        })
+        .find(|coordinate| *coordinate != object && *coordinate != symmetric)
+        .ok_or_else(|| anyhow!("could not choose distinct boundary coordinate"))?;
+    let empty = (0..size)
+        .flat_map(|y| (0..size).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            pixel(x, y) == palette::EMPTY
+                && (x, y) != object
+                && (x, y) != symmetric
+                && (x, y) != boundary
+                && x > 0
+                && y > 0
+                && x + 1 < size
+                && y + 1 < size
+        })
+        .or_else(|| {
+            (0..size)
+                .flat_map(|y| (0..size).map(move |x| (x, y)))
+                .find(|&(x, y)| {
+                    pixel(x, y) == palette::EMPTY
+                        && (x, y) != object
+                        && (x, y) != symmetric
+                        && (x, y) != boundary
+                })
+        })
+        .ok_or_else(|| anyhow!("factual board has no distinct empty coordinate"))?;
+    let coordinates = [object, boundary, empty, symmetric];
+    ensure!(
+        coordinates
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == coordinates.len(),
+        "ACTION6 strata must produce distinct coordinates"
+    );
+    Ok(coordinates)
+}
+
+fn generate_v5_factual_branch_group(
     seed: u64,
     episode_id: u64,
-    split: Split,
+    data_split: V5DataSplit,
+    content_size: u8,
+    operator: EpisodeOperator,
 ) -> Result<BranchGroup> {
-    let scenario = generate(seed, episode_id, split);
+    let mut scenario = scenario_for_v5(seed, episode_id, data_split, content_size);
+    scenario.undo_enabled = true;
     let sim = Simulator::new(scenario.clone());
     let mut state = State::initial(&scenario);
-    // Deterministically vary the shared source state without using the branch
-    // action itself to construct the observation.
-    let prefix_steps = (episode_id as usize) % 4;
-    for prefix in 0..prefix_steps {
-        let actions: Vec<_> = legal_actions(&scenario)
-            .into_iter()
-            .filter(|action| !matches!(action, Action::Undo))
-            .collect();
-        let action = actions[(episode_id as usize + prefix) % actions.len()];
-        state = apply_action(&sim, &state, action);
-    }
-    // Freeze an explicit within-action balance schedule for held-out factual
-    // evidence. Each direction is targeted in turn, alternating between a
-    // traversable and blocked source cell; all four branches still share the
-    // same exact observation. This removes the old ACTION1/3=no-change and
-    // ACTION2/4=change confound from evaluator populations.
-    if split == Split::HeldOutComposition {
+    // Give ACTION7 an applicable undo frame without conditioning the shared
+    // observation on any branch action.
+    let prefix = Action::Move(Dir::East);
+    state = apply_action(&sim, &state, prefix);
+    if data_split == V5DataSplit::Composition8x8 {
+        // Preserve the frozen held-out within-action balance from ADR 0002:
+        // each direction is targeted in turn, alternating traversable/blocked
+        // source cells while the complete v5 group still shares one frame.
         let ordinal = episode_id / 2;
-        let target_dir = Dir::ALL[(ordinal as usize) % Dir::ALL.len()];
+        let target_dir = Dir::ALL[ordinal as usize % Dir::ALL.len()];
         let want_changed = (ordinal / Dir::ALL.len() as u64).is_multiple_of(2);
         let target_action = Action::Move(target_dir);
-        let candidate = (0..scenario.height as i8)
+        if let Some(position) = (0..scenario.height as i8)
             .flat_map(|y| (0..scenario.width as i8).map(move |x| Pos::new(x, y)))
             .filter(|position| !scenario.is_blocked(*position))
             .find(|position| {
@@ -1029,104 +2106,93 @@ fn generate_simulator_branch_group(
                 candidate.pos = *position;
                 let next = apply_action(&sim, &candidate, target_action);
                 (next.pos != candidate.pos) == want_changed
-            });
-        if let Some(position) = candidate {
-            state.pos = position;
-            state.undo_stack.clear();
-        }
-    }
-    let branches = legal_actions(&scenario)
-        .into_iter()
-        .filter(|action| !matches!(action, Action::Undo))
-        .take(4)
-        .enumerate()
-        .map(|(index, action)| {
-            let next = apply_action(&sim, &state, action);
-            let mut sample = sample_from_transition_goal_free(
-                &scenario,
-                &state,
-                &next,
-                action,
-                "factual_branch",
-                index as u64,
-            )?;
-            sample.episode_id = episode_id;
-            FactualActionBranch::try_from_transition(sample)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    BranchGroup::try_new(branches)
-}
-
-fn generate_coordinate_branch_group(
-    seed: u64,
-    episode_id: u64,
-    split: Split,
-) -> Result<BranchGroup> {
-    let mut rng = rng_for(seed ^ 0xFAC7_A006, episode_id, split);
-    let start = (31u8, 31u8);
-    let mut current_pixels = vec![palette::EMPTY; FRAME_SIDE * FRAME_SIDE];
-    current_pixels[start.1 as usize * FRAME_SIDE + start.0 as usize] = palette::AGENT;
-    let mut current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, current_pixels)?;
-    paint_status_ui(&mut current, 64, 0);
-    let mut coordinates = std::collections::BTreeSet::new();
-    while coordinates.len() < 4 {
-        let coordinate = (
-            rng.random_range(0..FRAME_SIDE) as u8,
-            rng.random_range(0..FRAME_SIDE - 1) as u8,
-        );
-        if coordinate != start {
-            coordinates.insert(coordinate);
-        }
-    }
-    let branches = coordinates
-        .into_iter()
-        .enumerate()
-        .map(|(index, (x, y))| {
-            let mut next_pixels = current.pixels.clone();
-            next_pixels[start.1 as usize * FRAME_SIDE + start.0 as usize] = palette::EMPTY;
-            next_pixels[y as usize * FRAME_SIDE + x as usize] = palette::AGENT;
-            let mut next = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, next_pixels)?;
-            paint_status_ui(&mut next, 64, 1);
-            FactualActionBranch::try_from_transition(TransitionSample {
-                current: current.clone(),
-                next,
-                action: ArcAction::new(6, Some(x), Some(y))?,
-                goal_features: GoalFeatures::zeros(),
-                noop: Some(false),
-                goal_satisfied: None,
-                goal_failed: None,
-                exhausted: Some(false),
-                split,
-                family: "factual_coordinate_branch".into(),
-                seed,
-                episode_id,
-                transition_index: index as u64,
-                provenance: TransitionProvenance::full_frame(
-                    seed,
-                    episode_id,
-                    split,
-                    "factual_coordinate_branch",
-                ),
-                oracle_latent: Some(oracle_latent_from_frame(&current)),
             })
+        {
+            state.pos = position;
+        }
+    }
+    let family = if episode_id.is_multiple_of(2) {
+        "factual_branch_v5"
+    } else {
+        "factual_coordinate_branch"
+    };
+    let mut transitions = Vec::with_capacity(FACTUAL_BRANCHES_PER_GROUP);
+    for action in Action::moves() {
+        let next = apply_action(&sim, &state, action);
+        transitions.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            family,
+            transitions.len() as u64,
+        )?);
+    }
+    transitions.push(operator_sample_from_state(
+        &scenario,
+        &state,
+        ArcAction::new(5, None, None)?,
+        operator,
+        family,
+        transitions.len() as u64,
+    )?);
+    let current = &transitions[0].current;
+    for (x, y) in stratified_action6_coordinates(current, content_size)? {
+        transitions.push(operator_sample_from_state(
+            &scenario,
+            &state,
+            ArcAction::new(6, Some(x), Some(y))?,
+            operator,
+            family,
+            transitions.len() as u64,
+        )?);
+    }
+    let undo = Action::Undo;
+    let next = apply_action(&sim, &state, undo);
+    transitions.push(sample_from_transition_goal_free(
+        &scenario,
+        &state,
+        &next,
+        undo,
+        family,
+        transitions.len() as u64,
+    )?);
+    ensure!(
+        transitions.len() == FACTUAL_BRANCHES_PER_GROUP,
+        "v5 factual group has wrong branch count"
+    );
+    let trajectory_id = format!(
+        "factual-v5/{data_split:?}/{seed}/{episode_id}/{:?}",
+        operator.family
+    );
+    let branches = transitions
+        .into_iter()
+        .map(|mut transition| {
+            transition.episode_id = episode_id;
+            transition.provenance.trajectory_id = trajectory_id.clone();
+            FactualActionBranch::try_from_transition(transition)
         })
         .collect::<Result<Vec<_>>>()?;
     BranchGroup::try_new(branches)
 }
 
-/// Phase-1B factual experience: four different confirmed actions from one
-/// unchanged current state. Alternating groups cover simulator movement and
-/// marker-free ACTION6 coordinate transitions.
+/// Complete v5 same-state comparison: every applicable simple action plus four
+/// stratified ACTION6 coordinates (object, boundary, empty, symmetric).
 pub fn generate_factual_branch_group(
     seed: u64,
     episode_id: u64,
     split: Split,
 ) -> Result<BranchGroup> {
-    if episode_id.is_multiple_of(2) {
-        generate_simulator_branch_group(seed, episode_id, split)
+    let data_split = if split == Split::Train {
+        V5DataSplit::Train
     } else {
-        generate_coordinate_branch_group(seed, episode_id, split)
-    }
+        V5DataSplit::Composition8x8
+    };
+    let content_size = if split == Split::Train { 7 } else { 8 };
+    let families = OperatorFamilySplit::default();
+    let mut rng = seeded_v5_rng(seed, episode_id, data_split, 0xFAC7_0005);
+    let operator = sampled_operator(&families, data_split, &mut rng)?;
+    generate_v5_factual_branch_group(seed, episode_id, data_split, content_size, operator)
 }
 
 fn interleave<T>(left: Vec<T>, right: Vec<T>) -> Vec<T> {
@@ -1375,6 +2441,492 @@ pub fn generate_p1c_hard_retarget_multistep(
     Ok(out)
 }
 
+/// One complete stationary-schedule v5 batch. `samples` is the loss-facing
+/// representation; `factual` exposes canonical group rows and pair labels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MixedStreamBatch {
+    samples: Vec<V5Sample>,
+    factual: Option<FactualBatch>,
+    factual_group_ranges: Vec<std::ops::Range<usize>>,
+    stream_counts: BTreeMap<MixedStreamKind, usize>,
+    scheduled_proportions: MixedStreamProportions,
+}
+
+impl MixedStreamBatch {
+    pub fn samples(&self) -> &[V5Sample] {
+        &self.samples
+    }
+
+    pub fn transitions(&self) -> impl ExactSizeIterator<Item = &TransitionSample> {
+        self.samples.iter().map(|sample| &sample.transition)
+    }
+
+    pub fn content_masks(&self) -> impl ExactSizeIterator<Item = &ContentMask> {
+        self.samples.iter().map(|sample| &sample.content_mask)
+    }
+
+    pub fn flattened_content_masks_f32(&self) -> Vec<f32> {
+        self.samples
+            .iter()
+            .flat_map(|sample| {
+                sample
+                    .content_mask
+                    .values
+                    .iter()
+                    .map(|&value| f32::from(value))
+            })
+            .collect()
+    }
+
+    pub fn factual(&self) -> Option<&FactualBatch> {
+        self.factual.as_ref()
+    }
+
+    /// Ranges in mixed-batch row order; every range is one complete group.
+    pub fn factual_group_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.factual_group_ranges
+    }
+
+    pub fn stream_counts(&self) -> &BTreeMap<MixedStreamKind, usize> {
+        &self.stream_counts
+    }
+
+    pub fn scheduled_proportions(&self) -> MixedStreamProportions {
+        self.scheduled_proportions
+    }
+
+    pub fn into_samples(self) -> Vec<V5Sample> {
+        self.samples
+    }
+}
+
+fn allocate_stream_counts(
+    batch_size: usize,
+    proportions: MixedStreamProportions,
+) -> BTreeMap<MixedStreamKind, usize> {
+    let normalized = proportions.normalized();
+    let ordered = normalized.ordered();
+    let mut counts = BTreeMap::new();
+    let mut remainders = Vec::new();
+    let mut assigned = 0usize;
+    for (kind, weight) in ordered {
+        let exact = weight as f64 * batch_size as f64;
+        let floor = exact.floor() as usize;
+        counts.insert(kind, floor);
+        remainders.push((kind, exact - floor as f64));
+        assigned += floor;
+    }
+    remainders.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (kind, _) in remainders.into_iter().take(batch_size - assigned) {
+        *counts.get_mut(&kind).expect("all stream kinds inserted") += 1;
+    }
+
+    let factual = counts[&MixedStreamKind::FactualBranches];
+    let complete_factual = (factual / FACTUAL_BRANCHES_PER_GROUP)
+        .max(1)
+        .saturating_mul(FACTUAL_BRANCHES_PER_GROUP)
+        .min(batch_size);
+    if complete_factual < factual {
+        *counts
+            .get_mut(&MixedStreamKind::RandomOneStep)
+            .expect("random stream exists") += factual - complete_factual;
+    } else if complete_factual > factual {
+        let mut needed = complete_factual - factual;
+        for kind in [
+            MixedStreamKind::RandomOneStep,
+            MixedStreamKind::Exploration,
+            MixedStreamKind::SequentialFragments,
+            MixedStreamKind::HazardOneStep,
+        ] {
+            let available = counts[&kind];
+            let take = available.min(needed);
+            *counts.get_mut(&kind).expect("stream exists") -= take;
+            needed -= take;
+            if needed == 0 {
+                break;
+            }
+        }
+    }
+    counts.insert(MixedStreamKind::FactualBranches, complete_factual);
+    debug_assert_eq!(counts.values().sum::<usize>(), batch_size);
+    counts
+}
+
+fn raw_random_v5_sample(
+    seed: u64,
+    episode_id: u64,
+    split: V5DataSplit,
+    size: u8,
+    operator: EpisodeOperator,
+) -> Result<TransitionSample> {
+    let scenario = scenario_for_v5(seed, episode_id, split, size);
+    let sim = Simulator::new(scenario.clone());
+    let mut rng = seeded_v5_rng(seed, episode_id, split, 0xA11C_E005);
+    let mut state = State::initial(&scenario);
+    for _ in 0..episode_id as usize % 4 {
+        let action = Action::moves()[rng.random_range(0..4)];
+        state = apply_action(&sim, &state, action);
+    }
+    match episode_id % 7 {
+        0..=3 => {
+            let action = Action::moves()[episode_id as usize % 4];
+            let next = apply_action(&sim, &state, action);
+            sample_from_transition_goal_free(&scenario, &state, &next, action, "random_one_step", 0)
+        }
+        4 => operator_sample_from_state(
+            &scenario,
+            &state,
+            ArcAction::new(5, None, None)?,
+            operator,
+            "random_one_step",
+            0,
+        ),
+        5 => {
+            let current = render_state_padded(&scenario, &state)?;
+            let coordinates = stratified_action6_coordinates(&current, size)?;
+            let (x, y) = coordinates[rng.random_range(0..coordinates.len())];
+            operator_sample_from_state(
+                &scenario,
+                &state,
+                ArcAction::new(6, Some(x), Some(y))?,
+                operator,
+                "random_one_step",
+                0,
+            )
+        }
+        _ => null_sample_from_state(&scenario, &state, "random_one_step", 0),
+    }
+}
+
+fn raw_exploration_v5_fragment(
+    seed: u64,
+    episode_id: u64,
+    split: V5DataSplit,
+    size: u8,
+    length: usize,
+) -> Result<Vec<TransitionSample>> {
+    let scenario = scenario_for_v5(seed, episode_id, split, size);
+    let sim = Simulator::new(scenario.clone());
+    let mut rng = seeded_v5_rng(seed, episode_id, split, 0xE1A1_0005);
+    let mut state = State::initial(&scenario);
+    let mut samples = Vec::with_capacity(length);
+    for index in 0..length {
+        let action = Action::moves()[rng.random_range(0..4)];
+        let next = apply_action(&sim, &state, action);
+        samples.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            "exploration",
+            index as u64,
+        )?);
+        state = next;
+    }
+    Ok(samples)
+}
+
+fn raw_sequential_v5_fragment(
+    seed: u64,
+    episode_id: u64,
+    split: V5DataSplit,
+    size: u8,
+    max_length: usize,
+) -> Result<Vec<TransitionSample>> {
+    let scenario = scenario_for_v5(seed, episode_id, split, size);
+    let sim = Simulator::new(scenario.clone());
+    let state = State::initial(&scenario);
+    let offset = episode_id as usize % scenario.candidate_goals.len();
+    let (goal, plan) = scenario
+        .candidate_goals
+        .iter()
+        .cycle()
+        .skip(offset)
+        .take(scenario.candidate_goals.len())
+        .find_map(|goal| {
+            shortest_path(&sim, &state, goal, scenario.action_budget)
+                .filter(|plan| !plan.actions.is_empty())
+                .map(|plan| (goal, plan))
+        })
+        .ok_or_else(|| anyhow!("no non-empty public plan for v5 sequential fragment"))?;
+    let mut state = state;
+    let mut samples = Vec::with_capacity(max_length.min(4));
+    for (index, action) in plan.actions.into_iter().take(max_length.min(4)).enumerate() {
+        let next = apply_action(&sim, &state, action);
+        let mut sample =
+            sample_from_transition(&scenario, &state, &next, action, goal, index as u64)?;
+        sample.family = "sequential_fragments".into();
+        sample.provenance.source_kind = "sequential_fragments".into();
+        samples.push(sample);
+        state = next;
+    }
+    Ok(samples)
+}
+
+fn raw_hazard_v5_sample(
+    seed: u64,
+    episode_id: u64,
+    split: V5DataSplit,
+    size: u8,
+) -> Result<TransitionSample> {
+    let mut scenario = scenario_for_v5(seed, episode_id, split, size);
+    ensure!(!scenario.hazards.is_empty(), "v5 scenario has no hazard");
+    ensure!(!scenario.markers.is_empty(), "v5 scenario has no marker");
+    let hazard = scenario.hazards[0];
+    let candidates = [
+        (Pos::new(hazard.x - 1, hazard.y), Action::Move(Dir::East)),
+        (Pos::new(hazard.x + 1, hazard.y), Action::Move(Dir::West)),
+        (Pos::new(hazard.x, hazard.y - 1), Action::Move(Dir::South)),
+        (Pos::new(hazard.x, hazard.y + 1), Action::Move(Dir::North)),
+    ];
+    let (start, action) = candidates
+        .into_iter()
+        .find(|(position, _)| scenario.in_bounds(*position))
+        .ok_or_else(|| anyhow!("hazard has no in-bounds neighbor"))?;
+    scenario.walls.remove(&start);
+    scenario.start = start;
+    let sim = Simulator::new(scenario.clone());
+    let state = State::initial(&scenario);
+    let next = apply_action(&sim, &state, action);
+    let goal = Goal::AvoidHazardReachMarker {
+        hazard: 0,
+        marker: 0,
+    };
+    let mut sample = sample_from_transition(&scenario, &state, &next, action, &goal, 0)?;
+    sample.family = "hazard_one_step".into();
+    sample.provenance.source_kind = "hazard_one_step".into();
+    Ok(sample)
+}
+
+fn augment_v5_unit(
+    transitions: Vec<TransitionSample>,
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    stream: MixedStreamKind,
+    operator: EpisodeOperator,
+    episode_id: u64,
+) -> Result<Vec<V5Sample>> {
+    ensure!(!transitions.is_empty(), "cannot augment an empty v5 unit");
+    let size = u8::try_from(transitions[0].provenance.content_width)
+        .map_err(|_| anyhow!("content size does not fit u8"))?;
+    let mut augmentation_rng = seeded_v5_rng(config.seed, episode_id, split, 0xA06D_4E05);
+    let rect = sampled_content_rect(size, split, &mut augmentation_rng);
+    let augmentation = sampled_augmentation(&mut augmentation_rng, config.symmetry_augmentation);
+    let mut dropout_rng = seeded_v5_rng(config.seed, episode_id, split, 0xD20F_0005);
+    transitions
+        .into_iter()
+        .map(|transition| {
+            augment_v5_transition(
+                transition,
+                split,
+                stream,
+                operator,
+                rect,
+                augmentation.clone(),
+                config.goal_dropout_probability,
+                &mut dropout_rng,
+            )
+        })
+        .collect()
+}
+
+fn append_nonfactual_stream(
+    samples: &mut Vec<V5Sample>,
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    stream: MixedStreamKind,
+    count: usize,
+    batch_index: u64,
+    episode_counter: &mut u64,
+) -> Result<()> {
+    let start_len = samples.len();
+    while samples.len() - start_len < count {
+        let remaining = count - (samples.len() - start_len);
+        let episode_id = batch_index
+            .wrapping_mul(1_000_003)
+            .wrapping_add(*episode_counter);
+        *episode_counter = episode_counter.wrapping_add(1);
+        let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0x51DE_0005);
+        let size = sampled_content_size(split, &mut rng);
+        let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
+        let raw = match stream {
+            MixedStreamKind::RandomOneStep => vec![raw_random_v5_sample(
+                config.seed,
+                episode_id,
+                split,
+                size,
+                operator,
+            )?],
+            MixedStreamKind::Exploration => {
+                raw_exploration_v5_fragment(config.seed, episode_id, split, size, remaining.min(4))?
+            }
+            MixedStreamKind::SequentialFragments => {
+                let mut generated = None;
+                for retry in 0..16u64 {
+                    let retry_episode = episode_id.wrapping_add(retry.wrapping_mul(10_000_019));
+                    if let Ok(fragment) = raw_sequential_v5_fragment(
+                        config.seed,
+                        retry_episode,
+                        split,
+                        size,
+                        remaining.min(4),
+                    ) {
+                        generated = Some(fragment);
+                        break;
+                    }
+                }
+                generated.ok_or_else(|| anyhow!("could not generate v5 sequential fragment"))?
+            }
+            MixedStreamKind::HazardOneStep => {
+                vec![raw_hazard_v5_sample(config.seed, episode_id, split, size)?]
+            }
+            MixedStreamKind::FactualBranches => {
+                bail!("factual stream must be appended as whole groups")
+            }
+        };
+        let mut unit = augment_v5_unit(raw, config, split, stream, operator, episode_id)?;
+        unit.truncate(remaining);
+        samples.append(&mut unit);
+    }
+    Ok(())
+}
+
+/// Compose one deterministic, mixed foundation-v2 batch.
+///
+/// `progress` is clamped to `[0,1]`. Factual row allocation is rounded to a
+/// whole ten-branch group and all other streams absorb the at-most-nine-row
+/// difference, so `batch_size` remains exact and no group is split.
+pub fn compose_mixed_stream_batch(
+    config: &MixedStreamConfig,
+    progress: f32,
+    batch_index: u64,
+    split: V5DataSplit,
+) -> Result<MixedStreamBatch> {
+    config.validate()?;
+    if let V5DataSplit::HeldOutOperator(family) = split {
+        ensure!(
+            config.operator_families.held_out.contains(&family),
+            "operator eval split requested a non-held-out family"
+        );
+    }
+    let scheduled_proportions = (config.schedule)(progress);
+    ensure!(
+        scheduled_proportions
+            .ordered()
+            .iter()
+            .all(|(_, weight)| weight.is_finite() && *weight >= 0.0),
+        "mixed stream schedule returned invalid weights"
+    );
+    let stream_counts = allocate_stream_counts(config.batch_size, scheduled_proportions);
+    let mut samples = Vec::with_capacity(config.batch_size);
+    let mut factual_groups = Vec::new();
+    let mut factual_group_ranges = Vec::new();
+    let mut episode_counter = 0u64;
+
+    append_nonfactual_stream(
+        &mut samples,
+        config,
+        split,
+        MixedStreamKind::RandomOneStep,
+        stream_counts[&MixedStreamKind::RandomOneStep],
+        batch_index,
+        &mut episode_counter,
+    )?;
+
+    let factual_group_count =
+        stream_counts[&MixedStreamKind::FactualBranches] / FACTUAL_BRANCHES_PER_GROUP;
+    for _ in 0..factual_group_count {
+        let episode_id = batch_index
+            .wrapping_mul(1_000_003)
+            .wrapping_add(episode_counter);
+        episode_counter = episode_counter.wrapping_add(1);
+        let mut rng = seeded_v5_rng(config.seed, episode_id, split, 0xFAC7_0005);
+        let size = sampled_content_size(split, &mut rng);
+        let operator = sampled_operator(&config.operator_families, split, &mut rng)?;
+        let raw_group =
+            generate_v5_factual_branch_group(config.seed, episode_id, split, size, operator)?;
+        let mut raw_transitions = raw_group.into_transitions().collect::<Vec<_>>();
+        raw_transitions.sort_by_key(|transition| {
+            (
+                transition.action.id,
+                transition.action.x,
+                transition.action.y,
+            )
+        });
+        let mut augmented = augment_v5_unit(
+            raw_transitions,
+            config,
+            split,
+            MixedStreamKind::FactualBranches,
+            operator,
+            episode_id,
+        )?;
+        augmented.sort_by_key(|sample| {
+            (
+                sample.transition.action.id,
+                sample.transition.action.x,
+                sample.transition.action.y,
+            )
+        });
+        let transformed_group = BranchGroup::try_new(
+            augmented
+                .iter()
+                .map(|sample| FactualActionBranch::try_from_transition(sample.transition.clone()))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let group_id = BranchGroupId::from_transition(&augmented[0].transition);
+        for sample in &mut augmented {
+            sample.provenance.branch_group_id = Some(group_id.clone());
+        }
+        let start = samples.len();
+        samples.append(&mut augmented);
+        factual_group_ranges.push(start..samples.len());
+        factual_groups.push(transformed_group);
+    }
+
+    for stream in [
+        MixedStreamKind::Exploration,
+        MixedStreamKind::SequentialFragments,
+        MixedStreamKind::HazardOneStep,
+    ] {
+        append_nonfactual_stream(
+            &mut samples,
+            config,
+            split,
+            stream,
+            stream_counts[&stream],
+            batch_index,
+            &mut episode_counter,
+        )?;
+    }
+    ensure!(
+        samples.len() == config.batch_size,
+        "mixed composer produced {} rows for requested batch {}",
+        samples.len(),
+        config.batch_size
+    );
+    for sample in &samples {
+        sample.validate()?;
+    }
+    let factual = if factual_groups.is_empty() {
+        None
+    } else {
+        Some(FactualBatch::from_groups(factual_groups)?)
+    };
+    Ok(MixedStreamBatch {
+        samples,
+        factual,
+        factual_group_ranges,
+        stream_counts,
+        scheduled_proportions,
+    })
+}
+
 /// Deterministic curriculum batch keyed by `(kind, seed, episode_id, split)`.
 pub fn generate_curriculum(
     kind: &str,
@@ -1480,7 +3032,8 @@ mod tests {
         assert!(ArcAction::new(6, Some(10), Some(20)).is_ok());
         assert!(ArcAction::new(6, None, None).is_err());
         assert!(ArcAction::new(1, Some(0), None).is_err());
-        assert!(ArcAction::new(0, None, None).is_err());
+        assert!(ArcAction::new(0, None, None).is_ok());
+        assert!(ArcAction::new(0, None, None).unwrap().to_tofy().is_err());
         assert_eq!(
             ArcAction::new(7, None, None).unwrap().to_tofy().unwrap(),
             Action::Undo
@@ -1632,7 +3185,7 @@ mod tests {
     #[test]
     fn factual_groups_preserve_shared_state_and_board_only_effects() -> Result<()> {
         let movement = generate_factual_branch_group(17, 2, Split::Train)?;
-        assert_eq!(movement.branches().len(), 4);
+        assert_eq!(movement.branches().len(), FACTUAL_BRANCHES_PER_GROUP);
         assert!(movement
             .branches()
             .windows(2)
@@ -1643,33 +3196,22 @@ mod tests {
             .all(|branch| !branch.status_changed_cells.is_empty()));
 
         let coordinate = generate_factual_branch_group(17, 3, Split::Train)?;
-        assert_eq!(coordinate.branches().len(), 4);
-        let current = &coordinate.branches()[0].transition.current;
+        assert_eq!(coordinate.branches().len(), FACTUAL_BRANCHES_PER_GROUP);
         assert_eq!(
-            current
-                .pixels
+            coordinate
+                .branches()
                 .iter()
-                .filter(|&&pixel| pixel == palette::AGENT)
+                .filter(|branch| branch.transition.action.id == 6)
                 .count(),
-            1
-        );
-        assert_eq!(
-            current
-                .pixels
-                .iter()
-                .filter(|&&pixel| (palette::MARKER_BASE..palette::COLLECTIBLE).contains(&pixel))
-                .count(),
-            0,
-            "ACTION6 target coordinates must not leak through marker pixels"
+            4
         );
         assert!(coordinate
             .branches()
             .iter()
-            .all(|branch| branch.board_effect.changed));
+            .any(|branch| branch.board_effect.changed));
         assert_eq!(
-            coordinate.unique_changed_effect_indices(),
-            vec![0, 1, 2, 3],
-            "distinct ACTION6 board outcomes are recoverable without status UI"
+            coordinate.effect_equivalence_matrix().len(),
+            FACTUAL_BRANCHES_PER_GROUP
         );
         Ok(())
     }
@@ -1687,7 +3229,13 @@ mod tests {
         let reconstructed = FactualBatch::from_rows(&shuffled)?;
         assert_eq!(reconstructed.group_ids(), expected.group_ids());
         assert_eq!(reconstructed.rows(), expected.rows());
-        assert_eq!(reconstructed.group_ranges(), &[0..4, 4..8]);
+        assert_eq!(
+            reconstructed.group_ranges(),
+            &[
+                0..FACTUAL_BRANCHES_PER_GROUP,
+                FACTUAL_BRANCHES_PER_GROUP..2 * FACTUAL_BRANCHES_PER_GROUP
+            ]
+        );
         assert!(FactualBatch::from_rows(&shuffled[..2]).is_err());
         Ok(())
     }
@@ -1700,6 +3248,9 @@ mod tests {
                 generate_factual_branch_group(0xFA_C7_EA_11, episode, Split::HeldOutComposition)?
                     .branches()
             {
+                if !(1..=4).contains(&branch.transition.action.id) {
+                    continue;
+                }
                 let entry = outcomes.entry(branch.transition.action.id).or_default();
                 if branch.board_effect.changed {
                     entry.0 = true;

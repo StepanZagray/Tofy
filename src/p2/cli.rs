@@ -18,7 +18,7 @@ use std::path::PathBuf;
 /// `p2-train` — synthetic curriculum only (no ARC public recordings).
 #[derive(Debug, Clone, Args)]
 pub struct P2TrainArgs {
-    /// Immutable successor recipe. `full-v4` resolves all model/objective
+    /// Immutable successor recipe. Fixed recipes resolve model/objective
     /// choices while leaving runtime, seed, batch, and output controls intact.
     #[arg(long, value_enum, default_value_t = TrainingRecipe::LegacyExperimental)]
     pub recipe: TrainingRecipe,
@@ -37,8 +37,13 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = 2)]
     pub steps_per_lesson: usize,
 
-    #[arg(long, default_value_t = 2)]
-    pub physical_batch: usize,
+    /// Total optimizer steps for `foundation-v2` (default 24576).
+    #[arg(long)]
+    pub steps: Option<usize>,
+
+    /// Defaults to 2048 for `foundation-v2`, otherwise 2.
+    #[arg(long)]
+    pub physical_batch: Option<usize>,
 
     /// Number of physical microbatches per optimizer update.
     #[arg(long, default_value_t = 1)]
@@ -100,7 +105,7 @@ pub struct P2TrainArgs {
     #[arg(long, default_value = "cpu")]
     pub device: String,
 
-    #[arg(long, default_value = "runs/p2/smoke")]
+    #[arg(long, visible_alias = "out", default_value = "runs/p2/smoke")]
     pub output_dir: PathBuf,
 
     /// Complete checkpoint bundle, checkpoints directory, or run directory to resume.
@@ -113,8 +118,9 @@ pub struct P2TrainArgs {
     pub allow_batch_schedule_migration: bool,
 
     /// Save a complete resumable checkpoint every N updates; zero disables periodic saves.
-    #[arg(long, default_value_t = 100)]
-    pub checkpoint_every_steps: usize,
+    /// Defaults to 256 for `foundation-v2`, otherwise 100.
+    #[arg(long)]
+    pub checkpoint_every_steps: Option<usize>,
 
     /// Cleanly pause after N updates in this invocation (useful for batch schedulers).
     #[arg(long)]
@@ -317,6 +323,7 @@ pub struct P2TrainArgs {
 
 impl P2TrainArgs {
     pub fn to_config(&self) -> TrainConfig {
+        let foundation_v2 = self.recipe == TrainingRecipe::FoundationV2;
         let lessons = if self.lessons.is_empty() {
             DEFAULT_LESSONS.iter().map(|s| (*s).to_string()).collect()
         } else {
@@ -326,8 +333,14 @@ impl P2TrainArgs {
             recipe: self.recipe,
             seed: self.seed,
             lessons,
-            steps_per_lesson: self.steps_per_lesson,
-            physical_batch: self.physical_batch,
+            steps_per_lesson: if foundation_v2 {
+                self.steps.unwrap_or(24_576)
+            } else {
+                self.steps_per_lesson
+            },
+            physical_batch: self
+                .physical_batch
+                .unwrap_or(if foundation_v2 { 2_048 } else { 2 }),
             grad_accum: self.grad_accum,
             lr: self.lr,
             weight_decay: self.weight_decay,
@@ -350,7 +363,11 @@ impl P2TrainArgs {
             output_dir: self.output_dir.clone(),
             resume: self.resume.clone(),
             allow_batch_schedule_migration: self.allow_batch_schedule_migration,
-            checkpoint_every_steps: self.checkpoint_every_steps,
+            checkpoint_every_steps: self.checkpoint_every_steps.unwrap_or(if foundation_v2 {
+                256
+            } else {
+                100
+            }),
             max_steps_this_run: self.max_steps_this_run,
             profile_update: self.profile_update,
             pressure_updates: self.pressure_updates.clone(),
@@ -436,6 +453,8 @@ impl P2TrainArgs {
         };
         if self.recipe == TrainingRecipe::FullV4 {
             cfg.apply_full_v4_recipe();
+        } else if self.recipe == TrainingRecipe::FoundationV2 {
+            cfg.apply_foundation_v2_recipe();
         }
         cfg
     }

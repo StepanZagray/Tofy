@@ -6,14 +6,15 @@
 use anyhow::{bail, Result};
 use candle_core::{DType, Tensor, D};
 
-/// DeepSeek-V4 rescales orthogonalized updates to this target RMS (Algorithm 1, γ).
-pub const MUON_RMS_SCALE: f64 = 0.18;
+/// Muon-is-Scalable RMS matching coefficient.
+pub const MUON_RMS_SCALE: f64 = 0.2;
 
 const NS_FAST: (f64, f64, f64) = (3.4445, -4.7750, 2.0315);
 const NS_LOCK: (f64, f64, f64) = (2.0, -1.5, 0.5);
 
-/// Minimum rows/cols for Muon orthogonalization (DeepSeek-V4: undefined on vectors).
-const MUON_MIN_SIDE: usize = 2;
+/// Foundation-v2 keeps tiny/degenerate projections on Adam. Whitening a matrix
+/// with either fan below eight creates a disproportionate fixed-magnitude step.
+const MUON_MIN_SIDE: usize = 8;
 
 /// Name fragments that stay on AdamW per DeepSeek-V4 §2.4:
 /// embeddings, prediction heads, norm scales, biases.
@@ -90,7 +91,8 @@ pub fn hybrid_newton_schulz(g: &Tensor) -> Result<Tensor> {
     Ok(x)
 }
 
-/// Shape rescale from DeepSeek-V4 Algorithm 1: `U * sqrt(max(n,m)) * γ`.
+/// Muon-is-Scalable RMS matching: `U * 0.2 * sqrt(max(fan_in, fan_out))`.
+/// `gamma` remains explicit for checkpointed experiment configuration.
 pub fn muon_shape_rescale(update: &Tensor, gamma: f64) -> Result<Tensor> {
     let (n, m) = update.dims2()?;
     let scale = (n.max(m) as f64).sqrt() * gamma;
@@ -148,7 +150,8 @@ mod tests {
         // Muon: state/input projections into hidden dim
         assert!(uses_muon("action_proj.weight", &[128, 8]));
         assert!(uses_muon("goal_proj.weight", &[128, 64]));
-        assert!(uses_muon("coord_proj.weight", &[128, 2]));
+        assert!(!uses_muon("coord_proj.weight", &[128, 2]));
+        assert!(!uses_muon("spatial_action_proj.weight", &[128, 4, 1, 1]));
     }
 
     #[test]

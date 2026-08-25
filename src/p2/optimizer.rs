@@ -7,6 +7,175 @@ use candle_nn::optim::ParamsAdamW;
 use candle_nn::VarMap;
 use std::path::Path;
 
+pub const DEFAULT_EMA_DECAY: f64 = 0.999;
+
+/// Device-resident exponential moving average of all floating model weights.
+///
+/// The EMA owns independent storage. Evaluation can temporarily install it in
+/// the live [`VarMap`] and restore the training weights afterward.
+pub struct ModelEma {
+    decay: f64,
+    weights: VarMap,
+    eval_backup: Option<Vec<(String, Tensor)>>,
+}
+
+impl ModelEma {
+    pub fn new(model_vars: &VarMap, decay: f64) -> Result<Self> {
+        if !decay.is_finite() || !(0.0..1.0).contains(&decay) {
+            bail!("EMA decay must be finite and in [0,1), got {decay}");
+        }
+        let weights = VarMap::new();
+        for (name, var) in named_float_vars(model_vars) {
+            let value = var.as_tensor().copy()?.detach();
+            weights
+                .data()
+                .lock()
+                .unwrap()
+                .insert(name, Var::from_tensor(&value)?);
+        }
+        Ok(Self {
+            decay,
+            weights,
+            eval_backup: None,
+        })
+    }
+
+    pub fn with_default_decay(model_vars: &VarMap) -> Result<Self> {
+        Self::new(model_vars, DEFAULT_EMA_DECAY)
+    }
+
+    pub fn decay(&self) -> f64 {
+        self.decay
+    }
+
+    /// EMA storage for checkpoint save/load alongside the training weights.
+    pub fn weights(&self) -> &VarMap {
+        &self.weights
+    }
+
+    /// Apply `ema = decay*ema + (1-decay)*model` after one optimizer step.
+    pub fn update(&mut self, model_vars: &VarMap) -> Result<()> {
+        if self.eval_backup.is_some() {
+            bail!("cannot update EMA while EMA weights are installed for evaluation");
+        }
+        let model = named_float_vars(model_vars);
+        let ema = named_float_vars(&self.weights);
+        ensure_matching_vars(&model, &ema, "update EMA")?;
+        for ((_, model), (_, ema)) in model.iter().zip(&ema) {
+            let next = ema
+                .as_tensor()
+                .affine(self.decay, 0.0)?
+                .add(&model.as_tensor().affine(1.0 - self.decay, 0.0)?)?
+                .detach();
+            ema.set(&next)?;
+        }
+        Ok(())
+    }
+
+    /// Replace live model weights with EMA weights until
+    /// [`Self::restore_after_eval`] is called.
+    pub fn swap_in_for_eval(&mut self, model_vars: &VarMap) -> Result<()> {
+        if self.eval_backup.is_some() {
+            bail!("EMA weights are already installed for evaluation");
+        }
+        let model = named_float_vars(model_vars);
+        let ema = named_float_vars(&self.weights);
+        ensure_matching_vars(&model, &ema, "install EMA")?;
+        let backup = model
+            .iter()
+            .map(|(name, var)| Ok((name.clone(), var.as_tensor().copy()?.detach())))
+            .collect::<Result<Vec<_>>>()?;
+        self.eval_backup = Some(backup);
+        for ((_, model), (_, ema)) in model.iter().zip(&ema) {
+            model.set(&ema.as_tensor().detach())?;
+        }
+        Ok(())
+    }
+
+    /// Restore the training weights saved by [`Self::swap_in_for_eval`].
+    pub fn restore_after_eval(&mut self, model_vars: &VarMap) -> Result<()> {
+        let backup = self
+            .eval_backup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("EMA weights are not installed"))?;
+        let model = named_float_vars(model_vars);
+        let backup_names = backup
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let model_names = model
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        if model_names != backup_names {
+            bail!("restore EMA model parameter names changed");
+        }
+        for ((_, model), (_, value)) in model.iter().zip(backup) {
+            model.set(value)?;
+        }
+        self.eval_backup = None;
+        Ok(())
+    }
+
+    /// Run an evaluation closure with EMA weights, restoring training weights
+    /// even when evaluation itself returns an error.
+    pub fn with_eval_weights<T>(
+        &mut self,
+        model_vars: &VarMap,
+        evaluate: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.swap_in_for_eval(model_vars)?;
+        let evaluated = evaluate();
+        let restored = self.restore_after_eval(model_vars);
+        match (evaluated, restored) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context("restore training weights after EMA eval")),
+            (Err(eval), Err(restore)) => Err(eval.context(format!(
+                "EMA evaluation also failed to restore training weights: {restore:#}"
+            ))),
+        }
+    }
+}
+
+fn named_float_vars(varmap: &VarMap) -> Vec<(String, Var)> {
+    let data = varmap.data().lock().unwrap();
+    let mut vars = data
+        .iter()
+        .filter(|(_, var)| var.dtype().is_float())
+        .map(|(name, var)| (name.clone(), var.clone()))
+        .collect::<Vec<_>>();
+    vars.sort_by(|a, b| a.0.cmp(&b.0));
+    vars
+}
+
+fn ensure_matching_vars(
+    left: &[(String, Var)],
+    right: &[(String, Var)],
+    operation: &str,
+) -> Result<()> {
+    if left.len() != right.len() {
+        bail!(
+            "{operation}: parameter count mismatch {} vs {}",
+            left.len(),
+            right.len()
+        );
+    }
+    for ((left_name, left), (right_name, right)) in left.iter().zip(right) {
+        if left_name != right_name || left.shape() != right.shape() || left.dtype() != right.dtype()
+        {
+            bail!(
+                "{operation}: parameter mismatch {left_name} {:?} {:?} vs {right_name} {:?} {:?}",
+                left.shape(),
+                left.dtype(),
+                right.shape(),
+                right.dtype()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OptKind {
     Adam,
@@ -184,6 +353,16 @@ impl CheckpointHybridOptimizer {
 
     pub fn step_t(&self) -> usize {
         self.step_t
+    }
+
+    /// Update the shared AdamW/Muon learning rate without rebuilding either
+    /// optimizer state. Foundation-v2 calls this once per WSD update.
+    pub fn set_learning_rate(&mut self, lr: f64) -> Result<()> {
+        if !(lr.is_finite() && lr > 0.0) {
+            bail!("optimizer learning rate must be finite and > 0, got {lr}");
+        }
+        self.adam.lr = lr;
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -414,7 +593,13 @@ mod tests {
     fn muon_decay_applies_before_unattenuated_update() -> Result<()> {
         let device = Device::Cpu;
         let varmap = VarMap::new();
-        let initial = Tensor::new(&[[1f32, -2.0], [3.0, -4.0]], &device)?;
+        let initial = Tensor::from_vec(
+            (0..64)
+                .map(|index| index as f32 / 8.0 - 4.0)
+                .collect::<Vec<_>>(),
+            (8, 8),
+            &device,
+        )?;
         let weight = Var::from_tensor(&initial)?;
         varmap
             .data()
@@ -434,8 +619,14 @@ mod tests {
             momentum,
             MUON_RMS_SCALE,
         )?;
-        let gradient = Tensor::new(&[[2f32, 1.0], [-1.0, 3.0]], &device)?;
-        let zero = Tensor::zeros((2, 2), DType::F32, &device)?;
+        let gradient = Tensor::from_vec(
+            (0..64)
+                .map(|index| (index % 11) as f32 - 5.0)
+                .collect::<Vec<_>>(),
+            (8, 8),
+            &device,
+        )?;
+        let zero = Tensor::zeros((8, 8), DType::F32, &device)?;
         let (_, delta) = muon_update(&gradient, &zero, momentum, lr, MUON_RMS_SCALE)?;
         let expected = initial.affine(1.0 - lr * weight_decay, 0.0)?.add(&delta)?;
         let attenuated_update = initial.add(&delta)?.affine(1.0 - lr * weight_decay, 0.0)?;

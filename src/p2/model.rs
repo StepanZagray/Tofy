@@ -3,7 +3,8 @@
 use anyhow::{bail, Result};
 use candle_core::{DType, Tensor, D};
 use candle_nn::{
-    conv2d, embedding, linear, Conv2d, Conv2dConfig, Embedding, Linear, Module, VarBuilder,
+    conv2d, embedding, linear, Conv2d, Conv2dConfig, Embedding, Init, Linear, Module, VarBuilder,
+    VarMap,
 };
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -88,6 +89,10 @@ impl RecursionOpts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub frame_side: usize,
+    /// Side length of one square encoder/decoder patch. Foundation-v2 uses 4;
+    /// patch 8 remains available for legacy comparisons.
+    #[serde(default = "default_patch_size")]
+    pub patch_size: usize,
     pub hidden_dim: usize,
     pub action_dim: usize,
     pub goal_dim: usize,
@@ -118,8 +123,9 @@ pub struct ModelConfig {
     pub spatial_action_residual: bool,
     #[serde(default = "default_spatial_action_residual_scale")]
     pub spatial_action_residual_scale: f64,
-    /// Instantiate the action-faithful world-core-v2 heads. V2 checkpoints are
-    /// intentionally incompatible with legacy training checkpoints.
+    /// Instantiate the legacy action-faithful world-core-v2 topology. The
+    /// inverse-action heads are also present on V5 so foundation-v2 can train
+    /// the ADR 0003 inverse-action objective without composing V2 and V4.
     #[serde(default)]
     pub world_core_v2: bool,
     /// Explicit experiment schema marker. V3 retains the V2 heads/topology.
@@ -129,6 +135,10 @@ pub struct ModelConfig {
     /// experimental factual-branch heads.
     #[serde(default)]
     pub world_core_v4: bool,
+    /// Foundation-v2 objective marker. Reuses the V4 exact decoder while
+    /// enabling only the inverse-action heads required by ADR 0003.
+    #[serde(default)]
+    pub world_core_v5: bool,
     /// Readout used only by Q/event/reliability planning heads.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -136,6 +146,10 @@ pub struct ModelConfig {
 
 fn default_sigreg_projector_dim() -> usize {
     128
+}
+
+fn default_patch_size() -> usize {
+    PATCH_SIZE
 }
 
 fn default_spatial_action_residual_scale() -> f64 {
@@ -146,6 +160,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             frame_side: FRAME_SIDE,
+            patch_size: default_patch_size(),
             hidden_dim: 128,
             action_dim: 32,
             goal_dim: DEFAULT_GOAL_DIM,
@@ -163,6 +178,7 @@ impl Default for ModelConfig {
             world_core_v2: false,
             world_core_v3: false,
             world_core_v4: false,
+            world_core_v5: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
         }
     }
@@ -187,6 +203,18 @@ impl ModelConfig {
                 self.frame_side
             );
         }
+        if !matches!(self.patch_size, PATCH_SIZE | LEGACY_PATCH_SIZE) {
+            bail!(
+                "ModelConfig.patch_size must be 4 or 8, got {}",
+                self.patch_size
+            );
+        }
+        if !FRAME_SIDE.is_multiple_of(self.patch_size) {
+            bail!(
+                "frame side {FRAME_SIDE} must be divisible by patch size {}",
+                self.patch_size
+            );
+        }
         if self.hidden_dim == 0
             || self.action_dim == 0
             || self.goal_dim == 0
@@ -205,6 +233,9 @@ impl ModelConfig {
         if self.world_core_v4 && (self.world_core_v2 || self.world_core_v3) {
             bail!("world_core_v4 cannot be composed with V2/V3");
         }
+        if self.world_core_v5 && !self.world_core_v4 {
+            bail!("world_core_v5 requires the world_core_v4 exact-decoder topology");
+        }
         if self.world_core_v4
             && (!self.spatial_action_field
                 || self.consumer_readout != ConsumerReadoutTopology::SpatialQuery)
@@ -221,6 +252,10 @@ impl ModelConfig {
             bail!("spatial_action_residual_scale must be finite and in (0,1]");
         }
         Ok(())
+    }
+
+    pub fn latent_grid(&self) -> usize {
+        FRAME_SIDE / self.patch_size
     }
 }
 
@@ -251,9 +286,37 @@ fn seeded_gaussian_like(template: &Tensor, sigma: f64, seed: u64) -> Result<Tens
     Tensor::from_vec(data, shape, template.device()).map_err(Into::into)
 }
 
-/// Side length of square input patches (`64 / PATCH_SIZE` grid).
-pub const PATCH_SIZE: usize = 8;
-/// Spatial latent grid side (matches patch grid; dynamics stay on `B×C×8×8`).
+fn zero_initialized_linear(in_dim: usize, out_dim: usize, vb: VarBuilder<'_>) -> Result<Linear> {
+    let weight = vb.get_with_hints((out_dim, in_dim), "weight", Init::Const(0.0))?;
+    let bias = vb.get_with_hints(out_dim, "bias", Init::Const(0.0))?;
+    Ok(Linear::new(weight, Some(bias)))
+}
+
+/// Restore FiLM's identity initialization after any generic model-wide
+/// reinitializer. Tofy's name-seeded initializer intentionally overwrites all
+/// weights, so foundation-v2 training calls this once immediately afterward.
+pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.starts_with("action_film_"))
+    {
+        var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
+            .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
+        matched += 1;
+    }
+    if matched != 4 {
+        bail!("expected four action FiLM parameters, found {matched}");
+    }
+    Ok(())
+}
+
+/// Default side length of square input patches (`64 / PATCH_SIZE` grid).
+pub const PATCH_SIZE: usize = 4;
+/// Retained legacy patch side for explicit patch-8 comparisons.
+pub const LEGACY_PATCH_SIZE: usize = 8;
+/// Default spatial latent grid side. Configured patch-8 models use an 8×8 grid.
 pub const LATENT_GRID: usize = FRAME_SIDE / PATCH_SIZE;
 
 /// Flatten `B×C×H×W` (or pass through `B×D`) for SIGReg / identifiability.
@@ -326,6 +389,23 @@ struct GridResidualBlock {
     c2: Conv2d,
 }
 
+#[derive(Clone)]
+struct ActionFilm {
+    gamma_delta: Tensor,
+    beta: Tensor,
+}
+
+impl ActionFilm {
+    fn neutral_like(latent: &Tensor) -> Result<Self> {
+        let (batch, channels, _, _) = latent.dims4()?;
+        let zeros = Tensor::zeros((batch, channels, 1, 1), latent.dtype(), latent.device())?;
+        Ok(Self {
+            gamma_delta: zeros.clone(),
+            beta: zeros,
+        })
+    }
+}
+
 impl GridResidualBlock {
     fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         let cfg = Conv2dConfig {
@@ -338,8 +418,11 @@ impl GridResidualBlock {
         })
     }
 
-    fn forward(&self, h: &Tensor) -> Result<Tensor> {
-        let delta = self.c2.forward(&self.c1.forward(h)?.silu()?)?;
+    fn forward(&self, h: &Tensor, film: &ActionFilm) -> Result<Tensor> {
+        let hidden = self.c1.forward(h)?.silu()?;
+        let gamma = film.gamma_delta.affine(1.0, 1.0)?;
+        let hidden = hidden.broadcast_mul(&gamma)?.broadcast_add(&film.beta)?;
+        let delta = self.c2.forward(&hidden)?;
         h.add(&delta).map_err(Into::into)
     }
 }
@@ -352,15 +435,12 @@ struct GridEncoder {
 }
 
 impl GridEncoder {
-    fn new(cell_dim: usize, vb: VarBuilder) -> Result<Self> {
-        if !FRAME_SIDE.is_multiple_of(PATCH_SIZE) {
-            bail!("FRAME_SIDE must be divisible by PATCH_SIZE");
-        }
-        if LATENT_GRID != FRAME_SIDE / PATCH_SIZE {
-            bail!("LATENT_GRID mismatch");
+    fn new(cell_dim: usize, patch_size: usize, vb: VarBuilder) -> Result<Self> {
+        if !FRAME_SIDE.is_multiple_of(patch_size) {
+            bail!("FRAME_SIDE must be divisible by patch_size");
         }
         let patch_cfg = Conv2dConfig {
-            stride: PATCH_SIZE,
+            stride: patch_size,
             ..Default::default()
         };
         let conv_cfg = Conv2dConfig {
@@ -368,7 +448,7 @@ impl GridEncoder {
             ..Default::default()
         };
         Ok(Self {
-            patch: conv2d(PIXEL_EMB_DIM, 32, PATCH_SIZE, patch_cfg, vb.pp("patch"))?,
+            patch: conv2d(PIXEL_EMB_DIM, 32, patch_size, patch_cfg, vb.pp("patch"))?,
             c2: conv2d(32, 64, 3, conv_cfg, vb.pp("c2"))?,
             c3: conv2d(64, 64, 3, conv_cfg, vb.pp("c3"))?,
             proj: conv2d(64, cell_dim, 1, Default::default(), vb.pp("proj"))?,
@@ -500,8 +580,10 @@ pub struct WorldModel {
     encoder: GridEncoder,
     action_emb: Embedding,
     action_proj: Linear,
+    action_film_gamma: Linear,
+    action_film_beta: Linear,
     coord_proj: Linear,
-    /// Optional `B×4×8×8` ACTION6 coordinate field projection.
+    /// Optional `B×4×grid×grid` ACTION6 coordinate field projection.
     spatial_action_proj: Option<Conv2d>,
     goal_proj: Linear,
     block: GridResidualBlock,
@@ -562,19 +644,27 @@ impl WorldModel {
                 )
             })
             .transpose()?;
-        let action_decoder = cfg
-            .world_core_v2
+        let action_decoder = (cfg.world_core_v2 || cfg.world_core_v5)
             .then(|| linear(cfg.hidden_dim, ACTION_VOCAB, vb.pp("action_decoder")))
             .transpose()?;
-        let coordinate_decoder = cfg
-            .world_core_v2
+        let coordinate_decoder = (cfg.world_core_v2 || cfg.world_core_v5)
             .then(|| linear(cfg.hidden_dim, 2, vb.pp("coordinate_decoder")))
             .transpose()?;
         Ok(Self {
             pixel_emb: embedding(PALETTE_SIZE, PIXEL_EMB_DIM, vb.pp("pixel_emb"))?,
-            encoder: GridEncoder::new(cfg.hidden_dim, vb.pp("encoder"))?,
+            encoder: GridEncoder::new(cfg.hidden_dim, cfg.patch_size, vb.pp("encoder"))?,
             action_emb: embedding(ACTION_VOCAB, cfg.action_dim, vb.pp("action_emb"))?,
             action_proj: linear(cfg.action_dim, cfg.hidden_dim, vb.pp("action_proj"))?,
+            action_film_gamma: zero_initialized_linear(
+                cfg.action_dim,
+                cfg.hidden_dim,
+                vb.pp("action_film_gamma"),
+            )?,
+            action_film_beta: zero_initialized_linear(
+                cfg.action_dim,
+                cfg.hidden_dim,
+                vb.pp("action_film_beta"),
+            )?,
             coord_proj: linear(2, cfg.hidden_dim, vb.pp("coord_proj"))?,
             spatial_action_proj,
             goal_proj: linear(cfg.goal_dim, cfg.hidden_dim, vb.pp("goal_proj"))?,
@@ -594,11 +684,18 @@ impl WorldModel {
             sigreg_projector,
             patch_histogram_grounding: PatchHistogramGrounding::new(
                 cfg.hidden_dim,
+                cfg.patch_size,
                 vb.pp("grounding_head"),
             )?,
             exact_patch_grounding: cfg
                 .world_core_v4
-                .then(|| ExactPatchGrounding::new(cfg.hidden_dim, vb.pp("exact_grounding_head")))
+                .then(|| {
+                    ExactPatchGrounding::new(
+                        cfg.hidden_dim,
+                        cfg.patch_size,
+                        vb.pp("exact_grounding_head"),
+                    )
+                })
                 .transpose()?,
             config: cfg,
         })
@@ -630,10 +727,63 @@ impl WorldModel {
     /// canonical semantic seam used by Full V4 evaluation; it never includes
     /// the synthetic status row.
     pub fn exact_gameplay_logits(&self, latents: &Tensor) -> Result<Tensor> {
+        self.exact_gameplay_logits_trainable(latents)
+    }
+
+    /// Decode predicted latents without severing the predictor/encoder graph.
+    /// Foundation-v2's primary pixel loss must use this explicit seam.
+    pub fn exact_gameplay_logits_trainable(&self, latents: &Tensor) -> Result<Tensor> {
         self.exact_patch_grounding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
             .gameplay_logits(latents)
+    }
+
+    /// Detached exact logits for observer labels and diagnostics only.
+    pub fn exact_gameplay_logits_detached(&self, latents: &Tensor) -> Result<Tensor> {
+        Ok(self.exact_gameplay_logits_trainable(latents)?.detach())
+    }
+
+    /// Per-pixel probability that evaluation should use the predicted colour
+    /// instead of copying the current observation.
+    pub fn exact_copy_gate(&self, predicted: &Tensor) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("copy gate requires world-core-v4"))?
+            .copy_gate(predicted)
+    }
+
+    /// Trainable per-pixel copy/change logits for the balanced gate BCE loss.
+    pub fn exact_copy_gate_logits_trainable(&self, predicted: &Tensor) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("copy gate requires world-core-v4"))?
+            .copy_gate_logits(predicted)
+    }
+
+    /// Discrete gameplay decode used by evaluation. The sigmoid copy gate is
+    /// thresholded at 0.5, then composes `gate*prediction + (1-gate)*current`.
+    pub fn composed_gameplay_decode(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+    ) -> Result<Tensor> {
+        let batch = predicted.dim(0)?;
+        if current_frames.dims4()? != (batch, 1, FRAME_SIDE, FRAME_SIDE) {
+            bail!("current frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}");
+        }
+        let predicted_pixels = self
+            .exact_gameplay_logits_detached(predicted)?
+            .argmax(D::Minus1)?;
+        let current_pixels = current_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        self.exact_copy_gate(predicted)?
+            .detach()
+            .ge(0.5)?
+            .where_cond(&predicted_pixels, &current_pixels)
+            .map_err(Into::into)
     }
 
     pub fn exact_transition_correctness(
@@ -652,7 +802,26 @@ impl WorldModel {
     /// consumed by transition/observer heads; this is a Tofy adaptation, not
     /// the separate loss-only projectors used by LeWorldModel.
     pub fn canonical_representation(&self, spatial: &Tensor) -> Result<Tensor> {
-        rms_norm_latent(&self.consumer_readout.forward(spatial)?)
+        rms_norm_latent(&self.read_consumer(spatial)?)
+    }
+
+    /// Preserve the established 8×8 SpatialQuery interface while the v5
+    /// dynamics grid becomes 16×16. Patch-4 tokens are averaged in exact 2×2
+    /// groups before the canonical readout; patch-8 models pass through.
+    fn read_consumer(&self, spatial: &Tensor) -> Result<Tensor> {
+        let (_, _, height, width) = spatial.dims4()?;
+        let readout_grid = FRAME_SIDE / LEGACY_PATCH_SIZE;
+        if height == readout_grid && width == readout_grid {
+            return self.consumer_readout.forward(spatial).map_err(Into::into);
+        }
+        if height != width || !height.is_multiple_of(readout_grid) {
+            bail!(
+                "consumer spatial grid must downsample exactly to {readout_grid}x{readout_grid}, got {height}x{width}"
+            );
+        }
+        self.consumer_readout
+            .forward(&spatial.avg_pool2d(height / readout_grid)?)
+            .map_err(Into::into)
     }
 
     /// Encode palette-index frames into the shared latent space.
@@ -735,9 +904,11 @@ impl WorldModel {
         let current = rms_norm_latent(&current_raw)?;
         let target = rms_norm_latent(&target_raw)?;
         let x = self.add_action(&current, actions, action_coords)?;
+        let film = self.action_film(actions, current.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| current.clone());
         let recursion = self.run_latent_recursion(
             &x,
+            &film,
             0.0,
             None,
             RecursionDepth::from_config(&self.config),
@@ -784,7 +955,7 @@ impl WorldModel {
                 if self.config.world_core_v4 {
                     self.canonical_representation(&prediction)?.detach()
                 } else {
-                    self.consumer_readout.forward(&prediction)?.detach()
+                    self.read_consumer(&prediction)?.detach()
                 },
             ),
             (
@@ -847,6 +1018,35 @@ impl WorldModel {
         self.add_action_with_canonical(state, None, actions, action_coords)
     }
 
+    fn action_film(&self, actions: &Tensor, batch: usize) -> Result<ActionFilm> {
+        let actions = match actions.rank() {
+            1 => actions.clone(),
+            2 if actions.dim(1)? == 1 => actions.reshape((batch,))?,
+            rank => bail!("actions must be shape [B] or [B,1], got rank {rank}"),
+        };
+        if actions.dim(0)? != batch {
+            bail!(
+                "action batch {} does not match latent batch {batch}",
+                actions.dim(0)?
+            );
+        }
+        let embedding = self.action_emb.forward(&actions)?;
+        Ok(ActionFilm {
+            gamma_delta: self.action_film_gamma.forward(&embedding)?.reshape((
+                batch,
+                self.config.hidden_dim,
+                1,
+                1,
+            ))?,
+            beta: self.action_film_beta.forward(&embedding)?.reshape((
+                batch,
+                self.config.hidden_dim,
+                1,
+                1,
+            ))?,
+        })
+    }
+
     /// Shared action-conditioning implementation. Full V4 training supplies
     /// the already-required canonical state so action conditioning, SIGReg,
     /// and the prediction objective reuse one autograd node.
@@ -858,10 +1058,13 @@ impl WorldModel {
         action_coords: &Tensor,
     ) -> Result<Tensor> {
         let b = state.dim(0)?;
-        if state.dims4()? != (b, self.config.hidden_dim, LATENT_GRID, LATENT_GRID) {
+        let latent_grid = self.config.latent_grid();
+        if state.dims4()? != (b, self.config.hidden_dim, latent_grid, latent_grid) {
             bail!(
-                "state must be Bx{}x{LATENT_GRID}x{LATENT_GRID}, got {:?}",
+                "state must be Bx{}x{}x{}, got {:?}",
                 self.config.hidden_dim,
+                latent_grid,
+                latent_grid,
                 state.dims()
             );
         }
@@ -953,23 +1156,24 @@ impl WorldModel {
             bail!("action_coords must have shape [B,2]");
         }
         let coords = action_coords.to_dtype(DType::F32)?;
+        let latent_grid = self.config.latent_grid();
         let x = coords.narrow(1, 0, 1)?.reshape((b, 1, 1, 1))?;
         let y = coords.narrow(1, 1, 1)?.reshape((b, 1, 1, 1))?;
-        let axis = Tensor::arange(0f32, LATENT_GRID as f32, coords.device())?
-            .affine(1.0 / (LATENT_GRID - 1) as f64, 0.0)?;
-        let grid_x = axis.reshape((1, 1, 1, LATENT_GRID))?;
-        let grid_y = axis.reshape((1, 1, LATENT_GRID, 1))?;
+        let axis = Tensor::arange(0f32, latent_grid as f32, coords.device())?
+            .affine(1.0 / (latent_grid - 1) as f64, 0.0)?;
+        let grid_x = axis.reshape((1, 1, 1, latent_grid))?;
+        let grid_y = axis.reshape((1, 1, latent_grid, 1))?;
         let dx = grid_x
             .broadcast_sub(&x)?
-            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+            .broadcast_as((b, 1, latent_grid, latent_grid))?;
         let dy = grid_y
             .broadcast_sub(&y)?
-            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+            .broadcast_as((b, 1, latent_grid, latent_grid))?;
         let active = actions
             .eq(6u32)?
             .to_dtype(DType::F32)?
             .reshape((b, 1, 1, 1))?
-            .broadcast_as((b, 1, LATENT_GRID, LATENT_GRID))?;
+            .broadcast_as((b, 1, latent_grid, latent_grid))?;
         let impulse = dx
             .sqr()?
             .add(&dy.sqr()?)?
@@ -1011,7 +1215,7 @@ impl WorldModel {
         actions: &Tensor,
         action_coords: &Tensor,
         goal_features: &Tensor,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+    ) -> Result<(Tensor, ActionFilm, Tensor, Option<Tensor>)> {
         let state = if self.config.warm_start_y {
             Some(self.encode_state(frames)?)
         } else {
@@ -1021,15 +1225,16 @@ impl WorldModel {
             Some(s) => self.add_action(s, actions, action_coords)?,
             None => self.encode_x(frames, actions, action_coords)?,
         };
+        let film = self.action_film(actions, x.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
-        Ok((x, goal_h, state))
+        Ok((x, film, goal_h, state))
     }
 
     fn heads(&self, y: &Tensor, goal_h: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let readout = if self.config.world_core_v4 {
             self.canonical_representation(y)?
         } else {
-            self.consumer_readout.forward(y)?
+            self.read_consumer(y)?
         };
         let event_in = Tensor::cat(&[&readout, goal_h], D::Minus1)?;
         let event_logits = self.event_head.forward(&event_in)?;
@@ -1044,7 +1249,7 @@ impl WorldModel {
         let readout = if self.config.world_core_v4 {
             self.canonical_representation(y)?
         } else {
-            self.consumer_readout.forward(y)?
+            self.read_consumer(y)?
         };
         let event_in = Tensor::cat(&[&readout, &goal_h], D::Minus1)?;
         self.event_head.forward(&event_in).map_err(Into::into)
@@ -1101,6 +1306,7 @@ impl WorldModel {
         x: &Tensor,
         y: &Tensor,
         z: &Tensor,
+        film: &ActionFilm,
         inner_steps: usize,
         sigma: f64,
         noise_seed_base: Option<u64>,
@@ -1127,14 +1333,14 @@ impl WorldModel {
                 Some(xy) => xy.add(&z)?,
                 None => x.add(&y)?.add(&z)?,
             };
-            z = self.block.forward(&inp)?;
+            z = self.block.forward(&inp, film)?;
         }
         let inp = if self.config.world_core_v4 {
             xy.expect("Full V4 x+y was prepared").add(&z)?
         } else {
             y.add(&z)?
         };
-        y = self.block.forward(&inp)?;
+        y = self.block.forward(&inp, film)?;
         Ok((y, z))
     }
 
@@ -1142,6 +1348,7 @@ impl WorldModel {
     fn run_latent_recursion(
         &self,
         x: &Tensor,
+        film: &ActionFilm,
         sigma: f64,
         noise_seed_base: Option<u64>,
         depth: RecursionDepth,
@@ -1182,6 +1389,7 @@ impl WorldModel {
                 x,
                 &y,
                 &z,
+                film,
                 depth.inner_steps,
                 sigma,
                 noise_seed_base,
@@ -1216,6 +1424,7 @@ impl WorldModel {
     fn run_recursion(
         &self,
         x: &Tensor,
+        film: &ActionFilm,
         goal_h: &Tensor,
         sigma: f64,
         noise_seed_base: Option<u64>,
@@ -1223,7 +1432,8 @@ impl WorldModel {
         y_init: Option<Tensor>,
         opts: RecursionOpts,
     ) -> Result<ForwardOutput> {
-        let latent = self.run_latent_recursion(x, sigma, noise_seed_base, depth, y_init, opts)?;
+        let latent =
+            self.run_latent_recursion(x, film, sigma, noise_seed_base, depth, y_init, opts)?;
         self.attach_heads(latent, goal_h)
     }
 
@@ -1259,7 +1469,7 @@ impl WorldModel {
         let readout = if self.config.world_core_v4 {
             self.canonical_representation(y)?
         } else {
-            self.consumer_readout.forward(y)?
+            self.read_consumer(y)?
         };
         self.q_head.forward(&readout).map_err(Into::into)
     }
@@ -1268,7 +1478,7 @@ impl WorldModel {
         let readout = if self.config.world_core_v4 {
             self.canonical_representation(y)?
         } else {
-            self.consumer_readout.forward(y)?
+            self.read_consumer(y)?
         };
         self.reliability_head.forward(&readout).map_err(Into::into)
     }
@@ -1305,8 +1515,9 @@ impl WorldModel {
     }
 
     /// Recover action identity and ACTION6 coordinates from a predicted latent
-    /// displacement. This head is available only in world-core-v2 and is
-    /// trained on factual, board-effect-bearing branches.
+    /// displacement. This head is available in world-core-v2 and the
+    /// foundation-v2 exact-decoder topology, and is trained only on factual,
+    /// board-effect-bearing branches.
     pub fn decode_action_displacement(&self, displacement: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, channels) = displacement.dims2()?;
         if channels != self.config.hidden_dim {
@@ -1318,11 +1529,10 @@ impl WorldModel {
         let action_decoder = self
             .action_decoder
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("action decoder requires world_core_v2"))?;
-        let coordinate_decoder = self
-            .coordinate_decoder
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("coordinate decoder requires world_core_v2"))?;
+            .ok_or_else(|| anyhow::anyhow!("action decoder requires an action-faithful model"))?;
+        let coordinate_decoder = self.coordinate_decoder.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("coordinate decoder requires an action-faithful model")
+        })?;
         Ok((
             action_decoder.forward(displacement)?,
             candle_nn::ops::sigmoid(&coordinate_decoder.forward(displacement)?)?,
@@ -1373,10 +1583,11 @@ impl WorldModel {
         z_noise_sigma: f64,
         noise_seed: Option<u64>,
     ) -> Result<ForwardOutput> {
-        let (x, goal_h, y_init) =
+        let (x, film, goal_h, y_init) =
             self.prepare_transition(frames, actions, action_coords, goal_features)?;
         self.run_recursion(
             &x,
+            &film,
             &goal_h,
             z_noise_sigma,
             noise_seed,
@@ -1401,6 +1612,7 @@ impl WorldModel {
         recursion: RecursionOpts,
     ) -> Result<ForwardOutput> {
         let x = self.add_action(cur_state, actions, action_coords)?;
+        let film = self.action_film(actions, cur_state.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
             Some(cur_state.clone())
@@ -1409,6 +1621,7 @@ impl WorldModel {
         };
         self.run_recursion(
             &x,
+            &film,
             &goal_h,
             z_noise_sigma,
             noise_seed,
@@ -1435,8 +1648,17 @@ impl WorldModel {
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
         let x = self.add_action(cur_state, actions, action_coords)?;
+        let film = self.action_film(actions, cur_state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
-        self.run_latent_recursion(&x, z_noise_sigma, noise_seed, depth, y_init, recursion)
+        self.run_latent_recursion(
+            &x,
+            &film,
+            z_noise_sigma,
+            noise_seed,
+            depth,
+            y_init,
+            recursion,
+        )
     }
 
     /// Full V4 training recursion with a caller-owned canonical current state.
@@ -1463,8 +1685,17 @@ impl WorldModel {
             actions,
             action_coords,
         )?;
+        let film = self.action_film(actions, cur_state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
-        self.run_latent_recursion(&x, z_noise_sigma, noise_seed, depth, y_init, recursion)
+        self.run_latent_recursion(
+            &x,
+            &film,
+            z_noise_sigma,
+            noise_seed,
+            depth,
+            y_init,
+            recursion,
+        )
     }
 
     /// Deterministic forward (no noise, no learned halting).
@@ -1496,10 +1727,11 @@ impl WorldModel {
         goal_features: &Tensor,
         outer_steps: usize,
     ) -> Result<ForwardOutput> {
-        let (x, goal_h, y_init) =
+        let (x, film, goal_h, y_init) =
             self.prepare_transition(frames, actions, action_coords, goal_features)?;
         self.run_recursion(
             &x,
+            &film,
             &goal_h,
             0.0,
             None,
@@ -1538,6 +1770,7 @@ impl WorldModel {
         depth: RecursionDepth,
     ) -> Result<ForwardOutput> {
         let x = self.add_action(state, actions, action_coords)?;
+        let film = self.action_film(actions, state.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
             Some(state.clone())
@@ -1546,6 +1779,7 @@ impl WorldModel {
         };
         self.run_recursion(
             &x,
+            &film,
             &goal_h,
             0.0,
             None,
@@ -1564,9 +1798,18 @@ impl WorldModel {
         depth: RecursionDepth,
     ) -> Result<Tensor> {
         let x = self.add_action(state, actions, action_coords)?;
+        let film = self.action_film(actions, state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         Ok(self
-            .run_latent_recursion(&x, 0.0, None, depth, y_init, RecursionOpts::training(true))?
+            .run_latent_recursion(
+                &x,
+                &film,
+                0.0,
+                None,
+                depth,
+                y_init,
+                RecursionOpts::training(true),
+            )?
             .y)
     }
 
@@ -1607,15 +1850,44 @@ impl WorldModel {
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
-        let (x, goal_h, y_init) =
+        let (x, film, goal_h, y_init) =
             self.prepare_transition(frames, actions, action_coords, goal_features)?;
-        self.forward_ptrm_prepared(&x, &goal_h, y_init, depth, ptrm)
+        self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
     }
 
-    /// PTRM from precomputed transition tensors (no frame encode).
+    /// Legacy PTRM from a precomputed action-conditioned tensor. Because this
+    /// seam does not receive action IDs, it retains identity FiLM.
     pub fn forward_ptrm_prepared(
         &self,
         x: &Tensor,
+        goal_h: &Tensor,
+        y_init: Option<Tensor>,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
+        let film = ActionFilm::neutral_like(x)?;
+        self.forward_ptrm_prepared_with_film(x, &film, goal_h, y_init, depth, ptrm)
+    }
+
+    /// Action-aware PTRM from precomputed transition tensors (no frame encode).
+    /// Foundation-v2 callers use this seam so every recurrence step receives FiLM.
+    pub fn forward_ptrm_prepared_with_actions(
+        &self,
+        x: &Tensor,
+        actions: &Tensor,
+        goal_h: &Tensor,
+        y_init: Option<Tensor>,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
+        let film = self.action_film(actions, x.dim(0)?)?;
+        self.forward_ptrm_prepared_with_film(x, &film, goal_h, y_init, depth, ptrm)
+    }
+
+    fn forward_ptrm_prepared_with_film(
+        &self,
+        x: &Tensor,
+        film: &ActionFilm,
         goal_h: &Tensor,
         y_init: Option<Tensor>,
         depth: RecursionDepth,
@@ -1627,7 +1899,7 @@ impl WorldModel {
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
-        let latent_trajectories = self.ptrm_latent_trajectories(x, y_init, depth, ptrm)?;
+        let latent_trajectories = self.ptrm_latent_trajectories(x, film, y_init, depth, ptrm)?;
         let mut trajectories = Vec::with_capacity(ptrm.k);
         let mut q_logits = Vec::with_capacity(ptrm.k);
         for latent in latent_trajectories {
@@ -1650,6 +1922,7 @@ impl WorldModel {
     fn ptrm_latent_trajectories(
         &self,
         x: &Tensor,
+        film: &ActionFilm,
         y_init: Option<Tensor>,
         depth: RecursionDepth,
         ptrm: PtrmConfig,
@@ -1669,6 +1942,7 @@ impl WorldModel {
                 .map(|s| s ^ (traj as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let out = self.run_latent_recursion(
                 x,
+                film,
                 sigma,
                 noise_base,
                 depth,
@@ -1697,8 +1971,9 @@ impl WorldModel {
             bail!("PTRM sigma must be finite and non-negative");
         }
         let x = self.add_action(state, actions, action_coords)?;
+        let film = self.action_film(actions, state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
-        self.ptrm_latent_trajectories(&x, y_init, depth, ptrm)?
+        self.ptrm_latent_trajectories(&x, &film, y_init, depth, ptrm)?
             .into_iter()
             .map(|trajectory| {
                 let q_logit = self.q_logit_from_y(&trajectory.y)?;
