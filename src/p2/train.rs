@@ -219,23 +219,40 @@ pub fn foundation_v2_gate_evaluation(
         (best, None) => best,
     };
     let collapse_floor = running_best_after.map(|best| best * 0.8);
-    let foreground_active = step >= 4_096;
+    // Absolute-quality gates get the same warmup grace as foreground
+    // reconstruction: before step 4096 the model cannot yet be expected to
+    // beat latent copy or show action sensitivity, so those gates are
+    // measured and logged but PASS by fiat. The collapse detector stays
+    // active from the first evaluation because it is relative to the run's
+    // own best.
+    let warmup_done = step >= 4_096;
+    let foreground_active = warmup_done;
     let gates = vec![
         FoundationV2GateResult {
             name: "positive_improvement".into(),
-            passed: metrics
-                .improvement_fraction
-                .is_some_and(|value| value > 0.0),
+            passed: !warmup_done
+                || metrics
+                    .improvement_fraction
+                    .is_some_and(|value| value > 0.0),
             measured: metrics.improvement_fraction,
-            threshold: "> 0".into(),
+            threshold: if warmup_done {
+                "> 0".into()
+            } else {
+                "warmup PASS until step 4096".into()
+            },
         },
         FoundationV2GateResult {
             name: "shuffled_action_ratio".into(),
-            passed: metrics
-                .shuffled_action_changed_pixel_ratio
-                .is_some_and(|value| value <= 0.95),
+            passed: !warmup_done
+                || metrics
+                    .shuffled_action_changed_pixel_ratio
+                    .is_some_and(|value| value <= 0.95),
             measured: metrics.shuffled_action_changed_pixel_ratio,
-            threshold: "<= 0.95".into(),
+            threshold: if warmup_done {
+                "<= 0.95".into()
+            } else {
+                "warmup PASS until step 4096".into()
+            },
         },
         FoundationV2GateResult {
             name: "foreground_reconstruction".into(),

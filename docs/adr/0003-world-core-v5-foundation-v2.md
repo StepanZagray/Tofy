@@ -109,11 +109,19 @@ logs PASS/FAIL to the report and a FAIL twice in a row aborts the run with a
 sealed diagnostic bundle:
 
 1. `improvement_fraction > 0` (predictor beats latent copy on changed
-   transitions).
-2. Shuffled-action changed-pixel ratio ≤ 0.95 (action sensitivity).
+   transitions) — enforced after step 4096; measured and logged from the
+   first evaluation.
+2. Shuffled-action changed-pixel ratio ≤ 0.95 (action sensitivity) —
+   enforced after step 4096; measured and logged from the first evaluation.
 3. Foreground reconstruction pixel accuracy (encoded next) ≥ 0.85 after step
    4096.
-4. One-step changed-exact within 20% of its running best (collapse detector).
+4. One-step changed-exact within 20% of its running best (collapse detector)
+   — active from the first evaluation, since it is relative to the run's own
+   best. Amendment 2026-08-25: gates 1–2 originally enforced from step 1024
+   and aborted the first launch at step 2048 with mid-training thresholds
+   applied to a warmup-phase model (changed-exact was already 0.071 at step
+   1024, above full-v4's final 0.034); absolute-quality gates now share
+   gate 3's warmup grace.
 
 ## 6. Evaluation fixes (all §2.6 bugs from the research doc)
 
