@@ -63,14 +63,14 @@ fn wsd_schedule_matches_every_boundary() {
     assert!((foundation_v2_wsd_learning_rate(total, total) - 1e-4).abs() < 1e-12);
 }
 
-fn metrics(improvement: f64) -> GateSupportMetrics {
+fn metrics(shuffled_ratio: f64) -> GateSupportMetrics {
     GateSupportMetrics {
         samples: 512,
         changed_transitions: 128,
         changed_pixels: 256,
         foreground_pixels: 512,
-        improvement_fraction: Some(improvement),
-        shuffled_action_changed_pixel_ratio: Some(0.9),
+        improvement_fraction: Some(-25.0),
+        shuffled_action_changed_pixel_ratio: Some(shuffled_ratio),
         foreground_reconstruction_accuracy: Some(0.9),
         one_step_changed_exact: Some(0.5),
         population_contract: "fixed test population".into(),
@@ -79,29 +79,50 @@ fn metrics(improvement: f64) -> GateSupportMetrics {
 
 #[test]
 fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
-    let pass = foundation_v2_gate_evaluation(4_096, metrics(0.1), Some(0.6));
+    let pass = foundation_v2_gate_evaluation(4_096, metrics(0.9), Some(0.6));
     assert!(pass.gates.iter().all(|gate| gate.passed));
+    // Latent-MSE improvement is diagnostic-only: deeply negative yet passing.
+    assert_eq!(pass.gates[0].name, "positive_improvement");
+    assert_eq!(pass.gates[0].measured, Some(-25.0));
 
-    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(-0.1), Some(0.6));
-    assert!(!first_fail.gates[0].passed);
+    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.97), Some(0.6));
+    assert!(first_fail.gates[0].passed);
+    assert!(!first_fail.gates[1].passed);
     assert!(!foundation_v2_gate_history_aborts(&[first_fail.clone()]));
 
-    let recovery = foundation_v2_gate_evaluation(6_144, metrics(0.1), Some(0.6));
+    let recovery = foundation_v2_gate_evaluation(6_144, metrics(0.9), Some(0.6));
     assert!(!foundation_v2_gate_history_aborts(&[
         first_fail.clone(),
         recovery.clone()
     ]));
 
-    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(-0.2), Some(0.6));
+    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(0.98), Some(0.6));
     assert!(!foundation_v2_gate_history_aborts(&[
         first_fail.clone(),
         recovery,
         second_fail.clone()
     ]));
-    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(-0.3), Some(0.6));
+    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(0.99), Some(0.6));
     assert!(foundation_v2_gate_history_aborts(&[
         first_fail,
         second_fail,
         consecutive
     ]));
+}
+
+#[test]
+fn absolute_gates_warm_up_and_foreground_enforces_at_8192() {
+    // Before 4096: shuffled-action gate passes by warmup fiat even when awful.
+    let early = foundation_v2_gate_evaluation(1_024, metrics(0.99), None);
+    assert!(early.gates[1].passed);
+    // 4096..8192: foreground below threshold still passes (warmup).
+    let mut mid_metrics = metrics(0.9);
+    mid_metrics.foreground_reconstruction_accuracy = Some(0.63);
+    let mid = foundation_v2_gate_evaluation(5_120, mid_metrics, Some(0.6));
+    assert!(mid.gates[2].passed);
+    // From 8192 the foreground threshold is enforced.
+    let mut late_metrics = metrics(0.9);
+    late_metrics.foreground_reconstruction_accuracy = Some(0.63);
+    let late = foundation_v2_gate_evaluation(8_192, late_metrics, Some(0.6));
+    assert!(!late.gates[2].passed);
 }
