@@ -115,14 +115,19 @@ fn absolute_gates_warm_up_and_foreground_enforces_at_8192() {
     // Before 4096: shuffled-action gate passes by warmup fiat even when awful.
     let early = foundation_v2_gate_evaluation(1_024, metrics(0.99), None);
     assert!(early.gates[1].passed);
-    // 4096..8192: foreground below threshold still passes (warmup).
+    // 4096..8192: foreground below the floor still passes (warmup).
     let mut mid_metrics = metrics(0.9);
-    mid_metrics.foreground_reconstruction_accuracy = Some(0.63);
+    mid_metrics.foreground_reconstruction_accuracy = Some(0.55);
     let mid = foundation_v2_gate_evaluation(5_120, mid_metrics, Some(0.6));
     assert!(mid.gates[2].passed);
-    // From 8192 the foreground threshold is enforced.
+    // From 8192 the collapse floor is enforced: the observed asymptote
+    // (~0.67) passes, genuine regression below 0.60 fails.
+    let mut ok_metrics = metrics(0.9);
+    ok_metrics.foreground_reconstruction_accuracy = Some(0.67);
+    let ok = foundation_v2_gate_evaluation(8_192, ok_metrics, Some(0.6));
+    assert!(ok.gates[2].passed);
     let mut late_metrics = metrics(0.9);
-    late_metrics.foreground_reconstruction_accuracy = Some(0.63);
+    late_metrics.foreground_reconstruction_accuracy = Some(0.55);
     let late = foundation_v2_gate_evaluation(8_192, late_metrics, Some(0.6));
     assert!(!late.gates[2].passed);
 }

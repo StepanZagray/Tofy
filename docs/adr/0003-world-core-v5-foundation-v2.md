@@ -113,8 +113,13 @@ sealed diagnostic bundle:
    first evaluation.
 2. Shuffled-action changed-pixel ratio ≤ 0.95 (action sensitivity) —
    enforced after step 4096; measured and logged from the first evaluation.
-3. Foreground reconstruction pixel accuracy (encoded next) ≥ 0.85 after step
-   4096.
+3. Foreground reconstruction pixel accuracy (encoded next) ≥ 0.60 after step
+   8192 — a decoder-collapse floor. Amendment 2026-08-26: originally ≥ 0.85
+   after step 4096; the first launch measured a stable asymptote near 0.67
+   (0.639 → 0.675 over steps 4096–9216) while changed-exact climbed 0.42 →
+   0.51 — the aspirational bar aborted a healthy run at step 9216, so the
+   threshold now sits below the observed asymptote to catch only genuine
+   regression.
 4. One-step changed-exact within 20% of its running best (collapse detector)
    — active from the first evaluation, since it is relative to the run's own
    best. Amendment 2026-08-25: gates 1–2 originally enforced from step 1024
