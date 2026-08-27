@@ -6,6 +6,7 @@ use tofy::p2::grounding::patch_tokens_to_pixels;
 use tofy::p2::model::{
     ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts, WorldModel, FRAME_SIDE,
 };
+use tofy::p2::model::zero_copy_bypass_gate;
 use tofy::p2::train::reinit_varmap_deterministic;
 
 fn exact_config(patch_size: usize) -> ModelConfig {
@@ -626,5 +627,287 @@ fn phase_a_capability_probe_reports_specific_gaps() -> Result<()> {
         pooled_prefix.reason.as_deref(),
         Some("requires the world-core-v4 recurrence prefix path")
     );
+    Ok(())
+}
+
+fn treatment_config() -> ModelConfig {
+    ModelConfig {
+        residual_y_update: true,
+        warm_start_y: true,
+        ..v5_config(4)
+    }
+}
+
+fn action6(device: &Device, x: f32, y: f32) -> Result<(Tensor, Tensor, Tensor)> {
+    Ok((
+        Tensor::from_vec(vec![6u32], (1,), device)?,
+        Tensor::from_vec(vec![x, y], (1, 2), device)?,
+        Tensor::zeros((1, 6), DType::F32, device)?,
+    ))
+}
+
+fn set_alpha(vars: &VarMap, value: f32) -> Result<()> {
+    let data = vars.data().lock().unwrap();
+    let var = data
+        .get("y_copy_bypass_alpha")
+        .expect("copy-bypass gate parameter exists");
+    var.set(&Tensor::full(value, var.shape().dims(), var.device())?)?;
+    Ok(())
+}
+
+#[test]
+fn copy_bypass_zero_gate_is_exact_latent_copy_for_any_finite_state() -> Result<()> {
+    let device = Device::Cpu;
+    let vars = VarMap::new();
+    let cfg = ModelConfig {
+        copy_bypass_gate: true,
+        ..treatment_config()
+    };
+    let model = WorldModel::new(cfg, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+    reinit_varmap_deterministic(&vars, 7)?;
+    zero_copy_bypass_gate(&vars)?;
+    // Deliberately non-unit-RMS: the zero-gate fixpoint must hold for any
+    // finite latent, not only encoder-manifold states.
+    let state = spatial_with_values(&device, &[(3, 5, 3.7), (10, 2, -8.0)])?;
+    let (actions, coords, goals) = action6(&device, 0.5, 0.5)?;
+    let out = model.forward_from_latent(&state, &actions, &coords, &goals)?;
+    assert!(max_abs_diff(&out.y, &state)? < 1e-7);
+    Ok(())
+}
+
+#[test]
+fn copy_bypass_alpha_one_reproduces_the_legacy_update() -> Result<()> {
+    let device = Device::Cpu;
+    let legacy_vars = VarMap::new();
+    let legacy = WorldModel::new(
+        treatment_config(),
+        VarBuilder::from_varmap(&legacy_vars, DType::F32, &device),
+    )?;
+    let gated_vars = VarMap::new();
+    let gated = WorldModel::new(
+        ModelConfig {
+            copy_bypass_gate: true,
+            ..treatment_config()
+        },
+        VarBuilder::from_varmap(&gated_vars, DType::F32, &device),
+    )?;
+    // Identical name-seeded weights in both models; only the gate differs.
+    reinit_varmap_deterministic(&legacy_vars, 11)?;
+    reinit_varmap_deterministic(&gated_vars, 11)?;
+    set_alpha(&gated_vars, 1.0)?;
+    let state = spatial_with_values(&device, &[(1, 1, 0.9), (7, 12, -0.4)])?;
+    let (actions, coords, goals) = action6(&device, 0.25, 0.75)?;
+    let legacy_out = legacy.forward_from_latent(&state, &actions, &coords, &goals)?;
+    let gated_out = gated.forward_from_latent(&state, &actions, &coords, &goals)?;
+    assert!(max_abs_diff(&legacy_out.y, &gated_out.y)? < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn copy_bypass_gate_receives_gradient_at_zero() -> Result<()> {
+    let device = Device::Cpu;
+    let vars = VarMap::new();
+    let model = WorldModel::new(
+        ModelConfig {
+            copy_bypass_gate: true,
+            ..treatment_config()
+        },
+        VarBuilder::from_varmap(&vars, DType::F32, &device),
+    )?;
+    reinit_varmap_deterministic(&vars, 13)?;
+    zero_copy_bypass_gate(&vars)?;
+    let state = spatial_with_values(&device, &[(2, 2, 1.0)])?;
+    let target = spatial_with_values(&device, &[(2, 3, 1.0)])?;
+    let (actions, coords, goals) = action6(&device, 0.1, 0.1)?;
+    let out = model.forward_from_latent(&state, &actions, &coords, &goals)?;
+    let loss = out.y.sub(&target)?.sqr()?.mean_all()?;
+    let grads = loss.backward()?;
+    let alpha_grad = {
+        let data = vars.data().lock().unwrap();
+        let alpha = data.get("y_copy_bypass_alpha").expect("gate exists");
+        grads
+            .get(alpha.as_tensor())
+            .expect("gate must receive a gradient")
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+    };
+    assert!(alpha_grad.is_finite() && alpha_grad > 0.0);
+    Ok(())
+}
+
+#[test]
+fn reinit_then_zero_helper_restores_the_zero_gate() -> Result<()> {
+    let device = Device::Cpu;
+    let vars = VarMap::new();
+    let _model = WorldModel::new(
+        ModelConfig {
+            copy_bypass_gate: true,
+            ..treatment_config()
+        },
+        VarBuilder::from_varmap(&vars, DType::F32, &device),
+    )?;
+    reinit_varmap_deterministic(&vars, 17)?;
+    zero_copy_bypass_gate(&vars)?;
+    let data = vars.data().lock().unwrap();
+    let alpha = data.get("y_copy_bypass_alpha").expect("gate exists");
+    assert_eq!(alpha.as_tensor().abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
+    Ok(())
+}
+
+#[test]
+fn copy_gate_bias_prior_starts_as_calibrated_copy() -> Result<()> {
+    let device = Device::Cpu;
+    let cfg = ModelConfig {
+        copy_gate_bias_prior: Some(0.02),
+        ..v5_config(4)
+    };
+    let model = WorldModel::new(
+        cfg,
+        VarBuilder::from_varmap(&VarMap::new(), DType::F32, &device),
+    )?;
+    // A zero latent reaches exactly the bias through the 1x1 gate conv.
+    let zero_latent = Tensor::zeros((1, 8, 16, 16), DType::F32, &device)?;
+    let gate = model.exact_copy_gate(&zero_latent)?;
+    let max_gate = gate.max_all()?.to_scalar::<f32>()?;
+    let min_gate = gate.min_all()?.to_scalar::<f32>()?;
+    assert!((max_gate - 0.02).abs() < 1e-4 && (min_gate - 0.02).abs() < 1e-4);
+    // Composition at init is a pure copy: zero false edits anywhere.
+    let current = frames(&device)?;
+    let composed = model.composed_gameplay_decode(&zero_latent, &current)?;
+    let gameplay = current
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    assert!(max_abs_diff(&composed, &gameplay)? == 0.0);
+    Ok(())
+}
+
+#[test]
+fn grid_scaled_impulse_sharpens_adjacent_action6_coordinates() -> Result<()> {
+    let device = Device::Cpu;
+    let build = |grid_scaled: bool, seed: u64| -> Result<(WorldModel, VarMap)> {
+        let vars = VarMap::new();
+        let model = WorldModel::new(
+            ModelConfig {
+                grid_scaled_action_impulse: grid_scaled,
+                ..treatment_config()
+            },
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&vars, seed)?;
+        Ok((model, vars))
+    };
+    let (legacy, _lv) = build(false, 19)?;
+    let (scaled, _sv) = build(true, 19)?;
+    let state = spatial_with_values(&device, &[(8, 8, 1.0)])?;
+    let goals = Tensor::zeros((1, 6), DType::F32, &device)?;
+    let one_cell = 1.0 / 15.0;
+    let sensitivity = |model: &WorldModel| -> Result<f32> {
+        let (actions, coords_a, _) = action6(&device, 0.5, 0.5)?;
+        let coords_b = Tensor::from_vec(vec![0.5 + one_cell, 0.5], (1, 2), &device)?;
+        let out_a = model.forward_from_latent(&state, &actions, &coords_a, &goals)?;
+        let out_b = model.forward_from_latent(&state, &actions, &coords_b, &goals)?;
+        max_abs_diff(&out_a.y, &out_b.y)
+    };
+    let legacy_sensitivity = sensitivity(&legacy)?;
+    let scaled_sensitivity = sensitivity(&scaled)?;
+    assert!(
+        scaled_sensitivity > legacy_sensitivity,
+        "grid-scaled impulse must increase one-cell coordinate sensitivity: \
+         legacy {legacy_sensitivity}, scaled {scaled_sensitivity}"
+    );
+    Ok(())
+}
+
+#[test]
+fn joint_copy_mixture_matches_two_candidate_rule_and_never_edits_below_half() -> Result<()> {
+    let device = Device::Cpu;
+    let model = WorldModel::new(
+        ModelConfig {
+            decode_composition: tofy::p2::grounding::DecodeComposition::JointCopyMixture,
+            ..v5_config(4)
+        },
+        VarBuilder::from_varmap(&VarMap::new(), DType::F32, &device),
+    )?;
+    let latent = spatial_with_values(&device, &[(0, 0, 2.0), (9, 9, -1.5), (15, 15, 0.7)])?;
+    let current = frames(&device)?;
+    let composed = model.composed_gameplay_decode(&latent, &current)?;
+    let logits = model.exact_gameplay_logits_detached(&latent)?;
+    let gate = model.exact_copy_gate(&latent)?;
+    let probs = candle_nn::ops::softmax(&logits, candle_core::D::Minus1)?;
+    let gameplay = current
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    let composed_v = composed.flatten_all()?.to_vec1::<u32>()?;
+    let current_v = gameplay.flatten_all()?.to_vec1::<u32>()?;
+    let gate_v = gate.flatten_all()?.to_vec1::<f32>()?;
+    let probs_v = probs.flatten_all()?.to_vec1::<f32>()?;
+    for (pixel, (&out, (&cur, &g))) in composed_v
+        .iter()
+        .zip(current_v.iter().zip(gate_v.iter()))
+        .enumerate()
+    {
+        let row = &probs_v[pixel * 16..(pixel + 1) * 16];
+        let (argmax, p_max) = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            });
+        let p_cur = row[cur as usize];
+        let expected = if g * p_max > (1.0 - g) + g * p_cur {
+            argmax as u32
+        } else {
+            cur
+        };
+        assert_eq!(out, expected, "pixel {pixel}: mixture MAP mismatch");
+        if g < 0.5 {
+            assert_eq!(out, cur, "pixel {pixel}: sub-0.5 gate must copy");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn positional_value_readout_is_reachable_from_config() -> Result<()> {
+    let device = Device::Cpu;
+    let build = |flag: bool| -> Result<Vec<String>> {
+        let vars = VarMap::new();
+        let _model = WorldModel::new(
+            ModelConfig {
+                positional_value_readout: flag,
+                ..v5_config(4)
+            },
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+        )?;
+        let data = vars.data().lock().unwrap();
+        Ok(data.keys().cloned().collect())
+    };
+    let with_flag = build(true)?;
+    let without_flag = build(false)?;
+    assert!(with_flag
+        .iter()
+        .any(|name| name.contains("position_value_embedding")));
+    assert!(!without_flag
+        .iter()
+        .any(|name| name.contains("position_value_embedding")));
+    Ok(())
+}
+
+#[test]
+fn treatment_config_validation_fails_closed() -> Result<()> {
+    let no_warm_start = ModelConfig {
+        copy_bypass_gate: true,
+        warm_start_y: false,
+        ..treatment_config()
+    };
+    assert!(no_warm_start.validate().is_err());
+    let bad_prior = ModelConfig {
+        copy_gate_bias_prior: Some(1.5),
+        ..v5_config(4)
+    };
+    assert!(bad_prior.validate().is_err());
     Ok(())
 }

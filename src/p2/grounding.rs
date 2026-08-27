@@ -37,6 +37,22 @@ pub struct PatchHistogramGrounding {
     latent_grid: usize,
 }
 
+/// Composition rule used by the deployed gameplay decode.
+///
+/// `JointCopyMixture` treats the gate as mixture weight over copy and the
+/// color distribution: `P(c) = (1-g)*1[c=current] + g*softmax(logits)_c`,
+/// decoded by MAP. Because the copy component always holds mass `1-g`, a
+/// sub-0.5 gate can never be overridden; the mixture differs from the hard
+/// gate one-directionally, converting above-0.5 gates with unconfident or
+/// current-favoring color evidence back into copies (fewer false edits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeComposition {
+    #[default]
+    LegacyHardGate,
+    JointCopyMixture,
+}
+
 /// Exact, position-preserving decoder used by Full V4. Each spatial token
 /// predicts the palette indices in its corresponding observation patch.
 /// The synthetic status row is removed before both loss and correctness are
@@ -46,29 +62,62 @@ pub struct ExactPatchGrounding {
     copy_gate: candle_nn::Conv2d,
     patch_side: usize,
     latent_grid: usize,
+    composition: DecodeComposition,
 }
 
 impl ExactPatchGrounding {
-    pub fn new(hidden_dim: usize, patch_side: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(
+        hidden_dim: usize,
+        patch_side: usize,
+        copy_gate_bias_prior: Option<f64>,
+        composition: DecodeComposition,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         ensure!(
             patch_side > 0 && FRAME_SIDE.is_multiple_of(patch_side),
             "exact grounding patch side must divide {FRAME_SIDE}"
         );
+        let gate_out = patch_side * patch_side;
+        let gate_vb = vb.pp("copy_gate");
+        // Mirror candle's conv2d initialization exactly, overriding only the
+        // bias when a changed-pixel prior is configured: composition then
+        // starts as calibrated copy instead of a ~50/50 gate. Checkpoint
+        // loading overrides init hints, so resumed runs are unaffected.
+        let copy_gate = {
+            let weight = gate_vb.get_with_hints(
+                (gate_out, hidden_dim, 1, 1),
+                "weight",
+                candle_nn::init::DEFAULT_KAIMING_NORMAL,
+            )?;
+            let bias_init = match copy_gate_bias_prior {
+                Some(prior) => {
+                    ensure!(
+                        prior.is_finite() && prior > 0.0 && prior < 1.0,
+                        "copy_gate_bias_prior must be a probability in (0, 1)"
+                    );
+                    candle_nn::Init::Const((prior / (1.0 - prior)).ln())
+                }
+                None => {
+                    let bound = 1.0 / (hidden_dim as f64).sqrt();
+                    candle_nn::Init::Uniform {
+                        lo: -bound,
+                        up: bound,
+                    }
+                }
+            };
+            let bias = gate_vb.get_with_hints(gate_out, "bias", bias_init)?;
+            candle_nn::Conv2d::new(weight, Some(bias), Default::default())
+        };
         Ok(Self {
             decoder: linear(
                 hidden_dim,
                 patch_side * patch_side * PALETTE_SIZE,
                 vb.pp("decoder"),
             )?,
-            copy_gate: candle_nn::conv2d(
-                hidden_dim,
-                patch_side * patch_side,
-                1,
-                Default::default(),
-                vb.pp("copy_gate"),
-            )?,
+            copy_gate,
             patch_side,
             latent_grid: FRAME_SIDE / patch_side,
+            composition,
         })
     }
 
@@ -171,16 +220,57 @@ impl ExactPatchGrounding {
         transition_correctness_from_gameplay(&predicted, &current, &target)
     }
 
+    /// Deployed discrete gameplay decode: detached logits and gate composed
+    /// per the configured [`DecodeComposition`]. Returns `B×63×64` U32 pixels.
+    pub fn compose_gameplay_pixels(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+    ) -> Result<Tensor> {
+        let batch = predicted.dim(0)?;
+        ensure!(
+            current_frames.dims4()? == (batch, 1, FRAME_SIDE, FRAME_SIDE),
+            "current frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}"
+        );
+        let logits = self.gameplay_logits(predicted)?.detach();
+        let current = current_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        let gate = self.copy_gate(predicted)?.detach();
+        match self.composition {
+            DecodeComposition::LegacyHardGate => {
+                let predicted_pixels = logits.argmax(D::Minus1)?;
+                gate.ge(0.5)?
+                    .where_cond(&predicted_pixels, &current)
+                    .map_err(Into::into)
+            }
+            DecodeComposition::JointCopyMixture => {
+                // MAP of the mixture reduces exactly to two candidates: the
+                // color argmax (mass g*p_max) and the current pixel (mass
+                // (1-g) + g*p_cur); no other color can exceed both.
+                let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
+                let predicted_pixels = logits.argmax(D::Minus1)?;
+                let p_max = probs.max(D::Minus1)?;
+                let p_cur = probs
+                    .gather(&current.unsqueeze(D::Minus1)?, D::Minus1)?
+                    .squeeze(D::Minus1)?;
+                let edit_score = gate.mul(&p_max)?;
+                let copy_score = gate.affine(-1.0, 1.0)?.add(&gate.mul(&p_cur)?)?;
+                edit_score
+                    .gt(&copy_score)?
+                    .where_cond(&predicted_pixels, &current)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
     pub fn composed_transition_correctness(
         &self,
         predicted: &Tensor,
         current_frames: &Tensor,
         next_frames: &Tensor,
     ) -> Result<Tensor> {
-        let predicted_pixels = self
-            .gameplay_logits(predicted)?
-            .detach()
-            .argmax(D::Minus1)?;
         let current = current_frames
             .narrow(2, 0, FRAME_SIDE - 1)?
             .squeeze(1)?
@@ -189,11 +279,7 @@ impl ExactPatchGrounding {
             .narrow(2, 0, FRAME_SIDE - 1)?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
-        let composed = self
-            .copy_gate(predicted)?
-            .detach()
-            .ge(0.5)?
-            .where_cond(&predicted_pixels, &current)?;
+        let composed = self.compose_gameplay_pixels(predicted, current_frames)?;
         transition_correctness_from_gameplay(&composed, &current, &target)
     }
 
@@ -497,8 +583,13 @@ mod tests {
     fn exact_grounding_ignores_status_only_differences() -> Result<()> {
         let device = candle_core::Device::Cpu;
         let vars = VarMap::new();
-        let head =
-            ExactPatchGrounding::new(4, 4, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        let head = ExactPatchGrounding::new(
+            4,
+            4,
+            None,
+            DecodeComposition::default(),
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+        )?;
         let latents = Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?;
         let clean = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
         let status = Tensor::ones((1, 1, 1, FRAME_SIDE), DType::U32, &device)?;

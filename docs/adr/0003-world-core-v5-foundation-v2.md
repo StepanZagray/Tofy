@@ -92,6 +92,51 @@
 - No model-quality claim follows from these corrections either; they carry
   compile, deterministic-generator, and objective tests only.
 
+## Preregistered model-treatment flags (2026-08-27, all default off)
+
+Five config-gated model treatments exist for the next matched runs. Every
+flag defaults to the exact legacy behavior, adds parameters only when
+enabled, is recorded in the training contract (a resume across arms fails
+closed), and is caller-owned under foundation-v2 validation. At most one
+treatment may be enabled per arm; the strongest allowed claim for any of
+them is "worth a matched test".
+
+1. `copy_bypass_gate` — copy-bypass gated outer update
+   `l = clamp(rms_norm(y + ny)); y' = y + a*(l - y)` with scalar `a`
+   zero-initialized. `a = 0` is exact latent copy for any finite state (the
+   diagnosed F1 failure: the trained run's one-step latent MSE was ~18.5x
+   latent copy); `a = 1` reproduces the legacy update bit-for-bit, so the
+   baseline is an interior point of the treatment. Evidence: local algebra
+   (machine-checkable identity properties) plus the zero-gate residual
+   surgery result (arXiv:2607.16568); post/pre-norm Transformer papers
+   motivate measurement only. First treatment to test.
+2. `copy_gate_bias_prior` — copy-gate bias initialized to `logit(p)` for an
+   expected changed-pixel rate `p`. Composition then starts as calibrated
+   copy. Counterargument on record: under the class-balanced gate BCE the
+   uninformative optimum is 0.5, so the init is transient; a preregistered
+   choice, not a prescribed default.
+3. `grid_scaled_action_impulse` — the ACTION6 Gaussian impulse exponent
+   becomes `-(grid-1)^2/2 * d^2` (sigma = one latent cell). The legacy
+   fixed `-16` was calibrated for the 8x8 grid; at patch 4 its neighbor-cell
+   contrast blurred from 0.72 to 0.93, a silent coordinate-conditioning
+   regression consistent with the 0.70 shuffled-action plateau.
+4. `decode_composition = joint_copy_mixture` — MAP of the mixture
+   `(1-g)*copy + g*softmax(colors)`. One-directional by construction: a
+   sub-0.5 gate can never be overridden (the copy component holds mass
+   `>= 1-g`); above-0.5 gates with unconfident or current-favoring colors
+   fall back to copy, reducing false edits. Deployable for frozen rescoring
+   without retraining; the corresponding mixture NLL training objective is
+   deferred and would need an objective-revision bump.
+5. `positional_value_readout` — native-grid canonical readout with
+   positional values (removes the proved 2x2 pooling alias; +57,344
+   parameters). New runs only: loading a checkpoint without the embeddings
+   fails closed. Not recommended for the same arm as `copy_bypass_gate`.
+
+Prerequisite control for every arm: the repaired H2 rollout path must
+demonstrably fire (>=16 fragments -> finite nonzero loss reaching the
+recurrent core; the sealed run trained with a rollout loss of exactly zero).
+This is enforced by `foundation_v2_rollout_floor_and_activation_premise`.
+
 ## 1. Data contract (fixes RC5, geometry pathology, transfer defects)
 
 1. **Mixed stream, no lessons.** One stationary-schedule mixture per batch,

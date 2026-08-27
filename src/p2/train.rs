@@ -15,9 +15,10 @@ use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
     SigregStatistic, TrainingRecipe,
 };
-use crate::p2::grounding::PatchGroundingMode;
+use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, zero_action_film_projections, ModelConfig, PtrmConfig,
+    flatten_latent, latent_mse_per_sample, zero_action_film_projections, zero_copy_bypass_gate,
+    ModelConfig, PtrmConfig,
     RecursionDepth, RecursionOpts, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
     PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
@@ -708,6 +709,24 @@ pub struct TrainConfig {
     pub promotion_metric: PromotionMetric,
     #[serde(default)]
     pub branch_learning: BranchLearningConfig,
+    /// Preregistered model-treatment arms for the next matched runs. All
+    /// default off; each is recorded in the training contract, and at most
+    /// one should be enabled per arm to preserve causal attribution.
+    /// Copy-bypass gated outer update (`y' = y + a*(l - y)`, `a` zero-init).
+    #[serde(default)]
+    pub copy_bypass_gate: bool,
+    /// Copy-gate bias initialized to `logit(p)` for this changed-pixel prior.
+    #[serde(default)]
+    pub copy_gate_bias_prior: Option<f64>,
+    /// Grid-scaled ACTION6 Gaussian impulse (sigma = one latent cell).
+    #[serde(default)]
+    pub grid_scaled_action_impulse: bool,
+    /// Deployed decode composition (legacy hard gate vs joint copy mixture).
+    #[serde(default)]
+    pub decode_composition: DecodeComposition,
+    /// Native-grid positional-value canonical readout (adds 57,344 params).
+    #[serde(default)]
+    pub positional_value_readout: bool,
 }
 
 pub fn effective_batch(cfg: &TrainConfig) -> usize {
@@ -887,6 +906,11 @@ impl Default for TrainConfig {
             split_ce_changed_budget: None,
             promotion_metric: PromotionMetric::ChangedExact,
             branch_learning: BranchLearningConfig::default(),
+            copy_bypass_gate: false,
+            copy_gate_bias_prior: None,
+            grid_scaled_action_impulse: false,
+            decode_composition: DecodeComposition::default(),
+            positional_value_readout: false,
         }
     }
 }
@@ -1035,6 +1059,11 @@ impl TrainConfig {
             world_core_v4: self.world_core_v4,
             world_core_v5: self.recipe == TrainingRecipe::FoundationV2,
             consumer_readout: self.consumer_readout,
+            copy_bypass_gate: self.copy_bypass_gate,
+            copy_gate_bias_prior: self.copy_gate_bias_prior,
+            grid_scaled_action_impulse: self.grid_scaled_action_impulse,
+            decode_composition: self.decode_composition,
+            positional_value_readout: self.positional_value_readout,
         }
     }
 
@@ -1169,6 +1198,14 @@ impl TrainConfig {
         canonical.pressure_updates = self.pressure_updates.clone();
         canonical.prefetch_batches = self.prefetch_batches;
         canonical.data_workers = self.data_workers;
+        // Preregistered model-treatment arms: caller-owned by design, recorded
+        // in the training contract so a resume across arms fails closed. At
+        // most one should be enabled per matched run.
+        canonical.copy_bypass_gate = self.copy_bypass_gate;
+        canonical.copy_gate_bias_prior = self.copy_gate_bias_prior;
+        canonical.grid_scaled_action_impulse = self.grid_scaled_action_impulse;
+        canonical.decode_composition = self.decode_composition;
+        canonical.positional_value_readout = self.positional_value_readout;
         if self != &canonical {
             bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
         }
@@ -1633,6 +1670,16 @@ struct TrainingContract {
     promotion_metric: PromotionMetric,
     #[serde(default)]
     branch_learning: BranchLearningConfig,
+    #[serde(default)]
+    copy_bypass_gate: bool,
+    #[serde(default)]
+    copy_gate_bias_prior: Option<f64>,
+    #[serde(default)]
+    grid_scaled_action_impulse: bool,
+    #[serde(default)]
+    decode_composition: DecodeComposition,
+    #[serde(default)]
+    positional_value_readout: bool,
     device: String,
     adam_beta1: f64,
     adam_beta2: f64,
@@ -1713,6 +1760,11 @@ impl From<&TrainConfig> for TrainingContract {
             split_ce_changed_budget: cfg.split_ce_changed_budget,
             promotion_metric: cfg.promotion_metric,
             branch_learning: cfg.branch_learning.clone(),
+            copy_bypass_gate: cfg.copy_bypass_gate,
+            copy_gate_bias_prior: cfg.copy_gate_bias_prior,
+            grid_scaled_action_impulse: cfg.grid_scaled_action_impulse,
+            decode_composition: cfg.decode_composition,
+            positional_value_readout: cfg.positional_value_readout,
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
@@ -6390,9 +6442,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .transpose()?;
     if resumed_from.is_none() {
         reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
-        // FiLM identity initialization is restored exactly once after fresh
-        // deterministic init. Checkpoint loads must retain learned projections.
+        // FiLM identity and copy-bypass zero initialization are restored
+        // exactly once after fresh deterministic init. Checkpoint loads must
+        // retain the learned values.
         zero_action_film_projections(&varmap)?;
+        zero_copy_bypass_gate(&varmap)?;
     }
     let mut ema = ModelEma::with_default_decay(&varmap)?;
     let mut state = if let Some(bundle) = &resumed_from {
@@ -9793,6 +9847,98 @@ mod tests {
         let err = train(&cfg).expect_err("missing optimizer state must reject resume");
         assert!(err.to_string().contains("checkpoint bundle is incomplete"));
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_rollout_floor_and_activation_premise() -> Result<()> {
+        // Papers-audit mandatory control: the imported run trained with
+        // rollout "enabled" but a mean rollout loss of exactly zero, so no
+        // architecture arm can be interpreted until this path demonstrably
+        // fires. Below the 16-fragment floor the loss must be exactly zero;
+        // at a full batch it must be finite, nonzero, and reach the
+        // recurrent core's parameters.
+        let device = Device::Cpu;
+        let mut cfg = TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, 23)?;
+
+        let small = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 128,
+                seed: 51,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            0.5,
+            0,
+            V5DataSplit::Train,
+        )?;
+        let (small_loss, small_fragments) =
+            foundation_v2_rollout_loss(&model, &small, &device)?;
+        assert!(small_fragments < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
+        assert_eq!(small_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?, 0.0);
+
+        let full = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 512,
+                seed: 52,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            0.5,
+            0,
+            V5DataSplit::Train,
+        )?;
+        let (loss, fragments) = foundation_v2_rollout_loss(&model, &full, &device)?;
+        assert!(fragments >= FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
+        let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        assert!(value.is_finite() && value > 0.0, "rollout loss {value}");
+        let grads = loss.backward()?;
+        let core_grad = {
+            let data = varmap.data().lock().unwrap();
+            let weight = data.get("block.c1.weight").expect("core weight exists");
+            grads
+                .get(weight.as_tensor())
+                .expect("rollout loss must reach the recurrent core")
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?
+        };
+        assert!(core_grad.is_finite() && core_grad > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn model_treatment_flags_are_contract_recorded_and_foundation_legal() -> Result<()> {
+        let mut cfg = TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        cfg.seed = 3;
+        cfg.physical_batch = 16;
+        cfg.copy_bypass_gate = true;
+        cfg.grid_scaled_action_impulse = true;
+        cfg.copy_gate_bias_prior = Some(0.02);
+        cfg.decode_composition = DecodeComposition::JointCopyMixture;
+        // Treatment arms are caller-owned: foundation validation accepts them.
+        cfg.validate()?;
+        let model_cfg = cfg.model_config();
+        assert!(model_cfg.copy_bypass_gate);
+        assert!(model_cfg.grid_scaled_action_impulse);
+        assert_eq!(model_cfg.copy_gate_bias_prior, Some(0.02));
+        assert_eq!(
+            model_cfg.decode_composition,
+            DecodeComposition::JointCopyMixture
+        );
+        // A resume across arms must fail closed: the contract differs.
+        let contract = TrainingContract::from(&cfg);
+        let mut control = cfg.clone();
+        control.copy_bypass_gate = false;
+        assert_ne!(contract, TrainingContract::from(&control));
         Ok(())
     }
 }

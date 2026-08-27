@@ -15,7 +15,8 @@ use crate::p2::consumer_readout::ConsumerReadout;
 use crate::p2::data::TransitionSample;
 use crate::p2::experiment::ConsumerReadoutTopology;
 use crate::p2::grounding::{
-    ExactPatchGrounding, PatchGroundingLoss, PatchGroundingMode, PatchHistogramGrounding,
+    DecodeComposition, ExactPatchGrounding, PatchGroundingLoss, PatchGroundingMode,
+    PatchHistogramGrounding,
 };
 use crate::p2::representation::RepresentationSeam;
 
@@ -142,6 +143,35 @@ pub struct ModelConfig {
     /// Readout used only by Q/event/reliability planning heads.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
+    /// Copy-bypass gated outer update: the legacy candidate
+    /// `l = clamp(rms_norm(y + ny))` is interpolated as `y' = y + a*(l - y)`
+    /// with a scalar gate `a` initialized to zero. `a = 0` is exact latent
+    /// copy for any finite state; `a = 1` reproduces the legacy update
+    /// bit-for-bit, so the treatment contains the baseline as an interior
+    /// point. Requires `residual_y_update && warm_start_y`.
+    #[serde(default)]
+    pub copy_bypass_gate: bool,
+    /// Initialize the copy-gate bias to `logit(p)` for this expected
+    /// changed-pixel rate so composition starts as calibrated copy.
+    /// `None` keeps candle's default uniform bias (a ~50/50 gate). Note the
+    /// counterargument: under the class-balanced gate BCE the uninformative
+    /// optimum is 0.5, so a negative bias is transient and is a
+    /// preregistered choice, not a prescribed default.
+    #[serde(default)]
+    pub copy_gate_bias_prior: Option<f64>,
+    /// Scale the ACTION6 Gaussian impulse to the latent grid (sigma = one
+    /// cell) instead of fixed normalized units; the fixed -16 exponent
+    /// blurred neighbor-cell contrast from 0.72 to 0.93 under patch 4.
+    #[serde(default)]
+    pub grid_scaled_action_impulse: bool,
+    /// Composition rule for the deployed gameplay decode.
+    #[serde(default)]
+    pub decode_composition: DecodeComposition,
+    /// Native-grid positional-value canonical readout. New-run only: enabling
+    /// adds position-value embeddings, so loading a checkpoint without them
+    /// fails closed.
+    #[serde(default)]
+    pub positional_value_readout: bool,
 }
 
 fn default_sigreg_projector_dim() -> usize {
@@ -180,6 +210,11 @@ impl Default for ModelConfig {
             world_core_v4: false,
             world_core_v5: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
+            copy_bypass_gate: false,
+            copy_gate_bias_prior: None,
+            grid_scaled_action_impulse: false,
+            decode_composition: DecodeComposition::default(),
+            positional_value_readout: false,
         }
     }
 }
@@ -226,6 +261,17 @@ impl ModelConfig {
         }
         if self.sigreg_projector && self.sigreg_projector_dim < 2 {
             bail!("sigreg_projector_dim must be >= 2 when the projector is enabled");
+        }
+        if self.copy_bypass_gate && !(self.residual_y_update && self.warm_start_y) {
+            bail!(
+                "copy_bypass_gate requires residual_y_update and warm_start_y: \
+                 the zero-gate fixpoint must be the warm-started current state"
+            );
+        }
+        if let Some(prior) = self.copy_gate_bias_prior {
+            if !(prior.is_finite() && prior > 0.0 && prior < 1.0) {
+                bail!("copy_gate_bias_prior must be a probability in (0, 1), got {prior}");
+            }
         }
         if self.world_core_v3 && !self.world_core_v2 {
             bail!("world_core_v3 requires the world_core_v2 base topology");
@@ -308,6 +354,22 @@ pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
     }
     if matched != 4 {
         bail!("expected four action FiLM parameters, found {matched}");
+    }
+    Ok(())
+}
+
+/// Restore the copy-bypass gate's zero initialization after any generic
+/// model-wide reinitializer (which xavier-initializes every non-bias tensor).
+/// A no-op when the gate is absent; foundation-v2 training calls this next to
+/// [`zero_action_film_projections`].
+pub fn zero_copy_bypass_gate(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.ends_with("y_copy_bypass_alpha"))
+    {
+        var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
+            .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
     }
     Ok(())
 }
@@ -604,6 +666,8 @@ pub struct WorldModel {
     spatial_action_proj: Option<Conv2d>,
     goal_proj: Linear,
     block: GridResidualBlock,
+    /// Scalar copy-bypass gate `a` (zero-init) when `copy_bypass_gate` is on.
+    y_copy_bypass_alpha: Option<Tensor>,
     event_head: Linear,
     /// PTRM trajectory ranking score.
     q_head: Linear,
@@ -624,7 +688,8 @@ pub struct WorldModel {
 
 impl WorldModel {
     pub fn new(cfg: ModelConfig, vb: VarBuilder) -> Result<Self> {
-        Self::new_with_positional_value_readout(cfg, false, vb)
+        let positional = cfg.positional_value_readout;
+        Self::new_with_positional_value_readout(cfg, positional, vb)
     }
 
     /// Build with position-aware readout values. The default constructor keeps
@@ -696,6 +761,19 @@ impl WorldModel {
             spatial_action_proj,
             goal_proj: linear(cfg.goal_dim, cfg.hidden_dim, vb.pp("goal_proj"))?,
             block: GridResidualBlock::new(cfg.hidden_dim, vb.pp("block"))?,
+            // Created only when the flag is on so default-off checkpoints keep
+            // their exact parameter set. No ".weight" suffix: the tiny gate
+            // must route to AdamW, never Muon.
+            y_copy_bypass_alpha: cfg
+                .copy_bypass_gate
+                .then(|| {
+                    vb.get_with_hints(
+                        (1usize, 1usize, 1usize, 1usize),
+                        "y_copy_bypass_alpha",
+                        candle_nn::Init::Const(0.0),
+                    )
+                })
+                .transpose()?,
             event_head: linear(cfg.hidden_dim * 2, cfg.num_events, vb.pp("event_head"))?,
             q_head: linear(cfg.hidden_dim, 1, vb.pp("q_head"))?,
             reliability_head: linear(cfg.hidden_dim, 1, vb.pp("reliability_head"))?,
@@ -726,6 +804,8 @@ impl WorldModel {
                     ExactPatchGrounding::new(
                         cfg.hidden_dim,
                         cfg.patch_size,
+                        cfg.copy_gate_bias_prior,
+                        cfg.decode_composition,
                         vb.pp("exact_grounding_head"),
                     )
                 })
@@ -795,29 +875,17 @@ impl WorldModel {
             .copy_gate_logits(predicted)
     }
 
-    /// Discrete gameplay decode used by evaluation. The sigmoid copy gate is
-    /// thresholded at 0.5, then composes `gate*prediction + (1-gate)*current`.
+    /// Discrete gameplay decode used by evaluation, composed per the
+    /// configured [`DecodeComposition`] (legacy hard gate by default).
     pub fn composed_gameplay_decode(
         &self,
         predicted: &Tensor,
         current_frames: &Tensor,
     ) -> Result<Tensor> {
-        let batch = predicted.dim(0)?;
-        if current_frames.dims4()? != (batch, 1, FRAME_SIDE, FRAME_SIDE) {
-            bail!("current frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}");
-        }
-        let predicted_pixels = self
-            .exact_gameplay_logits_detached(predicted)?
-            .argmax(D::Minus1)?;
-        let current_pixels = current_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
-            .squeeze(1)?
-            .to_dtype(DType::U32)?;
-        self.exact_copy_gate(predicted)?
-            .detach()
-            .ge(0.5)?
-            .where_cond(&predicted_pixels, &current_pixels)
-            .map_err(Into::into)
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("composed decode requires world-core-v4"))?
+            .compose_gameplay_pixels(predicted, current_frames)
     }
 
     /// Compatibility seam for observer labels. This intentionally uses the
@@ -1234,10 +1302,19 @@ impl WorldModel {
             .to_dtype(DType::F32)?
             .reshape((b, 1, 1, 1))?
             .broadcast_as((b, 1, latent_grid, latent_grid))?;
+        // Legacy -16 is fixed in normalized units (sigma ~0.18, ~11 board
+        // pixels): sharp on the 8x8 grid but nearly flat over a +-2-cell
+        // neighborhood at patch 4. Grid scaling pins sigma to one latent
+        // cell: exponent -(d_cells^2)/2 = -((grid-1)^2/2)*(dx^2+dy^2).
+        let impulse_coeff = if self.config.grid_scaled_action_impulse {
+            -(((latent_grid - 1) * (latent_grid - 1)) as f64) / 2.0
+        } else {
+            -16.0
+        };
         let impulse = dx
             .sqr()?
             .add(&dy.sqr()?)?
-            .affine(-16.0, 0.0)?
+            .affine(impulse_coeff, 0.0)?
             .exp()?
             .broadcast_mul(&active)?;
         let dx = dx.broadcast_mul(&active)?;
@@ -1455,12 +1532,18 @@ impl WorldModel {
                 noise_seed_base,
                 &mut noise_counter,
             )?;
-            y = if self.config.residual_y_update {
+            let candidate = if self.config.residual_y_update {
                 rms_norm_latent(&y.add(&ny)?)?
             } else {
                 rms_norm_latent(&ny)?
             };
-            y = y.clamp(-32.0, 32.0)?;
+            let candidate = candidate.clamp(-32.0, 32.0)?;
+            y = match &self.y_copy_bypass_alpha {
+                // y' = y + a*(l - y): a=0 is exact latent copy for any
+                // finite state, a=1 reproduces the legacy update exactly.
+                Some(alpha) => y.add(&candidate.sub(&y)?.broadcast_mul(alpha)?)?,
+                None => candidate,
+            };
             z = nz;
             if let Some(y_before) = y_before {
                 probes.push(Self::probe_step(&y_before, &y, outer_idx)?);

@@ -10,7 +10,7 @@ use crate::p2::arc3_live::{
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
-use crate::p2::grounding::PatchGroundingMode;
+use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{
@@ -344,6 +344,32 @@ pub struct P2TrainArgs {
     /// preserves the historical changed-pixel-only selection rule.
     #[arg(long, value_enum, default_value_t = PromotionMetric::ChangedExact)]
     pub promotion_metric: PromotionMetric,
+
+    /// Preregistered model treatment: copy-bypass gated outer update
+    /// (`y' = y + a*(l - y)`, scalar `a` zero-initialized; exact copy at
+    /// init, legacy update at a=1). Enable at most one treatment per arm.
+    #[arg(long, default_value_t = false)]
+    pub copy_bypass_gate: bool,
+
+    /// Preregistered model treatment: initialize the copy-gate bias to
+    /// logit(p) for this expected changed-pixel rate in (0,1).
+    #[arg(long)]
+    pub copy_gate_bias_prior: Option<f64>,
+
+    /// Preregistered model treatment: scale the ACTION6 Gaussian impulse to
+    /// the latent grid (sigma = one cell) instead of fixed normalized units.
+    #[arg(long, default_value_t = false)]
+    pub grid_scaled_action_impulse: bool,
+
+    /// Deployed decode composition. `joint-copy-mixture` converts above-0.5
+    /// gates with unconfident colors back into copies (fewer false edits).
+    #[arg(long, value_enum, default_value_t = DecodeComposition::LegacyHardGate)]
+    pub decode_composition: DecodeComposition,
+
+    /// Preregistered model treatment: native-grid positional-value canonical
+    /// readout (adds 57,344 parameters; new runs only).
+    #[arg(long, default_value_t = false)]
+    pub positional_value_readout: bool,
 }
 
 impl P2TrainArgs {
@@ -479,6 +505,11 @@ impl P2TrainArgs {
                     }),
                 displacement_norm_floor: self.displacement_norm_floor,
             },
+            copy_bypass_gate: self.copy_bypass_gate,
+            copy_gate_bias_prior: self.copy_gate_bias_prior,
+            grid_scaled_action_impulse: self.grid_scaled_action_impulse,
+            decode_composition: self.decode_composition,
+            positional_value_readout: self.positional_value_readout,
         };
         if self.recipe == TrainingRecipe::FullV4 {
             cfg.apply_full_v4_recipe();
