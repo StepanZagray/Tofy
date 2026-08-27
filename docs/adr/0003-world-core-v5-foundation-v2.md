@@ -105,26 +105,40 @@ them is "worth a matched test".
    `l = clamp(rms_norm(y + ny)); y' = y + a*(l - y)` with scalar `a`
    zero-initialized. `a = 0` is exact latent copy for any finite state (the
    diagnosed F1 failure: the trained run's one-step latent MSE was ~18.5x
-   latent copy); `a = 1` reproduces the legacy update bit-for-bit, so the
-   baseline is an interior point of the treatment. Evidence: local algebra
+   latent copy); `a = 1` reproduces the legacy update algebraically exactly
+   (verified to 1e-6 in f32; the flag-off baseline arm is the bit-identical
+   comparator), so the baseline is an interior point of the treatment. The
+   interpolation is re-clamped to the legacy activation envelope, and the
+   uniform AdamW weight decay drifts the unconstrained gate toward its own
+   copy-null; both are recorded interpretation caveats. Evidence: local algebra
    (machine-checkable identity properties) plus the zero-gate residual
    surgery result (arXiv:2607.16568); post/pre-norm Transformer papers
    motivate measurement only. First treatment to test.
 2. `copy_gate_bias_prior` — copy-gate bias initialized to `logit(p)` for an
-   expected changed-pixel rate `p`. Composition then starts as calibrated
-   copy. Counterargument on record: under the class-balanced gate BCE the
-   uninformative optimum is 0.5, so the init is transient; a preregistered
-   choice, not a prescribed default.
+   expected changed-pixel rate `p` (exact on a zero latent; approximate on
+   real latents, whose kaiming-normal gate weights perturb the logit).
+   Fresh-init training restores the prior after the generic reinitializer,
+   which zeroes every bias. Evidence: preregistered-engineering-choice, and
+   a recorded counterargument only: the papers review argued a neutral zero
+   bias is correct under the class-balanced gate BCE (uninformative optimum
+   0.5) and that a negative bias risks re-introducing saturation. No source
+   argued for this knob; it stays optional and unscheduled.
 3. `grid_scaled_action_impulse` — the ACTION6 Gaussian impulse exponent
    becomes `-(grid-1)^2/2 * d^2` (sigma = one latent cell). The legacy
    fixed `-16` was calibrated for the 8x8 grid; at patch 4 its neighbor-cell
    contrast blurred from 0.72 to 0.93, a silent coordinate-conditioning
-   regression consistent with the 0.70 shuffled-action plateau.
+   regression consistent with the 0.70 shuffled-action plateau. Evidence:
+   proved-local (the lattice algebra was derived and independently
+   re-verified in review; provenance in the research run's
+   model-improvements-fable-core-math finding) plus
+   preregistered-engineering-choice for sigma = 1 cell.
 4. `decode_composition = joint_copy_mixture` — MAP of the mixture
    `(1-g)*copy + g*softmax(colors)`. One-directional by construction: a
    sub-0.5 gate can never be overridden (the copy component holds mass
    `>= 1-g`); above-0.5 gates with unconfident or current-favoring colors
-   fall back to copy, reducing false edits. Deployable for frozen rescoring
+   fall back to copy, so false edits are non-increasing by construction
+   (the symmetric risk is suppressing true edits; net benefit is empirical).
+   Deployable for frozen rescoring
    without retraining; the corresponding mixture NLL training objective is
    deferred and would need an objective-revision bump.
 5. `positional_value_readout` — native-grid canonical readout with
@@ -135,7 +149,12 @@ them is "worth a matched test".
 Prerequisite control for every arm: the repaired H2 rollout path must
 demonstrably fire (>=16 fragments -> finite nonzero loss reaching the
 recurrent core; the sealed run trained with a rollout loss of exactly zero).
-This is enforced by `foundation_v2_rollout_floor_and_activation_premise`.
+`foundation_v2_rollout_floor_and_activation_premise` checks this at test
+time; it is not a runtime launch gate, so the launch preflight must verify
+a nonzero realized rollout loss on the actual batch size before a campaign.
+The one-treatment-per-arm rule is enforced at validation: enabling more
+than one treatment fails closed unless `allow_multi_treatment_arm`
+explicitly waives single-factor attribution.
 
 ## 1. Data contract (fixes RC5, geometry pathology, transfer defects)
 

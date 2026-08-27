@@ -17,8 +17,8 @@ use crate::p2::experiment::{
 };
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, zero_action_film_projections, zero_copy_bypass_gate,
-    ModelConfig, PtrmConfig,
+    flatten_latent, latent_mse_per_sample, restore_copy_gate_bias_prior,
+    zero_action_film_projections, zero_copy_bypass_gate, ModelConfig, PtrmConfig,
     RecursionDepth, RecursionOpts, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
     PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
@@ -727,6 +727,11 @@ pub struct TrainConfig {
     /// Native-grid positional-value canonical readout (adds 57,344 params).
     #[serde(default)]
     pub positional_value_readout: bool,
+    /// Explicit acknowledgement that this run intentionally enables more than
+    /// one model treatment, giving up single-factor causal attribution.
+    /// Without it, foundation-v2 validation rejects multi-treatment arms.
+    #[serde(default)]
+    pub allow_multi_treatment_arm: bool,
 }
 
 pub fn effective_batch(cfg: &TrainConfig) -> usize {
@@ -911,6 +916,7 @@ impl Default for TrainConfig {
             grid_scaled_action_impulse: false,
             decode_composition: DecodeComposition::default(),
             positional_value_readout: false,
+            allow_multi_treatment_arm: false,
         }
     }
 }
@@ -1206,8 +1212,21 @@ impl TrainConfig {
         canonical.grid_scaled_action_impulse = self.grid_scaled_action_impulse;
         canonical.decode_composition = self.decode_composition;
         canonical.positional_value_readout = self.positional_value_readout;
+        canonical.allow_multi_treatment_arm = self.allow_multi_treatment_arm;
         if self != &canonical {
             bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
+        }
+        let enabled_treatments = usize::from(self.copy_bypass_gate)
+            + usize::from(self.copy_gate_bias_prior.is_some())
+            + usize::from(self.grid_scaled_action_impulse)
+            + usize::from(self.decode_composition != DecodeComposition::LegacyHardGate)
+            + usize::from(self.positional_value_readout);
+        if enabled_treatments > 1 && !self.allow_multi_treatment_arm {
+            bail!(
+                "{enabled_treatments} model treatments are enabled; single-factor \
+                 attribution requires one per arm (set allow_multi_treatment_arm \
+                 to intentionally give that up)"
+            );
         }
         if self.physical_batch < crate::p2::data::FACTUAL_BRANCHES_PER_GROUP {
             bail!(
@@ -6442,11 +6461,14 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .transpose()?;
     if resumed_from.is_none() {
         reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
-        // FiLM identity and copy-bypass zero initialization are restored
-        // exactly once after fresh deterministic init. Checkpoint loads must
-        // retain the learned values.
+        // FiLM identity, copy-bypass zero, and gate-bias-prior initialization
+        // are restored exactly once after fresh deterministic init (the
+        // reinitializer zeroes every bias, which would silently turn the
+        // configured prior into a 50/50 gate). Checkpoint loads must retain
+        // the learned values.
         zero_action_film_projections(&varmap)?;
         zero_copy_bypass_gate(&varmap)?;
+        restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
     }
     let mut ema = ModelEma::with_default_decay(&varmap)?;
     let mut state = if let Some(bundle) = &resumed_from {
@@ -6853,6 +6875,10 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         if cfg.world_core_v3 {
             zero_v3_spatial_residual(&varmap)?;
         }
+        // Treatment initializations survive the generic reinit on every
+        // fresh-init path, not only foundation-v2.
+        zero_copy_bypass_gate(&varmap)?;
+        restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
         TrainerState {
             schema: TRAINER_STATE_SCHEMA.into(),
             contract: TrainingContract::from(cfg),
@@ -9924,7 +9950,9 @@ mod tests {
         cfg.grid_scaled_action_impulse = true;
         cfg.copy_gate_bias_prior = Some(0.02);
         cfg.decode_composition = DecodeComposition::JointCopyMixture;
-        // Treatment arms are caller-owned: foundation validation accepts them.
+        // Multi-treatment arms need the explicit attribution waiver.
+        assert!(cfg.validate().is_err());
+        cfg.allow_multi_treatment_arm = true;
         cfg.validate()?;
         let model_cfg = cfg.model_config();
         assert!(model_cfg.copy_bypass_gate);

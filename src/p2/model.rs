@@ -146,9 +146,11 @@ pub struct ModelConfig {
     /// Copy-bypass gated outer update: the legacy candidate
     /// `l = clamp(rms_norm(y + ny))` is interpolated as `y' = y + a*(l - y)`
     /// with a scalar gate `a` initialized to zero. `a = 0` is exact latent
-    /// copy for any finite state; `a = 1` reproduces the legacy update
-    /// bit-for-bit, so the treatment contains the baseline as an interior
-    /// point. Requires `residual_y_update && warm_start_y`.
+    /// copy for any state in the clamp envelope; `a = 1` reproduces the
+    /// legacy update algebraically (tested to 1e-6 in f32), so the treatment
+    /// contains the baseline as an interior point. The interpolation is
+    /// re-clamped to the legacy envelope. Requires
+    /// `residual_y_update && warm_start_y`.
     #[serde(default)]
     pub copy_bypass_gate: bool,
     /// Initialize the copy-gate bias to `logit(p)` for this expected
@@ -273,6 +275,14 @@ impl ModelConfig {
                 bail!("copy_gate_bias_prior must be a probability in (0, 1), got {prior}");
             }
         }
+        if self.positional_value_readout
+            && self.consumer_readout != ConsumerReadoutTopology::SpatialQuery
+        {
+            bail!(
+                "positional_value_readout requires the SpatialQuery consumer readout; \
+                 the GlobalMean topology would silently ignore it"
+            );
+        }
         if self.world_core_v3 && !self.world_core_v2 {
             bail!("world_core_v3 requires the world_core_v2 base topology");
         }
@@ -360,8 +370,8 @@ pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
 
 /// Restore the copy-bypass gate's zero initialization after any generic
 /// model-wide reinitializer (which xavier-initializes every non-bias tensor).
-/// A no-op when the gate is absent; foundation-v2 training calls this next to
-/// [`zero_action_film_projections`].
+/// A no-op when the gate is absent; every fresh-init training path calls this
+/// next to [`zero_action_film_projections`].
 pub fn zero_copy_bypass_gate(varmap: &VarMap) -> Result<()> {
     let data = varmap.data().lock().unwrap();
     for (name, var) in data
@@ -370,6 +380,35 @@ pub fn zero_copy_bypass_gate(varmap: &VarMap) -> Result<()> {
     {
         var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
             .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Restore the configured copy-gate bias prior after a generic reinitializer.
+/// The reinitializer zeroes every `*bias` tensor, which would silently turn
+/// the calibrated-copy prior into a 50/50 gate and degenerate the treatment
+/// arm into its control. Must be called on every fresh-init path when the
+/// prior is configured; fails loudly if the gate tensor is absent.
+pub fn restore_copy_gate_bias_prior(varmap: &VarMap, prior: Option<f64>) -> Result<()> {
+    let Some(prior) = prior else {
+        return Ok(());
+    };
+    if !(prior.is_finite() && prior > 0.0 && prior < 1.0) {
+        bail!("copy_gate_bias_prior must be a probability in (0, 1), got {prior}");
+    }
+    let logit = ((prior / (1.0 - prior)).ln()) as f32;
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.ends_with("copy_gate.bias"))
+    {
+        var.set(&Tensor::full(logit, var.shape().dims(), var.device())?)
+            .map_err(|error| anyhow::anyhow!("restore {name}: {error}"))?;
+        matched += 1;
+    }
+    if matched == 0 {
+        bail!("copy_gate_bias_prior is configured but no copy-gate bias tensor exists");
     }
     Ok(())
 }
@@ -1539,9 +1578,14 @@ impl WorldModel {
             };
             let candidate = candidate.clamp(-32.0, 32.0)?;
             y = match &self.y_copy_bypass_alpha {
-                // y' = y + a*(l - y): a=0 is exact latent copy for any
-                // finite state, a=1 reproduces the legacy update exactly.
-                Some(alpha) => y.add(&candidate.sub(&y)?.broadcast_mul(alpha)?)?,
+                // y' = y + a*(l - y): a=0 is exact latent copy for any state
+                // inside the clamp envelope; a=1 reproduces the legacy update
+                // algebraically (tested to 1e-6 in f32). The gate is
+                // unconstrained, so the interpolation is re-clamped to keep
+                // the legacy activation envelope even if a leaves [0, 1].
+                Some(alpha) => y
+                    .add(&candidate.sub(&y)?.broadcast_mul(alpha)?)?
+                    .clamp(-32.0, 32.0)?,
                 None => candidate,
             };
             z = nz;

@@ -370,6 +370,11 @@ pub struct P2TrainArgs {
     /// readout (adds 57,344 parameters; new runs only).
     #[arg(long, default_value_t = false)]
     pub positional_value_readout: bool,
+
+    /// Intentionally enable more than one model treatment in this run,
+    /// giving up single-factor causal attribution.
+    #[arg(long, default_value_t = false)]
+    pub allow_multi_treatment_arm: bool,
 }
 
 impl P2TrainArgs {
@@ -510,6 +515,7 @@ impl P2TrainArgs {
             grid_scaled_action_impulse: self.grid_scaled_action_impulse,
             decode_composition: self.decode_composition,
             positional_value_readout: self.positional_value_readout,
+            allow_multi_treatment_arm: self.allow_multi_treatment_arm,
         };
         if self.recipe == TrainingRecipe::FullV4 {
             cfg.apply_full_v4_recipe();

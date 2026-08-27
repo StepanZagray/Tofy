@@ -6,7 +6,7 @@ use tofy::p2::grounding::patch_tokens_to_pixels;
 use tofy::p2::model::{
     ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts, WorldModel, FRAME_SIDE,
 };
-use tofy::p2::model::zero_copy_bypass_gate;
+use tofy::p2::model::{restore_copy_gate_bias_prior, zero_copy_bypass_gate};
 use tofy::p2::train::reinit_varmap_deterministic;
 
 fn exact_config(patch_size: usize) -> ModelConfig {
@@ -762,10 +762,12 @@ fn copy_gate_bias_prior_starts_as_calibrated_copy() -> Result<()> {
         copy_gate_bias_prior: Some(0.02),
         ..v5_config(4)
     };
-    let model = WorldModel::new(
-        cfg,
-        VarBuilder::from_varmap(&VarMap::new(), DType::F32, &device),
-    )?;
+    let vars = VarMap::new();
+    let model = WorldModel::new(cfg, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+    // Pipeline-faithful: the generic reinitializer zeroes every bias, so the
+    // prior must survive via the same restore step training uses.
+    reinit_varmap_deterministic(&vars, 29)?;
+    restore_copy_gate_bias_prior(&vars, Some(0.02))?;
     // A zero latent reaches exactly the bias through the 1x1 gate conv.
     let zero_latent = Tensor::zeros((1, 8, 16, 16), DType::F32, &device)?;
     let gate = model.exact_copy_gate(&zero_latent)?;
