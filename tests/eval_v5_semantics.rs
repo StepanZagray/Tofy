@@ -46,6 +46,8 @@ fn sample(
         provenance: TransitionProvenance {
             content_width: 7,
             content_height: 7,
+            content_x: 0,
+            content_y: 0,
             source_kind: source.into(),
             trajectory_id: trajectory.into(),
         },
@@ -179,5 +181,54 @@ fn false_edit_rate_uses_the_exact_translated_content_mask() -> Result<()> {
     )?;
     assert!((content.unwrap() - 1.0 / 49.0).abs() < 1e-12);
     assert_eq!(padding, Some(0.0));
+    Ok(())
+}
+
+#[test]
+fn provenance_origin_classifies_translated_false_edits_without_a_mask_sidecar() -> Result<()> {
+    // A 7x7 board placed at (10,10): with the origin recorded in provenance,
+    // an unchanged-pixel edit inside the rectangle is a content false edit
+    // and never a padding hallucination, even when no exact mask sidecar is
+    // supplied. Before the origin plumbing this row silently reverted to a
+    // top-left mask and misclassified both rates.
+    let mut row = sample("translated", "sim/translated/1", 0, 1, 1, 1, Some(true))?;
+    row.provenance.content_x = 10;
+    row.provenance.content_y = 10;
+    let inside = (10 + 10 * FRAME_SIDE) as usize;
+    let mut prediction = row.next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE].to_vec();
+    prediction[inside] = 5;
+
+    let content = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&prediction),
+        None,
+        false,
+    )?;
+    let padding = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&prediction),
+        None,
+        true,
+    )?;
+    assert!((content.unwrap() - 1.0 / 49.0).abs() < 1e-12);
+    assert_eq!(padding, Some(0.0));
+
+    // The same edit outside the translated rectangle is padding, not content.
+    let mut outside_prediction = row.next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE].to_vec();
+    outside_prediction[0] = 5;
+    let content_outside = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&outside_prediction),
+        None,
+        false,
+    )?;
+    let padding_outside = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&outside_prediction),
+        None,
+        true,
+    )?;
+    assert_eq!(content_outside, Some(0.0));
+    assert!(padding_outside.unwrap() > 0.0);
     Ok(())
 }

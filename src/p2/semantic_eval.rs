@@ -458,10 +458,15 @@ impl SourceAccum {
 fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [Vec<bool>; 9] {
     let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
     let mut content = vec![false; gameplay_pixels];
-    let width = usize::from(sample.provenance.content_width).min(FRAME_SIDE);
-    let height = usize::from(sample.provenance.content_height).min(FRAME_SIDE - 1);
-    for y in 0..height {
-        for x in 0..width {
+    // Provenance carries the exact placement origin (zero for legacy rows),
+    // so translated V5 content is classified as content, not padding.
+    let origin_x = usize::from(sample.provenance.content_x);
+    let origin_y = usize::from(sample.provenance.content_y);
+    let width = usize::from(sample.provenance.content_width).min(FRAME_SIDE.saturating_sub(origin_x));
+    let height = usize::from(sample.provenance.content_height)
+        .min((FRAME_SIDE - 1).saturating_sub(origin_y));
+    for y in origin_y..origin_y + height {
+        for x in origin_x..origin_x + width {
             content[y * FRAME_SIDE + x] = true;
         }
     }
@@ -1055,6 +1060,8 @@ mod tests {
             provenance: TransitionProvenance {
                 content_width: 7,
                 content_height: 7,
+                content_x: 0,
+                content_y: 0,
                 source_kind: "movement".into(),
                 trajectory_id: "sim/Train/9/4".into(),
             },

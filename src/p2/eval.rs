@@ -2559,6 +2559,8 @@ pub fn one_step_false_edit_rate_with_content_masks(
         if prediction.len() != target.len() || current.len() != target.len() {
             bail!("gate one-step prediction width does not match gameplay target");
         }
+        let content_x = usize::from(sample.provenance.content_x);
+        let content_y = usize::from(sample.provenance.content_y);
         let content_width = usize::from(sample.provenance.content_width).min(FRAME_SIDE);
         let content_height = usize::from(sample.provenance.content_height).min(FRAME_SIDE - 1);
         for (index, ((before, after), predicted)) in
@@ -2569,7 +2571,12 @@ pub fn one_step_false_edit_rate_with_content_masks(
             }
             let in_content = match content_masks {
                 Some(masks) => masks[row].values[index] != 0,
-                None => index % FRAME_SIDE < content_width && index / FRAME_SIDE < content_height,
+                None => {
+                    let x = index % FRAME_SIDE;
+                    let y = index / FRAME_SIDE;
+                    (content_x..content_x + content_width).contains(&x)
+                        && (content_y..content_y + content_height).contains(&y)
+                }
             };
             if in_content == padding {
                 continue;
@@ -3030,14 +3037,13 @@ fn eval_q_labels(q_logit: &Tensor, labels: &[f32]) -> Result<QEvalAccum> {
     Ok(out)
 }
 
-/// Origin-aligned content mask reconstructed from provenance dimensions.
-/// Exact only for populations whose content rectangle starts at (0,0) — the
-/// origin is not part of `TransitionProvenance`, so translated V5 rows need
-/// an exact mask sidecar instead of this reconstruction.
+/// Exact content mask reconstructed from provenance: dimensions plus the
+/// recorded placement origin (zero for legacy origin-aligned populations,
+/// the sampled origin for translated V5 rows).
 fn origin_aligned_content_mask(sample: &TransitionSample) -> Result<ContentMask> {
     let rect = ContentRect {
-        x: 0,
-        y: 0,
+        x: u8::try_from(sample.provenance.content_x).context("content x does not fit u8")?,
+        y: u8::try_from(sample.provenance.content_y).context("content y does not fit u8")?,
         width: u8::try_from(sample.provenance.content_width)
             .context("content width does not fit u8")?,
         height: u8::try_from(sample.provenance.content_height)
@@ -6835,6 +6841,8 @@ mod tests {
             provenance: crate::p2::data::TransitionProvenance {
                 content_width: 1,
                 content_height: 1,
+                content_x: 0,
+                content_y: 0,
                 source_kind: "action_diagnostic".into(),
                 trajectory_id: format!("test/action_diagnostic/{episode_id}"),
             },

@@ -717,6 +717,14 @@ pub struct TransitionProvenance {
     pub content_width: u16,
     /// Height of the semantic board region. The ARC status row is never part of this region.
     pub content_height: u16,
+    /// Canvas x-origin of the content rectangle. Zero for legacy
+    /// origin-aligned populations; translated V5 placements record the exact
+    /// sampled origin so downstream masks never revert to top-left.
+    #[serde(default)]
+    pub content_x: u16,
+    /// Canvas y-origin of the content rectangle (see `content_x`).
+    #[serde(default)]
+    pub content_y: u16,
     /// Generator/import population that produced the transition (stable across goal retargeting).
     pub source_kind: String,
     /// Stable trajectory identity. Unlike `family`, this does not change when a goal is retargeted.
@@ -735,6 +743,14 @@ impl TransitionProvenance {
             FRAME_SIDE - 1
         );
         ensure!(
+            self.content_x + self.content_width <= FRAME_SIDE as u16,
+            "content rectangle exceeds the canvas width"
+        );
+        ensure!(
+            self.content_y + self.content_height <= (FRAME_SIDE - 1) as u16,
+            "content rectangle exceeds the gameplay height"
+        );
+        ensure!(
             !self.source_kind.is_empty(),
             "source_kind must not be empty"
         );
@@ -750,6 +766,8 @@ impl TransitionProvenance {
         Self {
             content_width: u16::from(scenario.width),
             content_height: u16::from(scenario.height),
+            content_x: 0,
+            content_y: 0,
             trajectory_id: format!(
                 "sim/{source_kind}/{:?}/{}/{}",
                 scenario.split, scenario.seed, scenario.episode_id
@@ -762,6 +780,8 @@ impl TransitionProvenance {
         Self {
             content_width: FRAME_SIDE as u16,
             content_height: (FRAME_SIDE - 1) as u16,
+            content_x: 0,
+            content_y: 0,
             source_kind: source_kind.into(),
             trajectory_id: format!("synthetic/{source_kind}/{split:?}/{seed}/{episode_id}"),
         }
@@ -1856,6 +1876,11 @@ fn augment_v5_transition(
     transition.next =
         frame_with_transformed_content(&transition.next, source_rect, rect, &augmentation)?;
     transition.action = conjugate_action(&transition.action, augmentation.d4, source_rect, rect)?;
+    // The sampled placement origin becomes part of transition provenance so
+    // standalone consumers can rebuild the exact content mask; before this,
+    // translated rows silently reverted to top-left masks downstream.
+    transition.provenance.content_x = u16::from(rect.x);
+    transition.provenance.content_y = u16::from(rect.y);
     transform_oracle_latent_d4(
         &mut transition.oracle_latent,
         augmentation.d4,

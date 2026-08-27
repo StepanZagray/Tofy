@@ -475,10 +475,11 @@ fn mixed_stream_bytes_are_identical_across_rayon_thread_counts() -> Result<()> {
         assert_eq!(one, many);
         if (progress, batch_index, split) == (0.35, 17, V5DataSplit::Train) {
             // Re-pinned after hazard rows gained their real avoid-hazard
-            // labels and the tolerance-compliant 170-row allocation.
+            // labels, the tolerance-compliant 170-row allocation, and the
+            // content-rect origin joining TransitionProvenance.
             assert_eq!(
                 batch_hash(&one)?,
-                "036fa2fdd57f8a10fc65b17a2111fa9d9badd441a56fa8cbfb8c1afed790e4d0"
+                "6dbc2aa61b1e426da1de7d8643f0c34e35bb790229ff6c4197dc481c61746b6c"
             );
         }
     }

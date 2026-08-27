@@ -305,6 +305,8 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
             provenance: TransitionProvenance {
                 content_width: FRAME_SIDE as u16,
                 content_height: (FRAME_SIDE - 1) as u16,
+                content_x: 0,
+                content_y: 0,
                 source_kind: format!("arc3_recording:{}", curr.game_id),
                 trajectory_id: format!(
                     "arc3/{}/{}/{}",
