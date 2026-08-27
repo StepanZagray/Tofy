@@ -30,10 +30,11 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v3";
+pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v4";
 pub const LIVE_POLICY: &str = "model_reliable_effect_v1";
 const POLICY_LIMITATION: &str = "The checkpoint predicts transition fidelity, reliability, no-op probability, and latent action effect; it has no trained reward/value head. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
@@ -42,6 +43,8 @@ const MAX_HTTP_ATTEMPTS: usize = 5;
 /// Default cap on guid-scoped RESET retries per level after a recoverable
 /// non-WIN terminal such as GAME_OVER.
 pub const DEFAULT_MAX_LEVEL_RETRIES: usize = 3;
+/// Default official-style action budget for each level.
+pub const DEFAULT_MAX_ACTIONS_PER_LEVEL: u32 = 512;
 /// Default score penalty for already-tried actions. The policy score is a
 /// convex mixture in [0, 1]; 0.25 demotes near-ties toward exploration while
 /// still letting a tried action win again once its margin over every untried
@@ -57,7 +60,6 @@ pub struct LiveEvalConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub games: Vec<String>,
-    pub max_actions_per_game: usize,
     pub physical_batch: usize,
     pub action6_max_candidates: usize,
     pub action6_grid_stride: usize,
@@ -69,10 +71,6 @@ pub struct LiveEvalConfig {
 impl LiveEvalConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.physical_batch > 0, "physical_batch must be > 0");
-        ensure!(
-            self.max_actions_per_game > 0,
-            "max_actions_per_game must be > 0"
-        );
         ensure!(
             self.action6_max_candidates > 0,
             "action6_max_candidates must be > 0"
@@ -102,24 +100,37 @@ impl LiveEvalConfig {
 pub struct LiveDriverOptions {
     /// Competition mode: RESET always retries the current level and earlier
     /// levels cannot be revisited, so a guid-scoped retry is always safe.
-    #[serde(default)]
+    #[serde(default = "default_competition_mode")]
     pub competition_mode: bool,
     /// Maximum guid-scoped RESET retries per level after a recoverable
     /// non-WIN terminal such as GAME_OVER.
     #[serde(default = "default_max_level_retries")]
     pub max_level_retries: usize,
-    /// Optional per-level action budget mirroring the official per-level
-    /// scoring budget. `None` keeps only the per-game guard.
+    /// Primary action budget, applied independently to every level.
+    #[serde(default = "default_max_actions_per_level")]
+    pub max_actions_per_level: u32,
+    /// Optional game-wide emergency stop, not a scoring budget.
     #[serde(default)]
-    pub max_actions_per_level: Option<usize>,
+    pub max_actions_per_game: Option<u32>,
     /// Score penalty subtracted from already-tried actions within one
     /// tried-state key. See [`DEFAULT_TRIED_PENALTY`].
     #[serde(default = "default_tried_penalty")]
     pub tried_penalty: f64,
+    /// Permit an otherwise refused dirty driver repair to open a scorecard.
+    #[serde(default)]
+    pub exploratory: bool,
 }
 
 fn default_max_level_retries() -> usize {
     DEFAULT_MAX_LEVEL_RETRIES
+}
+
+fn default_competition_mode() -> bool {
+    true
+}
+
+fn default_max_actions_per_level() -> u32 {
+    DEFAULT_MAX_ACTIONS_PER_LEVEL
 }
 
 fn default_tried_penalty() -> f64 {
@@ -129,19 +140,26 @@ fn default_tried_penalty() -> f64 {
 impl Default for LiveDriverOptions {
     fn default() -> Self {
         Self {
-            competition_mode: false,
+            competition_mode: true,
             max_level_retries: DEFAULT_MAX_LEVEL_RETRIES,
-            max_actions_per_level: None,
+            max_actions_per_level: DEFAULT_MAX_ACTIONS_PER_LEVEL,
+            max_actions_per_game: None,
             tried_penalty: DEFAULT_TRIED_PENALTY,
+            exploratory: false,
         }
     }
 }
 
 impl LiveDriverOptions {
     pub fn validate(&self) -> Result<()> {
-        if let Some(cap) = self.max_actions_per_level {
-            ensure!(cap > 0, "max_actions_per_level must be > 0 when set");
-        }
+        ensure!(
+            self.max_actions_per_level > 0,
+            "max_actions_per_level must be > 0"
+        );
+        ensure!(
+            self.max_actions_per_game.is_none_or(|cap| cap > 0),
+            "max_actions_per_game must be > 0 when set"
+        );
         ensure!(
             self.tried_penalty.is_finite() && (0.0..=1.0).contains(&self.tried_penalty),
             "tried_penalty must be finite and in [0,1]"
@@ -161,9 +179,8 @@ pub struct ArcObservation {
     pub game_id: String,
     pub guid: String,
     pub frame: ArcFrame,
-    /// Every animation layer from the API response in order, each padded to
-    /// the fixed 64x64 canvas. For API-converted observations the settled
-    /// frame (`frame`) is the last layer. Empty for legacy serialized data.
+    /// Every API-native animation layer in order. `frame` is the final layer
+    /// padded to the fixed 64x64 model canvas. Empty for legacy serialized data.
     #[serde(default)]
     pub animation: Vec<ArcFrame>,
     /// True when RESET replaced the whole game session rather than retrying
@@ -248,12 +265,13 @@ impl TryFrom<ApiObservation> for ArcObservation {
                 "ARC response frame is ragged"
             );
             let pixels = layer.iter().flatten().copied().collect();
-            animation.push(ArcFrame::new(width as u16, layer.len() as u16, pixels)?.to_fixed_64()?);
+            animation.push(ArcFrame::new(width as u16, layer.len() as u16, pixels)?);
         }
         let frame = animation
             .last()
             .cloned()
-            .context("ARC response contains no frames")?;
+            .context("ARC response contains no frames")?
+            .to_fixed_64()?;
         let observation = Self {
             game_id: value.game_id,
             guid: value.guid,
@@ -1073,22 +1091,32 @@ pub struct LiveActionTrace {
     pub api_latency_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MutationAttemptOutcome {
+    Confirmed,
+    Ambiguous { mutation: AmbiguousMutation },
+    Rejected { reason: String },
+    ProtocolViolation { kind: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationAttempt {
+    pub index: usize,
+    pub game_id: String,
+    pub guid: String,
+    pub action: ArcAction,
+    pub levels_before: u16,
+    pub api_latency_ms: u128,
+    pub outcome: MutationAttemptOutcome,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiveLevelUsage {
     pub level_index: u16,
     pub attempted_actions: usize,
     pub confirmed_actions: usize,
     pub reset_retries: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AmbiguousAttemptedAction {
-    pub index: usize,
-    pub available_actions: Vec<u8>,
-    pub decision: ActionDecision,
-    pub levels_before: u16,
-    pub api_latency_ms: u128,
-    pub mutation: AmbiguousMutation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1103,11 +1131,14 @@ pub struct LiveGameReport {
     pub error: Option<String>,
     pub duration_ms: u128,
     pub trace: Vec<LiveActionTrace>,
-    pub ambiguous_attempted_action: Option<AmbiguousAttemptedAction>,
     #[serde(default)]
     pub ambiguous_reset: Option<AmbiguousMutation>,
     #[serde(default)]
     pub attempted_actions: usize,
+    #[serde(default)]
+    pub confirmed_actions: usize,
+    #[serde(default)]
+    pub mutation_attempts: Vec<MutationAttempt>,
     #[serde(default)]
     pub reset_retries: usize,
     #[serde(default)]
@@ -1128,6 +1159,20 @@ pub struct LiveEvalReport {
     pub train_config_sha256: String,
     pub device: String,
     pub base_url: String,
+    #[serde(default)]
+    pub git_revision: String,
+    #[serde(default)]
+    pub git_dirty: bool,
+    #[serde(default)]
+    pub dirty_diff_sha256: Option<String>,
+    #[serde(default)]
+    pub executable_sha256: Option<String>,
+    #[serde(default)]
+    pub build_profile: String,
+    #[serde(default)]
+    pub cli_args: Vec<String>,
+    #[serde(default)]
+    pub evidence_class: String,
     pub policy: String,
     pub policy_limitation: String,
     pub goal_feature_contract: String,
@@ -1158,8 +1203,22 @@ pub struct LiveRunSettings {
     pub device: String,
     pub base_url: String,
     pub requested_games: Vec<String>,
-    pub max_actions_per_game: usize,
     pub driver: LiveDriverOptions,
+    pub git_revision: String,
+    pub git_dirty: bool,
+    pub dirty_diff_sha256: Option<String>,
+    pub executable_sha256: Option<String>,
+    pub build_profile: String,
+    pub cli_args: Vec<String>,
+    pub evidence_class: String,
+}
+
+fn live_evidence_class(driver: &LiveDriverOptions) -> &'static str {
+    if driver.exploratory {
+        "exploratory_driver_repair"
+    } else {
+        "completed_evidence"
+    }
 }
 
 pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
@@ -1168,6 +1227,14 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     settings: &LiveRunSettings,
 ) -> Result<LiveEvalReport> {
     settings.driver.validate()?;
+    ensure!(
+        settings.evidence_class == live_evidence_class(&settings.driver),
+        "live evidence class does not match driver mode"
+    );
+    ensure!(
+        !settings.git_dirty || settings.driver.exploratory,
+        "refusing to open a scorecard from a dirty worktree without --exploratory"
+    );
     let mut discovered = api.list_games().context("discover public ARC games")?;
     discovered.sort_by(|a, b| a.game_id.cmp(&b.game_id));
     ensure!(!discovered.is_empty(), "ARC API returned no public games");
@@ -1175,6 +1242,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     let evaluating_all = settings.requested_games.is_empty() && selected.len() == discovered.len();
     let metadata = json!({
         "tags": ["tofy", "p2", "held-out", "live-eval"],
+        "competition_mode": settings.driver.competition_mode,
         "opaque": {
             "schema": LIVE_REPORT_SCHEMA,
             "checkpoint_sha256": settings.checkpoint_sha256,
@@ -1189,7 +1257,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     for game in &selected {
         let started = Instant::now();
         let mut trace = Vec::new();
-        let mut ambiguous_attempted_action = None;
+        let mut mutation_attempts = Vec::new();
         let mut ambiguous_reset = None;
         let mut error = None;
         let mut stop_reason = "reset_failed".to_string();
@@ -1233,16 +1301,16 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                         level_index: observation.levels_completed,
                         ..LiveLevelUsage::default()
                     });
-                if attempted_actions >= settings.max_actions_per_game {
-                    stop_reason = "max_actions_reached".into();
+                if usage.attempted_actions >= settings.driver.max_actions_per_level as usize {
+                    stop_reason = "level_action_cap_reached".into();
                     break;
                 }
                 if settings
                     .driver
-                    .max_actions_per_level
-                    .is_some_and(|cap| usage.attempted_actions >= cap)
+                    .max_actions_per_game
+                    .is_some_and(|cap| attempted_actions >= cap as usize)
                 {
-                    stop_reason = "level_action_cap_reached".into();
+                    stop_reason = "max_actions_reached".into();
                     break;
                 }
                 let retry_is_safe =
@@ -1290,22 +1358,22 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 last = Some(retry);
                 continue;
             }
-            if attempted_actions >= settings.max_actions_per_game {
-                stop_reason = "max_actions_reached".into();
-                break;
-            }
             let usage = level_usage
                 .entry(observation.levels_completed)
                 .or_insert_with(|| LiveLevelUsage {
                     level_index: observation.levels_completed,
                     ..LiveLevelUsage::default()
                 });
+            if usage.attempted_actions >= settings.driver.max_actions_per_level as usize {
+                stop_reason = "level_action_cap_reached".into();
+                break;
+            }
             if settings
                 .driver
-                .max_actions_per_level
-                .is_some_and(|cap| usage.attempted_actions >= cap)
+                .max_actions_per_game
+                .is_some_and(|cap| attempted_actions >= cap as usize)
             {
-                stop_reason = "level_action_cap_reached".into();
+                stop_reason = "max_actions_reached".into();
                 break;
             }
             let decision = match policy.choose_action(&observation) {
@@ -1328,7 +1396,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             let call_started = Instant::now();
             attempted_actions += 1;
             usage.attempted_actions += 1;
-            action_since_reset_or_transition = true;
+            let attempt_index = mutation_attempts.len();
             let next = match api.act(
                 &game.game_id,
                 &observation.guid,
@@ -1337,6 +1405,18 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             ) {
                 Ok(next) => next,
                 Err(MutationError::Ambiguous(mutation)) => {
+                    let api_latency_ms = call_started.elapsed().as_millis();
+                    mutation_attempts.push(MutationAttempt {
+                        index: attempt_index,
+                        game_id: game.game_id.clone(),
+                        guid: observation.guid.clone(),
+                        action: decision.chosen.action.clone(),
+                        levels_before: observation.levels_completed,
+                        api_latency_ms,
+                        outcome: MutationAttemptOutcome::Ambiguous {
+                            mutation: mutation.clone(),
+                        },
+                    });
                     agent_session.record_ambiguous(
                         &observation,
                         decision.chosen.action.clone(),
@@ -1344,23 +1424,38 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                     )?;
                     error = Some(format!("action {}: {mutation}", trace.len() + 1));
                     stop_reason = "ambiguous_mutation".into();
-                    ambiguous_attempted_action = Some(AmbiguousAttemptedAction {
-                        index: trace.len(),
-                        available_actions: observation.available_actions.clone(),
-                        decision,
-                        levels_before: observation.levels_completed,
-                        api_latency_ms: call_started.elapsed().as_millis(),
-                        mutation,
-                    });
                     break;
                 }
                 Err(err) => {
+                    mutation_attempts.push(MutationAttempt {
+                        index: attempt_index,
+                        game_id: game.game_id.clone(),
+                        guid: observation.guid.clone(),
+                        action: decision.chosen.action.clone(),
+                        levels_before: observation.levels_completed,
+                        api_latency_ms: call_started.elapsed().as_millis(),
+                        outcome: MutationAttemptOutcome::Rejected {
+                            reason: format!("{err:#}"),
+                        },
+                    });
                     error = Some(format!("action {}: {err}", trace.len() + 1));
                     stop_reason = "api_error".into();
                     break;
                 }
             };
             if next.levels_completed < observation.levels_completed {
+                mutation_attempts.push(MutationAttempt {
+                    index: attempt_index,
+                    game_id: game.game_id.clone(),
+                    guid: observation.guid.clone(),
+                    action: decision.chosen.action.clone(),
+                    levels_before: observation.levels_completed,
+                    api_latency_ms: call_started.elapsed().as_millis(),
+                    outcome: MutationAttemptOutcome::ProtocolViolation {
+                        kind: "level_regression".into(),
+                    },
+                });
+                agent_session.observe(&next)?;
                 error = Some(format!(
                     "ACTION response regressed levels {} -> {}",
                     observation.levels_completed, next.levels_completed
@@ -1370,6 +1465,18 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 break;
             }
             if next.full_reset {
+                mutation_attempts.push(MutationAttempt {
+                    index: attempt_index,
+                    game_id: game.game_id.clone(),
+                    guid: observation.guid.clone(),
+                    action: decision.chosen.action.clone(),
+                    levels_before: observation.levels_completed,
+                    api_latency_ms: call_started.elapsed().as_millis(),
+                    outcome: MutationAttemptOutcome::ProtocolViolation {
+                        kind: "full_reset".into(),
+                    },
+                });
+                agent_session.observe(&next)?;
                 full_reset_detected = true;
                 error = Some("ACTION response unexpectedly reported full_reset=true".into());
                 stop_reason = "protocol_full_reset".into();
@@ -1378,6 +1485,17 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             }
             agent_session.record_confirmed(&observation, decision.chosen.action.clone(), &next)?;
             usage.confirmed_actions += 1;
+            action_since_reset_or_transition = true;
+            let api_latency_ms = call_started.elapsed().as_millis();
+            mutation_attempts.push(MutationAttempt {
+                index: attempt_index,
+                game_id: game.game_id.clone(),
+                guid: observation.guid.clone(),
+                action: decision.chosen.action.clone(),
+                levels_before: observation.levels_completed,
+                api_latency_ms,
+                outcome: MutationAttemptOutcome::Confirmed,
+            });
             trace.push(LiveActionTrace {
                 index: trace.len(),
                 available_actions: observation.available_actions.clone(),
@@ -1386,7 +1504,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 levels_after: next.levels_completed,
                 state_after: next.state.clone(),
                 frame_changed: observation.frame != next.frame,
-                api_latency_ms: call_started.elapsed().as_millis(),
+                api_latency_ms,
             });
             if next.levels_completed > observation.levels_completed {
                 policy.on_level_transition(next.levels_completed);
@@ -1405,6 +1523,14 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 )
             })
             .unwrap_or((0, 0, "RESET_FAILED".into()));
+        let confirmed_actions = mutation_attempts
+            .iter()
+            .filter(|attempt| matches!(attempt.outcome, MutationAttemptOutcome::Confirmed))
+            .count();
+        ensure!(
+            attempted_actions == mutation_attempts.len() && confirmed_actions == trace.len(),
+            "action totals do not reconcile with the mutation ledger"
+        );
         policy.on_game_end(&stop_reason);
         game_reports.push(LiveGameReport {
             game_id: game.game_id.clone(),
@@ -1417,9 +1543,10 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             error,
             duration_ms: started.elapsed().as_millis(),
             trace,
-            ambiguous_attempted_action,
             ambiguous_reset,
             attempted_actions,
+            confirmed_actions,
+            mutation_attempts,
             reset_retries,
             full_reset_detected,
             level_usage: level_usage.into_values().collect(),
@@ -1441,7 +1568,6 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     let official_rhae = official_scorecard
         .as_ref()
         .and_then(official_rhae_from_benchmark);
-
     Ok(LiveEvalReport {
         schema: LIVE_REPORT_SCHEMA.into(),
         created_at_unix_ms: unix_ms(),
@@ -1451,6 +1577,13 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         train_config_sha256: settings.train_config_sha256.clone(),
         device: settings.device.clone(),
         base_url: settings.base_url.clone(),
+        git_revision: settings.git_revision.clone(),
+        git_dirty: settings.git_dirty,
+        dirty_diff_sha256: settings.dirty_diff_sha256.clone(),
+        executable_sha256: settings.executable_sha256.clone(),
+        build_profile: settings.build_profile.clone(),
+        cli_args: settings.cli_args.clone(),
+        evidence_class: settings.evidence_class.clone(),
         policy: LIVE_POLICY.into(),
         policy_limitation: POLICY_LIMITATION.into(),
         goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),
@@ -1508,6 +1641,7 @@ pub fn list_public_games(config: &LiveEvalConfig) -> Result<Vec<PublicGame>> {
 
 pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     config.validate()?;
+    let provenance = live_run_provenance()?;
     let train_config = load_train_config(&config.train_config)?;
     let _gpu_guard = if config.device == "cuda" || config.device.starts_with("cuda:") {
         Some(GpuSessionGuard::acquire(&train_config.output_dir)?)
@@ -1539,12 +1673,68 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         device: config.device.clone(),
         base_url: config.base_url.clone(),
         requested_games: config.games.clone(),
-        max_actions_per_game: config.max_actions_per_game,
         driver: config.driver.clone(),
+        git_revision: provenance.git_revision,
+        git_dirty: provenance.git_dirty,
+        dirty_diff_sha256: provenance.dirty_diff_sha256,
+        executable_sha256: provenance.executable_sha256,
+        build_profile: provenance.build_profile,
+        cli_args: provenance.cli_args,
+        evidence_class: live_evidence_class(&config.driver).into(),
     };
     let report = run_public_suite(&mut api, &mut policy, &settings)?;
     write_json_atomic(&config.output, &report)?;
     Ok(report)
+}
+
+struct LiveRunProvenance {
+    git_revision: String,
+    git_dirty: bool,
+    dirty_diff_sha256: Option<String>,
+    executable_sha256: Option<String>,
+    build_profile: String,
+    cli_args: Vec<String>,
+}
+
+fn live_run_provenance() -> Result<LiveRunProvenance> {
+    let git_revision = git_output(&["rev-parse", "HEAD"])?;
+    let status = git_output(&["status", "--porcelain", "--untracked-files=all"])?;
+    let git_dirty = !status.trim().is_empty();
+    let dirty_diff_sha256 = git_dirty
+        .then(|| {
+            git_output(&["diff", "--binary", "HEAD"]).map(|diff| sha256_bytes(diff.as_bytes()))
+        })
+        .transpose()?;
+    let executable_sha256 = env::current_exe()
+        .ok()
+        .and_then(|path| sha256_file(&path).ok());
+    Ok(LiveRunProvenance {
+        git_revision: git_revision.trim().into(),
+        git_dirty,
+        dirty_diff_sha256,
+        executable_sha256,
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+        .into(),
+        cli_args: env::args().collect(),
+    })
+}
+
+fn git_output(args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout).context("git output is not UTF-8")
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1561,6 +1751,12 @@ fn sha256_file(path: &Path) -> Result<String> {
         digest.update(&buffer[..n]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -1589,7 +1785,8 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::Path;
     use std::sync::Mutex;
 
     fn frame(fill: u8) -> ArcFrame {
@@ -1958,6 +2155,63 @@ mod tests {
         );
     }
 
+    fn scored_action(id: u8, score: f64) -> ActionScore {
+        ActionScore {
+            action: ArcAction::new(id, None, None).unwrap(),
+            score,
+            q_probability: 0.0,
+            reliability_probability: 0.0,
+            noop_probability: 0.0,
+            predicted_effect: 0.0,
+        }
+    }
+
+    #[test]
+    fn tried_penalty_explores_near_ties_but_keeps_large_margins() {
+        let first = ArcAction::new(1, None, None).unwrap();
+        let mut near_tie = vec![scored_action(1, 1.0), scored_action(2, 0.9)];
+        let mut tried = BTreeSet::from([action_key(&first)]);
+        apply_tried_penalty(&mut near_tie, &mut tried, DEFAULT_TRIED_PENALTY);
+        assert!(near_tie[1].score > near_tie[0].score);
+
+        let mut large_margin = vec![scored_action(1, 1.0), scored_action(2, 0.7)];
+        apply_tried_penalty(&mut large_margin, &mut tried, DEFAULT_TRIED_PENALTY);
+        assert!(large_margin[0].score > large_margin[1].score);
+    }
+
+    #[test]
+    fn tried_penalty_clears_an_exhausted_history_once() {
+        let mut scores = vec![scored_action(1, 0.8), scored_action(2, 0.7)];
+        let mut tried =
+            BTreeSet::from([action_key(&scores[0].action), action_key(&scores[1].action)]);
+        apply_tried_penalty(&mut scores, &mut tried, DEFAULT_TRIED_PENALTY);
+        assert!(tried.is_empty());
+        assert_eq!(scores[0].score, 0.8);
+        apply_tried_penalty(&mut scores, &mut tried, DEFAULT_TRIED_PENALTY);
+        assert!(tried.is_empty());
+        assert_eq!(scores[0].score, 0.8);
+    }
+
+    #[test]
+    fn tried_history_isolated_by_guid_and_level() {
+        let first = observation("game", "NOT_FINISHED", vec![1]);
+        let mut other_guid = first.clone();
+        other_guid.guid = "other-guid".into();
+        let mut other_level = first.clone();
+        other_level.levels_completed = 1;
+        let mut histories: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+        histories.insert(observation_hash(&first), BTreeSet::from(["1:-:-".into()]));
+
+        assert_ne!(observation_hash(&first), observation_hash(&other_guid));
+        assert_ne!(observation_hash(&first), observation_hash(&other_level));
+        assert!(histories
+            .get(&observation_hash(&other_guid))
+            .is_none_or(BTreeSet::is_empty));
+        assert!(histories
+            .get(&observation_hash(&other_level))
+            .is_none_or(BTreeSet::is_empty));
+    }
+
     #[test]
     fn action_enumeration_masks_and_bounds_action6() {
         let mut obs = observation("demo", "NOT_FINISHED", vec![1, 5, 6]);
@@ -2072,6 +2326,7 @@ mod tests {
         resets: VecDeque<MutationResult<ArcObservation>>,
         actions: VecDeque<MutationResult<ArcObservation>>,
         reset_guids: Vec<Option<String>>,
+        open_metadata: Option<Value>,
         closed: bool,
     }
 
@@ -2084,6 +2339,7 @@ mod tests {
                 resets: resets.into(),
                 actions: actions.into(),
                 reset_guids: Vec::new(),
+                open_metadata: None,
                 closed: false,
             }
         }
@@ -2097,7 +2353,8 @@ mod tests {
             }])
         }
 
-        fn open_scorecard(&mut self, _metadata: &Value) -> Result<String> {
+        fn open_scorecard(&mut self, metadata: &Value) -> Result<String> {
+            self.open_metadata = Some(metadata.clone());
             Ok("card".into())
         }
 
@@ -2139,6 +2396,7 @@ mod tests {
     }
 
     fn scripted_settings(driver: LiveDriverOptions) -> LiveRunSettings {
+        let evidence_class = live_evidence_class(&driver).into();
         LiveRunSettings {
             checkpoint: "model.safetensors".into(),
             checkpoint_sha256: "model-hash".into(),
@@ -2147,8 +2405,14 @@ mod tests {
             device: "cpu".into(),
             base_url: "https://example.invalid".into(),
             requested_games: Vec::new(),
-            max_actions_per_game: 8,
             driver,
+            git_revision: "test-revision".into(),
+            git_dirty: false,
+            dirty_diff_sha256: None,
+            executable_sha256: Some("test-executable".into()),
+            build_profile: "test".into(),
+            cli_args: vec!["p2-arc3-live-eval".into()],
+            evidence_class,
         }
     }
 
@@ -2167,7 +2431,7 @@ mod tests {
             &scripted_settings(LiveDriverOptions {
                 competition_mode: true,
                 max_level_retries: 1,
-                max_actions_per_level: Some(2),
+                max_actions_per_level: 2,
                 ..LiveDriverOptions::default()
             }),
         )
@@ -2186,6 +2450,10 @@ mod tests {
             vec!["start:game", "retry:game_over", "level:1", "end:completed"]
         );
         assert!(api.closed);
+        assert_eq!(
+            api.open_metadata.as_ref().unwrap()["competition_mode"],
+            Value::Bool(true)
+        );
     }
 
     #[test]
@@ -2195,7 +2463,10 @@ mod tests {
         let report = run_public_suite(
             &mut api,
             &mut policy,
-            &scripted_settings(LiveDriverOptions::default()),
+            &scripted_settings(LiveDriverOptions {
+                competition_mode: false,
+                ..LiveDriverOptions::default()
+            }),
         )
         .unwrap();
         assert_eq!(api.reset_guids, vec![None]);
@@ -2216,7 +2487,7 @@ mod tests {
             game.remove(field);
         }
         let restored: LiveEvalReport = serde_json::from_value(legacy).unwrap();
-        assert!(!restored.driver.competition_mode);
+        assert!(restored.driver.competition_mode);
         assert_eq!(restored.games[0].attempted_actions, 0);
         assert!(restored.games[0].level_usage.is_empty());
     }
@@ -2246,7 +2517,7 @@ mod tests {
             &mut FirstPolicy,
             &scripted_settings(LiveDriverOptions {
                 competition_mode: true,
-                max_actions_per_level: Some(1),
+                max_actions_per_level: 1,
                 ..LiveDriverOptions::default()
             }),
         )
@@ -2254,6 +2525,49 @@ mod tests {
         assert_eq!(capped.games[0].stop_reason, "level_action_cap_reached");
         assert_eq!(capped.games[0].reset_retries, 0);
         assert_eq!(capped_api.reset_guids, vec![None]);
+    }
+
+    #[test]
+    fn per_level_cap_does_not_impose_a_default_game_wide_stop() {
+        let mut opening = scripted_observation("NOT_FINISHED", 0);
+        opening.win_levels = 6;
+        let mut actions = Vec::new();
+        for level in 0..5 {
+            for attempt in 0..100 {
+                let mut next = scripted_observation("NOT_FINISHED", level);
+                next.win_levels = 6;
+                if attempt == 99 {
+                    next.levels_completed = level + 1;
+                }
+                actions.push(Ok(next));
+            }
+        }
+        for _ in 0..11 {
+            let mut next = scripted_observation("NOT_FINISHED", 5);
+            next.win_levels = 6;
+            actions.push(Ok(next));
+        }
+        let mut win = scripted_observation("WIN", 6);
+        win.win_levels = 6;
+        actions.push(Ok(win));
+
+        let mut api = ScriptedApi::new(vec![Ok(opening)], actions);
+        let report = run_public_suite(
+            &mut api,
+            &mut FirstPolicy,
+            &scripted_settings(LiveDriverOptions {
+                max_actions_per_level: 100,
+                ..LiveDriverOptions::default()
+            }),
+        )
+        .unwrap();
+        let game = &report.games[0];
+        assert_eq!(game.actions, 512);
+        assert_eq!(game.stop_reason, "completed");
+        assert!(game
+            .level_usage
+            .iter()
+            .all(|usage| usage.attempted_actions <= 100));
     }
 
     #[test]
@@ -2272,6 +2586,84 @@ mod tests {
         assert!(report.games[0].full_reset_detected);
         assert_eq!(report.games[0].attempted_actions, 1);
         assert_eq!(report.games[0].actions, 0);
+    }
+
+    #[test]
+    fn every_action_attempt_has_one_ordered_ledger_outcome() {
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mut confirmed = scripted_observation("WIN", 1);
+        confirmed.win_levels = 1;
+        let ambiguous = AmbiguousMutation {
+            operation: "submit action".into(),
+            game_id: Some("game".into()),
+            guid: Some("guid-game".into()),
+            action: Some(ArcAction::new(1, None, None).unwrap()),
+            cause: "timeout".into(),
+        };
+        let mut full_reset = scripted_observation("NOT_FINISHED", 0);
+        full_reset.full_reset = true;
+        let cases = vec![
+            (Ok(confirmed), "confirmed"),
+            (Err(MutationError::Ambiguous(ambiguous)), "ambiguous"),
+            (
+                Err(MutationError::Failed(anyhow::anyhow!("HTTP 400"))),
+                "rejected",
+            ),
+            (Ok(full_reset), "protocol"),
+        ];
+
+        for (action, expected) in cases {
+            let mut api = ScriptedApi::new(vec![Ok(opening.clone())], vec![action]);
+            let report = run_public_suite(
+                &mut api,
+                &mut FirstPolicy,
+                &scripted_settings(LiveDriverOptions::default()),
+            )
+            .unwrap();
+            let game = &report.games[0];
+            assert_eq!(game.attempted_actions, 1);
+            assert_eq!(game.mutation_attempts.len(), 1);
+            let attempt = &game.mutation_attempts[0];
+            assert_eq!(attempt.index, 0);
+            assert_eq!(attempt.game_id, "game");
+            assert_eq!(attempt.guid, "guid-game");
+            assert_eq!(attempt.action.id, 1);
+            assert_eq!(
+                match &attempt.outcome {
+                    MutationAttemptOutcome::Confirmed => "confirmed",
+                    MutationAttemptOutcome::Ambiguous { .. } => "ambiguous",
+                    MutationAttemptOutcome::Rejected { .. } => "rejected",
+                    MutationAttemptOutcome::ProtocolViolation { .. } => "protocol",
+                },
+                expected
+            );
+            match &attempt.outcome {
+                MutationAttemptOutcome::Ambiguous { mutation } => {
+                    assert_eq!(mutation.cause, "timeout");
+                }
+                MutationAttemptOutcome::Rejected { reason } => {
+                    assert!(reason.contains("HTTP 400"));
+                }
+                MutationAttemptOutcome::ProtocolViolation { kind } => {
+                    assert_eq!(kind, "full_reset");
+                    assert_eq!(game.agent_session.observations.len(), 2);
+                }
+                MutationAttemptOutcome::Confirmed => {}
+            }
+            if expected == "confirmed" {
+                assert_eq!(game.confirmed_actions, 1);
+                assert_eq!(game.agent_session.experience_graph.edges.len(), 1);
+                assert!(game.agent_session.experience_graph.edges[0].to.is_some());
+            } else {
+                assert_eq!(game.confirmed_actions, 0);
+                assert!(game
+                    .agent_session
+                    .experience_graph
+                    .edges
+                    .iter()
+                    .all(|edge| edge.to.is_none()));
+            }
+        }
     }
 
     #[test]
@@ -2294,6 +2686,36 @@ mod tests {
         assert_eq!(report.games[0].stop_reason, "ambiguous_reset");
         assert!(report.games[0].ambiguous_reset.is_some());
         assert_eq!(policy.events, vec!["end:ambiguous_reset"]);
+    }
+
+    #[test]
+    fn dirty_driver_refuses_scorecard_without_exploratory_override() {
+        let mut api = ScriptedApi::new(Vec::new(), Vec::new());
+        let mut settings = scripted_settings(LiveDriverOptions::default());
+        settings.git_dirty = true;
+        settings.dirty_diff_sha256 = Some("dirty-diff".into());
+
+        assert!(run_public_suite(&mut api, &mut FirstPolicy, &settings).is_err());
+        assert!(api.open_metadata.is_none());
+    }
+
+    #[test]
+    fn exploratory_dirty_driver_records_provenance_class_and_digest() {
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        let mut api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(win)]);
+        let mut settings = scripted_settings(LiveDriverOptions {
+            exploratory: true,
+            ..LiveDriverOptions::default()
+        });
+        settings.git_dirty = true;
+        settings.dirty_diff_sha256 = Some("dirty-diff".into());
+
+        let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
+        assert_eq!(report.evidence_class, "exploratory_driver_repair");
+        assert_eq!(report.dirty_diff_sha256.as_deref(), Some("dirty-diff"));
+        assert_eq!(report.git_revision, "test-revision");
     }
 
     struct FakeApi {
@@ -2377,17 +2799,7 @@ mod tests {
             acted_games: Vec::new(),
             ambiguous_action: false,
         };
-        let settings = LiveRunSettings {
-            checkpoint: "model.safetensors".into(),
-            checkpoint_sha256: "model-hash".into(),
-            train_config: "config.json".into(),
-            train_config_sha256: "config-hash".into(),
-            device: "cpu".into(),
-            base_url: "https://example.invalid".into(),
-            requested_games: Vec::new(),
-            max_actions_per_game: 4,
-            driver: LiveDriverOptions::default(),
-        };
+        let settings = scripted_settings(LiveDriverOptions::default());
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
         assert!(api.closed);
         assert_eq!(api.acted_games, vec!["a-1", "b-1"]);
@@ -2409,23 +2821,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_attempt_is_reported_outside_confirmed_trace_and_scorecard_closes() {
+    fn ambiguous_attempt_is_recorded_in_the_mutation_ledger() {
         let mut api = FakeApi {
             closed: false,
             acted_games: Vec::new(),
             ambiguous_action: true,
         };
-        let settings = LiveRunSettings {
-            checkpoint: "model.safetensors".into(),
-            checkpoint_sha256: "model-hash".into(),
-            train_config: "config.json".into(),
-            train_config_sha256: "config-hash".into(),
-            device: "cpu".into(),
-            base_url: "https://example.invalid".into(),
-            requested_games: vec!["a-1".into()],
-            max_actions_per_game: 4,
-            driver: LiveDriverOptions::default(),
-        };
+        let mut settings = scripted_settings(LiveDriverOptions::default());
+        settings.requested_games = vec!["a-1".into()];
 
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
         let game = &report.games[0];
@@ -2433,13 +2836,11 @@ mod tests {
         assert_eq!(game.stop_reason, "ambiguous_mutation");
         assert_eq!(game.actions, 0);
         assert!(game.trace.is_empty());
-        assert_eq!(
-            game.ambiguous_attempted_action
-                .as_ref()
-                .and_then(|attempt| attempt.mutation.action.as_ref())
-                .map(|action| action.id),
-            Some(1)
-        );
+        assert_eq!(game.mutation_attempts.len(), 1);
+        assert!(matches!(
+            game.mutation_attempts[0].outcome,
+            MutationAttemptOutcome::Ambiguous { .. }
+        ));
     }
 
     #[test]
@@ -2460,43 +2861,102 @@ mod tests {
             )),
             Ok(response(StatusCode::OK, "{}")),
         ]);
-        let settings = LiveRunSettings {
-            checkpoint: "model.safetensors".into(),
-            checkpoint_sha256: "model-hash".into(),
-            train_config: "config.json".into(),
-            train_config_sha256: "config-hash".into(),
-            device: "cpu".into(),
-            base_url: "https://example.invalid".into(),
-            requested_games: vec!["game".into()],
-            max_actions_per_game: 4,
-            driver: LiveDriverOptions::default(),
-        };
+        let mut settings = scripted_settings(LiveDriverOptions::default());
+        settings.requested_games = vec!["game".into()];
 
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
         let game = &report.games[0];
         assert_eq!(game.stop_reason, "ambiguous_mutation");
         assert_eq!(game.actions, 0);
         assert!(game.trace.is_empty());
-        assert_eq!(
-            game.ambiguous_attempted_action.as_ref().map(|_| ()),
-            Some(())
-        );
+        assert!(matches!(
+            game.mutation_attempts[0].outcome,
+            MutationAttemptOutcome::Ambiguous { .. }
+        ));
         assert_eq!(api.transport.send_count(), 5);
+    }
+
+    fn collect_rust_sources(root: &Path, sources: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, sources);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let relative = path
+                    .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+                    .unwrap()
+                    .display()
+                    .to_string();
+                sources.insert(relative, std::fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+
+    fn contains_forbidden_training_import(source: &str) -> bool {
+        [
+            "crate::p2::arc3",
+            "crate::p2::arc3_live",
+            "import_recordings_dir",
+            "RecordingRunSummary",
+            "ARC_API_KEY",
+            "reqwest::",
+        ]
+        .iter()
+        .any(|forbidden| source.contains(forbidden))
+    }
+
+    fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).unwrap();
+        let body_start = start + source[start..].find('{').unwrap();
+        let mut depth = 0usize;
+        for (offset, byte) in source[body_start..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated function {signature}");
     }
 
     #[test]
     fn training_source_cannot_depend_on_live_or_recording_modules() {
-        let training = include_str!("train.rs");
-        for forbidden in [
-            "crate::p2::arc3",
-            "crate::p2::arc3_live",
-            "ARC_API_KEY",
-            "reqwest::",
-        ] {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = BTreeMap::new();
+        collect_rust_sources(&source_root, &mut sources);
+        for required in ["p2/data.rs", "p2/train.rs", "p2/eval.rs", "p2/model.rs"] {
             assert!(
-                !training.contains(forbidden),
-                "training source contains forbidden held-out dependency {forbidden}"
+                sources.contains_key(required),
+                "source scan missed {required}"
             );
         }
+
+        for (path, source) in &sources {
+            if matches!(
+                path.as_str(),
+                "p2/agent_session.rs" | "p2/arc3.rs" | "p2/arc3_live.rs" | "p2/cli.rs"
+            ) {
+                continue;
+            }
+            let source = if path == "p2/eval.rs" {
+                function_source(source, "pub fn evaluate_gate_support_with_content_masks")
+            } else {
+                source
+            };
+            assert!(
+                !contains_forbidden_training_import(source),
+                "training-reachable source {path} contains a held-out dependency"
+            );
+        }
+
+        let data = &sources["p2/data.rs"];
+        let fixture = format!("{data}\nuse crate::p2::arc3::import_recordings_dir;");
+        assert!(contains_forbidden_training_import(&fixture));
     }
 }

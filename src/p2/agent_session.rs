@@ -26,6 +26,9 @@ pub struct ObservationIdentity {
     pub levels_completed: u16,
     pub win_levels: u16,
     pub available_actions: Vec<u8>,
+    /// Complete API-native animation layers, retained for audit replay.
+    #[serde(default)]
+    pub animation: Vec<crate::p2::data::ArcFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,15 +57,19 @@ pub struct FactualMemoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperienceEdge {
     pub memory_index: usize,
-    pub from: MechanicsStateId,
+    pub from: RawObservationId,
     pub action: ArcAction,
-    pub to: Option<MechanicsStateId>,
+    pub to: Option<RawObservationId>,
     pub confirmed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExactExperienceGraph {
-    pub nodes: BTreeMap<MechanicsStateId, Vec<RawObservationId>>,
+    /// Factual graph nodes never coalesce distinct API observations.
+    pub nodes: BTreeMap<RawObservationId, MechanicsStateId>,
+    /// Secondary mechanics lookup only; aliases do not merge factual nodes.
+    #[serde(default)]
+    pub mechanics_aliases: BTreeMap<MechanicsStateId, Vec<RawObservationId>>,
     pub edges: Vec<ExperienceEdge>,
 }
 
@@ -101,6 +108,7 @@ impl ObservationIdentity {
             levels_completed: observation.levels_completed,
             win_levels: observation.win_levels,
             available_actions: observation.available_actions.clone(),
+            animation: observation.animation.clone(),
         })
     }
 }
@@ -108,9 +116,13 @@ impl ObservationIdentity {
 impl AgentSession {
     pub fn observe(&mut self, observation: &ArcObservation) -> Result<ObservationIdentity> {
         let identity = ObservationIdentity::from_observation(observation)?;
+        self.experience_graph
+            .nodes
+            .entry(identity.raw.clone())
+            .or_insert_with(|| identity.mechanics.clone());
         let raw_ids = self
             .experience_graph
-            .nodes
+            .mechanics_aliases
             .entry(identity.mechanics.clone())
             .or_default();
         if !raw_ids.contains(&identity.raw) {
@@ -137,11 +149,11 @@ impl AgentSession {
         let index = self.factual_memory.len();
         self.factual_memory.push(FactualMemoryEntry {
             index,
-            current_raw: current_id.raw,
+            current_raw: current_id.raw.clone(),
             current_mechanics: current_id.mechanics.clone(),
             action: action.clone(),
             outcome: FactualActionOutcome::Confirmed {
-                next_raw: next_id.raw,
+                next_raw: next_id.raw.clone(),
                 next_mechanics: next_id.mechanics.clone(),
                 frame_changed: current.frame != next.frame,
                 levels_delta: i32::from(next.levels_completed)
@@ -150,9 +162,9 @@ impl AgentSession {
         });
         self.experience_graph.edges.push(ExperienceEdge {
             memory_index: index,
-            from: current_id.mechanics,
+            from: current_id.raw,
             action,
-            to: Some(next_id.mechanics),
+            to: Some(next_id.raw),
             confirmed: true,
         });
         Ok(())
@@ -168,14 +180,14 @@ impl AgentSession {
         let index = self.factual_memory.len();
         self.factual_memory.push(FactualMemoryEntry {
             index,
-            current_raw: current_id.raw,
+            current_raw: current_id.raw.clone(),
             current_mechanics: current_id.mechanics.clone(),
             action: action.clone(),
             outcome: FactualActionOutcome::Ambiguous { mutation },
         });
         self.experience_graph.edges.push(ExperienceEdge {
             memory_index: index,
-            from: current_id.mechanics,
+            from: current_id.raw,
             action,
             to: None,
             confirmed: false,
@@ -209,6 +221,58 @@ mod tests {
         let second = ObservationIdentity::from_observation(&observation("request-b"))?;
         assert_ne!(first.raw, second.raw);
         assert_eq!(first.mechanics, second.mechanics);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_raw_observations_do_not_merge_graph_nodes() -> Result<()> {
+        let first = observation("request-a");
+        let second = observation("request-b");
+        let mut session = AgentSession::default();
+        let first_id = session.observe(&first)?;
+        let second_id = session.observe(&second)?;
+
+        assert_eq!(session.experience_graph.nodes.len(), 2);
+        assert_eq!(session.experience_graph.mechanics_aliases.len(), 1);
+        assert_eq!(
+            session.experience_graph.mechanics_aliases[&first_id.mechanics],
+            vec![first_id.raw, second_id.raw]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_identity_includes_native_dimensions_and_animation() -> Result<()> {
+        let mut one_by_one = observation("request-a");
+        one_by_one.animation = vec![ArcFrame::new(1, 1, vec![0])?];
+        let mut two_by_one = one_by_one.clone();
+        two_by_one.animation = vec![ArcFrame::new(2, 1, vec![0, 0])?];
+        assert_ne!(
+            ObservationIdentity::from_observation(&one_by_one)?.raw,
+            ObservationIdentity::from_observation(&two_by_one)?.raw
+        );
+
+        let mut animated = one_by_one.clone();
+        animated.animation = vec![ArcFrame::new(1, 1, vec![1])?, ArcFrame::new(1, 1, vec![0])?];
+        assert_ne!(
+            ObservationIdentity::from_observation(&one_by_one)?.raw,
+            ObservationIdentity::from_observation(&animated)?.raw
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn animation_evidence_round_trips_byte_for_byte() -> Result<()> {
+        let mut observation = observation("request-a");
+        observation.animation = vec![
+            ArcFrame::new(1, 1, vec![1])?,
+            ArcFrame::new(2, 1, vec![2, 3])?,
+        ];
+        let mut session = AgentSession::default();
+        session.observe(&observation)?;
+
+        let restored: AgentSession = serde_json::from_slice(&serde_json::to_vec(&session)?)?;
+        assert_eq!(restored.observations[0].animation, observation.animation);
         Ok(())
     }
 

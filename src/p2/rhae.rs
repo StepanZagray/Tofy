@@ -5,7 +5,7 @@
 //! across games. This module recomputes RHAE from scorecard JSON returned by the
 //! official API; it does not estimate human baselines from recordings alone.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -106,42 +106,84 @@ pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
     for env in &card.environments {
         let total_levels = env
             .level_count
-            .and_then(|n| (n > 0).then_some(n as usize))
+            .filter(|&n| n > 0)
+            .map(|n| usize::try_from(n).context("scorecard level_count overflows usize"))
+            .transpose()?
             .or_else(|| {
                 env.runs
                     .first()
-                    .map(|run| run.number_of_levels.max(0) as usize)
+                    .and_then(|run| usize::try_from(run.number_of_levels).ok())
             })
             .unwrap_or(0);
 
         for run in &env.runs {
             n_runs += 1;
-            let per_level = if run.level_actions.len() == run.level_baseline_actions.len()
-                && !run.level_actions.is_empty()
+            let completed = match run.levels_completed {
+                Some(count) if count < 0 => bail!("scorecard levels_completed is negative"),
+                Some(count) => {
+                    usize::try_from(count).context("scorecard levels_completed overflows usize")?
+                }
+                None => run
+                    .level_actions
+                    .len()
+                    .max(run.level_baseline_actions.len())
+                    .max(run.level_scores.len()),
+            };
+            let per_level = if run.level_actions.len() >= completed
+                && run.level_baseline_actions.len() >= completed
+                && run.level_actions.len() == run.level_baseline_actions.len()
+                && run
+                    .level_actions
+                    .iter()
+                    .take(completed)
+                    .all(|&actions| actions > 0 && u32::try_from(actions).is_ok())
+                && run
+                    .level_baseline_actions
+                    .iter()
+                    .take(completed)
+                    .all(|&baseline| baseline > 0 && u32::try_from(baseline).is_ok())
             {
                 run.level_actions
                     .iter()
                     .zip(run.level_baseline_actions.iter())
-                    .map(|(&actions, &baseline)| level_score(baseline as u32, actions as u32))
-                    .collect::<Vec<_>>()
-            } else if !run.level_scores.is_empty() {
+                    .take(completed)
+                    .map(|(&actions, &baseline)| {
+                        Ok(level_score(
+                            u32::try_from(baseline).context("baseline action overflows u32")?,
+                            u32::try_from(actions).context("level action overflows u32")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else if run.level_scores.len() >= completed
+                && run
+                    .level_scores
+                    .iter()
+                    .take(completed)
+                    .all(|score| score.is_finite() && (0.0..=115.0).contains(score))
+            {
                 run.level_scores
                     .iter()
-                    .map(|&s| s / 100.0)
+                    .take(completed)
+                    .map(|&score| score / 100.0)
                     .collect::<Vec<_>>()
-            } else {
+            } else if completed == 0 {
                 Vec::new()
+            } else {
+                bail!(
+                    "scorecard has no valid per-level actions/baselines or level_scores for {completed} completed levels"
+                );
             };
-            let completed = run
-                .levels_completed
-                .map(|count| count.max(0) as usize)
-                .unwrap_or(per_level.len());
             let truncated: Vec<f64> = per_level.into_iter().take(completed).collect();
             let total = if total_levels > 0 {
                 total_levels
             } else {
-                run.number_of_levels.max(truncated.len() as i64) as usize
+                usize::try_from(run.number_of_levels)
+                    .unwrap_or(0)
+                    .max(truncated.len())
             };
+            if completed > total {
+                bail!("scorecard completed levels {completed} exceeds total levels {total}");
+            }
             if total > 0 {
                 game_scores.push(game_score(&truncated, total));
             }
@@ -238,5 +280,46 @@ mod tests {
         let bench = benchmark_from_scorecard_str(json).unwrap();
         assert_eq!(bench.api_score, Some(0.0));
         assert_eq!(bench.recomputed_rhae_percent, Some(0.0));
+    }
+
+    #[test]
+    fn unavailable_baseline_falls_back_to_valid_level_scores() {
+        let json = r#"{
+            "environments": [{
+                "level_count": 1,
+                "runs": [{
+                    "levels_completed": 1,
+                    "level_actions": [1],
+                    "level_baseline_actions": [-1],
+                    "level_scores": [0.0]
+                }]
+            }]
+        }"#;
+        let bench = benchmark_from_scorecard_str(json).unwrap();
+        assert_eq!(bench.recomputed_rhae_percent, Some(0.0));
+    }
+
+    #[test]
+    fn invalid_action_arrays_need_valid_score_fallback() {
+        let negative_actions = r#"{"environments":[{"level_count":1,"runs":[{"levels_completed":1,"level_actions":[-1],"level_baseline_actions":[1]}]}]}"#;
+        assert!(benchmark_from_scorecard_str(negative_actions).is_err());
+
+        let mismatched_lengths = r#"{"environments":[{"level_count":2,"runs":[{"levels_completed":2,"level_actions":[1],"level_baseline_actions":[1,1]}]}]}"#;
+        assert!(benchmark_from_scorecard_str(mismatched_lengths).is_err());
+    }
+
+    #[test]
+    fn completed_levels_cannot_exceed_total() {
+        let json = r#"{
+            "environments": [{
+                "level_count": 1,
+                "runs": [{
+                    "levels_completed": 2,
+                    "level_actions": [1, 1],
+                    "level_baseline_actions": [1, 1]
+                }]
+            }]
+        }"#;
+        assert!(benchmark_from_scorecard_str(json).is_err());
     }
 }
