@@ -1018,6 +1018,18 @@ impl TrainConfig {
             bail!("train_z_noise must be finite and >= 0");
         }
         self.branch_learning.validate(self.grad_accum)?;
+        let enabled_treatments = usize::from(self.copy_bypass_gate)
+            + usize::from(self.copy_gate_bias_prior.is_some())
+            + usize::from(self.grid_scaled_action_impulse)
+            + usize::from(self.decode_composition != DecodeComposition::LegacyHardGate)
+            + usize::from(self.positional_value_readout);
+        if enabled_treatments > 1 && !self.allow_multi_treatment_arm {
+            bail!(
+                "{enabled_treatments} model treatments are enabled; single-factor \
+                 attribution requires one per arm (set allow_multi_treatment_arm \
+                 to intentionally give that up)"
+            );
+        }
         if self.recipe == TrainingRecipe::FullV4 {
             self.validate_full_v4()?;
         } else if self.recipe == TrainingRecipe::FoundationV2 {
@@ -1215,18 +1227,6 @@ impl TrainConfig {
         canonical.allow_multi_treatment_arm = self.allow_multi_treatment_arm;
         if self != &canonical {
             bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
-        }
-        let enabled_treatments = usize::from(self.copy_bypass_gate)
-            + usize::from(self.copy_gate_bias_prior.is_some())
-            + usize::from(self.grid_scaled_action_impulse)
-            + usize::from(self.decode_composition != DecodeComposition::LegacyHardGate)
-            + usize::from(self.positional_value_readout);
-        if enabled_treatments > 1 && !self.allow_multi_treatment_arm {
-            bail!(
-                "{enabled_treatments} model treatments are enabled; single-factor \
-                 attribution requires one per arm (set allow_multi_treatment_arm \
-                 to intentionally give that up)"
-            );
         }
         if self.physical_batch < crate::p2::data::FACTUAL_BRANCHES_PER_GROUP {
             bail!(
@@ -1699,6 +1699,10 @@ struct TrainingContract {
     decode_composition: DecodeComposition,
     #[serde(default)]
     positional_value_readout: bool,
+    /// The multi-treatment attribution waiver is provenance: a resume that
+    /// flips it must fail the contract comparison.
+    #[serde(default)]
+    allow_multi_treatment_arm: bool,
     device: String,
     adam_beta1: f64,
     adam_beta2: f64,
@@ -1784,6 +1788,7 @@ impl From<&TrainConfig> for TrainingContract {
             grid_scaled_action_impulse: cfg.grid_scaled_action_impulse,
             decode_composition: cfg.decode_composition,
             positional_value_readout: cfg.positional_value_readout,
+            allow_multi_treatment_arm: cfg.allow_multi_treatment_arm,
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
             adam_beta2: adam.beta2,
@@ -4004,6 +4009,19 @@ fn foundation_v2_rollout_loss(
     mixed: &MixedStreamBatch,
     device: &Device,
 ) -> Result<(Tensor, usize)> {
+    foundation_v2_rollout_loss_inner(model, mixed, device, false)
+}
+
+/// `detach_open_loop_input` exists only for the gradient-attribution premise
+/// test: detaching `first_out.y` before transition two isolates the
+/// first-transition contribution to the core gradient. Production always
+/// passes `false`.
+fn foundation_v2_rollout_loss_inner(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+    detach_open_loop_input: bool,
+) -> Result<(Tensor, usize)> {
     let mut fragments =
         BTreeMap::<(u64, u64, String), Vec<(&TransitionSample, &ContentMask)>>::new();
     for sample in mixed
@@ -4054,9 +4072,14 @@ fn foundation_v2_rollout_loss(
         None,
         RecursionOpts::training(true),
     )?;
-    let h1_canonical = model.canonical_representation(&first_out.y)?;
+    let open_loop_input = if detach_open_loop_input {
+        first_out.y.detach()
+    } else {
+        first_out.y.clone()
+    };
+    let h1_canonical = model.canonical_representation(&open_loop_input)?;
     let second_out = model.full_v4_training_latents_from_encoded_state(
-        &first_out.y,
+        &open_loop_input,
         &h1_canonical,
         &second_batch.actions,
         &second_batch.action_coords,
@@ -9892,7 +9915,13 @@ mod tests {
             cfg.model_config(),
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
+        // Launch-faithful initialization: production restores these
+        // immediately after the generic reinit, so the premise must hold for
+        // the exact weights a run starts from.
         reinit_varmap_deterministic(&varmap, 23)?;
+        zero_action_film_projections(&varmap)?;
+        zero_copy_bypass_gate(&varmap)?;
+        restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
 
         let small = compose_mixed_stream_batch(
             &MixedStreamConfig {
@@ -9925,18 +9954,33 @@ mod tests {
         assert!(fragments >= FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
         let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         assert!(value.is_finite() && value > 0.0, "rollout loss {value}");
-        let grads = loss.backward()?;
-        let core_grad = {
+        let core_grad_vec = |loss: &Tensor| -> Result<Vec<f32>> {
+            let grads = loss.backward()?;
             let data = varmap.data().lock().unwrap();
             let weight = data.get("block.c1.weight").expect("core weight exists");
-            grads
+            Ok(grads
                 .get(weight.as_tensor())
                 .expect("rollout loss must reach the recurrent core")
-                .abs()?
-                .max_all()?
-                .to_scalar::<f32>()?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
         };
-        assert!(core_grad.is_finite() && core_grad > 0.0);
+        let attached = core_grad_vec(&loss)?;
+        assert!(attached
+            .iter()
+            .all(|g| g.is_finite() && attached.iter().any(|g| *g != 0.0)));
+        // Attribution control: detaching the open-loop input isolates the
+        // first transition's contribution. A shared core means a nonzero
+        // final gradient alone cannot prove the graph traverses transition
+        // one; the attached/detached difference can.
+        let (detached_loss, _) = foundation_v2_rollout_loss_inner(&model, &full, &device, true)?;
+        let detached = core_grad_vec(&detached_loss)?;
+        assert!(
+            attached
+                .iter()
+                .zip(&detached)
+                .any(|(a, d)| (a - d).abs() > 0.0),
+            "first open-loop transition contributes no core gradient"
+        );
         Ok(())
     }
 
@@ -9962,11 +10006,38 @@ mod tests {
             model_cfg.decode_composition,
             DecodeComposition::JointCopyMixture
         );
-        // A resume across arms must fail closed: the contract differs.
+        // A resume across arms must fail closed: every treatment field and
+        // the waiver must individually break contract equality.
         let contract = TrainingContract::from(&cfg);
-        let mut control = cfg.clone();
-        control.copy_bypass_gate = false;
-        assert_ne!(contract, TrainingContract::from(&control));
+        let variants: [fn(&mut TrainConfig); 6] = [
+            |c| c.copy_bypass_gate = false,
+            |c| c.copy_gate_bias_prior = None,
+            |c| c.grid_scaled_action_impulse = false,
+            |c| c.decode_composition = DecodeComposition::LegacyHardGate,
+            |c| c.positional_value_readout = !c.positional_value_readout,
+            |c| c.allow_multi_treatment_arm = false,
+        ];
+        for mutate in variants {
+            let mut control = cfg.clone();
+            mutate(&mut control);
+            assert_ne!(
+                contract,
+                TrainingContract::from(&control),
+                "a treatment field failed to participate in the resume contract"
+            );
+        }
+        // Applicability is enforced for the silently-inert combinations.
+        let mut inert = ModelConfig {
+            spatial_action_field: false,
+            world_core_v2: false,
+            grid_scaled_action_impulse: true,
+            ..ModelConfig::default()
+        };
+        assert!(inert.validate().is_err());
+        inert.grid_scaled_action_impulse = false;
+        inert.decode_composition = DecodeComposition::JointCopyMixture;
+        assert!(!inert.world_core_v4);
+        assert!(inert.validate().is_err());
         Ok(())
     }
 }

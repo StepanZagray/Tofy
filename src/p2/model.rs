@@ -283,6 +283,19 @@ impl ModelConfig {
                  the GlobalMean topology would silently ignore it"
             );
         }
+        if self.grid_scaled_action_impulse && !(self.world_core_v2 || self.spatial_action_field) {
+            bail!(
+                "grid_scaled_action_impulse requires the spatial action field; \
+                 without it the treatment silently does nothing while the \
+                 contract labels the run a treatment arm"
+            );
+        }
+        if self.decode_composition != DecodeComposition::LegacyHardGate && !self.world_core_v4 {
+            bail!(
+                "decode_composition treatments require the world-core-v4 exact \
+                 decoder; without it the flag silently does nothing"
+            );
+        }
         if self.world_core_v3 && !self.world_core_v2 {
             bail!("world_core_v3 requires the world_core_v2 base topology");
         }

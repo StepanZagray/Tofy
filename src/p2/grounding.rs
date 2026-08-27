@@ -238,6 +238,19 @@ impl ExactPatchGrounding {
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         let gate = self.copy_gate(predicted)?.detach();
+        // Fail closed on numerical corruption: comparison ops treat NaN as
+        // false, so a NaN gate or logit row would otherwise decode as a
+        // spuriously valid copy and inflate copy-heavy exactness metrics.
+        for (tensor, label) in [(&logits, "gameplay logits"), (&gate, "copy gate")] {
+            let sum = tensor
+                .to_dtype(DType::F32)?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+            ensure!(
+                sum.is_finite(),
+                "composed decode received non-finite {label}"
+            );
+        }
         match self.composition {
             DecodeComposition::LegacyHardGate => {
                 let predicted_pixels = logits.argmax(D::Minus1)?;
@@ -577,6 +590,32 @@ mod tests {
             "grounding_head.decoder.weight",
             &[PALETTE_SIZE, 128],
         ));
+    }
+
+    #[test]
+    fn composed_decode_fails_closed_on_non_finite_latents() -> Result<()> {
+        // Comparison ops treat NaN as false, so without the guard a NaN gate
+        // or logit row decodes as a spuriously valid copy.
+        let device = candle_core::Device::Cpu;
+        let vars = VarMap::new();
+        for composition in [
+            DecodeComposition::LegacyHardGate,
+            DecodeComposition::JointCopyMixture,
+        ] {
+            let head = ExactPatchGrounding::new(
+                4,
+                4,
+                None,
+                composition,
+                VarBuilder::from_varmap(&vars, DType::F32, &device),
+            )?;
+            let current = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
+            let finite = Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?;
+            head.compose_gameplay_pixels(&finite, &current)?;
+            let poisoned = Tensor::full(f32::NAN, (1, 4, 16, 16), &device)?;
+            assert!(head.compose_gameplay_pixels(&poisoned, &current).is_err());
+        }
+        Ok(())
     }
 
     #[test]
