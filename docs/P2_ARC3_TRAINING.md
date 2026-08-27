@@ -36,7 +36,7 @@ the exact source, binary, build, hardware, batch, and preflight hashes. Full V4
 rejects gradient accumulation above one so the EP population matches the
 physical batch.
 
-## Eval (schema `p2.eval_report.v15`)
+## Eval (schema `p2.eval_report.v17`)
 
 Split held-out probes aligned with training stages:
 
@@ -56,9 +56,40 @@ open-loop endpoints are persisted at H4 and H8; H1 is the one-step report.
 Visible-input collision ceilings and same-state factual-outcome retrieval are
 reported separately from action-ID recovery.
 
+Content false edits are measured only inside each provenance content rectangle;
+padding hallucinations and fixed-frame exactness are separate diagnostics. V5
+gate evaluation consumes the generator's exact translated content masks and
+reports raw-decoder and composed-copy-gate exactness separately. The source-local
+shuffled-action control uses an independent deterministic cyclic permutation and
+reports total, eligible, and genuinely changed `(id,x,y)` tuple counts. It leaves
+outcome-changing tuples unknown unless simulator truth is available; it never
+infers causal positives from a changed input alone.
+
 Every transition carries explicit content dimensions, source kind, and a stable
 trajectory ID. The bottom status row is counted separately and excluded from
 the exact decoder. ACTION5 and ACTION6 retain distinct source kinds.
+
+## Live driver (schema `p2.arc3_live_report.v3`)
+
+- Opening `RESET` is unscoped. A recoverable `GAME_OVER` may use a GUID-scoped
+  level retry, bounded by `--max-level-retries`; competition mode makes that
+  retry safe, while general mode requires a confirmed action since the last
+  reset or level transition.
+- `full_reset`, GUID, and level-regression checks fail closed. Transport/body/
+  parse ambiguity for ACTION or RESET is reported separately from confirmed
+  actions, and scorecard closure is still attempted.
+- The report persists driver options, attempted and confirmed action counts,
+  per-level budgets/retries, ambiguous mutations, and unexpected full resets.
+  Policy lifecycle hooks clear session/level retry history deterministically.
+- Every animation layer is preserved in the observation. The current model
+  policy still scores the settled final frame, so temporal animation use remains
+  an explicit model limitation rather than silently discarded API data.
+- ACTION6 row 63 is excluded when it is uniform background/padding and included
+  in both candidate enumeration and tried-state hashing when it has visible
+  non-background content.
+- API mutation responses must carry `full_reset`; a missing field is treated as
+  ambiguous, while `full_reset=true` after ACTION fails closed before action
+  confirmation.
 
 ## Diagnostic checkpoints and provenance
 
@@ -78,4 +109,5 @@ seal succeeds.
 
 - Public ARC game recordings (transfer eval only).
 - `available_actions` API masking (inference harness).
-- Animation frame sequences (importer uses settled last frame, same as `arc3`).
+- Animation-conditioned modeling (live observations preserve every layer, but
+  the current model and training importer consume only the settled final frame).

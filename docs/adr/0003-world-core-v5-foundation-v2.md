@@ -14,6 +14,43 @@
 - Live policy stays a searchless forward pass.
 - Deterministic seeds, persisted config, checkpoint bundles with manifests.
 
+## Implementation corrections (2026-08-27, before another run)
+
+- The historical changed/unchanged CE remains the default exactly. Alternative
+  weighting constructions redistribute the same per-batch coefficient mass as
+  that default. This preserves nominal coefficient mass, not gradient norm,
+  direction, or clipping pressure; those remain measured experiment outputs.
+  A configured changed budget is a loss-coefficient share, not a claimed
+  gradient share. The unrelated current-frame foreground CE is fixed.
+- Objective and promotion fields are part of the resume contract. Matched-arm
+  launch orchestration remains external/deferred because a bare JSON loader
+  cannot establish reviewed-source, binary, smoke-test, and population
+  provenance. The selected best checkpoint now exports its EMA weights;
+  latest-final EMA is only the fallback when no best exists.
+- The v5 event census persists labeled/positive counts for all four slots, but
+  `exhausted` is deliberately unlabelled: its required action-budget premise is
+  absent from the event head input. Goal-dependent slots are also masked on
+  goal-dropout rows. A completeness marker prevents a pre-census checkpoint
+  resume from presenting partial post-resume counts as the full population.
+  The gate seed is reserved from training, and meta-episode level IDs occupy a
+  checked namespace.
+- Spatial latent Huber, its canonical companion, rollout Huber, EP inputs, and
+  displacement-based branch/inverse-action objectives use the exact content
+  mask. The transition/observer canonical path remains unmasked because live
+  frames do not expose a content rectangle.
+- Exact decoders, copy gates, and action decoders stay on AdamW with the other
+  output heads. The WSD schedule reaches its final learning rate even in short
+  smoke schedules.
+- No model-quality claim follows from these corrections. They have compile,
+  deterministic-generator, and objective tests only until a fresh registered
+  multi-seed experiment is run.
+- The evidence order is the proved local library first (`CrossEntropy`,
+  `Identifiability`, `MarginalBlindness`, `Separation`, `Symmetrization`), then
+  current primary literature. Those proofs establish only their local stated
+  properties. Current 2026 Muon convergence counterexamples make optimizer
+  routing conservative; large-model Muon usage is not transferred as a Tofy
+  guarantee.
+
 ## 1. Data contract (fixes RC5, geometry pathology, transfer defects)
 
 1. **Mixed stream, no lessons.** One stationary-schedule mixture per batch,
@@ -29,8 +66,8 @@
    pairwise board-effect equivalence (status-row-free).
 3. **Geometry randomization** (RC3/RC4): content size sampled from
    {7,8,10,12,16,24,32} (log-skewed toward small), placed uniformly at random
-   in the 64×64 canvas. Provenance content rect kept exact; all losses receive
-   the content mask. Held-out splits: unseen-seed 7×7, 8×8 composition
+   in the 64×64 canvas. Provenance content rect kept exact; pixel and auxiliary
+   reconstruction losses receive the content mask. Held-out splits: unseen-seed 7×7, 8×8 composition
    (existing), plus translated-7×7 and 16×16 splits.
 4. **Symmetry augmentation** (Lean: `Symmetrization.lean`): per-sample color
    permutation over colors 1–15 (0 fixed), consistent across
@@ -84,7 +121,7 @@ Weights are initial; the gradient-budget controller (below) adapts EP only.
    steps measure encoder-gradient L2 of L_ep vs L_pred_ce; rescale EP weight so
    its gradient norm ≤ 0.3× the prediction gradient norm. Log both. EP stays
    marginal (LeJEPA), population = current+next canonical states.
-7. **L_rollout (0.02)**: open-loop horizon 2 ONLY, computed on ≥64 batched
+7. **L_rollout (0.02)**: open-loop horizon 2 ONLY, computed on ≥16 batched
    traces (RC6). No horizon progression. Auto-disabled if the one-step
    changed-exact gate regresses.
 8. **Observer heads** (concurrent, detached inputs): Q/reliability trained on
@@ -97,10 +134,13 @@ Weights are initial; the gradient-budget controller (below) adapts EP only.
   tiny/degenerate matrices → Adam.
 - **WSD schedule**: 500-step warmup → stable 1e-3 → cosine decay to 1e-4 over
   the final 15%. EMA (decay 0.999) maintained; eval uses EMA weights.
-- Batch 2048 physical; grad clip: **two clip groups** — (L_pred_ce + L_gate +
-  L_latent + branch terms) and (L_ep) clipped separately at 1.0 and 0.25.
+- Batch 2048 is the nominal target; launch preflight selects the largest stable
+  physical batch. The EP controller first limits its encoder pressure, then one
+  combined global L2 clip at 1.0 is applied to the complete objective.
 - 24,576 steps total. Checkpoint every 256; permanent eval bundle every 2048;
-  **best-checkpoint tracking** by held-out changed-exact (RC6).
+  **best-checkpoint tracking** by the configured held-out exactness metric
+  (historical default: changed-exact); the exported evaluation model is the
+  selected checkpoint's EMA.
 
 ## 5. Run gates (automated, in-trainer; RC2/RC6 would have been caught)
 
@@ -117,9 +157,9 @@ sealed diagnostic bundle:
    8192 — a decoder-collapse floor. Amendment 2026-08-26: originally ≥ 0.85
    after step 4096; the first launch measured a stable asymptote near 0.67
    (0.639 → 0.675 over steps 4096–9216) while changed-exact climbed 0.42 →
-   0.51 — the aspirational bar aborted a healthy run at step 9216, so the
-   threshold now sits below the observed asymptote to catch only genuine
-   regression.
+   0.51. That historical instrumented run was not independent healthy evidence;
+   the threshold was relaxed only as an internal collapse detector, not as a
+   promotion result.
 4. One-step changed-exact within 20% of its running best (collapse detector)
    — active from the first evaluation, since it is relative to the run's own
    best. Amendment 2026-08-25: gates 1–2 originally enforced from step 1024
@@ -133,10 +173,20 @@ sealed diagnostic bundle:
 Changed-transition stratification via `noop == Some(false)`; shuffled control
 partitioned by `provenance.source_kind`; action-masked control uses a trained
 NULL action embedding (id 0 added to training range with no-op semantics);
-content-mask metrics reported per-source only; rollout/one-step populations
-unified or labeled non-comparable; h16 rows populated or removed; live/train
-row-63 handling documented; add action-controllability probe (Δ latent across
-actions, Genie-style) and ambiguity-ceiling measurement to the eval report.
+content-mask metrics reported per-source only; full-frame exactness is separate
+from changed exactness; content false edits and padding hallucinations are
+separate; shuffled controls record genuinely changed tuple counts;
+rollout/one-step populations unified or labeled non-comparable; h16 rows
+populated or removed; live/train row-63 handling documented; add
+action-controllability probe (Δ latent across actions, Genie-style) and
+ambiguity-ceiling measurement to the eval report. Foundation-v2 Q calibration
+uses the same exact composed-transition labels as its training contract.
+The fixed in-trainer gate is fingerprinted and explicitly `selection_only`:
+it may choose a checkpoint but cannot satisfy a promotion claim. Promotion
+requires a fresh untouched, preregistered, multi-seed evaluation population.
+For shuffled actions the report distinguishes total rows, eligible rows, and
+genuinely changed input tuples; outcome-changing tuples remain `null` unless a
+simulator sidecar can establish them rather than guessing from model output.
 
 ## 7. Explicitly deferred (next iteration, not this run)
 

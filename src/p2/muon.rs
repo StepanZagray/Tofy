@@ -20,7 +20,7 @@ const MUON_MIN_SIDE: usize = 8;
 /// embeddings, prediction heads, norm scales, biases.
 const ADAMW_NAME_FRAGMENTS: &[&str] = &[
     "embed", "emb", // pixel_emb, action_emb
-    "head", "norm", "ln", "bias", "pos", "token", "lm_head",
+    "head", "decoder", "gate", "norm", "ln", "bias", "pos", "token", "lm_head",
 ];
 
 /// Leading `[rows, cols]` for a weight tensor (conv/linear flattened on trailing dims).
@@ -144,6 +144,9 @@ mod tests {
         assert!(!uses_muon("q_head.weight", &[1, 128]));
         assert!(!uses_muon("reliability_head.weight", &[1, 128]));
         assert!(!uses_muon("prefix_head.weight", &[128, 256]));
+        assert!(!uses_muon("grounding.decoder.weight", &[16, 128]));
+        assert!(!uses_muon("grounding.copy_gate.weight", &[1, 128]));
+        assert!(!uses_muon("action_decoder.weight", &[8, 128]));
         // Muon: hidden conv / block weights
         assert!(uses_muon("block.c1.weight", &[128, 128, 3, 3]));
         assert!(uses_muon("encoder.patch.weight", &[32, 8, 4, 4]));

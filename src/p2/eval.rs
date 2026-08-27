@@ -9,8 +9,8 @@ use crate::p2::board_probe::{
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
     generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, palette,
-    ArcAction, BranchGroup, FactualBatch, TransitionSample, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE,
-    ORACLE_LATENT_DIM,
+    ArcAction, BranchGroup, ContentMask, ContentRect, FactualBatch, TransitionSample,
+    FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -25,14 +25,14 @@ use crate::p2::rhae::{
 };
 use crate::p2::semantic_eval::{
     action_controllability_probe, aggregate_decoder_metrics, ambiguity_ceiling, collision_census,
-    evaluate_semantics, latent_semantic_metrics, shuffled_action_control_samples,
-    ActionControllabilityMetrics, AmbiguityCeiling, CollisionCensus, SemanticDecoderMetrics,
-    SemanticEvaluation,
+    evaluate_semantics_with_control, latent_semantic_metrics, shuffled_action_control_samples,
+    ActionControllabilityMetrics, AmbiguityCeiling, CollisionCensus, SemanticControlConfig,
+    SemanticDecoderMetrics, SemanticEvaluation,
 };
 use crate::p2::train::{
-    action_tensors_from_samples, batch_from_samples, load_train_config, load_varmap_exact,
-    model_sigreg_losses_for_encoded_pair, resolve_device, verify_checkpoint_bundle, BatchTensors,
-    TrainConfig,
+    action_tensors_from_samples, batch_from_samples, foundation_v2_graded_q_targets,
+    load_train_config, load_varmap_exact, model_sigreg_losses_for_encoded_pair, resolve_device,
+    verify_checkpoint_bundle, BatchTensors, TrainConfig,
 };
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v16";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v17";
 pub const ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD: f64 = 1e-3;
 
 fn log_eval_phase(phase: &str, detail: &str, elapsed: Duration) {
@@ -396,6 +396,17 @@ pub struct ChangedTransitionMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateSupportMetrics {
     pub samples: usize,
+    /// SHA-256 of the exact ordered serialized transition rows.
+    #[serde(default)]
+    pub population_fingerprint: String,
+    /// SHA-256 of the exact ordered V5 content masks when the caller supplies
+    /// them. `None` identifies the legacy origin-aligned fallback.
+    #[serde(default)]
+    pub content_mask_fingerprint: Option<String>,
+    /// This population participates in stopping/objective/checkpoint choices;
+    /// it is selection-only evidence, never an untouched confirmation set.
+    #[serde(default)]
+    pub evidence_class: String,
     pub changed_transitions: usize,
     pub changed_pixels: usize,
     pub foreground_pixels: usize,
@@ -404,11 +415,49 @@ pub struct GateSupportMetrics {
     /// Shuffled-action changed-pixel accuracy divided by true-action
     /// changed-pixel accuracy; lower means stronger action conditioning.
     pub shuffled_action_changed_pixel_ratio: Option<f64>,
+    /// Rows in the shuffled-action control population.
+    #[serde(default)]
+    pub shuffled_action_rows: usize,
+    /// Rows belonging to a source-local group with at least two donors.
+    #[serde(default)]
+    pub shuffled_action_eligible_rows: usize,
+    /// Rows whose complete `(id,x,y)` tuple genuinely changed after the
+    /// source-local marginal-preserving shuffle.
+    #[serde(default)]
+    pub shuffled_action_changed_tuples: usize,
+    /// Rows where the alternative tuple is known to change the simulator
+    /// outcome. `None` because `TransitionSample` has no counterfactual
+    /// simulator/operator sidecar; tuple sensitivity must not be read as
+    /// correct alternative-state prediction.
+    #[serde(default)]
+    pub shuffled_action_outcome_changing_tuples: Option<usize>,
     /// Exact-decoder pixel accuracy on non-empty pixels of the encoded next state.
     pub foreground_reconstruction_accuracy: Option<f64>,
     /// Fraction of Changed Transitions whose every factually changed gameplay
     /// pixel is decoded exactly from the one-step prediction.
     pub one_step_changed_exact: Option<f64>,
+    /// Diagnostic only: fraction of the same Changed Transitions whose entire
+    /// status-excluded gameplay frame (changed and unchanged pixels alike) is
+    /// decoded exactly by the composed copy-gate output used at inference.
+    #[serde(default)]
+    pub one_step_full_exact: Option<f64>,
+    /// Raw exact-decoder counterpart to `one_step_full_exact`, retained to
+    /// distinguish palette-head errors from copy-gate composition errors.
+    #[serde(default)]
+    pub one_step_raw_full_exact: Option<f64>,
+    /// Diagnostic only: fraction of factually unchanged pixels inside each
+    /// sample's exact content rectangle that the composed decode edits.
+    #[serde(default)]
+    pub false_edit_rate: Option<f64>,
+    /// Diagnostic only: fraction of unchanged padding pixels hallucinated by
+    /// the composed decode, reported separately from content false edits.
+    #[serde(default)]
+    pub padding_false_edit_rate: Option<f64>,
+    /// Raw exact-decoder false-edit counterparts, retained as diagnostics.
+    #[serde(default)]
+    pub raw_false_edit_rate: Option<f64>,
+    #[serde(default)]
+    pub raw_padding_false_edit_rate: Option<f64>,
     pub population_contract: String,
 }
 
@@ -2224,10 +2273,12 @@ fn gameplay_pixels(sample: &TransitionSample) -> (&[u8], &[u8]) {
 
 pub fn shuffled_action_changed_pixel_ratio(
     samples: &[TransitionSample],
+    shuffled_samples: &[TransitionSample],
     true_action_predictions: &[Vec<u8>],
     shuffled_action_predictions: &[Vec<u8>],
 ) -> Result<Option<f64>> {
     if samples.len() != true_action_predictions.len()
+        || samples.len() != shuffled_samples.len()
         || samples.len() != shuffled_action_predictions.len()
     {
         bail!("gate changed-pixel rows do not match the sample count");
@@ -2235,12 +2286,13 @@ pub fn shuffled_action_changed_pixel_ratio(
     let mut changed_pixels = 0usize;
     let mut true_correct = 0usize;
     let mut shuffled_correct = 0usize;
-    for ((sample, true_prediction), shuffled_prediction) in samples
+    for (((sample, shuffled_sample), true_prediction), shuffled_prediction) in samples
         .iter()
+        .zip(shuffled_samples)
         .zip(true_action_predictions)
         .zip(shuffled_action_predictions)
     {
-        if !is_board_changed_transition(sample) {
+        if sample.action == shuffled_sample.action || !is_board_changed_transition(sample) {
             continue;
         }
         let (current, target) = gameplay_pixels(sample);
@@ -2331,6 +2383,94 @@ pub fn one_step_changed_exact(
     Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
 }
 
+/// Full-transition exactness on the same changed-transition rows counted by
+/// `one_step_changed_exact`: every status-excluded gameplay pixel, unchanged
+/// pixels included, must be decoded exactly.
+pub fn one_step_full_exact(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+) -> Result<Option<f64>> {
+    if samples.len() != one_step_predictions.len() {
+        bail!("gate one-step rows do not match the sample count");
+    }
+    let mut transitions = 0usize;
+    let mut exact = 0usize;
+    for (sample, prediction) in samples.iter().zip(one_step_predictions) {
+        if !is_board_changed_transition(sample) {
+            continue;
+        }
+        let (current, target) = gameplay_pixels(sample);
+        if prediction.len() != target.len() || current.len() != target.len() {
+            bail!("gate one-step prediction width does not match gameplay target");
+        }
+        let changed_pixels = current.iter().zip(target).filter(|(a, b)| a != b).count();
+        if changed_pixels == 0 {
+            continue;
+        }
+        transitions += 1;
+        exact += usize::from(prediction.iter().zip(target).all(|(a, b)| a == b));
+    }
+    Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
+}
+
+/// Fraction of factually unchanged gameplay pixels edited by the one-step
+/// decode, measured over every supplied row (`1 -` unchanged-pixel accuracy).
+pub fn one_step_false_edit_rate(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+    padding: bool,
+) -> Result<Option<f64>> {
+    one_step_false_edit_rate_with_content_masks(samples, one_step_predictions, None, padding)
+}
+
+pub fn one_step_false_edit_rate_with_content_masks(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+    content_masks: Option<&[ContentMask]>,
+    padding: bool,
+) -> Result<Option<f64>> {
+    if samples.len() != one_step_predictions.len() {
+        bail!("gate one-step rows do not match the sample count");
+    }
+    if content_masks.is_some_and(|masks| masks.len() != samples.len()) {
+        bail!("gate content-mask rows do not match the sample count");
+    }
+    if content_masks.is_some_and(|masks| {
+        masks
+            .iter()
+            .any(|mask| mask.values.len() != FRAME_SIDE * FRAME_SIDE)
+    }) {
+        bail!("gate content mask is not fixed 64x64");
+    }
+    let mut unchanged = 0usize;
+    let mut edited = 0usize;
+    for (row, (sample, prediction)) in samples.iter().zip(one_step_predictions).enumerate() {
+        let (current, target) = gameplay_pixels(sample);
+        if prediction.len() != target.len() || current.len() != target.len() {
+            bail!("gate one-step prediction width does not match gameplay target");
+        }
+        let content_width = usize::from(sample.provenance.content_width).min(FRAME_SIDE);
+        let content_height = usize::from(sample.provenance.content_height).min(FRAME_SIDE - 1);
+        for (index, ((before, after), predicted)) in
+            current.iter().zip(target).zip(prediction).enumerate()
+        {
+            if before != after {
+                continue;
+            }
+            let in_content = match content_masks {
+                Some(masks) => masks[row].values[index] != 0,
+                None => index % FRAME_SIDE < content_width && index / FRAME_SIDE < content_height,
+            };
+            if in_content == padding {
+                continue;
+            }
+            unchanged += 1;
+            edited += usize::from(predicted != after);
+        }
+    }
+    Ok((unchanged > 0).then_some(edited as f64 / unchanged as f64))
+}
+
 fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<Vec<u8>>> {
     let batch = latent.dim(0)?;
     model
@@ -2350,16 +2490,51 @@ pub fn evaluate_gate_support(
     samples: &[TransitionSample],
     device: &Device,
 ) -> Result<GateSupportMetrics> {
+    evaluate_gate_support_with_content_masks(model, samples, None, device)
+}
+
+/// Foundation-v2 gate evaluation with the exact V5 content-mask sidecar.
+/// Legacy callers may use [`evaluate_gate_support`], whose origin-aligned
+/// fallback is valid for the non-translated curriculum rows it accepts.
+pub fn evaluate_gate_support_with_content_masks(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    content_masks: Option<&[ContentMask]>,
+    device: &Device,
+) -> Result<GateSupportMetrics> {
+    if content_masks.is_some_and(|masks| masks.len() != samples.len()) {
+        bail!("gate content-mask rows do not match the sample count");
+    }
+    let population_fingerprint =
+        format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(samples)?));
+    let content_mask_fingerprint = content_masks
+        .map(|masks| {
+            serde_json::to_vec(masks).map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+        })
+        .transpose()?;
     if samples.is_empty() {
         return Ok(GateSupportMetrics {
             samples: 0,
+            population_fingerprint,
+            content_mask_fingerprint,
+            evidence_class: "selection_only".into(),
             changed_transitions: 0,
             changed_pixels: 0,
             foreground_pixels: 0,
             improvement_fraction: None,
             shuffled_action_changed_pixel_ratio: None,
+            shuffled_action_rows: 0,
+            shuffled_action_eligible_rows: 0,
+            shuffled_action_changed_tuples: 0,
+            shuffled_action_outcome_changing_tuples: None,
             foreground_reconstruction_accuracy: None,
             one_step_changed_exact: None,
+            one_step_full_exact: None,
+            one_step_raw_full_exact: None,
+            false_edit_rate: None,
+            padding_false_edit_rate: None,
+            raw_false_edit_rate: None,
+            raw_padding_false_edit_rate: None,
             population_contract: "caller-owned fixed held-out transition set; empty population"
                 .into(),
         });
@@ -2373,6 +2548,21 @@ pub fn evaluate_gate_support(
         .forward_from_latent(&current, &batch.actions, &batch.action_coords, &batch.goals)?
         .y;
     let shuffled = shuffled_action_control_samples(samples);
+    let mut source_counts = BTreeMap::<&str, usize>::new();
+    for sample in samples {
+        *source_counts
+            .entry(sample.provenance.source_kind.as_str())
+            .or_default() += 1;
+    }
+    let shuffled_action_eligible_rows = samples
+        .iter()
+        .filter(|sample| source_counts[sample.provenance.source_kind.as_str()] >= 2)
+        .count();
+    let shuffled_action_changed_tuples = samples
+        .iter()
+        .zip(&shuffled)
+        .filter(|(factual, control)| factual.action != control.action)
+        .count();
     let (shuffled_actions, shuffled_coords) = action_tensors_from_samples(&shuffled, device)?;
     let shuffled_prediction = model
         .forward_from_latent(&current, &shuffled_actions, &shuffled_coords, &batch.goals)?
@@ -2393,6 +2583,11 @@ pub fn evaluate_gate_support(
         .map(|index| copy_errors[*index])
         .collect::<Vec<_>>();
     let true_predictions = exact_palette_predictions(model, &prediction)?;
+    let composed_predictions = model
+        .composed_gameplay_decode(&prediction, &batch.frames)?
+        .reshape((samples.len(), (FRAME_SIDE - 1) * FRAME_SIDE))?
+        .to_dtype(DType::U8)?
+        .to_vec2::<u8>()?;
     let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
     let target_reconstructions = exact_palette_predictions(model, &target)?;
     let changed_pixels = samples
@@ -2415,21 +2610,55 @@ pub fn evaluate_gate_support(
         .sum();
     Ok(GateSupportMetrics {
         samples: samples.len(),
+        population_fingerprint,
+        content_mask_fingerprint,
+        evidence_class: "selection_only".into(),
         changed_transitions: changed_indices.len(),
         changed_pixels,
         foreground_pixels,
         improvement_fraction: improvement_fraction(&changed_learned, &changed_copy),
         shuffled_action_changed_pixel_ratio: shuffled_action_changed_pixel_ratio(
             samples,
+            &shuffled,
             &true_predictions,
             &shuffled_predictions,
         )?,
+        shuffled_action_rows: samples.len(),
+        shuffled_action_eligible_rows,
+        shuffled_action_changed_tuples,
+        shuffled_action_outcome_changing_tuples: None,
         foreground_reconstruction_accuracy: foreground_reconstruction_accuracy(
             samples,
             &target_reconstructions,
         )?,
         one_step_changed_exact: one_step_changed_exact(samples, &true_predictions)?,
-        population_contract: "caller-owned fixed held-out transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; complete action tuples shuffled only within provenance.source_kind; one encode batch plus true/shuffled forwards".into(),
+        one_step_full_exact: one_step_full_exact(samples, &composed_predictions)?,
+        one_step_raw_full_exact: one_step_full_exact(samples, &true_predictions)?,
+        false_edit_rate: one_step_false_edit_rate_with_content_masks(
+            samples,
+            &composed_predictions,
+            content_masks,
+            false,
+        )?,
+        padding_false_edit_rate: one_step_false_edit_rate_with_content_masks(
+            samples,
+            &composed_predictions,
+            content_masks,
+            true,
+        )?,
+        raw_false_edit_rate: one_step_false_edit_rate_with_content_masks(
+            samples,
+            &true_predictions,
+            content_masks,
+            false,
+        )?,
+        raw_padding_false_edit_rate: one_step_false_edit_rate_with_content_masks(
+            samples,
+            &true_predictions,
+            content_masks,
+            true,
+        )?,
+        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (legacy origin-aligned fallback otherwise); complete action tuples use the maximum-change cyclic shuffle within provenance.source_kind; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
     })
 }
 
@@ -2654,6 +2883,28 @@ fn eval_q_labels(q_logit: &Tensor, labels: &[f32]) -> Result<QEvalAccum> {
         }
     }
     Ok(out)
+}
+
+fn origin_content_tensor(samples: &[TransitionSample], device: &Device) -> Result<Tensor> {
+    let mut values = Vec::with_capacity(samples.len() * (FRAME_SIDE - 1) * FRAME_SIDE);
+    for sample in samples {
+        let rect = ContentRect {
+            x: 0,
+            y: 0,
+            width: u8::try_from(sample.provenance.content_width)
+                .context("content width does not fit u8")?,
+            height: u8::try_from(sample.provenance.content_height)
+                .context("content height does not fit u8")?,
+        };
+        let mask = ContentMask::from_rect(rect)?;
+        values.extend(
+            mask.values[..(FRAME_SIDE - 1) * FRAME_SIDE]
+                .iter()
+                .map(|&value| f32::from(value)),
+        );
+    }
+    Tensor::from_vec(values, (samples.len(), FRAME_SIDE - 1, FRAME_SIDE), device)
+        .map_err(Into::into)
 }
 
 fn ptrm_metrics_for_k(
@@ -2935,20 +3186,32 @@ fn eval_one_batch(
             }
         }
 
-        let exact_q_labels = (train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FullV4)
-            .then(|| -> Result<Vec<f32>> {
-                Ok(model
+        let observer_q_labels = match train_cfg.recipe {
+            crate::p2::experiment::TrainingRecipe::FullV4 => Some(
+                model
                     .exact_transition_correctness(&out.y, &batch.frames, &batch.next_frames)?
                     .flatten_all()?
-                    .to_vec1::<f32>()?)
-            })
-            .transpose()?;
-        partial.q_acc = if let Some(labels) = &exact_q_labels {
+                    .to_vec1::<f32>()?,
+            ),
+            crate::p2::experiment::TrainingRecipe::FoundationV2 => Some(
+                foundation_v2_graded_q_targets(
+                    model,
+                    &out.y,
+                    &batch.frames,
+                    &batch.next_frames,
+                    &origin_content_tensor(chunk, device)?,
+                )?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            ),
+            _ => None,
+        };
+        partial.q_acc = if let Some(labels) = &observer_q_labels {
             eval_q_labels(&out.q_logit, labels)?
         } else {
             eval_q(&out.q_logit, &mses, cfg.q_mse_threshold)?
         };
-        partial.q_labels = exact_q_labels.map_or_else(
+        partial.q_labels = observer_q_labels.map_or_else(
             || {
                 mses.iter()
                     .map(|m| f64::from(*m) < cfg.q_mse_threshold)
@@ -3911,12 +4174,17 @@ fn eval_sample_set(
     let identifiability = eval_identifiability(samples, &encoder_embeddings);
     let semantic = if train_cfg.world_core_v4 {
         Some(timed_eval_phase("semantic_decode", source, || {
-            evaluate_semantics(
+            evaluate_semantics_with_control(
                 model,
                 samples,
                 action_sources.unwrap_or(&fallback_sources),
                 cfg.physical_batch,
                 device,
+                SemanticControlConfig {
+                    trained_null_action_id: (train_cfg.recipe
+                        == crate::p2::experiment::TrainingRecipe::FoundationV2)
+                        .then_some(0),
+                },
             )
         })?)
     } else {
@@ -6353,17 +6621,49 @@ mod tests {
 
     fn semantic_decoder(pixel_accuracy: f64, pixels: usize) -> SemanticDecoderMetrics {
         SemanticDecoderMetrics {
-            masks: BTreeMap::from([(
-                "changed".into(),
-                crate::p2::semantic_eval::SemanticMaskMetrics {
-                    pixels,
-                    transitions: 1,
-                    mean_nll: Some(1.0 - pixel_accuracy),
-                    pixel_accuracy: Some(pixel_accuracy),
-                    exact_transition_accuracy: Some(if pixel_accuracy == 1.0 { 1.0 } else { 0.0 }),
-                    mean_transition_accuracy: Some(pixel_accuracy),
-                },
-            )]),
+            masks: BTreeMap::from([
+                (
+                    "changed".into(),
+                    crate::p2::semantic_eval::SemanticMaskMetrics {
+                        pixels,
+                        transitions: 1,
+                        mean_nll: Some(1.0 - pixel_accuracy),
+                        pixel_accuracy: Some(pixel_accuracy),
+                        exact_transition_accuracy: Some(if pixel_accuracy == 1.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }),
+                        mean_transition_accuracy: Some(pixel_accuracy),
+                    },
+                ),
+                (
+                    "unchanged_content".into(),
+                    crate::p2::semantic_eval::SemanticMaskMetrics {
+                        pixels: 20,
+                        transitions: 1,
+                        mean_nll: Some(0.1),
+                        pixel_accuracy: Some(0.9),
+                        exact_transition_accuracy: Some(0.0),
+                        mean_transition_accuracy: Some(0.9),
+                    },
+                ),
+                (
+                    "unchanged_padding".into(),
+                    crate::p2::semantic_eval::SemanticMaskMetrics {
+                        pixels: 30,
+                        transitions: 1,
+                        mean_nll: Some(0.0),
+                        pixel_accuracy: Some(1.0),
+                        exact_transition_accuracy: Some(1.0),
+                        mean_transition_accuracy: Some(1.0),
+                    },
+                ),
+            ]),
+            false_edit_rate: None,
+            false_edit_transition_rate: None,
+            padding_false_edit_rate: None,
+            padding_false_edit_transition_rate: None,
         }
     }
 
@@ -6391,6 +6691,11 @@ mod tests {
             semantic.open[&8].masks["changed"].pixel_accuracy,
             Some(0.25)
         );
+        assert!((semantic.open[&4].false_edit_rate.unwrap() - 0.1).abs() < 1e-12);
+        assert_eq!(semantic.open[&4].false_edit_transition_rate, Some(1.0));
+        assert_eq!(semantic.open[&8].padding_false_edit_rate, Some(0.0));
+        assert!(!semantic.open[&4].masks.contains_key("unchanged_content"));
+        assert!(!semantic.open[&4].masks.contains_key("unchanged_padding"));
     }
 
     #[test]

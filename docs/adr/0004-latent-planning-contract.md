@@ -5,6 +5,38 @@
 - Amends: [ADR 0003](0003-world-core-v5-foundation-v2.md) at decision time only
 - Basis: the in-repository evidence index at the end of this ADR
 
+## Amendments (2026-08-27, pre-acceptance)
+
+Three clauses are amended before acceptance, from the 2026-08-26 planning
+review threads (T3 `ac1c8438`, T2 `b56d996c`); the original text below is
+retained unmodified for history.
+
+1. **A5 selection safety.** The exhaustive `6 + 64^2 = 4,102`-root depth-1
+   sweep with an argmax finalist is demoted from deployed controller to
+   teacher/oracle use only. With per-candidate model error `epsilon`, the
+   maximum over ~4,102 noisy scores selects a corrupted finalist with
+   probability approaching 1 (winner's curse); the union bound in the
+   planning note is a worst case, not a calibration. The deployed Phase A
+   controller must use a bounded candidate budget (order 40-64 evaluations,
+   horizon <= 2) with a selection-aware acceptance charge; the
+   selection-charge identity holds under independent sub-Gaussian score
+   increments, and the correlated case is an open lemma
+   (`PlanningSelection.lean` target).
+2. **B2 EIG factorization.** The joint expected-information-gain score can
+   reward actions whose information is entirely about mechanics/rules and
+   carries zero information about the goal hypothesis (information
+   chain rule: `I(A; Goal, Rule) = I(A; Rule) + I(A; Goal | Rule)`; the
+   first term alone can dominate). Goal-directed selection must score the
+   goal term `I(A; Goal | Rule)` separately, and rule-information may only
+   be credited by an explicit, bounded exploration term.
+3. **Trust gate.** Inverse-action consistency is removed as trust evidence
+   for possibly irreversible edges: a predicted latent that encodes only
+   the conditioned action identity passes inverse-action recovery exactly
+   while being arbitrarily wrong about the state, so the check cannot
+   certify transition fidelity. It may remain as a falsifier (its failure
+   is disqualifying) but its success contributes nothing to the `0.02`
+   trust bounds.
+
 ## Decision
 
 Tofy will replace the bare greedy one-step confidence blend with one phased,

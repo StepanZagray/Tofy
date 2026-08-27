@@ -12,12 +12,12 @@ use crate::generator::{
     p1c_falsification_probe_width, rng_for, V5_CONTENT_SIZES,
 };
 use crate::search::shortest_path;
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Official ARC-AGI-3 frame side length.
 pub const FRAME_SIDE: usize = 64;
@@ -1808,7 +1808,17 @@ fn augment_v5_transition(
     let goal_dropped = dropout_rng.random_bool(f64::from(goal_dropout_probability));
     if goal_dropped {
         transition.goal_features = GoalFeatures::zeros();
+        // Goal-success/failure labels are candidate-dependent. Once dropout
+        // removes that candidate, retaining the labels creates identical
+        // observer inputs with contradictory targets.
+        transition.goal_satisfied = None;
+        transition.goal_failed = None;
     }
+    // The V4 encoder deliberately clears the status row, and neither the
+    // canonical state nor goal features carry actions-used/action-budget.
+    // Exhaustion is therefore not identifiable at this observer seam. Keep the
+    // slot masked until its conditioning is explicitly represented.
+    transition.exhausted = None;
     let content_mask = ContentMask::from_rect(rect)?;
     Ok(V5Sample {
         provenance: V5SampleProvenance {
@@ -2453,6 +2463,35 @@ pub struct MixedStreamBatch {
     scheduled_proportions: MixedStreamProportions,
 }
 
+/// Label support in a deterministic generated stream, ordered as
+/// noop/satisfied/failed/exhausted. This is a premise check for event-head
+/// supervision, not a model metric.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventLabelCensus {
+    pub rows: usize,
+    pub labeled: [usize; 4],
+    pub positive: [usize; 4],
+}
+
+pub fn census_event_labels<'a>(
+    rows: impl IntoIterator<Item = &'a TransitionSample>,
+) -> EventLabelCensus {
+    let mut census = EventLabelCensus::default();
+    for row in rows {
+        census.rows += 1;
+        for (slot, label) in [row.noop, row.goal_satisfied, row.goal_failed, row.exhausted]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(label) = label {
+                census.labeled[slot] += 1;
+                census.positive[slot] += usize::from(label);
+            }
+        }
+    }
+    census
+}
+
 impl MixedStreamBatch {
     pub fn samples(&self) -> &[V5Sample] {
         &self.samples
@@ -2494,6 +2533,10 @@ impl MixedStreamBatch {
 
     pub fn scheduled_proportions(&self) -> MixedStreamProportions {
         self.scheduled_proportions
+    }
+
+    pub fn event_label_census(&self) -> EventLabelCensus {
+        census_event_labels(self.transitions())
     }
 
     pub fn into_samples(self) -> Vec<V5Sample> {
@@ -3098,6 +3141,616 @@ pub fn generate_curriculum(
         );
     }
     Ok(samples)
+}
+
+/// Per-level size knobs for one deterministic multi-level shared-rule episode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetaEpisodeConfig {
+    /// Number of levels. At least two, so "earlier level" information exists.
+    pub levels: usize,
+    /// Movement transitions per level before the operator decision points.
+    pub steps_per_level: usize,
+    /// Operator decision points per level: one ACTION5 plus up to four
+    /// stratified ACTION6 coordinates. Zero yields a rule-independent episode
+    /// whose later decisions never touch the hidden rule.
+    pub operator_decisions_per_level: usize,
+    /// Square content size shared by every level layout.
+    pub content_size: u8,
+}
+
+impl Default for MetaEpisodeConfig {
+    fn default() -> Self {
+        Self {
+            levels: 3,
+            steps_per_level: 4,
+            operator_decisions_per_level: 3,
+            content_size: 7,
+        }
+    }
+}
+
+impl MetaEpisodeConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.levels >= 2,
+            "a meta-episode needs at least two levels so earlier-level information exists"
+        );
+        ensure!(
+            self.levels <= META_LEVEL_EPISODE_STRIDE as usize,
+            "meta-episode level count exceeds the reserved episode-id namespace"
+        );
+        ensure!(
+            self.operator_decisions_per_level <= 5,
+            "at most one ACTION5 plus four stratified ACTION6 decision points per level"
+        );
+        ensure!(
+            V5_CONTENT_SIZES.contains(&self.content_size),
+            "meta-episode content size must be one of {V5_CONTENT_SIZES:?}"
+        );
+        Ok(())
+    }
+}
+
+/// One level of a [`MetaEpisode`]: a freshly generated layout with its ordered
+/// transitions. The layout regenerates from `(seed, episode_id, split,
+/// content_size)`; `operator` is the rule actually applied to this level's
+/// ACTION5/ACTION6 transitions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetaLevel {
+    pub level_index: usize,
+    pub episode_id: u64,
+    pub operator: EpisodeOperator,
+    pub transitions: Vec<TransitionSample>,
+}
+
+/// Multi-level episode with one stable hidden rule shared by every level.
+///
+/// Pure function of `(seed, meta_episode_id, split, config)`: identical inputs
+/// reproduce identical bytes. Level boundaries are explicit indices over the
+/// flattened transition stream; samples are never mutated to mark boundaries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetaEpisode {
+    pub seed: u64,
+    pub meta_episode_id: u64,
+    pub data_split: V5DataSplit,
+    pub config: MetaEpisodeConfig,
+    /// The stable hidden rule. In the shuffled control this is the level-0 rule.
+    pub operator: EpisodeOperator,
+    /// Whether later levels deliberately break the shared rule.
+    pub shuffled_control: bool,
+    pub levels: Vec<MetaLevel>,
+    /// Level `i` owns flattened rows `level_boundaries[i]..level_boundaries[i+1]`.
+    pub level_boundaries: Vec<usize>,
+}
+
+/// Realized population of a shuffled-rule negative control. Counts are kept
+/// separate because an independent marginal draw may legitimately repeat the
+/// level-0 operator, and a genuinely changed operator may still produce the
+/// same outcome for a particular state/action tuple.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShuffledRuleRealizationCensus {
+    pub later_levels: usize,
+    pub repeated_level0_operator_levels: usize,
+    pub total_rows: usize,
+    pub eligible_operator_rows: usize,
+    pub genuinely_changed_operator_tuples: usize,
+    pub outcome_changing_tuples: usize,
+}
+
+impl MetaEpisode {
+    pub fn validate(&self) -> Result<()> {
+        self.config.validate()?;
+        ensure!(
+            self.levels.len() == self.config.levels,
+            "meta-episode level count does not match its config"
+        );
+        ensure!(
+            self.level_boundaries.len() == self.levels.len() + 1 && self.level_boundaries[0] == 0,
+            "level boundaries must be cumulative offsets starting at zero"
+        );
+        let mut offset = 0usize;
+        let mut episode_ids = BTreeSet::new();
+        for (index, level) in self.levels.iter().enumerate() {
+            ensure!(level.level_index == index, "level indices must be ordered");
+            ensure!(
+                level.episode_id == meta_level_episode_id(self.meta_episode_id, index)?,
+                "level episode id is outside the reserved meta-episode namespace"
+            );
+            ensure!(
+                episode_ids.insert(level.episode_id),
+                "meta-episode level ids must be unique"
+            );
+            ensure!(
+                level.transitions.iter().all(|row| {
+                    row.seed == self.seed
+                        && row.episode_id == level.episode_id
+                        && row.provenance.source_kind == "meta_episode_v5"
+                }),
+                "meta-episode transition provenance is inconsistent"
+            );
+            offset += level.transitions.len();
+            ensure!(
+                self.level_boundaries[index + 1] == offset,
+                "level boundary does not match its flattened transition count"
+            );
+        }
+        if !self.shuffled_control {
+            ensure!(
+                self.levels
+                    .iter()
+                    .all(|level| level.operator == self.operator),
+                "the shared rule must be stable across true meta-episode levels"
+            );
+        }
+        Ok(())
+    }
+
+    /// Transitions in flattened order; [`Self::level_boundaries`] indexes this stream.
+    pub fn flattened_transitions(&self) -> impl Iterator<Item = &TransitionSample> {
+        self.levels
+            .iter()
+            .flat_map(|level| level.transitions.iter())
+    }
+
+    /// Census the realized shuffled-control population without conditioning
+    /// its generation on being different from level 0.
+    pub fn shuffled_rule_realization_census(
+        &self,
+    ) -> Result<Option<ShuffledRuleRealizationCensus>> {
+        self.validate()?;
+        if !self.shuffled_control {
+            return Ok(None);
+        }
+        let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+        let mut census = ShuffledRuleRealizationCensus::default();
+        for level in self.levels.iter().filter(|level| level.level_index >= 1) {
+            census.later_levels += 1;
+            census.repeated_level0_operator_levels += usize::from(level.operator == self.operator);
+            census.total_rows += level.transitions.len();
+            for transition in level
+                .transitions
+                .iter()
+                .filter(|transition| matches!(transition.action.id, 5 | 6))
+            {
+                census.eligible_operator_rows += 1;
+                let changed = level.operator != self.operator;
+                census.genuinely_changed_operator_tuples += usize::from(changed);
+                if changed {
+                    let rect = ContentRect {
+                        x: 0,
+                        y: 0,
+                        width: u8::try_from(transition.provenance.content_width)
+                            .map_err(|_| anyhow!("content width does not fit u8"))?,
+                        height: u8::try_from(transition.provenance.content_height)
+                            .map_err(|_| anyhow!("content height does not fit u8"))?,
+                    };
+                    let level0_outcome = apply_episode_operator(
+                        &transition.current,
+                        &transition.action,
+                        rect,
+                        self.operator,
+                    )?;
+                    census.outcome_changing_tuples += usize::from(
+                        level0_outcome.pixels[..status_start]
+                            != transition.next.pixels[..status_start],
+                    );
+                }
+            }
+        }
+        Ok(Some(census))
+    }
+}
+
+const META_LEVEL_EPISODE_DOMAIN: u64 = 1 << 63;
+const META_LEVEL_EPISODE_STRIDE: u64 = 256;
+
+fn meta_level_episode_id(meta_episode_id: u64, level_index: usize) -> Result<u64> {
+    ensure!(
+        level_index < META_LEVEL_EPISODE_STRIDE as usize,
+        "meta level index exceeds reserved id stride"
+    );
+    let offset = meta_episode_id
+        .checked_mul(META_LEVEL_EPISODE_STRIDE)
+        .and_then(|base| base.checked_add(level_index as u64))
+        .context("meta episode id exceeds reserved namespace")?;
+    ensure!(
+        offset < META_LEVEL_EPISODE_DOMAIN,
+        "meta episode id exceeds reserved namespace"
+    );
+    Ok(META_LEVEL_EPISODE_DOMAIN | offset)
+}
+
+fn generate_meta_level(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    config: &MetaEpisodeConfig,
+    level_index: usize,
+    operator: EpisodeOperator,
+) -> Result<MetaLevel> {
+    let episode_id = meta_level_episode_id(meta_episode_id, level_index)?;
+    let scenario = scenario_for_v5(seed, episode_id, split, config.content_size);
+    let sim = Simulator::new(scenario.clone());
+    // Movement randomness never depends on the operator, so a true episode and
+    // its shuffled control share byte-identical layouts and walks per level.
+    let mut rng = seeded_v5_rng(seed, episode_id, split, 0x4D45_5441_4C56);
+    let mut state = State::initial(&scenario);
+    let mut transitions =
+        Vec::with_capacity(config.steps_per_level + config.operator_decisions_per_level);
+    for _ in 0..config.steps_per_level {
+        let action = Action::moves()[rng.random_range(0..4)];
+        let next = apply_action(&sim, &state, action);
+        transitions.push(sample_from_transition_goal_free(
+            &scenario,
+            &state,
+            &next,
+            action,
+            "meta_episode_v5",
+            transitions.len() as u64,
+        )?);
+        state = next;
+    }
+    if config.operator_decisions_per_level > 0 {
+        transitions.push(operator_sample_from_state(
+            &scenario,
+            &state,
+            ArcAction::new(5, None, None)?,
+            operator,
+            "meta_episode_v5",
+            transitions.len() as u64,
+        )?);
+        let current = render_state_padded(&scenario, &state)?;
+        for (x, y) in stratified_action6_coordinates(&current, config.content_size)?
+            .into_iter()
+            .take(config.operator_decisions_per_level - 1)
+        {
+            transitions.push(operator_sample_from_state(
+                &scenario,
+                &state,
+                ArcAction::new(6, Some(x), Some(y))?,
+                operator,
+                "meta_episode_v5",
+                transitions.len() as u64,
+            )?);
+        }
+    }
+    let trajectory_id = format!("meta-v5/{split:?}/{seed}/{meta_episode_id}/level{level_index}");
+    for transition in &mut transitions {
+        transition.provenance.trajectory_id = trajectory_id.clone();
+    }
+    Ok(MetaLevel {
+        level_index,
+        episode_id,
+        operator,
+        transitions,
+    })
+}
+
+fn assemble_meta_episode(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    config: &MetaEpisodeConfig,
+    operator: EpisodeOperator,
+    shuffled_control: bool,
+    level_operator: impl Fn(usize) -> Result<EpisodeOperator>,
+) -> Result<MetaEpisode> {
+    let mut levels = Vec::with_capacity(config.levels);
+    let mut level_boundaries = vec![0usize];
+    for level_index in 0..config.levels {
+        let level = generate_meta_level(
+            seed,
+            meta_episode_id,
+            split,
+            config,
+            level_index,
+            level_operator(level_index)?,
+        )?;
+        level_boundaries.push(level_boundaries[level_index] + level.transitions.len());
+        levels.push(level);
+    }
+    let episode = MetaEpisode {
+        seed,
+        meta_episode_id,
+        data_split: split,
+        config: *config,
+        operator,
+        shuffled_control,
+        levels,
+        level_boundaries,
+    };
+    episode.validate()?;
+    Ok(episode)
+}
+
+/// Deterministic multi-level shared-rule episode: one hidden
+/// [`EpisodeOperator`] sampled once and applied to every level's
+/// ACTION5/ACTION6 decision points, across freshly generated per-level layouts.
+pub fn generate_meta_episode(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    families: &OperatorFamilySplit,
+    config: &MetaEpisodeConfig,
+) -> Result<MetaEpisode> {
+    config.validate()?;
+    families.validate()?;
+    let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4D45_5441_0005);
+    let operator = sampled_operator(families, split, &mut rng)?;
+    assemble_meta_episode(
+        seed,
+        meta_episode_id,
+        split,
+        config,
+        operator,
+        false,
+        |_| Ok(operator),
+    )
+}
+
+/// Shuffled-rule negative control for [`generate_meta_episode`].
+///
+/// Identical inputs produce identical layouts and movement walks (the level
+/// RNG lane is operator-independent), but every later level (`level_index >=
+/// 1`) independently draws from the same split marginal as level 0. Repeats
+/// are allowed: conditioning on the earlier rule therefore gives no positive
+/// or negative information about a later rule. `operator` records the level-0
+/// rule and `shuffled_control` is set.
+pub fn generate_meta_episode_shuffled_control(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    families: &OperatorFamilySplit,
+    config: &MetaEpisodeConfig,
+) -> Result<MetaEpisode> {
+    config.validate()?;
+    families.validate()?;
+    let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4D45_5441_0005);
+    let operator = sampled_operator(families, split, &mut rng)?;
+    assemble_meta_episode(
+        seed,
+        meta_episode_id,
+        split,
+        config,
+        operator,
+        true,
+        |level_index| {
+            if level_index == 0 {
+                return Ok(operator);
+            }
+            let mut level_rng = seeded_v5_rng(
+                seed,
+                meta_level_episode_id(meta_episode_id, level_index)?,
+                split,
+                0x4D45_5348_5546,
+            );
+            sampled_operator(families, split, &mut level_rng)
+        },
+    )
+}
+
+/// Counts for one rule-identifiability census bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CensusCounts {
+    pub later_operator_points: usize,
+    pub alternative_outcome_sensitive: usize,
+    /// `alternative_outcome_sensitive / later_operator_points`; zero when
+    /// there are no points.
+    pub alternative_outcome_sensitive_fraction: f32,
+}
+
+impl CensusCounts {
+    fn add(&mut self, sensitive: bool) {
+        self.later_operator_points += 1;
+        self.alternative_outcome_sensitive += usize::from(sensitive);
+    }
+
+    fn finalize(&mut self) {
+        self.alternative_outcome_sensitive_fraction = if self.later_operator_points == 0 {
+            0.0
+        } else {
+            self.alternative_outcome_sensitive as f32 / self.later_operator_points as f32
+        };
+    }
+}
+
+/// Census bucket for one shared-rule operator family.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FamilyCensus {
+    pub family: OperatorFamily,
+    pub counts: CensusCounts,
+}
+
+/// Census bucket for one later-level index.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LevelCensus {
+    pub level_index: usize,
+    pub counts: CensusCounts,
+}
+
+/// Model-free identifiability census over generated meta-episodes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleIdentifiabilityCensus {
+    pub episodes: usize,
+    /// Episodes whose level-0 operator outcomes uniquely determine the true
+    /// family within the preregistered split candidate set.
+    pub earlier_rule_identified_episodes: usize,
+    /// Total levels across the censused episodes.
+    pub levels: usize,
+    pub overall: CensusCounts,
+    pub per_family: Vec<FamilyCensus>,
+    /// Only later levels (`level_index >= 1`) can contain decision points.
+    pub per_level: Vec<LevelCensus>,
+}
+
+fn census_candidate_families(
+    true_family: OperatorFamily,
+    families: &OperatorFamilySplit,
+) -> Result<Vec<OperatorFamily>> {
+    let same_split = if families.train.contains(&true_family) {
+        &families.train
+    } else {
+        &families.held_out
+    };
+    ensure!(
+        same_split.len() >= 2,
+        "rule identifiability is undefined for a singleton operator split"
+    );
+    Ok(same_split.clone())
+}
+
+/// Census whether earlier-level rule identity is relevant to later outcomes.
+///
+/// First, level-0 ACTION5/ACTION6 outcomes filter the same-split candidate
+/// families. An episode is identified only when this leaves exactly its true
+/// family. A later operator point is alternative-outcome-sensitive only when
+/// the earlier rule is identified and some a-priori same-split alternative
+/// produces a different board under the same fixed action. This establishes a
+/// model-free opportunity for useful cross-level memory; it does not show that
+/// memory changes the optimal action, task outcome, policy value, or that a
+/// learned model exploits the information.
+pub fn census_rule_identifiability(
+    episodes: &[MetaEpisode],
+    families: &OperatorFamilySplit,
+) -> Result<RuleIdentifiabilityCensus> {
+    families.validate()?;
+    ensure!(!episodes.is_empty(), "rule census needs meta-episodes");
+    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+    let mut overall = CensusCounts::default();
+    let mut per_family = BTreeMap::<OperatorFamily, CensusCounts>::new();
+    let mut per_level = BTreeMap::<usize, CensusCounts>::new();
+    let mut levels = 0usize;
+    let mut earlier_rule_identified_episodes = 0usize;
+    for episode in episodes {
+        episode.validate()?;
+        ensure!(
+            !episode.shuffled_control,
+            "rule-identifiability census requires stable-rule episodes"
+        );
+        levels += episode.levels.len();
+        let true_operator = episode.operator;
+        let candidates = census_candidate_families(true_operator.family, families)?;
+        let first_level = episode
+            .levels
+            .first()
+            .context("validated meta-episode has no first level")?;
+        let mut posterior = candidates.clone();
+        for transition in first_level
+            .transitions
+            .iter()
+            .filter(|transition| matches!(transition.action.id, 5 | 6))
+        {
+            let rect = ContentRect {
+                x: 0,
+                y: 0,
+                width: u8::try_from(transition.provenance.content_width)
+                    .map_err(|_| anyhow!("content width does not fit u8"))?,
+                height: u8::try_from(transition.provenance.content_height)
+                    .map_err(|_| anyhow!("content height does not fit u8"))?,
+            };
+            posterior.retain(|&family| {
+                apply_episode_operator(
+                    &transition.current,
+                    &transition.action,
+                    rect,
+                    EpisodeOperator {
+                        family,
+                        ..true_operator
+                    },
+                )
+                .is_ok_and(|candidate| {
+                    candidate.pixels[..status_start] == transition.next.pixels[..status_start]
+                })
+            });
+        }
+        ensure!(
+            posterior.contains(&true_operator.family),
+            "true operator was inconsistent with its own level-0 outcomes"
+        );
+        let earlier_rule_identified = posterior.len() == 1 && posterior[0] == true_operator.family;
+        earlier_rule_identified_episodes += usize::from(earlier_rule_identified);
+        let alternatives = candidates
+            .into_iter()
+            .filter(|family| *family != true_operator.family)
+            .collect::<Vec<_>>();
+        ensure!(
+            !alternatives.is_empty(),
+            "no alternative operator family to census against {:?}",
+            true_operator.family
+        );
+        for level in episode.levels.iter().filter(|level| level.level_index >= 1) {
+            for transition in level
+                .transitions
+                .iter()
+                .filter(|transition| matches!(transition.action.id, 5 | 6))
+            {
+                let rect = ContentRect {
+                    x: 0,
+                    y: 0,
+                    width: u8::try_from(transition.provenance.content_width)
+                        .map_err(|_| anyhow!("content width does not fit u8"))?,
+                    height: u8::try_from(transition.provenance.content_height)
+                        .map_err(|_| anyhow!("content height does not fit u8"))?,
+                };
+                let truth = apply_episode_operator(
+                    &transition.current,
+                    &transition.action,
+                    rect,
+                    level.operator,
+                )?;
+                let alternative_outcome_sensitive = earlier_rule_identified
+                    && alternatives.iter().any(|&family| {
+                        apply_episode_operator(
+                            &transition.current,
+                            &transition.action,
+                            rect,
+                            EpisodeOperator {
+                                family,
+                                ..level.operator
+                            },
+                        )
+                        .is_ok_and(|alternative| {
+                            alternative.pixels[..status_start] != truth.pixels[..status_start]
+                        })
+                    });
+                overall.add(alternative_outcome_sensitive);
+                per_family
+                    .entry(true_operator.family)
+                    .or_default()
+                    .add(alternative_outcome_sensitive);
+                per_level
+                    .entry(level.level_index)
+                    .or_default()
+                    .add(alternative_outcome_sensitive);
+            }
+        }
+    }
+    overall.finalize();
+    let per_family = per_family
+        .into_iter()
+        .map(|(family, mut counts)| {
+            counts.finalize();
+            FamilyCensus { family, counts }
+        })
+        .collect();
+    let per_level = per_level
+        .into_iter()
+        .map(|(level_index, mut counts)| {
+            counts.finalize();
+            LevelCensus {
+                level_index,
+                counts,
+            }
+        })
+        .collect();
+    Ok(RuleIdentifiabilityCensus {
+        episodes: episodes.len(),
+        earlier_rule_identified_episodes,
+        levels,
+        overall,
+        per_family,
+        per_level,
+    })
 }
 
 #[cfg(test)]

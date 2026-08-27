@@ -7,10 +7,10 @@ use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCaptu
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
-    FactualBatch, MixedStreamBatch, MixedStreamConfig, MixedStreamKind, TransitionSample,
-    V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
+    ContentMask, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
+    MixedStreamKind, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
-use crate::p2::eval::{evaluate_gate_support, GateSupportMetrics};
+use crate::p2::eval::{evaluate_gate_support_with_content_masks, GateSupportMetrics};
 use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
     SigregStatistic, TrainingRecipe,
@@ -36,6 +36,7 @@ use candle_graph::{ExecutionStep, SpanKind};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::{VarBuilder, VarMap};
+use clap::ValueEnum;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -86,10 +87,10 @@ const FOUNDATION_V2_GATE_EVERY: u64 = 1_024;
 const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
 const FOUNDATION_V2_GATE_SEED: u64 = 0xF0A2_DA7A_0000_0005;
-const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 64;
+const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 16;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v12";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v13";
 pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v9";
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -176,11 +177,15 @@ pub fn foundation_v2_wsd_learning_rate(step: usize, total_steps: usize) -> f64 {
         return FINAL;
     }
     let step = step.min(total_steps);
-    if step < WARMUP {
-        return PEAK * step as f64 / WARMUP as f64;
+    // Preserve the 500-update production warmup, but keep smoke schedules
+    // well-defined and guarantee the requested final LR at their last step.
+    let warmup_steps = WARMUP.min(total_steps.saturating_sub(1));
+    if warmup_steps > 0 && step < warmup_steps {
+        return PEAK * step as f64 / warmup_steps as f64;
     }
-    let decay_steps = ((total_steps as f64) * 0.15).ceil() as usize;
-    let decay_steps = decay_steps.max(1);
+    let decay_steps = (((total_steps as f64) * 0.15).ceil() as usize)
+        .max(1)
+        .min(total_steps.saturating_sub(warmup_steps).max(1));
     let decay_start = total_steps.saturating_sub(decay_steps);
     if step <= decay_start {
         return PEAK;
@@ -205,6 +210,51 @@ pub struct FoundationV2GateEvaluation {
     pub running_best_before: Option<f64>,
     pub running_best_after: Option<f64>,
     pub gates: Vec<FoundationV2GateResult>,
+}
+
+/// Checkpoint-promotion selection metric. `ChangedExact` is the historical
+/// default; `FullExact` selects on full-transition exactness (unchanged
+/// pixels included) without touching the gate or collapse-floor semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionMetric {
+    #[default]
+    ChangedExact,
+    FullExact,
+}
+
+/// Value of the configured promotion metric on one gate measurement.
+pub fn foundation_v2_promotion_value(
+    metric: PromotionMetric,
+    metrics: &GateSupportMetrics,
+) -> Option<f64> {
+    match metric {
+        PromotionMetric::ChangedExact => metrics.one_step_changed_exact,
+        PromotionMetric::FullExact => metrics.one_step_full_exact,
+    }
+}
+
+/// Whether the new measurement beats the running best of the configured
+/// promotion metric. `ChangedExact` compares against the persisted
+/// `best_changed_exact` exactly as before; `FullExact` compares against the
+/// best `one_step_full_exact` recorded in the gate history.
+pub fn foundation_v2_promotion_improved(
+    metric: PromotionMetric,
+    best_changed_exact: Option<f64>,
+    gate_history: &[FoundationV2GateEvaluation],
+    metrics: &GateSupportMetrics,
+) -> bool {
+    let prior_best = match metric {
+        PromotionMetric::ChangedExact => best_changed_exact,
+        PromotionMetric::FullExact => gate_history
+            .iter()
+            .filter_map(|evaluation| evaluation.metrics.one_step_full_exact)
+            .fold(None, |best: Option<f64>, value| {
+                Some(best.map_or(value, |best| best.max(value)))
+            }),
+    };
+    foundation_v2_promotion_value(metric, metrics)
+        .is_some_and(|current| prior_best.is_none_or(|best| current > best))
 }
 
 pub fn foundation_v2_gate_evaluation(
@@ -517,6 +567,19 @@ pub struct TrainConfig {
     pub spatial_action_residual: bool,
     #[serde(default = "default_spatial_action_residual_scale")]
     pub spatial_action_residual_scale: f64,
+    /// Foundation-v2 split-CE weighting construction (objective isolation).
+    /// Old configs deserialize to `current_double`, the exact ADR 0003 path.
+    #[serde(default)]
+    pub split_ce_weighting: SplitCeWeighting,
+    /// Optional fixed aggregate loss-coefficient share, strictly inside
+    /// `(0, 1)`, for the changed stratum. This is not a claim about measured
+    /// gradient share. Overrides the active mode's changed weight.
+    #[serde(default)]
+    pub split_ce_changed_budget: Option<f64>,
+    /// Checkpoint-promotion selection metric. Old configs deserialize to
+    /// `changed_exact`, the exact historical promotion behavior.
+    #[serde(default)]
+    pub promotion_metric: PromotionMetric,
     #[serde(default)]
     pub branch_learning: BranchLearningConfig,
 }
@@ -694,6 +757,9 @@ impl Default for TrainConfig {
             spatial_action_field: false,
             spatial_action_residual: false,
             spatial_action_residual_scale: default_spatial_action_residual_scale(),
+            split_ce_weighting: SplitCeWeighting::CurrentDouble,
+            split_ce_changed_budget: None,
+            promotion_metric: PromotionMetric::ChangedExact,
             branch_learning: BranchLearningConfig::default(),
         }
     }
@@ -732,6 +798,11 @@ impl TrainConfig {
     pub fn validate(&self) -> Result<()> {
         if self.steps_per_lesson == 0 {
             bail!("steps_per_lesson must be > 0");
+        }
+        if let Some(budget) = self.split_ce_changed_budget {
+            if !(budget > 0.0 && budget < 1.0) {
+                bail!("split_ce_changed_budget must lie strictly inside (0, 1)");
+            }
         }
         if self.physical_batch < 2 {
             bail!("physical_batch must be >= 2 (SIGReg needs batch >= 2)");
@@ -952,6 +1023,9 @@ impl TrainConfig {
     }
 
     fn validate_foundation_v2(&self) -> Result<()> {
+        if self.seed == FOUNDATION_V2_GATE_SEED {
+            bail!("foundation-v2 training seed is reserved by the frozen gate population");
+        }
         let mut canonical = self.clone();
         canonical.apply_foundation_v2_recipe();
         // Preserve the runtime/provenance fields explicitly left caller-owned.
@@ -1182,9 +1256,22 @@ pub struct FoundationV2TrainingReport {
     pub ep_gradient_budget: Vec<FoundationV2EpGradientSample>,
     pub gate_history: Vec<FoundationV2GateEvaluation>,
     pub best_changed_exact: Option<f64>,
+    #[serde(default)]
+    pub promotion_metric: PromotionMetric,
+    #[serde(default)]
+    pub best_promotion_value: Option<f64>,
     pub best_checkpoint: Option<PathBuf>,
     pub rollout_enabled: bool,
     pub permanent_checkpoints: Vec<PathBuf>,
+    /// Exact support observed in consumed generated rows, ordered as
+    /// noop/satisfied/failed/exhausted.
+    #[serde(default)]
+    pub event_label_census: EventLabelCensus,
+    /// False for checkpoints created before event-census tracking began; in
+    /// that case the counts cover only post-resume rows and must not be read as
+    /// the complete consumed population.
+    #[serde(default)]
+    pub event_label_census_complete: bool,
     pub clip_strategy: String,
 }
 
@@ -1366,6 +1453,12 @@ struct TrainingContract {
     #[serde(default = "default_spatial_action_residual_scale")]
     spatial_action_residual_scale: f64,
     #[serde(default)]
+    split_ce_weighting: SplitCeWeighting,
+    #[serde(default)]
+    split_ce_changed_budget: Option<f64>,
+    #[serde(default)]
+    promotion_metric: PromotionMetric,
+    #[serde(default)]
     branch_learning: BranchLearningConfig,
     device: String,
     adam_beta1: f64,
@@ -1442,6 +1535,9 @@ impl From<&TrainConfig> for TrainingContract {
             spatial_action_field: cfg.spatial_action_field,
             spatial_action_residual: cfg.spatial_action_residual,
             spatial_action_residual_scale: cfg.spatial_action_residual_scale,
+            split_ce_weighting: cfg.split_ce_weighting,
+            split_ce_changed_budget: cfg.split_ce_changed_budget,
+            promotion_metric: cfg.promotion_metric,
             branch_learning: cfg.branch_learning.clone(),
             device: cfg.device.clone(),
             adam_beta1: adam.beta1,
@@ -1501,6 +1597,10 @@ struct FoundationV2TrainerState {
     loss_sums: FoundationV2LossMeans,
     loss_steps: u64,
     permanent_checkpoints: Vec<PathBuf>,
+    #[serde(default)]
+    event_label_census: EventLabelCensus,
+    #[serde(default)]
+    event_label_census_complete: bool,
 }
 
 fn default_training_population_hash() -> u64 {
@@ -3385,6 +3485,8 @@ pub struct FoundationV2ObjectiveConfig {
     pub sigreg_knots: usize,
     pub sigreg_seed: u64,
     pub rollout_enabled: bool,
+    pub split_ce_weighting: SplitCeWeighting,
+    pub split_ce_changed_budget: Option<f64>,
 }
 
 impl Default for FoundationV2ObjectiveConfig {
@@ -3395,6 +3497,8 @@ impl Default for FoundationV2ObjectiveConfig {
             sigreg_knots: 5,
             sigreg_seed: 1,
             rollout_enabled: false,
+            split_ce_weighting: SplitCeWeighting::CurrentDouble,
+            split_ce_changed_budget: None,
         }
     }
 }
@@ -3456,7 +3560,7 @@ fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
-fn split_weighted_ce(
+pub fn split_weighted_ce(
     per_pixel: &Tensor,
     positive_mask: &Tensor,
     negative_mask: &Tensor,
@@ -3472,12 +3576,150 @@ fn split_weighted_ce(
         .map_err(Into::into)
 }
 
+/// Weighting construction for the foundation-v2 split cross-entropy
+/// (objective-isolation ablation). `CurrentDouble` is the ADR 0003 default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitCeWeighting {
+    /// Existing behavior: the positive-stratum mean is scaled by
+    /// `clamp((1-p)/p, 1, 64)`, so the per-pixel coefficient ratio is
+    /// `((1-p)/p)^2` pre-cap ("double weighting").
+    #[default]
+    CurrentDouble,
+    /// Equal aggregate coefficient shares for the two stratum means, rescaled
+    /// to preserve the legacy nominal coefficient mass.
+    EqualMeans,
+    /// One pooled masked mean over all content pixels with per-pixel weight
+    /// `w` on positive and 1.0 on negative pixels, so the per-pixel
+    /// coefficient ratio is `(1-p)/p` once (copy-gate BCE construction).
+    PooledPerPixel,
+}
+
+/// Mode dispatch for the split CE. `CurrentDouble` without a budget override
+/// calls [`split_weighted_ce`] with unchanged arguments, keeping the default
+/// path bit-for-bit identical. Every alternative redistributes the same total
+/// coefficient mass as that legacy loss (`positive_weight + 1` when both
+/// strata exist). This controls nominal loss coefficients; it does not
+/// preserve gradient direction, norm, or clipping pressure. `changed_budget`
+/// is an aggregate *coefficient* share, not a measured gradient share. If
+/// either stratum is empty, all modes fall back to the only observed stratum
+/// with the legacy coefficient mass.
+#[allow(clippy::too_many_arguments)]
+pub fn split_ce_with_weighting(
+    per_pixel: &Tensor,
+    positive_mask: &Tensor,
+    negative_mask: &Tensor,
+    positive_count: usize,
+    negative_count: usize,
+    positive_weight: f64,
+    mode: SplitCeWeighting,
+    changed_budget: Option<f64>,
+) -> Result<Tensor> {
+    if mode == SplitCeWeighting::CurrentDouble && changed_budget.is_none() {
+        return split_weighted_ce(
+            per_pixel,
+            positive_mask,
+            negative_mask,
+            positive_count,
+            negative_count,
+            positive_weight,
+        );
+    }
+    if positive_count == 0 && negative_count == 0 {
+        return per_pixel.zeros_like()?.sum_all().map_err(Into::into);
+    }
+
+    let positive = masked_mean_with_count(per_pixel, positive_mask, positive_count)?;
+    let negative = masked_mean_with_count(per_pixel, negative_mask, negative_count)?;
+    if positive_count == 0 {
+        return Ok(negative);
+    }
+    if negative_count == 0 {
+        return positive.affine(positive_weight, 0.0).map_err(Into::into);
+    }
+
+    let coefficient_mass = positive_weight + 1.0;
+    let positive_share = match changed_budget {
+        Some(budget) => budget,
+        None if mode == SplitCeWeighting::EqualMeans => 0.5,
+        None => {
+            let weighted_positive = positive_weight * positive_count as f64;
+            weighted_positive / (weighted_positive + negative_count as f64)
+        }
+    };
+    positive
+        .affine(coefficient_mass * positive_share, 0.0)?
+        .add(&negative.affine(coefficient_mass * (1.0 - positive_share), 0.0)?)
+        .map_err(Into::into)
+}
+
+fn latent_content_mask(
+    masks: &[&ContentMask],
+    latent_height: usize,
+    latent_width: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if masks.is_empty()
+        || latent_height == 0
+        || latent_width == 0
+        || !FRAME_SIDE.is_multiple_of(latent_height)
+        || !FRAME_SIDE.is_multiple_of(latent_width)
+    {
+        bail!("invalid latent/content-mask geometry");
+    }
+    let patch_height = FRAME_SIDE / latent_height;
+    let patch_width = FRAME_SIDE / latent_width;
+    let mut values = Vec::with_capacity(masks.len() * latent_height * latent_width);
+    for mask in masks {
+        if mask.values.len() != FRAME_SIDE * FRAME_SIDE {
+            bail!("content mask is not fixed 64x64");
+        }
+        for latent_y in 0..latent_height {
+            for latent_x in 0..latent_width {
+                let occupied = (0..patch_height).any(|dy| {
+                    let y = latent_y * patch_height + dy;
+                    (0..patch_width).any(|dx| {
+                        let x = latent_x * patch_width + dx;
+                        mask.values[y * FRAME_SIDE + x] != 0
+                    })
+                });
+                values.push(f32::from(occupied));
+            }
+        }
+    }
+    Tensor::from_vec(
+        values,
+        (masks.len(), 1, latent_height, latent_width),
+        device,
+    )
+    .map_err(Into::into)
+}
+
+fn masked_spatial_huber(input: &Tensor, target: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    if input.dims() != target.dims() {
+        bail!("masked Huber input/target shapes differ");
+    }
+    let (_, channels, height, width) = input.dims4()?;
+    if mask.dims() != [input.dim(0)?, 1, height, width] {
+        bail!("masked Huber mask shape does not match latent geometry");
+    }
+    let diff = input.sub(target)?;
+    let abs_diff = diff.abs()?;
+    let quadratic = diff.sqr()?.affine(0.5, 0.0)?;
+    let linear = abs_diff.affine(1.0, -0.5)?;
+    let elementwise = abs_diff.le(1.0)?.where_cond(&quadratic, &linear)?;
+    let numerator = elementwise.broadcast_mul(mask)?.sum_all()?;
+    let denominator = mask.sum_all()?.affine(channels as f64, 0.0)?;
+    numerator.broadcast_div(&denominator).map_err(Into::into)
+}
+
 fn foundation_v2_rollout_loss(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
     device: &Device,
 ) -> Result<(Tensor, usize)> {
-    let mut fragments = BTreeMap::<(u64, u64, String), Vec<&TransitionSample>>::new();
+    let mut fragments =
+        BTreeMap::<(u64, u64, String), Vec<(&TransitionSample, &ContentMask)>>::new();
     for sample in mixed
         .samples()
         .iter()
@@ -3491,18 +3733,20 @@ fn foundation_v2_rollout_loss(
                 transition.family.clone(),
             ))
             .or_default()
-            .push(transition);
+            .push((transition, &sample.content_mask));
     }
     let mut first = Vec::new();
     let mut second = Vec::new();
+    let mut second_masks = Vec::new();
     for fragment in fragments.values_mut() {
-        fragment.sort_by_key(|sample| sample.transition_index);
+        fragment.sort_by_key(|(sample, _)| sample.transition_index);
         if let Some(pair) = fragment
             .windows(2)
-            .find(|pair| pair[1].transition_index == pair[0].transition_index + 1)
+            .find(|pair| pair[1].0.transition_index == pair[0].0.transition_index + 1)
         {
-            first.push(pair[0].clone());
-            second.push(pair[1].clone());
+            first.push(pair[0].0.clone());
+            second.push(pair[1].0.clone());
+            second_masks.push(pair[1].1);
         }
     }
     if first.len() < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
@@ -3535,9 +3779,13 @@ fn foundation_v2_rollout_loss(
         None,
         RecursionOpts::training(true),
     )?;
-    let spatial = candle_nn::loss::huber(&second_out.y, &target_h2, 1.0)?;
-    let predicted_canonical = model.canonical_representation(&second_out.y)?;
-    let target_canonical = model.canonical_representation(&target_h2)?;
+    let (_, _, height, width) = second_out.y.dims4()?;
+    let content_mask = latent_content_mask(&second_masks, height, width, device)?;
+    let spatial = masked_spatial_huber(&second_out.y, &target_h2, &content_mask)?;
+    let predicted_canonical =
+        model.canonical_representation(&second_out.y.broadcast_mul(&content_mask)?)?;
+    let target_canonical =
+        model.canonical_representation(&target_h2.broadcast_mul(&content_mask)?)?;
     Ok((
         spatial.add(&candle_nn::loss::huber(
             &predicted_canonical,
@@ -3546,6 +3794,51 @@ fn foundation_v2_rollout_loss(
         )?)?,
         first.len(),
     ))
+}
+
+/// Graded Foundation-v2 observer target shared by training and evaluation.
+/// Changed rows score the composed copy-gate decode only on factually changed
+/// pixels; no-change rows score it over the exact content mask. The target is
+/// detached because Q/reliability are observer heads, not decoder objectives.
+pub fn foundation_v2_graded_q_targets(
+    model: &WorldModel,
+    predicted_latent: &Tensor,
+    current_frames: &Tensor,
+    next_frames: &Tensor,
+    content: &Tensor,
+) -> Result<Tensor> {
+    let batch_size = predicted_latent.dim(0)?;
+    if content.dims() != [batch_size, FRAME_SIDE - 1, FRAME_SIDE] {
+        bail!("foundation-v2 Q content mask has the wrong shape");
+    }
+    let current_labels = current_frames
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    let target_labels = next_frames
+        .narrow(2, 0, FRAME_SIDE - 1)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    let changed = current_labels.ne(&target_labels)?.to_dtype(DType::F32)?;
+    let composed = model.composed_gameplay_decode(&predicted_latent.detach(), current_frames)?;
+    let correct = composed.eq(&target_labels)?.to_dtype(DType::F32)?;
+    let changed_count_per_sample = changed.sum(2)?.sum(1)?;
+    let content_count_per_sample = content.sum(2)?.sum(1)?;
+    let changed_accuracy = correct
+        .mul(&changed)?
+        .sum(2)?
+        .sum(1)?
+        .div(&changed_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
+    let content_accuracy = correct
+        .mul(content)?
+        .sum(2)?
+        .sum(1)?
+        .div(&content_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
+    Ok(changed_count_per_sample
+        .gt(0.0)?
+        .where_cond(&changed_accuracy, &content_accuracy)?
+        .unsqueeze(1)?
+        .detach())
 }
 
 /// Foundation-v2's single mixed-stream objective. It is intentionally not an
@@ -3564,7 +3857,6 @@ pub fn foundation_v2_training_loss(
     let batch = batch_from_samples(&samples, device)?;
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_canonical = model.canonical_representation(&encoded.current)?;
-    let target_canonical = model.canonical_representation(&encoded.next)?;
     let out = model.full_v4_training_latents_from_encoded_state(
         &encoded.current,
         &current_canonical,
@@ -3576,6 +3868,15 @@ pub fn foundation_v2_training_loss(
         RecursionOpts::training(true),
     )?;
     let predicted_canonical = model.canonical_representation(&out.y)?;
+    let (_, _, latent_height, latent_width) = out.y.dims4()?;
+    let content_masks = mixed.content_masks().collect::<Vec<_>>();
+    let latent_mask = latent_content_mask(&content_masks, latent_height, latent_width, device)?;
+    let content_current_canonical =
+        model.canonical_representation(&encoded.current.broadcast_mul(&latent_mask)?)?;
+    let content_target_canonical =
+        model.canonical_representation(&encoded.next.broadcast_mul(&latent_mask)?)?;
+    let content_predicted_canonical =
+        model.canonical_representation(&out.y.broadcast_mul(&latent_mask)?)?;
     let batch_size = samples.len();
     let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
     let current_pixels = samples
@@ -3634,13 +3935,15 @@ pub fn foundation_v2_training_loss(
 
     let predicted_logits = model.exact_gameplay_logits_trainable(&out.y)?;
     let pred_per_pixel = foundation_v2_unimix_ce(&predicted_logits, &target_labels)?;
-    let pred_ce = split_weighted_ce(
+    let pred_ce = split_ce_with_weighting(
         &pred_per_pixel,
         &changed,
         &unchanged,
         changed_weights.changed_pixels,
         changed_weights.unchanged_pixels,
         changed_weights.changed_weight,
+        objective.split_ce_weighting,
+        objective.split_ce_changed_budget,
     )?;
 
     let gate_logits = model.exact_copy_gate_logits_trainable(&out.y)?;
@@ -3651,8 +3954,8 @@ pub fn foundation_v2_training_loss(
         .sum_all()?
         .affine(1.0 / changed_weights.content_pixels as f64, 0.0)?;
 
-    let latent = candle_nn::loss::huber(&out.y, &encoded.next, 1.0)?.add(
-        &candle_nn::loss::huber(&predicted_canonical, &target_canonical, 1.0)?,
+    let latent = masked_spatial_huber(&out.y, &encoded.next, &latent_mask)?.add(
+        &candle_nn::loss::huber(&content_predicted_canonical, &content_target_canonical, 1.0)?,
     )?;
 
     let foreground_values = current_pixels
@@ -3676,6 +3979,9 @@ pub fn foundation_v2_training_loss(
         device,
     )?;
     let background = content.sub(&foreground)?;
+    // Current-frame foreground/background reconstruction is a distinct
+    // objective and deliberately retains its fixed historical weighting. The
+    // ablation knob changes only changed-vs-unchanged transition terms.
     let encoded_current_ce = split_weighted_ce(
         &foundation_v2_unimix_ce(
             &model.exact_gameplay_logits_trainable(&encoded.current)?,
@@ -3687,7 +3993,7 @@ pub fn foundation_v2_training_loss(
         background_count,
         foreground_weight,
     )?;
-    let encoded_next_ce = split_weighted_ce(
+    let encoded_next_ce = split_ce_with_weighting(
         &foundation_v2_unimix_ce(
             &model.exact_gameplay_logits_trainable(&encoded.next)?,
             &target_labels,
@@ -3697,11 +4003,16 @@ pub fn foundation_v2_training_loss(
         changed_weights.changed_pixels,
         changed_weights.unchanged_pixels,
         changed_weights.changed_weight,
+        objective.split_ce_weighting,
+        objective.split_ce_changed_budget,
     )?;
     let enc_ce = encoded_current_ce.add(&encoded_next_ce)?.affine(0.5, 0.0)?;
 
     let zero = Tensor::zeros((), DType::F32, device)?;
-    let displacement = predicted_canonical.sub(&current_canonical)?;
+    // Branch-effect and inverse-action auxiliaries must not classify the
+    // translated PAD field. Derive displacement from the same content-masked
+    // canonical seam used by the latent/EP corrections.
+    let displacement = content_predicted_canonical.sub(&content_current_canonical)?;
     let displacement_norm = displacement
         .sqr()?
         .sum_keepdim(D::Minus1)?
@@ -3795,7 +4106,13 @@ pub fn foundation_v2_training_loss(
         }
     };
 
-    let ep_population = Tensor::stack(&[current_canonical.clone(), target_canonical.clone()], 0)?;
+    let ep_population = Tensor::stack(
+        &[
+            content_current_canonical.clone(),
+            content_target_canonical.clone(),
+        ],
+        0,
+    )?;
     let ep = sigreg_epps_pulley_seeded(
         &ep_population,
         objective.sigreg_projections,
@@ -3811,25 +4128,8 @@ pub fn foundation_v2_training_loss(
         &batch.event_mask,
         Some(&event_slot_weight_tensor(device)?),
     )?;
-    let composed = model.composed_gameplay_decode(&out.y.detach(), &batch.frames)?;
-    let correct = composed.eq(&target_labels)?.to_dtype(DType::F32)?;
-    let changed_count_per_sample = changed.sum(2)?.sum(1)?;
-    let content_count_per_sample = content.sum(2)?.sum(1)?;
-    let changed_accuracy = correct
-        .mul(&changed)?
-        .sum(2)?
-        .sum(1)?
-        .div(&changed_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
-    let content_accuracy = correct
-        .mul(&content)?
-        .sum(2)?
-        .sum(1)?
-        .div(&content_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
-    let graded_targets = changed_count_per_sample
-        .gt(0.0)?
-        .where_cond(&changed_accuracy, &content_accuracy)?
-        .unsqueeze(1)?
-        .detach();
+    let graded_targets =
+        foundation_v2_graded_q_targets(model, &out.y, &batch.frames, &batch.next_frames, &content)?;
     let q = bce_with_logits(
         &model.q_logit_from_canonical(&detached_canonical)?,
         &graded_targets,
@@ -4856,8 +5156,12 @@ fn save_export_snapshot(varmap: &VarMap, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn export_checkpoint_path(output_dir: &Path) -> Option<PathBuf> {
-    let best = output_dir.join("model.best.safetensors");
+fn export_checkpoint_path(cfg: &TrainConfig) -> Option<PathBuf> {
+    let best = if cfg.recipe == TrainingRecipe::FoundationV2 {
+        cfg.output_dir.join("checkpoints/best/ema.safetensors")
+    } else {
+        cfg.output_dir.join("model.best.safetensors")
+    };
     best.exists().then_some(best)
 }
 
@@ -5619,6 +5923,15 @@ fn build_report(
     resumed_from: Option<PathBuf>,
 ) -> TrainReport {
     let foundation_v2 = state.foundation_v2.as_ref().map(|foundation| {
+        let best_promotion_value = match cfg.promotion_metric {
+            PromotionMetric::ChangedExact => foundation.best_changed_exact,
+            PromotionMetric::FullExact => foundation
+                .gate_history
+                .iter()
+                .filter_map(|evaluation| evaluation.metrics.one_step_full_exact)
+                .reduce(f64::max),
+        };
+        let best_checkpoint = cfg.output_dir.join("checkpoints/best");
         FoundationV2TrainingReport {
             total_steps: foundation.total_steps,
             mean_losses: foundation_v2_loss_means(&foundation.loss_sums, foundation.loss_steps),
@@ -5626,11 +5939,13 @@ fn build_report(
             ep_gradient_budget: foundation.ep_gradient_budget.clone(),
             gate_history: foundation.gate_history.clone(),
             best_changed_exact: foundation.best_changed_exact,
-            best_checkpoint: foundation
-                .best_changed_exact
-                .map(|_| cfg.output_dir.join("checkpoints/best")),
+            promotion_metric: cfg.promotion_metric,
+            best_promotion_value,
+            best_checkpoint: best_checkpoint.exists().then_some(best_checkpoint),
             rollout_enabled: foundation.rollout_enabled,
             permanent_checkpoints: foundation.permanent_checkpoints.clone(),
+            event_label_census: foundation.event_label_census,
+            event_label_census_complete: foundation.event_label_census_complete,
             // Documented ADR 0003 approximation: EP is first constrained by
             // its encoder-gradient controller, then the combined gradient is
             // clipped at 1.0. We do not claim a separately clipped EP store.
@@ -5664,7 +5979,7 @@ fn build_report(
         resumed_from,
         batch_schedule_migrations: state.batch_schedule_migrations.clone(),
         checkpoint: cfg.output_dir.join("model.safetensors"),
-        export_checkpoint: export_checkpoint_path(&cfg.output_dir),
+        export_checkpoint: export_checkpoint_path(cfg),
         config_path: cfg.output_dir.join("config.json"),
         profile: state.profile.clone(),
         gradient_pressure: state.gradient_pressure.clone(),
@@ -5817,6 +6132,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 loss_sums: FoundationV2LossMeans::default(),
                 loss_steps: 0,
                 permanent_checkpoints: Vec::new(),
+                event_label_census: EventLabelCensus::default(),
+                event_label_census_complete: true,
             }),
         }
     };
@@ -5843,6 +6160,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         V5DataSplit::UnseenSeed7x7,
     )?;
     let gate_samples = gate_batch.transitions().cloned().collect::<Vec<_>>();
+    let gate_content_masks = gate_batch
+        .samples()
+        .iter()
+        .map(|sample| sample.content_mask.clone())
+        .collect::<Vec<_>>();
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
         seed: cfg.seed,
@@ -5926,6 +6248,19 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 V5DataSplit::Train,
             )?
         };
+        let batch_event_census = mixed.event_label_census();
+        {
+            let total = &mut state
+                .foundation_v2
+                .as_mut()
+                .expect("foundation-v2 state")
+                .event_label_census;
+            total.rows += batch_event_census.rows;
+            for slot in 0..4 {
+                total.labeled[slot] += batch_event_census.labeled[slot];
+                total.positive[slot] += batch_event_census.positive[slot];
+            }
+        }
         let consumed = mixed.transitions().cloned().collect::<Vec<_>>();
         update_training_population(&mut state, &consumed);
         let (ep_weight, rollout_enabled) = {
@@ -5942,6 +6277,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 sigreg_knots: cfg.sigreg_knots,
                 sigreg_seed: cfg.seed.wrapping_add(state.global_step),
                 rollout_enabled,
+                split_ce_weighting: cfg.split_ce_weighting,
+                split_ce_changed_budget: cfg.split_ce_changed_budget,
             },
         )?;
         let next_step = state.global_step + 1;
@@ -5997,15 +6334,22 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let mut abort = false;
         if state.global_step.is_multiple_of(FOUNDATION_V2_GATE_EVERY) {
             let metrics = ema.with_eval_weights(&varmap, || {
-                evaluate_gate_support(&model, &gate_samples, &device)
+                evaluate_gate_support_with_content_masks(
+                    &model,
+                    &gate_samples,
+                    Some(&gate_content_masks),
+                    &device,
+                )
             })?;
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             let prior_best = foundation.best_changed_exact;
             let evaluation = foundation_v2_gate_evaluation(state.global_step, metrics, prior_best);
-            improved_best = evaluation
-                .metrics
-                .one_step_changed_exact
-                .is_some_and(|current| prior_best.is_none_or(|best| current > best));
+            improved_best = foundation_v2_promotion_improved(
+                cfg.promotion_metric,
+                prior_best,
+                &foundation.gate_history,
+                &evaluation.metrics,
+            );
             foundation.best_changed_exact = evaluation.running_best_after;
             foundation.rollout_enabled = evaluation.gates[3].passed;
             foundation.gate_history.push(evaluation);
@@ -8985,6 +9329,15 @@ mod tests {
         let mut cfg = base.clone();
         cfg.spatial_action_residual_scale += 0.1;
         changed.push(("spatial_action_residual_scale", cfg));
+        let mut cfg = base.clone();
+        cfg.split_ce_weighting = SplitCeWeighting::PooledPerPixel;
+        changed.push(("split_ce_weighting", cfg));
+        let mut cfg = base.clone();
+        cfg.split_ce_changed_budget = Some(0.5);
+        changed.push(("split_ce_changed_budget", cfg));
+        let mut cfg = base.clone();
+        cfg.promotion_metric = PromotionMetric::FullExact;
+        changed.push(("promotion_metric", cfg));
         let mut cfg = base.clone();
         cfg.branch_learning.outcome_pull_weight += 0.01;
         changed.push(("branch_learning", cfg));

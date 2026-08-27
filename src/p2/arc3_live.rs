@@ -6,7 +6,7 @@
 
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::agent_session::AgentSession;
-use crate::p2::data::{ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
+use crate::p2::data::{palette, ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::eval::load_model;
 use crate::p2::model::{
     latent_mse_per_sample, RecursionDepth, RecursionOpts, WorldModel, EVENT_NOOP,
@@ -33,12 +33,21 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v2";
+pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v3";
 pub const LIVE_POLICY: &str = "model_reliable_effect_v1";
 const POLICY_LIMITATION: &str = "The checkpoint predicts transition fidelity, reliability, no-op probability, and latent action effect; it has no trained reward/value head. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
-const TRIED_ACTION_KEY_CONTRACT: &str = "game id + frame dimensions + visible pixels in rows [0,63); row 63 is excluded because training uses it as synthetic status while live games may contain real content there";
+const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content";
 const MAX_HTTP_ATTEMPTS: usize = 5;
+/// Default cap on guid-scoped RESET retries per level after a recoverable
+/// non-WIN terminal such as GAME_OVER.
+pub const DEFAULT_MAX_LEVEL_RETRIES: usize = 3;
+/// Default score penalty for already-tried actions. The policy score is a
+/// convex mixture in [0, 1]; 0.25 demotes near-ties toward exploration while
+/// still letting a tried action win again once its margin over every untried
+/// candidate exceeds a quarter of the score range. The former hard penalty of
+/// 1.0 swamped the whole range and turned "tried once" into "never again".
+pub const DEFAULT_TRIED_PENALTY: f64 = 0.25;
 
 #[derive(Debug, Clone)]
 pub struct LiveEvalConfig {
@@ -53,6 +62,7 @@ pub struct LiveEvalConfig {
     pub action6_max_candidates: usize,
     pub action6_grid_stride: usize,
     pub request_timeout_secs: u64,
+    pub driver: LiveDriverOptions,
     pub output: PathBuf,
 }
 
@@ -83,6 +93,59 @@ impl LiveEvalConfig {
             !self.api_key_env.trim().is_empty(),
             "api_key_env must not be empty"
         );
+        self.driver.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveDriverOptions {
+    /// Competition mode: RESET always retries the current level and earlier
+    /// levels cannot be revisited, so a guid-scoped retry is always safe.
+    #[serde(default)]
+    pub competition_mode: bool,
+    /// Maximum guid-scoped RESET retries per level after a recoverable
+    /// non-WIN terminal such as GAME_OVER.
+    #[serde(default = "default_max_level_retries")]
+    pub max_level_retries: usize,
+    /// Optional per-level action budget mirroring the official per-level
+    /// scoring budget. `None` keeps only the per-game guard.
+    #[serde(default)]
+    pub max_actions_per_level: Option<usize>,
+    /// Score penalty subtracted from already-tried actions within one
+    /// tried-state key. See [`DEFAULT_TRIED_PENALTY`].
+    #[serde(default = "default_tried_penalty")]
+    pub tried_penalty: f64,
+}
+
+fn default_max_level_retries() -> usize {
+    DEFAULT_MAX_LEVEL_RETRIES
+}
+
+fn default_tried_penalty() -> f64 {
+    DEFAULT_TRIED_PENALTY
+}
+
+impl Default for LiveDriverOptions {
+    fn default() -> Self {
+        Self {
+            competition_mode: false,
+            max_level_retries: DEFAULT_MAX_LEVEL_RETRIES,
+            max_actions_per_level: None,
+            tried_penalty: DEFAULT_TRIED_PENALTY,
+        }
+    }
+}
+
+impl LiveDriverOptions {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(cap) = self.max_actions_per_level {
+            ensure!(cap > 0, "max_actions_per_level must be > 0 when set");
+        }
+        ensure!(
+            self.tried_penalty.is_finite() && (0.0..=1.0).contains(&self.tried_penalty),
+            "tried_penalty must be finite and in [0,1]"
+        );
         Ok(())
     }
 }
@@ -98,6 +161,15 @@ pub struct ArcObservation {
     pub game_id: String,
     pub guid: String,
     pub frame: ArcFrame,
+    /// Every animation layer from the API response in order, each padded to
+    /// the fixed 64x64 canvas. For API-converted observations the settled
+    /// frame (`frame`) is the last layer. Empty for legacy serialized data.
+    #[serde(default)]
+    pub animation: Vec<ArcFrame>,
+    /// True when RESET replaced the whole game session rather than retrying
+    /// the current level. Legacy observations predate this API field.
+    #[serde(default)]
+    pub full_reset: bool,
     pub state: String,
     pub levels_completed: u16,
     pub win_levels: u16,
@@ -134,9 +206,12 @@ impl ArcObservation {
         Ok(())
     }
 
+    fn won(&self) -> bool {
+        self.state == "WIN" || (self.win_levels > 0 && self.levels_completed >= self.win_levels)
+    }
+
     fn terminal(&self) -> bool {
-        self.state != "NOT_FINISHED"
-            || (self.win_levels > 0 && self.levels_completed >= self.win_levels)
+        self.state != "NOT_FINISHED" || self.won()
     }
 }
 
@@ -145,6 +220,7 @@ struct ApiObservation {
     game_id: String,
     guid: String,
     frame: Vec<Vec<Vec<u8>>>,
+    full_reset: bool,
     state: String,
     levels_completed: u16,
     win_levels: u16,
@@ -155,29 +231,35 @@ impl TryFrom<ApiObservation> for ArcObservation {
     type Error = anyhow::Error;
 
     fn try_from(value: ApiObservation) -> Result<Self> {
-        let settled = value
-            .frame
+        ensure!(!value.frame.is_empty(), "ARC response contains no frames");
+        let mut animation = Vec::with_capacity(value.frame.len());
+        for layer in &value.frame {
+            ensure!(!layer.is_empty(), "ARC response contains an empty frame");
+            let width = layer[0].len();
+            ensure!(width > 0, "ARC response contains a zero-width frame");
+            ensure!(
+                width <= 64 && layer.len() <= 64,
+                "ARC response frame is {}x{}, exceeding the supported 64x64 canvas",
+                width,
+                layer.len()
+            );
+            ensure!(
+                layer.iter().all(|row| row.len() == width),
+                "ARC response frame is ragged"
+            );
+            let pixels = layer.iter().flatten().copied().collect();
+            animation.push(ArcFrame::new(width as u16, layer.len() as u16, pixels)?.to_fixed_64()?);
+        }
+        let frame = animation
             .last()
+            .cloned()
             .context("ARC response contains no frames")?;
-        ensure!(!settled.is_empty(), "ARC response contains an empty frame");
-        let width = settled[0].len();
-        ensure!(width > 0, "ARC response contains a zero-width frame");
-        ensure!(
-            width <= 64 && settled.len() <= 64,
-            "ARC response frame is {}x{}, exceeding the supported 64x64 canvas",
-            width,
-            settled.len()
-        );
-        ensure!(
-            settled.iter().all(|row| row.len() == width),
-            "ARC response frame is ragged"
-        );
-        let pixels = settled.iter().flatten().copied().collect();
-        let frame = ArcFrame::new(width as u16, settled.len() as u16, pixels)?.to_fixed_64()?;
         let observation = Self {
             game_id: value.game_id,
             guid: value.guid,
             frame,
+            animation,
+            full_reset: value.full_reset,
             state: value.state,
             levels_completed: value.levels_completed,
             win_levels: value.win_levels,
@@ -191,7 +273,17 @@ impl TryFrom<ApiObservation> for ArcObservation {
 pub trait ArcApi {
     fn list_games(&mut self) -> Result<Vec<PublicGame>>;
     fn open_scorecard(&mut self, metadata: &Value) -> Result<String>;
-    fn reset(&mut self, game_id: &str, card_id: &str) -> Result<ArcObservation>;
+    /// RESET. Without `guid` this opens/wipes a game session. With `guid`
+    /// (an existing session) the official semantics restart the current level
+    /// when an ACTION happened since the last RESET or level transition, and
+    /// otherwise reset the game; in competition mode a guid-scoped RESET
+    /// always retries the current level.
+    fn reset(
+        &mut self,
+        game_id: &str,
+        card_id: &str,
+        guid: Option<&str>,
+    ) -> MutationResult<ArcObservation>;
     fn act(
         &mut self,
         game_id: &str,
@@ -503,17 +595,39 @@ impl<T: HttpTransport> ArcApi for HttpArcApi<T> {
         Ok(response.card_id)
     }
 
-    fn reset(&mut self, game_id: &str, card_id: &str) -> Result<ArcObservation> {
-        let response: ApiObservation = self.post(
-            "/api/cmd/RESET",
-            &json!({ "game_id": game_id, "card_id": card_id }),
-            "reset game",
-        )?;
-        let observation = ArcObservation::try_from(response)?;
-        ensure!(
-            observation.game_id == game_id,
-            "RESET response game_id does not match request"
-        );
+    fn reset(
+        &mut self,
+        game_id: &str,
+        card_id: &str,
+        guid: Option<&str>,
+    ) -> MutationResult<ArcObservation> {
+        let mut body = json!({ "game_id": game_id, "card_id": card_id });
+        if let Some(guid) = guid {
+            body["guid"] = json!(guid);
+        }
+        let ambiguity = AmbiguousMutation {
+            operation: "reset game".into(),
+            game_id: Some(game_id.into()),
+            guid: guid.map(str::to_owned),
+            action: None,
+            cause: String::new(),
+        };
+        let response: ApiObservation =
+            self.action_post("/api/cmd/RESET", &body, ambiguity.clone())?;
+        let observation = ArcObservation::try_from(response).map_err(|error| {
+            MutationError::Ambiguous(AmbiguousMutation {
+                cause: format!("validate RESET response: {error:#}"),
+                ..ambiguity.clone()
+            })
+        })?;
+        if observation.game_id != game_id
+            || guid.is_some_and(|expected| observation.guid != expected)
+        {
+            return Err(MutationError::Ambiguous(AmbiguousMutation {
+                cause: "RESET response session identifiers do not match request".into(),
+                ..ambiguity
+            }));
+        }
         Ok(observation)
     }
 
@@ -590,6 +704,20 @@ pub struct ActionDecision {
 
 pub trait LivePolicy {
     fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision>;
+
+    /// Fires after the session-opening RESET of a game succeeds.
+    fn on_game_start(&mut self, _game_id: &str) {}
+
+    /// Fires whenever a confirmed action advances `levels_completed`.
+    fn on_level_transition(&mut self, _levels_completed: u16) {}
+
+    /// Fires when the driver decides to retry the current level with a
+    /// guid-scoped RESET after a recoverable non-WIN terminal.
+    fn on_reset_retry(&mut self, _reason: &str) {}
+
+    /// Fires once per attempted game with the final stop reason, even when
+    /// the opening RESET failed and `on_game_start` never fired.
+    fn on_game_end(&mut self, _outcome: &str) {}
 }
 
 pub struct ModelPolicy<'a> {
@@ -598,6 +726,7 @@ pub struct ModelPolicy<'a> {
     physical_batch: usize,
     action6_max_candidates: usize,
     action6_grid_stride: usize,
+    tried_penalty: f64,
     tried: BTreeMap<u64, BTreeSet<String>>,
 }
 
@@ -611,6 +740,7 @@ impl<'a> ModelPolicy<'a> {
         physical_batch: usize,
         action6_max_candidates: usize,
         action6_grid_stride: usize,
+        tried_penalty: f64,
     ) -> Self {
         Self {
             model,
@@ -618,6 +748,7 @@ impl<'a> ModelPolicy<'a> {
             physical_batch,
             action6_max_candidates,
             action6_grid_stride,
+            tried_penalty,
             tried: BTreeMap::new(),
         }
     }
@@ -713,17 +844,7 @@ impl LivePolicy for ModelPolicy<'_> {
         let mut scores = self.score_candidates(&observation.frame, &candidates)?;
         let hash = observation_hash(observation);
         let tried = self.tried.entry(hash).or_default();
-        let all_tried = scores
-            .iter()
-            .all(|score| tried.contains(&action_key(&score.action)));
-        if all_tried {
-            tried.clear();
-        }
-        for score in &mut scores {
-            if tried.contains(&action_key(&score.action)) {
-                score.score -= 1.0;
-            }
-        }
+        apply_tried_penalty(&mut scores, tried, self.tried_penalty);
         scores.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
@@ -741,15 +862,55 @@ impl LivePolicy for ModelPolicy<'_> {
             candidate_count: candidates.len(),
         })
     }
+
+    fn on_game_start(&mut self, _game_id: &str) {
+        self.tried.clear();
+    }
+
+    fn on_level_transition(&mut self, _levels_completed: u16) {
+        self.tried.clear();
+    }
+
+    fn on_reset_retry(&mut self, _reason: &str) {
+        self.tried.clear();
+    }
+
+    fn on_game_end(&mut self, _outcome: &str) {
+        self.tried.clear();
+    }
+}
+
+/// Soft tried-action demotion. Once every candidate has been tried the
+/// history for this key restarts; otherwise tried candidates lose `penalty`
+/// score so that near-ties explore while a strongly better tried action
+/// remains selectable.
+fn apply_tried_penalty(scores: &mut [ActionScore], tried: &mut BTreeSet<String>, penalty: f64) {
+    let all_tried = scores
+        .iter()
+        .all(|score| tried.contains(&action_key(&score.action)));
+    if all_tried {
+        tried.clear();
+    }
+    for score in scores {
+        if tried.contains(&action_key(&score.action)) {
+            score.score -= penalty;
+        }
+    }
 }
 
 pub fn observation_hash(observation: &ArcObservation) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     observation.game_id.hash(&mut hasher);
+    observation.guid.hash(&mut hasher);
+    observation.levels_completed.hash(&mut hasher);
     let frame = &observation.frame;
     frame.width.hash(&mut hasher);
     frame.height.hash(&mut hasher);
-    let visible_rows = usize::from(frame.height).min(FRAME_SIDE - 1);
+    let visible_rows = usize::from(frame.height).min(if row63_has_content(frame) {
+        FRAME_SIDE
+    } else {
+        FRAME_SIDE - 1
+    });
     let visible_len = visible_rows
         .saturating_mul(usize::from(frame.width))
         .min(frame.pixels.len());
@@ -787,7 +948,13 @@ pub fn enumerate_actions(
         }
     }
     if observation.available_actions.contains(&6) {
-        for (x, y) in action6_coordinates(&observation.frame, action6_max_candidates, grid_stride) {
+        let allow_row63 = row63_has_content(&observation.frame);
+        for (x, y) in action6_coordinates(
+            &observation.frame,
+            action6_max_candidates,
+            grid_stride,
+            allow_row63,
+        ) {
             candidates.push(ArcAction::new(6, Some(x), Some(y))?);
         }
     }
@@ -795,17 +962,42 @@ pub fn enumerate_actions(
     Ok(candidates)
 }
 
-fn action6_coordinates(frame: &ArcFrame, cap: usize, stride: usize) -> Vec<(u8, u8)> {
+fn dominant_color(frame: &ArcFrame) -> u8 {
     let mut counts = [0usize; 16];
     for &pixel in &frame.pixels {
         counts[pixel as usize] += 1;
     }
-    let background = counts
+    counts
         .iter()
         .enumerate()
         .max_by_key(|&(color, count)| (*count, std::cmp::Reverse(color)))
         .map(|(color, _)| color as u8)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Training synthesizes row 63 as a status row, but live games may put real
+/// content there. Content is any row-63 pixel differing from both the
+/// dominant background color and [`palette::PAD`] (fixed-64 padding).
+pub fn row63_has_content(frame: &ArcFrame) -> bool {
+    let background = dominant_color(frame);
+    let row_start = (FRAME_SIDE - 1) * FRAME_SIDE;
+    frame
+        .pixels
+        .get(row_start..)
+        .is_some_and(|row| row.iter().any(|&p| p != background && p != palette::PAD))
+}
+
+fn action6_coordinates(
+    frame: &ArcFrame,
+    cap: usize,
+    stride: usize,
+    allow_row63: bool,
+) -> Vec<(u8, u8)> {
+    let background = dominant_color(frame);
+    let mut counts = [0usize; 16];
+    for &pixel in &frame.pixels {
+        counts[pixel as usize] += 1;
+    }
     let mut points = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -821,11 +1013,11 @@ fn action6_coordinates(frame: &ArcFrame, cap: usize, stride: usize) -> Vec<(u8, 
         let mut sum_y = 0usize;
         let mut n = 0usize;
         for (index, &pixel) in frame.pixels.iter().enumerate() {
-            if pixel != color {
+            let y = index / FRAME_SIDE;
+            if pixel != color || (!allow_row63 && y == FRAME_SIDE - 1) {
                 continue;
             }
             let x = index % FRAME_SIDE;
-            let y = index / FRAME_SIDE;
             min_x = min_x.min(x);
             min_y = min_y.min(y);
             max_x = max_x.max(x);
@@ -849,7 +1041,12 @@ fn action6_coordinates(frame: &ArcFrame, cap: usize, stride: usize) -> Vec<(u8, 
         }
     }
 
-    for y in (stride / 2..FRAME_SIDE).step_by(stride) {
+    let row_limit = if allow_row63 {
+        FRAME_SIDE
+    } else {
+        FRAME_SIDE - 1
+    };
+    for y in (stride / 2..row_limit).step_by(stride) {
         for x in (stride / 2..FRAME_SIDE).step_by(stride) {
             let point = (x.min(63) as u8, y.min(63) as u8);
             if seen.insert(point) {
@@ -876,6 +1073,14 @@ pub struct LiveActionTrace {
     pub api_latency_ms: u128,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveLevelUsage {
+    pub level_index: u16,
+    pub attempted_actions: usize,
+    pub confirmed_actions: usize,
+    pub reset_retries: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbiguousAttemptedAction {
     pub index: usize,
@@ -900,6 +1105,16 @@ pub struct LiveGameReport {
     pub trace: Vec<LiveActionTrace>,
     pub ambiguous_attempted_action: Option<AmbiguousAttemptedAction>,
     #[serde(default)]
+    pub ambiguous_reset: Option<AmbiguousMutation>,
+    #[serde(default)]
+    pub attempted_actions: usize,
+    #[serde(default)]
+    pub reset_retries: usize,
+    #[serde(default)]
+    pub full_reset_detected: bool,
+    #[serde(default)]
+    pub level_usage: Vec<LiveLevelUsage>,
+    #[serde(default)]
     pub agent_session: AgentSession,
 }
 
@@ -917,6 +1132,8 @@ pub struct LiveEvalReport {
     pub policy_limitation: String,
     pub goal_feature_contract: String,
     pub tried_action_key_contract: String,
+    #[serde(default)]
+    pub driver: LiveDriverOptions,
     pub held_out_only: bool,
     pub public_data_used_for_fitting: bool,
     pub discovered_games: Vec<PublicGame>,
@@ -942,6 +1159,7 @@ pub struct LiveRunSettings {
     pub base_url: String,
     pub requested_games: Vec<String>,
     pub max_actions_per_game: usize,
+    pub driver: LiveDriverOptions,
 }
 
 pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
@@ -949,6 +1167,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     policy: &mut P,
     settings: &LiveRunSettings,
 ) -> Result<LiveEvalReport> {
+    settings.driver.validate()?;
     let mut discovered = api.list_games().context("discover public ARC games")?;
     discovered.sort_by(|a, b| a.game_id.cmp(&b.game_id));
     ensure!(!discovered.is_empty(), "ARC API returned no public games");
@@ -971,37 +1190,125 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         let started = Instant::now();
         let mut trace = Vec::new();
         let mut ambiguous_attempted_action = None;
+        let mut ambiguous_reset = None;
         let mut error = None;
         let mut stop_reason = "reset_failed".to_string();
         let mut agent_session = AgentSession::default();
-        let mut last = match api.reset(&game.game_id, &card_id) {
+        let mut attempted_actions = 0usize;
+        let mut reset_retries = 0usize;
+        let mut full_reset_detected = false;
+        let mut level_usage = BTreeMap::<u16, LiveLevelUsage>::new();
+        let mut action_since_reset_or_transition = false;
+        let mut last = match api.reset(&game.game_id, &card_id, None) {
             Ok(observation) => {
                 agent_session.observe(&observation)?;
+                policy.on_game_start(&game.game_id);
                 Some(observation)
             }
-            Err(err) => {
+            Err(MutationError::Ambiguous(mutation)) => {
+                error = Some(mutation.to_string());
+                stop_reason = "ambiguous_reset".into();
+                ambiguous_reset = Some(mutation);
+                None
+            }
+            Err(MutationError::Failed(err)) => {
                 error = Some(format!("{err:#}"));
                 None
             }
         };
 
-        while let Some(observation) = last.as_ref() {
+        while let Some(observation) = last.clone() {
             if observation.terminal() {
-                stop_reason = if observation.state == "WIN"
-                    || (observation.win_levels > 0
-                        && observation.levels_completed >= observation.win_levels)
+                if observation.won() {
+                    stop_reason = "completed".into();
+                    break;
+                }
+                if observation.state != "GAME_OVER" {
+                    stop_reason = format!("terminal_{}", observation.state.to_ascii_lowercase());
+                    break;
+                }
+                let usage = level_usage
+                    .entry(observation.levels_completed)
+                    .or_insert_with(|| LiveLevelUsage {
+                        level_index: observation.levels_completed,
+                        ..LiveLevelUsage::default()
+                    });
+                if attempted_actions >= settings.max_actions_per_game {
+                    stop_reason = "max_actions_reached".into();
+                    break;
+                }
+                if settings
+                    .driver
+                    .max_actions_per_level
+                    .is_some_and(|cap| usage.attempted_actions >= cap)
                 {
-                    "completed".into()
-                } else {
-                    format!("terminal_{}", observation.state.to_ascii_lowercase())
-                };
-                break;
+                    stop_reason = "level_action_cap_reached".into();
+                    break;
+                }
+                let retry_is_safe =
+                    settings.driver.competition_mode || action_since_reset_or_transition;
+                if !retry_is_safe {
+                    stop_reason = "terminal_game_over".into();
+                    break;
+                }
+                if usage.reset_retries >= settings.driver.max_level_retries {
+                    stop_reason = "level_retry_exhausted".into();
+                    break;
+                }
+
+                policy.on_reset_retry("game_over");
+                usage.reset_retries += 1;
+                reset_retries += 1;
+                let level_before = observation.levels_completed;
+                let retry =
+                    match api.reset(&game.game_id, &card_id, Some(observation.guid.as_str())) {
+                        Ok(retry) => retry,
+                        Err(MutationError::Ambiguous(mutation)) => {
+                            error = Some(mutation.to_string());
+                            stop_reason = "ambiguous_reset".into();
+                            ambiguous_reset = Some(mutation);
+                            break;
+                        }
+                        Err(MutationError::Failed(err)) => {
+                            error = Some(format!("retry reset: {err:#}"));
+                            stop_reason = "retry_reset_failed".into();
+                            break;
+                        }
+                    };
+                if retry.full_reset || retry.levels_completed != level_before {
+                    full_reset_detected = retry.full_reset;
+                    error = Some(format!(
+                        "retry RESET changed session scope: full_reset={} levels {} -> {}",
+                        retry.full_reset, level_before, retry.levels_completed
+                    ));
+                    stop_reason = "unsafe_retry_reset".into();
+                    last = Some(retry);
+                    break;
+                }
+                agent_session.observe(&retry)?;
+                action_since_reset_or_transition = false;
+                last = Some(retry);
+                continue;
             }
-            if trace.len() >= settings.max_actions_per_game {
+            if attempted_actions >= settings.max_actions_per_game {
                 stop_reason = "max_actions_reached".into();
                 break;
             }
-            let decision = match policy.choose_action(observation) {
+            let usage = level_usage
+                .entry(observation.levels_completed)
+                .or_insert_with(|| LiveLevelUsage {
+                    level_index: observation.levels_completed,
+                    ..LiveLevelUsage::default()
+                });
+            if settings
+                .driver
+                .max_actions_per_level
+                .is_some_and(|cap| usage.attempted_actions >= cap)
+            {
+                stop_reason = "level_action_cap_reached".into();
+                break;
+            }
+            let decision = match policy.choose_action(&observation) {
                 Ok(decision) => decision,
                 Err(err) => {
                     error = Some(format!("policy: {err:#}"));
@@ -1019,6 +1326,9 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 "candidate_count": decision.candidate_count,
             });
             let call_started = Instant::now();
+            attempted_actions += 1;
+            usage.attempted_actions += 1;
+            action_since_reset_or_transition = true;
             let next = match api.act(
                 &game.game_id,
                 &observation.guid,
@@ -1028,7 +1338,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 Ok(next) => next,
                 Err(MutationError::Ambiguous(mutation)) => {
                     agent_session.record_ambiguous(
-                        observation,
+                        &observation,
                         decision.chosen.action.clone(),
                         mutation.clone(),
                     )?;
@@ -1050,7 +1360,24 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                     break;
                 }
             };
-            agent_session.record_confirmed(observation, decision.chosen.action.clone(), &next)?;
+            if next.levels_completed < observation.levels_completed {
+                error = Some(format!(
+                    "ACTION response regressed levels {} -> {}",
+                    observation.levels_completed, next.levels_completed
+                ));
+                stop_reason = "protocol_level_regression".into();
+                last = Some(next);
+                break;
+            }
+            if next.full_reset {
+                full_reset_detected = true;
+                error = Some("ACTION response unexpectedly reported full_reset=true".into());
+                stop_reason = "protocol_full_reset".into();
+                last = Some(next);
+                break;
+            }
+            agent_session.record_confirmed(&observation, decision.chosen.action.clone(), &next)?;
+            usage.confirmed_actions += 1;
             trace.push(LiveActionTrace {
                 index: trace.len(),
                 available_actions: observation.available_actions.clone(),
@@ -1061,6 +1388,10 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 frame_changed: observation.frame != next.frame,
                 api_latency_ms: call_started.elapsed().as_millis(),
             });
+            if next.levels_completed > observation.levels_completed {
+                policy.on_level_transition(next.levels_completed);
+                action_since_reset_or_transition = false;
+            }
             last = Some(next);
         }
 
@@ -1074,6 +1405,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 )
             })
             .unwrap_or((0, 0, "RESET_FAILED".into()));
+        policy.on_game_end(&stop_reason);
         game_reports.push(LiveGameReport {
             game_id: game.game_id.clone(),
             title: game.title.clone(),
@@ -1086,6 +1418,11 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             duration_ms: started.elapsed().as_millis(),
             trace,
             ambiguous_attempted_action,
+            ambiguous_reset,
+            attempted_actions,
+            reset_retries,
+            full_reset_detected,
+            level_usage: level_usage.into_values().collect(),
             agent_session,
         });
     }
@@ -1118,6 +1455,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         policy_limitation: POLICY_LIMITATION.into(),
         goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),
         tried_action_key_contract: TRIED_ACTION_KEY_CONTRACT.into(),
+        driver: settings.driver.clone(),
         held_out_only: true,
         public_data_used_for_fitting: false,
         discovered_games: discovered,
@@ -1186,6 +1524,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         config.physical_batch,
         config.action6_max_candidates,
         config.action6_grid_stride,
+        config.driver.tried_penalty,
     );
     let mut api = HttpArcApi::from_env(
         &config.base_url,
@@ -1201,6 +1540,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         base_url: config.base_url.clone(),
         requested_games: config.games.clone(),
         max_actions_per_game: config.max_actions_per_game,
+        driver: config.driver.clone(),
     };
     let report = run_public_suite(&mut api, &mut policy, &settings)?;
     write_json_atomic(&config.output, &report)?;
@@ -1261,6 +1601,8 @@ mod tests {
             game_id: game_id.into(),
             guid: format!("guid-{game_id}"),
             frame: frame(0),
+            animation: Vec::new(),
+            full_reset: false,
             state: state.into(),
             levels_completed: 0,
             win_levels: 1,
@@ -1309,6 +1651,7 @@ mod tests {
             "game_id": game_id,
             "guid": guid,
             "frame": [[[0]]],
+            "full_reset": false,
             "state": state,
             "levels_completed": 0,
             "win_levels": 1,
@@ -1495,11 +1838,58 @@ mod tests {
     }
 
     #[test]
+    fn reset_request_scopes_retries_with_guid_and_preserves_full_reset() {
+        let mut api = http_api(vec![
+            Ok(response(
+                StatusCode::OK,
+                &json!({
+                    "game_id": "game", "guid": "guid", "frame": [[[0]]],
+                    "full_reset": true, "state": "NOT_FINISHED",
+                    "levels_completed": 0, "win_levels": 1, "available_actions": [1]
+                })
+                .to_string(),
+            )),
+            Ok(response(
+                StatusCode::OK,
+                &json!({
+                    "game_id": "game", "guid": "guid", "frame": [[[0]]],
+                    "full_reset": false, "state": "NOT_FINISHED",
+                    "levels_completed": 0, "win_levels": 1, "available_actions": [1]
+                })
+                .to_string(),
+            )),
+        ]);
+        assert!(api.reset("game", "card", None).unwrap().full_reset);
+        assert!(!api.reset("game", "card", Some("guid")).unwrap().full_reset);
+        let requests = api.transport.requests.lock().unwrap();
+        assert!(requests[0].body.as_ref().unwrap().get("guid").is_none());
+        assert_eq!(requests[1].body.as_ref().unwrap()["guid"], "guid");
+    }
+
+    #[test]
+    fn mutation_response_missing_full_reset_is_ambiguous() {
+        let mut api = http_api(vec![Ok(response(
+            StatusCode::OK,
+            &json!({
+                "game_id": "game", "guid": "guid", "frame": [[[0]]],
+                "state": "NOT_FINISHED", "levels_completed": 0,
+                "win_levels": 1, "available_actions": [1]
+            })
+            .to_string(),
+        ))]);
+        assert!(matches!(
+            api.reset("game", "card", None),
+            Err(MutationError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
     fn settled_frame_uses_last_animation_layer() {
         let api = ApiObservation {
             game_id: "demo".into(),
             guid: "guid".into(),
             frame: vec![vec![vec![1, 1]], vec![vec![7, 7]]],
+            full_reset: false,
             state: "NOT_FINISHED".into(),
             levels_completed: 0,
             win_levels: 1,
@@ -1508,6 +1898,25 @@ mod tests {
         let parsed = ArcObservation::try_from(api).unwrap();
         assert_eq!(parsed.frame.pixel(0, 0), Some(7));
         assert_eq!(parsed.frame.pixel(1, 0), Some(7));
+        assert_eq!(parsed.animation.len(), 2);
+        assert_eq!(parsed.animation[0].pixel(0, 0), Some(1));
+        assert_eq!(parsed.animation[1].pixel(0, 0), Some(7));
+    }
+
+    #[test]
+    fn legacy_observation_json_defaults_animation_and_full_reset() {
+        let parsed: ArcObservation = serde_json::from_value(json!({
+            "game_id": "game",
+            "guid": "guid",
+            "frame": frame(0),
+            "state": "NOT_FINISHED",
+            "levels_completed": 0,
+            "win_levels": 1,
+            "available_actions": [1]
+        }))
+        .unwrap();
+        assert!(parsed.animation.is_empty());
+        assert!(!parsed.full_reset);
     }
 
     #[test]
@@ -1516,6 +1925,7 @@ mod tests {
             game_id: "demo".into(),
             guid: "guid".into(),
             frame: vec![vec![vec![0; 65]]],
+            full_reset: false,
             state: "NOT_FINISHED".into(),
             levels_completed: 0,
             win_levels: 1,
@@ -1532,11 +1942,13 @@ mod tests {
     }
 
     #[test]
-    fn tried_action_hash_excludes_row_63_but_keeps_visible_gameplay() {
+    fn tried_action_hash_includes_row_63_when_it_has_non_background_content() {
         let first = observation("game", "NOT_FINISHED", vec![1]);
-        let mut status_changed = first.clone();
-        status_changed.frame.pixels[63 * FRAME_SIDE + 7] = 9;
-        assert_eq!(observation_hash(&first), observation_hash(&status_changed));
+        assert!(!row63_has_content(&first.frame));
+        let mut row63_content = first.clone();
+        row63_content.frame.pixels[63 * FRAME_SIDE + 7] = 9;
+        assert!(row63_has_content(&row63_content.frame));
+        assert_ne!(observation_hash(&first), observation_hash(&row63_content));
 
         let mut gameplay_changed = first.clone();
         gameplay_changed.frame.pixels[62 * FRAME_SIDE + 7] = 9;
@@ -1571,6 +1983,22 @@ mod tests {
     }
 
     #[test]
+    fn action6_row63_candidates_follow_the_content_classification() {
+        let plain = observation("demo", "NOT_FINISHED", vec![6]);
+        let plain_actions = enumerate_actions(&plain, 128, 8).unwrap();
+        assert!(plain_actions
+            .iter()
+            .all(|action| action.y.is_none_or(|y| y < 63)));
+
+        let mut gameplay = plain;
+        gameplay.frame.pixels[63 * FRAME_SIDE + 11] = 7;
+        let gameplay_actions = enumerate_actions(&gameplay, 128, 8).unwrap();
+        assert!(gameplay_actions
+            .iter()
+            .any(|action| action.x == Some(11) && action.y == Some(63)));
+    }
+
+    #[test]
     fn model_policy_scores_available_actions_from_one_observation() -> Result<()> {
         use crate::p2::model::ModelConfig;
         use candle_nn::{VarBuilder, VarMap};
@@ -1586,7 +2014,7 @@ mod tests {
         let varmap = VarMap::new();
         let builder = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = WorldModel::new(config, builder)?;
-        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32);
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
         let decision = policy.choose_action(&observation("demo", "NOT_FINISHED", vec![1, 2, 6]))?;
         assert!([1, 2, 6].contains(&decision.chosen.action.id));
         assert!(decision.chosen.score.is_finite());
@@ -1611,6 +2039,261 @@ mod tests {
                 candidate_count: 1,
             })
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingPolicy {
+        events: Vec<String>,
+    }
+
+    impl LivePolicy for RecordingPolicy {
+        fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+            FirstPolicy.choose_action(observation)
+        }
+
+        fn on_game_start(&mut self, game_id: &str) {
+            self.events.push(format!("start:{game_id}"));
+        }
+
+        fn on_level_transition(&mut self, levels_completed: u16) {
+            self.events.push(format!("level:{levels_completed}"));
+        }
+
+        fn on_reset_retry(&mut self, reason: &str) {
+            self.events.push(format!("retry:{reason}"));
+        }
+
+        fn on_game_end(&mut self, outcome: &str) {
+            self.events.push(format!("end:{outcome}"));
+        }
+    }
+
+    struct ScriptedApi {
+        resets: VecDeque<MutationResult<ArcObservation>>,
+        actions: VecDeque<MutationResult<ArcObservation>>,
+        reset_guids: Vec<Option<String>>,
+        closed: bool,
+    }
+
+    impl ScriptedApi {
+        fn new(
+            resets: Vec<MutationResult<ArcObservation>>,
+            actions: Vec<MutationResult<ArcObservation>>,
+        ) -> Self {
+            Self {
+                resets: resets.into(),
+                actions: actions.into(),
+                reset_guids: Vec::new(),
+                closed: false,
+            }
+        }
+    }
+
+    impl ArcApi for ScriptedApi {
+        fn list_games(&mut self) -> Result<Vec<PublicGame>> {
+            Ok(vec![PublicGame {
+                game_id: "game".into(),
+                title: "Game".into(),
+            }])
+        }
+
+        fn open_scorecard(&mut self, _metadata: &Value) -> Result<String> {
+            Ok("card".into())
+        }
+
+        fn reset(
+            &mut self,
+            _game_id: &str,
+            _card_id: &str,
+            guid: Option<&str>,
+        ) -> MutationResult<ArcObservation> {
+            self.reset_guids.push(guid.map(str::to_owned));
+            self.resets.pop_front().expect("scripted RESET response")
+        }
+
+        fn act(
+            &mut self,
+            _game_id: &str,
+            _guid: &str,
+            _action: &ArcAction,
+            _reasoning: &Value,
+        ) -> MutationResult<ArcObservation> {
+            self.actions.pop_front().expect("scripted ACTION response")
+        }
+
+        fn close_scorecard(&mut self, _card_id: &str) -> Result<Value> {
+            self.closed = true;
+            Ok(json!({}))
+        }
+    }
+
+    fn scripted_observation(state: &str, level: u16) -> ArcObservation {
+        let mut obs = observation(
+            "game",
+            state,
+            (state == "NOT_FINISHED").then_some(1).into_iter().collect(),
+        );
+        obs.guid = "guid-game".into();
+        obs.levels_completed = level;
+        obs
+    }
+
+    fn scripted_settings(driver: LiveDriverOptions) -> LiveRunSettings {
+        LiveRunSettings {
+            checkpoint: "model.safetensors".into(),
+            checkpoint_sha256: "model-hash".into(),
+            train_config: "config.json".into(),
+            train_config_sha256: "config-hash".into(),
+            device: "cpu".into(),
+            base_url: "https://example.invalid".into(),
+            requested_games: Vec::new(),
+            max_actions_per_game: 8,
+            driver,
+        }
+    }
+
+    #[test]
+    fn competition_game_over_retries_current_level_and_records_lifecycle() {
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let retry = scripted_observation("NOT_FINISHED", 0);
+        let game_over = scripted_observation("GAME_OVER", 0);
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        let mut api = ScriptedApi::new(vec![Ok(opening), Ok(retry)], vec![Ok(game_over), Ok(win)]);
+        let mut policy = RecordingPolicy::default();
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions {
+                competition_mode: true,
+                max_level_retries: 1,
+                max_actions_per_level: Some(2),
+                ..LiveDriverOptions::default()
+            }),
+        )
+        .unwrap();
+
+        let game = &report.games[0];
+        assert_eq!(api.reset_guids, vec![None, Some("guid-game".into())]);
+        assert_eq!(game.stop_reason, "completed");
+        assert_eq!(game.actions, 2);
+        assert_eq!(game.attempted_actions, 2);
+        assert_eq!(game.reset_retries, 1);
+        assert_eq!(game.level_usage[0].attempted_actions, 2);
+        assert_eq!(game.level_usage[0].reset_retries, 1);
+        assert_eq!(
+            policy.events,
+            vec!["start:game", "retry:game_over", "level:1", "end:completed"]
+        );
+        assert!(api.closed);
+    }
+
+    #[test]
+    fn general_mode_does_not_reset_a_terminal_opening_observation() {
+        let mut api = ScriptedApi::new(vec![Ok(scripted_observation("GAME_OVER", 0))], Vec::new());
+        let mut policy = RecordingPolicy::default();
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(api.reset_guids, vec![None]);
+        assert_eq!(report.games[0].stop_reason, "terminal_game_over");
+        assert_eq!(policy.events, vec!["start:game", "end:terminal_game_over"]);
+
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        let root = legacy.as_object_mut().unwrap();
+        root.remove("driver");
+        let game = root["games"][0].as_object_mut().unwrap();
+        for field in [
+            "ambiguous_reset",
+            "attempted_actions",
+            "reset_retries",
+            "full_reset_detected",
+            "level_usage",
+        ] {
+            game.remove(field);
+        }
+        let restored: LiveEvalReport = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.driver.competition_mode);
+        assert_eq!(restored.games[0].attempted_actions, 0);
+        assert!(restored.games[0].level_usage.is_empty());
+    }
+
+    #[test]
+    fn retry_full_reset_fails_closed_and_per_level_cap_survives_game_over() {
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let game_over = scripted_observation("GAME_OVER", 0);
+        let mut unsafe_reset = scripted_observation("NOT_FINISHED", 0);
+        unsafe_reset.full_reset = true;
+        let mut api = ScriptedApi::new(
+            vec![Ok(opening.clone()), Ok(unsafe_reset)],
+            vec![Ok(game_over.clone())],
+        );
+        let settings = scripted_settings(LiveDriverOptions {
+            competition_mode: true,
+            max_level_retries: 1,
+            ..LiveDriverOptions::default()
+        });
+        let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
+        assert_eq!(report.games[0].stop_reason, "unsafe_retry_reset");
+        assert!(report.games[0].full_reset_detected);
+
+        let mut capped_api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(game_over)]);
+        let capped = run_public_suite(
+            &mut capped_api,
+            &mut FirstPolicy,
+            &scripted_settings(LiveDriverOptions {
+                competition_mode: true,
+                max_actions_per_level: Some(1),
+                ..LiveDriverOptions::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(capped.games[0].stop_reason, "level_action_cap_reached");
+        assert_eq!(capped.games[0].reset_retries, 0);
+        assert_eq!(capped_api.reset_guids, vec![None]);
+    }
+
+    #[test]
+    fn action_full_reset_fails_closed_before_confirmation() {
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mut reset_action = scripted_observation("NOT_FINISHED", 0);
+        reset_action.full_reset = true;
+        let mut api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(reset_action)]);
+        let report = run_public_suite(
+            &mut api,
+            &mut FirstPolicy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(report.games[0].stop_reason, "protocol_full_reset");
+        assert!(report.games[0].full_reset_detected);
+        assert_eq!(report.games[0].attempted_actions, 1);
+        assert_eq!(report.games[0].actions, 0);
+    }
+
+    #[test]
+    fn ambiguous_opening_reset_is_reported_and_game_end_fires_once() {
+        let mutation = AmbiguousMutation {
+            operation: "reset game".into(),
+            game_id: Some("game".into()),
+            guid: None,
+            action: None,
+            cause: "lost response".into(),
+        };
+        let mut api = ScriptedApi::new(vec![Err(MutationError::Ambiguous(mutation))], Vec::new());
+        let mut policy = RecordingPolicy::default();
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(report.games[0].stop_reason, "ambiguous_reset");
+        assert!(report.games[0].ambiguous_reset.is_some());
+        assert_eq!(policy.events, vec!["end:ambiguous_reset"]);
     }
 
     struct FakeApi {
@@ -1638,7 +2321,12 @@ mod tests {
             Ok("card".into())
         }
 
-        fn reset(&mut self, game_id: &str, _card_id: &str) -> Result<ArcObservation> {
+        fn reset(
+            &mut self,
+            game_id: &str,
+            _card_id: &str,
+            _guid: Option<&str>,
+        ) -> MutationResult<ArcObservation> {
             Ok(observation(game_id, "NOT_FINISHED", vec![1]))
         }
 
@@ -1698,6 +2386,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             requested_games: Vec::new(),
             max_actions_per_game: 4,
+            driver: LiveDriverOptions::default(),
         };
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
         assert!(api.closed);
@@ -1710,7 +2399,7 @@ mod tests {
         assert!(report.goal_feature_contract.contains("30% goal dropout"));
         assert!(report
             .tried_action_key_contract
-            .contains("row 63 is excluded"));
+            .contains("row 63 participates"));
         assert_eq!(report.official_rhae, Some(100.0));
         assert!(report.official_scorecard_parse_error.is_none());
         assert!(report
@@ -1735,6 +2424,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             requested_games: vec!["a-1".into()],
             max_actions_per_game: 4,
+            driver: LiveDriverOptions::default(),
         };
 
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();
@@ -1779,6 +2469,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             requested_games: vec!["game".into()],
             max_actions_per_game: 4,
+            driver: LiveDriverOptions::default(),
         };
 
         let report = run_public_suite(&mut api, &mut FirstPolicy, &settings).unwrap();

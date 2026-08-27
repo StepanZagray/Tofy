@@ -57,6 +57,15 @@ fn mixed_stream_schedule_anneals_to_the_specified_endpoints() {
 #[test]
 fn factual_groups_stay_intact_and_effect_labels_ignore_status_row() -> Result<()> {
     let batch = compose_mixed_stream_batch(&test_config(100), 0.0, 3, V5DataSplit::Train)?;
+    let event_census = batch.event_label_census();
+    assert_eq!(event_census.labeled[3], 0);
+    assert_eq!(event_census.positive[3], 0);
+    assert!(batch.samples().iter().all(|sample| {
+        sample.transition.exhausted.is_none()
+            && (!sample.provenance.goal_dropped
+                || (sample.transition.goal_satisfied.is_none()
+                    && sample.transition.goal_failed.is_none()))
+    }));
     assert!(!batch.factual_group_ranges().is_empty());
     for range in batch.factual_group_ranges() {
         assert_eq!(range.len(), FACTUAL_BRANCHES_PER_GROUP);
@@ -255,10 +264,10 @@ fn mixed_stream_bytes_are_identical_across_rayon_thread_counts() -> Result<()> {
         assert_eq!(batch_hash(&one)?, batch_hash(&many)?);
         assert_eq!(one, many);
         if (progress, batch_index, split) == (0.35, 17, V5DataSplit::Train) {
-            // Captured from the serial composer before its parallel rewrite.
+            // Golden byte identity for the event-identifiable V5 contract.
             assert_eq!(
                 batch_hash(&one)?,
-                "4b0876551f84eee27a97e331085c7656e5d92231900e0bafc73879f106ada051"
+                "298cfb485c0b810c260f3dc33f98cd71a8f1f1e25620fe8e0379ff82507c66e4"
             );
         }
     }

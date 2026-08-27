@@ -9,17 +9,26 @@ use candle_nn::ops;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SEMANTIC_EVAL_SCHEMA: &str = "p2.semantic_eval.v2";
+pub const SEMANTIC_EVAL_SCHEMA: &str = "p2.semantic_eval.v3";
 
-const NONCOMPARABLE_CONTENT_MASKS: [&str; 3] = ["content", "padding", "changed_content"];
+const NONCOMPARABLE_CONTENT_MASKS: [&str; 5] = [
+    "content",
+    "padding",
+    "changed_content",
+    "unchanged_content",
+    "unchanged_padding",
+];
 
-const MASKS: [&str; 6] = [
+const MASKS: [&str; 9] = [
     "content",
     "padding",
     "foreground",
     "changed",
     "unchanged",
     "changed_content",
+    "unchanged_content",
+    "unchanged_padding",
+    "gameplay",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +46,42 @@ pub struct SemanticMaskMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticDecoderMetrics {
     pub masks: BTreeMap<String, SemanticMaskMetrics>,
+    /// Derived from `unchanged_content`: the fraction of unchanged board
+    /// content pixels the decode edits. Padding cannot dilute this metric.
+    #[serde(default)]
+    pub false_edit_rate: Option<f64>,
+    /// Derived from `unchanged_content`: fraction of transitions with at least
+    /// one false edit in the content rectangle.
+    #[serde(default)]
+    pub false_edit_transition_rate: Option<f64>,
+    /// Padding hallucination rate, kept separate from content false edits.
+    #[serde(default)]
+    pub padding_false_edit_rate: Option<f64>,
+    /// Fraction of transitions with at least one padding hallucination.
+    #[serde(default)]
+    pub padding_false_edit_transition_rate: Option<f64>,
+}
+
+impl SemanticDecoderMetrics {
+    fn from_masks(masks: BTreeMap<String, SemanticMaskMetrics>) -> Self {
+        let unchanged = masks.get("unchanged_content");
+        let padding = masks.get("unchanged_padding");
+        Self {
+            false_edit_rate: unchanged
+                .and_then(|mask| mask.pixel_accuracy)
+                .map(|accuracy| 1.0 - accuracy),
+            false_edit_transition_rate: unchanged
+                .and_then(|mask| mask.exact_transition_accuracy)
+                .map(|accuracy| 1.0 - accuracy),
+            padding_false_edit_rate: padding
+                .and_then(|mask| mask.pixel_accuracy)
+                .map(|accuracy| 1.0 - accuracy),
+            padding_false_edit_transition_rate: padding
+                .and_then(|mask| mask.exact_transition_accuracy)
+                .map(|accuracy| 1.0 - accuracy),
+            masks,
+        }
+    }
 }
 
 pub fn aggregate_decoder_metrics(
@@ -48,10 +93,9 @@ pub fn aggregate_decoder_metrics(
             masks.entry(name).or_default().push(metrics);
         }
     }
-    SemanticDecoderMetrics {
-        masks: masks
+    let mut metrics = SemanticDecoderMetrics::from_masks(
+        masks
             .into_iter()
-            .filter(|(name, _)| !NONCOMPARABLE_CONTENT_MASKS.contains(&name.as_str()))
             .map(|(name, rows)| {
                 let pixels = rows.iter().map(|row| row.pixels).sum::<usize>();
                 let transitions = rows.iter().map(|row| row.transitions).sum::<usize>();
@@ -88,7 +132,14 @@ pub fn aggregate_decoder_metrics(
                 )
             })
             .collect(),
-    }
+    );
+    // Content rectangles may differ across rollout sources, so their raw mask
+    // aggregates are not comparable. Derive the scalar false-edit diagnostics
+    // first, then omit only the misleading per-mask rows.
+    metrics
+        .masks
+        .retain(|name, _| !NONCOMPARABLE_CONTENT_MASKS.contains(&name.as_str()));
+    metrics
 }
 
 /// Model-independent reducer used by the report path and by action-blindness
@@ -167,6 +218,18 @@ where
 pub struct SemanticSourceMetrics {
     pub transitions: usize,
     pub status_pixels: usize,
+    /// Fraction of gameplay pixels where the raw argmax one-step decode and
+    /// the composed copy-gate decode disagree.
+    #[serde(default)]
+    pub raw_composed_pixel_disagreement: Option<f64>,
+    /// Fraction of factually changed gameplay pixels whose copy gate opens
+    /// (sigmoid >= 0.5 selects the predicted colour over the current pixel).
+    #[serde(default)]
+    pub copy_gate_open_rate_changed: Option<f64>,
+    /// Fraction of factually unchanged gameplay pixels whose copy gate opens;
+    /// the gate-side driver of false edits in the composed decode.
+    #[serde(default)]
+    pub copy_gate_open_rate_unchanged: Option<f64>,
     pub variants: BTreeMap<String, SemanticDecoderMetrics>,
 }
 
@@ -181,8 +244,9 @@ pub struct SemanticEvaluation {
     pub by_source: BTreeMap<String, SemanticSourceMetrics>,
 }
 
-/// Optional future action-ablation configuration. The default deliberately
-/// avoids action id 0 because no trained NULL embedding exists in foundation-v2.
+/// Action-ablation configuration. Generic callers default to no NULL action;
+/// the Foundation-v2 evaluator supplies id 0 because its mixed stream trains
+/// that explicit no-op embedding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticControlConfig {
     pub trained_null_action_id: Option<u8>,
@@ -306,6 +370,12 @@ impl MaskAccum {
 struct SourceAccum {
     transitions: usize,
     status_pixels: usize,
+    decode_pixels: usize,
+    raw_composed_disagreements: usize,
+    gate_changed_pixels: usize,
+    gate_open_changed: usize,
+    gate_unchanged_pixels: usize,
+    gate_open_unchanged: usize,
     variants: BTreeMap<String, BTreeMap<String, MaskAccum>>,
 }
 
@@ -332,22 +402,52 @@ impl SourceAccum {
         }
     }
 
+    /// Cross-tabulate the raw one-step argmax decode against the composed
+    /// copy-gate decode and the thresholded gate itself on one transition.
+    fn add_composition_diagnostics(
+        &mut self,
+        raw: &[u8],
+        composed: &[u8],
+        gate_open: &[u8],
+        current: &[u8],
+        target: &[u8],
+    ) {
+        for index in 0..raw.len() {
+            self.decode_pixels += 1;
+            self.raw_composed_disagreements += usize::from(raw[index] != composed[index]);
+            let open = usize::from(gate_open[index] != 0);
+            if current[index] != target[index] {
+                self.gate_changed_pixels += 1;
+                self.gate_open_changed += open;
+            } else {
+                self.gate_unchanged_pixels += 1;
+                self.gate_open_unchanged += open;
+            }
+        }
+    }
+
     fn finish(self) -> SemanticSourceMetrics {
         SemanticSourceMetrics {
             transitions: self.transitions,
             status_pixels: self.status_pixels,
+            raw_composed_pixel_disagreement: (self.decode_pixels > 0)
+                .then_some(self.raw_composed_disagreements as f64 / self.decode_pixels as f64),
+            copy_gate_open_rate_changed: (self.gate_changed_pixels > 0)
+                .then_some(self.gate_open_changed as f64 / self.gate_changed_pixels as f64),
+            copy_gate_open_rate_unchanged: (self.gate_unchanged_pixels > 0)
+                .then_some(self.gate_open_unchanged as f64 / self.gate_unchanged_pixels as f64),
             variants: self
                 .variants
                 .into_iter()
                 .map(|(variant, masks)| {
                     (
                         variant,
-                        SemanticDecoderMetrics {
-                            masks: masks
+                        SemanticDecoderMetrics::from_masks(
+                            masks
                                 .into_iter()
                                 .map(|(name, metrics)| (name, metrics.finish()))
                                 .collect(),
-                        },
+                        ),
                     )
                 })
                 .collect(),
@@ -355,7 +455,7 @@ impl SourceAccum {
     }
 }
 
-fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [Vec<bool>; 6] {
+fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [Vec<bool>; 9] {
     let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
     let mut content = vec![false; gameplay_pixels];
     let width = usize::from(sample.provenance.content_width).min(FRAME_SIDE);
@@ -365,8 +465,8 @@ fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [
             content[y * FRAME_SIDE + x] = true;
         }
     }
-    let padding = content.iter().map(|selected| !selected).collect();
-    let foreground = target
+    let padding: Vec<bool> = content.iter().map(|selected| !selected).collect();
+    let foreground: Vec<bool> = target
         .iter()
         .map(|pixel| *pixel != palette::EMPTY)
         .collect();
@@ -375,12 +475,28 @@ fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [
         .zip(target)
         .map(|(before, after)| before != after)
         .collect();
-    let unchanged = changed.iter().map(|selected| !selected).collect();
-    let changed_content = changed
+    let unchanged: Vec<bool> = changed.iter().map(|selected| !selected).collect();
+    let changed_content: Vec<bool> = changed
         .iter()
         .zip(&content)
         .map(|(changed, content)| *changed && *content)
         .collect();
+    let unchanged_content: Vec<bool> = unchanged
+        .iter()
+        .zip(&content)
+        .map(|(unchanged, content)| *unchanged && *content)
+        .collect();
+    let unchanged_padding: Vec<bool> = unchanged
+        .iter()
+        .zip(&padding)
+        .map(|(unchanged, padding)| *unchanged && *padding)
+        .collect();
+    // Full-frame transition mask: every status-excluded gameplay pixel,
+    // padding included. Padding pixels are part of the decode contract (a
+    // decode that hallucinates content into padding is not exact), and the
+    // fixed 4032-pixel extent makes the mask comparable across source kinds,
+    // so it stays out of NONCOMPARABLE_CONTENT_MASKS.
+    let gameplay = vec![true; gameplay_pixels];
     [
         content,
         padding,
@@ -388,6 +504,9 @@ fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [
         changed,
         unchanged,
         changed_content,
+        unchanged_content,
+        unchanged_padding,
+        gameplay,
     ]
 }
 
@@ -438,12 +557,9 @@ pub fn latent_semantic_metrics(
         },
     );
     let mut variants = accum.finish().variants;
-    let mut metrics = variants
+    let metrics = variants
         .remove("rollout")
         .expect("rollout variant was inserted");
-    for mask in NONCOMPARABLE_CONTENT_MASKS {
-        metrics.masks.remove(mask);
-    }
     Ok(metrics)
 }
 
@@ -634,8 +750,10 @@ pub fn collision_census(
 }
 
 /// Deterministically rotate complete action tuples only among rows that share
-/// `provenance.source_kind`. Input ordering and caller-supplied source spans
-/// cannot cause cross-family action donation.
+/// `provenance.source_kind`. The cyclic offset maximizing genuinely changed
+/// tuples is selected per source (lowest offset breaks ties). This preserves
+/// source-local action marginals while exposing unavoidable duplicate tuples
+/// instead of pretending every row was perturbed.
 pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
     let mut shuffled = samples.to_vec();
     let mut source_rows = BTreeMap::<&str, Vec<usize>>::new();
@@ -649,8 +767,24 @@ pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<Tran
         if indices.len() < 2 {
             continue;
         }
+        let mut best_offset = 1usize;
+        let mut best_changed = 0usize;
+        for offset in 1..indices.len() {
+            let changed = indices
+                .iter()
+                .enumerate()
+                .filter(|(position, target)| {
+                    let donor = indices[(*position + offset) % indices.len()];
+                    samples[**target].action != samples[donor].action
+                })
+                .count();
+            if changed > best_changed {
+                best_changed = changed;
+                best_offset = offset;
+            }
+        }
         for (position, &target) in indices.iter().enumerate() {
-            let donor = indices[(position + 1) % indices.len()];
+            let donor = indices[(position + best_offset) % indices.len()];
             shuffled[target].action = samples[donor].action.clone();
         }
     }
@@ -716,6 +850,18 @@ pub fn evaluate_semantics_with_control(
                 &batch.goals,
             )?
             .y;
+        let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+        let composed_predictions = model
+            .composed_gameplay_decode(&prediction, &batch.frames)?
+            .reshape((rows.len(), gameplay_pixels))?
+            .to_dtype(DType::U8)?
+            .to_vec2::<u8>()?;
+        let gate_open = model
+            .exact_copy_gate(&prediction)?
+            .ge(0.5)?
+            .reshape((rows.len(), gameplay_pixels))?
+            .to_dtype(DType::U8)?
+            .to_vec2::<u8>()?;
         let mut decoded = vec![
             (
                 "current_reconstruction",
@@ -791,12 +937,32 @@ pub fn evaluate_semantics_with_control(
                 overall.add_variant(name, row());
                 source.add_variant(name, row());
             }
+            let raw_one_step = decoded
+                .iter()
+                .find(|(name, _)| *name == "one_step_prediction")
+                .map(|(_, rows)| rows.predictions[local].as_slice())
+                .expect("one-step decode variant is always present");
+            overall.add_composition_diagnostics(
+                raw_one_step,
+                &composed_predictions[local],
+                &gate_open[local],
+                current,
+                target,
+            );
+            source.add_composition_diagnostics(
+                raw_one_step,
+                &composed_predictions[local],
+                &gate_open[local],
+                current,
+                target,
+            );
             let copy = current;
             let zero = vec![palette::EMPTY; target.len()];
             for (name, prediction) in [
                 ("hard_copy_control", copy),
                 ("zero_control", zero.as_slice()),
                 ("direct_target_positive_control", target),
+                ("composed_copy_gate", composed_predictions[local].as_slice()),
             ] {
                 let row = || SemanticRow {
                     predictions: prediction,
@@ -819,12 +985,12 @@ pub fn evaluate_semantics_with_control(
     }
     Ok(SemanticEvaluation {
         schema: SEMANTIC_EVAL_SCHEMA.into(),
-        mask_contract: "gameplay=rows[0,63); content=[0,width)x[0,height); padding=gameplay-content; foreground=target!=EMPTY; changed=current!=target; unchanged=gameplay-changed; status=row63 excluded. content/padding/changed_content are omitted from overall and retained only in by_source because content rectangles are not comparable across source kinds".into(),
+        mask_contract: "gameplay=all rows[0,63) pixels (fixed 4032-pixel full-transition mask, padding included, source-comparable); content=[0,width)x[0,height); padding=gameplay-content; foreground=target!=EMPTY; changed=current!=target; unchanged=gameplay-changed; unchanged_content=unchanged&content; unchanged_padding=unchanged&padding; status=row63 excluded. Content-rectangle masks are retained by source. false-edit metrics use unchanged_content, while padding hallucinations are reported separately from unchanged_padding. composed_copy_gate decodes via composed_gameplay_decode (gate>=0.5 selects the predicted colour, else the current pixel)".into(),
         reduction_contract: "overall aggregates only source-comparable masks; by_source reports pixel aggregate plus equal-transition mean within provenance.source_kind".into(),
         population_contract: "one_step_population; not comparable as a horizon curve with semantic_rollout, whose trajectory-filtered population is separately fingerprinted".into(),
         action_control_contract: match control.trained_null_action_id {
             Some(id) => format!("action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; trained_null_action_prediction uses configured trained NULL action id {id} with zero coordinates"),
-            None => "action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; no action-masked/null variant is emitted because foundation-v2 has no trained NULL action embedding".into(),
+            None => "action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; no action-masked/null variant was configured for this checkpoint".into(),
         },
         overall,
         by_source: by_source
@@ -885,6 +1051,48 @@ mod tests {
         );
         assert_eq!(masks[3].iter().filter(|selected| **selected).count(), 2);
         assert_eq!(masks[5].iter().filter(|selected| **selected).count(), 1);
+        assert_eq!(masks[8].len(), (FRAME_SIDE - 1) * FRAME_SIDE);
+        assert!(masks[8].iter().all(|selected| *selected));
+    }
+
+    #[test]
+    fn gameplay_exactness_and_false_edit_fields_derive_from_the_unchanged_mask() {
+        let sample = sample(1);
+        let current = gameplay(&sample.current);
+        let target = gameplay(&sample.next);
+        let row = |predictions| SemanticRow {
+            predictions,
+            log_probs: None,
+            current,
+            transition_target: target,
+            decoder_labels: target,
+            sample: &sample,
+        };
+        // Perfect on the single changed pixel, but edits one unchanged pixel.
+        let mut edited = target.to_vec();
+        edited[5] = 3;
+        let mut accum = SourceAccum::default();
+        accum.add_variant("edited", row(&edited));
+        accum.add_variant("exact", row(target));
+        let source = accum.finish();
+
+        let edited = &source.variants["edited"];
+        assert_eq!(edited.masks["changed"].exact_transition_accuracy, Some(1.0));
+        assert_eq!(
+            edited.masks["gameplay"].exact_transition_accuracy,
+            Some(0.0)
+        );
+        let unchanged_pixels = 48.0;
+        assert!((edited.false_edit_rate.unwrap() - 1.0 / unchanged_pixels).abs() < 1e-12);
+        assert_eq!(edited.false_edit_transition_rate, Some(1.0));
+        assert_eq!(edited.padding_false_edit_rate, Some(0.0));
+
+        // Exactness on the gameplay mask is 1.0 iff every frame pixel matches.
+        let exact = &source.variants["exact"];
+        assert_eq!(exact.masks["gameplay"].exact_transition_accuracy, Some(1.0));
+        assert_eq!(exact.false_edit_rate, Some(0.0));
+        assert_eq!(exact.false_edit_transition_rate, Some(0.0));
+        assert_eq!(exact.padding_false_edit_rate, Some(0.0));
     }
 
     #[test]
@@ -938,8 +1146,14 @@ mod tests {
             "zero_control",
             "direct_target_positive_control",
             "action_shuffled_prediction",
+            "composed_copy_gate",
         ] {
             assert!(metrics.overall.variants.contains_key(variant));
+        }
+        assert!(metrics.overall.raw_composed_pixel_disagreement.is_some());
+        assert!(metrics.overall.copy_gate_open_rate_unchanged.is_some());
+        for variant in metrics.overall.variants.values() {
+            assert!(variant.masks.contains_key("gameplay"));
         }
         assert!(!metrics
             .overall

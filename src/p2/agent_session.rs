@@ -194,6 +194,8 @@ mod tests {
             game_id: "game".into(),
             guid: guid.into(),
             frame: ArcFrame::new(64, 64, vec![0; 64 * 64]).unwrap(),
+            animation: Vec::new(),
+            full_reset: false,
             state: "NOT_FINISHED".into(),
             levels_completed: 0,
             win_levels: 1,

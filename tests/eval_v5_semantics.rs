@@ -3,9 +3,13 @@ use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use tofy::domain::Split;
 use tofy::p2::data::{
-    palette, ArcAction, ArcFrame, GoalFeatures, TransitionProvenance, TransitionSample, FRAME_SIDE,
+    palette, ArcAction, ArcFrame, ContentMask, ContentRect, GoalFeatures, TransitionProvenance,
+    TransitionSample, FRAME_SIDE,
 };
-use tofy::p2::eval::{board_changed_transition_count, evaluate_gate_support};
+use tofy::p2::eval::{
+    board_changed_transition_count, evaluate_gate_support,
+    one_step_false_edit_rate_with_content_masks,
+};
 use tofy::p2::model::WorldModel;
 use tofy::p2::semantic_eval::{
     action_controllability_probe, ambiguity_ceiling, shuffled_action_control_samples,
@@ -144,5 +148,36 @@ fn gate_support_is_deterministic_across_calls() -> Result<()> {
     let first = evaluate_gate_support(&model, &rows, &device)?;
     let second = evaluate_gate_support(&model, &rows, &device)?;
     assert_eq!(first, second);
+    Ok(())
+}
+
+#[test]
+fn false_edit_rate_uses_the_exact_translated_content_mask() -> Result<()> {
+    let row = sample("translated", "translated/0", 0, 1, 1, 1, Some(true))?;
+    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let mut prediction = row.next.pixels[..gameplay_pixels].to_vec();
+    let edited_index = 10 * FRAME_SIDE + 10;
+    prediction[edited_index] = palette::AGENT;
+    let mask = ContentMask::from_rect(ContentRect {
+        x: 10,
+        y: 10,
+        width: 7,
+        height: 7,
+    })?;
+
+    let content = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&prediction),
+        Some(std::slice::from_ref(&mask)),
+        false,
+    )?;
+    let padding = one_step_false_edit_rate_with_content_masks(
+        std::slice::from_ref(&row),
+        std::slice::from_ref(&prediction),
+        Some(std::slice::from_ref(&mask)),
+        true,
+    )?;
+    assert!((content.unwrap() - 1.0 / 49.0).abs() < 1e-12);
+    assert_eq!(padding, Some(0.0));
     Ok(())
 }

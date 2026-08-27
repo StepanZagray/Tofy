@@ -3,14 +3,20 @@
 //! Defaults are tiny smoke settings and must not be treated as a research result.
 //! Wiring into the top-level CLI is owned by the primary agent.
 
-use crate::p2::arc3_live::{evaluate_live, list_public_games, LiveEvalConfig};
+use crate::p2::arc3_live::{
+    evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig, DEFAULT_MAX_LEVEL_RETRIES,
+    DEFAULT_TRIED_PENALTY,
+};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
 use crate::p2::grounding::PatchGroundingMode;
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
-use crate::p2::train::{default_data_workers, train, SigregTarget, TrainConfig, DEFAULT_LESSONS};
+use crate::p2::train::{
+    default_data_workers, train, PromotionMetric, SigregTarget, SplitCeWeighting, TrainConfig,
+    DEFAULT_LESSONS,
+};
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -323,6 +329,21 @@ pub struct P2TrainArgs {
 
     #[arg(long, default_value_t = 16_384)]
     pub health_maximum_rows: usize,
+
+    /// Foundation-v2 split-CE weighting construction (objective-isolation
+    /// ablation). `current-double` is the ADR 0003 default.
+    #[arg(long, value_enum, default_value_t = SplitCeWeighting::CurrentDouble)]
+    pub split_ce_weighting: SplitCeWeighting,
+
+    /// Fixed changed-stratum aggregate loss-coefficient share in (0,1). This
+    /// controls objective geometry, not an assumed share of measured gradients.
+    #[arg(long)]
+    pub split_ce_changed_budget: Option<f64>,
+
+    /// Metric used to select the best Foundation-v2 checkpoint. The default
+    /// preserves the historical changed-pixel-only selection rule.
+    #[arg(long, value_enum, default_value_t = PromotionMetric::ChangedExact)]
+    pub promotion_metric: PromotionMetric,
 }
 
 impl P2TrainArgs {
@@ -417,6 +438,9 @@ impl P2TrainArgs {
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
             spatial_action_residual_scale: self.spatial_action_residual_scale,
+            split_ce_weighting: self.split_ce_weighting,
+            split_ce_changed_budget: self.split_ce_changed_budget,
+            promotion_metric: self.promotion_metric,
             branch_learning: BranchLearningConfig {
                 enabled: self.world_core_v2 || self.world_core_v3,
                 outcome_pull_weight: self.outcome_pull_weight,
@@ -718,6 +742,23 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, default_value_t = 512)]
     pub max_actions_per_game: usize,
 
+    /// Use official competition semantics, where RESET retries the current
+    /// level and cannot wipe progress in the game.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub competition_mode: bool,
+
+    /// Maximum RESET retries after GAME_OVER on one level.
+    #[arg(long, default_value_t = DEFAULT_MAX_LEVEL_RETRIES)]
+    pub max_level_retries: usize,
+
+    /// Optional official-style action budget applied independently per level.
+    #[arg(long)]
+    pub max_actions_per_level: Option<usize>,
+
+    /// Soft score penalty for an action already tried in the same state.
+    #[arg(long, default_value_t = DEFAULT_TRIED_PENALTY)]
+    pub tried_penalty: f64,
+
     /// Maximum candidate actions scored together by Candle.
     #[arg(long, default_value_t = 128)]
     pub physical_batch: usize,
@@ -755,6 +796,12 @@ impl P2Arc3LiveEvalArgs {
             action6_max_candidates: self.action6_max_candidates,
             action6_grid_stride: self.action6_grid_stride,
             request_timeout_secs: self.request_timeout_secs,
+            driver: LiveDriverOptions {
+                competition_mode: self.competition_mode,
+                max_level_retries: self.max_level_retries,
+                max_actions_per_level: self.max_actions_per_level,
+                tried_penalty: self.tried_penalty,
+            },
             output: self.output.clone(),
         }
     }
