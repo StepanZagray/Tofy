@@ -580,6 +580,8 @@ pub struct V5Sample {
     pub transition: TransitionSample,
     pub content_mask: ContentMask,
     pub provenance: V5SampleProvenance,
+    #[serde(skip)]
+    original_goal_nonzero: bool,
 }
 
 impl V5Sample {
@@ -690,7 +692,21 @@ impl MixedStreamConfig {
                 .all(|(_, value)| value.is_finite() && *value >= 0.0),
             "mixed stream schedule returned invalid weights"
         );
+        self.realized_proportions(0.0)?;
         Ok(())
+    }
+
+    /// Exact fixed-batch realization of the scheduled stream proportions.
+    pub fn realized_proportions(&self, progress: f32) -> Result<RealizedStreamProportions> {
+        let scheduled = (self.schedule)(progress);
+        ensure!(
+            scheduled
+                .ordered()
+                .iter()
+                .all(|(_, weight)| weight.is_finite() && *weight >= 0.0),
+            "mixed stream schedule returned invalid weights"
+        );
+        realized_stream_proportions(self.batch_size, scheduled)
     }
 }
 
@@ -1496,6 +1512,41 @@ fn frame_with_transformed_content(
     ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, pixels)
 }
 
+/// Transform the agent-coordinate dimensions of an exact simulator oracle into
+/// the augmented content frame. The remaining dimensions are layout-free.
+pub fn transform_oracle_latent_d4(
+    oracle_latent: &mut Option<Vec<f32>>,
+    transform: D4Transform,
+    source_rect: ContentRect,
+    target_rect: ContentRect,
+) -> Result<()> {
+    source_rect.validate()?;
+    target_rect.validate()?;
+    ensure!(
+        source_rect.width == source_rect.height
+            && target_rect.width == target_rect.height
+            && source_rect.width == target_rect.width,
+        "oracle D4 transform requires equal square content rectangles"
+    );
+    let Some(latent) = oracle_latent else {
+        return Ok(());
+    };
+    ensure!(
+        latent.len() >= 2,
+        "oracle latent is missing agent-coordinate dimensions"
+    );
+    let side = f32::from(source_rect.width);
+    let local = |value: f32| {
+        (((value + 1.0) * 0.5 * side) - 0.5)
+            .round()
+            .clamp(0.0, side - 1.0) as u8
+    };
+    let (x, y) = transform.transform_point(local(latent[0]), local(latent[1]), source_rect.width);
+    latent[0] = (f32::from(x) + 0.5) / f32::from(target_rect.width) * 2.0 - 1.0;
+    latent[1] = (f32::from(y) + 0.5) / f32::from(target_rect.height) * 2.0 - 1.0;
+    Ok(())
+}
+
 fn find_color(frame: &ArcFrame, rect: ContentRect, color: u8) -> Option<(u8, u8)> {
     for y in rect.y..rect.y + rect.height {
         for x in rect.x..rect.x + rect.width {
@@ -1805,6 +1856,17 @@ fn augment_v5_transition(
     transition.next =
         frame_with_transformed_content(&transition.next, source_rect, rect, &augmentation)?;
     transition.action = conjugate_action(&transition.action, augmentation.d4, source_rect, rect)?;
+    transform_oracle_latent_d4(
+        &mut transition.oracle_latent,
+        augmentation.d4,
+        source_rect,
+        rect,
+    )?;
+    let original_goal_nonzero = transition
+        .goal_features
+        .values
+        .iter()
+        .any(|&value| value != 0.0);
     let goal_dropped = dropout_rng.random_bool(f64::from(goal_dropout_probability));
     if goal_dropped {
         transition.goal_features = GoalFeatures::zeros();
@@ -1816,8 +1878,8 @@ fn augment_v5_transition(
     }
     // The V4 encoder deliberately clears the status row, and neither the
     // canonical state nor goal features carry actions-used/action-budget.
-    // Exhaustion is therefore not identifiable at this observer seam. Keep the
-    // slot masked until its conditioning is explicitly represented.
+    // Per the ADR, exhaustion is therefore deliberately masked until its
+    // conditioning is explicitly represented at this observer seam.
     transition.exhausted = None;
     let content_mask = ContentMask::from_rect(rect)?;
     Ok(V5Sample {
@@ -1833,6 +1895,7 @@ fn augment_v5_transition(
         },
         transition,
         content_mask,
+        original_goal_nonzero,
     })
 }
 
@@ -1880,12 +1943,13 @@ pub fn generate_coordinate_one_step(
     let mut rng = rng_for(seed ^ 0xA11C_C006, episode_id, split);
     let mut out = Vec::with_capacity(n);
     for step in 0..n {
+        let sample_episode_id = non_meta_episode_id(episode_id, step as u64)?;
         let start_x = 31usize;
         let start_y = 31usize;
         let (x, y) = loop {
             let candidate = (
                 rng.random_range(0..FRAME_SIDE) as u8,
-                rng.random_range(0..FRAME_SIDE) as u8,
+                rng.random_range(0..V5_PLAYFIELD_HEIGHT) as u8,
             );
             if candidate != (start_x as u8, start_y as u8) {
                 break candidate;
@@ -1911,11 +1975,11 @@ pub fn generate_coordinate_one_step(
             split,
             family: "coordinate_action".into(),
             seed,
-            episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+            episode_id: sample_episode_id,
             transition_index: step as u64,
             provenance: TransitionProvenance::full_frame(
                 seed,
-                episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+                sample_episode_id,
                 split,
                 "coordinate_action",
             ),
@@ -1936,6 +2000,7 @@ pub fn generate_interact_one_step(
     let mut rng = rng_for(seed ^ 0xA11C_A005, episode_id, split);
     let mut out = Vec::with_capacity(n);
     for step in 0..n {
+        let sample_episode_id = non_meta_episode_id(episode_id, step as u64)?;
         let switch_x = rng.random_range(10..54) as u8;
         let switch_y = rng.random_range(10..54) as u8;
         let agent_x = switch_x.saturating_sub(1);
@@ -1962,11 +2027,11 @@ pub fn generate_interact_one_step(
             split,
             family: "action5_interact".into(),
             seed,
-            episode_id: episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+            episode_id: sample_episode_id,
             transition_index: step as u64,
             provenance: TransitionProvenance::full_frame(
                 seed,
-                episode_id.wrapping_mul(1_000_003).wrapping_add(step as u64),
+                sample_episode_id,
                 split,
                 "action5_interact",
             ),
@@ -1984,7 +2049,12 @@ pub fn generate_hazard_one_step(
 ) -> Result<Vec<TransitionSample>> {
     let mut out = Vec::with_capacity(n);
     for step in 0..n {
-        let mut scenario = generate(seed, episode_id.wrapping_add(step as u64), split);
+        let scenario_episode_id = checked_non_meta_episode_id(
+            episode_id
+                .checked_add(step as u64)
+                .context("hazard episode id overflow")?,
+        )?;
+        let mut scenario = generate(seed, scenario_episode_id, split);
         if scenario.hazards.is_empty() {
             scenario.hazards.push(Pos::new(2, 2));
         }
@@ -1992,32 +2062,47 @@ pub fn generate_hazard_one_step(
             scenario.markers.push(Pos::new(4, 4));
         }
         let hazard_pos = scenario.hazards[0];
-        let west = Pos::new(hazard_pos.x - 1, hazard_pos.y);
-        let east = Pos::new(hazard_pos.x + 1, hazard_pos.y);
-        let start = if scenario.in_bounds(west) && !scenario.is_blocked(west) {
-            west
-        } else if scenario.in_bounds(east) && !scenario.is_blocked(east) {
-            east
-        } else {
-            scenario.start
-        };
+        let candidates = [
+            (
+                Pos::new(hazard_pos.x - 1, hazard_pos.y),
+                Action::Move(Dir::East),
+            ),
+            (
+                Pos::new(hazard_pos.x + 1, hazard_pos.y),
+                Action::Move(Dir::West),
+            ),
+            (
+                Pos::new(hazard_pos.x, hazard_pos.y - 1),
+                Action::Move(Dir::South),
+            ),
+            (
+                Pos::new(hazard_pos.x, hazard_pos.y + 1),
+                Action::Move(Dir::North),
+            ),
+        ];
+        let (start, action) = candidates
+            .into_iter()
+            .find(|(position, _)| scenario.in_bounds(*position))
+            .ok_or_else(|| anyhow!("hazard has no in-bounds neighbor"))?;
+        scenario.walls.remove(&start);
+        scenario.walls.remove(&hazard_pos);
         scenario.start = start;
         let sim = Simulator::new(scenario.clone());
         let state = State::initial(&scenario);
-        let action = if hazard_pos.x > start.x {
-            Action::Move(Dir::East)
-        } else {
-            Action::Move(Dir::West)
-        };
         let next = apply_action(&sim, &state, action);
-        out.push(sample_from_transition_goal_free(
-            &scenario,
-            &state,
-            &next,
-            action,
-            "hazard_failure",
-            step as u64,
-        )?);
+        ensure!(
+            next.pos == hazard_pos,
+            "hazard action fell back to a blocked destination"
+        );
+        let goal = Goal::AvoidHazardReachMarker {
+            hazard: 0,
+            marker: 0,
+        };
+        let mut sample =
+            sample_from_transition(&scenario, &state, &next, action, &goal, step as u64)?;
+        sample.family = "hazard_failure".into();
+        sample.provenance.source_kind = "hazard_failure".into();
+        out.push(sample);
     }
     Ok(out)
 }
@@ -2461,6 +2546,25 @@ pub struct MixedStreamBatch {
     factual_group_ranges: Vec<std::ops::Range<usize>>,
     stream_counts: BTreeMap<MixedStreamKind, usize>,
     scheduled_proportions: MixedStreamProportions,
+    realized_proportions: RealizedStreamProportions,
+    goal_dropout_census: GoalDropoutCensus,
+}
+
+/// Exact row counts and fractions after whole factual branch groups are allocated.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RealizedStreamProportions {
+    pub normalized_target: MixedStreamProportions,
+    pub counts: BTreeMap<MixedStreamKind, usize>,
+    pub fractions: MixedStreamProportions,
+}
+
+/// Realized scope of goal dropout in one composed batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalDropoutCensus {
+    pub total: usize,
+    pub eligible: usize,
+    pub changed: usize,
+    pub final_zero_goal: usize,
 }
 
 /// Label support in a deterministic generated stream, ordered as
@@ -2471,6 +2575,192 @@ pub struct EventLabelCensus {
     pub rows: usize,
     pub labeled: [usize; 4],
     pub positive: [usize; 4],
+}
+
+/// One split/family/action bucket in factual branch coverage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchCoverageStratum {
+    pub split: Split,
+    pub family: String,
+    pub action_id: u8,
+    pub eligible_rows: usize,
+    pub changed_outcomes: usize,
+    pub distinct_effect_classes: usize,
+}
+
+/// Missing required factual action strata, grouped by source split and family.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingBranchActionKey {
+    pub split: Split,
+    pub family: String,
+    pub action_id: u8,
+}
+
+/// Duplicate factual action tuple inside one same-state branch group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateBranchActionKey {
+    pub split: Split,
+    pub family: String,
+    pub action: ArcAction,
+}
+
+/// Coverage of the complete factual branch contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchCoverageCensus {
+    pub strata: Vec<BranchCoverageStratum>,
+    pub missing_action_keys: Vec<MissingBranchActionKey>,
+    pub duplicate_action_keys: Vec<DuplicateBranchActionKey>,
+}
+
+impl BranchCoverageCensus {
+    /// Reject populations that cannot supervise the complete branch contract.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.missing_action_keys.is_empty(),
+            "branch coverage has missing action keys: {:?}",
+            self.missing_action_keys
+        );
+        ensure!(
+            self.duplicate_action_keys.is_empty(),
+            "branch coverage has duplicate action keys: {:?}",
+            self.duplicate_action_keys
+        );
+        ensure!(
+            self.strata
+                .iter()
+                .any(|stratum| stratum.changed_outcomes > 0),
+            "branch coverage has no changed outcomes"
+        );
+        ensure!(
+            self.strata
+                .iter()
+                .any(|stratum| stratum.distinct_effect_classes > 1),
+            "branch coverage has no distinct effect classes"
+        );
+        Ok(())
+    }
+}
+
+/// Census complete factual branch groups without silently repairing a malformed
+/// flat population. It intentionally reports missing keys for negative controls.
+pub fn census_branch_coverage(rows: &[TransitionSample]) -> BranchCoverageCensus {
+    let mut groups = BTreeMap::<BranchGroupId, Vec<&TransitionSample>>::new();
+    for row in rows {
+        if row.family.starts_with("factual_") {
+            groups
+                .entry(BranchGroupId::from_transition(row))
+                .or_default()
+                .push(row);
+        }
+    }
+    let mut buckets = BTreeMap::<(u8, String, u8), Vec<&TransitionSample>>::new();
+    let mut missing_action_keys = Vec::new();
+    let mut duplicate_action_keys = Vec::new();
+    for group in groups.values() {
+        let Some(first) = group.first() else {
+            continue;
+        };
+        let action_keys = group
+            .iter()
+            .map(|row| (row.action.id, row.action.x, row.action.y))
+            .collect::<BTreeSet<_>>();
+        for action_id in [1, 2, 3, 4, 5, 7] {
+            if !action_keys.iter().any(|(id, _, _)| *id == action_id) {
+                missing_action_keys.push(MissingBranchActionKey {
+                    split: first.split,
+                    family: first.family.clone(),
+                    action_id,
+                });
+            }
+        }
+        let coordinate_actions = group
+            .iter()
+            .filter(|row| row.action.id == 6)
+            .map(|row| row.action.clone())
+            .collect::<Vec<_>>();
+        let coordinate_keys = coordinate_actions
+            .iter()
+            .map(|action| (action.x, action.y))
+            .collect::<BTreeSet<_>>();
+        if coordinate_actions.len() != 4 {
+            missing_action_keys.push(MissingBranchActionKey {
+                split: first.split,
+                family: first.family.clone(),
+                action_id: 6,
+            });
+        }
+        if coordinate_keys.len() != coordinate_actions.len() {
+            duplicate_action_keys.extend(
+                coordinate_actions
+                    .into_iter()
+                    .filter(|action| {
+                        group
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.action.id == 6
+                                    && candidate.action.x == action.x
+                                    && candidate.action.y == action.y
+                            })
+                            .count()
+                            > 1
+                    })
+                    .map(|action| DuplicateBranchActionKey {
+                        split: first.split,
+                        family: first.family.clone(),
+                        action,
+                    }),
+            );
+        }
+        for row in group {
+            buckets
+                .entry((
+                    match row.split {
+                        Split::Train => 0,
+                        Split::HeldOutComposition => 1,
+                    },
+                    row.family.clone(),
+                    row.action.id,
+                ))
+                .or_default()
+                .push(row);
+        }
+    }
+    let strata = buckets
+        .into_iter()
+        .map(|((split, family, action_id), rows)| {
+            let effects = rows
+                .iter()
+                .map(|row| {
+                    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+                    row.next.pixels[..status_start].to_vec()
+                })
+                .collect::<BTreeSet<_>>();
+            let changed_outcomes = rows
+                .iter()
+                .filter(|row| {
+                    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+                    row.current.pixels[..status_start] != row.next.pixels[..status_start]
+                })
+                .count();
+            BranchCoverageStratum {
+                split: match split {
+                    0 => Split::Train,
+                    1 => Split::HeldOutComposition,
+                    _ => unreachable!(),
+                },
+                family,
+                action_id,
+                eligible_rows: rows.len(),
+                changed_outcomes,
+                distinct_effect_classes: effects.len(),
+            }
+        })
+        .collect();
+    BranchCoverageCensus {
+        strata,
+        missing_action_keys,
+        duplicate_action_keys,
+    }
 }
 
 pub fn census_event_labels<'a>(
@@ -2535,6 +2825,14 @@ impl MixedStreamBatch {
         self.scheduled_proportions
     }
 
+    pub fn realized_proportions(&self) -> &RealizedStreamProportions {
+        &self.realized_proportions
+    }
+
+    pub fn goal_dropout_census(&self) -> GoalDropoutCensus {
+        self.goal_dropout_census
+    }
+
     pub fn event_label_census(&self) -> EventLabelCensus {
         census_event_labels(self.transitions())
     }
@@ -2544,11 +2842,16 @@ impl MixedStreamBatch {
     }
 }
 
-fn allocate_stream_counts(
+fn realized_stream_proportions(
     batch_size: usize,
     proportions: MixedStreamProportions,
-) -> BTreeMap<MixedStreamKind, usize> {
+) -> Result<RealizedStreamProportions> {
+    ensure!(batch_size > 0, "mixed batch size must be positive");
     let normalized = proportions.normalized();
+    ensure!(
+        normalized.total() > f32::EPSILON,
+        "mixed stream schedule must have positive total weight"
+    );
     let ordered = normalized.ordered();
     let mut counts = BTreeMap::new();
     let mut remainders = Vec::new();
@@ -2598,7 +2901,26 @@ fn allocate_stream_counts(
     }
     counts.insert(MixedStreamKind::FactualBranches, complete_factual);
     debug_assert_eq!(counts.values().sum::<usize>(), batch_size);
-    counts
+    let fractions = MixedStreamProportions {
+        random_one_step: counts[&MixedStreamKind::RandomOneStep] as f32 / batch_size as f32,
+        factual_branches: counts[&MixedStreamKind::FactualBranches] as f32 / batch_size as f32,
+        exploration: counts[&MixedStreamKind::Exploration] as f32 / batch_size as f32,
+        sequential_fragments: counts[&MixedStreamKind::SequentialFragments] as f32
+            / batch_size as f32,
+        hazard_one_step: counts[&MixedStreamKind::HazardOneStep] as f32 / batch_size as f32,
+    };
+    for ((kind, target), (_, realized)) in normalized.ordered().into_iter().zip(fractions.ordered())
+    {
+        ensure!(
+            (target - realized).abs() <= 0.05 + f32::EPSILON,
+            "mixed batch size {batch_size} realizes {kind:?} at {realized:.3}, more than 5 percentage points from normalized target {target:.3} after intact factual-group rounding"
+        );
+    }
+    Ok(RealizedStreamProportions {
+        normalized_target: normalized,
+        counts,
+        fractions,
+    })
 }
 
 fn raw_random_v5_sample(
@@ -2733,10 +3055,15 @@ fn raw_hazard_v5_sample(
         .find(|(position, _)| scenario.in_bounds(*position))
         .ok_or_else(|| anyhow!("hazard has no in-bounds neighbor"))?;
     scenario.walls.remove(&start);
+    scenario.walls.remove(&hazard);
     scenario.start = start;
     let sim = Simulator::new(scenario.clone());
     let state = State::initial(&scenario);
     let next = apply_action(&sim, &state, action);
+    ensure!(
+        next.pos == hazard,
+        "hazard action fell back to a blocked destination"
+    );
     let goal = Goal::AvoidHazardReachMarker {
         hazard: 0,
         marker: 0,
@@ -2782,10 +3109,29 @@ fn augment_v5_unit(
 const MIXED_BATCH_EPISODE_STRIDE: u64 = 1_000_003;
 const MIXED_STREAM_FRAGMENT_ROWS: usize = 4;
 
-fn mixed_stream_episode_id(batch_index: u64, unit_index: u64) -> u64 {
-    batch_index
-        .wrapping_mul(MIXED_BATCH_EPISODE_STRIDE)
-        .wrapping_add(unit_index)
+fn checked_non_meta_episode_id(episode_id: u64) -> Result<u64> {
+    let outside_meta_domain = episode_id & META_LEVEL_EPISODE_DOMAIN == 0;
+    ensure!(
+        outside_meta_domain,
+        "non-meta episode id enters the reserved meta-episode namespace"
+    );
+    debug_assert!(
+        outside_meta_domain,
+        "non-meta episode id enters the reserved meta-episode namespace"
+    );
+    Ok(episode_id)
+}
+
+fn non_meta_episode_id(batch_or_episode: u64, offset: u64) -> Result<u64> {
+    let episode_id = batch_or_episode
+        .checked_mul(MIXED_BATCH_EPISODE_STRIDE)
+        .and_then(|base| base.checked_add(offset))
+        .context("non-meta episode id overflow")?;
+    checked_non_meta_episode_id(episode_id)
+}
+
+fn mixed_stream_episode_id(batch_index: u64, unit_index: u64) -> Result<u64> {
+    non_meta_episode_id(batch_index, unit_index)
 }
 
 fn compose_nonfactual_unit(
@@ -2816,7 +3162,15 @@ fn compose_nonfactual_unit(
         MixedStreamKind::SequentialFragments => {
             let mut generated = None;
             for retry in 0..16u64 {
-                let retry_episode = episode_id.wrapping_add(retry.wrapping_mul(10_000_019));
+                let retry_episode = checked_non_meta_episode_id(
+                    episode_id
+                        .checked_add(
+                            retry
+                                .checked_mul(10_000_019)
+                                .context("sequential retry episode id overflow")?,
+                        )
+                        .context("sequential retry episode id overflow")?,
+                )?;
                 if let Ok(fragment) = raw_sequential_v5_fragment(
                     config.seed,
                     retry_episode,
@@ -2867,7 +3221,12 @@ fn compose_fixed_nonfactual_stream(
                 config,
                 split,
                 stream,
-                mixed_stream_episode_id(batch_index, first_unit_index.wrapping_add(offset as u64)),
+                mixed_stream_episode_id(
+                    batch_index,
+                    first_unit_index
+                        .checked_add(offset as u64)
+                        .context("mixed stream unit index overflow")?,
+                )?,
                 maximum_rows,
             )
         })
@@ -2881,7 +3240,12 @@ fn compose_fixed_nonfactual_stream(
         "fixed-row stream {stream:?} produced {} rows for requested {count}",
         samples.len()
     );
-    Ok((samples, first_unit_index.wrapping_add(unit_count as u64)))
+    Ok((
+        samples,
+        first_unit_index
+            .checked_add(unit_count as u64)
+            .context("mixed stream unit index overflow")?,
+    ))
 }
 
 fn compose_sequential_stream(
@@ -2909,8 +3273,10 @@ fn compose_sequential_stream(
                     MixedStreamKind::SequentialFragments,
                     mixed_stream_episode_id(
                         batch_index,
-                        next_unit_index.wrapping_add(offset as u64),
-                    ),
+                        next_unit_index
+                            .checked_add(offset as u64)
+                            .context("mixed stream unit index overflow")?,
+                    )?,
                     MIXED_STREAM_FRAGMENT_ROWS,
                 )
             })
@@ -2923,7 +3289,9 @@ fn compose_sequential_stream(
             ensure!(!unit.is_empty(), "sequential fragment produced no rows");
             unit.truncate(count - samples.len());
             samples.append(&mut unit);
-            next_unit_index = next_unit_index.wrapping_add(1);
+            next_unit_index = next_unit_index
+                .checked_add(1)
+                .context("mixed stream unit index overflow")?;
         }
     }
     Ok((samples, next_unit_index))
@@ -3006,7 +3374,8 @@ pub fn compose_mixed_stream_batch(
             .all(|(_, weight)| weight.is_finite() && *weight >= 0.0),
         "mixed stream schedule returned invalid weights"
     );
-    let stream_counts = allocate_stream_counts(config.batch_size, scheduled_proportions);
+    let realized_proportions = config.realized_proportions(progress)?;
+    let stream_counts = realized_proportions.counts.clone();
     let mut samples = Vec::with_capacity(config.batch_size);
     let mut factual_groups = Vec::new();
     let mut factual_group_ranges = Vec::new();
@@ -3031,7 +3400,12 @@ pub fn compose_mixed_stream_batch(
             compose_factual_group(
                 config,
                 split,
-                mixed_stream_episode_id(batch_index, unit_index.wrapping_add(offset as u64)),
+                mixed_stream_episode_id(
+                    batch_index,
+                    unit_index
+                        .checked_add(offset as u64)
+                        .context("mixed stream unit index overflow")?,
+                )?,
             )
         })
         .collect::<Vec<_>>();
@@ -3042,7 +3416,9 @@ pub fn compose_mixed_stream_batch(
         factual_group_ranges.push(start..samples.len());
         factual_groups.push(composed.group);
     }
-    unit_index = unit_index.wrapping_add(factual_group_count as u64);
+    unit_index = unit_index
+        .checked_add(factual_group_count as u64)
+        .context("mixed stream unit index overflow")?;
 
     let (mut exploration_samples, next_unit_index) = compose_fixed_nonfactual_stream(
         config,
@@ -3083,6 +3459,21 @@ pub fn compose_mixed_stream_batch(
     for sample in &samples {
         sample.validate()?;
     }
+    let goal_dropout_census = GoalDropoutCensus {
+        total: samples.len(),
+        eligible: samples
+            .iter()
+            .filter(|sample| sample.original_goal_nonzero)
+            .count(),
+        changed: samples
+            .iter()
+            .filter(|sample| sample.original_goal_nonzero && sample.provenance.goal_dropped)
+            .count(),
+        final_zero_goal: samples
+            .iter()
+            .filter(|sample| sample.transition.goal_features.values == [0.0; GOAL_FEATURES_DIM])
+            .count(),
+    };
     let factual = if factual_groups.is_empty() {
         None
     } else {
@@ -3094,6 +3485,8 @@ pub fn compose_mixed_stream_batch(
         factual_group_ranges,
         stream_counts,
         scheduled_proportions,
+        realized_proportions,
+        goal_dropout_census,
     })
 }
 
@@ -3191,23 +3584,40 @@ impl MetaEpisodeConfig {
     }
 }
 
-/// One level of a [`MetaEpisode`]: a freshly generated layout with its ordered
-/// transitions. The layout regenerates from `(seed, episode_id, split,
-/// content_size)`; `operator` is the rule actually applied to this level's
-/// ACTION5/ACTION6 transitions.
+/// Stable identity of a same-state meta decision group.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MetaDecisionGroupId {
+    pub level_index: usize,
+    pub episode_id: u64,
+    pub group_index: usize,
+    pub current_fingerprint: String,
+}
+
+/// Counterfactual ACTION5/ACTION6 rows from one byte-identical current frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetaDecisionGroup {
+    pub id: MetaDecisionGroupId,
+    pub transitions: Vec<TransitionSample>,
+}
+
+/// One level of a [`MetaEpisode`]: a freshly generated layout whose trajectory
+/// is chronological and whose operator alternatives are separate groups. The
+/// layout regenerates from `(seed, episode_id, split, content_size)`;
+/// `operator` is the rule actually applied to its decision groups.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetaLevel {
     pub level_index: usize,
     pub episode_id: u64,
     pub operator: EpisodeOperator,
-    pub transitions: Vec<TransitionSample>,
+    pub trajectory: Vec<TransitionSample>,
+    pub decision_groups: Vec<MetaDecisionGroup>,
 }
 
 /// Multi-level episode with one stable hidden rule shared by every level.
 ///
-/// Pure function of `(seed, meta_episode_id, split, config)`: identical inputs
-/// reproduce identical bytes. Level boundaries are explicit indices over the
-/// flattened transition stream; samples are never mutated to mark boundaries.
+/// Pure function of `(seed, meta_episode_id, split, families, config)`:
+/// identical inputs reproduce identical bytes. Level boundaries are explicit
+/// indices over the flattened chronological trajectory stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetaEpisode {
     pub seed: u64,
@@ -3219,7 +3629,8 @@ pub struct MetaEpisode {
     /// Whether later levels deliberately break the shared rule.
     pub shuffled_control: bool,
     pub levels: Vec<MetaLevel>,
-    /// Level `i` owns flattened rows `level_boundaries[i]..level_boundaries[i+1]`.
+    /// Level `i` owns flattened chronological rows
+    /// `level_boundaries[i]..level_boundaries[i+1]`.
     pub level_boundaries: Vec<usize>,
 }
 
@@ -3235,6 +3646,38 @@ pub struct ShuffledRuleRealizationCensus {
     pub eligible_operator_rows: usize,
     pub genuinely_changed_operator_tuples: usize,
     pub outcome_changing_tuples: usize,
+}
+
+fn validate_meta_row(
+    row: &TransitionSample,
+    episode: &MetaEpisode,
+    level: &MetaLevel,
+    trajectory_id: &str,
+    transition_index: u64,
+) -> Result<()> {
+    row.provenance.validate()?;
+    ensure!(
+        row.seed == episode.seed
+            && row.episode_id == level.episode_id
+            && row.transition_index == transition_index
+            && row.split == episode.data_split.reported_split(),
+        "meta-episode transition identity or index is inconsistent"
+    );
+    ensure!(
+        row.family == "meta_episode_v5"
+            && row.provenance.source_kind == "meta_episode_v5"
+            && row.provenance.trajectory_id == trajectory_id
+            && row.provenance.content_width == u16::from(episode.config.content_size)
+            && row.provenance.content_height == u16::from(episode.config.content_size),
+        "meta-episode transition provenance is inconsistent"
+    );
+    ensure!(
+        row.goal_features == GoalFeatures::zeros()
+            && row.goal_satisfied.is_none()
+            && row.goal_failed.is_none(),
+        "meta-episode rows must remain goal-free"
+    );
+    Ok(())
 }
 
 impl MetaEpisode {
@@ -3261,14 +3704,107 @@ impl MetaEpisode {
                 "meta-episode level ids must be unique"
             );
             ensure!(
-                level.transitions.iter().all(|row| {
-                    row.seed == self.seed
-                        && row.episode_id == level.episode_id
-                        && row.provenance.source_kind == "meta_episode_v5"
-                }),
-                "meta-episode transition provenance is inconsistent"
+                level.trajectory.len() == self.config.steps_per_level,
+                "meta trajectory row count does not match its config"
             );
-            offset += level.transitions.len();
+            ensure!(
+                level.decision_groups.len()
+                    == usize::from(self.config.operator_decisions_per_level > 0),
+                "meta decision-group count does not match its config"
+            );
+            let trajectory_id = format!(
+                "meta-v5/{:?}/{}/{}/level{}",
+                self.data_split, self.seed, self.meta_episode_id, index
+            );
+            for (transition_index, row) in level.trajectory.iter().enumerate() {
+                validate_meta_row(row, self, level, &trajectory_id, transition_index as u64)?;
+                ensure!(
+                    matches!(row.action.id, 1..=4)
+                        && row.action.x.is_none()
+                        && row.action.y.is_none(),
+                    "meta trajectory action schema must be directional movement"
+                );
+            }
+            for pair in level.trajectory.windows(2) {
+                ensure!(
+                    pair[0].next == pair[1].current,
+                    "meta trajectory rows must be chronologically adjacent"
+                );
+            }
+            for (group_index, group) in level.decision_groups.iter().enumerate() {
+                ensure!(
+                    group.id.level_index == index
+                        && group.id.episode_id == level.episode_id
+                        && group.id.group_index == group_index,
+                    "meta decision-group id is inconsistent"
+                );
+                ensure!(
+                    group.transitions.len() == self.config.operator_decisions_per_level,
+                    "meta decision-group row count does not match its config"
+                );
+                let first = group
+                    .transitions
+                    .first()
+                    .context("configured meta decision group is empty")?;
+                ensure!(
+                    group.id.current_fingerprint == frame_fingerprint(&first.current),
+                    "meta decision-group fingerprint does not match current frame"
+                );
+                ensure!(
+                    group
+                        .transitions
+                        .iter()
+                        .all(|row| row.current == first.current),
+                    "meta decision-group rows must share a byte-identical current frame"
+                );
+                if let Some(last) = level.trajectory.last() {
+                    ensure!(
+                        last.next == first.current,
+                        "meta decision group must branch from the trajectory endpoint"
+                    );
+                }
+                let mut coordinates = BTreeSet::new();
+                for (row_index, row) in group.transitions.iter().enumerate() {
+                    validate_meta_row(
+                        row,
+                        self,
+                        level,
+                        &trajectory_id,
+                        (self.config.steps_per_level + group_index) as u64,
+                    )?;
+                    if row_index == 0 {
+                        ensure!(
+                            row.action == ArcAction::new(5, None, None)?,
+                            "first meta decision action must be ACTION5"
+                        );
+                    } else {
+                        ensure!(
+                            row.action.id == 6
+                                && row.action.x.is_some()
+                                && row.action.y.is_some()
+                                && coordinates.insert((
+                                    row.action.x.expect("checked"),
+                                    row.action.y.expect("checked")
+                                )),
+                            "later meta decision actions must be distinct ACTION6 coordinates"
+                        );
+                    }
+                    let rect = ContentRect {
+                        x: 0,
+                        y: 0,
+                        width: self.config.content_size,
+                        height: self.config.content_size,
+                    };
+                    let replayed =
+                        apply_episode_operator(&row.current, &row.action, rect, level.operator)?;
+                    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+                    ensure!(
+                        replayed.pixels[..status_start] == row.next.pixels[..status_start],
+                        "meta decision outcome does not replay under its operator"
+                    );
+                }
+            }
+            offset += level.trajectory.len();
             ensure!(
                 self.level_boundaries[index + 1] == offset,
                 "level boundary does not match its flattened transition count"
@@ -3281,15 +3817,62 @@ impl MetaEpisode {
                     .all(|level| level.operator == self.operator),
                 "the shared rule must be stable across true meta-episode levels"
             );
+        } else {
+            ensure!(
+                self.levels[0].operator == self.operator,
+                "shuffled-control level 0 must retain the recorded operator"
+            );
+            let expected = generate_meta_level(
+                self.seed,
+                self.meta_episode_id,
+                self.data_split,
+                &self.config,
+                0,
+                self.operator,
+            )?;
+            ensure!(
+                self.levels[0] == expected,
+                "shuffled-control level 0 must equal the corresponding stable-rule level"
+            );
         }
         Ok(())
     }
 
-    /// Transitions in flattened order; [`Self::level_boundaries`] indexes this stream.
+    /// Validate operator-family membership in addition to structural invariants.
+    pub fn validate_with_families(&self, families: &OperatorFamilySplit) -> Result<()> {
+        self.validate()?;
+        families.validate()?;
+        let allowed = match self.data_split {
+            V5DataSplit::HeldOutOperator(family) => {
+                ensure!(
+                    families.held_out.contains(&family),
+                    "meta held-out split requests a non-held-out operator"
+                );
+                &families.held_out
+            }
+            _ => &families.train,
+        };
+        ensure!(
+            allowed.contains(&self.operator.family)
+                && self
+                    .levels
+                    .iter()
+                    .all(|level| allowed.contains(&level.operator.family)),
+            "meta-episode operator is outside its split family membership"
+        );
+        Ok(())
+    }
+
+    /// Chronological transitions only; decision branches are intentionally excluded.
     pub fn flattened_transitions(&self) -> impl Iterator<Item = &TransitionSample> {
+        self.levels.iter().flat_map(|level| level.trajectory.iter())
+    }
+
+    /// Same-state ACTION5/ACTION6 branch groups, separate from chronological rows.
+    pub fn decision_groups(&self) -> impl Iterator<Item = &MetaDecisionGroup> {
         self.levels
             .iter()
-            .flat_map(|level| level.transitions.iter())
+            .flat_map(|level| level.decision_groups.iter())
     }
 
     /// Census the realized shuffled-control population without conditioning
@@ -3306,11 +3889,16 @@ impl MetaEpisode {
         for level in self.levels.iter().filter(|level| level.level_index >= 1) {
             census.later_levels += 1;
             census.repeated_level0_operator_levels += usize::from(level.operator == self.operator);
-            census.total_rows += level.transitions.len();
+            census.total_rows += level.trajectory.len()
+                + level
+                    .decision_groups
+                    .iter()
+                    .map(|group| group.transitions.len())
+                    .sum::<usize>();
             for transition in level
-                .transitions
+                .decision_groups
                 .iter()
-                .filter(|transition| matches!(transition.action.id, 5 | 6))
+                .flat_map(|group| group.transitions.iter())
             {
                 census.eligible_operator_rows += 1;
                 let changed = level.operator != self.operator;
@@ -3375,29 +3963,30 @@ fn generate_meta_level(
     // its shuffled control share byte-identical layouts and walks per level.
     let mut rng = seeded_v5_rng(seed, episode_id, split, 0x4D45_5441_4C56);
     let mut state = State::initial(&scenario);
-    let mut transitions =
-        Vec::with_capacity(config.steps_per_level + config.operator_decisions_per_level);
+    let mut trajectory = Vec::with_capacity(config.steps_per_level);
     for _ in 0..config.steps_per_level {
         let action = Action::moves()[rng.random_range(0..4)];
         let next = apply_action(&sim, &state, action);
-        transitions.push(sample_from_transition_goal_free(
+        trajectory.push(sample_from_transition_goal_free(
             &scenario,
             &state,
             &next,
             action,
             "meta_episode_v5",
-            transitions.len() as u64,
+            trajectory.len() as u64,
         )?);
         state = next;
     }
+    let mut decision_groups = Vec::new();
     if config.operator_decisions_per_level > 0 {
+        let mut transitions = Vec::with_capacity(config.operator_decisions_per_level);
         transitions.push(operator_sample_from_state(
             &scenario,
             &state,
             ArcAction::new(5, None, None)?,
             operator,
             "meta_episode_v5",
-            transitions.len() as u64,
+            config.steps_per_level as u64,
         )?);
         let current = render_state_padded(&scenario, &state)?;
         for (x, y) in stratified_action6_coordinates(&current, config.content_size)?
@@ -3410,19 +3999,35 @@ fn generate_meta_level(
                 ArcAction::new(6, Some(x), Some(y))?,
                 operator,
                 "meta_episode_v5",
-                transitions.len() as u64,
+                config.steps_per_level as u64,
             )?);
         }
+        decision_groups.push(MetaDecisionGroup {
+            id: MetaDecisionGroupId {
+                level_index,
+                episode_id,
+                group_index: 0,
+                current_fingerprint: frame_fingerprint(&transitions[0].current),
+            },
+            transitions,
+        });
     }
     let trajectory_id = format!("meta-v5/{split:?}/{seed}/{meta_episode_id}/level{level_index}");
-    for transition in &mut transitions {
+    for transition in &mut trajectory {
+        transition.provenance.trajectory_id = trajectory_id.clone();
+    }
+    for transition in decision_groups
+        .iter_mut()
+        .flat_map(|group| group.transitions.iter_mut())
+    {
         transition.provenance.trajectory_id = trajectory_id.clone();
     }
     Ok(MetaLevel {
         level_index,
         episode_id,
         operator,
-        transitions,
+        trajectory,
+        decision_groups,
     })
 }
 
@@ -3446,7 +4051,7 @@ fn assemble_meta_episode(
             level_index,
             level_operator(level_index)?,
         )?;
-        level_boundaries.push(level_boundaries[level_index] + level.transitions.len());
+        level_boundaries.push(level_boundaries[level_index] + level.trajectory.len());
         levels.push(level);
     }
     let episode = MetaEpisode {
@@ -3459,6 +4064,7 @@ fn assemble_meta_episode(
         levels,
         level_boundaries,
     };
+    // Families are an explicit deterministic input to the construction.
     episode.validate()?;
     Ok(episode)
 }
@@ -3477,7 +4083,7 @@ pub fn generate_meta_episode(
     families.validate()?;
     let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4D45_5441_0005);
     let operator = sampled_operator(families, split, &mut rng)?;
-    assemble_meta_episode(
+    let episode = assemble_meta_episode(
         seed,
         meta_episode_id,
         split,
@@ -3485,7 +4091,9 @@ pub fn generate_meta_episode(
         operator,
         false,
         |_| Ok(operator),
-    )
+    )?;
+    episode.validate_with_families(families)?;
+    Ok(episode)
 }
 
 /// Shuffled-rule negative control for [`generate_meta_episode`].
@@ -3507,7 +4115,7 @@ pub fn generate_meta_episode_shuffled_control(
     families.validate()?;
     let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4D45_5441_0005);
     let operator = sampled_operator(families, split, &mut rng)?;
-    assemble_meta_episode(
+    let episode = assemble_meta_episode(
         seed,
         meta_episode_id,
         split,
@@ -3526,7 +4134,9 @@ pub fn generate_meta_episode_shuffled_control(
             );
             sampled_operator(families, split, &mut level_rng)
         },
-    )
+    )?;
+    episode.validate_with_families(families)?;
+    Ok(episode)
 }
 
 /// Counts for one rule-identifiability census bucket.
@@ -3622,7 +4232,7 @@ pub fn census_rule_identifiability(
     let mut levels = 0usize;
     let mut earlier_rule_identified_episodes = 0usize;
     for episode in episodes {
-        episode.validate()?;
+        episode.validate_with_families(families)?;
         ensure!(
             !episode.shuffled_control,
             "rule-identifiability census requires stable-rule episodes"
@@ -3636,9 +4246,9 @@ pub fn census_rule_identifiability(
             .context("validated meta-episode has no first level")?;
         let mut posterior = candidates.clone();
         for transition in first_level
-            .transitions
+            .decision_groups
             .iter()
-            .filter(|transition| matches!(transition.action.id, 5 | 6))
+            .flat_map(|group| group.transitions.iter())
         {
             let rect = ContentRect {
                 x: 0,
@@ -3680,9 +4290,9 @@ pub fn census_rule_identifiability(
         );
         for level in episode.levels.iter().filter(|level| level.level_index >= 1) {
             for transition in level
-                .transitions
+                .decision_groups
                 .iter()
-                .filter(|transition| matches!(transition.action.id, 5 | 6))
+                .flat_map(|group| group.transitions.iter())
             {
                 let rect = ContentRect {
                     x: 0,
@@ -4018,6 +4628,83 @@ mod tests {
         );
         assert!(FactualBatch::from_rows(&shuffled[..2]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn d4_augmentation_keeps_oracle_agent_coordinates_in_frame() -> Result<()> {
+        for size in V5_CONTENT_SIZES {
+            let source_rect = ContentRect {
+                x: 0,
+                y: 0,
+                width: size,
+                height: size,
+            };
+            let target_rect = ContentRect {
+                x: (FRAME_SIDE as u8 - size) / 2,
+                y: (V5_PLAYFIELD_HEIGHT as u8 - size) / 2,
+                width: size,
+                height: size,
+            };
+            let source_agent = (size / 3, size / 2);
+            let mut source_pixels = vec![palette::PAD; FRAME_SIDE * FRAME_SIDE];
+            source_pixels[usize::from(source_agent.1) * FRAME_SIDE + usize::from(source_agent.0)] =
+                palette::AGENT;
+            let source = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, source_pixels)?;
+            let mut color_permutation = std::array::from_fn(|index| index as u8);
+            color_permutation.swap(palette::AGENT as usize, palette::TRIGGER_BASE as usize);
+            let expected_agent = color_permutation[palette::AGENT as usize];
+            for transform in D4Transform::ALL {
+                let augmentation = SymmetryAugmentation {
+                    d4: transform,
+                    color_permutation,
+                };
+                let transformed = frame_with_transformed_content(
+                    &source,
+                    source_rect,
+                    target_rect,
+                    &augmentation,
+                )?;
+                let mut latent = Some(vec![
+                    (f32::from(source_agent.0) + 0.5) / f32::from(size) * 2.0 - 1.0,
+                    (f32::from(source_agent.1) + 0.5) / f32::from(size) * 2.0 - 1.0,
+                ]);
+                transform_oracle_latent_d4(&mut latent, transform, source_rect, target_rect)?;
+                let mut positions = Vec::new();
+                for y in target_rect.y..target_rect.y + target_rect.height {
+                    for x in target_rect.x..target_rect.x + target_rect.width {
+                        if transformed.pixels[usize::from(y) * FRAME_SIDE + usize::from(x)]
+                            == expected_agent
+                        {
+                            positions.push((x, y));
+                        }
+                    }
+                }
+                assert_eq!(positions.len(), 1, "{transform:?}, size {size}");
+                let (x, y) = positions[0];
+                let latent = latent.expect("oracle latent remains present");
+                let expected_x = (f32::from(x - target_rect.x) + 0.5) / f32::from(size) * 2.0 - 1.0;
+                let expected_y = (f32::from(y - target_rect.y) + 0.5) / f32::from(size) * 2.0 - 1.0;
+                assert!((latent[0] - expected_x).abs() < 1e-6);
+                assert!((latent[1] - expected_y).abs() < 1e-6);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_meta_episode_ids_reject_the_reserved_meta_domain() {
+        let colliding_episode = 9_223_344_366_822u64;
+        let computed = colliding_episode
+            .checked_mul(MIXED_BATCH_EPISODE_STRIDE)
+            .expect("documented collision fits u64");
+        assert_eq!(
+            computed,
+            META_LEVEL_EPISODE_DOMAIN | 1268 * META_LEVEL_EPISODE_STRIDE + 50
+        );
+        let rejection = std::panic::catch_unwind(|| {
+            generate_coordinate_one_step(7, colliding_episode, Split::Train, 1)
+        });
+        assert!(matches!(rejection, Ok(Err(_)) | Err(_)));
     }
 
     #[test]

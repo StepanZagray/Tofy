@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::BTreeSet;
+use tofy::domain::Split;
 use tofy::p2::data::{
     apply_episode_operator, census_rule_identifiability, generate_meta_episode,
     generate_meta_episode_shuffled_control, ContentRect, MetaEpisode, MetaEpisodeConfig,
@@ -63,13 +64,13 @@ fn true_meta_episode_keeps_one_stable_rule_across_changed_layouts() -> Result<()
         .iter()
         .all(|level| level.operator == episode.operator));
 
-    // Explicit boundaries index the flattened stream; no sample is mutated.
-    let rows_per_level = config.steps_per_level + config.operator_decisions_per_level;
-    assert_eq!(episode.level_boundaries, vec![0, 7, 14, 21]);
+    // Explicit boundaries index only the chronological trajectory.
+    assert_eq!(episode.level_boundaries, vec![0, 4, 8, 12]);
     assert_eq!(
         episode.flattened_transitions().count(),
-        config.levels * rows_per_level
+        config.levels * config.steps_per_level
     );
+    assert_eq!(episode.decision_groups().count(), config.levels);
     assert!(episode
         .levels
         .iter()
@@ -88,35 +89,43 @@ fn true_meta_episode_keeps_one_stable_rule_across_changed_layouts() -> Result<()
     let starting_boards = episode
         .levels
         .iter()
-        .map(|level| board(&level.transitions[0].current.pixels).to_vec())
+        .map(|level| board(&level.trajectory[0].current.pixels).to_vec())
         .collect::<BTreeSet<_>>();
     assert_eq!(starting_boards.len(), config.levels);
 
-    // Every operator decision replays exactly under the shared rule.
+    // Every trajectory is chronological; every decision group is a same-state
+    // counterfactual branch that replays exactly under the shared rule.
     for level in &episode.levels {
-        for transition in &level.transitions {
-            if !matches!(transition.action.id, 5 | 6) {
-                continue;
+        assert!(level
+            .trajectory
+            .windows(2)
+            .all(|pair| pair[0].next == pair[1].current));
+        for group in &level.decision_groups {
+            assert!(group
+                .transitions
+                .windows(2)
+                .all(|pair| pair[0].current == pair[1].current));
+            for transition in &group.transitions {
+                let rect = ContentRect {
+                    x: 0,
+                    y: 0,
+                    width: config.content_size,
+                    height: config.content_size,
+                };
+                let replayed = apply_episode_operator(
+                    &transition.current,
+                    &transition.action,
+                    rect,
+                    episode.operator,
+                )?;
+                assert_eq!(
+                    board(&replayed.pixels),
+                    board(&transition.next.pixels),
+                    "level {} action {} must replay under the shared rule",
+                    level.level_index,
+                    transition.action.id
+                );
             }
-            let rect = ContentRect {
-                x: 0,
-                y: 0,
-                width: config.content_size,
-                height: config.content_size,
-            };
-            let replayed = apply_episode_operator(
-                &transition.current,
-                &transition.action,
-                rect,
-                episode.operator,
-            )?;
-            assert_eq!(
-                board(&replayed.pixels),
-                board(&transition.next.pixels),
-                "level {} action {} must replay under the shared rule",
-                level.level_index,
-                transition.action.id
-            );
         }
     }
     Ok(())
@@ -135,10 +144,7 @@ fn shuffled_control_shares_layouts_but_breaks_the_rule() -> Result<()> {
     assert_eq!(control.levels[0], truth.levels[0]);
     for (true_level, control_level) in truth.levels.iter().zip(&control.levels).skip(1) {
         // Same layout and movement walk (operator-independent RNG lane) ...
-        assert_eq!(
-            &true_level.transitions[..config.steps_per_level],
-            &control_level.transitions[..config.steps_per_level]
-        );
+        assert_eq!(&true_level.trajectory, &control_level.trajectory);
         // ... while the later rule is an independent draw from the same train
         // marginal (a repeat is valid and carries no negative information).
         assert!(families().train.contains(&control_level.operator.family));
@@ -154,13 +160,13 @@ fn census_counts_later_alternative_outcome_sensitivity_and_rule_free_zero() -> R
     println!("rule-identifiability census: {census:?}");
     assert_eq!(census.episodes, 8);
     assert_eq!(census.levels, 24);
-    assert!(census.earlier_rule_identified_episodes > 0);
+    // Current deterministic golden: every level-0 rule is identified and all
+    // later operator tuples are alternative-outcome-sensitive.
+    assert_eq!(census.earlier_rule_identified_episodes, 8);
     // Default config: 3 decision points in each of 2 later levels, 8 episodes.
     assert_eq!(census.overall.later_operator_points, 48);
-    assert!(
-        census.overall.alternative_outcome_sensitive_fraction > 0.0,
-        "identified earlier rules must distinguish some later fixed-action outcomes"
-    );
+    assert_eq!(census.overall.alternative_outcome_sensitive, 48);
+    assert_eq!(census.overall.alternative_outcome_sensitive_fraction, 1.0);
     assert!(census
         .per_family
         .iter()
@@ -231,5 +237,90 @@ fn shuffled_control_reports_realized_changed_and_outcome_changing_populations() 
     assert!(aggregate.genuinely_changed_operator_tuples > 0);
     assert!(aggregate.outcome_changing_tuples > 0);
     assert!(aggregate.outcome_changing_tuples <= aggregate.genuinely_changed_operator_tuples);
+    Ok(())
+}
+
+#[test]
+fn meta_episode_validation_rejects_each_contract_mutation() -> Result<()> {
+    let serialized = serde_json::to_vec(&true_episode(12)?)?;
+    let baseline: MetaEpisode = serde_json::from_slice(&serialized)?;
+
+    let mut adjacency = baseline.clone();
+    adjacency.levels[0].trajectory[1].current.pixels[0] ^= 1;
+    assert!(adjacency.validate().is_err());
+
+    let mut decision_current = baseline.clone();
+    decision_current.levels[0].decision_groups[0].transitions[1]
+        .current
+        .pixels[0] ^= 1;
+    assert!(decision_current.validate().is_err());
+
+    let mut action_schema = baseline.clone();
+    action_schema.levels[0].decision_groups[0].transitions[0]
+        .action
+        .id = 7;
+    assert!(action_schema.validate().is_err());
+
+    let mut transition_index = baseline.clone();
+    transition_index.levels[0].trajectory[0].transition_index += 1;
+    assert!(transition_index.validate().is_err());
+
+    let mut split = baseline.clone();
+    split.levels[0].trajectory[0].split = Split::HeldOutComposition;
+    assert!(split.validate().is_err());
+
+    let mut trajectory_id = baseline.clone();
+    trajectory_id.levels[0].trajectory[0]
+        .provenance
+        .trajectory_id = "wrong".into();
+    assert!(trajectory_id.validate().is_err());
+
+    let mut row_count = baseline.clone();
+    row_count.levels[0].decision_groups[0].transitions.pop();
+    assert!(row_count.validate().is_err());
+
+    let mut group_id = baseline.clone();
+    group_id.levels[0].decision_groups[0].id.group_index += 1;
+    assert!(group_id.validate().is_err());
+
+    let mut replay = baseline.clone();
+    replay.levels[0].decision_groups[0].transitions[0]
+        .next
+        .pixels[0] ^= 1;
+    assert!(replay.validate().is_err());
+
+    let mut control = generate_meta_episode_shuffled_control(
+        SEED,
+        12,
+        V5DataSplit::Train,
+        &families(),
+        &MetaEpisodeConfig::default(),
+    )?;
+    control.levels[0].trajectory[0].current.pixels[0] ^= 1;
+    assert!(control.validate().is_err());
+
+    let family_episode = (0..64)
+        .map(true_episode)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .find(|episode| {
+            !matches!(
+                episode.operator.family,
+                tofy::p2::data::OperatorFamily::Teleport | tofy::p2::data::OperatorFamily::Toggle
+            )
+        })
+        .expect("a train episode uses a movable operator family");
+    let mut family_split = families();
+    family_split
+        .train
+        .retain(|family| *family != family_episode.operator.family);
+    family_split.held_out = vec![family_episode.operator.family];
+    family_split
+        .train
+        .push(tofy::p2::data::OperatorFamily::SwapRegion);
+    family_split.validate()?;
+    assert!(family_episode
+        .validate_with_families(&family_split)
+        .is_err());
     Ok(())
 }
