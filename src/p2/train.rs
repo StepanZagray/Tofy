@@ -158,8 +158,10 @@ pub fn foundation_v2_loss_weights_from_masks(
     })
 }
 
-/// Pure multiplicative EP controller. The returned weight targets
-/// `weight * ||g_ep|| = 0.3 * ||g_pred||`, then applies the ADR bounds. When
+/// Direct-target EP controller: the returned weight satisfies
+/// `weight * ||g_ep|| = 0.3 * ||g_pred||` exactly in the interior (the
+/// previous weight participates only on the invalid-input rail), then
+/// applies the ADR bounds. When
 /// the budget demands a weight below the positive floor (including a zero
 /// prediction gradient), EP is disabled outright with weight zero rather than
 /// held at a floor that would violate the `<= 0.3x` bound.
@@ -259,8 +261,11 @@ pub struct FoundationV2GateEvaluation {
 /// `ComposedExactGuarded` selects on composed all-row exactness (the deployed
 /// copy-gate output, no-op rows included) and additionally refuses a
 /// candidate whose content or padding false-edit rate regresses versus the
-/// incumbent best — the deployed-behavior selection the canonical library
-/// prescribes; preregister it for new evidence runs.
+/// incumbent best — a guarded rule motivated by the canonical library's
+/// requirement to add composed decoding and false-change protection before
+/// selection; preregister it for new evidence runs. Note: `PromotionMetric`
+/// names in-run best-checkpoint *election* (a selection_only mechanism per
+/// ADR 0003 §6), not the promotion-evidence class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionMetric {
@@ -3432,7 +3437,7 @@ fn smooth_cap_nonnegative(raw: &Tensor, cap: f64) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
-fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
+pub(crate) fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
@@ -5319,27 +5324,30 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
             } else {
                 "model.safetensors"
             });
-    if let Some(export) = &report.export_checkpoint {
-        // Fail-closed re-verification: the exported evaluation model must be
-        // the checkpoint this run's own gate history selected, never a
-        // best-directory leftover from another trajectory or resume branch.
-        if cfg.recipe == TrainingRecipe::FoundationV2 {
-            let foundation = report
-                .foundation_v2
-                .as_ref()
-                .context("foundation-v2 export requires a foundation report")?;
+    // Fail-closed verification, run unconditionally for foundation-v2: a
+    // `checkpoints/best` that exists but does not match this run's own
+    // gate-history selection (a foreign bundle, another resume branch, a
+    // stale step) must abort publication loudly. Running it only when the
+    // report already claims an export would make the loud path unreachable,
+    // because the claim itself is produced by the same verification.
+    if cfg.recipe == TrainingRecipe::FoundationV2 {
+        if let Some(foundation) = report.foundation_v2.as_ref() {
             let verified = foundation_v2_verified_best_export(
                 cfg,
                 foundation.promotion_metric,
                 &foundation.gate_history,
             )?;
-            if verified.as_deref() != Some(export.as_path()) {
+            if report.export_checkpoint.as_deref() != verified.as_deref() {
                 bail!(
-                    "export checkpoint {} failed best-selection verification",
-                    export.display()
+                    "export checkpoint claim {:?} disagrees with best-selection \
+                     verification {:?}",
+                    report.export_checkpoint,
+                    verified
                 );
             }
         }
+    }
+    if let Some(export) = &report.export_checkpoint {
         fs::copy(export, &weights_tmp).with_context(|| {
             format!(
                 "copy export checkpoint {} -> {}",
@@ -6206,7 +6214,17 @@ fn build_report(
             metric => foundation_v2_best_evaluation(metric, &foundation.gate_history)
                 .and_then(|evaluation| foundation_v2_promotion_value(metric, &evaluation.metrics)),
         };
-        let best_checkpoint = cfg.output_dir.join("checkpoints/best");
+        // Advertise the best-bundle path only when it passes the same
+        // selection verification as the export claim; a foreign or stale
+        // `checkpoints/best` must not be published as this run's best.
+        let best_checkpoint = foundation_v2_verified_best_export(
+            cfg,
+            cfg.promotion_metric,
+            &foundation.gate_history,
+        )
+        .ok()
+        .flatten()
+        .map(|_| cfg.output_dir.join("checkpoints/best"));
         FoundationV2TrainingReport {
             total_steps: foundation.total_steps,
             mean_losses: foundation_v2_loss_means(&foundation.loss_sums, foundation.loss_steps),
@@ -6216,7 +6234,7 @@ fn build_report(
             best_changed_exact: foundation.best_changed_exact,
             promotion_metric: cfg.promotion_metric,
             best_promotion_value,
-            best_checkpoint: best_checkpoint.exists().then_some(best_checkpoint),
+            best_checkpoint,
             rollout_enabled: foundation.rollout_enabled,
             permanent_checkpoints: foundation.permanent_checkpoints.clone(),
             event_label_census: foundation.event_label_census,

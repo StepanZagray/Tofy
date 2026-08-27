@@ -13,9 +13,9 @@ retained unmodified for history.
 
 1. **A5 selection safety.** The exhaustive `6 + 64^2 = 4,102`-root depth-1
    sweep with an argmax finalist is demoted from deployed controller to
-   teacher/oracle use only. With per-candidate model error `epsilon`, the
-   maximum over ~4,102 noisy scores selects a corrupted finalist with
-   probability approaching 1 (winner's curse); the union bound in the
+   teacher/oracle use only. With independent per-candidate model error
+   `epsilon`, the maximum over ~4,102 noisy scores is expected to select a
+   corrupted finalist (winner's curse); the union bound in the
    planning note is a worst case, not a calibration. The deployed Phase A
    controller must use a bounded candidate budget (order 40-64 evaluations,
    horizon <= 2) with a selection-aware acceptance charge. The deterministic
@@ -372,10 +372,12 @@ superiority
 
 > **Superseded in deployment by Amendment 1 (2026-08-27).** The exhaustive
 > root sweep below is retained for teacher/oracle trace generation only. The
-> deployed Phase A controller uses the amended bounded budget: at most 64
-> model evaluations per decision, horizon at most 2, with the selection
-> charge from `formal/TofyFormal/PlanningSelection.lean` applied to finalist
-> acceptance. The decision-kernel line "roots = recursively imagine every
+> deployed Phase A controller must use the amended bounded budget: at most 64
+> model evaluations per decision, horizon at most 2, and must apply the
+> selection charge from `formal/TofyFormal/PlanningSelection.lean` to
+> finalist acceptance (the caps are implemented in
+> `latent_planning/config.rs`; the charge application is not yet
+> implemented). The decision-kernel line "roots = recursively imagine every
 > legal atomic action" inherits this supersession.
 
 The legal atomic set contains the six non-coordinate action types plus every

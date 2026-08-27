@@ -560,7 +560,7 @@ pub struct PhaseAInferenceCapabilities {
     pub spatial_prefix_faithful: PhaseAInferenceCheck,
     pub action_faithful_ptrm: PhaseAInferenceCheck,
     pub composed_decode_available: PhaseAInferenceCheck,
-    pub null_action_trained: PhaseAInferenceCheck,
+    pub null_action_row_present: PhaseAInferenceCheck,
 }
 
 /// Per-sample index of the trajectory with the highest Q logit.
@@ -2085,7 +2085,10 @@ impl WorldModel {
                 self.exact_patch_grounding.is_some(),
                 "requires the world-core-v4 exact decoder and copy gate",
             ),
-            null_action_trained: check(ACTION_VOCAB > 0, "action embedding has no id-0 row"),
+            // Structural only: an id-0 embedding row exists. Whether the NULL
+            // action was actually in the training range is a checkpoint
+            // property this probe cannot verify.
+            null_action_row_present: check(ACTION_VOCAB > 0, "action embedding has no id-0 row"),
         }
     }
 }

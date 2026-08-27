@@ -56,7 +56,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v17";
+/// v18 (2026-08-27): overall semantic reducer omits content-derived
+/// false-edit scalars; foundation-v2 SIGReg scored on the content-masked
+/// canonical population (whole-population, batch-invariant); identifiability
+/// split is group-disjoint; the correctness seam is composed copy-gate
+/// semantics; content masks honor the provenance origin; v5_holdout_gates
+/// added. v17 and v18 reports are not field-for-field comparable.
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v18";
 pub const ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD: f64 = 1e-3;
 
 fn log_eval_phase(phase: &str, detail: &str, elapsed: Duration) {
@@ -407,7 +413,7 @@ pub struct GateSupportMetrics {
     #[serde(default)]
     pub population_fingerprint: String,
     /// SHA-256 of the exact ordered V5 content masks when the caller supplies
-    /// them. `None` identifies the legacy origin-aligned fallback.
+    /// them. `None` identifies the provenance-origin rectangle reconstruction.
     #[serde(default)]
     pub content_mask_fingerprint: Option<String>,
     /// This population participates in stopping/objective/checkpoint choices;
@@ -2421,6 +2427,7 @@ pub fn one_step_changed_exact(
 fn foundation_v2_v5_holdout_gates(
     model: &WorldModel,
     cfg: &EvalConfig,
+    train_seed: u64,
     device: &Device,
 ) -> Result<BTreeMap<String, GateSupportMetrics>> {
     const V5_HOLDOUT_ROWS: usize = 512;
@@ -2445,6 +2452,12 @@ fn foundation_v2_v5_holdout_gates(
             .wrapping_add(lane as u64);
         if seed == crate::p2::train::FOUNDATION_V2_GATE_SEED {
             bail!("v5 holdout eval seed collides with the reserved in-trainer gate seed");
+        }
+        if seed == train_seed {
+            bail!(
+                "v5 holdout eval seed for {name} collides with the checkpoint's \
+                 training seed; the unseen-seed claim would be false"
+            );
         }
         let batch = compose_mixed_stream_batch(
             &MixedStreamConfig {
@@ -2771,7 +2784,7 @@ pub fn evaluate_gate_support_with_content_masks(
             content_masks,
             true,
         )?,
-        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (legacy origin-aligned fallback otherwise); complete action tuples use the maximum-change cyclic shuffle within provenance.source_kind; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
+        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (provenance-origin rectangle reconstruction otherwise); complete action tuples use the maximum-change cyclic shuffle within provenance.source_kind; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
     })
 }
 
@@ -3040,7 +3053,7 @@ fn eval_q_labels(q_logit: &Tensor, labels: &[f32]) -> Result<QEvalAccum> {
 /// Exact content mask reconstructed from provenance: dimensions plus the
 /// recorded placement origin (zero for legacy origin-aligned populations,
 /// the sampled origin for translated V5 rows).
-fn origin_aligned_content_mask(sample: &TransitionSample) -> Result<ContentMask> {
+fn provenance_content_mask(sample: &TransitionSample) -> Result<ContentMask> {
     let rect = ContentRect {
         x: u8::try_from(sample.provenance.content_x).context("content x does not fit u8")?,
         y: u8::try_from(sample.provenance.content_y).context("content y does not fit u8")?,
@@ -3055,7 +3068,7 @@ fn origin_aligned_content_mask(sample: &TransitionSample) -> Result<ContentMask>
 fn origin_content_tensor(samples: &[TransitionSample], device: &Device) -> Result<Tensor> {
     let mut values = Vec::with_capacity(samples.len() * (FRAME_SIDE - 1) * FRAME_SIDE);
     for sample in samples {
-        let mask = origin_aligned_content_mask(sample)?;
+        let mask = provenance_content_mask(sample)?;
         values.extend(
             mask.values[..(FRAME_SIDE - 1) * FRAME_SIDE]
                 .iter()
@@ -3292,7 +3305,7 @@ fn eval_one_batch(
             let (_, _, latent_height, latent_width) = current_z.dims4()?;
             let masks = chunk
                 .iter()
-                .map(origin_aligned_content_mask)
+                .map(provenance_content_mask)
                 .collect::<Result<Vec<_>>>()?;
             let mask_refs = masks.iter().collect::<Vec<_>>();
             let latent_mask =
@@ -4254,13 +4267,17 @@ fn eval_sample_set(
             values.extend_from_slice(row);
         }
         let stack = Tensor::from_vec(values, (2, rows, dim), device)?;
-        let raw = f64::from(
-            sigreg_loss_for_stack(&stack, train_cfg, cfg.seed)?
+        let raw_tensor = sigreg_loss_for_stack(&stack, train_cfg, cfg.seed)?;
+        let raw = f64::from(raw_tensor.to_dtype(DType::F32)?.to_scalar::<f32>()?);
+        // The bounded field keeps its smooth-cap semantics even though the
+        // foundation objective consumes the raw statistic directly.
+        let bounded = f64::from(
+            crate::p2::train::bounded_sigreg_loss(&raw_tensor)?
                 .to_dtype(DType::F32)?
                 .to_scalar::<f32>()?,
         );
         merged.sigreg_raw_weighted = raw * rows as f64;
-        merged.sigreg_bounded_weighted = raw * rows as f64;
+        merged.sigreg_bounded_weighted = bounded * rows as f64;
         merged.sigreg_n = rows;
     }
 
@@ -6472,7 +6489,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         && train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2)
         .then(|| {
             timed_eval_phase("population_generation", "v5_holdout_gates", || {
-                foundation_v2_v5_holdout_gates(&model, cfg, &device)
+                foundation_v2_v5_holdout_gates(&model, cfg, train_cfg.seed, &device)
             })
         })
         .transpose()?;

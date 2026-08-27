@@ -1213,11 +1213,17 @@ pub struct LiveRunSettings {
     pub evidence_class: String,
 }
 
+/// Evidence class at scorecard-open time. A clean worktree earns only
+/// `candidate_run`: AGENTS.md reserves `completed_evidence` for sealed runs
+/// whose provenance, integrity, and evaluation checks all passed, which a
+/// driver cannot certify at open time. The report builder downgrades to
+/// `failed_integrity_or_evaluation` when the run records a scorecard-close
+/// error or an unexpected full reset.
 fn live_evidence_class(driver: &LiveDriverOptions) -> &'static str {
     if driver.exploratory {
         "exploratory_driver_repair"
     } else {
-        "completed_evidence"
+        "candidate_run"
     }
 }
 
@@ -1568,6 +1574,17 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     let official_rhae = official_scorecard
         .as_ref()
         .and_then(official_rhae_from_benchmark);
+    // Downgrade the evidence class when the run itself recorded an integrity
+    // or evaluation failure; only a later sealing step may ever write
+    // `completed_evidence`.
+    let evidence_class = if scorecard_close_error.is_some()
+        || official_scorecard_parse_error.is_some()
+        || game_reports.iter().any(|game| game.full_reset_detected)
+    {
+        "failed_integrity_or_evaluation".to_string()
+    } else {
+        settings.evidence_class.clone()
+    };
     Ok(LiveEvalReport {
         schema: LIVE_REPORT_SCHEMA.into(),
         created_at_unix_ms: unix_ms(),
@@ -1583,7 +1600,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         executable_sha256: settings.executable_sha256.clone(),
         build_profile: settings.build_profile.clone(),
         cli_args: settings.cli_args.clone(),
-        evidence_class: settings.evidence_class.clone(),
+        evidence_class,
         policy: LIVE_POLICY.into(),
         policy_limitation: POLICY_LIMITATION.into(),
         goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),

@@ -578,7 +578,7 @@ fn phase_a_capability_probe_reports_specific_gaps() -> Result<()> {
         capabilities.spatial_prefix_faithful,
         capabilities.action_faithful_ptrm,
         capabilities.composed_decode_available,
-        capabilities.null_action_trained,
+        capabilities.null_action_row_present,
     ] {
         assert!(check.passed, "{:?}", check.reason);
     }

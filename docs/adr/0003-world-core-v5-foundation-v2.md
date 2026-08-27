@@ -79,10 +79,12 @@
   population and gate policy carry a frozen identity; a resume that
   regenerates a different population fails closed before any update. The
   exported best EMA is verified against the run's own gate-history selection
-  and fails closed on mismatch. A `composed_exact_guarded` promotion metric
-  (composed all-row exactness with a false-edit non-regression guard) is
-  available and preregistered as the selection metric for the next evidence
-  run; `changed_exact` remains the historical default for replay.
+  and fails closed on mismatch. A `composed_exact_guarded` checkpoint-election
+  rule (composed all-row exactness with a false-edit non-regression guard) is
+  available and preregistered for the next evidence run; `changed_exact`
+  remains the historical default for replay. `PromotionMetric` names in-run
+  best-checkpoint election — a `selection_only` mechanism under §6, never the
+  promotion-evidence class.
 - **Meta-episodes ship generator-first.** The cross-level meta-episode
   subsystem (generators, censuses, reserved ID namespace) has no trainer or
   evaluator consumer yet by design; wiring it into a training mixture is a

@@ -694,7 +694,12 @@ impl MixedStreamConfig {
                 .all(|(_, value)| value.is_finite() && *value >= 0.0),
             "mixed stream schedule returned invalid weights"
         );
-        self.realized_proportions(0.0)?;
+        // The schedule is progress-dependent and intact-group rounding is
+        // nonlinear, so a batch size can satisfy the tolerance at progress 0
+        // yet violate it later and abort mid-run; validate across the range.
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            self.realized_proportions(progress)?;
+        }
         Ok(())
     }
 
@@ -744,12 +749,15 @@ impl TransitionProvenance {
             "content_height must be in 1..{}",
             FRAME_SIDE - 1
         );
+        // u32 arithmetic: u16 addition would wrap in release for corrupt
+        // deserialized values and let an out-of-frame rectangle validate.
         ensure!(
-            self.content_x + self.content_width <= FRAME_SIDE as u16,
+            u32::from(self.content_x) + u32::from(self.content_width) <= FRAME_SIDE as u32,
             "content rectangle exceeds the canvas width"
         );
         ensure!(
-            self.content_y + self.content_height <= (FRAME_SIDE - 1) as u16,
+            u32::from(self.content_y) + u32::from(self.content_height)
+                <= (FRAME_SIDE - 1) as u32,
             "content rectangle exceeds the gameplay height"
         );
         ensure!(

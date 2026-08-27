@@ -30,13 +30,14 @@ pub struct PhaseAConfig {
     pub false_safe_trust_bound: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PhaseAConfigError {
     ModelEvaluationCap { requested: usize, maximum: usize },
     HorizonCap { requested: u8, maximum: u8 },
     CandidateCap { requested: usize, maximum: usize },
     InvalidDeadline,
     HardDeadlineCap { requested: u64, maximum: u64 },
+    InvalidProbability { field: &'static str, value: f32 },
 }
 
 impl fmt::Display for PhaseAConfigError {
@@ -54,6 +55,9 @@ impl fmt::Display for PhaseAConfigError {
             Self::InvalidDeadline => write!(f, "deadline must be positive and target <= hard"),
             Self::HardDeadlineCap { requested, maximum } => {
                 write!(f, "hard deadline {requested}ms exceeds {maximum}ms")
+            }
+            Self::InvalidProbability { field, value } => {
+                write!(f, "{field} must be a probability in (0, 1); got {value}")
             }
         }
     }
@@ -124,6 +128,19 @@ impl PhaseAConfig {
                 maximum: HARD_DEADLINE_MILLIS,
             });
         }
+        for (field, value) in [
+            ("unknown_prior", self.unknown_prior),
+            ("epsilon", self.epsilon),
+            ("alpha_safe", self.alpha_safe),
+            ("protected_mass", self.protected_mass),
+            ("ordinary_trust_bound", self.ordinary_trust_bound),
+            ("irreversible_trust_bound", self.irreversible_trust_bound),
+            ("false_safe_trust_bound", self.false_safe_trust_bound),
+        ] {
+            if !(value.is_finite() && value > 0.0 && value < 1.0) {
+                return Err(PhaseAConfigError::InvalidProbability { field, value });
+            }
+        }
         Ok(())
     }
 }
@@ -152,6 +169,21 @@ mod tests {
         assert!(matches!(
             too_slow.validate(),
             Err(PhaseAConfigError::HardDeadlineCap { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_probability_fields() {
+        let bad = PhaseAConfig {
+            unknown_prior: 2.0,
+            ..PhaseAConfig::default()
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(PhaseAConfigError::InvalidProbability {
+                field: "unknown_prior",
+                ..
+            })
         ));
     }
 
