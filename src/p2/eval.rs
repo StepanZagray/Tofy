@@ -8,9 +8,10 @@ use crate::p2::board_probe::{
 };
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
 use crate::p2::data::{
-    generate_curriculum, generate_factual_branch_group, generate_hazard_one_step, palette,
-    ArcAction, BranchGroup, ContentMask, ContentRect, FactualBatch, TransitionSample,
-    FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
+    compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum,
+    generate_factual_branch_group, generate_hazard_one_step, palette, ArcAction, BranchGroup,
+    ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
+    TransitionSample, V5DataSplit, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
 };
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
@@ -111,7 +112,12 @@ pub struct EvalConfig {
     pub checkpoint: PathBuf,
     pub train_config: PathBuf,
     pub seed: u64,
-    /// Unseen seed on the training-composition (7x7) distribution.
+    /// Unseen seed for the legacy origin-aligned curriculum generator used by
+    /// the `synthetic_iid_*` sections. This is NOT the foundation-v2 V5
+    /// training composition (no geometry randomization, symmetry
+    /// augmentation, or goal dropout); the `v5_holdout_gates` populations
+    /// cover the actual ADR 0003 held-out distributions. Also seeds the
+    /// domain-tagged V5 holdout populations.
     pub iid_seed: u64,
     pub synthetic_episodes: usize,
     pub physical_batch: usize,
@@ -527,6 +533,12 @@ pub struct TransitionKindDiagnostics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionDiagnostics {
+    /// Which intervention produced these paired errors, with a fingerprint of
+    /// the exact donor permutation. This is a *different* intervention from
+    /// the semantic evaluator's maximum-change cyclic rotation: the two
+    /// sections must not be read as one causal control.
+    #[serde(default)]
+    pub intervention_contract: String,
     pub aggregate: ActionSourceDiagnostics,
     pub by_source: BTreeMap<String, ActionSourceDiagnostics>,
     /// Primary deconfounded action intervention: only paired rows whose shuffled
@@ -1059,6 +1071,14 @@ pub struct EvalReport {
     pub outcome_counterfactuals: Option<OutcomeCounterfactualMetrics>,
     /// Optional transfer on imported ARC recordings (never used for training).
     pub arc3_transfer: Option<SplitEval>,
+    /// Foundation-v2 gate metrics on each named ADR 0003 V5 held-out split
+    /// (unseen seed, composition, translation, size, held-out operator
+    /// families), evaluated with exact content-mask sidecars. The legacy
+    /// `synthetic_iid_*` sections use the origin-aligned curriculum
+    /// generator, not the V5 training composition; these populations are the
+    /// contract's actual held-out distributions. Selection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v5_holdout_gates: Option<BTreeMap<String, GateSupportMetrics>>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
 }
@@ -2392,6 +2412,64 @@ pub fn one_step_changed_exact(
     Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
 }
 
+/// ADR 0003 §6: evaluate the foundation-v2 gate metrics on each named V5
+/// held-out split with exact content-mask sidecars, so offline reports cover
+/// the actual held-out populations (unseen seed, composition, translation,
+/// size, held-out operator families) instead of only the legacy
+/// origin-aligned curriculum rows. Selection-only; each population uses an
+/// eval-domain seed distinct from the reserved in-trainer gate seed.
+fn foundation_v2_v5_holdout_gates(
+    model: &WorldModel,
+    cfg: &EvalConfig,
+    device: &Device,
+) -> Result<BTreeMap<String, GateSupportMetrics>> {
+    const V5_HOLDOUT_ROWS: usize = 512;
+    const V5_HOLDOUT_SEED_DOMAIN: u64 = 0x5645_4C35_1D00_0000;
+    let mut splits: Vec<(String, V5DataSplit)> = vec![
+        ("unseen_seed_7x7".into(), V5DataSplit::UnseenSeed7x7),
+        ("composition_8x8".into(), V5DataSplit::Composition8x8),
+        ("translated_7x7".into(), V5DataSplit::Translated7x7),
+        ("size_16x16".into(), V5DataSplit::Size16x16),
+    ];
+    for family in OperatorFamilySplit::default().held_out {
+        splits.push((
+            format!("held_out_operator_{family:?}").to_lowercase(),
+            V5DataSplit::HeldOutOperator(family),
+        ));
+    }
+    let mut gates = BTreeMap::new();
+    for (lane, (name, split)) in splits.into_iter().enumerate() {
+        let seed = cfg
+            .iid_seed
+            .wrapping_add(V5_HOLDOUT_SEED_DOMAIN)
+            .wrapping_add(lane as u64);
+        if seed == crate::p2::train::FOUNDATION_V2_GATE_SEED {
+            bail!("v5 holdout eval seed collides with the reserved in-trainer gate seed");
+        }
+        let batch = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: V5_HOLDOUT_ROWS,
+                seed,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            split,
+        )?;
+        let samples = batch.transitions().cloned().collect::<Vec<_>>();
+        let masks = batch
+            .samples()
+            .iter()
+            .map(|sample| sample.content_mask.clone())
+            .collect::<Vec<_>>();
+        let metrics =
+            evaluate_gate_support_with_content_masks(model, &samples, Some(&masks), device)?;
+        gates.insert(name, metrics);
+    }
+    Ok(gates)
+}
+
 /// Full-transition exactness on the same changed-transition rows counted by
 /// `one_step_changed_exact`: every status-excluded gameplay pixel, unchanged
 /// pixels included, must be decoded exactly.
@@ -3603,6 +3681,30 @@ fn action_diagnostics_from_pairs(
         by_target_action_id: Some(by_target_action_id),
         by_target_action_kind: Some(by_target_action_kind),
         by_transition_kind: Some(by_transition_kind),
+        intervention_contract: {
+            let mut fingerprint = 0xcbf2_9ce4_8422_2325u64;
+            let mut push = |bytes: &[u8]| {
+                for byte in bytes {
+                    fingerprint ^= u64::from(*byte);
+                    fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            };
+            for ablated in shuffled {
+                push(&[
+                    ablated.action.id,
+                    ablated.action.x.unwrap_or(u8::MAX),
+                    ablated.action.y.unwrap_or(u8::MAX),
+                ]);
+            }
+            format!(
+                "per-source seeded Sattolo single-cycle permutation of complete action \
+                 tuples; changed_tuples={}/{}; donor_fingerprint=fnv1a64:{fingerprint:016x}; \
+                 distinct from the semantic evaluator's maximum-change cyclic rotation \
+                 (action_shuffled_prediction) - do not read the two sections as one control",
+                changed_conditioning_indices.len(),
+                samples.len(),
+            )
+        },
     })
 }
 
@@ -6360,6 +6462,15 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         .as_ref()
         .and_then(official_rhae_from_benchmark);
 
+    let v5_holdout_gates = (cfg.mode == EvalMode::Full
+        && train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2)
+        .then(|| {
+            timed_eval_phase("population_generation", "v5_holdout_gates", || {
+                foundation_v2_v5_holdout_gates(&model, cfg, &device)
+            })
+        })
+        .transpose()?;
+
     let report_reduction_started = Instant::now();
     let mut population_sha256 = BTreeMap::from([
         (
@@ -6404,6 +6515,14 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     if let Some(fingerprint) = arc3_population_fingerprint {
         population_sha256.insert("arc3_transfer".into(), fingerprint);
     }
+    if let Some(gates) = &v5_holdout_gates {
+        for (name, metrics) in gates {
+            population_sha256.insert(
+                format!("v5_holdout_{name}"),
+                metrics.population_fingerprint.clone(),
+            );
+        }
+    }
     let identity = evaluation_identity(cfg, population_sha256)?;
 
     let report = EvalReport {
@@ -6434,6 +6553,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         factual_branches,
         outcome_counterfactuals,
         arc3_transfer,
+        v5_holdout_gates,
         research_claim: false,
     };
     if let Some(jsonl) = cfg.episode_jsonl.as_deref() {
