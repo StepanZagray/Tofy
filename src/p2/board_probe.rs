@@ -34,13 +34,24 @@ impl BoardProbeRows {
     pub fn from_spatial_latent(latent: &Tensor) -> Result<Self> {
         let (batch, channels, height, width) = latent.dims4()?;
         ensure!(
-            channels > 0 && height == PATCHES_PER_SIDE && width == PATCHES_PER_SIDE,
-            "board probe requires BxCx8x8 spatial latents"
+            channels > 0
+                && height == width
+                && height >= PATCHES_PER_SIDE
+                && height % PATCHES_PER_SIDE == 0,
+            "board probe requires BxCxSxS spatial latents with S a positive multiple of {PATCHES_PER_SIDE}, got {height}x{width}"
         );
+        // Finer latent grids (e.g. 16x16 from a patch-4 encoder) are
+        // average-pooled so each probe row still corresponds to one fixed
+        // 8x8-pixel board patch; the persisted probe contract (64 rows per
+        // sample, fixed MSE ceiling) is unchanged.
+        let pool = height / PATCHES_PER_SIDE;
         let values = latent
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        let cell = |sample: usize, channel: usize, y: usize, x: usize| {
+            values[((sample * channels + channel) * height + y) * width + x]
+        };
         let mut rows = Vec::with_capacity(batch * PATCH_COUNT);
         for sample in 0..batch {
             for y in 0..PATCHES_PER_SIDE {
@@ -48,9 +59,13 @@ impl BoardProbeRows {
                     rows.push(
                         (0..channels)
                             .map(|channel| {
-                                values[((sample * channels + channel) * PATCHES_PER_SIDE + y)
-                                    * PATCHES_PER_SIDE
-                                    + x]
+                                let mut sum = 0.0_f32;
+                                for dy in 0..pool {
+                                    for dx in 0..pool {
+                                        sum += cell(sample, channel, y * pool + dy, x * pool + dx);
+                                    }
+                                }
+                                sum / (pool * pool) as f32
                             })
                             .collect(),
                     );

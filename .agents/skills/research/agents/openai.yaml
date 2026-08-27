@@ -1,4 +1,0 @@
-interface:
-  display_name: "Research"
-  short_description: "Rigorous multi-agent research with local memory"
-  default_prompt: "Use $research to investigate this question and save verified findings in my categorized knowledge library."
