@@ -754,8 +754,7 @@ pub fn collision_census(
 /// tuples is selected per source (lowest offset breaks ties). This preserves
 /// source-local action marginals while exposing unavoidable duplicate tuples
 /// instead of pretending every row was perturbed.
-pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
-    let mut shuffled = samples.to_vec();
+fn shuffled_action_source_rows(samples: &[TransitionSample]) -> BTreeMap<&str, Vec<usize>> {
     let mut source_rows = BTreeMap::<&str, Vec<usize>>::new();
     for (index, sample) in samples.iter().enumerate() {
         source_rows
@@ -763,6 +762,24 @@ pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<Tran
             .or_default()
             .push(index);
     }
+    source_rows
+}
+
+/// Rows eligible for the shuffled-action control: members of a
+/// `provenance.source_kind` group with at least two rows. Shares the exact
+/// grouping rule with `shuffled_action_control_samples` so the reported
+/// eligibility count cannot drift from the control's construction.
+pub fn shuffled_action_eligible_rows(samples: &[TransitionSample]) -> usize {
+    shuffled_action_source_rows(samples)
+        .values()
+        .filter(|indices| indices.len() >= 2)
+        .map(Vec::len)
+        .sum()
+}
+
+pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
+    let mut shuffled = samples.to_vec();
+    let source_rows = shuffled_action_source_rows(samples);
     for indices in source_rows.values() {
         if indices.len() < 2 {
             continue;
@@ -982,11 +999,18 @@ pub fn evaluate_semantics_with_control(
         for mask in NONCOMPARABLE_CONTENT_MASKS {
             metrics.masks.remove(mask);
         }
+        // The scalar false-edit fields derive from unchanged_content and
+        // unchanged_padding, which pool non-comparable content geometries
+        // across sources; `by_source` retains them, `overall` must not.
+        metrics.false_edit_rate = None;
+        metrics.false_edit_transition_rate = None;
+        metrics.padding_false_edit_rate = None;
+        metrics.padding_false_edit_transition_rate = None;
     }
     Ok(SemanticEvaluation {
         schema: SEMANTIC_EVAL_SCHEMA.into(),
         mask_contract: "gameplay=all rows[0,63) pixels (fixed 4032-pixel full-transition mask, padding included, source-comparable); content=[0,width)x[0,height); padding=gameplay-content; foreground=target!=EMPTY; changed=current!=target; unchanged=gameplay-changed; unchanged_content=unchanged&content; unchanged_padding=unchanged&padding; status=row63 excluded. Content-rectangle masks are retained by source. false-edit metrics use unchanged_content, while padding hallucinations are reported separately from unchanged_padding. composed_copy_gate decodes via composed_gameplay_decode (gate>=0.5 selects the predicted colour, else the current pixel)".into(),
-        reduction_contract: "overall aggregates only source-comparable masks; by_source reports pixel aggregate plus equal-transition mean within provenance.source_kind".into(),
+        reduction_contract: "overall aggregates only source-comparable masks and omits content-derived false-edit scalars; by_source reports pixel aggregate plus equal-transition mean within provenance.source_kind, including the false-edit scalars".into(),
         population_contract: "one_step_population; not comparable as a horizon curve with semantic_rollout, whose trajectory-filtered population is separately fingerprinted".into(),
         action_control_contract: match control.trained_null_action_id {
             Some(id) => format!("action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; trained_null_action_prediction uses configured trained NULL action id {id} with zero coordinates"),

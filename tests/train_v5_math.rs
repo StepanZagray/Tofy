@@ -4,8 +4,8 @@ use tofy::p2::train::{
     foundation_v2_ep_weight_update, foundation_v2_gate_evaluation,
     foundation_v2_gate_history_aborts, foundation_v2_loss_weights_from_masks,
     foundation_v2_promotion_improved, foundation_v2_promotion_value,
-    foundation_v2_wsd_learning_rate, split_ce_with_weighting, split_weighted_ce, PromotionMetric,
-    SplitCeWeighting, TrainConfig,
+    foundation_v2_selected_best_step, foundation_v2_wsd_learning_rate, separation_hinge_term,
+    split_ce_with_weighting, split_weighted_ce, PromotionMetric, SplitCeWeighting, TrainConfig,
 };
 
 #[test]
@@ -60,9 +60,60 @@ fn changed_pixel_weights_use_content_only_and_clamp_the_ratio() {
 fn ep_gradient_budget_update_targets_thirty_percent_and_clamps() {
     let adjusted = foundation_v2_ep_weight_update(0.01, 10.0, 1.0);
     assert!((adjusted - 0.03).abs() < 1e-12);
-    assert_eq!(foundation_v2_ep_weight_update(0.01, 1e9, 1.0), 1e-4);
+    // A budget-required weight below the floor disables EP instead of holding
+    // a floor that would violate the `<= 0.3x` bound (ADR 0003 §3.6).
+    assert_eq!(foundation_v2_ep_weight_update(0.01, 1e9, 1.0), 0.0);
+    assert_eq!(foundation_v2_ep_weight_update(0.01, 1.0, 0.0), 0.0);
+    assert_eq!(foundation_v2_ep_weight_update(0.01, 1.0, 1e-6), 0.0);
     assert_eq!(foundation_v2_ep_weight_update(0.01, 1e-9, 1.0), 0.1);
     assert_eq!(foundation_v2_ep_weight_update(0.01, 0.0, 1.0), 0.1);
+}
+
+#[test]
+fn ep_weight_always_satisfies_the_gradient_budget() {
+    for ep in [0.0, 1e-9, 1e-3, 1.0, 1e3, 1e9] {
+        for pred in [0.0, 1e-9, 1e-3, 1.0, 1e3, 1e9] {
+            let weight = foundation_v2_ep_weight_update(0.01, ep, pred);
+            assert!(weight.is_finite() && weight >= 0.0);
+            if ep > 0.0 {
+                assert!(
+                    weight * ep <= 0.3 * pred + 1e-12,
+                    "budget violated: w={weight} ep={ep} pred={pred}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn separation_hinge_uses_reachable_l2_distance_with_finite_gradients() {
+    use candle_core::{Device, Tensor, Var};
+    let device = Device::Cpu;
+    // Opposite 128-dimensional unit vectors: L2 distance 2 >= margin 0.3.
+    let mut unit = vec![0f32; 128];
+    unit[0] = 1.0;
+    let left = Tensor::from_vec(unit.clone(), (1, 128), &device).unwrap();
+    let right = left.affine(-1.0, 0.0).unwrap();
+    let hinge = separation_hinge_term(&left, &right, 0.3).unwrap();
+    assert!(hinge.to_scalar::<f32>().unwrap().abs() < 1e-5);
+    // Equal vectors: full margin, and the backward pass stays finite (a bare
+    // sqrt(0) would produce a non-finite gradient exactly at collapse).
+    let var = Var::from_tensor(&left).unwrap();
+    let equal_hinge = separation_hinge_term(&var, &left, 0.3).unwrap();
+    let value = equal_hinge.to_scalar::<f32>().unwrap();
+    assert!((value - 0.3).abs() < 1e-5);
+    let grads = equal_hinge.backward().unwrap();
+    let grad = grads.get(&var).expect("gradient for left displacement");
+    for value in grad.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+        assert!(value.is_finite());
+    }
+    // The old RMS distance capped at 2/sqrt(128) < 0.3; the L2 form reaches
+    // the boundary: distance exactly 0.3 yields a zero hinge.
+    let mut offset = vec![0f32; 128];
+    offset[0] = 1.0 - 0.3;
+    let boundary = Tensor::from_vec(offset, (1, 128), &device).unwrap();
+    let boundary_hinge = separation_hinge_term(&left, &boundary, 0.3).unwrap();
+    assert!(boundary_hinge.to_scalar::<f32>().unwrap().abs() < 1e-5);
 }
 
 #[test]
@@ -105,6 +156,8 @@ fn metrics(shuffled_ratio: f64) -> GateSupportMetrics {
         one_step_changed_exact: Some(0.5),
         one_step_full_exact: Some(0.2),
         one_step_raw_full_exact: Some(0.1),
+        one_step_composed_changed_exact: Some(0.45),
+        one_step_all_rows_exact: Some(0.6),
         false_edit_rate: Some(0.01),
         padding_false_edit_rate: Some(0.0),
         raw_false_edit_rate: Some(0.02),
@@ -479,6 +532,89 @@ fn promotion_metric_full_exact_switches_selection_to_the_full_frame_best() {
         &[],
         &candidate,
     ));
+}
+
+#[test]
+fn composed_exact_guarded_rejects_false_edit_regressions() {
+    let incumbent = foundation_v2_gate_evaluation(
+        4_096,
+        {
+            let mut best = metrics(0.9);
+            best.one_step_all_rows_exact = Some(0.5);
+            best.false_edit_rate = Some(0.01);
+            best.padding_false_edit_rate = Some(0.0);
+            best
+        },
+        None,
+    );
+    let history = vec![incumbent];
+
+    // Higher composed all-row exactness with non-regressed false edits wins.
+    let mut clean = metrics(0.9);
+    clean.one_step_all_rows_exact = Some(0.55);
+    clean.false_edit_rate = Some(0.01);
+    clean.padding_false_edit_rate = Some(0.0);
+    assert!(foundation_v2_promotion_improved(
+        PromotionMetric::ComposedExactGuarded,
+        None,
+        &history,
+        &clean,
+    ));
+
+    // The same exactness gain with a regressed content false-edit rate loses.
+    let mut hallucinating = clean.clone();
+    hallucinating.false_edit_rate = Some(0.05);
+    assert!(!foundation_v2_promotion_improved(
+        PromotionMetric::ComposedExactGuarded,
+        None,
+        &history,
+        &hallucinating,
+    ));
+
+    // A missing candidate rate against a measured incumbent fails closed.
+    let mut unmeasured = clean.clone();
+    unmeasured.false_edit_rate = None;
+    assert!(!foundation_v2_promotion_improved(
+        PromotionMetric::ComposedExactGuarded,
+        None,
+        &history,
+        &unmeasured,
+    ));
+
+    // The raw-decoder checkpoint with a closed copy gate cannot outrank the
+    // composed-correct one: selection reads the composed all-row metric only.
+    let mut raw_only = metrics(0.9);
+    raw_only.one_step_changed_exact = Some(0.9);
+    raw_only.one_step_all_rows_exact = Some(0.4);
+    assert!(!foundation_v2_promotion_improved(
+        PromotionMetric::ComposedExactGuarded,
+        None,
+        &history,
+        &raw_only,
+    ));
+}
+
+#[test]
+fn selected_best_step_replays_the_promotion_scan() {
+    let mut first = metrics(0.9);
+    first.one_step_changed_exact = Some(0.4);
+    let mut second = metrics(0.9);
+    second.one_step_changed_exact = Some(0.6);
+    let mut third = metrics(0.9);
+    third.one_step_changed_exact = Some(0.6); // tie: not a strict improvement
+    let history = vec![
+        foundation_v2_gate_evaluation(1_024, first, None),
+        foundation_v2_gate_evaluation(2_048, second, Some(0.4)),
+        foundation_v2_gate_evaluation(3_072, third, Some(0.6)),
+    ];
+    assert_eq!(
+        foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &history),
+        Some(2_048),
+    );
+    assert_eq!(
+        foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &[]),
+        None,
+    );
 }
 
 #[test]

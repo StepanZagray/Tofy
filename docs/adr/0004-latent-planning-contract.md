@@ -18,10 +18,12 @@ retained unmodified for history.
    probability approaching 1 (winner's curse); the union bound in the
    planning note is a worst case, not a calibration. The deployed Phase A
    controller must use a bounded candidate budget (order 40-64 evaluations,
-   horizon <= 2) with a selection-aware acceptance charge; the
-   selection-charge identity holds under independent sub-Gaussian score
-   increments, and the correlated case is an open lemma
-   (`PlanningSelection.lean` target).
+   horizon <= 2) with a selection-aware acceptance charge. The deterministic
+   `2 * max|error|` selection-charge bound, its candidate-set monotonicity,
+   and its tightness are machine-checked in
+   `formal/TofyFormal/PlanningSelection.lean` (2026-08-27); the
+   distributional identity under independent sub-Gaussian increments and the
+   correlated case remain open lemmas.
 2. **B2 EIG factorization.** The joint expected-information-gain score can
    reward actions whose information is entirely about mechanics/rules and
    carries zero information about the goal hypothesis (information
@@ -106,9 +108,11 @@ have used that exact value.
   hypotheses predict a terminal success at the same endpoint. A nonterminal
   real outcome is therefore evidence against all claiming hypotheses.
 - **Jointly safe** means every prefix passes the calibrated failure/exhaustion,
-  transition-correctness, reliability, disagreement, and inverse-action gates
-  for every goal hypothesis covering the protected posterior mass. It does not
-  mean the learned model has proved safety.
+  transition-correctness, reliability, and disagreement gates for every goal
+  hypothesis covering the protected posterior mass, and is not disqualified by
+  the inverse-action falsifier. Per Amendment 3, inverse-action success
+  contributes zero positive trust everywhere in this document; only its
+  failure is evidence. It does not mean the learned model has proved safety.
 - Q keeps ADR 0003's meaning: it ranks predicted-transition correctness. It is
   never called reward, return, progress, utility, or value, and it never adds a
   positive action-preference term. Reliability is likewise a trust signal, not
@@ -366,6 +370,14 @@ superiority
 
 ### A5. Probe generation and compute contract
 
+> **Superseded in deployment by Amendment 1 (2026-08-27).** The exhaustive
+> root sweep below is retained for teacher/oracle trace generation only. The
+> deployed Phase A controller uses the amended bounded budget: at most 64
+> model evaluations per decision, horizon at most 2, with the selection
+> charge from `formal/TofyFormal/PlanningSelection.lean` applied to finalist
+> acceptance. The decision-kernel line "roots = recursively imagine every
+> legal atomic action" inherits this supersession.
+
 The legal atomic set contains the six non-coordinate action types plus every
 ACTION6 coordinate, at most `6 + 64^2 = 4,102` actions. Phase A performs one
 logical, exhaustive, recursively imagined depth-1 sweep. It may microbatch for
@@ -476,6 +488,13 @@ JEPA-native uncertainty. Its use remains conditional on calibration; agreement
 among shared-trunk heads is not treated as independent proof.
 
 ### B2. EIG and action score
+
+> **Superseded in part by Amendment 2 (2026-08-27).** The joint
+> Jensen-Shannon information below mixes goal and rule/model-member
+> information. Goal-directed selection must score `I(A; Goal | Rule)`
+> separately; rule information may only be credited through an explicit,
+> bounded exploration term. The formulas below stand only after that
+> factorization is applied.
 
 For candidate goal `i`, ensemble member `k`, and imagined prefix endpoint `j`,
 let `p_ikj(o)` be the calibrated distribution over the four terminal channels,

@@ -88,10 +88,23 @@ const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
 const FOUNDATION_V2_GATE_SEED: u64 = 0xF0A2_DA7A_0000_0005;
 const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 16;
-/// Per-event-slot multipliers: noop, satisfied, failed, exhausted.
+/// ADR 0003 §3.5 hinge margin on the L2 distance of normalized displacements.
+const FOUNDATION_V2_SEPARATION_MARGIN: f64 = 0.3;
+/// Per-event-slot multipliers: noop, satisfied, failed, exhausted. The
+/// `exhausted` weight is deliberately dead for generated V5 data: its
+/// action-budget premise is absent from the event-head input, so
+/// `augment_v5_transition` force-masks the label (ADR 0003 corrections);
+/// do not "fix" the weight instead of the premise.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
 pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v13";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v9";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
+/// Revision of the foundation-v2 objective *implementation* (masks, loss
+/// construction, reductions, gates). Bump on any semantic change so a
+/// checkpoint trained under an older objective cannot silently resume under a
+/// newer one; the resume contract carries this value without a serde default.
+/// 1 = pre-content-mask objective; 2 = 2026-08-27 content-masked objective
+/// with the reachable separation hinge and budget-exact EP controller.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 2;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -146,13 +159,16 @@ pub fn foundation_v2_loss_weights_from_masks(
 }
 
 /// Pure multiplicative EP controller. The returned weight targets
-/// `weight * ||g_ep|| = 0.3 * ||g_pred||`, then applies the ADR bounds.
+/// `weight * ||g_ep|| = 0.3 * ||g_pred||`, then applies the ADR bounds. When
+/// the budget demands a weight below the positive floor (including a zero
+/// prediction gradient), EP is disabled outright with weight zero rather than
+/// held at a floor that would violate the `<= 0.3x` bound.
 pub fn foundation_v2_ep_weight_update(
     current_weight: f64,
     ep_gradient_l2: f64,
     prediction_gradient_l2: f64,
 ) -> f64 {
-    let current = current_weight.clamp(FOUNDATION_V2_EP_MIN_WEIGHT, FOUNDATION_V2_EP_MAX_WEIGHT);
+    let current = current_weight.clamp(0.0, FOUNDATION_V2_EP_MAX_WEIGHT);
     if !(ep_gradient_l2.is_finite() && prediction_gradient_l2.is_finite())
         || ep_gradient_l2 < 0.0
         || prediction_gradient_l2 < 0.0
@@ -162,9 +178,34 @@ pub fn foundation_v2_ep_weight_update(
     if ep_gradient_l2 == 0.0 {
         return FOUNDATION_V2_EP_MAX_WEIGHT;
     }
-    let multiplier =
-        FOUNDATION_V2_EP_GRADIENT_BUDGET * prediction_gradient_l2 / (current * ep_gradient_l2);
-    (current * multiplier).clamp(FOUNDATION_V2_EP_MIN_WEIGHT, FOUNDATION_V2_EP_MAX_WEIGHT)
+    let target =
+        FOUNDATION_V2_EP_GRADIENT_BUDGET * prediction_gradient_l2 / ep_gradient_l2;
+    if target < FOUNDATION_V2_EP_MIN_WEIGHT {
+        return 0.0;
+    }
+    target.clamp(FOUNDATION_V2_EP_MIN_WEIGHT, FOUNDATION_V2_EP_MAX_WEIGHT)
+}
+
+/// ADR 0003 §3.5 separation term: hinge of `margin` on the L2 distance
+/// between two displacement rows, in the same units as the L2-normalized
+/// displacements (an RMS distance over 128 dims caps at `2/sqrt(128) ≈ 0.177`
+/// and can never satisfy the 0.3 margin). The epsilon offset keeps the
+/// gradient finite at exact displacement equality, where a bare
+/// `sqrt(0)` backward is non-finite.
+pub fn separation_hinge_term(
+    left: &Tensor,
+    right: &Tensor,
+    margin: f64,
+) -> Result<Tensor> {
+    const EPS: f64 = 1e-12;
+    let distance = left
+        .sub(right)?
+        .sqr()?
+        .sum_all()?
+        .affine(1.0, EPS)?
+        .sqrt()?
+        .affine(1.0, -EPS.sqrt())?;
+    Ok(distance.affine(-1.0, margin)?.relu()?)
 }
 
 /// WSD schedule used by foundation-v2. `step` is the number of the update
@@ -215,12 +256,18 @@ pub struct FoundationV2GateEvaluation {
 /// Checkpoint-promotion selection metric. `ChangedExact` is the historical
 /// default; `FullExact` selects on full-transition exactness (unchanged
 /// pixels included) without touching the gate or collapse-floor semantics.
+/// `ComposedExactGuarded` selects on composed all-row exactness (the deployed
+/// copy-gate output, no-op rows included) and additionally refuses a
+/// candidate whose content or padding false-edit rate regresses versus the
+/// incumbent best — the deployed-behavior selection the canonical library
+/// prescribes; preregister it for new evidence runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionMetric {
     #[default]
     ChangedExact,
     FullExact,
+    ComposedExactGuarded,
 }
 
 /// Value of the configured promotion metric on one gate measurement.
@@ -231,30 +278,104 @@ pub fn foundation_v2_promotion_value(
     match metric {
         PromotionMetric::ChangedExact => metrics.one_step_changed_exact,
         PromotionMetric::FullExact => metrics.one_step_full_exact,
+        PromotionMetric::ComposedExactGuarded => metrics.one_step_all_rows_exact,
     }
+}
+
+/// Guard for `ComposedExactGuarded`: a candidate may not regress either
+/// false-edit rate versus the incumbent best. A measured incumbent rate with
+/// a missing candidate rate fails conservatively.
+fn foundation_v2_false_edit_guard(
+    incumbent: &GateSupportMetrics,
+    candidate: &GateSupportMetrics,
+) -> bool {
+    fn not_regressed(incumbent: Option<f64>, candidate: Option<f64>) -> bool {
+        match (incumbent, candidate) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(prior), Some(current)) => current <= prior + 1e-12,
+        }
+    }
+    not_regressed(incumbent.false_edit_rate, candidate.false_edit_rate)
+        && not_regressed(
+            incumbent.padding_false_edit_rate,
+            candidate.padding_false_edit_rate,
+        )
+}
+
+/// Whether `candidate` replaces `incumbent` under the configured promotion
+/// metric: a strictly larger metric value, plus the false-edit guard for
+/// `ComposedExactGuarded`.
+pub fn foundation_v2_candidate_improves(
+    metric: PromotionMetric,
+    incumbent: Option<&GateSupportMetrics>,
+    candidate: &GateSupportMetrics,
+) -> bool {
+    let Some(value) = foundation_v2_promotion_value(metric, candidate) else {
+        return false;
+    };
+    let better = incumbent
+        .and_then(|metrics| foundation_v2_promotion_value(metric, metrics))
+        .is_none_or(|best| value > best);
+    match metric {
+        PromotionMetric::ComposedExactGuarded => {
+            better
+                && incumbent
+                    .is_none_or(|metrics| foundation_v2_false_edit_guard(metrics, candidate))
+        }
+        _ => better,
+    }
+}
+
+/// The gate evaluation currently holding the promotion under `metric`,
+/// obtained by replaying the strict-improvement scan over the history.
+pub fn foundation_v2_best_evaluation<'a>(
+    metric: PromotionMetric,
+    gate_history: &'a [FoundationV2GateEvaluation],
+) -> Option<&'a FoundationV2GateEvaluation> {
+    let mut best: Option<&FoundationV2GateEvaluation> = None;
+    for evaluation in gate_history {
+        if foundation_v2_candidate_improves(
+            metric,
+            best.map(|evaluation| &evaluation.metrics),
+            &evaluation.metrics,
+        ) {
+            best = Some(evaluation);
+        }
+    }
+    best
 }
 
 /// Whether the new measurement beats the running best of the configured
 /// promotion metric. `ChangedExact` compares against the persisted
-/// `best_changed_exact` exactly as before; `FullExact` compares against the
-/// best `one_step_full_exact` recorded in the gate history.
+/// `best_changed_exact` exactly as before; the other metrics replay the gate
+/// history through the same strict-improvement rule used for selection.
 pub fn foundation_v2_promotion_improved(
     metric: PromotionMetric,
     best_changed_exact: Option<f64>,
     gate_history: &[FoundationV2GateEvaluation],
     metrics: &GateSupportMetrics,
 ) -> bool {
-    let prior_best = match metric {
-        PromotionMetric::ChangedExact => best_changed_exact,
-        PromotionMetric::FullExact => gate_history
-            .iter()
-            .filter_map(|evaluation| evaluation.metrics.one_step_full_exact)
-            .fold(None, |best: Option<f64>, value| {
-                Some(best.map_or(value, |best| best.max(value)))
-            }),
-    };
-    foundation_v2_promotion_value(metric, metrics)
-        .is_some_and(|current| prior_best.is_none_or(|best| current > best))
+    if metric == PromotionMetric::ChangedExact {
+        return foundation_v2_promotion_value(metric, metrics)
+            .is_some_and(|current| best_changed_exact.is_none_or(|best| current > best));
+    }
+    foundation_v2_candidate_improves(
+        metric,
+        foundation_v2_best_evaluation(metric, gate_history).map(|evaluation| &evaluation.metrics),
+        metrics,
+    )
+}
+
+/// The step whose gate evaluation last strictly improved the configured
+/// promotion metric — i.e. the step whose bundle `publish_best_checkpoint`
+/// promoted into `checkpoints/best`. `None` when no evaluation produced a
+/// metric value.
+pub fn foundation_v2_selected_best_step(
+    metric: PromotionMetric,
+    gate_history: &[FoundationV2GateEvaluation],
+) -> Option<u64> {
+    foundation_v2_best_evaluation(metric, gate_history).map(|evaluation| evaluation.step)
 }
 
 pub fn foundation_v2_gate_evaluation(
@@ -1246,6 +1367,50 @@ pub struct FoundationV2EpGradientSample {
     pub encoder_ep_gradient_l2: f64,
     pub encoder_prediction_gradient_l2: f64,
     pub ep_weight: f64,
+    /// Achieved `weight * ||g_ep|| / ||g_pred||`; `None` when undefined.
+    #[serde(default)]
+    pub weighted_budget_ratio: Option<f64>,
+    /// Whether the achieved ratio satisfies the `<= 0.3` ADR bound.
+    #[serde(default)]
+    pub budget_met: Option<bool>,
+    /// Which controller rail produced the weight, if any.
+    #[serde(default)]
+    pub rail: Option<FoundationV2EpRail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundationV2EpRail {
+    DisabledForBudget,
+    LowerBound,
+    UpperBound,
+    Interior,
+}
+
+/// Classify the controller output and its achieved budget compliance.
+pub fn foundation_v2_ep_budget_status(
+    weight: f64,
+    ep_gradient_l2: f64,
+    prediction_gradient_l2: f64,
+) -> (Option<f64>, Option<bool>, FoundationV2EpRail) {
+    let rail = if weight == 0.0 {
+        FoundationV2EpRail::DisabledForBudget
+    } else if weight <= FOUNDATION_V2_EP_MIN_WEIGHT {
+        FoundationV2EpRail::LowerBound
+    } else if weight >= FOUNDATION_V2_EP_MAX_WEIGHT {
+        FoundationV2EpRail::UpperBound
+    } else {
+        FoundationV2EpRail::Interior
+    };
+    let weighted = weight * ep_gradient_l2;
+    if prediction_gradient_l2 > 0.0 && weighted.is_finite() {
+        let ratio = weighted / prediction_gradient_l2;
+        let met = ratio <= FOUNDATION_V2_EP_GRADIENT_BUDGET * (1.0 + 1e-9);
+        (Some(ratio), Some(met), rail)
+    } else {
+        // A zero prediction gradient permits only zero EP pressure.
+        (None, Some(weighted == 0.0), rail)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1368,6 +1533,9 @@ pub struct GradientPressureDiagnostics {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TrainingContract {
+    // Deliberately no serde default: an older state lacking the revision must
+    // fail deserialization rather than hydrate into a changed objective.
+    foundation_objective_revision: u32,
     #[serde(default)]
     recipe: TrainingRecipe,
     seed: u64,
@@ -1474,6 +1642,7 @@ impl From<&TrainConfig> for TrainingContract {
     fn from(cfg: &TrainConfig) -> Self {
         let adam = adam_params(cfg);
         Self {
+            foundation_objective_revision: FOUNDATION_OBJECTIVE_REVISION,
             recipe: cfg.recipe,
             seed: cfg.seed,
             lessons: cfg.lessons.clone(),
@@ -1601,6 +1770,47 @@ struct FoundationV2TrainerState {
     event_label_census: EventLabelCensus,
     #[serde(default)]
     event_label_census_complete: bool,
+    /// Frozen identity of the fixed gate population and gate policy. A resume
+    /// must regenerate the exact same rows/masks under the same policy or
+    /// fail closed before any optimizer update: best/collapse comparisons
+    /// span runs and are meaningless across changed populations.
+    #[serde(default)]
+    gate_population_identity: Option<GatePopulationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatePopulationIdentity {
+    pub rows_sha256: String,
+    pub masks_sha256: String,
+    pub policy_schema: String,
+}
+
+/// Version of the in-trainer gate policy (thresholds, warmups, abort rule,
+/// shuffle construction). Bump on any change so a resumed run cannot compare
+/// new measurements against bests recorded under a different policy.
+const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v2";
+
+fn foundation_v2_gate_population_identity(
+    samples: &[TransitionSample],
+    masks: &[ContentMask],
+) -> Result<GatePopulationIdentity> {
+    let mut rows = Sha256::new();
+    for sample in samples {
+        let bytes = serde_json::to_vec(sample)?;
+        rows.update((bytes.len() as u64).to_le_bytes());
+        rows.update(&bytes);
+    }
+    let mut mask_digest = Sha256::new();
+    for mask in masks {
+        let bytes = serde_json::to_vec(mask)?;
+        mask_digest.update((bytes.len() as u64).to_le_bytes());
+        mask_digest.update(&bytes);
+    }
+    Ok(GatePopulationIdentity {
+        rows_sha256: format!("sha256:{:x}", rows.finalize()),
+        masks_sha256: format!("sha256:{:x}", mask_digest.finalize()),
+        policy_schema: FOUNDATION_V2_GATE_POLICY_SCHEMA.into(),
+    })
 }
 
 fn default_training_population_hash() -> u64 {
@@ -3226,7 +3436,7 @@ fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
-fn sigreg_loss_for_stack(stack: &Tensor, cfg: &TrainConfig, seed: u64) -> Result<Tensor> {
+pub(crate) fn sigreg_loss_for_stack(stack: &Tensor, cfg: &TrainConfig, seed: u64) -> Result<Tensor> {
     match cfg.sigreg_statistic {
         SigregStatistic::EppsPulley => {
             sigreg_epps_pulley_seeded(stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)
@@ -3653,7 +3863,7 @@ pub fn split_ce_with_weighting(
         .map_err(Into::into)
 }
 
-fn latent_content_mask(
+pub(crate) fn latent_content_mask(
     masks: &[&ContentMask],
     latent_height: usize,
     latent_width: usize,
@@ -4031,12 +4241,15 @@ pub fn foundation_v2_training_loss(
             let right = mixed_range.start + (label.right_row - factual_range.start);
             let left = normalized_displacement.narrow(0, left, 1)?;
             let right = normalized_displacement.narrow(0, right, 1)?;
-            let mse = left.sub(&right)?.sqr()?.mean_all()?;
             if label.equivalent {
-                pull_terms.push(mse);
+                pull_terms.push(left.sub(&right)?.sqr()?.mean_all()?);
                 equivalent_pairs += 1;
             } else {
-                separation_terms.push(mse.sqrt()?.affine(-1.0, 0.3)?.relu()?);
+                separation_terms.push(separation_hinge_term(
+                    &left,
+                    &right,
+                    FOUNDATION_V2_SEPARATION_MARGIN,
+                )?);
                 distinct_pairs += 1;
             }
         }
@@ -5107,6 +5320,26 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
                 "model.safetensors"
             });
     if let Some(export) = &report.export_checkpoint {
+        // Fail-closed re-verification: the exported evaluation model must be
+        // the checkpoint this run's own gate history selected, never a
+        // best-directory leftover from another trajectory or resume branch.
+        if cfg.recipe == TrainingRecipe::FoundationV2 {
+            let foundation = report
+                .foundation_v2
+                .as_ref()
+                .context("foundation-v2 export requires a foundation report")?;
+            let verified = foundation_v2_verified_best_export(
+                cfg,
+                foundation.promotion_metric,
+                &foundation.gate_history,
+            )?;
+            if verified.as_deref() != Some(export.as_path()) {
+                bail!(
+                    "export checkpoint {} failed best-selection verification",
+                    export.display()
+                );
+            }
+        }
         fs::copy(export, &weights_tmp).with_context(|| {
             format!(
                 "copy export checkpoint {} -> {}",
@@ -5156,13 +5389,58 @@ fn save_export_snapshot(varmap: &VarMap, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn export_checkpoint_path(cfg: &TrainConfig) -> Option<PathBuf> {
-    let best = if cfg.recipe == TrainingRecipe::FoundationV2 {
-        cfg.output_dir.join("checkpoints/best/ema.safetensors")
-    } else {
-        cfg.output_dir.join("model.best.safetensors")
+#[derive(Deserialize)]
+struct BundleGlobalStep {
+    global_step: u64,
+}
+
+/// Foundation-v2 export selector bound to the run's own selection state
+/// (ADR 0003: the exported evaluation model is the selected checkpoint's
+/// EMA). Fails when `checkpoints/best` exists but does not hold the step this
+/// run's gate history actually promoted — an explicitly resumed foreign
+/// bundle must not be published as this run's best.
+fn foundation_v2_verified_best_export(
+    cfg: &TrainConfig,
+    metric: PromotionMetric,
+    gate_history: &[FoundationV2GateEvaluation],
+) -> Result<Option<PathBuf>> {
+    let best_dir = cfg.output_dir.join("checkpoints/best");
+    let ema = best_dir.join("ema.safetensors");
+    if !ema.is_file() {
+        return Ok(None);
+    }
+    let Some(expected_step) = foundation_v2_selected_best_step(metric, gate_history) else {
+        bail!(
+            "{} exists but this run's gate history has promoted no checkpoint; \
+             refusing to export an unattributed best",
+            best_dir.display()
+        );
     };
-    best.exists().then_some(best)
+    let bundle: BundleGlobalStep = read_json(&best_dir.join("trainer_state.json"))?;
+    if bundle.global_step != expected_step {
+        bail!(
+            "best checkpoint at {} holds step {} but this run's gate history selected \
+             step {}; refusing a misattributed export",
+            best_dir.display(),
+            bundle.global_step,
+            expected_step
+        );
+    }
+    Ok(Some(ema))
+}
+
+fn export_checkpoint_path(cfg: &TrainConfig, state: &TrainerState) -> Option<PathBuf> {
+    if cfg.recipe == TrainingRecipe::FoundationV2 {
+        let foundation = state.foundation_v2.as_ref()?;
+        // A verification failure yields no export claim here; `save_checkpoint`
+        // re-runs the same check fallibly and fails publication closed.
+        foundation_v2_verified_best_export(cfg, cfg.promotion_metric, &foundation.gate_history)
+            .ok()
+            .flatten()
+    } else {
+        let best = cfg.output_dir.join("model.best.safetensors");
+        best.exists().then_some(best)
+    }
 }
 
 pub fn load_weights(varmap: &mut VarMap, path: &Path) -> Result<()> {
@@ -5925,11 +6203,8 @@ fn build_report(
     let foundation_v2 = state.foundation_v2.as_ref().map(|foundation| {
         let best_promotion_value = match cfg.promotion_metric {
             PromotionMetric::ChangedExact => foundation.best_changed_exact,
-            PromotionMetric::FullExact => foundation
-                .gate_history
-                .iter()
-                .filter_map(|evaluation| evaluation.metrics.one_step_full_exact)
-                .reduce(f64::max),
+            metric => foundation_v2_best_evaluation(metric, &foundation.gate_history)
+                .and_then(|evaluation| foundation_v2_promotion_value(metric, &evaluation.metrics)),
         };
         let best_checkpoint = cfg.output_dir.join("checkpoints/best");
         FoundationV2TrainingReport {
@@ -5979,7 +6254,7 @@ fn build_report(
         resumed_from,
         batch_schedule_migrations: state.batch_schedule_migrations.clone(),
         checkpoint: cfg.output_dir.join("model.safetensors"),
-        export_checkpoint: export_checkpoint_path(cfg),
+        export_checkpoint: export_checkpoint_path(cfg, state),
         config_path: cfg.output_dir.join("config.json"),
         profile: state.profile.clone(),
         gradient_pressure: state.gradient_pressure.clone(),
@@ -6134,6 +6409,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 permanent_checkpoints: Vec::new(),
                 event_label_census: EventLabelCensus::default(),
                 event_label_census_complete: true,
+                gate_population_identity: None,
             }),
         }
     };
@@ -6165,6 +6441,22 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .iter()
         .map(|sample| sample.content_mask.clone())
         .collect::<Vec<_>>();
+    {
+        let identity =
+            foundation_v2_gate_population_identity(&gate_samples, &gate_content_masks)?;
+        let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+        match &foundation.gate_population_identity {
+            Some(stored) if *stored != identity => bail!(
+                "resumed gate population/policy identity mismatch: stored {:?} vs \
+                 regenerated {:?}; best/collapse comparisons would span incomparable \
+                 populations",
+                stored,
+                identity
+            ),
+            Some(_) => {}
+            None => foundation.gate_population_identity = Some(identity),
+        }
+    }
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
         seed: cfg.seed,
@@ -6292,6 +6584,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             foundation.ep_weight =
                 foundation_v2_ep_weight_update(foundation.ep_weight, ep_norm, pred_norm);
+            let (weighted_budget_ratio, budget_met, rail) =
+                foundation_v2_ep_budget_status(foundation.ep_weight, ep_norm, pred_norm);
             foundation
                 .ep_gradient_budget
                 .push(FoundationV2EpGradientSample {
@@ -6299,6 +6593,9 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                     encoder_ep_gradient_l2: ep_norm,
                     encoder_prediction_gradient_l2: pred_norm,
                     ep_weight: foundation.ep_weight,
+                    weighted_budget_ratio,
+                    budget_met,
+                    rail: Some(rail),
                 });
         }
         let effective_ep_weight = state

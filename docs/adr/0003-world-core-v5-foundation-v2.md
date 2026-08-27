@@ -51,6 +51,45 @@
   routing conservative; large-model Muon usage is not transferred as a Tofy
   guarantee.
 
+## Implementation corrections (2026-08-27, second set — audit wave)
+
+- **§5 gate 1 demotion recorded.** The latent-MSE `improvement_fraction` gate
+  is diagnostic-only: measured and logged, never enforced, never aborting
+  (commits 9b9baca5/ffb494ee). It measures proximity in a latent space the v5
+  objective does not optimize; pixel-space gates supersede it. §5.1's
+  "enforced after step 4096" is void.
+- **§3.5 separation distance corrected.** The implementation measured an RMS
+  distance over 128 dims of L2-normalized displacements, which caps at
+  `2/sqrt(128) ≈ 0.177` and can never satisfy the `m=0.3` hinge; equality
+  also produced a non-finite `sqrt(0)` gradient exactly at collapse. The
+  distance is now the epsilon-stabilized L2 distance in the normalized
+  vectors' own units; the margin is reachable and gradients stay finite.
+- **§3.6 EP floor removed.** When the `<= 0.3x` budget requires a weight
+  below the old `1e-4` floor (including a zero prediction gradient), the
+  controller now disables EP with weight zero instead of violating the bound.
+  Each 128-step sample records the achieved weighted ratio, budget
+  compliance, and rail state.
+- **§1.1 endpoint schedule normalization made explicit.** The written end
+  proportions (25/30/20/15/5) sum to 0.95 and are normalized exactly at
+  allocation; realized per-stream row counts are a reported output, and the
+  goal-dropout intervention reports total/eligible/changed counts.
+- **§4/§6 selection integrity.** Trainer state is schema v10 with a
+  non-defaulted objective-implementation revision: a checkpoint trained under
+  an older objective cannot silently resume under a newer one. The fixed gate
+  population and gate policy carry a frozen identity; a resume that
+  regenerates a different population fails closed before any update. The
+  exported best EMA is verified against the run's own gate-history selection
+  and fails closed on mismatch. A `composed_exact_guarded` promotion metric
+  (composed all-row exactness with a false-edit non-regression guard) is
+  available and preregistered as the selection metric for the next evidence
+  run; `changed_exact` remains the historical default for replay.
+- **Meta-episodes ship generator-first.** The cross-level meta-episode
+  subsystem (generators, censuses, reserved ID namespace) has no trainer or
+  evaluator consumer yet by design; wiring it into a training mixture is a
+  separate preregistered change.
+- No model-quality claim follows from these corrections either; they carry
+  compile, deterministic-generator, and objective tests only.
+
 ## 1. Data contract (fixes RC5, geometry pathology, transfer defects)
 
 1. **Mixed stream, no lessons.** One stationary-schedule mixture per batch,

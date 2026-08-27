@@ -31,7 +31,8 @@ use crate::p2::semantic_eval::{
 };
 use crate::p2::train::{
     action_tensors_from_samples, batch_from_samples, foundation_v2_graded_q_targets,
-    load_train_config, load_varmap_exact, model_sigreg_losses_for_encoded_pair, resolve_device,
+    latent_content_mask, load_train_config, load_varmap_exact,
+    model_sigreg_losses_for_encoded_pair, resolve_device, sigreg_loss_for_stack,
     verify_checkpoint_bundle, BatchTensors, TrainConfig,
 };
 use anyhow::{bail, Context, Result};
@@ -445,6 +446,14 @@ pub struct GateSupportMetrics {
     /// distinguish palette-head errors from copy-gate composition errors.
     #[serde(default)]
     pub one_step_raw_full_exact: Option<f64>,
+    /// Composed-decode counterpart to `one_step_changed_exact`: the deployed
+    /// copy-gate output, scored on the same changed-transition rows.
+    #[serde(default)]
+    pub one_step_composed_changed_exact: Option<f64>,
+    /// Composed-decode full-frame exactness over every supplied row, no-op
+    /// transitions included, so hallucinations on unchanged rows depress it.
+    #[serde(default)]
+    pub one_step_all_rows_exact: Option<f64>,
     /// Diagnostic only: fraction of factually unchanged pixels inside each
     /// sample's exact content rectangle that the composed decode edits.
     #[serde(default)]
@@ -2413,6 +2422,29 @@ pub fn one_step_full_exact(
     Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
 }
 
+/// Full-frame exactness over every supplied row, no-op transitions included:
+/// the fraction of rows whose entire status-excluded gameplay frame is
+/// predicted exactly. A copy policy scores every genuinely unchanged row
+/// correct here, so hallucinations on no-op rows depress this metric even
+/// when changed-row exactness improves.
+pub fn one_step_all_rows_exact(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+) -> Result<Option<f64>> {
+    if samples.len() != one_step_predictions.len() {
+        bail!("gate one-step rows do not match the sample count");
+    }
+    let mut exact = 0usize;
+    for (sample, prediction) in samples.iter().zip(one_step_predictions) {
+        let (current, target) = gameplay_pixels(sample);
+        if prediction.len() != target.len() || current.len() != target.len() {
+            bail!("gate one-step prediction width does not match gameplay target");
+        }
+        exact += usize::from(prediction.iter().zip(target).all(|(a, b)| a == b));
+    }
+    Ok((!samples.is_empty()).then_some(exact as f64 / samples.len() as f64))
+}
+
 /// Fraction of factually unchanged gameplay pixels edited by the one-step
 /// decode, measured over every supplied row (`1 -` unchanged-pixel accuracy).
 pub fn one_step_false_edit_rate(
@@ -2531,6 +2563,8 @@ pub fn evaluate_gate_support_with_content_masks(
             one_step_changed_exact: None,
             one_step_full_exact: None,
             one_step_raw_full_exact: None,
+            one_step_composed_changed_exact: None,
+            one_step_all_rows_exact: None,
             false_edit_rate: None,
             padding_false_edit_rate: None,
             raw_false_edit_rate: None,
@@ -2548,16 +2582,8 @@ pub fn evaluate_gate_support_with_content_masks(
         .forward_from_latent(&current, &batch.actions, &batch.action_coords, &batch.goals)?
         .y;
     let shuffled = shuffled_action_control_samples(samples);
-    let mut source_counts = BTreeMap::<&str, usize>::new();
-    for sample in samples {
-        *source_counts
-            .entry(sample.provenance.source_kind.as_str())
-            .or_default() += 1;
-    }
-    let shuffled_action_eligible_rows = samples
-        .iter()
-        .filter(|sample| source_counts[sample.provenance.source_kind.as_str()] >= 2)
-        .count();
+    let shuffled_action_eligible_rows =
+        crate::p2::semantic_eval::shuffled_action_eligible_rows(samples);
     let shuffled_action_changed_tuples = samples
         .iter()
         .zip(&shuffled)
@@ -2634,6 +2660,8 @@ pub fn evaluate_gate_support_with_content_masks(
         one_step_changed_exact: one_step_changed_exact(samples, &true_predictions)?,
         one_step_full_exact: one_step_full_exact(samples, &composed_predictions)?,
         one_step_raw_full_exact: one_step_full_exact(samples, &true_predictions)?,
+        one_step_composed_changed_exact: one_step_changed_exact(samples, &composed_predictions)?,
+        one_step_all_rows_exact: one_step_all_rows_exact(samples, &composed_predictions)?,
         false_edit_rate: one_step_false_edit_rate_with_content_masks(
             samples,
             &composed_predictions,
@@ -2705,8 +2733,26 @@ fn eval_identifiability(
     let latent_dim = encoders
         .iter()
         .find_map(|row| row.as_ref().map(|h| h.len()))?;
+    // Group-disjoint split: an episode/trajectory must never straddle the
+    // bridge fit and its validation, and pair metrics must only score
+    // validation groups — otherwise memorized training deltas inflate the
+    // reported held-out alignment.
+    fn identifiability_group_hash(sample: &TransitionSample) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut push = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        push(&sample.seed.to_le_bytes());
+        push(&sample.episode_id.to_le_bytes());
+        push(sample.provenance.trajectory_id.as_bytes());
+        hash
+    }
     let mut labeled_h = Vec::new();
     let mut labeled_z = Vec::new();
+    let mut labeled_val = Vec::new();
     for (sample, encoder) in samples.iter().zip(encoders.iter()) {
         let Some(encoder) = encoder.as_ref() else {
             continue;
@@ -2719,20 +2765,35 @@ fn eval_identifiability(
         }
         labeled_h.push(encoder.clone());
         labeled_z.push(oracle.clone());
+        labeled_val.push(identifiability_group_hash(sample) % 5 == 0);
     }
     if labeled_h.is_empty() {
         return None;
     }
-
-    let n = labeled_h.len();
-    let split = ((n as f64) * 0.8).floor() as usize;
-    let split = split.clamp(1, n.saturating_sub(1));
-    let (train_h, val_h) = labeled_h.split_at(split);
-    let (train_z, val_z) = labeled_z.split_at(split);
+    // Degenerate assignments (every group on one side) leave no honest
+    // held-out population; fit on everything and report no validation R².
+    let split_usable = labeled_val.iter().any(|&v| v) && labeled_val.iter().any(|&v| !v);
+    let mut train_h = Vec::new();
+    let mut train_z = Vec::new();
+    let mut val_h = Vec::new();
+    let mut val_z = Vec::new();
+    for ((h, z), &validation) in labeled_h.iter().zip(&labeled_z).zip(&labeled_val) {
+        if split_usable && validation {
+            val_h.push(h.clone());
+            val_z.push(z.clone());
+        } else {
+            train_h.push(h.clone());
+            train_z.push(z.clone());
+        }
+    }
+    let (train_h, val_h) = (train_h.as_slice(), val_h.as_slice());
+    let (train_z, val_z) = (train_z.as_slice(), val_z.as_slice());
     let bridge = fit_ridge_h_to_z(train_h, train_z);
     let (r2_h_to_z, r2_h_to_z_train, bridge_w, h_dim, z_dim) = match bridge {
         Some((w, hd, zd)) => (
-            linear_r2_with_weights(val_h, val_z, &w, hd, zd),
+            split_usable
+                .then(|| linear_r2_with_weights(val_h, val_z, &w, hd, zd))
+                .flatten(),
             linear_r2_with_weights(train_h, train_z, &w, hd, zd),
             Some(w),
             hd,
@@ -2746,6 +2807,12 @@ fn eval_identifiability(
     let mut pair_cosine = Vec::new();
     let mut prev: Option<IdentifiabilityPairState> = None;
     for (sample, encoder) in samples.iter().zip(encoders.iter()) {
+        // Pair metrics score only validation groups: training-pair alignment
+        // must not raise the reported held-out increment cosine.
+        if split_usable && identifiability_group_hash(sample) % 5 != 0 {
+            prev = None;
+            continue;
+        }
         let encoder = match encoder {
             Some(value) => value,
             None => {
@@ -2885,18 +2952,26 @@ fn eval_q_labels(q_logit: &Tensor, labels: &[f32]) -> Result<QEvalAccum> {
     Ok(out)
 }
 
+/// Origin-aligned content mask reconstructed from provenance dimensions.
+/// Exact only for populations whose content rectangle starts at (0,0) — the
+/// origin is not part of `TransitionProvenance`, so translated V5 rows need
+/// an exact mask sidecar instead of this reconstruction.
+fn origin_aligned_content_mask(sample: &TransitionSample) -> Result<ContentMask> {
+    let rect = ContentRect {
+        x: 0,
+        y: 0,
+        width: u8::try_from(sample.provenance.content_width)
+            .context("content width does not fit u8")?,
+        height: u8::try_from(sample.provenance.content_height)
+            .context("content height does not fit u8")?,
+    };
+    ContentMask::from_rect(rect)
+}
+
 fn origin_content_tensor(samples: &[TransitionSample], device: &Device) -> Result<Tensor> {
     let mut values = Vec::with_capacity(samples.len() * (FRAME_SIDE - 1) * FRAME_SIDE);
     for sample in samples {
-        let rect = ContentRect {
-            x: 0,
-            y: 0,
-            width: u8::try_from(sample.provenance.content_width)
-                .context("content width does not fit u8")?,
-            height: u8::try_from(sample.provenance.content_height)
-                .context("content height does not fit u8")?,
-        };
-        let mask = ContentMask::from_rect(rect)?;
+        let mask = origin_aligned_content_mask(sample)?;
         values.extend(
             mask.values[..(FRAME_SIDE - 1) * FRAME_SIDE]
                 .iter()
@@ -3052,6 +3127,11 @@ struct BatchEvalPartial {
     sigreg_raw_weighted: f64,
     sigreg_bounded_weighted: f64,
     sigreg_n: usize,
+    /// Foundation-v2 only: content-masked canonical current/next rows in
+    /// sample order, for one whole-population EP statistic computed after all
+    /// chunks (per-chunk EP is nonlinear and physical-batch-dependent).
+    foundation_ep_current: Vec<Vec<f32>>,
+    foundation_ep_next: Vec<Vec<f32>>,
     changed_learned_errors: Vec<f32>,
     changed_copy_forward_errors: Vec<f32>,
     event_labeled: usize,
@@ -3103,7 +3183,13 @@ fn eval_one_batch(
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_z = encoded.current;
     let next_z = encoded.next;
-    let sigreg = (chunk.len() >= 2)
+    let foundation_recipe =
+        train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2;
+    // Foundation-v2 SIGReg is not scored per chunk: training regularizes the
+    // content-masked canonical population, and EP is nonlinear in the batch,
+    // so chunk-wise statistics change with physical batching. Collect the
+    // exact training-population rows instead and evaluate once at the end.
+    let sigreg = (chunk.len() >= 2 && !foundation_recipe)
         .then(|| {
             model_sigreg_losses_for_encoded_pair(
                 model,
@@ -3115,6 +3201,27 @@ fn eval_one_batch(
                 train_cfg,
                 cfg.seed.wrapping_add(bi as u64),
             )
+        })
+        .transpose()?;
+    let foundation_ep = foundation_recipe
+        .then(|| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+            let (_, _, latent_height, latent_width) = current_z.dims4()?;
+            let masks = chunk
+                .iter()
+                .map(origin_aligned_content_mask)
+                .collect::<Result<Vec<_>>>()?;
+            let mask_refs = masks.iter().collect::<Vec<_>>();
+            let latent_mask =
+                latent_content_mask(&mask_refs, latent_height, latent_width, device)?;
+            let current = model
+                .canonical_representation(&current_z.broadcast_mul(&latent_mask)?)?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?;
+            let next = model
+                .canonical_representation(&next_z.broadcast_mul(&latent_mask)?)?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?;
+            Ok((current, next))
         })
         .transpose()?;
     let current_vecs = flatten_latent(&current_z)?
@@ -3153,6 +3260,13 @@ fn eval_one_batch(
             None => 0.0,
         },
         sigreg_n: sigreg.as_ref().map_or(0, |_| chunk.len()),
+        foundation_ep_current: foundation_ep
+            .as_ref()
+            .map(|(current, _)| current.clone())
+            .unwrap_or_default(),
+        foundation_ep_next: foundation_ep
+            .map(|(_, next)| next)
+            .unwrap_or_default(),
         ..Default::default()
     };
     partial.mse_all.extend(mses.iter().copied());
@@ -3328,6 +3442,10 @@ fn merge_batch_partial(merged: &mut BatchEvalPartial, partial: BatchEvalPartial)
     merged.sigreg_raw_weighted += partial.sigreg_raw_weighted;
     merged.sigreg_bounded_weighted += partial.sigreg_bounded_weighted;
     merged.sigreg_n += partial.sigreg_n;
+    merged
+        .foundation_ep_current
+        .extend(partial.foundation_ep_current);
+    merged.foundation_ep_next.extend(partial.foundation_ep_next);
     merged
         .changed_learned_errors
         .extend(partial.changed_learned_errors);
@@ -4005,6 +4123,38 @@ fn eval_sample_set(
 
     log_eval_phase("ptrm_forwards", source, merged.ptrm_forward_elapsed);
     let metric_reduction_started = Instant::now();
+
+    if merged.foundation_ep_current.len() != merged.foundation_ep_next.len() {
+        bail!("foundation-v2 EP population current/next row counts diverged");
+    }
+    if merged.foundation_ep_current.len() >= 2 {
+        // One EP statistic over the complete ordered content-masked canonical
+        // population with one fixed projection seed: the reported value is
+        // invariant to the evaluator's physical batch size and matches the
+        // representation the training objective actually regularizes.
+        let rows = merged.foundation_ep_current.len();
+        let dim = merged.foundation_ep_current[0].len();
+        let mut values = Vec::with_capacity(2 * rows * dim);
+        for row in merged
+            .foundation_ep_current
+            .iter()
+            .chain(&merged.foundation_ep_next)
+        {
+            if row.len() != dim {
+                bail!("foundation-v2 EP population row dimensions diverged");
+            }
+            values.extend_from_slice(row);
+        }
+        let stack = Tensor::from_vec(values, (2, rows, dim), device)?;
+        let raw = f64::from(
+            sigreg_loss_for_stack(&stack, train_cfg, cfg.seed)?
+                .to_dtype(DType::F32)?
+                .to_scalar::<f32>()?,
+        );
+        merged.sigreg_raw_weighted = raw * rows as f64;
+        merged.sigreg_bounded_weighted = raw * rows as f64;
+        merged.sigreg_n = rows;
+    }
 
     let representation_seams = seam_collector.summarize()?;
     let post_rms_pooled = top_level_collector.summarize()?;
