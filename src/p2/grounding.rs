@@ -150,7 +150,7 @@ impl ExactPatchGrounding {
     /// Frozen, pixel-derived transition labels for observer heads. A positive
     /// requires >=99% gameplay accuracy and, when the transition changes any
     /// gameplay pixels, >=90% accuracy on those changed pixels.
-    pub fn transition_correctness(
+    pub fn raw_decoder_transition_correctness(
         &self,
         predicted: &Tensor,
         current_frames: &Tensor,
@@ -169,6 +169,43 @@ impl ExactPatchGrounding {
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         transition_correctness_from_gameplay(&predicted, &current, &target)
+    }
+
+    pub fn composed_transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        let predicted_pixels = self
+            .gameplay_logits(predicted)?
+            .detach()
+            .argmax(D::Minus1)?;
+        let current = current_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        let target = next_frames
+            .narrow(2, 0, FRAME_SIDE - 1)?
+            .squeeze(1)?
+            .to_dtype(DType::U32)?;
+        let composed = self
+            .copy_gate(predicted)?
+            .detach()
+            .ge(0.5)?
+            .where_cond(&predicted_pixels, &current)?;
+        transition_correctness_from_gameplay(&composed, &current, &target)
+    }
+
+    /// Compatibility seam for observer labels. This intentionally uses the
+    /// deployed copy-gate composition rather than raw decoder colours.
+    pub fn transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        self.composed_transition_correctness(predicted, current_frames, next_frames)
     }
 }
 
