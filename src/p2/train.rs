@@ -732,6 +732,11 @@ pub struct TrainConfig {
     /// Without it, foundation-v2 validation rejects multi-treatment arms.
     #[serde(default)]
     pub allow_multi_treatment_arm: bool,
+    /// One-based optimizer updates captured as full candle-graph evidence
+    /// bundles during foundation-v2 training (mechanism observability for
+    /// bundle runs). Empty disables periodic capture.
+    #[serde(default)]
+    pub profile_updates: Vec<u64>,
 }
 
 pub fn effective_batch(cfg: &TrainConfig) -> usize {
@@ -917,6 +922,7 @@ impl Default for TrainConfig {
             decode_composition: DecodeComposition::default(),
             positional_value_readout: false,
             allow_multi_treatment_arm: false,
+            profile_updates: Vec::new(),
         }
     }
 }
@@ -981,6 +987,20 @@ impl TrainConfig {
         }
         if self.profile_update == 0 {
             bail!("profile_update is one-based and must be > 0");
+        }
+        if !self.profile_updates.is_empty() {
+            if self.recipe != TrainingRecipe::FoundationV2 {
+                bail!(
+                    "profile_updates is consumed only by the foundation-v2 loop; \
+                     setting it elsewhere would silently capture nothing"
+                );
+            }
+            let mut sorted = self.profile_updates.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.first() == Some(&0) || sorted.len() != self.profile_updates.len() {
+                bail!("profile_updates must be unique, one-based update numbers");
+            }
         }
         if self.pressure_updates.contains(&0) {
             bail!("pressure_updates are one-based and must be > 0");
@@ -1214,6 +1234,7 @@ impl TrainConfig {
         canonical.init_seed = self.init_seed;
         canonical.profile_update = self.profile_update;
         canonical.pressure_updates = self.pressure_updates.clone();
+        canonical.profile_updates = self.profile_updates.clone();
         canonical.prefetch_batches = self.prefetch_batches;
         canonical.data_workers = self.data_workers;
         // Preregistered model-treatment arms: caller-owned by design, recorded
@@ -3778,6 +3799,9 @@ pub struct FoundationV2ObjectiveConfig {
     pub rollout_enabled: bool,
     pub split_ce_weighting: SplitCeWeighting,
     pub split_ce_changed_budget: Option<f64>,
+    /// Collect detached seam tensors for a profiled update's mechanism
+    /// packet. Off on ordinary updates.
+    pub capture_mechanism_seams: bool,
 }
 
 impl Default for FoundationV2ObjectiveConfig {
@@ -3790,11 +3814,20 @@ impl Default for FoundationV2ObjectiveConfig {
             rollout_enabled: false,
             split_ce_weighting: SplitCeWeighting::CurrentDouble,
             split_ce_changed_budget: None,
+            capture_mechanism_seams: false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
+/// Detached seam tensors captured for a profiled update's mechanism packet.
+pub struct FoundationV2MechanismSeams {
+    pub out_y: Tensor,
+    pub current_canonical: Tensor,
+    pub predicted_canonical: Tensor,
+    pub gate_logits: Tensor,
+}
+
 pub struct FoundationV2LossBreakdown {
     pub total: Tensor,
     pub non_ep_total: Tensor,
@@ -3816,6 +3849,8 @@ pub struct FoundationV2LossBreakdown {
     pub distinct_pairs: usize,
     pub inverse_action_rows: usize,
     pub rollout_fragments: usize,
+    /// Populated only when the objective requested mechanism-seam capture.
+    pub mechanism_seams: Option<FoundationV2MechanismSeams>,
 }
 
 fn masked_mean_with_count(values: &Tensor, mask: &Tensor, count: usize) -> Result<Tensor> {
@@ -4472,6 +4507,14 @@ pub fn foundation_v2_training_loss(
         non_ep_total = non_ep_total.add(&loss.affine(weight, 0.0)?)?;
     }
     let total = non_ep_total.add(&ep.affine(objective.ep_weight, 0.0)?)?;
+    let mechanism_seams = objective
+        .capture_mechanism_seams
+        .then(|| FoundationV2MechanismSeams {
+            out_y: out.y.detach(),
+            current_canonical: current_canonical.detach(),
+            predicted_canonical: predicted_canonical.detach(),
+            gate_logits: gate_logits.detach(),
+        });
     Ok(FoundationV2LossBreakdown {
         total,
         non_ep_total,
@@ -4493,6 +4536,7 @@ pub fn foundation_v2_training_loss(
         distinct_pairs,
         inverse_action_rows: inverse_rows.len(),
         rollout_fragments,
+        mechanism_seams,
     })
 }
 
@@ -6688,6 +6732,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 rollout_enabled,
                 split_ce_weighting: cfg.split_ce_weighting,
                 split_ce_changed_budget: cfg.split_ce_changed_budget,
+                capture_mechanism_seams: false,
             },
         )?;
         let next_step = state.global_step + 1;

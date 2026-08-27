@@ -375,6 +375,11 @@ pub struct P2TrainArgs {
     /// giving up single-factor causal attribution.
     #[arg(long, default_value_t = false)]
     pub allow_multi_treatment_arm: bool,
+
+    /// One-based optimizer updates captured as full candle-graph evidence
+    /// bundles (foundation-v2 mechanism observability).
+    #[arg(long, value_delimiter = ',')]
+    pub profile_updates: Vec<u64>,
 }
 
 impl P2TrainArgs {
@@ -516,6 +521,7 @@ impl P2TrainArgs {
             decode_composition: self.decode_composition,
             positional_value_readout: self.positional_value_readout,
             allow_multi_treatment_arm: self.allow_multi_treatment_arm,
+            profile_updates: self.profile_updates.clone(),
         };
         if self.recipe == TrainingRecipe::FullV4 {
             cfg.apply_full_v4_recipe();

@@ -228,6 +228,15 @@ pub struct RecursionStepProbe {
     pub mean_residual_norm: f64,
     pub mean_latent_norm: f64,
     pub mean_amplification: f64,
+    /// Batch-mean cosine between the state before and after this outer step.
+    /// The diagnosed F1 mechanism is a per-step rotation of the state
+    /// direction; a copy-consistent update keeps this near 1.
+    #[serde(default = "default_step_cosine")]
+    pub mean_step_cosine: f64,
+}
+
+fn default_step_cosine() -> f64 {
+    f64::NAN
 }
 
 pub const PREFIX_HORIZONS: [usize; 5] = [1, 2, 4, 8, 16];
@@ -1774,11 +1783,24 @@ impl WorldModel {
         } else {
             1.0
         };
+        // Per-sample cosine over flattened C*H*W, averaged across the batch.
+        let batch = y_before.dim(0)?;
+        let a = y_before.detach().reshape((batch, ()))?;
+        let b = y_after.detach().reshape((batch, ()))?;
+        let dot = a.mul(&b)?.sum(1)?;
+        let norm_a = a.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, f64::INFINITY)?;
+        let norm_b = b.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, f64::INFINITY)?;
+        let cosine = dot
+            .div(&norm_a)?
+            .div(&norm_b)?
+            .mean_all()?
+            .to_scalar::<f32>()? as f64;
         Ok(RecursionStepProbe {
             outer_step: outer_idx,
             mean_residual_norm: res_norm,
             mean_latent_norm: lat_norm,
             mean_amplification: amplification,
+            mean_step_cosine: cosine,
         })
     }
 
