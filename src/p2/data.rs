@@ -676,8 +676,10 @@ impl Default for MixedStreamConfig {
 impl MixedStreamConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.batch_size >= FACTUAL_BRANCHES_PER_GROUP,
-            "mixed batch must fit at least one complete factual group"
+            self.batch_size > FACTUAL_BRANCHES_PER_GROUP,
+            "mixed batch must fit a complete factual group plus at least one \
+             row from another stream; a single-group batch degenerates to \
+             100% factual"
         );
         ensure!(
             (0.0..=1.0).contains(&self.goal_dropout_probability),
@@ -2934,11 +2936,16 @@ fn realized_stream_proportions(
             / batch_size as f32,
         hazard_one_step: counts[&MixedStreamKind::HazardOneStep] as f32 / batch_size as f32,
     };
+    // The intact-branch-group constraint moves stream shares in steps of one
+    // whole group, so small smoke batches cannot meet the 5pp tolerance at
+    // all; the enforceable tolerance is the larger of 5pp and one group's
+    // share of the batch.
+    let tolerance = 0.05f32.max(FACTUAL_BRANCHES_PER_GROUP as f32 / batch_size as f32);
     for ((kind, target), (_, realized)) in normalized.ordered().into_iter().zip(fractions.ordered())
     {
         ensure!(
-            (target - realized).abs() <= 0.05 + f32::EPSILON,
-            "mixed batch size {batch_size} realizes {kind:?} at {realized:.3}, more than 5 percentage points from normalized target {target:.3} after intact factual-group rounding"
+            (target - realized).abs() <= tolerance + f32::EPSILON,
+            "mixed batch size {batch_size} realizes {kind:?} at {realized:.3}, more than {tolerance:.3} from normalized target {target:.3} after intact factual-group rounding"
         );
     }
     Ok(RealizedStreamProportions {
