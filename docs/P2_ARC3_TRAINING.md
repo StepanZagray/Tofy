@@ -60,7 +60,7 @@ Content false edits are measured only inside each provenance content rectangle;
 padding hallucinations and fixed-frame exactness are separate diagnostics. V5
 gate evaluation consumes the generator's exact translated content masks and
 reports raw-decoder and composed-copy-gate exactness separately. The source-local
-shuffled-action control uses an independent deterministic cyclic permutation and
+shuffled-action control uses a deterministic data-dependent cyclic permutation and
 reports total, eligible, and genuinely changed `(id,x,y)` tuple counts. It leaves
 outcome-changing tuples unknown unless simulator truth is available; it never
 infers causal positives from a changed input alone.
@@ -69,18 +69,22 @@ Every transition carries explicit content dimensions, source kind, and a stable
 trajectory ID. The bottom status row is counted separately and excluded from
 the exact decoder. ACTION5 and ACTION6 retain distinct source kinds.
 
-## Live driver (schema `p2.arc3_live_report.v3`)
+## Live driver (schema `p2.arc3_live_report.v4`)
 
 - Opening `RESET` is unscoped. A recoverable `GAME_OVER` may use a GUID-scoped
-  level retry, bounded by `--max-level-retries`; competition mode makes that
+  level retry, bounded by `--max-level-retries`; competition mode is enabled by
+  default and makes that
   retry safe, while general mode requires a confirmed action since the last
   reset or level transition.
 - `full_reset`, GUID, and level-regression checks fail closed. Transport/body/
   parse ambiguity for ACTION or RESET is reported separately from confirmed
   actions, and scorecard closure is still attempted.
-- The report persists driver options, attempted and confirmed action counts,
-  per-level budgets/retries, ambiguous mutations, and unexpected full resets.
-  Policy lifecycle hooks clear session/level retry history deterministically.
+- The per-level action budget is primary; `--max-actions-per-game` is an
+  optional emergency guard. The report persists driver options, ordered mutation
+  outcomes, provenance, attempted and confirmed action counts, per-level
+  budgets/retries, and unexpected full resets. A dirty worktree is refused
+  before scorecard open unless `--exploratory` marks the report
+  `exploratory_driver_repair`.
 - Every animation layer is preserved in the observation. The current model
   policy still scores the settled final frame, so temporal animation use remains
   an explicit model limitation rather than silently discarded API data.

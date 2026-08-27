@@ -4,8 +4,8 @@
 //! Wiring into the top-level CLI is owned by the primary agent.
 
 use crate::p2::arc3_live::{
-    evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig, DEFAULT_MAX_LEVEL_RETRIES,
-    DEFAULT_TRIED_PENALTY,
+    evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
+    DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
 };
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
@@ -739,8 +739,9 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, value_delimiter = ',')]
     pub games: Vec<String>,
 
-    #[arg(long, default_value_t = 512)]
-    pub max_actions_per_game: usize,
+    /// Optional game-wide emergency stop; the per-level cap remains primary.
+    #[arg(long)]
+    pub max_actions_per_game: Option<u32>,
 
     /// Use official competition semantics, where RESET retries the current
     /// level and cannot wipe progress in the game.
@@ -751,13 +752,17 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, default_value_t = DEFAULT_MAX_LEVEL_RETRIES)]
     pub max_level_retries: usize,
 
-    /// Optional official-style action budget applied independently per level.
-    #[arg(long)]
-    pub max_actions_per_level: Option<usize>,
+    /// Official-style action budget applied independently to every level.
+    #[arg(long, default_value_t = DEFAULT_MAX_ACTIONS_PER_LEVEL)]
+    pub max_actions_per_level: u32,
 
     /// Soft score penalty for an action already tried in the same state.
     #[arg(long, default_value_t = DEFAULT_TRIED_PENALTY)]
     pub tried_penalty: f64,
+
+    /// Permit a dirty driver repair to open a scorecard as exploratory evidence.
+    #[arg(long, default_value_t = false)]
+    pub exploratory: bool,
 
     /// Maximum candidate actions scored together by Candle.
     #[arg(long, default_value_t = 128)]
@@ -791,7 +796,6 @@ impl P2Arc3LiveEvalArgs {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             games: self.games.clone(),
-            max_actions_per_game: self.max_actions_per_game,
             physical_batch: self.physical_batch,
             action6_max_candidates: self.action6_max_candidates,
             action6_grid_stride: self.action6_grid_stride,
@@ -800,7 +804,9 @@ impl P2Arc3LiveEvalArgs {
                 competition_mode: self.competition_mode,
                 max_level_retries: self.max_level_retries,
                 max_actions_per_level: self.max_actions_per_level,
+                max_actions_per_game: self.max_actions_per_game,
                 tried_penalty: self.tried_penalty,
+                exploratory: self.exploratory,
             },
             output: self.output.clone(),
         }
