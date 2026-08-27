@@ -524,6 +524,7 @@ pub struct PtrmTrajectory {
     pub y: Tensor,
     pub event_logits: Tensor,
     pub q_logit: Tensor,
+    pub reliability_logit: Tensor,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +546,21 @@ pub struct PtrmConfig {
     pub k: usize,
     pub sigma: f64,
     pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseAInferenceCheck {
+    pub passed: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseAInferenceCapabilities {
+    pub patch4_grid: PhaseAInferenceCheck,
+    pub spatial_prefix_faithful: PhaseAInferenceCheck,
+    pub action_faithful_ptrm: PhaseAInferenceCheck,
+    pub composed_decode_available: PhaseAInferenceCheck,
+    pub null_action_trained: PhaseAInferenceCheck,
 }
 
 /// Per-sample index of the trajectory with the highest Q logit.
@@ -576,6 +592,7 @@ pub fn best_q_indices(q_logits: &[Tensor]) -> Result<Vec<usize>> {
 
 pub struct WorldModel {
     config: ModelConfig,
+    positional_value_readout: bool,
     pixel_emb: Embedding,
     encoder: GridEncoder,
     action_emb: Embedding,
@@ -607,6 +624,16 @@ pub struct WorldModel {
 
 impl WorldModel {
     pub fn new(cfg: ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_positional_value_readout(cfg, false, vb)
+    }
+
+    /// Build with position-aware readout values. The default constructor keeps
+    /// existing checkpoint parameter names and the legacy pooled readout.
+    pub fn new_with_positional_value_readout(
+        cfg: ModelConfig,
+        positional_value_readout: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         cfg.validate()?;
         let sigreg_projector = cfg
             .sigreg_projector
@@ -675,6 +702,12 @@ impl WorldModel {
             consumer_readout: ConsumerReadout::new(
                 cfg.consumer_readout,
                 cfg.hidden_dim,
+                if positional_value_readout {
+                    cfg.latent_grid()
+                } else {
+                    FRAME_SIDE / LEGACY_PATCH_SIZE
+                },
+                positional_value_readout,
                 vb.pp("consumer_readout"),
             )?,
             prefix_head: linear(cfg.hidden_dim * 2, cfg.hidden_dim, vb.pp("prefix_head"))?,
@@ -697,6 +730,7 @@ impl WorldModel {
                     )
                 })
                 .transpose()?,
+            positional_value_readout,
             config: cfg,
         })
     }
@@ -786,7 +820,18 @@ impl WorldModel {
             .map_err(Into::into)
     }
 
+    /// Compatibility seam for observer labels. This intentionally uses the
+    /// deployed copy-gate composition rather than raw decoder colours.
     pub fn exact_transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        self.composed_transition_correctness(predicted, current_frames, next_frames)
+    }
+
+    pub fn raw_decoder_transition_correctness(
         &self,
         predicted: &Tensor,
         current_frames: &Tensor,
@@ -795,7 +840,19 @@ impl WorldModel {
         self.exact_patch_grounding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
-            .transition_correctness(predicted, current_frames, next_frames)
+            .raw_decoder_transition_correctness(predicted, current_frames, next_frames)
+    }
+
+    pub fn composed_transition_correctness(
+        &self,
+        predicted: &Tensor,
+        current_frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("exact grounding requires world-core-v4"))?
+            .composed_transition_correctness(predicted, current_frames, next_frames)
     }
 
     /// Full V4's single canonical BxC state. It is both regularized and
@@ -809,6 +866,9 @@ impl WorldModel {
     /// dynamics grid becomes 16×16. Patch-4 tokens are averaged in exact 2×2
     /// groups before the canonical readout; patch-8 models pass through.
     fn read_consumer(&self, spatial: &Tensor) -> Result<Tensor> {
+        if self.positional_value_readout {
+            return self.consumer_readout.forward(spatial).map_err(Into::into);
+        }
         let (_, _, height, width) = spatial.dims4()?;
         let readout_grid = FRAME_SIDE / LEGACY_PATCH_SIZE;
         if height == readout_grid && width == readout_grid {
@@ -1490,6 +1550,17 @@ impl WorldModel {
         actions: &Tensor,
         action_coords: &Tensor,
     ) -> Result<Tensor> {
+        if self.config.world_core_v4 {
+            return self.predict_latent_with_depth(
+                state,
+                actions,
+                action_coords,
+                RecursionDepth {
+                    inner_steps: 1,
+                    outer_steps: 1,
+                },
+            );
+        }
         let b = state.dim(0)?;
         if let Some(spatial_prefix_head) = &self.spatial_prefix_head {
             let conditioned = self.add_action(state, actions, action_coords)?;
@@ -1855,6 +1926,23 @@ impl WorldModel {
         self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
     }
 
+    /// Action-faithful PTRM from an already encoded latent state.
+    pub fn forward_ptrm_from_latent(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
+        let x = self.add_action(state, actions, action_coords)?;
+        let film = self.action_film(actions, state.dim(0)?)?;
+        let goal_h = self.project_goal(goal_features)?;
+        let y_init = self.config.warm_start_y.then(|| state.clone());
+        self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
+    }
+
     /// Legacy PTRM from a precomputed action-conditioned tensor. Because this
     /// seam does not receive action IDs, it retains identity FiLM.
     pub fn forward_ptrm_prepared(
@@ -1865,22 +1953,10 @@ impl WorldModel {
         depth: RecursionDepth,
         ptrm: PtrmConfig,
     ) -> Result<PtrmOutput> {
+        if self.config.world_core_v5 {
+            bail!("world-core-v5 PTRM requires action-aware preparation");
+        }
         let film = ActionFilm::neutral_like(x)?;
-        self.forward_ptrm_prepared_with_film(x, &film, goal_h, y_init, depth, ptrm)
-    }
-
-    /// Action-aware PTRM from precomputed transition tensors (no frame encode).
-    /// Foundation-v2 callers use this seam so every recurrence step receives FiLM.
-    pub fn forward_ptrm_prepared_with_actions(
-        &self,
-        x: &Tensor,
-        actions: &Tensor,
-        goal_h: &Tensor,
-        y_init: Option<Tensor>,
-        depth: RecursionDepth,
-        ptrm: PtrmConfig,
-    ) -> Result<PtrmOutput> {
-        let film = self.action_film(actions, x.dim(0)?)?;
         self.forward_ptrm_prepared_with_film(x, &film, goal_h, y_init, depth, ptrm)
     }
 
@@ -1910,6 +1986,7 @@ impl WorldModel {
                 y: out.y,
                 event_logits: out.event_logits,
                 q_logit: out.q_logit,
+                reliability_logit: out.reliability_logit,
             });
         }
         let best_indices = best_q_indices(&q_logits)?;
@@ -1983,6 +2060,33 @@ impl WorldModel {
                 })
             })
             .collect()
+    }
+
+    /// Read-only Phase A deployment capability probe.
+    pub fn phase_a_inference_capabilities(&self) -> PhaseAInferenceCapabilities {
+        let check = |passed, reason: &str| PhaseAInferenceCheck {
+            passed,
+            reason: (!passed).then(|| reason.to_string()),
+        };
+        PhaseAInferenceCapabilities {
+            patch4_grid: check(
+                self.config.patch_size == PATCH_SIZE,
+                "requires the canonical patch-4 latent grid",
+            ),
+            spatial_prefix_faithful: check(
+                self.config.world_core_v4 && self.spatial_prefix_head.is_none(),
+                "requires the world-core-v4 recurrence prefix path",
+            ),
+            action_faithful_ptrm: check(
+                self.config.world_core_v5,
+                "requires world-core-v5 action-aware PTRM preparation",
+            ),
+            composed_decode_available: check(
+                self.exact_patch_grounding.is_some(),
+                "requires the world-core-v4 exact decoder and copy gate",
+            ),
+            null_action_trained: check(ACTION_VOCAB > 0, "action embedding has no id-0 row"),
+        }
     }
 }
 

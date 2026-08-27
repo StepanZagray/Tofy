@@ -10,52 +10,66 @@ use candle_nn::{embedding, linear, ops::softmax, Embedding, Linear, Module, VarB
 use crate::p2::experiment::ConsumerReadoutTopology;
 use crate::p2::model::pool_latent;
 
-const SPATIAL_SIDE: usize = 8;
-const SPATIAL_TOKENS: usize = SPATIAL_SIDE * SPATIAL_SIDE;
-
 pub struct ConsumerReadout {
     topology: ConsumerReadoutTopology,
     position_embedding: Option<Embedding>,
+    position_value_embedding: Option<Embedding>,
     query_score: Option<Linear>,
+    spatial_side: usize,
 }
 
 impl ConsumerReadout {
-    pub fn new(topology: ConsumerReadoutTopology, channels: usize, vb: VarBuilder) -> Result<Self> {
-        let (position_embedding, query_score) = match topology {
-            ConsumerReadoutTopology::GlobalMean => (None, None),
+    pub fn new(
+        topology: ConsumerReadoutTopology,
+        channels: usize,
+        spatial_side: usize,
+        positional_value_readout: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let spatial_tokens = spatial_side * spatial_side;
+        let (position_embedding, position_value_embedding, query_score) = match topology {
+            ConsumerReadoutTopology::GlobalMean => (None, None, None),
             ConsumerReadoutTopology::SpatialQuery => (
                 Some(embedding(
-                    SPATIAL_TOKENS,
+                    spatial_tokens,
                     channels,
                     vb.pp("position_embedding"),
                 )?),
+                positional_value_readout
+                    .then(|| embedding(spatial_tokens, channels, vb.pp("position_value_embedding")))
+                    .transpose()?,
                 Some(linear(channels, 1, vb.pp("query_score"))?),
             ),
         };
         Ok(Self {
             topology,
             position_embedding,
+            position_value_embedding,
             query_score,
+            spatial_side,
         })
     }
 
-    /// Read a `B×C×8×8` prediction into the `B×C` interface expected by
+    /// Read a `B×C×S×S` prediction into the `B×C` interface expected by
     /// planning heads. The spatial-query adapter scores position-augmented
-    /// tokens but returns a weighted sum of the original prediction tokens.
+    /// tokens and, when enabled, returns position-augmented values too.
     pub fn forward(&self, spatial: &Tensor) -> Result<Tensor> {
         let (batch, channels, height, width) = spatial.dims4()?;
         ensure!(
-            height == SPATIAL_SIDE && width == SPATIAL_SIDE,
-            "consumer readout requires BxCx8x8, got BxCx{height}x{width}"
+            height == self.spatial_side && width == self.spatial_side,
+            "consumer readout requires BxCx{}x{}, got BxCx{height}x{width}",
+            self.spatial_side,
+            self.spatial_side,
         );
         if self.topology == ConsumerReadoutTopology::GlobalMean {
             return pool_latent(spatial);
         }
 
+        let spatial_tokens = self.spatial_side * self.spatial_side;
         let tokens = spatial
             .permute((0, 2, 3, 1))?
-            .reshape((batch, SPATIAL_TOKENS, channels))?;
-        let positions = Tensor::arange(0u32, SPATIAL_TOKENS as u32, spatial.device())?;
+            .reshape((batch, spatial_tokens, channels))?;
+        let positions = Tensor::arange(0u32, spatial_tokens as u32, spatial.device())?;
         let position_embedding = self
             .position_embedding
             .as_ref()
@@ -71,11 +85,13 @@ impl ConsumerReadout {
             .expect("spatial-query adapter owns a query scorer")
             .forward(&scored_tokens)?;
         let weights = softmax(&logits.squeeze(D::Minus1)?, 1)?.unsqueeze(D::Minus1)?;
-        tokens
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&weights)?
-            .sum(1)
-            .map_err(Into::into)
+        let values = match &self.position_value_embedding {
+            Some(position_values) => tokens
+                .to_dtype(DType::F32)?
+                .broadcast_add(&position_values.forward(&positions)?.to_dtype(DType::F32)?)?,
+            None => tokens.to_dtype(DType::F32)?,
+        };
+        values.broadcast_mul(&weights)?.sum(1).map_err(Into::into)
     }
 
     pub fn topology(&self) -> ConsumerReadoutTopology {
@@ -97,6 +113,8 @@ mod tests {
         let readout = ConsumerReadout::new(
             ConsumerReadoutTopology::GlobalMean,
             3,
+            8,
+            false,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         let spatial =
@@ -115,6 +133,8 @@ mod tests {
         let readout = ConsumerReadout::new(
             ConsumerReadoutTopology::SpatialQuery,
             4,
+            8,
+            false,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         let spatial = Tensor::ones((2, 4, 8, 8), DType::F32, &device)?;
@@ -135,6 +155,8 @@ mod tests {
         let readout = ConsumerReadout::new(
             ConsumerReadoutTopology::SpatialQuery,
             4,
+            8,
+            false,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         reinit_varmap_deterministic(&varmap, 17)?;
