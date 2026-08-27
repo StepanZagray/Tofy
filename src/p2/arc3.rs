@@ -9,6 +9,7 @@ use crate::p2::data::{
     ArcAction, ArcFrame, GoalFeatures, TransitionProvenance, TransitionSample, FRAME_SIDE,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
@@ -403,12 +404,8 @@ pub fn summarize_recording_runs(events: &[RecordingEvent]) -> Vec<RecordingRunSu
 
 /// Summarize every `*.jsonl` recording under `root`.
 pub fn summarize_recordings_dir(root: &Path) -> Result<Vec<RecordingRunSummary>> {
-    let mut files = Vec::new();
-    collect_jsonl(root, &mut files)?;
-    files.sort();
     let mut out = Vec::new();
-    for path in files {
-        let events = load_recording_jsonl(&path)?;
+    for events in load_recordings_dir(root)? {
         out.extend(summarize_recording_runs(&events));
     }
     Ok(out)
@@ -416,15 +413,40 @@ pub fn summarize_recordings_dir(root: &Path) -> Result<Vec<RecordingRunSummary>>
 
 /// Recursively import `*.jsonl` under `root`, sorted deterministically by path.
 pub fn import_recordings_dir(root: &Path) -> Result<Vec<TransitionSample>> {
-    let mut files = Vec::new();
-    collect_jsonl(root, &mut files)?;
-    files.sort();
     let mut all = Vec::new();
-    for path in files {
-        let events = load_recording_jsonl(&path)?;
+    for events in load_recordings_dir(root)? {
         all.extend(events_to_transitions(&events)?);
     }
     Ok(all)
+}
+
+/// Parse each sorted recording file once and derive both transfer samples and
+/// run summaries from the same ordered event population.
+pub fn import_and_summarize_recordings_dir(
+    root: &Path,
+) -> Result<(Vec<TransitionSample>, Vec<RecordingRunSummary>)> {
+    let mut samples = Vec::new();
+    let mut runs = Vec::new();
+    for events in load_recordings_dir(root)? {
+        samples.extend(events_to_transitions(&events)?);
+        runs.extend(summarize_recording_runs(&events));
+    }
+    Ok((samples, runs))
+}
+
+fn load_recordings_dir(root: &Path) -> Result<Vec<Vec<RecordingEvent>>> {
+    let mut files = Vec::new();
+    collect_jsonl(root, &mut files)?;
+    files.sort();
+    let loaded = files
+        .par_iter()
+        .map(|path| load_recording_jsonl(path))
+        .collect::<Vec<_>>();
+    let mut ordered = Vec::with_capacity(loaded.len());
+    for events in loaded {
+        ordered.push(events?);
+    }
+    Ok(ordered)
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -528,6 +550,10 @@ mod tests {
 
         let imported = import_recordings_dir(&dir).unwrap();
         assert_eq!(imported, samples);
+        let summarized = summarize_recordings_dir(&dir).unwrap();
+        let (shared_import, shared_summaries) = import_and_summarize_recordings_dir(&dir).unwrap();
+        assert_eq!(shared_import, imported);
+        assert_eq!(shared_summaries, summarized);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

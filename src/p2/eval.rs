@@ -2,7 +2,7 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
-use crate::p2::arc3::{import_recordings_dir, summarize_recordings_dir, RecordingRunSummary};
+use crate::p2::arc3::{import_and_summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::board_probe::{
     BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
 };
@@ -52,9 +52,24 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v16";
 pub const ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD: f64 = 1e-3;
+
+fn log_eval_phase(phase: &str, detail: &str, elapsed: Duration) {
+    eprintln!(
+        "[p2-eval timing] phase={phase} detail={detail} elapsed_s={:.3}",
+        elapsed.as_secs_f64()
+    );
+}
+
+fn timed_eval_phase<T>(phase: &str, detail: &str, f: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = f();
+    log_eval_phase(phase, detail, started.elapsed());
+    result
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -1138,7 +1153,7 @@ fn collect_synthetic_sources(
         .enumerate()
         .flat_map(|(kind_index, kind)| (0..episodes).map(move |ep| (kind_index, ep, *kind)))
         .collect();
-    let mut parts: Vec<(usize, Vec<TransitionSample>)> = jobs
+    let parts = jobs
         .par_iter()
         .enumerate()
         .map(|(job_idx, &(kind_index, ep, kind))| {
@@ -1148,13 +1163,13 @@ fn collect_synthetic_sources(
             let samples = generate_curriculum(kind, seed, episode_id, split)?;
             Ok((job_idx, samples))
         })
-        .collect::<Result<Vec<_>>>()?;
-    parts.sort_by_key(|(job_idx, _)| *job_idx);
+        .collect::<Vec<Result<_>>>();
     let mut sources = kinds
         .iter()
         .map(|kind| ((*kind).to_string(), Vec::new()))
         .collect::<Vec<_>>();
-    for (job_index, samples) in parts {
+    for part in parts {
+        let (job_index, samples) = part?;
         let kind_index = job_index / episodes.max(1);
         sources[kind_index].1.extend(samples);
     }
@@ -1331,17 +1346,21 @@ fn collect_hazard_samples(
     if episodes == 0 {
         return Ok(Vec::new());
     }
-    let mut parts: Vec<(usize, Vec<TransitionSample>)> = (0..episodes)
+    let parts = (0..episodes)
         .into_par_iter()
         .map(|ep| {
             generate_hazard_one_step(seed.wrapping_add(0xFA17), ep as u64, split, 4)
                 .map(|samples| (ep, samples))
         })
-        .collect::<Result<_>>()?;
-    parts.sort_by_key(|(ep, _)| *ep);
-    Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
+        .collect::<Vec<_>>();
+    let mut samples = Vec::new();
+    for part in parts {
+        samples.extend(part?.1);
+    }
+    Ok(samples)
 }
 
+#[cfg(test)]
 fn collect_dynamics_rollout_samples(
     seed: u64,
     episodes: usize,
@@ -1352,7 +1371,7 @@ fn collect_dynamics_rollout_samples(
         .enumerate()
         .flat_map(|(kind_index, kind)| (0..episodes).map(move |ep| (kind_index, ep, *kind)))
         .collect();
-    let mut parts: Vec<(usize, Vec<TransitionSample>)> = jobs
+    let parts = jobs
         .par_iter()
         .enumerate()
         .map(|(job_idx, &(kind_index, ep, kind))| {
@@ -1362,34 +1381,55 @@ fn collect_dynamics_rollout_samples(
             let samples = generate_curriculum(kind, seed, episode_id, split)?;
             Ok((job_idx, samples))
         })
-        .collect::<Result<Vec<_>>>()?;
-    parts.sort_by_key(|(job_idx, _)| *job_idx);
-    Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
+        .collect::<Vec<Result<_>>>();
+    let mut samples = Vec::new();
+    for part in parts {
+        samples.extend(part?.1);
+    }
+    Ok(samples)
 }
 
 fn collect_planner_rollout_samples(
     seed: u64,
     episodes: usize,
     split: Split,
+    cached_sequential: Option<&[TransitionSample]>,
 ) -> Result<Vec<TransitionSample>> {
-    let jobs: Vec<(usize, usize, &str)> = ["sequential", "p1c_hard_retarget"]
-        .iter()
-        .enumerate()
-        .flat_map(|(kind_index, kind)| (0..episodes).map(move |ep| (kind_index, ep, *kind)))
-        .collect();
-    let mut parts: Vec<(usize, Vec<TransitionSample>)> = jobs
-        .par_iter()
-        .enumerate()
-        .map(|(job_idx, &(kind_index, ep, kind))| {
+    let mut samples = match cached_sequential {
+        Some(cached) => cached.to_vec(),
+        None => collect_curriculum_source(seed, episodes, 0, "sequential", split)?,
+    };
+    samples.extend(collect_curriculum_source(
+        seed,
+        episodes,
+        1,
+        "p1c_hard_retarget",
+        split,
+    )?);
+    Ok(samples)
+}
+
+fn collect_curriculum_source(
+    seed: u64,
+    episodes: usize,
+    kind_index: usize,
+    kind: &str,
+    split: Split,
+) -> Result<Vec<TransitionSample>> {
+    let parts = (0..episodes)
+        .into_par_iter()
+        .map(|episode| {
             let episode_id = (kind_index as u64)
                 .wrapping_mul(1_000_003)
-                .wrapping_add(ep as u64);
-            let samples = generate_curriculum(kind, seed, episode_id, split)?;
-            Ok((job_idx, samples))
+                .wrapping_add(episode as u64);
+            generate_curriculum(kind, seed, episode_id, split)
         })
-        .collect::<Result<Vec<_>>>()?;
-    parts.sort_by_key(|(job_idx, _)| *job_idx);
-    Ok(parts.into_iter().flat_map(|(_, samples)| samples).collect())
+        .collect::<Vec<_>>();
+    let mut samples = Vec::new();
+    for part in parts {
+        samples.extend(part?);
+    }
+    Ok(samples)
 }
 
 fn batch_ranges(len: usize, batch: usize) -> Vec<(usize, usize)> {
@@ -2777,6 +2817,7 @@ struct BatchEvalPartial {
     matched_acc: BTreeMap<usize, (f64, usize, usize)>,
     ensemble_disagreement: f64,
     ensemble_n: usize,
+    ptrm_forward_elapsed: Duration,
 }
 
 fn eval_one_batch(
@@ -2926,6 +2967,7 @@ fn eval_one_batch(
             .recursion_probes
             .extend(out.recursion_probes.clone());
 
+        let ptrm_forward_started = Instant::now();
         if cfg.ensemble_members >= 2 {
             let ptrm = model.forward_ptrm(
                 &batch.frames,
@@ -3012,6 +3054,7 @@ fn eval_one_batch(
                 e.4 += m.n;
             }
         }
+        partial.ptrm_forward_elapsed = ptrm_forward_started.elapsed();
     }
     Ok(partial)
 }
@@ -3040,6 +3083,7 @@ fn merge_batch_partial(merged: &mut BatchEvalPartial, partial: BatchEvalPartial)
     merged.recursion_probes.extend(partial.recursion_probes);
     merged.ensemble_disagreement += partial.ensemble_disagreement;
     merged.ensemble_n += partial.ensemble_n;
+    merged.ptrm_forward_elapsed += partial.ptrm_forward_elapsed;
     for (k, (p, bq, d, oracle, n)) in partial.ptrm_acc {
         let e = merged.ptrm_acc.entry(k).or_insert((0.0, 0.0, 0.0, 0.0, 0));
         e.0 += p;
@@ -3657,8 +3701,11 @@ fn eval_sample_set(
     device: &Device,
     with_rollout: bool,
 ) -> Result<SplitEval> {
+    let sample_set_started = Instant::now();
     if samples.is_empty() {
-        return Ok(empty_split(source, 0));
+        let split = empty_split(source, 0);
+        log_eval_phase("sample_set", source, sample_set_started.elapsed());
+        return Ok(split);
     }
 
     let batch_size = cfg.physical_batch.max(1);
@@ -3692,6 +3739,9 @@ fn eval_sample_set(
             device.synchronize()?;
         }
     }
+
+    log_eval_phase("ptrm_forwards", source, merged.ptrm_forward_elapsed);
+    let metric_reduction_started = Instant::now();
 
     let representation_seams = seam_collector.summarize()?;
     let post_rms_pooled = top_level_collector.summarize()?;
@@ -3859,9 +3909,8 @@ fn eval_sample_set(
         .as_deref()
         .map(|rows| rollout_metrics_from_rows(rows, RolloutMetric::Closed, cfg.seed ^ 0xC1));
     let identifiability = eval_identifiability(samples, &encoder_embeddings);
-    let semantic = train_cfg
-        .world_core_v4
-        .then(|| {
+    let semantic = if train_cfg.world_core_v4 {
+        Some(timed_eval_phase("semantic_decode", source, || {
             evaluate_semantics(
                 model,
                 samples,
@@ -3869,12 +3918,14 @@ fn eval_sample_set(
                 cfg.physical_batch,
                 device,
             )
-        })
-        .transpose()?;
+        })?)
+    } else {
+        None
+    };
     let collision_census = collision_census(samples, action_sources.unwrap_or(&fallback_sources));
     let ambiguity_ceiling = ambiguity_ceiling(samples);
 
-    Ok(SplitEval {
+    let split = SplitEval {
         source: source.into(),
         n_samples: samples.len(),
         one_step_latent_mse: mean(&mse_all),
@@ -3900,7 +3951,14 @@ fn eval_sample_set(
         action_diagnostics,
         recursion_probes,
         ensemble,
-    })
+    };
+    log_eval_phase(
+        "metric_reduction",
+        source,
+        metric_reduction_started.elapsed(),
+    );
+    log_eval_phase("sample_set", source, sample_set_started.elapsed());
+    Ok(split)
 }
 
 fn summarize_recursion_probes(probes: &[RecursionStepProbe]) -> Option<RecursionProbeSummary> {
@@ -4087,6 +4145,28 @@ fn factual_branch_eval_seed(seed: u64) -> u64 {
     fnv1a_append(&mut hash, FACTUAL_BRANCH_EVAL_DOMAIN);
     fnv1a_append(&mut hash, &seed.to_le_bytes());
     hash
+}
+
+fn generate_factual_eval_population(
+    seed: u64,
+    synthetic_episodes: usize,
+) -> Result<Option<FactualBatch>> {
+    let group_count = synthetic_episodes.saturating_mul(4);
+    if group_count == 0 {
+        return Ok(None);
+    }
+    let seed = factual_branch_eval_seed(seed);
+    let generated = (0..group_count)
+        .into_par_iter()
+        .map(|episode| {
+            generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
+        })
+        .collect::<Vec<_>>();
+    let mut groups = Vec::with_capacity(group_count);
+    for group in generated {
+        groups.push(group?);
+    }
+    Ok(Some(FactualBatch::from_groups(groups)?))
 }
 
 fn factual_population_fingerprint(groups: &[BranchGroup], synthetic_episodes: usize) -> String {
@@ -4479,23 +4559,21 @@ fn evaluate_outcome_counterfactuals(
     model: &WorldModel,
     cfg: &EvalConfig,
     device: &Device,
+    factual_population: Option<&FactualBatch>,
 ) -> Result<OutcomeCounterfactualMetrics> {
-    let seed = factual_branch_eval_seed(cfg.seed);
     let group_count = cfg.synthetic_episodes.saturating_mul(4);
     if group_count == 0 {
         return Ok(empty_outcome_counterfactual_metrics());
     }
-    let generated_groups = (0..group_count)
-        .map(|episode| {
-            generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let factual_batch = FactualBatch::from_groups(generated_groups)?;
+    let factual_batch = factual_population
+        .context("outcome counterfactual evaluation is missing its factual population")?;
+    let seed = factual_branch_eval_seed(cfg.seed);
     let groups = factual_batch.groups();
     let samples = factual_batch.rows();
     let eval_batch = cfg.physical_batch.max(FACTUAL_BRANCHES_PER_GROUP)
         / FACTUAL_BRANCHES_PER_GROUP
         * FACTUAL_BRANCHES_PER_GROUP;
+    let forward_started = Instant::now();
     let mut predicted_displacements = Vec::<Vec<f32>>::with_capacity(samples.len());
     let mut target_displacements = Vec::<Vec<f32>>::with_capacity(samples.len());
     for (start, end) in batch_ranges(samples.len(), eval_batch) {
@@ -4528,6 +4606,12 @@ fn evaluate_outcome_counterfactuals(
         predicted_displacements.extend(predicted);
         target_displacements.extend(target);
     }
+    log_eval_phase(
+        "model_forwards",
+        "factual_outcome_counterfactuals",
+        forward_started.elapsed(),
+    );
+    let reduction_started = Instant::now();
 
     let pairs_per_group =
         FACTUAL_BRANCHES_PER_GROUP.saturating_mul(FACTUAL_BRANCHES_PER_GROUP.saturating_sub(1)) / 2;
@@ -4872,7 +4956,7 @@ fn evaluate_outcome_counterfactuals(
         && outcome_interval_reconciles(&coordinate, &coordinate_group_means)
         && outcome_interval_reconciles(&changed_changed, &changed_changed_group_means)
         && outcome_interval_reconciles(&changed_unchanged, &changed_unchanged_group_means);
-    Ok(OutcomeCounterfactualMetrics {
+    let metrics = OutcomeCounterfactualMetrics {
         population_fingerprint: outcome_population_fingerprint(&group_fingerprints),
         groups: groups.len(),
         movement_groups,
@@ -4894,13 +4978,20 @@ fn evaluate_outcome_counterfactuals(
         population_gates,
         pair_ledger: ledger,
         ledger_reconciled,
-    })
+    };
+    log_eval_phase(
+        "metric_reduction",
+        "factual_outcome_counterfactuals",
+        reduction_started.elapsed(),
+    );
+    Ok(metrics)
 }
 
 fn evaluate_factual_branches(
     model: &WorldModel,
     cfg: &EvalConfig,
     device: &Device,
+    factual_population: Option<&FactualBatch>,
 ) -> Result<FactualBranchMetrics> {
     let seed = factual_branch_eval_seed(cfg.seed);
     // The generic evaluation count controls expensive rollouts. Factual
@@ -4943,19 +5034,15 @@ fn evaluate_factual_branches(
             semantic_outcome_by_family: BTreeMap::new(),
         });
     }
-    let generated_groups = (0..factual_group_count)
-        .map(|episode| {
-            generate_factual_branch_group(seed, episode as u64, Split::HeldOutComposition)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Canonicalize once, before inference and metric construction. Rebuilding
-    // batches independently would reorder branch actions for model input while
-    // leaving labels in generator order, silently misaligning evidence rows.
-    let factual_batch = FactualBatch::from_groups(generated_groups)?;
+    // The shared population is canonicalized once before either factual metric
+    // consumer runs, so inference rows and labels cannot diverge in ordering.
+    let factual_batch = factual_population
+        .context("factual branch evaluation is missing its factual population")?;
     let groups = factual_batch.groups().to_vec();
     let population_fingerprint = factual_population_fingerprint(&groups, factual_group_count);
     let samples = factual_batch.rows().to_vec();
 
+    let forward_started = Instant::now();
     let mut predicted_displacements = Vec::with_capacity(samples.len());
     let mut predicted_consumer_latents = Vec::with_capacity(samples.len());
     let mut action_logits = Vec::with_capacity(samples.len());
@@ -5017,6 +5104,12 @@ fn evaluate_factual_branches(
             predicted_patch_latents = Some(predicted_rows);
         }
     }
+    log_eval_phase(
+        "model_forwards",
+        "factual_branches",
+        forward_started.elapsed(),
+    );
+    let reduction_started = Instant::now();
 
     let legal_actions = groups
         .iter()
@@ -5048,6 +5141,7 @@ fn evaluate_factual_branches(
         )?)
     };
 
+    let board_probe_started = Instant::now();
     let board_probe = if groups.len() >= 2 {
         // Split only between same-state groups. Cutting a four-branch group
         // would leak the shared current state (and sometimes an equivalent
@@ -5087,6 +5181,11 @@ fn evaluate_factual_branches(
     } else {
         None
     };
+    log_eval_phase(
+        "board_probe",
+        "factual_branches",
+        board_probe_started.elapsed(),
+    );
 
     let mut changed_norms = Vec::new();
     let mut unchanged_norms = Vec::new();
@@ -5402,7 +5501,7 @@ fn evaluate_factual_branches(
             )
         })
         .collect();
-    Ok(FactualBranchMetrics {
+    let metrics = FactualBranchMetrics {
         population_fingerprint,
         groups: groups.len(),
         branches: counts.branches,
@@ -5449,11 +5548,18 @@ fn evaluate_factual_branches(
         semantic_factual_nll_mean: (semantic_outcome_retrieval_n > 0)
             .then_some(semantic_factual_nll_sum / semantic_outcome_retrieval_n as f64),
         semantic_outcome_by_family,
-    })
+    };
+    log_eval_phase(
+        "metric_reduction",
+        "factual_branches",
+        reduction_started.elapsed(),
+    );
+    Ok(metrics)
 }
 
 /// Full evaluation: synthetic held-out (+ optional ARC recordings dir).
 pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
+    let evaluation_started = Instant::now();
     cfg.validate()?;
     let train_cfg = load_train_config(&cfg.train_config)?;
     if let Some(bundle) = cfg.checkpoint.parent() {
@@ -5490,81 +5596,142 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         );
     }
     let device = resolve_device(&cfg.device)?;
-    let (model, _varmap) = load_model(&train_cfg, &cfg.checkpoint, &device)?;
+    let (model, _varmap) = timed_eval_phase("model_load", "checkpoint", || {
+        load_model(&train_cfg, &cfg.checkpoint, &device)
+    })?;
+    let needs_factual_population =
+        cfg.mode == EvalMode::Full || train_cfg.world_core_v2 || train_cfg.world_core_v4;
+    let factual_population = if needs_factual_population {
+        timed_eval_phase("population_generation", "factual_shared", || {
+            generate_factual_eval_population(cfg.seed, cfg.synthetic_episodes)
+        })?
+    } else {
+        None
+    };
     let outcome_counterfactuals = (cfg.mode == EvalMode::Full)
-        .then(|| evaluate_outcome_counterfactuals(&model, cfg, &device))
+        .then(|| {
+            evaluate_outcome_counterfactuals(&model, cfg, &device, factual_population.as_ref())
+        })
         .transpose()?;
     let factual_branches = (train_cfg.world_core_v2 || train_cfg.world_core_v4)
-        .then(|| evaluate_factual_branches(&model, cfg, &device))
+        .then(|| evaluate_factual_branches(&model, cfg, &device, factual_population.as_ref()))
         .transpose()?;
 
-    let mut dynamics_sources = collect_synthetic_sources(
-        cfg.seed,
-        cfg.synthetic_episodes,
-        &["random_one_step", "exploration"],
-        Split::HeldOutComposition,
+    let mut dynamics_sources = timed_eval_phase(
+        "population_generation",
+        "synthetic_ood_dynamics[random_one_step,exploration]",
+        || {
+            collect_synthetic_sources(
+                cfg.seed,
+                cfg.synthetic_episodes,
+                &["random_one_step", "exploration"],
+                Split::HeldOutComposition,
+            )
+        },
     )?;
+    let dynamics_rollout_samples = timed_eval_phase(
+        "rollout_collection",
+        "synthetic_ood_dynamics[cached_h1]",
+        || flatten_sources(&dynamics_sources),
+    );
     dynamics_sources.push((
         "hazard_one_step".into(),
-        collect_hazard_samples(cfg.seed, cfg.synthetic_episodes, Split::HeldOutComposition)?,
+        timed_eval_phase(
+            "population_generation",
+            "synthetic_ood_dynamics[hazard_one_step]",
+            || collect_hazard_samples(cfg.seed, cfg.synthetic_episodes, Split::HeldOutComposition),
+        )?,
     ));
     let dynamics_samples = flatten_sources(&dynamics_sources);
     let dynamics_source_lengths = source_lengths(&dynamics_sources);
-    let board_probe = evaluate_board_probe(&model, &dynamics_samples, cfg.physical_batch, &device)?;
-    let dynamics_rollout_samples = collect_dynamics_rollout_samples(
-        cfg.seed,
-        cfg.synthetic_episodes,
-        Split::HeldOutComposition,
-    )?;
+    let board_probe = timed_eval_phase("board_probe", "synthetic_ood_dynamics", || {
+        evaluate_board_probe(&model, &dynamics_samples, cfg.physical_batch, &device)
+    })?;
 
-    let planner_sources = collect_synthetic_sources(
-        cfg.seed,
-        cfg.synthetic_episodes,
-        &[
-            "sequential",
-            "hypothesis_probe",
-            "p1c_falsification",
-            "p1c_hard_retarget",
-        ],
-        Split::HeldOutComposition,
+    let planner_sources = timed_eval_phase(
+        "population_generation",
+        "synthetic_ood_planner[sequential,hypothesis_probe,p1c_falsification,p1c_hard_retarget]",
+        || {
+            collect_synthetic_sources(
+                cfg.seed,
+                cfg.synthetic_episodes,
+                &[
+                    "sequential",
+                    "hypothesis_probe",
+                    "p1c_falsification",
+                    "p1c_hard_retarget",
+                ],
+                Split::HeldOutComposition,
+            )
+        },
     )?;
     let planner_samples = flatten_sources(&planner_sources);
     let planner_source_lengths = source_lengths(&planner_sources);
-    let planner_rollout_samples = collect_planner_rollout_samples(
-        cfg.seed,
-        cfg.synthetic_episodes,
-        Split::HeldOutComposition,
-    )?;
+    let planner_rollout_samples =
+        timed_eval_phase("rollout_collection", "synthetic_ood_planner", || {
+            collect_planner_rollout_samples(
+                cfg.seed,
+                cfg.synthetic_episodes,
+                Split::HeldOutComposition,
+                Some(&planner_sources[0].1),
+            )
+        })?;
 
-    let mut iid_dynamics_sources = collect_synthetic_sources(
-        cfg.iid_seed,
-        cfg.synthetic_episodes,
-        &["random_one_step", "exploration"],
-        Split::Train,
+    let mut iid_dynamics_sources = timed_eval_phase(
+        "population_generation",
+        "synthetic_iid_dynamics[random_one_step,exploration]",
+        || {
+            collect_synthetic_sources(
+                cfg.iid_seed,
+                cfg.synthetic_episodes,
+                &["random_one_step", "exploration"],
+                Split::Train,
+            )
+        },
     )?;
+    let iid_dynamics_rollout_samples = timed_eval_phase(
+        "rollout_collection",
+        "synthetic_iid_dynamics[cached_h1]",
+        || flatten_sources(&iid_dynamics_sources),
+    );
     iid_dynamics_sources.push((
         "hazard_one_step".into(),
-        collect_hazard_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?,
+        timed_eval_phase(
+            "population_generation",
+            "synthetic_iid_dynamics[hazard_one_step]",
+            || collect_hazard_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train),
+        )?,
     ));
     let iid_dynamics_samples = flatten_sources(&iid_dynamics_sources);
     let iid_dynamics_source_lengths = source_lengths(&iid_dynamics_sources);
-    let iid_dynamics_rollout_samples =
-        collect_dynamics_rollout_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?;
-    let iid_planner_sources = collect_synthetic_sources(
-        cfg.iid_seed,
-        cfg.synthetic_episodes,
-        &[
-            "sequential",
-            "hypothesis_probe",
-            "p1c_falsification",
-            "p1c_hard_retarget",
-        ],
-        Split::Train,
+    let iid_planner_sources = timed_eval_phase(
+        "population_generation",
+        "synthetic_iid_planner[sequential,hypothesis_probe,p1c_falsification,p1c_hard_retarget]",
+        || {
+            collect_synthetic_sources(
+                cfg.iid_seed,
+                cfg.synthetic_episodes,
+                &[
+                    "sequential",
+                    "hypothesis_probe",
+                    "p1c_falsification",
+                    "p1c_hard_retarget",
+                ],
+                Split::Train,
+            )
+        },
     )?;
     let iid_planner_samples = flatten_sources(&iid_planner_sources);
     let iid_planner_source_lengths = source_lengths(&iid_planner_sources);
     let iid_planner_rollout_samples =
-        collect_planner_rollout_samples(cfg.iid_seed, cfg.synthetic_episodes, Split::Train)?;
+        timed_eval_phase("rollout_collection", "synthetic_iid_planner", || {
+            collect_planner_rollout_samples(
+                cfg.iid_seed,
+                cfg.synthetic_episodes,
+                Split::Train,
+                Some(&iid_planner_sources[0].1),
+            )
+        })?;
 
     let mut synthetic_dynamics = if cfg.mode == EvalMode::Rollout {
         empty_split("synthetic_dynamics", dynamics_samples.len())
@@ -5582,14 +5749,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         )?
     };
     let dynamics_rollout_rows = if cfg.mode != EvalMode::Representation {
-        eval_episode_rollouts(
-            &train_cfg,
-            &cfg.checkpoint,
-            &model,
-            &dynamics_rollout_samples,
-            &device,
-            "synthetic_dynamics",
-        )?
+        timed_eval_phase("rollout_forwards", "synthetic_dynamics", || {
+            eval_episode_rollouts(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &dynamics_rollout_samples,
+                &device,
+                "synthetic_dynamics",
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -5613,14 +5782,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         )?
     };
     let planner_rollout_rows = if cfg.mode != EvalMode::Representation {
-        eval_episode_rollouts(
-            &train_cfg,
-            &cfg.checkpoint,
-            &model,
-            &planner_rollout_samples,
-            &device,
-            "synthetic_planner",
-        )?
+        timed_eval_phase("rollout_forwards", "synthetic_planner", || {
+            eval_episode_rollouts(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &planner_rollout_samples,
+                &device,
+                "synthetic_planner",
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -5644,14 +5815,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         )?
     };
     let iid_dynamics_rollout_rows = if cfg.mode != EvalMode::Representation {
-        eval_episode_rollouts(
-            &train_cfg,
-            &cfg.checkpoint,
-            &model,
-            &iid_dynamics_rollout_samples,
-            &device,
-            "synthetic_iid_dynamics",
-        )?
+        timed_eval_phase("rollout_forwards", "synthetic_iid_dynamics", || {
+            eval_episode_rollouts(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &iid_dynamics_rollout_samples,
+                &device,
+                "synthetic_iid_dynamics",
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -5679,14 +5852,16 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         )?
     };
     let iid_planner_rollout_rows = if cfg.mode != EvalMode::Representation {
-        eval_episode_rollouts(
-            &train_cfg,
-            &cfg.checkpoint,
-            &model,
-            &iid_planner_rollout_samples,
-            &device,
-            "synthetic_iid_planner",
-        )?
+        timed_eval_phase("rollout_forwards", "synthetic_iid_planner", || {
+            eval_episode_rollouts(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &iid_planner_rollout_samples,
+                &device,
+                "synthetic_iid_planner",
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -5698,39 +5873,54 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         );
     }
 
-    let (arc3_transfer, arc3_population_fingerprint) = if cfg.mode != EvalMode::Rollout {
-        if let Some(dir) = &cfg.arc_recordings_dir {
-            let samples = import_recordings_dir(dir)?;
-            let fingerprint = semantic_population_fingerprint(&samples);
-            (
-                Some(eval_sample_set(
-                    &train_cfg,
-                    &cfg.checkpoint,
-                    &model,
-                    &samples,
-                    "arc3_transfer",
-                    None,
-                    cfg,
-                    &device,
-                    false,
-                )?),
-                Some(fingerprint),
-            )
-        } else {
-            (None, None)
-        }
+    let arc3_recordings = if cfg.mode != EvalMode::Rollout {
+        cfg.arc_recordings_dir
+            .as_ref()
+            .map(|dir| {
+                timed_eval_phase("population_generation", "arc3_recordings[shared]", || {
+                    import_and_summarize_recordings_dir(dir)
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let (arc3_transfer, arc3_population_fingerprint) = if let Some((samples, _)) = &arc3_recordings
+    {
+        let fingerprint = semantic_population_fingerprint(&samples);
+        (
+            Some(eval_sample_set(
+                &train_cfg,
+                &cfg.checkpoint,
+                &model,
+                &samples,
+                "arc3_transfer",
+                None,
+                cfg,
+                &device,
+                false,
+            )?),
+            Some(fingerprint),
+        )
     } else {
         (None, None)
     };
 
     let arc3_recording_runs = if cfg.mode == EvalMode::Full {
-        if let Some(dir) = &cfg.arc_recordings_dir {
-            let runs = summarize_recordings_dir(dir)?;
+        if let Some((_, runs)) = arc3_recordings {
+            let reduction_started = Instant::now();
             Some(Arc3RecordingBenchmark {
                 n_runs: runs.len(),
                 total_actions: runs.iter().map(|r| r.actions).sum(),
                 total_levels_completed: runs.iter().map(|r| r.levels_completed).sum(),
                 runs,
+            })
+            .inspect(|_| {
+                log_eval_phase(
+                    "metric_reduction",
+                    "arc3_recording_runs",
+                    reduction_started.elapsed(),
+                )
             })
         } else {
             None
@@ -5752,6 +5942,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         .as_ref()
         .and_then(official_rhae_from_benchmark);
 
+    let report_reduction_started = Instant::now();
     let mut population_sha256 = BTreeMap::from([
         (
             "synthetic_ood_dynamics_h1".into(),
@@ -5837,6 +6028,12 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
     }
     write_json_atomic(&cfg.output, &report)?;
     write_eval_digest(&cfg.output)?;
+    log_eval_phase(
+        "metric_reduction",
+        "report_and_output",
+        report_reduction_started.elapsed(),
+    );
+    log_eval_phase("total", "p2_eval", evaluation_started.elapsed());
     Ok(report)
 }
 
@@ -5855,6 +6052,123 @@ mod tests {
     use crate::p2::train::{
         reinit_varmap_deterministic, save_checkpoint, TrainReport, TRAIN_REPORT_SCHEMA,
     };
+    use rayon::ThreadPoolBuilder;
+
+    fn serialized_eval_population_fixture() -> Result<Vec<u8>> {
+        let episodes = 1;
+        let seed = 0xE7A1_0005u64;
+        let iid_seed = seed.wrapping_add(1);
+        let factual = generate_factual_eval_population(seed, episodes)?;
+
+        let mut dynamics = collect_synthetic_sources(
+            seed,
+            episodes,
+            &["random_one_step", "exploration"],
+            Split::HeldOutComposition,
+        )?;
+        let dynamics_rollout = flatten_sources(&dynamics);
+        assert_eq!(
+            dynamics_rollout,
+            collect_dynamics_rollout_samples(seed, episodes, Split::HeldOutComposition)?
+        );
+        dynamics.push((
+            "hazard_one_step".into(),
+            collect_hazard_samples(seed, episodes, Split::HeldOutComposition)?,
+        ));
+        let planner = collect_synthetic_sources(
+            seed,
+            episodes,
+            &[
+                "sequential",
+                "hypothesis_probe",
+                "p1c_falsification",
+                "p1c_hard_retarget",
+            ],
+            Split::HeldOutComposition,
+        )?;
+        let planner_rollout = collect_planner_rollout_samples(
+            seed,
+            episodes,
+            Split::HeldOutComposition,
+            Some(&planner[0].1),
+        )?;
+        assert_eq!(
+            planner_rollout,
+            collect_planner_rollout_samples(seed, episodes, Split::HeldOutComposition, None,)?
+        );
+
+        let mut iid_dynamics = collect_synthetic_sources(
+            iid_seed,
+            episodes,
+            &["random_one_step", "exploration"],
+            Split::Train,
+        )?;
+        let iid_dynamics_rollout = flatten_sources(&iid_dynamics);
+        assert_eq!(
+            iid_dynamics_rollout,
+            collect_dynamics_rollout_samples(iid_seed, episodes, Split::Train)?
+        );
+        iid_dynamics.push((
+            "hazard_one_step".into(),
+            collect_hazard_samples(iid_seed, episodes, Split::Train)?,
+        ));
+        let iid_planner = collect_synthetic_sources(
+            iid_seed,
+            episodes,
+            &[
+                "sequential",
+                "hypothesis_probe",
+                "p1c_falsification",
+                "p1c_hard_retarget",
+            ],
+            Split::Train,
+        )?;
+        let iid_planner_rollout = collect_planner_rollout_samples(
+            iid_seed,
+            episodes,
+            Split::Train,
+            Some(&iid_planner[0].1),
+        )?;
+        assert_eq!(
+            iid_planner_rollout,
+            collect_planner_rollout_samples(iid_seed, episodes, Split::Train, None)?
+        );
+
+        Ok(serde_json::to_vec(&(
+            factual,
+            dynamics,
+            dynamics_rollout,
+            planner,
+            planner_rollout,
+            iid_dynamics,
+            iid_dynamics_rollout,
+            iid_planner,
+            iid_planner_rollout,
+        ))?)
+    }
+
+    #[test]
+    fn eval_population_bytes_are_identical_across_rayon_thread_counts() -> Result<()> {
+        let serial = ThreadPoolBuilder::new().num_threads(1).build()?;
+        let parallel = ThreadPoolBuilder::new().num_threads(4).build()?;
+        let serial_started = Instant::now();
+        let serial_bytes = serial.install(serialized_eval_population_fixture)?;
+        let serial_elapsed = serial_started.elapsed();
+        let parallel_started = Instant::now();
+        let parallel_bytes = parallel.install(serialized_eval_population_fixture)?;
+        let parallel_elapsed = parallel_started.elapsed();
+        eprintln!(
+            "eval population determinism fixture: one_thread_s={:.3} four_threads_s={:.3}",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64()
+        );
+        assert_eq!(
+            Sha256::digest(&serial_bytes),
+            Sha256::digest(&parallel_bytes)
+        );
+        assert_eq!(serial_bytes, parallel_bytes);
+        Ok(())
+    }
 
     #[test]
     fn q_metrics_require_both_classes_and_reject_extreme_label_rates() {
@@ -5940,16 +6254,16 @@ mod tests {
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         reinit_varmap_deterministic(&varmap, train_cfg.seed)?;
-        let metrics = evaluate_factual_branches(
-            &model,
-            &EvalConfig {
-                seed: 17,
-                synthetic_episodes: 1,
-                physical_batch: 4,
-                ..EvalConfig::default()
-            },
-            &device,
-        )?;
+        let eval_cfg = EvalConfig {
+            seed: 17,
+            synthetic_episodes: 1,
+            physical_batch: 4,
+            ..EvalConfig::default()
+        };
+        let factual_population =
+            generate_factual_eval_population(eval_cfg.seed, eval_cfg.synthetic_episodes)?;
+        let metrics =
+            evaluate_factual_branches(&model, &eval_cfg, &device, factual_population.as_ref())?;
         assert_eq!(metrics.semantic_outcome_retrieval_n, metrics.branches);
         assert!(metrics.semantic_outcome_retrieval_accuracy.is_some());
         assert!(metrics.semantic_outcome_chance.is_some());
