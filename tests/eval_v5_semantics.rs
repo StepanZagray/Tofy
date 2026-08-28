@@ -51,6 +51,7 @@ fn sample(
             content_y: 0,
             source_kind: source.into(),
             trajectory_id: trajectory.into(),
+            operator: None,
         },
         oracle_latent: None,
     })

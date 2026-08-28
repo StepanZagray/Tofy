@@ -1351,22 +1351,6 @@ impl WorldModel {
         )
     }
 
-    fn add_action_with_operator(
-        &self,
-        state: &Tensor,
-        actions: &Tensor,
-        action_coords: &Tensor,
-        operator_conditioning: &Tensor,
-    ) -> Result<Tensor> {
-        self.add_action_with_canonical_and_operator(
-            state,
-            None,
-            actions,
-            action_coords,
-            operator_conditioning,
-        )
-    }
-
     fn action_embedding(&self, actions: &Tensor, batch: usize) -> Result<(Tensor, Tensor)> {
         let actions = match actions.rank() {
             1 => actions.clone(),

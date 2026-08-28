@@ -2592,7 +2592,7 @@ pub fn frames_to_indices(frames: &[ArcFrame], device: &Device) -> Result<Tensor>
     Tensor::from_vec(indices, (b, 1, FRAME_SIDE, FRAME_SIDE), device).map_err(Into::into)
 }
 
-trait TransitionSampleView: Sync {
+pub(crate) trait TransitionSampleView: Sync {
     fn transition_sample(&self) -> &TransitionSample;
 }
 
@@ -2729,7 +2729,7 @@ pub struct BatchTensors {
 
 /// Tensorize observable train-family operators. Held-out families and rows
 /// without provenance receive UNKNOWN and a neutral all-zero color triple.
-pub fn operator_conditioning_from_samples<T: TransitionSampleView>(
+pub(crate) fn operator_conditioning_from_samples<T: TransitionSampleView>(
     samples: &[T],
     device: &Device,
 ) -> Result<Tensor> {
