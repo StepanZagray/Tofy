@@ -156,6 +156,16 @@ The one-treatment-per-arm rule is enforced at validation: enabling more
 than one treatment fails closed unless `allow_multi_treatment_arm`
 explicitly waives single-factor attribution.
 
+Bundle-run observability: an exploratory multi-treatment run publishes full
+candle-graph bundles, including labeled tensor statistics, at every
+preregistered `profile_updates` target; records EMA-weight copy-bypass,
+outer-step-cosine, and copy-gate scalars at the 1024-update gate cadence; and
+runs a same-weights eval ablation battery for decode composition, action
+impulse, and copy-bypass alpha. These observations can confirm that a mechanism
+was active and attribute eval-time ablation effects, but they cannot assign
+training-dynamics credit among bundled treatments. Both the training evidence
+and ablations remain exploratory/`selection_only`.
+
 ## 1. Data contract (fixes RC5, geometry pathology, transfer defects)
 
 1. **Mixed stream, no lessons.** One stationary-schedule mixture per batch,

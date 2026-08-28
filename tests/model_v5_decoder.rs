@@ -656,6 +656,29 @@ fn set_alpha(vars: &VarMap, value: f32) -> Result<()> {
 }
 
 #[test]
+fn copy_bypass_alpha_accessor_tracks_flag_and_value() -> Result<()> {
+    let device = Device::Cpu;
+    let disabled_vars = VarMap::new();
+    let disabled = WorldModel::new(
+        treatment_config(),
+        VarBuilder::from_varmap(&disabled_vars, DType::F32, &device),
+    )?;
+    assert_eq!(disabled.copy_bypass_alpha()?, None);
+
+    let enabled_vars = VarMap::new();
+    let enabled = WorldModel::new(
+        ModelConfig {
+            copy_bypass_gate: true,
+            ..treatment_config()
+        },
+        VarBuilder::from_varmap(&enabled_vars, DType::F32, &device),
+    )?;
+    set_alpha(&enabled_vars, 0.375)?;
+    assert_eq!(enabled.copy_bypass_alpha()?, Some(0.375));
+    Ok(())
+}
+
+#[test]
 fn copy_bypass_zero_gate_is_exact_latent_copy_for_any_finite_state() -> Result<()> {
     let device = Device::Cpu;
     let vars = VarMap::new();

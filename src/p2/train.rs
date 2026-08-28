@@ -3,7 +3,9 @@
 use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
 use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, BranchLearningConfig};
-use crate::p2::cg_profile::{CaptureSpec, ProfileState, RepresentativeUpdateCapture};
+use crate::p2::cg_profile::{
+    CaptureSpec, ProfileRange, ProfileState, RepresentativeUpdateCapture,
+};
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
@@ -1496,6 +1498,15 @@ pub fn foundation_v2_ep_budget_status(
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2MechanismSample {
+    pub step: u64,
+    pub copy_bypass_alpha: Option<f64>,
+    pub outer_step_cosines: Vec<f64>,
+    pub gate_open_rate: f64,
+    pub gate_mean_probability: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FoundationV2TrainingReport {
     pub total_steps: usize,
     pub mean_losses: FoundationV2LossMeans,
@@ -1519,6 +1530,12 @@ pub struct FoundationV2TrainingReport {
     /// the complete consumed population.
     #[serde(default)]
     pub event_label_census_complete: bool,
+    /// Cheap EMA-weight mechanism diagnostics sampled with each trainer gate.
+    #[serde(default)]
+    pub mechanism_history: Vec<FoundationV2MechanismSample>,
+    /// Atomically published candle-graph bundles for preregistered updates.
+    #[serde(default)]
+    pub profile_bundles: Vec<PathBuf>,
     pub clip_strategy: String,
 }
 
@@ -1872,6 +1889,11 @@ struct FoundationV2TrainerState {
     event_label_census: EventLabelCensus,
     #[serde(default)]
     event_label_census_complete: bool,
+    #[serde(default)]
+    mechanism_history: Vec<FoundationV2MechanismSample>,
+    /// One-based preregistered updates whose evidence bundles were published.
+    #[serde(default)]
+    profiles_published: Vec<u64>,
     /// Frozen identity of the fixed gate population and gate policy. A resume
     /// must regenerate the exact same rows/masks under the same policy or
     /// fail closed before any optimizer update: best/collapse comparisons
@@ -6377,6 +6399,16 @@ fn build_report(
             permanent_checkpoints: foundation.permanent_checkpoints.clone(),
             event_label_census: foundation.event_label_census,
             event_label_census_complete: foundation.event_label_census_complete,
+            mechanism_history: foundation.mechanism_history.clone(),
+            profile_bundles: foundation
+                .profiles_published
+                .iter()
+                .map(|update| {
+                    cfg.output_dir
+                        .join("profile")
+                        .join(format!("update-{update:012}"))
+                })
+                .collect(),
             // Documented ADR 0003 approximation: EP is first constrained by
             // its encoder-gradient controller, then the combined gradient is
             // clipped at 1.0. We do not claim a separately clipped EP store.
@@ -6487,6 +6519,115 @@ fn add_foundation_v2_loss_sums(sums: &mut FoundationV2LossMeans, values: &Founda
     sums.gradient_clip_scale += values.gradient_clip_scale;
 }
 
+fn validate_foundation_v2_profile_resume(
+    profile_updates: &[u64],
+    profiles_published: &[u64],
+    global_step: u64,
+) -> Result<()> {
+    let missing = profile_updates
+        .iter()
+        .copied()
+        .filter(|update| *update <= global_step && !profiles_published.contains(update))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "foundation-v2 resume is missing preregistered profile evidence for completed updates {:?}",
+            missing
+        );
+    }
+    Ok(())
+}
+
+fn record_foundation_v2_profile_tensors(
+    profile: &RepresentativeUpdateCapture,
+    range: &ProfileRange<'_>,
+    losses: &FoundationV2LossBreakdown,
+) -> Result<()> {
+    for (name, tensor) in [
+        ("total", &losses.total),
+        ("non_ep_total", &losses.non_ep_total),
+        ("pred_ce", &losses.pred_ce),
+        ("gate", &losses.gate),
+        ("latent", &losses.latent),
+        ("enc_ce", &losses.enc_ce),
+        ("separation", &losses.separation),
+        ("pull", &losses.pull),
+        ("inverse_action", &losses.inverse_action),
+        ("ep", &losses.ep),
+        ("rollout", &losses.rollout),
+        ("event", &losses.event),
+        ("q", &losses.q),
+        ("reliability", &losses.reliability),
+    ] {
+        let label = format!("loss/{name}");
+        profile.record_tensor(range, &label, tensor, Some(ExecutionStep::Forward))?;
+        profile.record_tensor_stats(range, &label, tensor)?;
+    }
+    let seams = losses
+        .mechanism_seams
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("profiled foundation-v2 loss omitted mechanism seams"))?;
+    for (label, tensor) in [
+        ("seam/out_y", &seams.out_y),
+        ("seam/current_canonical", &seams.current_canonical),
+        ("seam/predicted_canonical", &seams.predicted_canonical),
+        ("seam/gate_logits", &seams.gate_logits),
+    ] {
+        profile.record_tensor(range, label, tensor, Some(ExecutionStep::Forward))?;
+        profile.record_tensor_stats(range, label, tensor)?;
+    }
+    Ok(())
+}
+
+fn foundation_v2_mechanism_sample(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+    step: u64,
+) -> Result<FoundationV2MechanismSample> {
+    if samples.is_empty() {
+        bail!("foundation-v2 mechanism sample requires at least one gate row");
+    }
+    let rows = &samples[..samples.len().min(128)];
+    let batch = batch_from_samples(rows, device)?;
+    let current = model.encode_state(&batch.frames)?;
+    let out = model.forward_from_encoded_state(
+        &current,
+        &batch.frames,
+        &batch.actions,
+        &batch.action_coords,
+        &batch.goals,
+        RecursionDepth::from_config(model.config()),
+        0.0,
+        None,
+        RecursionOpts {
+            record_probes: true,
+            store_intermediate_steps: false,
+        },
+    )?;
+    let gate = model.exact_copy_gate(&out.y)?.detach().to_dtype(DType::F32)?;
+    let gate_mean_probability = gate.mean_all()?.to_scalar::<f32>()? as f64;
+    let gate_open_rate = gate
+        .ge(0.5)?
+        .to_dtype(DType::F32)?
+        .mean_all()?
+        .to_scalar::<f32>()? as f64;
+    if !gate_mean_probability.is_finite() || !gate_open_rate.is_finite() {
+        bail!("foundation-v2 mechanism sample produced non-finite gate statistics");
+    }
+    Ok(FoundationV2MechanismSample {
+        step,
+        copy_bypass_alpha: model.copy_bypass_alpha()?,
+        outer_step_cosines: out
+            .recursion_probes
+            .iter()
+            .map(|probe| probe.mean_step_cosine)
+            .collect(),
+        gate_open_rate,
+        gate_mean_probability,
+    })
+}
+
 fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     let mut cfg = requested_cfg.clone();
     if cfg.resume.is_none() && implicit_resume_source(&cfg).is_some() {
@@ -6570,6 +6711,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 permanent_checkpoints: Vec::new(),
                 event_label_census: EventLabelCensus::default(),
                 event_label_census_complete: true,
+                mechanism_history: Vec::new(),
+                profiles_published: Vec::new(),
                 gate_population_identity: None,
             }),
         }
@@ -6618,6 +6761,15 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             None => foundation.gate_population_identity = Some(identity),
         }
     }
+    validate_foundation_v2_profile_resume(
+        &cfg.profile_updates,
+        &state
+            .foundation_v2
+            .as_ref()
+            .expect("foundation-v2 state")
+            .profiles_published,
+        state.global_step,
+    )?;
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
         seed: cfg.seed,
@@ -6683,8 +6835,56 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             return Ok(report);
         }
 
+        let next_step = state.global_step + 1;
+        let pending_profile = ProfileState::Pending;
+        let cg_profile = if cfg.profile_updates.contains(&next_step)
+            && !state
+                .foundation_v2
+                .as_ref()
+                .expect("foundation-v2 state")
+                .profiles_published
+                .contains(&next_step)
+        {
+            Some(RepresentativeUpdateCapture::begin(CaptureSpec {
+                completed_updates: state.global_step,
+                selected_update: next_step,
+                state: &pending_profile,
+                output_dir: &cfg.output_dir,
+                device: &cfg.device,
+                measured_region_device_synchronized: device.is_cuda(),
+                lesson: "foundation_v2",
+                physical_batch: cfg.physical_batch,
+                grad_accum: cfg.grad_accum,
+                hidden_dim: cfg.hidden_dim,
+                inner_steps: cfg.inner_steps,
+                outer_steps: cfg.outer_steps,
+                precision: if cfg.bf16_conv {
+                    "bf16-conv/f32-rest"
+                } else {
+                    "f32"
+                },
+            })?)
+        } else {
+            None
+        };
+        if cg_profile.as_ref().is_some_and(|profile| profile.active()) {
+            sync_cuda_device(&device)?;
+        }
+        let profile_measurement = cg_profile
+            .as_ref()
+            .and_then(RepresentativeUpdateCapture::measurement);
         let mixed = if let Some(prefetcher) = data_prefetcher.as_mut() {
-            let (batch_index, batch) = prefetcher.recv_next()?;
+            let (batch_index, batch) = if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "prefetched_receive",
+                    SpanKind::Module,
+                    None,
+                    || prefetcher.recv_next(),
+                )?
+            } else {
+                prefetcher.recv_next()?
+            };
             if batch_index != state.global_step {
                 bail!(
                     "foundation-v2 prefetch returned batch {batch_index} while step {} was required",
@@ -6694,12 +6894,29 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             batch
         } else {
             let progress = state.global_step as f32 / total_steps.max(1) as f32;
-            compose_mixed_stream_batch(
-                &stream_config,
-                progress,
-                state.global_step,
-                V5DataSplit::Train,
-            )?
+            if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "generation",
+                    SpanKind::Module,
+                    None,
+                    || {
+                        compose_mixed_stream_batch(
+                            &stream_config,
+                            progress,
+                            state.global_step,
+                            V5DataSplit::Train,
+                        )
+                    },
+                )?
+            } else {
+                compose_mixed_stream_batch(
+                    &stream_config,
+                    progress,
+                    state.global_step,
+                    V5DataSplit::Train,
+                )?
+            }
         };
         let batch_event_census = mixed.event_label_census();
         {
@@ -6720,22 +6937,33 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
             (foundation.ep_weight, foundation.rollout_enabled)
         };
-        let losses = foundation_v2_training_loss(
-            &model,
-            &mixed,
-            &device,
-            FoundationV2ObjectiveConfig {
-                ep_weight,
-                sigreg_projections: cfg.sigreg_projections,
-                sigreg_knots: cfg.sigreg_knots,
-                sigreg_seed: cfg.seed.wrapping_add(state.global_step),
-                rollout_enabled,
-                split_ce_weighting: cfg.split_ce_weighting,
-                split_ce_changed_budget: cfg.split_ce_changed_budget,
-                capture_mechanism_seams: false,
-            },
-        )?;
-        let next_step = state.global_step + 1;
+        let objective = FoundationV2ObjectiveConfig {
+            ep_weight,
+            sigreg_projections: cfg.sigreg_projections,
+            sigreg_knots: cfg.sigreg_knots,
+            sigreg_seed: cfg.seed.wrapping_add(state.global_step),
+            rollout_enabled,
+            split_ce_weighting: cfg.split_ce_weighting,
+            split_ce_changed_budget: cfg.split_ce_changed_budget,
+            capture_mechanism_seams: cg_profile.is_some(),
+        };
+        let losses = if let Some(profile) = &cg_profile {
+            profile.synchronized_phase_with_range(
+                &device,
+                "forward_loss",
+                SpanKind::Function,
+                Some(ExecutionStep::Forward),
+                |range| {
+                    let losses = foundation_v2_training_loss(&model, &mixed, &device, objective)?;
+                    if let Some(range) = range {
+                        record_foundation_v2_profile_tensors(profile, range, &losses)?;
+                    }
+                    Ok(losses)
+                },
+            )?
+        } else {
+            foundation_v2_training_loss(&model, &mixed, &device, objective)?
+        };
         if next_step.is_multiple_of(128) {
             // These two attribution stores are read-only. Their graphs are
             // reused below for the actual combined backward pass.
@@ -6768,7 +6996,26 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let total = losses
             .non_ep_total
             .add(&losses.ep.affine(effective_ep_weight, 0.0)?)?;
-        let mut grads = total.backward()?;
+        let mut grads = if let Some(profile) = &cg_profile {
+            profile.synchronized_phase(
+                &device,
+                "backward",
+                SpanKind::Function,
+                Some(ExecutionStep::Backward),
+                || total.backward().map_err(Into::into),
+            )?
+        } else {
+            total.backward()?
+        };
+        if let Some(profile) = &cg_profile {
+            profile.synchronized_phase(
+                &device,
+                "gradients",
+                SpanKind::Module,
+                Some(ExecutionStep::Backward),
+                || profile.record_gradients(&varmap, &grads),
+            )?;
+        }
         // ADR 0003's documented approximation: the adaptive controller bounds
         // EP's encoder contribution first, then one combined gradient store is
         // clipped at 1.0. There is no separately clipped EP accumulation.
@@ -6777,7 +7024,38 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             next_step as usize,
             total_steps,
         ))?;
-        optimizer.step(&grads)?;
+        if let Some(profile) = &cg_profile {
+            profile.synchronized_phase(
+                &device,
+                "optimizer",
+                SpanKind::Function,
+                Some(ExecutionStep::Optimizer),
+                || optimizer.step(&grads),
+            )?;
+        } else {
+            optimizer.step(&grads)?;
+        }
+        drop(profile_measurement);
+        let published_profile = if let Some(profile) = cg_profile {
+            let artifacts = profile
+                .finish()?
+                .ok_or_else(|| anyhow::anyhow!("selected foundation-v2 profile was inactive"))?;
+            if artifacts.update != next_step {
+                bail!(
+                    "foundation-v2 profile published update {} while update {next_step} was selected",
+                    artifacts.update
+                );
+            }
+            state
+                .foundation_v2
+                .as_mut()
+                .expect("foundation-v2 state")
+                .profiles_published
+                .push(next_step);
+            true
+        } else {
+            false
+        };
         ema.update(&varmap)?;
         let values = foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
         {
@@ -6792,13 +7070,20 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let mut improved_best = false;
         let mut abort = false;
         if state.global_step.is_multiple_of(FOUNDATION_V2_GATE_EVERY) {
-            let metrics = ema.with_eval_weights(&varmap, || {
-                evaluate_gate_support_with_content_masks(
+            let (metrics, mechanism_sample) = ema.with_eval_weights(&varmap, || {
+                let metrics = evaluate_gate_support_with_content_masks(
                     &model,
                     &gate_samples,
                     Some(&gate_content_masks),
                     &device,
-                )
+                )?;
+                let mechanism_sample = foundation_v2_mechanism_sample(
+                    &model,
+                    &gate_samples,
+                    &device,
+                    state.global_step,
+                )?;
+                Ok((metrics, mechanism_sample))
             })?;
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             let prior_best = foundation.best_changed_exact;
@@ -6812,6 +7097,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             foundation.best_changed_exact = evaluation.running_best_after;
             foundation.rollout_enabled = evaluation.gates[3].passed;
             foundation.gate_history.push(evaluation);
+            foundation.mechanism_history.push(mechanism_sample);
             abort = foundation_v2_gate_history_aborts(&foundation.gate_history);
         }
 
@@ -6830,7 +7116,14 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 prefetcher.shutdown();
             }
         }
-        if periodic || permanent || improved_best || abort || complete || requested_pause {
+        if published_profile
+            || periodic
+            || permanent
+            || improved_best
+            || abort
+            || complete
+            || requested_pause
+        {
             sync_cuda_device(&device)?;
             if permanent {
                 state
@@ -10026,6 +10319,107 @@ mod tests {
                 .any(|(a, d)| (a - d).abs() > 0.0),
             "first open-loop transition contributes no core gradient"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_mechanism_sample_reads_probes_and_copy_gate() -> Result<()> {
+        let device = Device::Cpu;
+        let model_cfg = ModelConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 2,
+            world_core_v4: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            residual_y_update: true,
+            warm_start_y: true,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            model_cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&varmap, 71)?;
+        zero_action_film_projections(&varmap)?;
+        restore_copy_gate_bias_prior(&varmap, None)?;
+        let mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 16,
+                seed: 72,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::UnseenSeed7x7,
+        )?;
+        let samples = mixed.transitions().cloned().collect::<Vec<_>>();
+        let sample = foundation_v2_mechanism_sample(&model, &samples, &device, 1_024)?;
+        assert_eq!(sample.step, 1_024);
+        assert_eq!(sample.copy_bypass_alpha, None);
+        assert_eq!(sample.outer_step_cosines.len(), 2);
+        assert!(sample.outer_step_cosines.iter().all(|value| value.is_finite()));
+        assert!((0.0..=1.0).contains(&sample.gate_open_rate));
+        assert!((0.0..=1.0).contains(&sample.gate_mean_probability));
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_profile_resume_rejects_passed_unpublished_target() {
+        let error = validate_foundation_v2_profile_resume(&[2, 4], &[4], 4)
+            .expect_err("completed preregistered update 2 has no published evidence");
+        assert!(error.to_string().contains("completed updates [2]"), "{error:#}");
+        validate_foundation_v2_profile_resume(&[2, 4], &[2, 4], 4).unwrap();
+    }
+
+    #[test]
+    fn foundation_v2_profile_update_publishes_tensor_stats_bundle() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-foundation-v2-profile-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        cfg.seed = 73;
+        cfg.steps_per_lesson = 2;
+        cfg.physical_batch = crate::p2::data::FACTUAL_BRANCHES_PER_GROUP + 1;
+        cfg.output_dir = root.join("run");
+        cfg.checkpoint_every_steps = 0;
+        cfg.prefetch_batches = false;
+        cfg.profile_updates = vec![2];
+        let report = train(&cfg)?;
+        let foundation = report
+            .foundation_v2
+            .as_ref()
+            .expect("foundation-v2 report exists");
+        assert_eq!(foundation.profile_bundles.len(), 1);
+        let bundle = &foundation.profile_bundles[0];
+        for name in ["application.jsonl", "evidence.json", "EVIDENCE.md"] {
+            assert!(bundle.join(name).is_file(), "missing {name}");
+        }
+        let required = [
+            "seam/out_y",
+            "seam/current_canonical",
+            "seam/predicted_canonical",
+            "seam/gate_logits",
+        ];
+        let mut seen = BTreeMap::new();
+        for line in fs::read_to_string(bundle.join("application.jsonl"))?.lines() {
+            let event: serde_json::Value = serde_json::from_str(line)?;
+            if event.get("kind").and_then(serde_json::Value::as_str) == Some("tensor_stats") {
+                if let Some(label) = event.get("label").and_then(serde_json::Value::as_str) {
+                    seen.insert(label.to_string(), ());
+                }
+            }
+        }
+        for label in required {
+            assert!(seen.contains_key(label), "missing tensor stats for {label}");
+        }
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 

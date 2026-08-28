@@ -880,6 +880,26 @@ impl WorldModel {
         &self.config
     }
 
+    /// Learned scalar for the optional latent copy-bypass treatment.
+    pub fn copy_bypass_alpha(&self) -> Result<Option<f64>> {
+        self.y_copy_bypass_alpha
+            .as_ref()
+            .map(|alpha| {
+                let value = alpha
+                    .detach()
+                    .to_dtype(DType::F32)?
+                    .reshape(())?
+                    .to_scalar::<f32>()
+                    .map(f64::from)
+                    .map_err(anyhow::Error::from)?;
+                if !value.is_finite() {
+                    bail!("copy-bypass alpha is non-finite");
+                }
+                Ok(value)
+            })
+            .transpose()
+    }
+
     pub fn patch_histogram_grounding_loss(
         &self,
         predicted: &Tensor,

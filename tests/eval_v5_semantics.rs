@@ -1,16 +1,17 @@
 use anyhow::Result;
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
+use serde::{Deserialize, Serialize};
 use tofy::domain::Split;
 use tofy::p2::data::{
     palette, ArcAction, ArcFrame, ContentMask, ContentRect, GoalFeatures, TransitionProvenance,
     TransitionSample, FRAME_SIDE,
 };
 use tofy::p2::eval::{
-    board_changed_transition_count, evaluate_gate_support,
-    one_step_false_edit_rate_with_content_masks,
+    board_changed_transition_count, evaluate_gate_support, evaluate_mechanism_ablations,
+    one_step_false_edit_rate_with_content_masks, MechanismAblationReport,
 };
-use tofy::p2::model::WorldModel;
+use tofy::p2::model::{zero_copy_bypass_gate, WorldModel};
 use tofy::p2::semantic_eval::{
     action_controllability_probe, ambiguity_ceiling, shuffled_action_control_samples,
 };
@@ -150,6 +151,108 @@ fn gate_support_is_deterministic_across_calls() -> Result<()> {
     let first = evaluate_gate_support(&model, &rows, &device)?;
     let second = evaluate_gate_support(&model, &rows, &device)?;
     assert_eq!(first, second);
+    Ok(())
+}
+
+fn tiny_foundation_model(copy_bypass_gate: bool) -> Result<(WorldModel, VarMap)> {
+    let device = Device::Cpu;
+    let mut config = TrainConfig::default();
+    config.apply_foundation_v2_recipe();
+    config.hidden_dim = 8;
+    config.action_dim = 4;
+    config.inner_steps = 1;
+    config.outer_steps = 1;
+    config.copy_bypass_gate = copy_bypass_gate;
+    let varmap = VarMap::new();
+    let model = WorldModel::new(
+        config.model_config(),
+        VarBuilder::from_varmap(&varmap, DType::F32, &device),
+    )?;
+    reinit_varmap_deterministic(&varmap, 91)?;
+    zero_copy_bypass_gate(&varmap)?;
+    Ok((model, varmap))
+}
+
+fn ablation_rows() -> Result<Vec<TransitionSample>> {
+    Ok(vec![
+        sample("alpha", "alpha/0", 0, 1, 2, 1, Some(false))?,
+        sample("alpha", "alpha/1", 0, 2, 3, 2, Some(false))?,
+    ])
+}
+
+#[test]
+fn mechanism_ablations_cover_parameter_free_variants_without_alpha_gate() -> Result<()> {
+    let device = Device::Cpu;
+    let (model, varmap) = tiny_foundation_model(false)?;
+    let rows = ablation_rows()?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    assert_eq!(report.rows, rows.len());
+    assert_eq!(report.evidence_class, "selection_only");
+    assert!(report.decode_composition.is_some());
+    assert!(report.action_impulse.is_some());
+    assert!(report.copy_bypass_alpha_sweep.is_none());
+    Ok(())
+}
+
+#[test]
+fn alpha_sweep_preserves_main_weights_and_starts_at_trained_baseline() -> Result<()> {
+    let device = Device::Cpu;
+    let (model, varmap) = tiny_foundation_model(true)?;
+    {
+        let data = varmap.data().lock().unwrap();
+        let alpha = data
+            .get("y_copy_bypass_alpha")
+            .expect("copy bypass alpha exists");
+        alpha.set(&Tensor::full(
+            0.375f32,
+            alpha.shape().dims(),
+            alpha.device(),
+        )?)?;
+    }
+    let rows = ablation_rows()?;
+    let before = evaluate_gate_support(&model, &rows, &device)?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    let after = evaluate_gate_support(&model, &rows, &device)?;
+    assert_eq!(before, after, "alpha sweep mutated the main evaluation model");
+    assert_eq!(serde_json::to_vec(&before)?, serde_json::to_vec(&after)?);
+    assert_eq!(model.copy_bypass_alpha()?, Some(0.375));
+    let points = report
+        .copy_bypass_alpha_sweep
+        .as_ref()
+        .expect("flag-on checkpoint produces alpha sweep");
+    assert_eq!(points.len(), 6);
+    assert_eq!(points[0].alpha, 0.375);
+    assert_eq!(
+        points[0].metrics,
+        report
+            .decode_composition
+            .as_ref()
+            .expect("decode pair")
+            .baseline
+    );
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AblationFieldCompatibility {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mechanism_ablations: Option<MechanismAblationReport>,
+}
+
+#[test]
+fn mechanism_ablation_field_round_trips_present_and_absent() -> Result<()> {
+    let old: AblationFieldCompatibility = serde_json::from_str("{}")?;
+    assert!(old.mechanism_ablations.is_none());
+
+    let device = Device::Cpu;
+    let (model, varmap) = tiny_foundation_model(false)?;
+    let rows = ablation_rows()?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    let encoded = serde_json::to_string(&AblationFieldCompatibility {
+        mechanism_ablations: Some(report.clone()),
+    })?;
+    let decoded: AblationFieldCompatibility = serde_json::from_str(&encoded)?;
+    assert_eq!(decoded.mechanism_ablations, Some(report));
     Ok(())
 }
 

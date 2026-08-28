@@ -13,6 +13,7 @@ use crate::p2::data::{
     ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
     TransitionSample, V5DataSplit, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
 };
+use crate::p2::grounding::DecodeComposition;
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
     RecursionStepProbe, WorldModel, EVENT_GOAL_FAILED,
@@ -37,7 +38,7 @@ use crate::p2::train::{
     verify_checkpoint_bundle, BatchTensors, TrainConfig,
 };
 use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::{ops, VarBuilder, VarMap};
 use clap::ValueEnum;
 use rand::Rng;
@@ -480,6 +481,40 @@ pub struct GateSupportMetrics {
     #[serde(default)]
     pub raw_padding_false_edit_rate: Option<f64>,
     pub population_contract: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AblationMetrics {
+    pub one_step_changed_exact: Option<f64>,
+    pub one_step_all_rows_exact: Option<f64>,
+    pub false_edit_rate: Option<f64>,
+    pub padding_false_edit_rate: Option<f64>,
+    pub improvement_fraction: Option<f64>,
+    pub shuffled_action_changed_pixel_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AblationPair {
+    pub baseline_description: String,
+    pub baseline: AblationMetrics,
+    pub variant_description: String,
+    pub variant: AblationMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlphaSweepPoint {
+    pub alpha: f64,
+    pub metrics: AblationMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MechanismAblationReport {
+    pub rows: usize,
+    pub population_fingerprint: String,
+    pub decode_composition: Option<AblationPair>,
+    pub action_impulse: Option<AblationPair>,
+    pub copy_bypass_alpha_sweep: Option<Vec<AlphaSweepPoint>>,
+    pub evidence_class: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1085,6 +1120,9 @@ pub struct EvalReport {
     /// contract's actual held-out distributions. Selection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v5_holdout_gates: Option<BTreeMap<String, GateSupportMetrics>>,
+    /// Same-checkpoint, same-row mechanism ablations for bundled treatments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanism_ablations: Option<MechanismAblationReport>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
 }
@@ -2429,7 +2467,11 @@ fn foundation_v2_v5_holdout_gates(
     cfg: &EvalConfig,
     train_seed: u64,
     device: &Device,
-) -> Result<BTreeMap<String, GateSupportMetrics>> {
+) -> Result<(
+    BTreeMap<String, GateSupportMetrics>,
+    Vec<TransitionSample>,
+    Vec<ContentMask>,
+)> {
     const V5_HOLDOUT_ROWS: usize = 512;
     const V5_HOLDOUT_SEED_DOMAIN: u64 = 0x5645_4C35_1D00_0000;
     let mut splits: Vec<(String, V5DataSplit)> = vec![
@@ -2445,6 +2487,7 @@ fn foundation_v2_v5_holdout_gates(
         ));
     }
     let mut gates = BTreeMap::new();
+    let mut ablation_population = None;
     for (lane, (name, split)) in splits.into_iter().enumerate() {
         let seed = cfg
             .iid_seed
@@ -2478,9 +2521,14 @@ fn foundation_v2_v5_holdout_gates(
             .collect::<Vec<_>>();
         let metrics =
             evaluate_gate_support_with_content_masks(model, &samples, Some(&masks), device)?;
+        if lane == 0 {
+            ablation_population = Some((samples.clone(), masks.clone()));
+        }
         gates.insert(name, metrics);
     }
-    Ok(gates)
+    let (samples, masks) =
+        ablation_population.expect("unseen-seed V5 holdout population is always present");
+    Ok((gates, samples, masks))
 }
 
 /// Full-transition exactness on the same changed-transition rows counted by
@@ -2623,6 +2671,34 @@ pub fn evaluate_gate_support(
     evaluate_gate_support_with_content_masks(model, samples, None, device)
 }
 
+struct EncodedGateSupportPopulation {
+    batch: BatchTensors,
+    current: Tensor,
+    target: Tensor,
+    shuffled: Vec<TransitionSample>,
+    shuffled_actions: Tensor,
+    shuffled_coords: Tensor,
+}
+
+fn encode_gate_support_population(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<EncodedGateSupportPopulation> {
+    let batch = batch_from_samples(samples, device)?;
+    let (current, target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let shuffled = shuffled_action_control_samples(samples);
+    let (shuffled_actions, shuffled_coords) = action_tensors_from_samples(&shuffled, device)?;
+    Ok(EncodedGateSupportPopulation {
+        batch,
+        current,
+        target,
+        shuffled,
+        shuffled_actions,
+        shuffled_coords,
+    })
+}
+
 /// Foundation-v2 gate evaluation with the exact V5 content-mask sidecar.
 /// Legacy callers may use [`evaluate_gate_support`], whose origin-aligned
 /// fallback is valid for the non-translated curriculum rows it accepts.
@@ -2631,6 +2707,16 @@ pub fn evaluate_gate_support_with_content_masks(
     samples: &[TransitionSample],
     content_masks: Option<&[ContentMask]>,
     device: &Device,
+) -> Result<GateSupportMetrics> {
+    evaluate_gate_support_impl(model, samples, content_masks, device, None)
+}
+
+fn evaluate_gate_support_impl(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    content_masks: Option<&[ContentMask]>,
+    device: &Device,
+    encoded: Option<&EncodedGateSupportPopulation>,
 ) -> Result<GateSupportMetrics> {
     if content_masks.is_some_and(|masks| masks.len() != samples.len()) {
         bail!("gate content-mask rows do not match the sample count");
@@ -2674,25 +2760,38 @@ pub fn evaluate_gate_support_with_content_masks(
     if !model.config().world_core_v4 {
         bail!("foundation-v2 gate support requires the exact gameplay decoder");
     }
-    let batch = batch_from_samples(samples, device)?;
-    let (current, target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let owned_encoded;
+    let encoded = if let Some(encoded) = encoded {
+        encoded
+    } else {
+        owned_encoded = encode_gate_support_population(model, samples, device)?;
+        &owned_encoded
+    };
     let prediction = model
-        .forward_from_latent(&current, &batch.actions, &batch.action_coords, &batch.goals)?
+        .forward_from_latent(
+            &encoded.current,
+            &encoded.batch.actions,
+            &encoded.batch.action_coords,
+            &encoded.batch.goals,
+        )?
         .y;
-    let shuffled = shuffled_action_control_samples(samples);
     let shuffled_action_eligible_rows =
         crate::p2::semantic_eval::shuffled_action_eligible_rows(samples);
     let shuffled_action_changed_tuples = samples
         .iter()
-        .zip(&shuffled)
+        .zip(&encoded.shuffled)
         .filter(|(factual, control)| factual.action != control.action)
         .count();
-    let (shuffled_actions, shuffled_coords) = action_tensors_from_samples(&shuffled, device)?;
     let shuffled_prediction = model
-        .forward_from_latent(&current, &shuffled_actions, &shuffled_coords, &batch.goals)?
+        .forward_from_latent(
+            &encoded.current,
+            &encoded.shuffled_actions,
+            &encoded.shuffled_coords,
+            &encoded.batch.goals,
+        )?
         .y;
-    let learned_errors = per_sample_mse(&prediction, &target)?;
-    let copy_errors = per_sample_mse(&current, &target)?;
+    let learned_errors = per_sample_mse(&prediction, &encoded.target)?;
+    let copy_errors = per_sample_mse(&encoded.current, &encoded.target)?;
     let changed_indices = samples
         .iter()
         .enumerate()
@@ -2708,12 +2807,12 @@ pub fn evaluate_gate_support_with_content_masks(
         .collect::<Vec<_>>();
     let true_predictions = exact_palette_predictions(model, &prediction)?;
     let composed_predictions = model
-        .composed_gameplay_decode(&prediction, &batch.frames)?
+        .composed_gameplay_decode(&prediction, &encoded.batch.frames)?
         .reshape((samples.len(), (FRAME_SIDE - 1) * FRAME_SIDE))?
         .to_dtype(DType::U8)?
         .to_vec2::<u8>()?;
     let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
-    let target_reconstructions = exact_palette_predictions(model, &target)?;
+    let target_reconstructions = exact_palette_predictions(model, &encoded.target)?;
     let changed_pixels = samples
         .iter()
         .filter(|sample| is_board_changed_transition(sample))
@@ -2743,7 +2842,7 @@ pub fn evaluate_gate_support_with_content_masks(
         improvement_fraction: improvement_fraction(&changed_learned, &changed_copy),
         shuffled_action_changed_pixel_ratio: shuffled_action_changed_pixel_ratio(
             samples,
-            &shuffled,
+            &encoded.shuffled,
             &true_predictions,
             &shuffled_predictions,
         )?,
@@ -2785,6 +2884,166 @@ pub fn evaluate_gate_support_with_content_masks(
             true,
         )?,
         population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (provenance-origin rectangle reconstruction otherwise); complete action tuples use the maximum-change cyclic shuffle within provenance.source_kind; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
+    })
+}
+
+fn ablation_metrics(metrics: &GateSupportMetrics) -> AblationMetrics {
+    AblationMetrics {
+        one_step_changed_exact: metrics.one_step_changed_exact,
+        one_step_all_rows_exact: metrics.one_step_all_rows_exact,
+        false_edit_rate: metrics.false_edit_rate,
+        padding_false_edit_rate: metrics.padding_false_edit_rate,
+        improvement_fraction: metrics.improvement_fraction,
+        shuffled_action_changed_pixel_ratio: metrics.shuffled_action_changed_pixel_ratio,
+    }
+}
+
+fn decode_composition_description(composition: DecodeComposition) -> String {
+    match composition {
+        DecodeComposition::LegacyHardGate => "decode_composition=legacy_hard_gate".into(),
+        DecodeComposition::JointCopyMixture => "decode_composition=joint_copy_mixture".into(),
+    }
+}
+
+fn action_impulse_description(enabled: bool) -> String {
+    format!(
+        "action_impulse={}",
+        if enabled {
+            "grid_scaled"
+        } else {
+            "legacy_field"
+        }
+    )
+}
+
+fn deep_copy_varmap(source: &VarMap) -> Result<VarMap> {
+    let copied = {
+        let data = source.data().lock().unwrap();
+        data.iter()
+            .map(|(name, var)| {
+                Ok((
+                    name.clone(),
+                    Var::from_tensor(&var.as_tensor().copy()?.detach())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let target = VarMap::new();
+    target.data().lock().unwrap().extend(copied);
+    Ok(target)
+}
+
+fn set_copy_bypass_alpha(varmap: &VarMap, alpha: f64) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.ends_with("y_copy_bypass_alpha"))
+    {
+        var.set(&Tensor::full(
+            alpha as f32,
+            var.shape().dims(),
+            var.device(),
+        )?)
+        .map_err(|error| anyhow::anyhow!("set {name} to {alpha}: {error}"))?;
+        matched += 1;
+    }
+    if matched != 1 {
+        bail!("expected one copy-bypass alpha tensor, found {matched}");
+    }
+    Ok(())
+}
+
+/// Evaluate parameter-free and scalar treatment ablations on identical rows
+/// without mutating the checkpoint VarMap used by the main evaluation.
+pub fn evaluate_mechanism_ablations(
+    model: &WorldModel,
+    varmap: &VarMap,
+    samples: &[TransitionSample],
+    content_masks: Option<&[ContentMask]>,
+    device: &Device,
+) -> Result<MechanismAblationReport> {
+    let encoded = (!samples.is_empty())
+        .then(|| encode_gate_support_population(model, samples, device))
+        .transpose()?;
+    let evaluate_variant = |candidate: &WorldModel| {
+        evaluate_gate_support_impl(
+            candidate,
+            samples,
+            content_masks,
+            device,
+            encoded.as_ref(),
+        )
+    };
+    let baseline_gate = evaluate_variant(model)?;
+    let baseline = ablation_metrics(&baseline_gate);
+    let baseline_cfg = model.config().clone();
+
+    let mut decode_cfg = baseline_cfg.clone();
+    decode_cfg.decode_composition = match baseline_cfg.decode_composition {
+        DecodeComposition::LegacyHardGate => DecodeComposition::JointCopyMixture,
+        DecodeComposition::JointCopyMixture => DecodeComposition::LegacyHardGate,
+    };
+    let decode_model = WorldModel::new(
+        decode_cfg.clone(),
+        VarBuilder::from_varmap(varmap, DType::F32, device),
+    )?;
+    let decode_variant = ablation_metrics(&evaluate_variant(&decode_model)?);
+
+    let mut impulse_cfg = baseline_cfg.clone();
+    impulse_cfg.grid_scaled_action_impulse = !baseline_cfg.grid_scaled_action_impulse;
+    let impulse_model = WorldModel::new(
+        impulse_cfg.clone(),
+        VarBuilder::from_varmap(varmap, DType::F32, device),
+    )?;
+    let impulse_variant = ablation_metrics(&evaluate_variant(&impulse_model)?);
+
+    let copy_bypass_alpha_sweep = model
+        .copy_bypass_alpha()?
+        .map(|trained_alpha| -> Result<Vec<AlphaSweepPoint>> {
+            let sweep_varmap = deep_copy_varmap(varmap)?;
+            let sweep_model = WorldModel::new(
+                baseline_cfg.clone(),
+                VarBuilder::from_varmap(&sweep_varmap, DType::F32, device),
+            )?;
+            let mut points = vec![AlphaSweepPoint {
+                alpha: trained_alpha,
+                metrics: baseline.clone(),
+            }];
+            for alpha in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                set_copy_bypass_alpha(&sweep_varmap, alpha)?;
+                points.push(AlphaSweepPoint {
+                    alpha,
+                    metrics: ablation_metrics(&evaluate_variant(&sweep_model)?),
+                });
+            }
+            Ok(points)
+        })
+        .transpose()?;
+
+    Ok(MechanismAblationReport {
+        rows: samples.len(),
+        population_fingerprint: baseline_gate.population_fingerprint,
+        decode_composition: Some(AblationPair {
+            baseline_description: decode_composition_description(
+                baseline_cfg.decode_composition,
+            ),
+            baseline: baseline.clone(),
+            variant_description: decode_composition_description(decode_cfg.decode_composition),
+            variant: decode_variant,
+        }),
+        action_impulse: Some(AblationPair {
+            baseline_description: action_impulse_description(
+                baseline_cfg.grid_scaled_action_impulse,
+            ),
+            baseline,
+            variant_description: action_impulse_description(
+                impulse_cfg.grid_scaled_action_impulse,
+            ),
+            variant: impulse_variant,
+        }),
+        copy_bypass_alpha_sweep,
+        evidence_class: "selection_only".into(),
     })
 }
 
@@ -6139,7 +6398,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         );
     }
     let device = resolve_device(&cfg.device)?;
-    let (model, _varmap) = timed_eval_phase("model_load", "checkpoint", || {
+    let (model, varmap) = timed_eval_phase("model_load", "checkpoint", || {
         load_model(&train_cfg, &cfg.checkpoint, &device)
     })?;
     let needs_factual_population =
@@ -6485,7 +6744,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         .as_ref()
         .and_then(official_rhae_from_benchmark);
 
-    let v5_holdout_gates = (cfg.mode == EvalMode::Full
+    let foundation_holdout = (cfg.mode == EvalMode::Full
         && train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2)
         .then(|| {
             timed_eval_phase("population_generation", "v5_holdout_gates", || {
@@ -6493,6 +6752,22 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
             })
         })
         .transpose()?;
+    let (v5_holdout_gates, mechanism_ablations) = if let Some((gates, samples, masks)) =
+        foundation_holdout
+    {
+        let ablations = timed_eval_phase("mechanism_ablations", "v5_unseen_seed_7x7", || {
+            evaluate_mechanism_ablations(
+                &model,
+                &varmap,
+                &samples,
+                Some(&masks),
+                &device,
+            )
+        })?;
+        (Some(gates), Some(ablations))
+    } else {
+        (None, None)
+    };
 
     let report_reduction_started = Instant::now();
     let mut population_sha256 = BTreeMap::from([
@@ -6577,6 +6852,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         outcome_counterfactuals,
         arc3_transfer,
         v5_holdout_gates,
+        mechanism_ablations,
         research_claim: false,
     };
     if let Some(jsonl) = cfg.episode_jsonl.as_deref() {

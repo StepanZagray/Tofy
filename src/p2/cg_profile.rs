@@ -249,6 +249,18 @@ impl RepresentativeUpdateCapture {
         candle::record_tensor(session, guard.id(), &capture)
     }
 
+    pub fn record_tensor_stats(
+        &self,
+        range: &ProfileRange<'_>,
+        label: &str,
+        tensor: &Tensor,
+    ) -> Result<()> {
+        let (Some(session), Some(guard)) = (self.session.as_ref(), range._candle.as_ref()) else {
+            return Ok(());
+        };
+        session.record_tensor_stats(&format!("s{}", guard.id().raw()), label, tensor)
+    }
+
     pub fn record_gradients(&self, varmap: &VarMap, grads: &GradStore) -> Result<()> {
         let Some(session) = self.session.as_ref() else {
             return Ok(());
