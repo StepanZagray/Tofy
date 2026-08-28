@@ -103,6 +103,25 @@
   target. Their 0.25 Q and 0.30 reliability live-policy terms therefore counted
   one measurement twice. The unchanged score weights now combine distinct
   pixel-accuracy and latent-confidence signals; no reward/value claim follows.
+=======
+## Implementation correction (2026-08-28 — observable episode operator)
+
+- Foundation-v2 now conditions the existing additive action seam on a six-way
+  episode-operator family token (five families plus `UNKNOWN`) and the
+  color-conjugated agent/primary/secondary triple. The three colors are
+  represented as separate 16-way one-hots and projected together with the
+  family token through a zero-initialized linear, so fresh outputs exactly
+  preserve revision-3 behavior while the model can learn the new signal.
+- This removes two causal-identifiability defects in the single-transition
+  rows: ACTION5/ACTION6 targets no longer silently mix episode rules, and
+  palette augmentation no longer hides which recolored indices implement the
+  agent and operator colors. The conditioning triple is taken after the same
+  permutation applied to the board.
+- The held-out `SwapRegion` arm is now explicitly an unknown-rule evaluation:
+  it receives the `UNKNOWN` family token and a neutral all-zero color triple,
+  rather than silently overloading an observable tuple with an undisclosed
+  rule. Rows without synthetic operator provenance, including live ARC games,
+  use the same honest deployment posture.
 
 ## Preregistered model-treatment flags (2026-08-27, all default off)
 

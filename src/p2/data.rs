@@ -345,6 +345,17 @@ impl OperatorFamily {
         Self::PushLine,
         Self::SwapRegion,
     ];
+
+    /// Stable nonzero token; token zero is reserved for UNKNOWN.
+    pub const fn conditioning_token(self) -> usize {
+        match self {
+            Self::Teleport => 1,
+            Self::Toggle => 2,
+            Self::Paint => 3,
+            Self::PushLine => 4,
+            Self::SwapRegion => 5,
+        }
+    }
 }
 
 /// Episode-level operator split. Entire families, never individual rows, are
@@ -601,6 +612,10 @@ impl V5Sample {
             "v5 sidecar/source provenance mismatch"
         );
         ensure!(
+            self.transition.provenance.operator == Some(self.provenance.operator),
+            "v5 transition/operator provenance mismatch"
+        );
+        ensure!(
             self.provenance.source.content_width == u16::from(self.provenance.content_rect.width)
                 && self.provenance.source.content_height
                     == u16::from(self.provenance.content_rect.height),
@@ -736,6 +751,10 @@ pub struct TransitionProvenance {
     pub source_kind: String,
     /// Stable trajectory identity. Unlike `family`, this does not change when a goal is retargeted.
     pub trajectory_id: String,
+    /// Episode operator after row-level color conjugation. Legacy and real
+    /// rows omit it and are conditioned as an unknown rule with neutral colors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<EpisodeOperator>,
 }
 
 impl TransitionProvenance {
@@ -768,6 +787,15 @@ impl TransitionProvenance {
             !self.trajectory_id.is_empty(),
             "trajectory_id must not be empty"
         );
+        if let Some(operator) = self.operator {
+            for color in [
+                operator.agent_color,
+                operator.primary_color,
+                operator.secondary_color,
+            ] {
+                ensure!(color < 16, "operator color is outside palette");
+            }
+        }
         Ok(())
     }
 
@@ -783,6 +811,7 @@ impl TransitionProvenance {
                 scenario.split, scenario.seed, scenario.episode_id
             ),
             source_kind,
+            operator: None,
         }
     }
 
@@ -794,6 +823,7 @@ impl TransitionProvenance {
             content_y: 0,
             source_kind: source_kind.into(),
             trajectory_id: format!("synthetic/{source_kind}/{split:?}/{seed}/{episode_id}"),
+            operator: None,
         }
     }
 }
@@ -1917,13 +1947,15 @@ fn augment_v5_transition(
     // conditioning is explicitly represented at this observer seam.
     transition.exhausted = None;
     let content_mask = ContentMask::from_rect(rect)?;
+    let operator = permute_operator(operator, &augmentation.color_permutation);
+    transition.provenance.operator = Some(operator);
     Ok(V5Sample {
         provenance: V5SampleProvenance {
             source: transition.provenance.clone(),
             content_rect: rect,
             data_split: split,
             stream,
-            operator: permute_operator(operator, &augmentation.color_permutation),
+            operator,
             augmentation,
             goal_dropped,
             branch_group_id: None,

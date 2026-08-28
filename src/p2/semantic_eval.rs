@@ -1034,21 +1034,23 @@ pub fn evaluate_semantics_with_control(
         let (current_latent, target_latent) =
             model.encode_state_pair(&batch.frames, &batch.next_frames)?;
         let prediction = model
-            .forward_from_latent(
+            .forward_from_latent_with_operator_conditioning(
                 &current_latent,
                 &batch.actions,
                 &batch.action_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
             )?
             .y;
         let (shuffled_actions, shuffled_coords) =
             action_tensors_from_samples(&shuffled[start..end], device)?;
         let shuffled_prediction = model
-            .forward_from_latent(
+            .forward_from_latent_with_operator_conditioning(
                 &current_latent,
                 &shuffled_actions,
                 &shuffled_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
             )?
             .y;
         let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
@@ -1097,7 +1099,13 @@ pub fn evaluate_semantics_with_control(
             )?;
             let null_coords = Tensor::zeros((rows.len(), 2), DType::F32, device)?;
             let null_prediction = model
-                .forward_from_latent(&current_latent, &null_actions, &null_coords, &batch.goals)?
+                .forward_from_latent_with_operator_conditioning(
+                    &current_latent,
+                    &null_actions,
+                    &null_coords,
+                    &batch.goals,
+                    &batch.operator_conditioning,
+                )?
                 .y;
             decoded.push((
                 "trained_null_action_prediction",
@@ -1248,6 +1256,7 @@ mod tests {
                 content_y: 0,
                 source_kind: "movement".into(),
                 trajectory_id: "sim/Train/9/4".into(),
+                operator: None,
             },
             oracle_latent: None,
         }

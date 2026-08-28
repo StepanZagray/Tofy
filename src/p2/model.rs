@@ -29,6 +29,12 @@ pub const PALETTE_SIZE: usize = 16;
 /// Inclusive action ID range `0..=6`.
 /// Embedding rows for official action ids `0..=7` (`0` unused; `1..=7` = ACTION1..ACTION7).
 pub const ACTION_VOCAB: usize = 8;
+/// UNKNOWN plus the five synthetic episode-operator families.
+pub const OPERATOR_FAMILY_VOCAB: usize = 6;
+/// One family one-hot and three independent 16-color one-hots.
+pub const OPERATOR_CONDITION_DIM: usize = OPERATOR_FAMILY_VOCAB + 3 * PALETTE_SIZE;
+/// Family token used for held-out or unavailable operator provenance.
+pub const OPERATOR_FAMILY_UNKNOWN: usize = 0;
 
 /// Six family indicators plus public parameters/order slots.
 pub const DEFAULT_GOAL_DIM: usize = 19;
@@ -395,6 +401,35 @@ pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
     Ok(())
 }
 
+/// Restore the operator pathway's identity-preserving zero initialization
+/// after the deterministic model-wide reinitializer. Legacy topologies do not
+/// instantiate this projection and are a deliberate no-op.
+pub fn zero_operator_conditioning_projection(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.starts_with("operator_conditioning_proj."))
+    {
+        var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
+            .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
+        matched += 1;
+    }
+    if matched != 0 && matched != 2 {
+        bail!("expected zero or two operator-conditioning parameters, found {matched}");
+    }
+    Ok(())
+}
+
+/// UNKNOWN family token with a neutral all-zero color triple.
+pub fn unknown_operator_conditioning(batch: usize, device: &candle_core::Device) -> Result<Tensor> {
+    let mut values = vec![0f32; batch * OPERATOR_CONDITION_DIM];
+    for row in 0..batch {
+        values[row * OPERATOR_CONDITION_DIM + OPERATOR_FAMILY_UNKNOWN] = 1.0;
+    }
+    Tensor::from_vec(values, (batch, OPERATOR_CONDITION_DIM), device).map_err(Into::into)
+}
+
 /// Restore the copy-bypass gate's small nonzero initialization after any
 /// generic model-wide reinitializer (which xavier-initializes every non-bias
 /// tensor). A no-op when the gate is absent; every fresh-init training path
@@ -727,6 +762,8 @@ pub struct WorldModel {
     encoder: GridEncoder,
     action_emb: Embedding,
     action_proj: Linear,
+    /// Zero-initialized additive projection of family and operator colors.
+    operator_conditioning_proj: Option<Linear>,
     action_film_gamma: Linear,
     action_film_beta: Linear,
     coord_proj: Linear,
@@ -815,6 +852,16 @@ impl WorldModel {
             encoder: GridEncoder::new(cfg.hidden_dim, cfg.patch_size, vb.pp("encoder"))?,
             action_emb: embedding(ACTION_VOCAB, cfg.action_dim, vb.pp("action_emb"))?,
             action_proj: linear(cfg.action_dim, cfg.hidden_dim, vb.pp("action_proj"))?,
+            operator_conditioning_proj: cfg
+                .world_core_v5
+                .then(|| {
+                    zero_initialized_linear(
+                        OPERATOR_CONDITION_DIM,
+                        cfg.hidden_dim,
+                        vb.pp("operator_conditioning_proj"),
+                    )
+                })
+                .transpose()?,
             action_film_gamma: zero_initialized_linear(
                 cfg.action_dim,
                 cfg.hidden_dim,
@@ -1129,12 +1176,33 @@ impl WorldModel {
         next_frames: &Tensor,
         actions: &Tensor,
         action_coords: &Tensor,
+        goal_features: &Tensor,
+    ) -> Result<RepresentationDiagnosticOutput> {
+        let operator_conditioning = unknown_operator_conditioning(frames.dim(0)?, frames.device())?;
+        self.representation_diagnostic_with_operator_conditioning(
+            frames,
+            next_frames,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+        )
+    }
+
+    pub fn representation_diagnostic_with_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
         _goal_features: &Tensor,
+        operator_conditioning: &Tensor,
     ) -> Result<RepresentationDiagnosticOutput> {
         let (current_raw, target_raw) = self.encode_state_pair_raw(frames, next_frames)?;
         let current = rms_norm_latent(&current_raw)?;
         let target = rms_norm_latent(&target_raw)?;
-        let x = self.add_action(&current, actions, action_coords)?;
+        let x =
+            self.add_action_with_operator(&current, actions, action_coords, operator_conditioning)?;
         let film = self.action_film(actions, current.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| current.clone());
         let recursion = self.run_latent_recursion(
@@ -1246,7 +1314,30 @@ impl WorldModel {
         actions: &Tensor,
         action_coords: &Tensor,
     ) -> Result<Tensor> {
-        self.add_action_with_canonical(state, None, actions, action_coords)
+        let operator_conditioning = unknown_operator_conditioning(state.dim(0)?, state.device())?;
+        self.add_action_with_canonical_and_operator(
+            state,
+            None,
+            actions,
+            action_coords,
+            &operator_conditioning,
+        )
+    }
+
+    fn add_action_with_operator(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: &Tensor,
+    ) -> Result<Tensor> {
+        self.add_action_with_canonical_and_operator(
+            state,
+            None,
+            actions,
+            action_coords,
+            operator_conditioning,
+        )
     }
 
     fn action_film(&self, actions: &Tensor, batch: usize) -> Result<ActionFilm> {
@@ -1281,12 +1372,13 @@ impl WorldModel {
     /// Shared action-conditioning implementation. Full V4 training supplies
     /// the already-required canonical state so action conditioning, SIGReg,
     /// and the prediction objective reuse one autograd node.
-    fn add_action_with_canonical(
+    fn add_action_with_canonical_and_operator(
         &self,
         state: &Tensor,
         canonical: Option<&Tensor>,
         actions: &Tensor,
         action_coords: &Tensor,
+        operator_conditioning: &Tensor,
     ) -> Result<Tensor> {
         let b = state.dim(0)?;
         let latent_grid = self.config.latent_grid();
@@ -1313,11 +1405,23 @@ impl WorldModel {
         if action_coords.dims2()? != (b, 2) {
             bail!("action_coords must have shape [B,2]");
         }
+        if operator_conditioning.dims2()? != (b, OPERATOR_CONDITION_DIM) {
+            bail!("operator_conditioning must have shape [B,{OPERATOR_CONDITION_DIM}]");
+        }
         let action = self
             .action_proj
             .forward(&self.action_emb.forward(&actions)?)?;
         let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
-        let conditioned = state.broadcast_add(&action_bias)?;
+        let mut conditioned = state.broadcast_add(&action_bias)?;
+        if let Some(projection) = &self.operator_conditioning_proj {
+            let operator_bias = projection.forward(operator_conditioning)?.reshape((
+                b,
+                self.config.hidden_dim,
+                1,
+                1,
+            ))?;
+            conditioned = conditioned.broadcast_add(&operator_bias)?;
+        }
         let coord_bias = if !self.config.spatial_action_field || self.config.spatial_action_residual
         {
             let mut coords = self.coord_proj.forward(action_coords)?;
@@ -1449,13 +1553,13 @@ impl WorldModel {
         Ok(self.goal_proj.forward(goal_features)?)
     }
 
-    /// Shared transition prep: encode state/action, project goals, optional warm-start `y`.
-    fn prepare_transition(
+    fn prepare_transition_with_operator_conditioning(
         &self,
         frames: &Tensor,
         actions: &Tensor,
         action_coords: &Tensor,
         goal_features: &Tensor,
+        operator_conditioning: &Tensor,
     ) -> Result<(Tensor, ActionFilm, Tensor, Option<Tensor>)> {
         let state = if self.config.warm_start_y {
             Some(self.encode_state(frames)?)
@@ -1463,8 +1567,18 @@ impl WorldModel {
             None
         };
         let x = match &state {
-            Some(s) => self.add_action(s, actions, action_coords)?,
-            None => self.encode_x(frames, actions, action_coords)?,
+            Some(s) => {
+                self.add_action_with_operator(s, actions, action_coords, operator_conditioning)?
+            }
+            None => {
+                let state = self.encode_state(frames)?;
+                self.add_action_with_operator(
+                    &state,
+                    actions,
+                    action_coords,
+                    operator_conditioning,
+                )?
+            }
         };
         let film = self.action_film(actions, x.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
@@ -1860,8 +1974,38 @@ impl WorldModel {
         z_noise_sigma: f64,
         noise_seed: Option<u64>,
     ) -> Result<ForwardOutput> {
-        let (x, film, goal_h, y_init) =
-            self.prepare_transition(frames, actions, action_coords, goal_features)?;
+        let operator_conditioning = unknown_operator_conditioning(frames.dim(0)?, frames.device())?;
+        self.forward_with_depth_and_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_depth_and_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+    ) -> Result<ForwardOutput> {
+        let (x, film, goal_h, y_init) = self.prepare_transition_with_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+        )?;
         self.run_recursion(
             &x,
             &film,
@@ -1879,7 +2023,7 @@ impl WorldModel {
     pub fn forward_from_encoded_state(
         &self,
         cur_state: &Tensor,
-        _frames: &Tensor,
+        frames: &Tensor,
         actions: &Tensor,
         action_coords: &Tensor,
         goal_features: &Tensor,
@@ -1888,7 +2032,42 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<ForwardOutput> {
-        let x = self.add_action(cur_state, actions, action_coords)?;
+        let operator_conditioning =
+            unknown_operator_conditioning(cur_state.dim(0)?, cur_state.device())?;
+        self.forward_from_encoded_state_with_operator_conditioning(
+            cur_state,
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_from_encoded_state_with_operator_conditioning(
+        &self,
+        cur_state: &Tensor,
+        _frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<ForwardOutput> {
+        let x = self.add_action_with_operator(
+            cur_state,
+            actions,
+            action_coords,
+            operator_conditioning,
+        )?;
         let film = self.action_film(actions, cur_state.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
@@ -1924,7 +2103,38 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
-        let x = self.add_action(cur_state, actions, action_coords)?;
+        let operator_conditioning =
+            unknown_operator_conditioning(cur_state.dim(0)?, cur_state.device())?;
+        self.training_latents_from_encoded_state_with_operator_conditioning(
+            cur_state,
+            actions,
+            action_coords,
+            &operator_conditioning,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn training_latents_from_encoded_state_with_operator_conditioning(
+        &self,
+        cur_state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
+        let x = self.add_action_with_operator(
+            cur_state,
+            actions,
+            action_coords,
+            operator_conditioning,
+        )?;
         let film = self.action_film(actions, cur_state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(
@@ -1953,14 +2163,43 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
+        let operator_conditioning =
+            unknown_operator_conditioning(cur_state.dim(0)?, cur_state.device())?;
+        self.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
+            cur_state,
+            current_canonical,
+            actions,
+            action_coords,
+            &operator_conditioning,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_v4_training_latents_from_encoded_state_with_operator_conditioning(
+        &self,
+        cur_state: &Tensor,
+        current_canonical: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
         if !self.config.world_core_v4 {
             bail!("Full V4 training recursion requires world_core_v4");
         }
-        let x = self.add_action_with_canonical(
+        let x = self.add_action_with_canonical_and_operator(
             cur_state,
             Some(current_canonical),
             actions,
             action_coords,
+            operator_conditioning,
         )?;
         let film = self.action_film(actions, cur_state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
@@ -1994,6 +2233,26 @@ impl WorldModel {
         )
     }
 
+    pub fn forward_with_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+    ) -> Result<ForwardOutput> {
+        self.forward_with_depth_and_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            RecursionDepth::from_config(&self.config),
+            0.0,
+            None,
+        )
+    }
+
     /// Deterministic matched-compute ablation with extra recursion and unchanged
     /// weights. This is evaluation-only; training uses the configured depth.
     pub fn forward_with_outer_steps(
@@ -2004,8 +2263,33 @@ impl WorldModel {
         goal_features: &Tensor,
         outer_steps: usize,
     ) -> Result<ForwardOutput> {
-        let (x, film, goal_h, y_init) =
-            self.prepare_transition(frames, actions, action_coords, goal_features)?;
+        let operator_conditioning = unknown_operator_conditioning(frames.dim(0)?, frames.device())?;
+        self.forward_with_outer_steps_and_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            outer_steps,
+        )
+    }
+
+    pub fn forward_with_outer_steps_and_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        outer_steps: usize,
+    ) -> Result<ForwardOutput> {
+        let (x, film, goal_h, y_init) = self.prepare_transition_with_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+        )?;
         self.run_recursion(
             &x,
             &film,
@@ -2038,6 +2322,24 @@ impl WorldModel {
         )
     }
 
+    pub fn forward_from_latent_with_operator_conditioning(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+    ) -> Result<ForwardOutput> {
+        self.forward_from_latent_with_depth_and_operator_conditioning(
+            state,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            RecursionDepth::from_config(&self.config),
+        )
+    }
+
     pub fn forward_from_latent_with_depth(
         &self,
         state: &Tensor,
@@ -2046,7 +2348,28 @@ impl WorldModel {
         goal_features: &Tensor,
         depth: RecursionDepth,
     ) -> Result<ForwardOutput> {
-        let x = self.add_action(state, actions, action_coords)?;
+        let operator_conditioning = unknown_operator_conditioning(state.dim(0)?, state.device())?;
+        self.forward_from_latent_with_depth_and_operator_conditioning(
+            state,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            depth,
+        )
+    }
+
+    pub fn forward_from_latent_with_depth_and_operator_conditioning(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+    ) -> Result<ForwardOutput> {
+        let x =
+            self.add_action_with_operator(state, actions, action_coords, operator_conditioning)?;
         let film = self.action_film(actions, state.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
@@ -2112,6 +2435,26 @@ impl WorldModel {
         )
     }
 
+    pub fn forward_ptrm_with_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
+        self.forward_ptrm_with_depth_and_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            RecursionDepth::from_config(&self.config),
+            ptrm,
+        )
+    }
+
     pub fn forward_ptrm_with_depth(
         &self,
         frames: &Tensor,
@@ -2121,14 +2464,41 @@ impl WorldModel {
         depth: RecursionDepth,
         ptrm: PtrmConfig,
     ) -> Result<PtrmOutput> {
+        let operator_conditioning = unknown_operator_conditioning(frames.dim(0)?, frames.device())?;
+        self.forward_ptrm_with_depth_and_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            depth,
+            ptrm,
+        )
+    }
+
+    pub fn forward_ptrm_with_depth_and_operator_conditioning(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
         if ptrm.k == 0 {
             bail!("PTRM requires K >= 1");
         }
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
-        let (x, film, goal_h, y_init) =
-            self.prepare_transition(frames, actions, action_coords, goal_features)?;
+        let (x, film, goal_h, y_init) = self.prepare_transition_with_operator_conditioning(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+        )?;
         self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
     }
 
@@ -2142,7 +2512,30 @@ impl WorldModel {
         depth: RecursionDepth,
         ptrm: PtrmConfig,
     ) -> Result<PtrmOutput> {
-        let x = self.add_action(state, actions, action_coords)?;
+        let operator_conditioning = unknown_operator_conditioning(state.dim(0)?, state.device())?;
+        self.forward_ptrm_from_latent_with_operator_conditioning(
+            state,
+            actions,
+            action_coords,
+            goal_features,
+            &operator_conditioning,
+            depth,
+            ptrm,
+        )
+    }
+
+    pub fn forward_ptrm_from_latent_with_operator_conditioning(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        depth: RecursionDepth,
+        ptrm: PtrmConfig,
+    ) -> Result<PtrmOutput> {
+        let x =
+            self.add_action_with_operator(state, actions, action_coords, operator_conditioning)?;
         let film = self.action_film(actions, state.dim(0)?)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
@@ -2682,6 +3075,68 @@ mod tests {
                 assert!(step.event_logits.is_none());
                 assert!(step.q_logit.is_none());
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_initialized_operator_conditioning_is_bit_identical_to_unknown_input() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            world_core_v4: true,
+            world_core_v5: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..tiny_cfg()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
+        reinit_varmap_deterministic(&varmap, 97)?;
+        zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
+        let (frames, actions, coords, goals) = sample_batch(&device, 2, model.config.goal_dim)?;
+        let baseline = model.forward(&frames, &actions, &coords, &goals)?;
+        let mut values = vec![0f32; 2 * OPERATOR_CONDITION_DIM];
+        for row in 0..2 {
+            let base = row * OPERATOR_CONDITION_DIM;
+            values[base + 2] = 1.0;
+            values[base + OPERATOR_FAMILY_VOCAB + 7] = 1.0;
+            values[base + OPERATOR_FAMILY_VOCAB + PALETTE_SIZE + 11] = 1.0;
+            values[base + OPERATOR_FAMILY_VOCAB + 2 * PALETTE_SIZE + 4] = 1.0;
+        }
+        let attached = Tensor::from_vec(values, (2, OPERATOR_CONDITION_DIM), &device)?;
+        let conditioned = model
+            .forward_with_operator_conditioning(&frames, &actions, &coords, &goals, &attached)?;
+        for (name, left, right) in [
+            ("latent", &baseline.y, &conditioned.y),
+            ("events", &baseline.event_logits, &conditioned.event_logits),
+            ("q", &baseline.q_logit, &conditioned.q_logit),
+            (
+                "reliability",
+                &baseline.reliability_logit,
+                &conditioned.reliability_logit,
+            ),
+        ] {
+            assert_eq!(
+                left.flatten_all()?.to_vec1::<f32>()?,
+                right.flatten_all()?.to_vec1::<f32>()?,
+                "fresh output differs at {name}"
+            );
+        }
+        let parameters = varmap.data().lock().unwrap();
+        for (name, parameter) in parameters
+            .iter()
+            .filter(|(name, _)| name.starts_with("operator_conditioning_proj."))
+        {
+            assert!(
+                parameter
+                    .as_tensor()
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .all(|value| *value == 0.0),
+                "{name} was not zero initialized"
+            );
         }
         Ok(())
     }

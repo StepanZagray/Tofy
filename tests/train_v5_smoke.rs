@@ -5,7 +5,9 @@ use tofy::p2::data::{
     compose_mixed_stream_batch, MixedStreamConfig, V5DataSplit, GOAL_FEATURES_DIM,
 };
 use tofy::p2::experiment::ConsumerReadoutTopology;
-use tofy::p2::model::{zero_action_film_projections, ModelConfig, WorldModel};
+use tofy::p2::model::{
+    zero_action_film_projections, zero_operator_conditioning_projection, ModelConfig, WorldModel,
+};
 use tofy::p2::train::{
     foundation_v2_training_loss, reinit_varmap_deterministic, FoundationV2ObjectiveConfig,
 };
@@ -47,6 +49,7 @@ fn mixed_batch_runs_the_complete_foundation_v2_objective_on_cpu() -> Result<()> 
     )?;
     reinit_varmap_deterministic(&vars, 23)?;
     zero_action_film_projections(&vars)?;
+    zero_operator_conditioning_projection(&vars)?;
 
     let losses = foundation_v2_training_loss(
         &model,

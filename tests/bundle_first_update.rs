@@ -3,7 +3,10 @@ use anyhow::Result;
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use tofy::p2::data::{compose_mixed_stream_batch, foundation_v2_stream_schedule, MixedStreamConfig, V5DataSplit};
-use tofy::p2::model::{init_copy_bypass_gate, restore_copy_gate_bias_prior, zero_action_film_projections, WorldModel};
+use tofy::p2::model::{
+    init_copy_bypass_gate, restore_copy_gate_bias_prior, zero_action_film_projections,
+    zero_operator_conditioning_projection, WorldModel,
+};
 use tofy::p2::train::{foundation_v2_training_loss, reinit_varmap_deterministic, FoundationV2ObjectiveConfig, TrainConfig};
 
 #[test]
@@ -25,6 +28,7 @@ fn bundle_treatments_first_update_gradient_is_finite_and_bounded() -> Result<()>
     let model = WorldModel::new(cfg.model_config(), VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
     reinit_varmap_deterministic(&varmap, 9993)?;
     zero_action_film_projections(&varmap)?;
+    zero_operator_conditioning_projection(&varmap)?;
     init_copy_bypass_gate(&varmap)?;
     restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
     let mixed = compose_mixed_stream_batch(
