@@ -48,12 +48,31 @@ fn changed_pixel_weights_use_content_only_and_clamp_the_ratio() {
     let mut rare_target = vec![0; 100];
     rare_target[0] = 1;
     let rare = foundation_v2_loss_weights_from_masks(&[0; 100], &rare_target, &[1; 100]).unwrap();
-    assert_eq!(rare.changed_weight, 64.0);
+    assert_eq!(rare.changed_weight, 50.0);
 
     let all_changed = foundation_v2_loss_weights_from_masks(&[0; 8], &[1; 8], &[1; 8]).unwrap();
     assert_eq!(all_changed.changed_weight, 1.0);
     let none_changed = foundation_v2_loss_weights_from_masks(&[0; 8], &[0; 8], &[1; 8]).unwrap();
-    assert_eq!(none_changed.changed_weight, 64.0);
+    assert_eq!(none_changed.changed_weight, 50.0);
+}
+
+#[test]
+fn changed_pixel_amplification_preserves_live_regime_and_caps_rare_changes() {
+    let content_pixels = 13_341;
+    let changed_pixels = 812;
+    let current = vec![0; content_pixels];
+    let mut target = current.clone();
+    target[..changed_pixels].fill(1);
+    let live =
+        foundation_v2_loss_weights_from_masks(&current, &target, &vec![1; content_pixels]).unwrap();
+    let uncapped = (content_pixels - changed_pixels) as f64 / changed_pixels as f64;
+    assert!((live.changed_weight - uncapped).abs() < 1e-12);
+
+    let mut rare_target = vec![0; 1_000];
+    rare_target[0] = 1;
+    let rare =
+        foundation_v2_loss_weights_from_masks(&[0; 1_000], &rare_target, &[1; 1_000]).unwrap();
+    assert_eq!(rare.changed_weight, 50.0);
 }
 
 #[test]

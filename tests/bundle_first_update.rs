@@ -7,7 +7,10 @@ use tofy::p2::model::{restore_copy_gate_bias_prior, zero_action_film_projections
 use tofy::p2::train::{foundation_v2_training_loss, reinit_varmap_deterministic, FoundationV2ObjectiveConfig, TrainConfig};
 
 #[test]
-fn bundle_treatments_first_update_gradient_is_finite() -> Result<()> {
+fn bundle_treatments_first_update_gradient_is_finite_and_bounded() -> Result<()> {
+    // The deterministic post-fix fixture is ~704; retain modest headroom for
+    // backend reduction-order variation while catching conditioning regressions.
+    const MAX_FIRST_UPDATE_GRADIENT_L2: f64 = 800.0;
     let device = Device::Cpu;
     let mut cfg = TrainConfig::default();
     cfg.apply_foundation_v2_recipe();
@@ -35,13 +38,21 @@ fn bundle_treatments_first_update_gradient_is_finite() -> Result<()> {
     })?;
     let grads = losses.total.backward()?;
     let mut nonfinite = Vec::new();
+    let mut gradient_squared_l2 = 0.0;
     let data = varmap.data().lock().unwrap();
     for (name, var) in data.iter() {
         if let Some(g) = grads.get(var.as_tensor()) {
             let s = g.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
             if !s.is_finite() { nonfinite.push(format!("{name}={s}")); }
+            gradient_squared_l2 +=
+                f64::from(g.to_dtype(DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?);
         }
     }
     assert!(nonfinite.is_empty(), "non-finite grads: {nonfinite:?}");
+    let gradient_l2 = gradient_squared_l2.sqrt();
+    assert!(
+        gradient_l2 <= MAX_FIRST_UPDATE_GRADIENT_L2,
+        "copy-bypass init gradient L2 {gradient_l2} exceeds conditioning bound"
+    );
     Ok(())
 }

@@ -81,8 +81,16 @@ const ROLLOUT_ERROR_RESET: f32 = 5.0;
 const Q_SURPRISE_WEIGHT: f64 = 0.1;
 /// Smooth forward bound for SIGReg while retaining gradients above the limit.
 const SIGREG_LOSS_CAP: f64 = 10_000.0;
-/// Global gradient L2 clip for recursive training stability.
+/// Global gradient L2 clip. A safety rail is the intended policy, but keep 1.0
+/// until post-conditioning run telemetry establishes the typical norm;
+/// pre-fix, almost-always-clipped norms do not justify raising the threshold.
 const MAX_GRAD_NORM: f64 = 1.0;
+/// Caps rare-change amplification while leaving the observed 812/13_341
+/// changed-pixel regime (`(1-p)/p = 15.43`) unchanged.
+const FOUNDATION_V2_CHANGED_STRATUM_AMPLIFICATION_MAX: f64 = 50.0;
+/// Smooth displacement-normalization radius. For
+/// `d / sqrt(||d||^2 + eps^2)`, the Jacobian operator norm is at most 1/eps.
+const FOUNDATION_V2_DISPLACEMENT_NORM_EPS: f64 = 1e-3;
 const FOUNDATION_V2_EP_MIN_WEIGHT: f64 = 1e-4;
 const FOUNDATION_V2_EP_MAX_WEIGHT: f64 = 0.1;
 const FOUNDATION_V2_EP_GRADIENT_BUDGET: f64 = 0.3;
@@ -106,8 +114,9 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// checkpoint trained under an older objective cannot silently resume under a
 /// newer one; the resume contract carries this value without a serde default.
 /// 1 = pre-content-mask objective; 2 = 2026-08-27 content-masked objective
-/// with the reachable separation hinge and budget-exact EP controller.
-pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 2;
+/// with the reachable separation hinge and budget-exact EP controller;
+/// 3 = bounded split-CE amplification and conditioned displacement norm.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 3;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -156,7 +165,7 @@ pub fn foundation_v2_loss_weights_from_masks(
         changed_pixels,
         unchanged_pixels,
         changed_fraction,
-        changed_weight: ratio.clamp(1.0, 64.0),
+        changed_weight: ratio.clamp(1.0, FOUNDATION_V2_CHANGED_STRATUM_AMPLIFICATION_MAX),
         unchanged_weight: 1.0,
     })
 }
@@ -1443,6 +1452,8 @@ pub struct FoundationV2LossMeans {
     pub reliability: f64,
     pub pre_clip_gradient_norm: f64,
     pub gradient_clip_scale: f64,
+    #[serde(default)]
+    pub clipped_fraction: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3930,7 +3941,7 @@ pub fn split_weighted_ce(
 #[serde(rename_all = "snake_case")]
 pub enum SplitCeWeighting {
     /// Existing behavior: the positive-stratum mean is scaled by
-    /// `clamp((1-p)/p, 1, 64)`, so the per-pixel coefficient ratio is
+    /// `clamp((1-p)/p, 1, 50)`, so the per-pixel coefficient ratio is
     /// `((1-p)/p)^2` pre-cap ("double weighting").
     #[default]
     CurrentDouble,
@@ -4379,16 +4390,14 @@ pub fn foundation_v2_training_loss(
     // translated PAD field. Derive displacement from the same content-masked
     // canonical seam used by the latent/EP corrections.
     let displacement = content_predicted_canonical.sub(&content_current_canonical)?;
-    // Epsilon inside the sqrt: with the copy-bypass gate at its zero init the
-    // predicted canonical EXACTLY equals the current canonical, and sqrt(0)
-    // has a non-finite backward (the first bundle-run smoke aborted with NaN
-    // gradients here). The clamp alone cannot fix the backward pass.
+    // Smooth the norm at the copy-bypass zero init. Besides keeping sqrt(0)
+    // backward finite, eps=1e-3 bounds this normalization's Jacobian scale by
+    // 1/eps=1_000 instead of the previous effective scale of 1_000_000.
     let displacement_norm = displacement
         .sqr()?
         .sum_keepdim(D::Minus1)?
-        .affine(1.0, 1e-12)?
-        .sqrt()?
-        .clamp(1e-6, f64::INFINITY)?;
+        .affine(1.0, FOUNDATION_V2_DISPLACEMENT_NORM_EPS.powi(2))?
+        .sqrt()?;
     let normalized_displacement = displacement.broadcast_div(&displacement_norm)?;
     let mut pull_terms = Vec::new();
     let mut separation_terms = Vec::new();
@@ -6362,6 +6371,7 @@ fn foundation_v2_loss_means(sums: &FoundationV2LossMeans, count: u64) -> Foundat
         reliability: sums.reliability / n,
         pre_clip_gradient_norm: sums.pre_clip_gradient_norm / n,
         gradient_clip_scale: sums.gradient_clip_scale / n,
+        clipped_fraction: sums.clipped_fraction / n,
     }
 }
 
@@ -6503,6 +6513,7 @@ fn foundation_v2_loss_values(
         reliability: values[12] as f64,
         pre_clip_gradient_norm,
         gradient_clip_scale,
+        clipped_fraction: f64::from(gradient_clip_scale < 1.0),
     })
 }
 
@@ -6522,6 +6533,7 @@ fn add_foundation_v2_loss_sums(sums: &mut FoundationV2LossMeans, values: &Founda
     sums.reliability += values.reliability;
     sums.pre_clip_gradient_norm += values.pre_clip_gradient_norm;
     sums.gradient_clip_scale += values.gradient_clip_scale;
+    sums.clipped_fraction += values.clipped_fraction;
 }
 
 fn validate_foundation_v2_profile_resume(
@@ -8031,6 +8043,15 @@ mod tests {
             output_dir,
             ..TrainConfig::default()
         }
+    }
+
+    #[test]
+    fn foundation_v2_loss_means_reports_clipped_fraction() {
+        let sums = FoundationV2LossMeans {
+            clipped_fraction: 3.0,
+            ..FoundationV2LossMeans::default()
+        };
+        assert_eq!(foundation_v2_loss_means(&sums, 4).clipped_fraction, 0.75);
     }
 
     /// Compare state produced by two independently executed runs.
