@@ -2883,7 +2883,7 @@ fn evaluate_gate_support_impl(
             content_masks,
             true,
         )?,
-        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (provenance-origin rectangle reconstruction otherwise); complete action tuples use the maximum-change cyclic shuffle within provenance.source_kind; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
+        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (provenance-origin rectangle reconstruction otherwise); action tuples use the maximum-change cyclic shuffle within provenance.source_kind, with ACTION6 rectangle-relative coordinates conjugated onto each target content rectangle; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
     })
 }
 

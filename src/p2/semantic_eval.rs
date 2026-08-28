@@ -754,11 +754,12 @@ pub fn collision_census(
     }
 }
 
-/// Deterministically rotate complete action tuples only among rows that share
-/// `provenance.source_kind`. The cyclic offset maximizing genuinely changed
-/// tuples is selected per source (lowest offset breaks ties). This preserves
-/// source-local action marginals while exposing unavoidable duplicate tuples
-/// instead of pretending every row was perturbed.
+/// Deterministically rotate action tuples only among rows that share
+/// `provenance.source_kind`. ACTION6 coordinates rotate as rectangle-relative
+/// offsets and are re-based onto each target row's content rectangle. The
+/// cyclic offset maximizing genuinely changed resulting tuples is selected per
+/// source (lowest offset breaks ties), exposing unavoidable duplicates instead
+/// of pretending every row was perturbed.
 fn shuffled_action_source_rows(samples: &[TransitionSample]) -> BTreeMap<&str, Vec<usize>> {
     let mut source_rows = BTreeMap::<&str, Vec<usize>>::new();
     for (index, sample) in samples.iter().enumerate() {
@@ -782,6 +783,58 @@ pub fn shuffled_action_eligible_rows(samples: &[TransitionSample]) -> usize {
         .sum()
 }
 
+fn conjugated_action_for_target(donor: &TransitionSample, target: &TransitionSample) -> ArcAction {
+    if donor.action.id != 6 {
+        return donor.action.clone();
+    }
+
+    fn rebase(
+        coordinate: u8,
+        donor_origin: u16,
+        donor_size: u16,
+        target_origin: u16,
+        target_size: u16,
+    ) -> Option<u8> {
+        let offset = u16::from(coordinate).checked_sub(donor_origin)?;
+        if offset >= donor_size || target_size == 0 {
+            return None;
+        }
+        let offset = if donor_size == target_size {
+            offset
+        } else {
+            offset.min(target_size.saturating_sub(1))
+        };
+        u8::try_from(target_origin + offset).ok()
+    }
+
+    let conjugated = donor.action.x.zip(donor.action.y).and_then(|(x, y)| {
+        Some((
+            rebase(
+                x,
+                donor.provenance.content_x,
+                donor.provenance.content_width,
+                target.provenance.content_x,
+                target.provenance.content_width,
+            )?,
+            rebase(
+                y,
+                donor.provenance.content_y,
+                donor.provenance.content_height,
+                target.provenance.content_y,
+                target.provenance.content_height,
+            )?,
+        ))
+    });
+    match conjugated {
+        Some((x, y)) => ArcAction {
+            id: donor.action.id,
+            x: Some(x),
+            y: Some(y),
+        },
+        None => donor.action.clone(),
+    }
+}
+
 pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
     let mut shuffled = samples.to_vec();
     let source_rows = shuffled_action_source_rows(samples);
@@ -797,7 +850,8 @@ pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<Tran
                 .enumerate()
                 .filter(|(position, target)| {
                     let donor = indices[(*position + offset) % indices.len()];
-                    samples[**target].action != samples[donor].action
+                    samples[**target].action
+                        != conjugated_action_for_target(&samples[donor], &samples[**target])
                 })
                 .count();
             if changed > best_changed {
@@ -807,7 +861,8 @@ pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<Tran
         }
         for (position, &target) in indices.iter().enumerate() {
             let donor = indices[(position + best_offset) % indices.len()];
-            shuffled[target].action = samples[donor].action.clone();
+            shuffled[target].action =
+                conjugated_action_for_target(&samples[donor], &samples[target]);
         }
     }
     shuffled
@@ -1018,8 +1073,8 @@ pub fn evaluate_semantics_with_control(
         reduction_contract: "overall aggregates only source-comparable masks and omits content-derived false-edit scalars; by_source reports pixel aggregate plus equal-transition mean within provenance.source_kind, including the false-edit scalars".into(),
         population_contract: "one_step_population; not comparable as a horizon curve with semantic_rollout, whose trajectory-filtered population is separately fingerprinted".into(),
         action_control_contract: match control.trained_null_action_id {
-            Some(id) => format!("action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; trained_null_action_prediction uses configured trained NULL action id {id} with zero coordinates"),
-            None => "action_shuffled_prediction rotates complete action tuples only within provenance.source_kind; no action-masked/null variant was configured for this checkpoint".into(),
+            Some(id) => format!("action_shuffled_prediction rotates action tuples only within provenance.source_kind and conjugates ACTION6 rectangle-relative coordinates onto each target content rectangle; trained_null_action_prediction uses configured trained NULL action id {id} with zero coordinates"),
+            None => "action_shuffled_prediction rotates action tuples only within provenance.source_kind and conjugates ACTION6 rectangle-relative coordinates onto each target content rectangle; no action-masked/null variant was configured for this checkpoint".into(),
         },
         overall,
         by_source: by_source
@@ -1135,6 +1190,32 @@ mod tests {
         assert_eq!(census.overall.rows_in_conflicts, 2);
         assert_eq!(census.overall.deterministic_exact_ceiling, Some(0.5));
         assert_eq!(census.by_source["movement"].conflicting_visible_inputs, 1);
+    }
+
+    #[test]
+    fn shuffled_action6_coordinates_are_conjugated_into_target_rectangles() -> Result<()> {
+        let mut first = sample(1);
+        first.provenance.content_x = 10;
+        first.provenance.content_y = 20;
+        first.action = ArcAction::new(6, Some(12), Some(23))?;
+
+        let mut second = sample(2);
+        second.provenance.content_x = 30;
+        second.provenance.content_y = 40;
+        second.action = ArcAction::new(6, Some(34), Some(45))?;
+
+        let shuffled = shuffled_action_control_samples(&[first.clone(), second.clone()]);
+        assert_eq!(shuffled[0].action, ArcAction::new(6, Some(14), Some(25))?);
+        assert_eq!(shuffled[1].action, ArcAction::new(6, Some(32), Some(43))?);
+        for (target, shuffled) in [first, second].iter().zip(&shuffled) {
+            let x = shuffled.action.x.expect("ACTION6 x");
+            let y = shuffled.action.y.expect("ACTION6 y");
+            assert!(x >= target.provenance.content_x as u8);
+            assert!(x < (target.provenance.content_x + target.provenance.content_width) as u8);
+            assert!(y >= target.provenance.content_y as u8);
+            assert!(y < (target.provenance.content_y + target.provenance.content_height) as u8);
+        }
+        Ok(())
     }
 
     #[test]

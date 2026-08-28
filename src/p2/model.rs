@@ -1378,9 +1378,10 @@ impl WorldModel {
     /// ACTION6 coordinate conditioning over the latent grid.
     ///
     /// Coordinates are normalized to `[0, 1]`. The four channels are a localized
-    /// impulse, relative x/y offsets, and an ACTION6-active mask. Simple actions
-    /// produce an all-zero field even though their placeholder coordinates are
-    /// still shape-checked by [`Self::add_action`].
+    /// impulse, relative x/y offsets, and an ACTION6-active mask. These raw
+    /// channels are zero for simple actions, but the following biased 1x1
+    /// projection may still contribute a learned constant spatial offset.
+    /// Placeholder coordinates remain shape-checked by [`Self::add_action`].
     fn spatial_action_field(&self, actions: &Tensor, action_coords: &Tensor) -> Result<Tensor> {
         let b = actions.dim(0)?;
         if action_coords.dims2()? != (b, 2) {
