@@ -26,6 +26,12 @@ BIN=target/release/tofy
   --checkpoint-every-steps 100 \
   --output-dir "$RUN_DIR"
 
+if [[ ! -f "$RUN_DIR/train_report.json" ]] || \
+  ! jq -e '.status == "completed"' "$RUN_DIR/train_report.json" >/dev/null; then
+  printf 'training did not complete; skipping synthetic and live evals for %s\n' "$RUN_DIR"
+  exit 0
+fi
+
 # Eval flags mirror the proven full-v4 boundary evals so reports stay comparable.
 "$BIN" p2-eval \
   --device "$DEVICE" \

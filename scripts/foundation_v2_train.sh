@@ -29,6 +29,12 @@ fi
   --output-dir "$RUN_DIR" \
   "${RESUME_ARGS[@]}"
 
+if [[ ! -f "$RUN_DIR/train_report.json" ]] || \
+  ! jq -e '.status == "completed"' "$RUN_DIR/train_report.json" >/dev/null; then
+  printf 'training did not complete; skipping synthetic and live evals for %s\n' "$RUN_DIR"
+  exit 0
+fi
+
 CHECKPOINT="$RUN_DIR/checkpoints/best/ema.safetensors"
 if [[ ! -f "$CHECKPOINT" ]]; then
   CHECKPOINT="$RUN_DIR/model.safetensors"
