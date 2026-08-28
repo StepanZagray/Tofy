@@ -373,6 +373,7 @@ impl MixedStreamBatchPrefetcher {
     ) -> Result<Self> {
         ensure!(worker_count > 0, "foundation-v2 data workers must be > 0");
         ensure!(queue_depth > 0, "foundation-v2 prefetch depth must be > 0");
+        config.validate()?;
         ensure!(
             first_batch_index <= total_steps as u64,
             "foundation-v2 prefetch start exceeds total steps"
@@ -574,6 +575,14 @@ mod mixed_stream_tests {
             )?;
             let direct_digest =
                 training_content_batch_digest(direct.transitions(), direct.content_masks())?;
+            assert_eq!(
+                prefetched
+                    .factual()
+                    .map(|factual| factual.pairwise_board_effect_labels()),
+                direct
+                    .factual()
+                    .map(|factual| factual.pairwise_board_effect_labels())
+            );
             assert_eq!(prefetched, direct);
             assert_eq!(prefetched_digest, direct_digest);
         }
@@ -614,6 +623,35 @@ mod mixed_stream_tests {
         }
         assert_eq!(prefetched_chain, inline_chain);
         prefetcher.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_stream_generation_content_digest_snapshot() -> Result<()> {
+        let config = MixedStreamConfig {
+            batch_size: 20,
+            seed: 0xDA7A_0008,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        };
+        let total_steps = 3usize;
+        let chain = (0..total_steps as u64).try_fold([0; 32], |chain, batch_index| {
+            let batch = compose_mixed_stream_batch(
+                &config,
+                batch_index as f32 / total_steps as f32,
+                batch_index,
+                V5DataSplit::Train,
+            )?;
+            let digest = training_content_batch_digest(batch.transitions(), batch.content_masks())?;
+            Ok::<_, anyhow::Error>(training_content_hash_append(chain, digest))
+        })?;
+        assert_eq!(
+            chain,
+            [
+                58, 187, 230, 60, 23, 57, 11, 196, 148, 84, 86, 212, 55, 6, 200, 150, 121, 167,
+                230, 199, 39, 156, 181, 68, 61, 31, 145, 79, 15, 0, 70, 166,
+            ]
+        );
         Ok(())
     }
 }

@@ -7255,7 +7255,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let predictions = samples
             .iter()
-            .map(|sample| sample.next.pixels.clone())
+            .map(|sample| sample.next.pixels.to_vec())
             .collect::<Vec<_>>();
         let outcome_changing = vec![Some(false); samples.len()];
 
@@ -7289,11 +7289,11 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let factual_predictions = samples
             .iter()
-            .map(|sample| sample.next.pixels.clone())
+            .map(|sample| sample.next.pixels.to_vec())
             .collect::<Vec<_>>();
         let counterfactual_predictions = samples
             .iter()
-            .map(|sample| sample.current.pixels.clone())
+            .map(|sample| sample.current.pixels.to_vec())
             .collect::<Vec<_>>();
         let outcome_changing = vec![Some(true); samples.len()];
 

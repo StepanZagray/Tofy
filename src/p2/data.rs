@@ -16,8 +16,11 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 /// Official ARC-AGI-3 frame side length.
 pub const FRAME_SIDE: usize = 64;
@@ -51,12 +54,77 @@ pub mod palette {
     pub const PAD: u8 = 0;
 }
 
+/// Clone-on-write byte storage. Generated frames and content masks are cloned
+/// frequently while they are immutable, so sharing here avoids copying a
+/// 4096-byte buffer for every row that reuses the same state or rectangle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBytes(Arc<Vec<u8>>);
+
+impl SharedBytes {
+    fn allocation_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl From<Vec<u8>> for SharedBytes {
+    fn from(values: Vec<u8>) -> Self {
+        Self(Arc::new(values))
+    }
+}
+
+impl Deref for SharedBytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SharedBytes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a SharedBytes {
+    type Item = &'a u8;
+    type IntoIter = std::slice::Iter<'a, u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for SharedBytes {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedBytes {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<u8>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// Discrete ARC-like frame: row-major `width * height` categorical pixels in `0..=15`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArcFrame {
     pub width: u16,
     pub height: u16,
-    pub pixels: Vec<u8>,
+    pub pixels: SharedBytes,
 }
 
 impl ArcFrame {
@@ -76,7 +144,7 @@ impl ArcFrame {
         Ok(Self {
             width,
             height,
-            pixels,
+            pixels: pixels.into(),
         })
     }
 
@@ -467,7 +535,7 @@ impl ContentRect {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentMask {
     /// Row-major 64x64 values in `{0,1}`. Row 63 is always zero.
-    pub values: Vec<u8>,
+    pub values: SharedBytes,
 }
 
 impl ContentMask {
@@ -478,11 +546,22 @@ impl ContentMask {
             let start = y * FRAME_SIDE + usize::from(rect.x);
             values[start..start + usize::from(rect.width)].fill(1);
         }
-        Ok(Self { values })
+        Ok(Self {
+            values: values.into(),
+        })
     }
 
     pub fn as_f32(&self) -> Vec<f32> {
         self.values.iter().map(|&value| f32::from(value)).collect()
+    }
+
+    fn matches_rect(&self, rect: ContentRect) -> bool {
+        self.values.len() == FRAME_SIDE * FRAME_SIDE
+            && self.values.iter().enumerate().all(|(index, &value)| {
+                let x = (index % FRAME_SIDE) as u8;
+                let y = (index / FRAME_SIDE) as u8;
+                value == u8::from(rect.contains(x, y))
+            })
     }
 }
 
@@ -594,6 +673,14 @@ impl V5Sample {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_row(true, true)
+    }
+
+    fn validate_after_unit_fields(&self) -> Result<()> {
+        self.validate_row(false, false)
+    }
+
+    fn validate_row(&self, validate_mask: bool, validate_permutation: bool) -> Result<()> {
         self.provenance.source.validate()?;
         self.provenance.content_rect.validate()?;
         ensure!(
@@ -606,23 +693,15 @@ impl V5Sample {
                     == u16::from(self.provenance.content_rect.height),
             "v5 content rect size does not match source provenance"
         );
-        let expected_mask = ContentMask::from_rect(self.provenance.content_rect)?;
-        ensure!(
-            self.content_mask == expected_mask,
-            "v5 content mask does not match provenance rect"
-        );
-        let permutation = self
-            .provenance
-            .augmentation
-            .color_permutation
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        ensure!(
-            self.provenance.augmentation.color_permutation[0] == 0
-                && permutation == (0u8..16).collect::<std::collections::BTreeSet<_>>(),
-            "v5 color permutation must be a bijection with color 0 fixed"
-        );
+        if validate_mask {
+            ensure!(
+                self.content_mask.matches_rect(self.provenance.content_rect),
+                "v5 content mask does not match provenance rect"
+            );
+        }
+        if validate_permutation {
+            validate_color_permutation(&self.provenance.augmentation.color_permutation)?;
+        }
         for color in [
             self.provenance.operator.agent_color,
             self.provenance.operator.primary_color,
@@ -647,6 +726,22 @@ impl V5Sample {
         }
         Ok(())
     }
+}
+
+fn validate_color_permutation(permutation: &[u8; 16]) -> Result<()> {
+    let mut seen = [false; 16];
+    for &color in permutation {
+        let Some(slot) = seen.get_mut(usize::from(color)) else {
+            bail!("v5 color permutation contains value outside 0..=15");
+        };
+        ensure!(!*slot, "v5 color permutation contains a duplicate value");
+        *slot = true;
+    }
+    ensure!(
+        permutation[0] == 0 && seen.into_iter().all(|value| value),
+        "v5 color permutation must be a bijection with color 0 fixed"
+    );
+    Ok(())
 }
 
 /// Public composer configuration consumed by foundation-v2 training.
@@ -874,6 +969,8 @@ pub struct FactualBatch {
     group_ids: Vec<BranchGroupId>,
     rows: Vec<TransitionSample>,
     group_ranges: Vec<std::ops::Range<usize>>,
+    #[serde(skip, default)]
+    pairwise_board_effect_labels: Vec<PairwiseBoardEffectLabel>,
 }
 
 /// One status-row-free pair label for the v5 separation/pull objectives.
@@ -948,11 +1045,33 @@ impl FactualBatch {
             group_ranges.push(start..rows.len());
             group_ids.push(id);
         }
+        let pairwise_board_effect_labels = groups
+            .iter()
+            .zip(&group_ranges)
+            .enumerate()
+            .flat_map(|(group_index, (group, range))| {
+                (0..group.branches.len()).flat_map(move |left| {
+                    (left + 1..group.branches.len()).map(move |right| {
+                        let left_branch = &group.branches[left];
+                        let right_branch = &group.branches[right];
+                        PairwiseBoardEffectLabel {
+                            group_index,
+                            left_row: range.start + left,
+                            right_row: range.start + right,
+                            equivalent: left_branch.outcome_equivalent(right_branch),
+                            left_changed: left_branch.board_effect.changed,
+                            right_changed: right_branch.board_effect.changed,
+                        }
+                    })
+                })
+            })
+            .collect();
         Ok(Self {
             groups,
             group_ids,
             rows,
             group_ranges,
+            pairwise_board_effect_labels,
         })
     }
 
@@ -1004,26 +1123,8 @@ impl FactualBatch {
 
     /// Pair labels are computed from board rows only; status UI never enters
     /// equivalence or changed/no-effect labels.
-    pub fn pairwise_board_effect_labels(&self) -> Vec<PairwiseBoardEffectLabel> {
-        let mut labels = Vec::new();
-        for (group_index, (group, range)) in self.groups.iter().zip(&self.group_ranges).enumerate()
-        {
-            for left in 0..group.branches.len() {
-                for right in left + 1..group.branches.len() {
-                    let left_branch = &group.branches[left];
-                    let right_branch = &group.branches[right];
-                    labels.push(PairwiseBoardEffectLabel {
-                        group_index,
-                        left_row: range.start + left,
-                        right_row: range.start + right,
-                        equivalent: left_branch.outcome_equivalent(right_branch),
-                        left_changed: left_branch.board_effect.changed,
-                        right_changed: right_branch.board_effect.changed,
-                    });
-                }
-            }
-        }
-        labels
+    pub fn pairwise_board_effect_labels(&self) -> &[PairwiseBoardEffectLabel] {
+        &self.pairwise_board_effect_labels
     }
 }
 
@@ -1202,14 +1303,12 @@ pub fn oracle_latent_from_frame(frame: &ArcFrame) -> Vec<f32> {
 ///
 /// Stable palette semantics; agent draws last. Never encodes
 /// `hidden_goal_index` or candidate-goal identity.
-pub fn render_state(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
-    let w = scenario.width as usize;
-    let h = scenario.height as usize;
-    let mut pixels = vec![palette::EMPTY; w * h];
+fn render_state_pixels(scenario: &Scenario, state: &State, stride: usize, len: usize) -> Vec<u8> {
+    let mut pixels = vec![palette::EMPTY; len];
 
     let put = |pixels: &mut [u8], p: Pos, color: u8| {
         if p.x >= 0 && p.y >= 0 && (p.x as u8) < scenario.width && (p.y as u8) < scenario.height {
-            pixels[p.y as usize * w + p.x as usize] = color;
+            pixels[p.y as usize * stride + p.x as usize] = color;
         }
     };
 
@@ -1245,14 +1344,35 @@ pub fn render_state(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
         put(&mut pixels, p, palette::TRIGGER_BASE + i.min(2) as u8);
     }
     put(&mut pixels, state.pos, palette::AGENT);
+    pixels
+}
 
-    ArcFrame::new(scenario.width as u16, scenario.height as u16, pixels)
+pub fn render_state(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
+    let width = scenario.width as usize;
+    let height = scenario.height as usize;
+    ArcFrame::new(
+        scenario.width as u16,
+        scenario.height as u16,
+        render_state_pixels(scenario, state, width, width * height),
+    )
 }
 
 /// Render native grid, pad to official `64×64`, and draw per-episode status UI in the
 /// margin (ARC-AGI-3 frames embed budget counters in pixels; placement varies by game).
 pub fn render_state_padded(scenario: &Scenario, state: &State) -> Result<ArcFrame> {
-    let mut frame = render_state(scenario, state)?.to_fixed_64()?;
+    ensure!(
+        scenario.width as usize <= FRAME_SIDE && scenario.height as usize <= FRAME_SIDE,
+        "cannot render scenario {}x{} into {}x{} without interpolation/crop",
+        scenario.width,
+        scenario.height,
+        FRAME_SIDE,
+        FRAME_SIDE
+    );
+    let mut frame = ArcFrame::new(
+        FRAME_SIDE as u16,
+        FRAME_SIDE as u16,
+        render_state_pixels(scenario, state, FRAME_SIDE, FRAME_SIDE * FRAME_SIDE),
+    )?;
     apply_arc_status_ui(&mut frame, scenario, state);
     Ok(frame)
 }
@@ -1293,10 +1413,32 @@ pub fn sample_from_transition(
     transition_index: u64,
 ) -> Result<TransitionSample> {
     let (current, next) = render_transition_frames(scenario, before, after)?;
+    Ok(sample_from_rendered_transition(
+        scenario,
+        before,
+        after,
+        action,
+        goal,
+        transition_index,
+        current,
+        next,
+    ))
+}
+
+fn sample_from_rendered_transition(
+    scenario: &Scenario,
+    before: &State,
+    after: &State,
+    action: Action,
+    goal: &Goal,
+    transition_index: u64,
+    current: ArcFrame,
+    next: ArcFrame,
+) -> TransitionSample {
     let goal_satisfied = goal_satisfied(scenario, after, goal);
     let goal_failed = goal_terminal_failure(scenario, after, goal);
     let exhausted = !goal_satisfied && !goal_failed && after.actions_used >= scenario.action_budget;
-    Ok(TransitionSample {
+    TransitionSample {
         current,
         next,
         action: ArcAction::from_tofy(action),
@@ -1312,7 +1454,7 @@ pub fn sample_from_transition(
         transition_index,
         provenance: TransitionProvenance::simulator(scenario, goal_family(goal)),
         oracle_latent: Some(oracle_latent(scenario, before)),
-    })
+    }
 }
 
 /// Goal-free transition sample: zero goal features and masked event labels (early ARC play).
@@ -1325,7 +1467,27 @@ pub fn sample_from_transition_goal_free(
     transition_index: u64,
 ) -> Result<TransitionSample> {
     let (current, next) = render_transition_frames(scenario, before, after)?;
-    Ok(TransitionSample {
+    Ok(sample_from_rendered_transition_goal_free(
+        scenario,
+        before,
+        action,
+        family,
+        transition_index,
+        current,
+        next,
+    ))
+}
+
+fn sample_from_rendered_transition_goal_free(
+    scenario: &Scenario,
+    before: &State,
+    action: Action,
+    family: &str,
+    transition_index: u64,
+    current: ArcFrame,
+    next: ArcFrame,
+) -> TransitionSample {
+    TransitionSample {
         current,
         next,
         action: ArcAction::from_tofy(action),
@@ -1341,7 +1503,7 @@ pub fn sample_from_transition_goal_free(
         transition_index,
         provenance: TransitionProvenance::simulator(scenario, family),
         oracle_latent: Some(oracle_latent(scenario, before)),
-    })
+    }
 }
 
 /// Paint remaining action-budget UI on the bottom row (common ARC-AGI-3 layout).
@@ -1504,12 +1666,17 @@ pub fn conjugate_action(
     }
 }
 
+thread_local! {
+    static FRAME_TRANSFORM_SCRATCH: RefCell<Vec<u8>> =
+        RefCell::new(vec![palette::PAD; FRAME_SIDE * FRAME_SIDE]);
+}
+
 fn frame_with_transformed_content(
-    source: &ArcFrame,
+    source: &mut ArcFrame,
     source_rect: ContentRect,
     target_rect: ContentRect,
     augmentation: &SymmetryAugmentation,
-) -> Result<ArcFrame> {
+) -> Result<()> {
     ensure!(
         source.width as usize == FRAME_SIDE && source.height as usize == FRAME_SIDE,
         "v5 augmentation requires fixed-size source frames"
@@ -1522,24 +1689,45 @@ fn frame_with_transformed_content(
             && target_rect.height == source_rect.height,
         "v5 D4 augmentation requires equal square source/target rectangles"
     );
-    let mut pixels = vec![palette::PAD; FRAME_SIDE * FRAME_SIDE];
-    for y in 0..source_rect.height {
-        for x in 0..source_rect.width {
-            let source_x = usize::from(source_rect.x + x);
-            let source_y = usize::from(source_rect.y + y);
-            let color = source.pixels[source_y * FRAME_SIDE + source_x];
-            let color = augmentation.color_permutation[color as usize];
-            let (target_x, target_y) = augmentation.d4.transform_point(x, y, source_rect.width);
-            let target_x = usize::from(target_rect.x + target_x);
-            let target_y = usize::from(target_rect.y + target_y);
-            pixels[target_y * FRAME_SIDE + target_x] = color;
+    FRAME_TRANSFORM_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.fill(palette::PAD);
+        for y in 0..source_rect.height {
+            for x in 0..source_rect.width {
+                let source_x = usize::from(source_rect.x + x);
+                let source_y = usize::from(source_rect.y + y);
+                let color = source.pixels[source_y * FRAME_SIDE + source_x];
+                let color = augmentation.color_permutation[color as usize];
+                let (target_x, target_y) = augmentation.d4.transform_point(x, y, source_rect.width);
+                let target_x = usize::from(target_rect.x + target_x);
+                let target_y = usize::from(target_rect.y + target_y);
+                scratch[target_y * FRAME_SIDE + target_x] = color;
+            }
         }
+        // Status UI is copied only after spatial/color augmentation and is never
+        // part of the semantic content mask or branch-effect equivalence.
+        let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+        scratch[status_start..].copy_from_slice(&source.pixels[status_start..]);
+        source.pixels.copy_from_slice(&scratch);
+    });
+    Ok(())
+}
+
+fn transform_frame_once(
+    frame: &mut ArcFrame,
+    source_rect: ContentRect,
+    target_rect: ContentRect,
+    augmentation: &SymmetryAugmentation,
+    cache: &mut BTreeMap<(usize, u16, u16), ArcFrame>,
+) -> Result<()> {
+    let key = (frame.pixels.allocation_id(), frame.width, frame.height);
+    if let Some(transformed) = cache.get(&key) {
+        *frame = transformed.clone();
+        return Ok(());
     }
-    // Status UI is copied only after spatial/color augmentation and is never
-    // part of the semantic content mask or branch-effect equivalence.
-    let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
-    pixels[status_start..].copy_from_slice(&source.pixels[status_start..]);
-    ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, pixels)
+    frame_with_transformed_content(frame, source_rect, target_rect, augmentation)?;
+    cache.insert(key, frame.clone());
+    Ok(())
 }
 
 /// Transform the agent-coordinate dimensions of an exact simulator oracle into
@@ -1800,6 +1988,26 @@ fn operator_sample_from_state(
     transition_index: u64,
 ) -> Result<TransitionSample> {
     let current = render_state_padded(scenario, state)?;
+    operator_sample_from_rendered_current(
+        scenario,
+        state,
+        current,
+        action,
+        operator,
+        family,
+        transition_index,
+    )
+}
+
+fn operator_sample_from_rendered_current(
+    scenario: &Scenario,
+    state: &State,
+    current: ArcFrame,
+    action: ArcAction,
+    operator: EpisodeOperator,
+    family: &str,
+    transition_index: u64,
+) -> Result<TransitionSample> {
     let source_rect = ContentRect {
         x: 0,
         y: 0,
@@ -1866,8 +2074,10 @@ fn augment_v5_transition(
     operator: EpisodeOperator,
     rect: ContentRect,
     augmentation: SymmetryAugmentation,
+    content_mask: ContentMask,
     goal_dropout_probability: f32,
     dropout_rng: &mut ChaCha8Rng,
+    frame_cache: &mut BTreeMap<(usize, u16, u16), ArcFrame>,
 ) -> Result<V5Sample> {
     let source_rect = ContentRect {
         x: 0,
@@ -1881,10 +2091,20 @@ fn augment_v5_transition(
         source_rect.width == rect.width && source_rect.height == rect.height,
         "augmentation rectangle does not match transition provenance"
     );
-    transition.current =
-        frame_with_transformed_content(&transition.current, source_rect, rect, &augmentation)?;
-    transition.next =
-        frame_with_transformed_content(&transition.next, source_rect, rect, &augmentation)?;
+    transform_frame_once(
+        &mut transition.current,
+        source_rect,
+        rect,
+        &augmentation,
+        frame_cache,
+    )?;
+    transform_frame_once(
+        &mut transition.next,
+        source_rect,
+        rect,
+        &augmentation,
+        frame_cache,
+    )?;
     transition.action = conjugate_action(&transition.action, augmentation.d4, source_rect, rect)?;
     // The sampled placement origin becomes part of transition provenance so
     // standalone consumers can rebuild the exact content mask; before this,
@@ -1916,7 +2136,6 @@ fn augment_v5_transition(
     // Per the ADR, exhaustion is therefore deliberately masked until its
     // conditioning is explicitly represented at this observer seam.
     transition.exhausted = None;
-    let content_mask = ContentMask::from_rect(rect)?;
     Ok(V5Sample {
         provenance: V5SampleProvenance {
             source: transition.provenance.clone(),
@@ -2214,7 +2433,8 @@ fn generate_v5_factual_branch_group(
 ) -> Result<BranchGroup> {
     let mut scenario = scenario_for_v5(seed, episode_id, data_split, content_size);
     scenario.undo_enabled = true;
-    let sim = Simulator::new(scenario.clone());
+    let scenario = Arc::new(scenario);
+    let sim = Simulator::new(Arc::clone(&scenario));
     let mut state = State::initial(&scenario);
     // Give ACTION7 an applicable undo frame without conditioning the shared
     // observation on any branch action.
@@ -2247,30 +2467,34 @@ fn generate_v5_factual_branch_group(
         "factual_coordinate_branch"
     };
     let mut transitions = Vec::with_capacity(FACTUAL_BRANCHES_PER_GROUP);
+    let current = render_state_padded(&scenario, &state)?;
     for action in Action::moves() {
         let next = apply_action(&sim, &state, action);
-        transitions.push(sample_from_transition_goal_free(
+        let next_frame = render_state_padded(&scenario, &next)?;
+        transitions.push(sample_from_rendered_transition_goal_free(
             &scenario,
             &state,
-            &next,
             action,
             family,
             transitions.len() as u64,
-        )?);
+            current.clone(),
+            next_frame,
+        ));
     }
-    transitions.push(operator_sample_from_state(
+    transitions.push(operator_sample_from_rendered_current(
         &scenario,
         &state,
+        current.clone(),
         ArcAction::new(5, None, None)?,
         operator,
         family,
         transitions.len() as u64,
     )?);
-    let current = &transitions[0].current;
-    for (x, y) in stratified_action6_coordinates(current, content_size)? {
-        transitions.push(operator_sample_from_state(
+    for (x, y) in stratified_action6_coordinates(&current, content_size)? {
+        transitions.push(operator_sample_from_rendered_current(
             &scenario,
             &state,
+            current.clone(),
             ArcAction::new(6, Some(x), Some(y))?,
             operator,
             family,
@@ -2279,14 +2503,16 @@ fn generate_v5_factual_branch_group(
     }
     let undo = Action::Undo;
     let next = apply_action(&sim, &state, undo);
-    transitions.push(sample_from_transition_goal_free(
+    let next_frame = render_state_padded(&scenario, &next)?;
+    transitions.push(sample_from_rendered_transition_goal_free(
         &scenario,
         &state,
-        &next,
         undo,
         family,
         transitions.len() as u64,
-    )?);
+        current,
+        next_frame,
+    ));
     ensure!(
         transitions.len() == FACTUAL_BRANCHES_PER_GROUP,
         "v5 factual group has wrong branch count"
@@ -2970,8 +3196,8 @@ fn raw_random_v5_sample(
     size: u8,
     operator: EpisodeOperator,
 ) -> Result<TransitionSample> {
-    let scenario = scenario_for_v5(seed, episode_id, split, size);
-    let sim = Simulator::new(scenario.clone());
+    let scenario = Arc::new(scenario_for_v5(seed, episode_id, split, size));
+    let sim = Simulator::new(Arc::clone(&scenario));
     let mut rng = seeded_v5_rng(seed, episode_id, split, 0xA11C_E005);
     let mut state = State::initial(&scenario);
     for _ in 0..episode_id as usize % 4 {
@@ -2996,9 +3222,10 @@ fn raw_random_v5_sample(
             let current = render_state_padded(&scenario, &state)?;
             let coordinates = stratified_action6_coordinates(&current, size)?;
             let (x, y) = coordinates[rng.random_range(0..coordinates.len())];
-            operator_sample_from_state(
+            operator_sample_from_rendered_current(
                 &scenario,
                 &state,
+                current,
                 ArcAction::new(6, Some(x), Some(y))?,
                 operator,
                 "random_one_step",
@@ -3016,23 +3243,27 @@ fn raw_exploration_v5_fragment(
     size: u8,
     length: usize,
 ) -> Result<Vec<TransitionSample>> {
-    let scenario = scenario_for_v5(seed, episode_id, split, size);
-    let sim = Simulator::new(scenario.clone());
+    let scenario = Arc::new(scenario_for_v5(seed, episode_id, split, size));
+    let sim = Simulator::new(Arc::clone(&scenario));
     let mut rng = seeded_v5_rng(seed, episode_id, split, 0xE1A1_0005);
     let mut state = State::initial(&scenario);
+    let mut current = render_state_padded(&scenario, &state)?;
     let mut samples = Vec::with_capacity(length);
     for index in 0..length {
         let action = Action::moves()[rng.random_range(0..4)];
         let next = apply_action(&sim, &state, action);
-        samples.push(sample_from_transition_goal_free(
+        let next_frame = render_state_padded(&scenario, &next)?;
+        samples.push(sample_from_rendered_transition_goal_free(
             &scenario,
             &state,
-            &next,
             action,
             "exploration",
             index as u64,
-        )?);
+            current,
+            next_frame.clone(),
+        ));
         state = next;
+        current = next_frame;
     }
     Ok(samples)
 }
@@ -3044,8 +3275,8 @@ fn raw_sequential_v5_fragment(
     size: u8,
     max_length: usize,
 ) -> Result<Vec<TransitionSample>> {
-    let scenario = scenario_for_v5(seed, episode_id, split, size);
-    let sim = Simulator::new(scenario.clone());
+    let scenario = Arc::new(scenario_for_v5(seed, episode_id, split, size));
+    let sim = Simulator::new(Arc::clone(&scenario));
     let state = State::initial(&scenario);
     let offset = episode_id as usize % scenario.candidate_goals.len();
     let (goal, plan) = scenario
@@ -3061,15 +3292,26 @@ fn raw_sequential_v5_fragment(
         })
         .ok_or_else(|| anyhow!("no non-empty public plan for v5 sequential fragment"))?;
     let mut state = state;
+    let mut current = render_state_padded(&scenario, &state)?;
     let mut samples = Vec::with_capacity(max_length.min(4));
     for (index, action) in plan.actions.into_iter().take(max_length.min(4)).enumerate() {
         let next = apply_action(&sim, &state, action);
-        let mut sample =
-            sample_from_transition(&scenario, &state, &next, action, goal, index as u64)?;
+        let next_frame = render_state_padded(&scenario, &next)?;
+        let mut sample = sample_from_rendered_transition(
+            &scenario,
+            &state,
+            &next,
+            action,
+            goal,
+            index as u64,
+            current,
+            next_frame.clone(),
+        );
         sample.family = "sequential_fragments".into();
         sample.provenance.source_kind = "sequential_fragments".into();
         samples.push(sample);
         state = next;
+        current = next_frame;
     }
     Ok(samples)
 }
@@ -3097,7 +3339,8 @@ fn raw_hazard_v5_sample(
     scenario.walls.remove(&start);
     scenario.walls.remove(&hazard);
     scenario.start = start;
-    let sim = Simulator::new(scenario.clone());
+    let scenario = Arc::new(scenario);
+    let sim = Simulator::new(Arc::clone(&scenario));
     let state = State::initial(&scenario);
     let next = apply_action(&sim, &state, action);
     ensure!(
@@ -3128,7 +3371,14 @@ fn augment_v5_unit(
     let mut augmentation_rng = seeded_v5_rng(config.seed, episode_id, split, 0xA06D_4E05);
     let rect = sampled_content_rect(size, split, &mut augmentation_rng);
     let augmentation = sampled_augmentation(&mut augmentation_rng, config.symmetry_augmentation);
+    validate_color_permutation(&augmentation.color_permutation)?;
+    let content_mask = ContentMask::from_rect(rect)?;
+    ensure!(
+        content_mask.matches_rect(rect),
+        "shared v5 content mask does not match sampled unit rect"
+    );
     let mut dropout_rng = seeded_v5_rng(config.seed, episode_id, split, 0xD20F_0005);
+    let mut frame_cache = BTreeMap::new();
     transitions
         .into_iter()
         .map(|transition| {
@@ -3139,8 +3389,10 @@ fn augment_v5_unit(
                 operator,
                 rect,
                 augmentation.clone(),
+                content_mask.clone(),
                 config.goal_dropout_probability,
                 &mut dropout_rng,
+                &mut frame_cache,
             )
         })
         .collect()
@@ -3399,7 +3651,6 @@ pub fn compose_mixed_stream_batch(
     batch_index: u64,
     split: V5DataSplit,
 ) -> Result<MixedStreamBatch> {
-    config.validate()?;
     if let V5DataSplit::HeldOutOperator(family) = split {
         ensure!(
             config.operator_families.held_out.contains(&family),
@@ -3497,7 +3748,9 @@ pub fn compose_mixed_stream_batch(
         config.batch_size
     );
     for sample in &samples {
-        sample.validate()?;
+        // Mask shape and color bijection were validated once when this row's
+        // unit allocated its shared mask/augmentation.
+        sample.validate_after_unit_fields()?;
     }
     let goal_dropout_census = GoalDropoutCensus {
         total: samples.len(),
@@ -4660,6 +4913,14 @@ mod tests {
         assert_eq!(reconstructed.group_ids(), expected.group_ids());
         assert_eq!(reconstructed.rows(), expected.rows());
         assert_eq!(
+            reconstructed.pairwise_board_effect_labels(),
+            expected.pairwise_board_effect_labels()
+        );
+        assert_eq!(
+            reconstructed.pairwise_board_effect_labels().len(),
+            2 * FACTUAL_BRANCHES_PER_GROUP * (FACTUAL_BRANCHES_PER_GROUP - 1) / 2
+        );
+        assert_eq!(
             reconstructed.group_ranges(),
             &[
                 0..FACTUAL_BRANCHES_PER_GROUP,
@@ -4667,6 +4928,46 @@ mod tests {
             ]
         );
         assert!(FactualBatch::from_rows(&shuffled[..2]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_units_share_frame_and_mask_storage() -> Result<()> {
+        let config = MixedStreamConfig {
+            batch_size: 20,
+            seed: 0x5A4E_0001,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        };
+        config.validate()?;
+        let batch = compose_mixed_stream_batch(&config, 0.0, 0, V5DataSplit::Train)?;
+        let factual_range = batch
+            .factual_group_ranges()
+            .first()
+            .expect("small mixed batch contains a complete factual group");
+        let factual = &batch.samples()[factual_range.clone()];
+        assert!(factual.windows(2).all(|pair| {
+            pair[0].transition.current.pixels.allocation_id()
+                == pair[1].transition.current.pixels.allocation_id()
+        }));
+        assert!(factual.windows(2).all(|pair| {
+            pair[0].content_mask.values.allocation_id()
+                == pair[1].content_mask.values.allocation_id()
+        }));
+        let chained = batch
+            .samples()
+            .windows(2)
+            .filter(|pair| {
+                pair[0].provenance.stream == MixedStreamKind::Exploration
+                    && pair[1].provenance.stream == MixedStreamKind::Exploration
+                    && pair[0].transition.episode_id == pair[1].transition.episode_id
+            })
+            .collect::<Vec<_>>();
+        assert!(!chained.is_empty());
+        assert!(chained.iter().all(|pair| {
+            pair[0].transition.next.pixels.allocation_id()
+                == pair[1].transition.current.pixels.allocation_id()
+        }));
         Ok(())
     }
 
@@ -4698,8 +4999,9 @@ mod tests {
                     d4: transform,
                     color_permutation,
                 };
-                let transformed = frame_with_transformed_content(
-                    &source,
+                let mut transformed = source.clone();
+                frame_with_transformed_content(
+                    &mut transformed,
                     source_rect,
                     target_rect,
                     &augmentation,
