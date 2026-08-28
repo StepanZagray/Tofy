@@ -7068,6 +7068,15 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
             foundation.loss_steps += 1;
         }
+        // Release the training step's entire autograd graph, batch tensors,
+        // and gradient store before any same-step evaluation work. The first
+        // bundle run OOMed exactly at step 1024, where the gate evaluation,
+        // the mechanism sample, and (then) a profiled capture stacked on top
+        // of these still-live allocations at 39.6/48 GB steady state.
+        drop(total);
+        drop(losses);
+        drop(grads);
+        drop(mixed);
         state.global_step = next_step;
         state.optimizer_step = optimizer.step_t();
         updates_this_run += 1;
