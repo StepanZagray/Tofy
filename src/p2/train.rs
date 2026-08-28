@@ -4379,9 +4379,14 @@ pub fn foundation_v2_training_loss(
     // translated PAD field. Derive displacement from the same content-masked
     // canonical seam used by the latent/EP corrections.
     let displacement = content_predicted_canonical.sub(&content_current_canonical)?;
+    // Epsilon inside the sqrt: with the copy-bypass gate at its zero init the
+    // predicted canonical EXACTLY equals the current canonical, and sqrt(0)
+    // has a non-finite backward (the first bundle-run smoke aborted with NaN
+    // gradients here). The clamp alone cannot fix the backward pass.
     let displacement_norm = displacement
         .sqr()?
         .sum_keepdim(D::Minus1)?
+        .affine(1.0, 1e-12)?
         .sqrt()?
         .clamp(1e-6, f64::INFINITY)?;
     let normalized_displacement = displacement.broadcast_div(&displacement_norm)?;
