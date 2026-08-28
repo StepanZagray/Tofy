@@ -2,7 +2,8 @@ use candle_core::{Device, Tensor};
 use tofy::p2::eval::GateSupportMetrics;
 use tofy::p2::train::{
     foundation_v2_candidate_improves, foundation_v2_ep_weight_update,
-    foundation_v2_evaluation_improves, foundation_v2_gate_evaluation,
+    foundation_v2_evaluation_improves,
+    foundation_v2_gate_evaluation as try_foundation_v2_gate_evaluation,
     foundation_v2_gate_history_aborts, foundation_v2_loss_weights_from_masks,
     foundation_v2_named_gate_passed, foundation_v2_promotion_improved,
     foundation_v2_promotion_value, foundation_v2_selected_best_step,
@@ -172,7 +173,7 @@ fn metrics(shuffled_ratio: f64) -> GateSupportMetrics {
         shuffled_action_rows: 512,
         shuffled_action_eligible_rows: 512,
         shuffled_action_changed_tuples: 512,
-        shuffled_action_outcome_changing_tuples: None,
+        shuffled_action_outcome_changing_tuples: Some(128),
         foreground_reconstruction_accuracy: Some(0.9),
         one_step_changed_exact: Some(0.5),
         one_step_full_exact: Some(0.2),
@@ -185,6 +186,21 @@ fn metrics(shuffled_ratio: f64) -> GateSupportMetrics {
         raw_padding_false_edit_rate: Some(0.01),
         population_contract: "fixed test population".into(),
     }
+}
+
+fn foundation_v2_gate_evaluation(
+    step: u64,
+    metrics: GateSupportMetrics,
+    running_best: Option<f64>,
+    composed_running_best: Option<f64>,
+) -> FoundationV2GateEvaluation {
+    try_foundation_v2_gate_evaluation(
+        step,
+        metrics,
+        running_best,
+        composed_running_best,
+    )
+    .expect("test gate population is causally eligible")
 }
 
 fn gate(evaluation: &FoundationV2GateEvaluation, name: &str) -> bool {
@@ -226,6 +242,17 @@ fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
         second_fail,
         consecutive
     ]));
+}
+
+#[test]
+fn gate_rejects_a_zero_outcome_changing_population_during_warmup() {
+    let mut degenerate = metrics(0.9);
+    degenerate.shuffled_action_changed_pixel_ratio = None;
+    degenerate.shuffled_action_outcome_changing_tuples = Some(0);
+    let error = try_foundation_v2_gate_evaluation(1_024, degenerate, None, None)
+        .expect_err("degenerate gate population must fail before warmup PASS");
+    assert!(error.to_string().contains("outcome-changing tuples"));
+    assert!(error.to_string().contains("at least 32"));
 }
 
 /// Six pixels on a 2x3 grid: changed {0.5, 2.5}, unchanged {1.5, 3.5, 0.25},

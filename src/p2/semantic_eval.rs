@@ -1,6 +1,9 @@
 //! Foundation-v2 semantic evaluation at the exact-decoder seam.
 
-use crate::p2::data::{palette, ArcAction, TransitionSample, FRAME_SIDE};
+use crate::p2::data::{
+    apply_episode_operator, palette, ArcAction, ArcFrame, TransitionSample, V5SampleProvenance,
+    FRAME_SIDE,
+};
 use crate::p2::model::{WorldModel, PALETTE_SIZE};
 use crate::p2::train::{action_tensors_from_samples, batch_from_samples};
 use anyhow::{ensure, Result};
@@ -835,9 +838,28 @@ fn conjugated_action_for_target(donor: &TransitionSample, target: &TransitionSam
     }
 }
 
-pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
+fn shuffled_action_control_samples_where(
+    samples: &[TransitionSample],
+    eligible: impl Fn(&TransitionSample) -> bool,
+) -> (Vec<TransitionSample>, usize) {
     let mut shuffled = samples.to_vec();
-    let source_rows = shuffled_action_source_rows(samples);
+    let source_rows = shuffled_action_source_rows(samples)
+        .into_iter()
+        .map(|(source, indices)| {
+            (
+                source,
+                indices
+                    .into_iter()
+                    .filter(|&index| eligible(&samples[index]))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let eligible_rows = source_rows
+        .values()
+        .filter(|indices| indices.len() >= 2)
+        .map(Vec::len)
+        .sum();
     for indices in source_rows.values() {
         if indices.len() < 2 {
             continue;
@@ -865,7 +887,109 @@ pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<Tran
                 conjugated_action_for_target(&samples[donor], &samples[target]);
         }
     }
-    shuffled
+    (shuffled, eligible_rows)
+}
+
+pub fn shuffled_action_control_samples(samples: &[TransitionSample]) -> Vec<TransitionSample> {
+    shuffled_action_control_samples_where(samples, |_| true).0
+}
+
+/// Sidecar-aware action intervention used by the foundation-v2 gate. Only the
+/// ACTION5/ACTION6 rows governed by the recorded episode operator are rotated;
+/// every changed tuple can therefore be replayed exactly on the target board.
+#[derive(Debug, Clone)]
+pub struct ShuffledActionControlPopulation {
+    pub samples: Vec<TransitionSample>,
+    pub counterfactual_next: Vec<Option<ArcFrame>>,
+    pub eligible_rows: usize,
+}
+
+impl ShuffledActionControlPopulation {
+    pub fn changed_tuples(&self, factual: &[TransitionSample]) -> usize {
+        factual
+            .iter()
+            .zip(&self.samples)
+            .filter(|(factual, shuffled)| factual.action != shuffled.action)
+            .count()
+    }
+
+    pub fn outcome_changing(&self, factual: &[TransitionSample]) -> Vec<Option<bool>> {
+        factual
+            .iter()
+            .zip(&self.counterfactual_next)
+            .map(|(factual, counterfactual)| {
+                counterfactual.as_ref().map(|counterfactual| {
+                    let gameplay_len = (FRAME_SIDE - 1) * FRAME_SIDE;
+                    counterfactual.pixels[..gameplay_len] != factual.next.pixels[..gameplay_len]
+                })
+            })
+            .collect()
+    }
+
+    pub fn outcome_changing_tuples(&self, factual: &[TransitionSample]) -> Option<usize> {
+        self.outcome_changing(factual)
+            .into_iter()
+            .try_fold(0usize, |count, changed| {
+                changed.map(|changed| count + usize::from(changed))
+            })
+    }
+}
+
+/// Build the exact shuffled conditioning shown to the model and, when V5
+/// operator provenance is available, replay that conditioning on each target
+/// row's current board. Populations without the sidecar retain the historical
+/// shuffle and expose unknown counterfactuals so callers can fail closed to the
+/// old per-row metric behavior without claiming causal coverage.
+pub fn shuffled_action_control_population(
+    samples: &[TransitionSample],
+    provenance: Option<&[V5SampleProvenance]>,
+) -> Result<ShuffledActionControlPopulation> {
+    let (shuffled, eligible_rows) = if provenance.is_some() {
+        shuffled_action_control_samples_where(samples, |sample| matches!(sample.action.id, 5 | 6))
+    } else {
+        shuffled_action_control_samples_where(samples, |_| true)
+    };
+    let Some(provenance) = provenance else {
+        return Ok(ShuffledActionControlPopulation {
+            counterfactual_next: vec![None; samples.len()],
+            samples: shuffled,
+            eligible_rows,
+        });
+    };
+    ensure!(
+        provenance.len() == samples.len(),
+        "shuffled-action V5 provenance rows do not match the sample count"
+    );
+    let counterfactual_next = samples
+        .iter()
+        .zip(&shuffled)
+        .zip(provenance)
+        .map(|((factual, shuffled), provenance)| {
+            ensure!(
+                provenance.source == factual.provenance,
+                "shuffled-action V5 provenance does not match its transition"
+            );
+            if factual.action == shuffled.action {
+                return Ok(Some(factual.next.clone()));
+            }
+            ensure!(
+                matches!(shuffled.action.id, 5 | 6),
+                "sidecar-aware shuffle produced an action outside the V5 episode operator"
+            );
+            apply_episode_operator(
+                &factual.current,
+                &shuffled.action,
+                provenance.content_rect,
+                provenance.operator,
+            )
+            .map(Some)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ShuffledActionControlPopulation {
+        samples: shuffled,
+        counterfactual_next,
+        eligible_rows,
+    })
 }
 
 /// Evaluate the current encoding, target encoding, predicted next state, and
@@ -1089,9 +1213,14 @@ mod tests {
     use super::*;
     use crate::domain::Split;
     use crate::p2::data::{
-        generate_curriculum, ArcAction, ArcFrame, GoalFeatures, TransitionProvenance, FRAME_SIDE,
+        compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcAction,
+        ArcFrame, ContentRect, D4Transform, EpisodeOperator, GoalFeatures, MixedStreamConfig,
+        MixedStreamKind, OperatorFamily, SymmetryAugmentation, TransitionProvenance, V5DataSplit,
+        V5SampleProvenance, FRAME_SIDE,
     };
-    use crate::p2::train::{reinit_varmap_deterministic, TrainConfig};
+    use crate::p2::train::{
+        reinit_varmap_deterministic, TrainConfig, FOUNDATION_V2_GATE_SEED,
+    };
     use candle_nn::{VarBuilder, VarMap};
 
     fn sample(next_pixel: u8) -> TransitionSample {
@@ -1122,6 +1251,62 @@ mod tests {
             },
             oracle_latent: None,
         }
+    }
+
+    fn operator_row(
+        current: ArcFrame,
+        action: ArcAction,
+        operator: EpisodeOperator,
+        episode_id: u64,
+    ) -> Result<(TransitionSample, V5SampleProvenance)> {
+        let content_rect = ContentRect {
+            x: 0,
+            y: 0,
+            width: 7,
+            height: 7,
+        };
+        let next = apply_episode_operator(&current, &action, content_rect, operator)?;
+        let source = TransitionProvenance {
+            content_width: 7,
+            content_height: 7,
+            content_x: 0,
+            content_y: 0,
+            source_kind: "operator_control".into(),
+            trajectory_id: format!("test/operator_control/{episode_id}"),
+        };
+        let noop = current.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE]
+            == next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE];
+        let sample = TransitionSample {
+            current,
+            next,
+            action,
+            goal_features: GoalFeatures::zeros(),
+            noop: Some(noop),
+            goal_satisfied: None,
+            goal_failed: None,
+            exhausted: None,
+            split: Split::Train,
+            family: "operator_control".into(),
+            seed: 11,
+            episode_id,
+            transition_index: 0,
+            provenance: source.clone(),
+            oracle_latent: None,
+        };
+        let provenance = V5SampleProvenance {
+            source,
+            content_rect,
+            data_split: V5DataSplit::Train,
+            stream: MixedStreamKind::FactualBranches,
+            operator,
+            augmentation: SymmetryAugmentation {
+                d4: D4Transform::Identity,
+                color_permutation: std::array::from_fn(|index| index as u8),
+            },
+            goal_dropped: false,
+            branch_group_id: None,
+        };
+        Ok((sample, provenance))
     }
 
     #[test]
@@ -1215,6 +1400,125 @@ mod tests {
             assert!(y >= target.provenance.content_y as u8);
             assert!(y < (target.provenance.content_y + target.provenance.content_height) as u8);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_toggle_inert_coordinates_are_not_outcome_changing() -> Result<()> {
+        let current = ArcFrame::new(
+            FRAME_SIDE as u16,
+            FRAME_SIDE as u16,
+            vec![palette::EMPTY; FRAME_SIDE * FRAME_SIDE],
+        )?;
+        // Equal EMPTY toggle colors make both selected cells explicitly inert
+        // without changing the production operator semantics under test.
+        let operator = EpisodeOperator {
+            family: OperatorFamily::Toggle,
+            agent_color: palette::AGENT,
+            primary_color: palette::EMPTY,
+            secondary_color: palette::EMPTY,
+        };
+        let (first, first_provenance) = operator_row(
+            current.clone(),
+            ArcAction::new(6, Some(1), Some(1))?,
+            operator,
+            1,
+        )?;
+        let (second, second_provenance) = operator_row(
+            current,
+            ArcAction::new(6, Some(5), Some(5))?,
+            operator,
+            2,
+        )?;
+        let factual = vec![first, second];
+        let control = shuffled_action_control_population(
+            &factual,
+            Some(&[first_provenance, second_provenance]),
+        )?;
+
+        assert_eq!(control.samples.len(), 2);
+        assert_eq!(control.eligible_rows, 2);
+        assert_eq!(control.changed_tuples(&factual), 2);
+        assert_eq!(control.outcome_changing(&factual), vec![Some(false); 2]);
+        assert_eq!(control.outcome_changing_tuples(&factual), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_teleport_coordinate_that_moves_the_agent_is_outcome_changing() -> Result<()> {
+        let mut pixels = vec![palette::EMPTY; FRAME_SIDE * FRAME_SIDE];
+        pixels[FRAME_SIDE + 1] = palette::AGENT;
+        let current = ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, pixels)?;
+        let operator = EpisodeOperator {
+            family: OperatorFamily::Teleport,
+            agent_color: palette::AGENT,
+            primary_color: palette::SWITCH_BASE,
+            secondary_color: palette::SWITCH_BASE + 1,
+        };
+        let (first, first_provenance) = operator_row(
+            current.clone(),
+            ArcAction::new(6, Some(2), Some(2))?,
+            operator,
+            1,
+        )?;
+        let (second, second_provenance) = operator_row(
+            current,
+            ArcAction::new(6, Some(5), Some(5))?,
+            operator,
+            2,
+        )?;
+        let factual = vec![first, second];
+        let provenance = vec![first_provenance, second_provenance];
+        let control = shuffled_action_control_population(&factual, Some(&provenance))?;
+
+        assert_eq!(control.changed_tuples(&factual), 2);
+        assert_eq!(control.outcome_changing(&factual), vec![Some(true); 2]);
+        assert_eq!(control.outcome_changing_tuples(&factual), Some(2));
+        for ((sample, shuffled), counterfactual) in factual
+            .iter()
+            .zip(&control.samples)
+            .zip(&control.counterfactual_next)
+        {
+            let expected = apply_episode_operator(
+                &sample.current,
+                &shuffled.action,
+                provenance[0].content_rect,
+                operator,
+            )?;
+            assert_eq!(counterfactual.as_ref(), Some(&expected));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_foundation_gate_population_has_causal_shuffle_support() -> Result<()> {
+        let batch = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 512,
+                seed: FOUNDATION_V2_GATE_SEED,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::UnseenSeed7x7,
+        )?;
+        let samples = batch.transitions().cloned().collect::<Vec<_>>();
+        let provenance = batch
+            .samples()
+            .iter()
+            .map(|sample| sample.provenance.clone())
+            .collect::<Vec<_>>();
+        let control = shuffled_action_control_population(&samples, Some(&provenance))?;
+        let outcome_changing = control
+            .outcome_changing_tuples(&samples)
+            .expect("V5 sidecars cover the entire gate population");
+
+        assert!(control.changed_tuples(&samples) >= outcome_changing);
+        assert!(
+            outcome_changing >= crate::p2::eval::MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS,
+            "fixed gate produced only {outcome_changing} causal interventions"
+        );
         Ok(())
     }
 

@@ -268,6 +268,14 @@ sealed diagnostic bundle:
    first evaluation.
 2. Shuffled-action changed-pixel ratio ≤ 0.95 (action sensitivity) —
    enforced after step 4096; measured and logged from the first evaluation.
+   Amendment 2026-08-28: the denominator now contains only genuinely changed
+   ACTION5/ACTION6 tuples whose generation-time counterfactual, replayed with
+   the target row's recorded operator and the exact conjugated coordinate shown
+   to the model, changes the status-excluded gameplay outcome. Outcome-equivalent
+   tuples no longer penalize a correct simulator. At least 32 outcome-changing
+   rows are required; a smaller or unavailable causal population is a fail-closed
+   evaluation configuration error. The ≤0.95 threshold is unchanged because an
+   action-blind model still approaches ratio 1.0 on outcome-changing rows.
 3. Foreground reconstruction pixel accuracy (encoded next) ≥ 0.60 after step
    8192 — a decoder-collapse floor. Amendment 2026-08-26: originally ≥ 0.85
    after step 4096; the first launch measured a stable asymptote near 0.67
@@ -300,8 +308,10 @@ The fixed in-trainer gate is fingerprinted and explicitly `selection_only`:
 it may choose a checkpoint but cannot satisfy a promotion claim. Promotion
 requires a fresh untouched, preregistered, multi-seed evaluation population.
 For shuffled actions the report distinguishes total rows, eligible rows, and
-genuinely changed input tuples; outcome-changing tuples remain `null` unless a
-simulator sidecar can establish them rather than guessing from model output.
+genuinely changed input tuples. V5 gate populations additionally replay each
+shuffled operator tuple from the target current board and report the exact
+outcome-changing count; legacy populations without that sidecar retain `null`
+rather than guessing from model output.
 
 ## 7. Explicitly deferred (next iteration, not this run)
 
