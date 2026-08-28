@@ -4,9 +4,9 @@ use candle_nn::{VarBuilder, VarMap};
 use tofy::p2::experiment::ConsumerReadoutTopology;
 use tofy::p2::grounding::patch_tokens_to_pixels;
 use tofy::p2::model::{
-    ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts, WorldModel, FRAME_SIDE,
+    init_copy_bypass_gate, restore_copy_gate_bias_prior, ModelConfig, PtrmConfig, RecursionDepth,
+    RecursionOpts, WorldModel, COPY_BYPASS_INITIAL_ALPHA, FRAME_SIDE,
 };
-use tofy::p2::model::{restore_copy_gate_bias_prior, zero_copy_bypass_gate};
 use tofy::p2::train::reinit_varmap_deterministic;
 
 fn exact_config(patch_size: usize) -> ModelConfig {
@@ -688,7 +688,7 @@ fn copy_bypass_zero_gate_is_exact_latent_copy_for_any_finite_state() -> Result<(
     };
     let model = WorldModel::new(cfg, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
     reinit_varmap_deterministic(&vars, 7)?;
-    zero_copy_bypass_gate(&vars)?;
+    set_alpha(&vars, 0.0)?;
     // Deliberately non-unit-RMS: the zero-gate fixpoint must hold for any
     // finite latent, not only encoder-manifold states.
     let state = spatial_with_values(&device, &[(3, 5, 3.7), (10, 2, -8.0)])?;
@@ -727,7 +727,7 @@ fn copy_bypass_alpha_one_reproduces_the_legacy_update() -> Result<()> {
 }
 
 #[test]
-fn copy_bypass_gate_receives_gradient_at_zero() -> Result<()> {
+fn copy_bypass_gate_and_candidate_path_receive_gradient_at_init() -> Result<()> {
     let device = Device::Cpu;
     let vars = VarMap::new();
     let model = WorldModel::new(
@@ -738,29 +738,48 @@ fn copy_bypass_gate_receives_gradient_at_zero() -> Result<()> {
         VarBuilder::from_varmap(&vars, DType::F32, &device),
     )?;
     reinit_varmap_deterministic(&vars, 13)?;
-    zero_copy_bypass_gate(&vars)?;
+    init_copy_bypass_gate(&vars)?;
     let state = spatial_with_values(&device, &[(2, 2, 1.0)])?;
     let target = spatial_with_values(&device, &[(2, 3, 1.0)])?;
     let (actions, coords, goals) = action6(&device, 0.1, 0.1)?;
     let out = model.forward_from_latent(&state, &actions, &coords, &goals)?;
     let loss = out.y.sub(&target)?.sqr()?.mean_all()?;
     let grads = loss.backward()?;
-    let alpha_grad = {
+    let (alpha_grad, core_grad, action_grad) = {
         let data = vars.data().lock().unwrap();
         let alpha = data.get("y_copy_bypass_alpha").expect("gate exists");
-        grads
+        let alpha_grad = grads
             .get(alpha.as_tensor())
             .expect("gate must receive a gradient")
             .abs()?
             .max_all()?
-            .to_scalar::<f32>()?
+            .to_scalar::<f32>()?;
+        let core = data.get("block.c1.weight").expect("core weight exists");
+        let core_grad = grads
+            .get(core.as_tensor())
+            .expect("initial candidate path must reach the recurrent core")
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let action = data
+            .get("action_proj.weight")
+            .expect("action projection exists");
+        let action_grad = grads
+            .get(action.as_tensor())
+            .expect("initial candidate path must reach action conditioning")
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        (alpha_grad, core_grad, action_grad)
     };
     assert!(alpha_grad.is_finite() && alpha_grad > 0.0);
+    assert!(core_grad.is_finite() && core_grad > 0.0);
+    assert!(action_grad.is_finite() && action_grad > 0.0);
     Ok(())
 }
 
 #[test]
-fn reinit_then_zero_helper_restores_the_zero_gate() -> Result<()> {
+fn reinit_then_init_helper_restores_the_small_nonzero_gate() -> Result<()> {
     let device = Device::Cpu;
     let vars = VarMap::new();
     let _model = WorldModel::new(
@@ -771,10 +790,13 @@ fn reinit_then_zero_helper_restores_the_zero_gate() -> Result<()> {
         VarBuilder::from_varmap(&vars, DType::F32, &device),
     )?;
     reinit_varmap_deterministic(&vars, 17)?;
-    zero_copy_bypass_gate(&vars)?;
+    init_copy_bypass_gate(&vars)?;
     let data = vars.data().lock().unwrap();
     let alpha = data.get("y_copy_bypass_alpha").expect("gate exists");
-    assert_eq!(alpha.as_tensor().abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
+    assert_eq!(
+        alpha.as_tensor().reshape(())?.to_scalar::<f32>()?,
+        COPY_BYPASS_INITIAL_ALPHA as f32
+    );
     Ok(())
 }
 

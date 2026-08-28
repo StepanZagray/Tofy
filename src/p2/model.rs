@@ -35,6 +35,11 @@ pub const DEFAULT_GOAL_DIM: usize = 19;
 /// Default event head width: noop / goal_satisfied / goal_failed / exhausted.
 pub const DEFAULT_NUM_EVENTS: usize = 4;
 
+/// Initial copy-bypass interpolation weight. This must remain small enough to
+/// preserve the latent-copy prior, but nonzero so the candidate path receives
+/// prediction gradient from the first update.
+pub const COPY_BYPASS_INITIAL_ALPHA: f64 = 0.02;
+
 pub const EVENT_NOOP: usize = 0;
 pub const EVENT_GOAL_SATISFIED: usize = 1;
 pub const EVENT_GOAL_FAILED: usize = 2;
@@ -145,11 +150,11 @@ pub struct ModelConfig {
     pub consumer_readout: ConsumerReadoutTopology,
     /// Copy-bypass gated outer update: the legacy candidate
     /// `l = clamp(rms_norm(y + ny))` is interpolated as `y' = y + a*(l - y)`
-    /// with a scalar gate `a` initialized to zero. `a = 0` is exact latent
-    /// copy for any state in the clamp envelope; `a = 1` reproduces the
-    /// legacy update algebraically (tested to 1e-6 in f32), so the treatment
-    /// contains the baseline as an interior point. The interpolation is
-    /// re-clamped to the legacy envelope. Requires
+    /// with a scalar gate `a` initialized to [`COPY_BYPASS_INITIAL_ALPHA`].
+    /// `a = 0` is exact latent copy for any state in the clamp envelope;
+    /// `a = 1` reproduces the legacy update algebraically (tested to 1e-6 in
+    /// f32), so the treatment contains the baseline as a parameter setting.
+    /// The interpolation is re-clamped to the legacy envelope. Requires
     /// `residual_y_update && warm_start_y`.
     #[serde(default)]
     pub copy_bypass_gate: bool,
@@ -292,9 +297,9 @@ impl ModelConfig {
                  the GlobalMean topology would silently ignore it"
             );
         }
-        if self.grid_scaled_action_impulse && !(self.world_core_v2 || self.spatial_action_field) {
+        if self.grid_scaled_action_impulse && !self.spatial_action_field {
             bail!(
-                "grid_scaled_action_impulse requires the spatial action field; \
+                "grid_scaled_action_impulse requires spatial_action_field=true; \
                  without it the treatment silently does nothing while the \
                  contract labels the run a treatment arm"
             );
@@ -390,18 +395,20 @@ pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
     Ok(())
 }
 
-/// Restore the copy-bypass gate's zero initialization after any generic
-/// model-wide reinitializer (which xavier-initializes every non-bias tensor).
-/// A no-op when the gate is absent; every fresh-init training path calls this
-/// next to [`zero_action_film_projections`].
-pub fn zero_copy_bypass_gate(varmap: &VarMap) -> Result<()> {
+/// Restore the copy-bypass gate's small nonzero initialization after any
+/// generic model-wide reinitializer (which xavier-initializes every non-bias
+/// tensor). A no-op when the gate is absent; every fresh-init training path
+/// calls this next to [`zero_action_film_projections`].
+pub fn init_copy_bypass_gate(varmap: &VarMap) -> Result<()> {
     let data = varmap.data().lock().unwrap();
     for (name, var) in data
         .iter()
         .filter(|(name, _)| name.ends_with("y_copy_bypass_alpha"))
     {
-        var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
-            .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
+        let initial = Tensor::zeros(var.shape(), var.dtype(), var.device())?
+            .affine(0.0, COPY_BYPASS_INITIAL_ALPHA)?;
+        var.set(&initial)
+            .map_err(|error| anyhow::anyhow!("initialize {name}: {error}"))?;
     }
     Ok(())
 }
@@ -727,7 +734,7 @@ pub struct WorldModel {
     spatial_action_proj: Option<Conv2d>,
     goal_proj: Linear,
     block: GridResidualBlock,
-    /// Scalar copy-bypass gate `a` (zero-init) when `copy_bypass_gate` is on.
+    /// Scalar copy-bypass gate `a` (small nonzero init) when enabled.
     y_copy_bypass_alpha: Option<Tensor>,
     event_head: Linear,
     /// PTRM trajectory ranking score.
@@ -831,7 +838,7 @@ impl WorldModel {
                     vb.get_with_hints(
                         (1usize, 1usize, 1usize, 1usize),
                         "y_copy_bypass_alpha",
-                        candle_nn::Init::Const(0.0),
+                        candle_nn::Init::Const(COPY_BYPASS_INITIAL_ALPHA),
                     )
                 })
                 .transpose()?,
@@ -1622,9 +1629,10 @@ impl WorldModel {
             y = match &self.y_copy_bypass_alpha {
                 // y' = y + a*(l - y): a=0 is exact latent copy for any state
                 // inside the clamp envelope; a=1 reproduces the legacy update
-                // algebraically (tested to 1e-6 in f32). The gate is
-                // unconstrained, so the interpolation is re-clamped to keep
-                // the legacy activation envelope even if a leaves [0, 1].
+                // algebraically (tested to 1e-6 in f32). Fresh runs use a
+                // small nonzero a so prediction gradients reach l immediately.
+                // The gate is unconstrained, so the interpolation is re-clamped
+                // to keep the legacy activation envelope if a leaves [0, 1].
                 Some(alpha) => y
                     .add(&candidate.sub(&y)?.broadcast_mul(alpha)?)?
                     .clamp(-32.0, 32.0)?,
@@ -2302,6 +2310,22 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
         let model = WorldModel::new(cfg, vb)?;
         Ok((model, varmap))
+    }
+
+    #[test]
+    fn grid_scaled_impulse_rejects_world_core_without_spatial_field() {
+        let config = ModelConfig {
+            world_core_v2: true,
+            spatial_action_field: false,
+            grid_scaled_action_impulse: true,
+            ..ModelConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("an impulse without its spatial field must be rejected");
+        assert!(error
+            .to_string()
+            .contains("grid_scaled_action_impulse requires spatial_action_field=true"));
     }
 
     #[test]

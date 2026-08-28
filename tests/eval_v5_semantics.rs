@@ -11,7 +11,7 @@ use tofy::p2::eval::{
     board_changed_transition_count, evaluate_gate_support, evaluate_mechanism_ablations,
     one_step_false_edit_rate_with_content_masks, MechanismAblationReport,
 };
-use tofy::p2::model::{zero_copy_bypass_gate, WorldModel};
+use tofy::p2::model::{init_copy_bypass_gate, WorldModel};
 use tofy::p2::semantic_eval::{
     action_controllability_probe, ambiguity_ceiling, shuffled_action_control_samples,
 };
@@ -169,7 +169,7 @@ fn tiny_foundation_model(copy_bypass_gate: bool) -> Result<(WorldModel, VarMap)>
         VarBuilder::from_varmap(&varmap, DType::F32, &device),
     )?;
     reinit_varmap_deterministic(&varmap, 91)?;
-    zero_copy_bypass_gate(&varmap)?;
+    init_copy_bypass_gate(&varmap)?;
     Ok((model, varmap))
 }
 

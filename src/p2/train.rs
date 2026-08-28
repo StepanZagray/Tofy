@@ -19,10 +19,10 @@ use crate::p2::experiment::{
 };
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, restore_copy_gate_bias_prior,
-    zero_action_film_projections, zero_copy_bypass_gate, ModelConfig, PtrmConfig,
-    RecursionDepth, RecursionOpts, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
-    PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
+    flatten_latent, init_copy_bypass_gate, latent_mse_per_sample, restore_copy_gate_bias_prior,
+    zero_action_film_projections, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
+    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, PALETTE_SIZE, PATCH_SIZE,
+    PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
@@ -714,7 +714,7 @@ pub struct TrainConfig {
     /// Preregistered model-treatment arms for the next matched runs. All
     /// default off; each is recorded in the training contract, and at most
     /// one should be enabled per arm to preserve causal attribution.
-    /// Copy-bypass gated outer update (`y' = y + a*(l - y)`, `a` zero-init).
+    /// Copy-bypass gated outer update (`y' = y + a*(l - y)`, small nonzero `a` init).
     #[serde(default)]
     pub copy_bypass_gate: bool,
     /// Copy-gate bias initialized to `logit(p)` for this changed-pixel prior.
@@ -6674,13 +6674,13 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .transpose()?;
     if resumed_from.is_none() {
         reinit_varmap_deterministic(&varmap, cfg.init_seed.unwrap_or(cfg.seed))?;
-        // FiLM identity, copy-bypass zero, and gate-bias-prior initialization
+        // FiLM identity, copy-bypass, and gate-bias-prior initialization
         // are restored exactly once after fresh deterministic init (the
         // reinitializer zeroes every bias, which would silently turn the
         // configured prior into a 50/50 gate). Checkpoint loads must retain
         // the learned values.
         zero_action_film_projections(&varmap)?;
-        zero_copy_bypass_gate(&varmap)?;
+        init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
     }
     let mut ema = ModelEma::with_default_decay(&varmap)?;
@@ -7252,7 +7252,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
         // Treatment initializations survive the generic reinit on every
         // fresh-init path, not only foundation-v2.
-        zero_copy_bypass_gate(&varmap)?;
+        init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
         TrainerState {
             schema: TRAINER_STATE_SCHEMA.into(),
@@ -10272,7 +10272,7 @@ mod tests {
         // the exact weights a run starts from.
         reinit_varmap_deterministic(&varmap, 23)?;
         zero_action_film_projections(&varmap)?;
-        zero_copy_bypass_gate(&varmap)?;
+        init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
 
         let small = compose_mixed_stream_batch(

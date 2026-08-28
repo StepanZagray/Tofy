@@ -29,6 +29,23 @@ pub struct PatchGroundingLoss {
     pub unchanged_patches: usize,
 }
 
+fn ensure_composed_decode_finite(tensor: &Tensor, label: &str) -> Result<()> {
+    let tensor = tensor.to_dtype(DType::F32)?;
+    // Count a bounded 0/1 mask instead of summing the values themselves:
+    // finite f32 values can overflow a sum even when every element is valid.
+    let finite_count = tensor
+        .eq(&tensor)?
+        .to_dtype(DType::F32)?
+        .mul(&tensor.abs()?.le(f32::MAX)?.to_dtype(DType::F32)?)?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    ensure!(
+        finite_count == tensor.elem_count() as f32,
+        "composed decode received non-finite {label}"
+    );
+    Ok(())
+}
+
 /// Shared linear decoder from one spatial latent token to a normalized
 /// 16-colour histogram for the corresponding observation patch.
 pub struct PatchHistogramGrounding {
@@ -242,14 +259,7 @@ impl ExactPatchGrounding {
         // false, so a NaN gate or logit row would otherwise decode as a
         // spuriously valid copy and inflate copy-heavy exactness metrics.
         for (tensor, label) in [(&logits, "gameplay logits"), (&gate, "copy gate")] {
-            let sum = tensor
-                .to_dtype(DType::F32)?
-                .sum_all()?
-                .to_scalar::<f32>()?;
-            ensure!(
-                sum.is_finite(),
-                "composed decode received non-finite {label}"
-            );
+            ensure_composed_decode_finite(tensor, label)?;
         }
         match self.composition {
             DecodeComposition::LegacyHardGate => {
@@ -614,6 +624,19 @@ mod tests {
             head.compose_gameplay_pixels(&finite, &current)?;
             let poisoned = Tensor::full(f32::NAN, (1, 4, 16, 16), &device)?;
             assert!(head.compose_gameplay_pixels(&poisoned, &current).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn composed_decode_finiteness_check_does_not_overflow() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let large_finite = Tensor::full(1e38f32, (1024,), &device)?;
+        ensure_composed_decode_finite(&large_finite, "test tensor")?;
+
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let poisoned = Tensor::from_vec(vec![1.0f32, value], (2,), &device)?;
+            assert!(ensure_composed_decode_finite(&poisoned, "test tensor").is_err());
         }
         Ok(())
     }
