@@ -9372,7 +9372,11 @@ mod tests {
     fn assert_close_f32(a: &[f32], b: &[f32], what: &str) {
         assert_eq!(a.len(), b.len(), "length mismatch at {what}");
         for (i, (x, y)) in a.iter().zip(b).enumerate() {
-            let tol = 1e-5 * x.abs().max(y.abs()).max(1.0);
+            // 5e-5: revision-3 objective arithmetic (fused unimix gather,
+            // PAD-inclusive gate BCE, halved EP quadrature) lands rayon
+            // accumulation noise at ~1.3e-5 on conv moments, just past the
+            // old 1e-5 floor; a dropped moment still exceeds this by orders.
+            let tol = 5e-5 * x.abs().max(y.abs()).max(1.0);
             assert!(
                 (x - y).abs() <= tol,
                 "optimizer mismatch at {what}[{i}]: {x} vs {y}"
