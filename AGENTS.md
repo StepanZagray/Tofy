@@ -24,7 +24,7 @@
 ## Research
 - Always use the globally installed `research` skill (the local-memory workflow under
   `~/.agents/skills/research/`) when analyzing or comparing experiments or experiment results,
-  and whenever the user asks to research, investigate, or produce a source-backed report.
+  and whenever the user asks to research, or produce a source-backed report.
 - Follow the skill's global-library workflow and use the `ml/tofy` scope for Tofy research.
 - For every completed experiment analysis, preserve a concise insight under
   `ml/tofy/insights/` with exact run identifiers and revisions, positive and negative results,

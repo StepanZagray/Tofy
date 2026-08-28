@@ -15,6 +15,7 @@ pub struct ConsumerReadout {
     position_embedding: Option<Embedding>,
     position_value_embedding: Option<Embedding>,
     query_score: Option<Linear>,
+    position_indices: Option<Tensor>,
     spatial_side: usize,
 }
 
@@ -27,6 +28,9 @@ impl ConsumerReadout {
         vb: VarBuilder,
     ) -> Result<Self> {
         let spatial_tokens = spatial_side * spatial_side;
+        let position_indices = (topology == ConsumerReadoutTopology::SpatialQuery)
+            .then(|| Tensor::arange(0u32, spatial_tokens as u32, vb.device()))
+            .transpose()?;
         let (position_embedding, position_value_embedding, query_score) = match topology {
             ConsumerReadoutTopology::GlobalMean => (None, None, None),
             ConsumerReadoutTopology::SpatialQuery => (
@@ -46,6 +50,7 @@ impl ConsumerReadout {
             position_embedding,
             position_value_embedding,
             query_score,
+            position_indices,
             spatial_side,
         })
     }
@@ -69,12 +74,15 @@ impl ConsumerReadout {
         let tokens = spatial
             .permute((0, 2, 3, 1))?
             .reshape((batch, spatial_tokens, channels))?;
-        let positions = Tensor::arange(0u32, spatial_tokens as u32, spatial.device())?;
+        let positions = self
+            .position_indices
+            .as_ref()
+            .expect("spatial-query adapter owns position indices");
         let position_embedding = self
             .position_embedding
             .as_ref()
             .expect("spatial-query adapter owns position embeddings")
-            .forward(&positions)?
+            .forward(positions)?
             .to_dtype(DType::F32)?;
         let scored_tokens = tokens
             .to_dtype(DType::F32)?
@@ -88,7 +96,7 @@ impl ConsumerReadout {
         let values = match &self.position_value_embedding {
             Some(position_values) => tokens
                 .to_dtype(DType::F32)?
-                .broadcast_add(&position_values.forward(&positions)?.to_dtype(DType::F32)?)?,
+                .broadcast_add(&position_values.forward(positions)?.to_dtype(DType::F32)?)?,
             None => tokens.to_dtype(DType::F32)?,
         };
         values.broadcast_mul(&weights)?.sum(1).map_err(Into::into)
