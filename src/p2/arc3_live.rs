@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v4";
 pub const LIVE_POLICY: &str = "model_reliable_effect_v1";
-const POLICY_LIMITATION: &str = "The checkpoint predicts transition fidelity, reliability, no-op probability, and latent action effect; it has no trained reward/value head. This exploratory policy is not a hidden-goal solver.";
+const POLICY_LIMITATION: &str = "The checkpoint predicts composed next-frame accuracy, latent self-confidence, no-op probability, and latent action effect; it has no trained reward/value head. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
 const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content";
 const MAX_HTTP_ATTEMPTS: usize = 5;
@@ -832,6 +832,9 @@ impl<'a> ModelPolicy<'a> {
             for index in 0..n {
                 let effect_scaled = f64::from(effect[index]).max(0.0);
                 let effect_unit = effect_scaled / (1.0 + effect_scaled);
+                // Q measures composed next-frame pixel accuracy; reliability
+                // measures confidence that factual latent MSE is within its
+                // threshold; no-op and effect measure predicted action impact.
                 // TODO(ADR 0003 §7): retain the searchless forward-pass policy
                 // until a goal/belief-conditioned ranking target is trained.
                 let score = 0.25 * f64::from(q[index])
