@@ -229,6 +229,11 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub bf16_conv: bool,
 
+    /// Preregistered model treatment: BF16 products in block.c1/block.c2
+    /// only, with F32 master weights and F32 recurrent state boundaries.
+    #[arg(long, default_value_t = false)]
+    pub bf16_recurrent_core: bool,
+
     #[arg(long, default_value_t = 8)]
     pub ensemble_members: usize,
 
@@ -463,6 +468,7 @@ impl P2TrainArgs {
             prefix_weight: self.prefix_weight,
             reliability_weight: self.reliability_weight,
             bf16_conv: self.bf16_conv,
+            bf16_recurrent_core: self.bf16_recurrent_core,
             ensemble_members: self.ensemble_members,
             muon_momentum: self.muon_momentum,
             muon_rms_scale: self.muon_rms_scale,

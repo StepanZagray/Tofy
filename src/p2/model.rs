@@ -120,6 +120,11 @@ pub struct ModelConfig {
     /// Run conv encoder/decoder paths in BF16 (norms/losses stay F32).
     #[serde(default)]
     pub bf16_conv: bool,
+    /// Run only the recurrent block's convolution products in BF16. Inputs
+    /// and F32 master weights are cast at use time; every convolution result
+    /// returns to F32 before bias, activation, FiLM, or residual/state math.
+    #[serde(default)]
+    pub bf16_recurrent_core: bool,
     /// Feed pre-RMS pooled encoder features through a learned SIGReg projector.
     #[serde(default)]
     pub sigreg_projector: bool,
@@ -213,6 +218,7 @@ impl Default for ModelConfig {
             residual_y_update: false,
             warm_start_y: false,
             bf16_conv: false,
+            bf16_recurrent_core: false,
             sigreg_projector: false,
             sigreg_projector_dim: default_sigreg_projector_dim(),
             spatial_action_field: false,
@@ -583,12 +589,57 @@ impl GridResidualBlock {
         })
     }
 
-    fn forward(&self, h: &Tensor, film: &ActionFilm) -> Result<Tensor> {
-        let hidden = self.c1.forward(h)?.silu()?;
+    fn conv_product_f32(&self, conv: &Conv2d, input: &Tensor) -> Result<Tensor> {
+        let config = *conv.config();
+        let input = input.to_dtype(DType::BF16)?;
+        let weight = conv.weight().to_dtype(DType::BF16)?;
+        // Candle's generic CPU conv lowers through a matmul implementation
+        // that currently rejects BF16. Round both already-quantized operands
+        // back to F32 there to emulate BF16 operands with F32 accumulation;
+        // CUDA keeps the actual BF16 convolution required by the treatment.
+        let (input, weight) = if input.device().is_cpu() {
+            (input.to_dtype(DType::F32)?, weight.to_dtype(DType::F32)?)
+        } else {
+            (input, weight)
+        };
+        let output = input.conv2d_with_algo(
+            &weight,
+            config.padding,
+            config.stride,
+            config.dilation,
+            config.groups,
+            config.cudnn_fwd_algo,
+        )?;
+        let output = output.to_dtype(DType::F32)?;
+        match conv.bias() {
+            None => Ok(output),
+            Some(bias) => {
+                let channels = bias.dims1()?;
+                output
+                    .broadcast_add(&bias.reshape((1, channels, 1, 1))?)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    fn forward(&self, h: &Tensor, film: &ActionFilm, bf16: bool) -> Result<Tensor> {
+        if !bf16 {
+            let hidden = self.c1.forward(h)?.silu()?;
+            let hidden = hidden
+                .broadcast_mul(&film.gamma)?
+                .broadcast_add(&film.beta)?;
+            let delta = self.c2.forward(&hidden)?;
+            return h.add(&delta).map_err(Into::into);
+        }
+
+        // Bias stays on the F32 side of each cast island. This avoids BF16
+        // bias quantization and returns c1 to F32 before SiLU/FiLM, while c2
+        // returns its delta to F32 before the residual addition.
+        let hidden = self.conv_product_f32(&self.c1, h)?.silu()?;
         let hidden = hidden
             .broadcast_mul(&film.gamma)?
             .broadcast_add(&film.beta)?;
-        let delta = self.c2.forward(&hidden)?;
+        let delta = self.conv_product_f32(&self.c2, &hidden)?;
         h.add(&delta).map_err(Into::into)
     }
 }
@@ -1736,7 +1787,10 @@ impl WorldModel {
                 (None, Some(z)) => x.add(&y)?.add(z)?,
                 (None, None) => x.add(&y)?,
             };
-            z = Some(self.block.forward(&inp, film)?);
+            z = Some(
+                self.block
+                    .forward(&inp, film, self.config.bf16_recurrent_core)?,
+            );
         }
         let z = z.expect("inner_steps >= 1 initializes z");
         let inp = if self.config.world_core_v4 {
@@ -1744,7 +1798,9 @@ impl WorldModel {
         } else {
             y.add(&z)?
         };
-        y = self.block.forward(&inp, film)?;
+        y = self
+            .block
+            .forward(&inp, film, self.config.bf16_recurrent_core)?;
         Ok((y, z))
     }
 
@@ -2754,7 +2810,8 @@ impl WorldModel {
 mod tests {
     use super::*;
     use crate::p2::train::reinit_varmap_deterministic;
-    use candle_core::{DType, Device, IndexOp, Tensor};
+    use candle_core::{DType, Device, IndexOp, Tensor, Var};
+    use candle_nn::optim::{Optimizer, SGD};
     use candle_nn::{VarBuilder, VarMap};
 
     fn tiny_cfg() -> ModelConfig {
@@ -3363,9 +3420,9 @@ mod tests {
         let xy = x.add(&legacy_y)?;
         for _ in 0..2 {
             let input = xy.add(&legacy_z)?;
-            legacy_z = model.block.forward(&input, &film)?;
+            legacy_z = model.block.forward(&input, &film, false)?;
         }
-        legacy_y = model.block.forward(&xy.add(&legacy_z)?, &film)?;
+        legacy_y = model.block.forward(&xy.add(&legacy_z)?, &film, false)?;
 
         assert_eq!(
             optimized.0.flatten_all()?.to_vec1::<f32>()?,
@@ -3498,6 +3555,120 @@ mod tests {
             }
         }
         assert!(seen > 0, "expected nonempty finite parameter gradients");
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_recurrent_flag_off_is_bit_exact_forward_and_backward() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let block = GridResidualBlock::new(
+            4,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("block"),
+        )?;
+        reinit_varmap_deterministic(&varmap, 211)?;
+        let input = Var::from_tensor(
+            &Tensor::arange(0f32, 64f32, &device)?
+                .affine(1.0 / 32.0, -1.0)?
+                .reshape((1, 4, 4, 4))?,
+        )?;
+        let film = ActionFilm {
+            gamma: Tensor::from_vec(vec![1.0f32, 0.75, 1.25, 0.5], (1, 4, 1, 1), &device)?,
+            beta: Tensor::from_vec(vec![0.0f32, 0.1, -0.2, 0.3], (1, 4, 1, 1), &device)?,
+        };
+
+        let actual = block.forward(input.as_tensor(), &film, false)?;
+        let expected_hidden = block.c1.forward(input.as_tensor())?.silu()?;
+        let expected_hidden = expected_hidden
+            .broadcast_mul(&film.gamma)?
+            .broadcast_add(&film.beta)?;
+        let expected = input.as_tensor().add(&block.c2.forward(&expected_hidden)?)?;
+        assert_eq!(
+            actual.flatten_all()?.to_vec1::<f32>()?,
+            expected.flatten_all()?.to_vec1::<f32>()?
+        );
+
+        let actual_grads = actual.sqr()?.sum_all()?.backward()?;
+        let expected_grads = expected.sqr()?.sum_all()?.backward()?;
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            let actual = actual_grads
+                .get(var)
+                .unwrap_or_else(|| panic!("missing actual gradient for {name}"));
+            let expected = expected_grads
+                .get(var)
+                .unwrap_or_else(|| panic!("missing reference gradient for {name}"));
+            assert_eq!(
+                actual.flatten_all()?.to_vec1::<f32>()?,
+                expected.flatten_all()?.to_vec1::<f32>()?,
+                "flag-off gradient drifted for {name}"
+            );
+        }
+        assert_eq!(
+            actual_grads
+                .get(&input)
+                .expect("actual input gradient")
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            expected_grads
+                .get(&input)
+                .expect("reference input gradient")
+                .flatten_all()?
+                .to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_recurrent_core_updates_f32_masters_with_finite_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let block = GridResidualBlock::new(
+            4,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("block"),
+        )?;
+        reinit_varmap_deterministic(&varmap, 223)?;
+        let input = Tensor::arange(0f32, 64f32, &device)?
+            .affine(1.0 / 32.0, -1.0)?
+            .reshape((1, 4, 4, 4))?;
+        let film = ActionFilm::neutral_like(&input)?;
+        let output = block.forward(&input, &film, true)?;
+        assert_eq!(output.dtype(), DType::F32);
+        assert!(output
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|value| value.is_finite()));
+        let grads = output.sqr()?.mean_all()?.backward()?;
+
+        let mut masters = Vec::new();
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            assert_eq!(var.dtype(), DType::F32, "{name} is not an F32 master");
+            if name == "block.c1.weight" || name == "block.c2.weight" {
+                let grad = grads
+                    .get(var)
+                    .unwrap_or_else(|| panic!("missing gradient for {name}"));
+                assert_eq!(grad.dtype(), DType::F32, "{name} gradient is not F32");
+                let values = grad.flatten_all()?.to_vec1::<f32>()?;
+                assert!(values.iter().all(|value| value.is_finite()));
+                assert!(values.iter().any(|value| *value != 0.0));
+                masters.push((name.clone(), var.clone(), var.as_tensor().copy()?));
+            }
+        }
+        assert_eq!(masters.len(), 2);
+        let mut optimizer = SGD::new(varmap.all_vars(), 1e-3)?;
+        optimizer.step(&grads)?;
+        for (name, var, before) in masters {
+            assert_eq!(var.dtype(), DType::F32, "{name} changed dtype after update");
+            let after = var.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+            assert!(after.iter().all(|value| value.is_finite()));
+            assert_ne!(before.flatten_all()?.to_vec1::<f32>()?, after);
+        }
+        let updated = block.forward(&input, &film, true)?;
+        assert!(updated
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|value| value.is_finite()));
         Ok(())
     }
 
