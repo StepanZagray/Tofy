@@ -10,7 +10,7 @@ use crate::p2::cg_profile::{
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
-    ContentMask, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
+    ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
     MixedStreamKind, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{evaluate_gate_support_with_content_masks, GateSupportMetrics};
@@ -117,7 +117,8 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// 1 = pre-content-mask objective; 2 = 2026-08-27 content-masked objective
 /// with the reachable separation hinge and budget-exact EP controller;
 /// 3 = bounded split-CE amplification, conditioned displacement norm, and the
-/// nonzero copy-bypass alpha init that reopens the candidate gradient path.
+/// nonzero copy-bypass alpha init that reopens the candidate gradient path,
+/// plus unchanged-target copy-gate supervision on gameplay PAD pixels.
 pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 3;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1699,10 +1700,13 @@ pub struct TrainReport {
     pub lr: f64,
     pub weight_decay: f64,
     pub parameter_count: usize,
-    /// Ordered provenance fingerprint of every generated training row consumed
-    /// by completed optimizer updates.
+    /// Legacy FNV-1a provenance fingerprint of every generated training row
+    /// consumed by completed optimizer updates. It deliberately excludes
+    /// content masks and content origins; use `training_content_fingerprint`
+    /// when those objective inputs must be bound.
     pub training_population_fingerprint: String,
-    /// Cryptographic chain over provenance plus complete current/next frames.
+    /// Cryptographic chain over provenance, exact content masks, and complete
+    /// current/next frames.
     #[serde(default)]
     pub training_content_fingerprint: String,
     pub training_population_rows: u64,
@@ -2087,11 +2091,67 @@ fn foundation_v2_gate_population_identity(
     })
 }
 
+/// Initial state for the compatibility FNV fingerprint, which intentionally
+/// excludes content masks and content origins.
 fn default_training_population_hash() -> u64 {
     FNV1A64_OFFSET
 }
 
-fn update_training_population(state: &mut TrainerState, samples: &[TransitionSample]) {
+/// Append one ordered row to the cryptographic training-content chain.
+///
+/// Objective revision 3 binds the exact mask sidecar and content origin, so
+/// published identities produced here differ from revision-2 runs even when
+/// their serialized `TransitionSample` rows are otherwise identical.
+fn training_content_hash_append(
+    previous: [u8; 32],
+    sample: &TransitionSample,
+    content_mask: &ContentMask,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(previous);
+    digest.update(sample.seed.to_le_bytes());
+    digest.update(sample.episode_id.to_le_bytes());
+    digest.update(sample.transition_index.to_le_bytes());
+    digest.update((sample.family.len() as u64).to_le_bytes());
+    digest.update(sample.family.as_bytes());
+    digest.update(sample.provenance.content_width.to_le_bytes());
+    digest.update(sample.provenance.content_height.to_le_bytes());
+    digest.update(sample.provenance.content_x.to_le_bytes());
+    digest.update(sample.provenance.content_y.to_le_bytes());
+    digest.update((content_mask.values.len() as u64).to_le_bytes());
+    digest.update(&content_mask.values);
+    digest.update((sample.provenance.source_kind.len() as u64).to_le_bytes());
+    digest.update(sample.provenance.source_kind.as_bytes());
+    digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
+    digest.update(sample.provenance.trajectory_id.as_bytes());
+    digest.update([sample.action.id]);
+    digest.update([
+        sample.action.x.unwrap_or(u8::MAX),
+        sample.action.y.unwrap_or(u8::MAX),
+    ]);
+    for value in sample.goal_features.values {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    digest.update([option_bool_byte(sample.noop)]);
+    digest.update([option_bool_byte(sample.goal_satisfied)]);
+    digest.update([option_bool_byte(sample.goal_failed)]);
+    digest.update([option_bool_byte(sample.exhausted)]);
+    digest.update((sample.current.pixels.len() as u64).to_le_bytes());
+    digest.update(&sample.current.pixels);
+    digest.update((sample.next.pixels.len() as u64).to_le_bytes());
+    digest.update(&sample.next.pixels);
+    digest.finalize().into()
+}
+
+fn update_training_population(
+    state: &mut TrainerState,
+    samples: &[TransitionSample],
+    content_masks: &[&ContentMask],
+) -> Result<()> {
+    if samples.len() != content_masks.len() {
+        bail!("training population rows and content masks differ in length");
+    }
+
     fn bytes(hash: &mut u64, value: &[u8]) {
         for byte in value {
             *hash ^= u64::from(*byte);
@@ -2099,37 +2159,9 @@ fn update_training_population(state: &mut TrainerState, samples: &[TransitionSam
         }
     }
 
-    for sample in samples {
-        let mut digest = Sha256::new();
-        digest.update(state.training_content_hash);
-        digest.update(sample.seed.to_le_bytes());
-        digest.update(sample.episode_id.to_le_bytes());
-        digest.update(sample.transition_index.to_le_bytes());
-        digest.update((sample.family.len() as u64).to_le_bytes());
-        digest.update(sample.family.as_bytes());
-        digest.update(sample.provenance.content_width.to_le_bytes());
-        digest.update(sample.provenance.content_height.to_le_bytes());
-        digest.update((sample.provenance.source_kind.len() as u64).to_le_bytes());
-        digest.update(sample.provenance.source_kind.as_bytes());
-        digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
-        digest.update(sample.provenance.trajectory_id.as_bytes());
-        digest.update([sample.action.id]);
-        digest.update([
-            sample.action.x.unwrap_or(u8::MAX),
-            sample.action.y.unwrap_or(u8::MAX),
-        ]);
-        for value in sample.goal_features.values {
-            digest.update(value.to_bits().to_le_bytes());
-        }
-        digest.update([option_bool_byte(sample.noop)]);
-        digest.update([option_bool_byte(sample.goal_satisfied)]);
-        digest.update([option_bool_byte(sample.goal_failed)]);
-        digest.update([option_bool_byte(sample.exhausted)]);
-        digest.update((sample.current.pixels.len() as u64).to_le_bytes());
-        digest.update(&sample.current.pixels);
-        digest.update((sample.next.pixels.len() as u64).to_le_bytes());
-        digest.update(&sample.next.pixels);
-        state.training_content_hash = digest.finalize().into();
+    for (sample, content_mask) in samples.iter().zip(content_masks) {
+        state.training_content_hash =
+            training_content_hash_append(state.training_content_hash, sample, content_mask);
         bytes(
             &mut state.training_population_hash,
             &sample.seed.to_le_bytes(),
@@ -2159,6 +2191,18 @@ fn update_training_population(state: &mut TrainerState, samples: &[TransitionSam
         );
         state.training_population_rows += 1;
     }
+    Ok(())
+}
+
+fn training_content_mask_from_provenance(sample: &TransitionSample) -> Result<ContentMask> {
+    ContentMask::from_rect(ContentRect {
+        x: u8::try_from(sample.provenance.content_x).context("content x does not fit u8")?,
+        y: u8::try_from(sample.provenance.content_y).context("content y does not fit u8")?,
+        width: u8::try_from(sample.provenance.content_width)
+            .context("content width does not fit u8")?,
+        height: u8::try_from(sample.provenance.content_height)
+            .context("content height does not fit u8")?,
+    })
 }
 
 fn option_bool_byte(value: Option<bool>) -> u8 {
@@ -2890,6 +2934,21 @@ fn bce_with_logits_elem(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
 
 fn bce_with_logits(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
     bce_with_logits_elem(logits, targets)?
+        .mean_all()
+        .map_err(Into::into)
+}
+
+/// Copy-gate BCE over the same complete 63x64 gameplay frame used by composed
+/// exactness and padding-false-edit metrics. `changed` is content-masked, so
+/// every PAD pixel is an unchanged target with unit weight.
+fn foundation_v2_copy_gate_loss(
+    gate_logits: &Tensor,
+    changed: &Tensor,
+    changed_weight: f64,
+) -> Result<Tensor> {
+    let gate_weights = changed.affine(changed_weight - 1.0, 1.0)?;
+    bce_with_logits_elem(gate_logits, changed)?
+        .mul(&gate_weights)?
         .mean_all()
         .map_err(Into::into)
 }
@@ -4020,6 +4079,8 @@ pub struct FoundationV2LossBreakdown {
     pub equivalent_pairs: usize,
     pub distinct_pairs: usize,
     pub inverse_action_rows: usize,
+    /// Number of eligible fragments only when the rollout loss cleared its
+    /// activation floor; zero means that the rollout objective was inert.
     pub rollout_fragments: usize,
     /// Populated only when the objective requested mechanism-seam capture.
     pub mechanism_seams: Option<FoundationV2MechanismSeams>,
@@ -4220,7 +4281,10 @@ fn masked_spatial_huber(input: &Tensor, target: &Tensor, mask: &Tensor) -> Resul
     let linear = abs_diff.affine(1.0, -0.5)?;
     let elementwise = abs_diff.le(1.0)?.where_cond(&quadratic, &linear)?;
     let numerator = elementwise.broadcast_mul(mask)?.sum_all()?;
-    let denominator = mask.sum_all()?.affine(channels as f64, 0.0)?;
+    let denominator = mask
+        .sum_all()?
+        .clamp(1.0f32, f32::INFINITY)?
+        .affine(channels as f64, 0.0)?;
     numerator.broadcast_div(&denominator).map_err(Into::into)
 }
 
@@ -4279,7 +4343,7 @@ fn foundation_v2_rollout_loss_inner(
         }
     }
     if first_rows.len() < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
-        return Ok((Tensor::zeros((), DType::F32, device)?, first_rows.len()));
+        return Ok((Tensor::zeros((), DType::F32, device)?, 0));
     }
     // These are exact row selections from the batch encoded above: Foundation
     // V2 applies neither frame augmentation nor encoder noise, and recurrence
@@ -4351,14 +4415,15 @@ pub fn foundation_v2_graded_q_targets(
     let predicted_latent = predicted_latent.detach();
     let predicted_logits = model.exact_gameplay_logits_detached(&predicted_latent)?;
     let copy_gate = model.exact_copy_gate(&predicted_latent)?.detach();
-    foundation_v2_graded_q_targets_from_parts(
+    Ok(foundation_v2_graded_q_targets_from_parts(
         model,
         &predicted_logits,
         &copy_gate,
         current_frames,
         next_frames,
         content,
-    )
+    )?
+    .0)
 }
 
 fn foundation_v2_graded_q_targets_from_parts(
@@ -4368,7 +4433,7 @@ fn foundation_v2_graded_q_targets_from_parts(
     current_frames: &Tensor,
     next_frames: &Tensor,
     content: &Tensor,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Tensor)> {
     let batch_size = predicted_logits.dim(0)?;
     if content.dims() != [batch_size, FRAME_SIDE - 1, FRAME_SIDE] {
         bail!("foundation-v2 Q content mask has the wrong shape");
@@ -4381,10 +4446,28 @@ fn foundation_v2_graded_q_targets_from_parts(
         .narrow(2, 0, FRAME_SIDE - 1)?
         .squeeze(1)?
         .to_dtype(DType::U32)?;
-    let changed = current_labels.ne(&target_labels)?.to_dtype(DType::F32)?;
     let composed =
         model.composed_gameplay_decode_from_parts(predicted_logits, copy_gate, &current_labels)?;
-    let correct = composed.eq(&target_labels)?.to_dtype(DType::F32)?;
+    foundation_v2_graded_q_targets_from_labels(&composed, &current_labels, &target_labels, content)
+}
+
+fn foundation_v2_graded_q_targets_from_labels(
+    composed: &Tensor,
+    current_labels: &Tensor,
+    target_labels: &Tensor,
+    content: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    if composed.dims() != target_labels.dims()
+        || current_labels.dims() != target_labels.dims()
+        || content.dims() != target_labels.dims()
+    {
+        bail!("foundation-v2 Q label tensors have mismatched shapes");
+    }
+    let changed = current_labels
+        .ne(target_labels)?
+        .to_dtype(DType::F32)?
+        .mul(content)?;
+    let correct = composed.eq(target_labels)?.to_dtype(DType::F32)?;
     let changed_count_per_sample = changed.sum(2)?.sum(1)?;
     let content_count_per_sample = content.sum(2)?.sum(1)?;
     let changed_accuracy = correct
@@ -4397,11 +4480,16 @@ fn foundation_v2_graded_q_targets_from_parts(
         .sum(2)?
         .sum(1)?
         .div(&content_count_per_sample.clamp(1.0, f64::INFINITY)?)?;
-    Ok(changed_count_per_sample
+    let targets = changed_count_per_sample
         .gt(0.0)?
         .where_cond(&changed_accuracy, &content_accuracy)?
         .unsqueeze(1)?
-        .detach())
+        .detach();
+    let mask = content_count_per_sample
+        .gt(0.0)?
+        .to_dtype(DType::F32)?
+        .unsqueeze(1)?;
+    Ok((targets, mask))
 }
 
 /// Foundation-v2's single mixed-stream objective. It is intentionally not an
@@ -4510,12 +4598,8 @@ pub fn foundation_v2_training_loss(
     )?;
 
     let gate_logits = model.exact_copy_gate_logits_trainable(&out.y)?;
-    let gate_weights = changed.affine(changed_weights.changed_weight - 1.0, 1.0)?;
-    let gate = bce_with_logits_elem(&gate_logits, &changed)?
-        .mul(&gate_weights)?
-        .mul(&content)?
-        .sum_all()?
-        .affine(1.0 / changed_weights.content_pixels as f64, 0.0)?;
+    let gate =
+        foundation_v2_copy_gate_loss(&gate_logits, &changed, changed_weights.changed_weight)?;
 
     let latent = masked_spatial_huber(&out.y, &encoded.next, &latent_mask)?.add(
         &candle_nn::loss::huber(&content_predicted_canonical, &content_target_canonical, 1.0)?,
@@ -4701,7 +4785,7 @@ pub fn foundation_v2_training_loss(
     // Reuse their detached values for the observer targets instead of
     // repeating the full exact decoder and copy-gate convolution.
     let predicted_copy_gate = candle_nn::ops::sigmoid(&gate_logits.detach())?;
-    let graded_targets = foundation_v2_graded_q_targets_from_parts(
+    let (graded_targets, graded_mask) = foundation_v2_graded_q_targets_from_parts(
         model,
         &predicted_logits.detach(),
         &predicted_copy_gate,
@@ -4709,13 +4793,17 @@ pub fn foundation_v2_training_loss(
         &batch.next_frames,
         &content,
     )?;
-    let q = bce_with_logits(
+    let q = masked_bce_with_slot_weights(
         &model.q_logit_from_canonical(&detached_canonical)?,
         &graded_targets,
+        &graded_mask,
+        None,
     )?;
-    let reliability = bce_with_logits(
+    let reliability = masked_bce_with_slot_weights(
         &model.reliability_logit_from_canonical(&detached_canonical)?,
         &graded_targets,
+        &graded_mask,
+        None,
     )?;
     let (rollout, rollout_fragments) = if objective.rollout_enabled {
         foundation_v2_rollout_loss(model, mixed, &batch, &encoded, device)?
@@ -6875,9 +6963,10 @@ fn record_foundation_v2_profile_tensors(
     profile: &RepresentativeUpdateCapture,
     range: &ProfileRange<'_>,
     losses: &FoundationV2LossBreakdown,
+    effective_total: &Tensor,
 ) -> Result<()> {
     for (name, tensor) in [
-        ("total", &losses.total),
+        ("total", effective_total),
         ("non_ep_total", &losses.non_ep_total),
         ("pred_ce", &losses.pred_ce),
         ("gate", &losses.gate),
@@ -7280,7 +7369,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             }
         }
         let consumed = mixed.transitions().cloned().collect::<Vec<_>>();
-        update_training_population(&mut state, &consumed);
+        let consumed_masks = mixed.content_masks().collect::<Vec<_>>();
+        update_training_population(&mut state, &consumed, &consumed_masks)?;
         let (ep_weight, rollout_enabled) = {
             let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
             (foundation.ep_weight, foundation.rollout_enabled)
@@ -7296,18 +7386,12 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             capture_mechanism_seams: cg_profile.is_some(),
         };
         let losses = if let Some(profile) = &cg_profile {
-            profile.synchronized_phase_with_range(
+            profile.synchronized_phase(
                 &device,
                 "forward_loss",
                 SpanKind::Function,
                 Some(ExecutionStep::Forward),
-                |range| {
-                    let losses = foundation_v2_training_loss(&model, &mixed, &device, objective)?;
-                    if let Some(range) = range {
-                        record_foundation_v2_profile_tensors(profile, range, &losses)?;
-                    }
-                    Ok(losses)
-                },
+                || foundation_v2_training_loss(&model, &mixed, &device, objective),
             )?
         } else {
             foundation_v2_training_loss(&model, &mixed, &device, objective)?
@@ -7344,6 +7428,20 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let total = losses
             .non_ep_total
             .add(&losses.ep.affine(effective_ep_weight, 0.0)?)?;
+        if let Some(profile) = &cg_profile {
+            profile.synchronized_phase_with_range(
+                &device,
+                "loss_tensors",
+                SpanKind::Module,
+                Some(ExecutionStep::Forward),
+                |range| {
+                    if let Some(range) = range {
+                        record_foundation_v2_profile_tensors(profile, range, &losses, &total)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         let mut grads = if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
                 &device,
@@ -7806,7 +7904,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     })
                 },
             )?;
-            update_training_population(&mut state, &samples);
+            let content_masks = samples
+                .iter()
+                .map(training_content_mask_from_provenance)
+                .collect::<Result<Vec<_>>>()?;
+            let content_mask_refs = content_masks.iter().collect::<Vec<_>>();
+            update_training_population(&mut state, &samples, &content_mask_refs)?;
             if micro == 0 && use_prefetch {
                 top_up_prefetch(
                     &mut prefetched_through_step,
@@ -8408,6 +8511,70 @@ mod tests {
                 "unimix CE differs at {index}: got {got}, want {want}, relative error {relative_error}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_copy_gate_supervises_pad_as_unchanged() -> Result<()> {
+        let device = Device::Cpu;
+        // Pixel 0 stands for content and pixel 1 for PAD. Neither changed, so
+        // opening the gate only on PAD must increase the objective.
+        let changed = Tensor::zeros((1, 1, 2), DType::F32, &device)?;
+        let pad_closed = Tensor::new(&[[[0.0f32, -20.0]]], &device)?;
+        let pad_open = Tensor::new(&[[[0.0f32, 20.0]]], &device)?;
+        let closed =
+            foundation_v2_copy_gate_loss(&pad_closed, &changed, 7.0)?.to_scalar::<f32>()?;
+        let open = foundation_v2_copy_gate_loss(&pad_open, &changed, 7.0)?.to_scalar::<f32>()?;
+        assert!(
+            open > closed + 9.0,
+            "PAD gate loss did not activate: {closed} vs {open}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_q_targets_ignore_pad_changes_and_mask_empty_rows() -> Result<()> {
+        let device = Device::Cpu;
+        let current = Tensor::new(&[[[0u32, 0]], [[0, 0]]], &device)?;
+        let target = Tensor::new(&[[[1u32, 0]], [[1, 0]]], &device)?;
+        let composed = Tensor::new(&[[[0u32, 0]], [[0, 0]]], &device)?;
+        let content = Tensor::new(&[[[0.0f32, 1.0]], [[0.0, 0.0]]], &device)?;
+        let (targets, mask) =
+            foundation_v2_graded_q_targets_from_labels(&composed, &current, &target, &content)?;
+        assert_eq!(targets.flatten_all()?.to_vec1::<f32>()?, vec![1.0, 0.0]);
+        assert_eq!(mask.flatten_all()?.to_vec1::<f32>()?, vec![1.0, 0.0]);
+
+        let logits = Tensor::new(&[[0.0f32], [100.0]], &device)?;
+        let loss =
+            masked_bce_with_slot_weights(&logits, &targets, &mask, None)?.to_scalar::<f32>()?;
+        assert!(
+            (loss - std::f32::consts::LN_2).abs() < 1e-6,
+            "masked Q BCE was {loss}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn masked_spatial_huber_is_zero_for_an_empty_mask() -> Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::ones((1, 2, 1, 1), DType::F32, &device)?;
+        let target = Tensor::zeros_like(&input)?;
+        let mask = Tensor::zeros((1, 1, 1, 1), DType::F32, &device)?;
+        let loss = masked_spatial_huber(&input, &target, &mask)?.to_scalar::<f32>()?;
+        assert_eq!(loss, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn training_content_chain_binds_content_mask_bits() -> Result<()> {
+        let mut rows = generate_curriculum("random_one_step", 17, 0, Split::Train)?;
+        let sample = rows.remove(0);
+        let mask = training_content_mask_from_provenance(&sample)?;
+        let mut changed_mask = mask.clone();
+        changed_mask.values[0] ^= 1;
+        let first = training_content_hash_append([0; 32], &sample, &mask);
+        let second = training_content_hash_append([0; 32], &sample, &changed_mask);
+        assert_ne!(first, second);
         Ok(())
     }
 
@@ -10697,7 +10864,7 @@ mod tests {
             model.encode_state_pair_for_training(&small_batch.frames, &small_batch.next_frames)?;
         let (small_loss, small_fragments) =
             foundation_v2_rollout_loss(&model, &small, &small_batch, &small_encoded, &device)?;
-        assert!(small_fragments < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
+        assert_eq!(small_fragments, 0, "inert rollout must report inactive");
         assert_eq!(small_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?, 0.0);
 
         let full = compose_mixed_stream_batch(
