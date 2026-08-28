@@ -33,6 +33,7 @@ fn bundle_treatments_first_update_gradient_is_finite_and_bounded() -> Result<()>
     )?;
     let losses = foundation_v2_training_loss(&model, &mixed, &device, FoundationV2ObjectiveConfig {
         ep_weight: 0.01, sigreg_projections: 8, sigreg_knots: 5, sigreg_seed: 1,
+        q_mse_threshold: cfg.q_mse_threshold,
         rollout_enabled: true, split_ce_weighting: Default::default(), split_ce_changed_budget: None,
         capture_mechanism_seams: false,
     })?;

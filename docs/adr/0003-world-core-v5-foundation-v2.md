@@ -92,6 +92,18 @@
 - No model-quality claim follows from these corrections either; they carry
   compile, deterministic-generator, and objective tests only.
 
+## Implementation amendment (2026-08-28, observer target split)
+
+- The Q head retains the graded composed-pixel-accuracy target. The reliability
+  head is retargeted to latent self-confidence: whether full-spatial predicted
+  vs factual encoded-next latent MSE is at or below `q_mse_threshold`. This is
+  the same seam and boundary used by evaluation calibration, and the binary
+  target is detached from the world model.
+- Previously both detached canonical heads received the same graded pixel
+  target. Their 0.25 Q and 0.30 reliability live-policy terms therefore counted
+  one measurement twice. The unchanged score weights now combine distinct
+  pixel-accuracy and latent-confidence signals; no reward/value claim follows.
+
 ## Preregistered model-treatment flags (2026-08-27, all default off)
 
 Five config-gated model treatments exist for the next matched runs. Every
@@ -239,9 +251,10 @@ Weights are initial; the gradient-budget controller (below) adapts EP only.
 7. **L_rollout (0.02)**: open-loop horizon 2 ONLY, computed on ≥16 batched
    traces (RC6). No horizon progression. Auto-disabled if the one-step
    changed-exact gate regresses.
-8. **Observer heads** (concurrent, detached inputs): Q/reliability trained on
-   **graded** changed-pixel accuracy targets (soft BCE), not the ≥99%∧≥90%
-   threshold (RC7); event/noop heads as v4 with goal dropout.
+8. **Observer heads** (concurrent, detached inputs): Q trains on **graded**
+   changed-pixel accuracy (soft BCE), not the ≥99%∧≥90% threshold (RC7);
+   reliability trains on thresholded factual latent MSE as amended 2026-08-28;
+   event/noop heads remain as v4 with goal dropout.
 
 ## 4. Optimization (RC2, RC6, RC8, T0.3)
 

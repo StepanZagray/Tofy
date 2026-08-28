@@ -3566,8 +3566,15 @@ struct BatchEvalPartial {
     hazard_false_negatives: usize,
     q_acc: QEvalAccum,
     q_probs: Vec<f32>,
+    /// Labels for the recipe-specific Q objective (pixel accuracy for current
+    /// Foundation-v2 and Full-v4 checkpoints).
     q_labels: Vec<bool>,
+    /// Thresholded full-spatial prediction/encoded-target latent MSE used by
+    /// Q-surprise and Foundation-v2 reliability calibration.
+    latent_reliability_labels: Vec<bool>,
     reliability_probs: Vec<f32>,
+    /// Labels matching the active recipe's reliability training target.
+    reliability_labels: Vec<bool>,
     recursion_probes: Vec<RecursionStepProbe>,
     ptrm_acc: BTreeMap<usize, (f64, f64, f64, f64, usize)>,
     matched_acc: BTreeMap<usize, (f64, usize, usize)>,
@@ -3760,6 +3767,17 @@ fn eval_one_batch(
         partial.q_probs = candle_nn::ops::sigmoid(&out.q_logit.to_dtype(DType::F32)?)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        partial.latent_reliability_labels = mses
+            .iter()
+            .map(|mse| f64::from(*mse) <= cfg.q_mse_threshold)
+            .collect();
+        // Foundation-v2 now trains reliability on latent confidence. Preserve
+        // the exact-pixel Full-v4 calibration contract outside this recipe.
+        partial.reliability_labels = if foundation_recipe {
+            partial.latent_reliability_labels.clone()
+        } else {
+            partial.q_labels.clone()
+        };
         partial.reliability_probs =
             candle_nn::ops::sigmoid(&out.reliability_logit.to_dtype(DType::F32)?)?
                 .flatten_all()?
@@ -3884,7 +3902,11 @@ fn merge_batch_partial(merged: &mut BatchEvalPartial, partial: BatchEvalPartial)
     merged.q_acc.merge(partial.q_acc);
     merged.q_probs.extend(partial.q_probs);
     merged.q_labels.extend(partial.q_labels);
+    merged
+        .latent_reliability_labels
+        .extend(partial.latent_reliability_labels);
     merged.reliability_probs.extend(partial.reliability_probs);
+    merged.reliability_labels.extend(partial.reliability_labels);
     merged.recursion_probes.extend(partial.recursion_probes);
     merged.ensemble_disagreement += partial.ensemble_disagreement;
     merged.ensemble_n += partial.ensemble_n;
@@ -4690,8 +4712,8 @@ fn eval_sample_set(
         .then_some(deterministic_matched_compute);
 
     let q_surprise = (cfg.mode == EvalMode::Full)
-        .then(|| eval_q_surprise_labels(&merged.q_probs, &merged.q_labels));
-    let labels = merged.q_labels.clone();
+        .then(|| eval_q_surprise_labels(&merged.q_probs, &merged.latent_reliability_labels));
+    let labels = merged.reliability_labels.clone();
     let (calibration, calibration_gates) = if cfg.mode == EvalMode::Full
         && merged.reliability_probs.len() == labels.len()
         && !labels.is_empty()
@@ -4722,9 +4744,9 @@ fn eval_sample_set(
     let ensemble = (cfg.mode == EvalMode::Full && merged.ensemble_n > 0).then(|| {
         let mean_disagreement = Some(merged.ensemble_disagreement / merged.ensemble_n as f64);
         let high_error: Vec<bool> = merged
-            .q_labels
+            .reliability_labels
             .iter()
-            .take(merged.ensemble_n.min(merged.q_labels.len()))
+            .take(merged.ensemble_n.min(merged.reliability_labels.len()))
             .map(|reliable| !reliable)
             .collect();
         let uncertainty: Vec<f32> = (0..high_error.len())

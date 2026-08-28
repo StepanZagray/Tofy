@@ -139,8 +139,10 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// with the reachable separation hinge and budget-exact EP controller;
 /// 3 = bounded split-CE amplification, conditioned displacement norm, and the
 /// nonzero copy-bypass alpha init that reopens the candidate gradient path,
-/// plus unchanged-target copy-gate supervision on gameplay PAD pixels.
-pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 3;
+/// plus unchanged-target copy-gate supervision on gameplay PAD pixels;
+/// 4 = reliability observes thresholded factual latent prediction error while
+/// Q continues to observe graded composed-pixel accuracy.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 4;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -4232,6 +4234,7 @@ pub struct FoundationV2ObjectiveConfig {
     pub sigreg_projections: usize,
     pub sigreg_knots: usize,
     pub sigreg_seed: u64,
+    pub q_mse_threshold: f64,
     pub rollout_enabled: bool,
     pub split_ce_weighting: SplitCeWeighting,
     pub split_ce_changed_budget: Option<f64>,
@@ -4247,6 +4250,7 @@ impl Default for FoundationV2ObjectiveConfig {
             sigreg_projections: 8,
             sigreg_knots: 5,
             sigreg_seed: 1,
+            q_mse_threshold: 0.05,
             rollout_enabled: false,
             split_ce_weighting: SplitCeWeighting::CurrentDouble,
             split_ce_changed_budget: None,
@@ -4694,6 +4698,22 @@ fn foundation_v2_graded_q_targets_from_labels(
     Ok((targets, mask))
 }
 
+/// Foundation-v2 reliability is confidence in the factual next latent, using
+/// the same full-spatial prediction/encoder-target MSE seam as evaluation.
+fn foundation_v2_reliability_targets(
+    predicted_latent: &Tensor,
+    factual_target_latent: &Tensor,
+    mse_threshold: f64,
+) -> Result<Tensor> {
+    if !(mse_threshold.is_finite() && mse_threshold >= 0.0) {
+        bail!("foundation-v2 reliability MSE threshold must be finite and >= 0");
+    }
+    let mse = latent_mse_per_sample(predicted_latent, factual_target_latent)?.detach();
+    // Keep the hard boundary used by evaluation. A sigmoid margin target would
+    // require changing the binary calibration semantics as well.
+    Ok(mse.le(mse_threshold)?.to_dtype(DType::F32)?.detach())
+}
+
 /// Foundation-v2's single mixed-stream objective. It is intentionally not an
 /// adapter over `lesson_loss_weights`: all world and detached observer heads
 /// are active together from update zero.
@@ -5018,10 +5038,16 @@ fn foundation_v2_training_loss_with_event_weights(
         &graded_mask,
         None,
     )?;
+    let reliability_targets =
+        foundation_v2_reliability_targets(&out.y, &encoded.next, objective.q_mse_threshold)?;
+    // Q masks rows without gameplay content because pixel accuracy is then
+    // undefined. Full-spatial latent MSE remains defined for every encoded
+    // row, so reliability uses the same masked-BCE policy with an all-row mask.
+    let reliability_mask = Tensor::ones_like(&reliability_targets)?;
     let reliability = masked_bce_with_slot_weights(
         &model.reliability_logit_from_canonical(&detached_canonical)?,
-        &graded_targets,
-        &graded_mask,
+        &reliability_targets,
+        &reliability_mask,
         None,
     )?;
     let (rollout, rollout_fragments) = if objective.rollout_enabled {
@@ -8062,6 +8088,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             sigreg_projections: cfg.sigreg_projections,
             sigreg_knots: cfg.sigreg_knots,
             sigreg_seed: cfg.seed.wrapping_add(state.global_step),
+            q_mse_threshold: cfg.q_mse_threshold,
             rollout_enabled,
             split_ce_weighting: cfg.split_ce_weighting,
             split_ce_changed_budget: cfg.split_ce_changed_budget,
@@ -9298,6 +9325,59 @@ mod tests {
         assert!(
             (loss - std::f32::consts::LN_2).abs() < 1e-6,
             "masked Q BCE was {loss}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_q_and_reliability_receive_distinct_targets() -> Result<()> {
+        let device = Device::Cpu;
+        let labels = Tensor::new(&[[[3u32]]], &device)?;
+        let content = Tensor::new(&[[[1.0f32]]], &device)?;
+        let (q_targets, q_mask) =
+            foundation_v2_graded_q_targets_from_labels(&labels, &labels, &labels, &content)?;
+        let predicted_latent = Tensor::new(&[[[[1.0f32]]]], &device)?;
+        let factual_target_latent = Tensor::zeros_like(&predicted_latent)?;
+        let reliability_targets =
+            foundation_v2_reliability_targets(&predicted_latent, &factual_target_latent, 0.05)?;
+
+        assert_eq!(q_targets.flatten_all()?.to_vec1::<f32>()?, vec![1.0]);
+        assert_eq!(q_mask.flatten_all()?.to_vec1::<f32>()?, vec![1.0]);
+        assert_eq!(
+            reliability_targets.flatten_all()?.to_vec1::<f32>()?,
+            vec![0.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_reliability_target_includes_threshold_boundary() -> Result<()> {
+        let device = Device::Cpu;
+        let predicted = Tensor::new(&[[0.5f32], [0.5001]], &device)?;
+        let factual = Tensor::zeros_like(&predicted)?;
+        let targets = foundation_v2_reliability_targets(&predicted, &factual, 0.25)?;
+        assert_eq!(targets.flatten_all()?.to_vec1::<f32>()?, vec![1.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_reliability_targets_detach_latent_path() -> Result<()> {
+        let device = Device::Cpu;
+        let predicted = Var::from_tensor(&Tensor::new(&[[1.0f32]], &device)?)?;
+        let factual = Tensor::zeros((1, 1), DType::F32, &device)?;
+        let targets = foundation_v2_reliability_targets(&predicted, &factual, 0.05)?;
+        let logits = Var::from_tensor(&Tensor::new(&[[0.0f32]], &device)?)?;
+        let mask = Tensor::ones_like(&targets)?;
+        let loss = masked_bce_with_slot_weights(&logits, &targets, &mask, None)?;
+        let grads = loss.backward()?;
+
+        assert!(
+            grads.get(&predicted).is_none(),
+            "reliability target leaked a gradient into the latent prediction"
+        );
+        assert!(
+            grads.get(&logits).is_some(),
+            "detached targets must still train the reliability logit"
         );
         Ok(())
     }
