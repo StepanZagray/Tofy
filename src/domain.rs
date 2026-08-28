@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// Grid coordinate. Origin is top-left; +x east, +y south.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -226,7 +227,7 @@ pub struct StepOutcome {
 /// Exact simulator with mutating step and pure transition for search.
 #[derive(Clone, Debug)]
 pub struct Simulator {
-    scenario: Scenario,
+    scenario: Arc<Scenario>,
     state: State,
     terminal: Option<TerminalState>,
 }
@@ -239,7 +240,8 @@ enum TerminalState {
 }
 
 impl Simulator {
-    pub fn new(scenario: Scenario) -> Self {
+    pub fn new(scenario: impl Into<Arc<Scenario>>) -> Self {
+        let scenario = scenario.into();
         let state = State::initial(&scenario);
         let terminal = if goal_satisfied(&scenario, &state, scenario.hidden_goal()) {
             Some(TerminalState::Success)

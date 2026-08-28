@@ -8031,6 +8031,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             cfg.data_workers,
         )?)
     } else {
+        stream_config.validate()?;
         None
     };
 
