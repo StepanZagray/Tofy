@@ -39,3 +39,28 @@ Encoder c1 microbench (`tests/cuda_conv_probe.rs`):
 | `--features cudnn` + patches | lowest | real bwd filter + skip leaf input grad |
 
 End-to-end `p2-train` (hidden 128, batch 1024): see `docs/RESULTS_P2.md`.
+
+## 3. BF16 Conv2D accumulation contract
+
+BF16 cuDNN forward, backward-data, and backward-filter use BF16 tensor/filter descriptors,
+an FP32 convolution compute descriptor, and explicit `CUDNN_TENSOR_OP_MATH`. Results remain
+BF16 tensors: cuDNN accumulates internally in FP32 and rounds once when storing `y`, `dX`, or
+`dW`. In particular, convolution gradients are BF16 before a differentiable cast returns them
+to an F32 master tensor.
+
+The non-cuDNN CUDA forward path is im2col plus BF16 cuBLAS GEMM with FP32 compute by default;
+its direct fallback CUDA kernel also has an FP32 accumulator. Backward operators use the same
+FP32-accumulating primitives and store BF16 outputs. CPU Conv2D and the ConvTranspose2D used by
+its backward-data path convert BF16 operands to F32 internally, accumulate in F32, and convert
+the stored result back to BF16. Existing behavior for every other dtype is unchanged.
+
+Run the A40 kernel/timing probe with:
+
+```console
+cargo run --release --features cudnn --example conv_kernel_probe -- --warmup 20 --iters 100
+```
+
+The probe binary is named `conv_kernel_probe`, benchmarks the Foundation-V2 recurrent shape,
+and synchronizes every forward/backward sample. Candle has no convolution-level TF32 toggle, so
+the F32 arm measures cuDNN's existing default math behavior; use an Nsight Systems trace of this
+binary to identify the selected F32 and BF16 kernels.

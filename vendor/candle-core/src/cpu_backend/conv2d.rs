@@ -4,12 +4,40 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
     conv::ParamsConv2D,
-    cpu_backend::{copy_strided_src_, Im2Col, Map1, Map2, MatMul},
+    cpu_backend::{copy_strided_src_, CpuStorage, Im2Col, Map1, Map2, MatMul},
     shape::dims4,
     Layout, Result, WithDType,
 };
+use half::bf16;
 
 pub(super) struct Conv2D<'a>(pub(super) &'a crate::conv::ParamsConv2D);
+
+impl Conv2D<'_> {
+    pub(super) fn map(
+        &self,
+        inp: &CpuStorage,
+        inp_l: &Layout,
+        kernel: &CpuStorage,
+        kernel_l: &Layout,
+    ) -> Result<CpuStorage> {
+        match (inp, kernel) {
+            (CpuStorage::BF16(inp), CpuStorage::BF16(kernel)) => {
+                // BF16 convolution is a dot product: round operands at the dtype boundary,
+                // accumulate in F32, then round the stored output once.
+                let inp = inp.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+                let kernel = kernel
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>();
+                let output = self.f(&inp, inp_l, &kernel, kernel_l)?;
+                Ok(CpuStorage::BF16(
+                    output.into_iter().map(bf16::from_f32).collect(),
+                ))
+            }
+            _ => <Self as Map2>::map(self, inp, inp_l, kernel, kernel_l),
+        }
+    }
+}
 
 #[allow(dead_code)]
 enum Conv2dImpl {
