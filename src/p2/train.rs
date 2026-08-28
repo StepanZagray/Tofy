@@ -4,7 +4,8 @@ use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
 use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, BranchLearningConfig};
 use crate::p2::cg_profile::{
-    CaptureSpec, ProfileRange, ProfileState, RepresentativeUpdateCapture,
+    profile_bundle_is_complete, CaptureSpec, ProfileRange, ProfileState,
+    RepresentativeUpdateCapture,
 };
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
@@ -45,8 +46,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -1645,6 +1646,11 @@ struct TrainingContract {
     physical_batch: usize,
     grad_accum: usize,
     profile_update: u64,
+    /// `None` identifies checkpoints written before this field existed. On
+    /// load, only that legacy case adopts the configured preregistration list;
+    /// newly written contracts compare the full list exactly on resume.
+    #[serde(default)]
+    profile_updates: Option<Vec<u64>>,
     #[serde(default)]
     pressure_updates: Vec<u64>,
     lr: f64,
@@ -1764,6 +1770,7 @@ impl From<&TrainConfig> for TrainingContract {
             physical_batch: cfg.physical_batch,
             grad_accum: cfg.grad_accum,
             profile_update: cfg.profile_update,
+            profile_updates: Some(cfg.profile_updates.clone()),
             pressure_updates: cfg.pressure_updates.clone(),
             lr: cfg.lr,
             weight_decay: cfg.weight_decay,
@@ -1894,6 +1901,10 @@ struct FoundationV2TrainerState {
     /// One-based preregistered updates whose evidence bundles were published.
     #[serde(default)]
     profiles_published: Vec<u64>,
+    /// Consecutive completed updates whose enabled realized rollout loss was
+    /// exactly zero.
+    #[serde(default)]
+    rollout_zero_loss_consecutive_steps: u64,
     /// Frozen identity of the fixed gate population and gate policy. A resume
     /// must regenerate the exact same rows/masks under the same policy or
     /// fail closed before any optimizer update: best/collapse comparisons
@@ -6093,6 +6104,9 @@ fn load_training_checkpoint(
     if state.contract.experiment.is_none() {
         state.contract.experiment = requested.experiment.clone();
     }
+    if state.contract.profile_updates.is_none() {
+        state.contract.profile_updates = requested.profile_updates.clone();
+    }
     if state.contract != requested {
         let migration = cfg
             .allow_batch_schedule_migration
@@ -6506,6 +6520,73 @@ fn foundation_v2_loss_values(
     })
 }
 
+#[derive(Serialize)]
+struct FoundationV2LossLogEntry<'a> {
+    global_step: u64,
+    #[serde(flatten)]
+    values: &'a FoundationV2LossMeans,
+    learning_rate: f64,
+}
+
+struct FoundationV2LossLog {
+    path: PathBuf,
+    writer: BufWriter<File>,
+}
+
+impl FoundationV2LossLog {
+    fn open(output_dir: &Path) -> Result<Self> {
+        let path = output_dir.join("loss_log.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open append-only loss log {}", path.display()))?;
+        Ok(Self {
+            path,
+            writer: BufWriter::new(file),
+        })
+    }
+
+    fn append(
+        &mut self,
+        global_step: u64,
+        values: &FoundationV2LossMeans,
+        learning_rate: f64,
+    ) -> Result<()> {
+        let entry = FoundationV2LossLogEntry {
+            global_step,
+            values,
+            learning_rate,
+        };
+        serde_json::to_writer(&mut self.writer, &entry)
+            .with_context(|| format!("append loss record to {}", self.path.display()))?;
+        self.writer
+            .write_all(b"\n")
+            .with_context(|| format!("terminate loss record in {}", self.path.display()))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .with_context(|| format!("flush loss log {}", self.path.display()))?;
+        self.writer
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("sync loss log {}", self.path.display()))
+    }
+}
+
+impl Drop for FoundationV2LossLog {
+    fn drop(&mut self) {
+        if let Err(error) = self.flush() {
+            tracing::error!(
+                "failed to flush foundation-v2 loss log {} on drop: {error:#}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 fn add_foundation_v2_loss_sums(sums: &mut FoundationV2LossMeans, values: &FoundationV2LossMeans) {
     sums.total += values.total;
     sums.pred_ce += values.pred_ce;
@@ -6524,11 +6605,60 @@ fn add_foundation_v2_loss_sums(sums: &mut FoundationV2LossMeans, values: &Founda
     sums.gradient_clip_scale += values.gradient_clip_scale;
 }
 
+fn foundation_v2_active_loss_means(sums: &FoundationV2LossMeans, count: u64) -> LessonLossMeans {
+    let means = foundation_v2_loss_means(sums, count);
+    LessonLossMeans {
+        total: means.total,
+        rollout: means.rollout,
+        pre_clip_gradient_norm: means.pre_clip_gradient_norm,
+        gradient_clip_scale: means.gradient_clip_scale,
+        event: means.event,
+        q: means.q,
+        reliability: means.reliability,
+        ..LessonLossMeans::default()
+    }
+}
+
+fn update_foundation_v2_rollout_zero_streak(
+    consecutive_steps: &mut u64,
+    rollout_enabled: bool,
+    rollout_loss: f64,
+    global_step: u64,
+) {
+    if rollout_enabled && rollout_loss == 0.0 {
+        *consecutive_steps = consecutive_steps.saturating_add(1);
+        if *consecutive_steps == FOUNDATION_V2_GATE_EVERY {
+            tracing::warn!(
+                "foundation-v2 realized rollout loss has remained exactly zero for {} \
+                 consecutive rollout-enabled updates through step {global_step}",
+                FOUNDATION_V2_GATE_EVERY
+            );
+        }
+    } else {
+        *consecutive_steps = 0;
+    }
+}
+
 fn validate_foundation_v2_profile_resume(
     profile_updates: &[u64],
-    profiles_published: &[u64],
+    profiles_published: &mut Vec<u64>,
     global_step: u64,
+    output_dir: &Path,
 ) -> Result<()> {
+    for &update in profile_updates {
+        if !profiles_published.contains(&update) && profile_bundle_is_complete(output_dir, update) {
+            profiles_published.push(update);
+            tracing::warn!(
+                "reconciled foundation-v2 profile update {update} from complete bundle {}",
+                output_dir
+                    .join("profile")
+                    .join(format!("update-{update:012}"))
+                    .display()
+            );
+        }
+    }
+    profiles_published.sort_unstable();
+    profiles_published.dedup();
     let missing = profile_updates
         .iter()
         .copied()
@@ -6718,11 +6848,14 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 event_label_census_complete: true,
                 mechanism_history: Vec::new(),
                 profiles_published: Vec::new(),
+                rollout_zero_loss_consecutive_steps: 0,
                 gate_population_identity: None,
             }),
         }
     };
+    let mut loss_log = FoundationV2LossLog::open(&cfg.output_dir)?;
     let mut latest_checkpoint = if resumed_from.is_none() {
+        loss_log.flush()?;
         Some(save_training_checkpoint(
             &varmap,
             &optimizer,
@@ -6768,12 +6901,13 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     }
     validate_foundation_v2_profile_resume(
         &cfg.profile_updates,
-        &state
+        &mut state
             .foundation_v2
-            .as_ref()
+            .as_mut()
             .expect("foundation-v2 state")
             .profiles_published,
         state.global_step,
+        &cfg.output_dir,
     )?;
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
@@ -6815,6 +6949,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 .and_then(|name| name.to_str())
                 != Some(&format!("step-{:012}", state.global_step))
             {
+                loss_log.flush()?;
                 latest_checkpoint = Some(save_training_checkpoint(
                     &varmap,
                     &optimizer,
@@ -7025,10 +7160,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         // EP's encoder contribution first, then one combined gradient store is
         // clipped at 1.0. There is no separately clipped EP accumulation.
         let clip = clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
-        optimizer.set_learning_rate(foundation_v2_wsd_learning_rate(
-            next_step as usize,
-            total_steps,
-        ))?;
+        let learning_rate = foundation_v2_wsd_learning_rate(next_step as usize, total_steps);
+        optimizer.set_learning_rate(learning_rate)?;
         if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
                 &device,
@@ -7063,11 +7196,19 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         };
         ema.update(&varmap)?;
         let values = foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
-        {
+        loss_log.append(next_step, &values, learning_rate)?;
+        state.active_sums = {
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
             foundation.loss_steps += 1;
-        }
+            update_foundation_v2_rollout_zero_streak(
+                &mut foundation.rollout_zero_loss_consecutive_steps,
+                rollout_enabled,
+                values.rollout,
+                next_step,
+            );
+            foundation_v2_active_loss_means(&foundation.loss_sums, foundation.loss_steps)
+        };
         // Release the training step's entire autograd graph, batch tensors,
         // and gradient store before any same-step evaluation work. The first
         // bundle run OOMed exactly at step 1024, where the gate evaluation,
@@ -7139,6 +7280,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             || requested_pause
         {
             sync_cuda_device(&device)?;
+            loss_log.flush()?;
             if permanent {
                 state
                     .foundation_v2
@@ -10382,19 +10524,92 @@ mod tests {
     }
 
     #[test]
-    fn foundation_v2_profile_resume_rejects_passed_unpublished_target() {
-        let error = validate_foundation_v2_profile_resume(&[2, 4], &[4], 4)
+    fn foundation_v2_profile_resume_rejects_passed_unpublished_target() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-foundation-v2-missing-profile-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut published = vec![4];
+        let error = validate_foundation_v2_profile_resume(&[2, 4], &mut published, 4, &root)
             .expect_err("completed preregistered update 2 has no published evidence");
-        assert!(error.to_string().contains("completed updates [2]"), "{error:#}");
-        validate_foundation_v2_profile_resume(&[2, 4], &[2, 4], 4).unwrap();
+        assert!(
+            error.to_string().contains("completed updates [2]"),
+            "{error:#}"
+        );
+        validate_foundation_v2_profile_resume(&[2, 4], &mut vec![2, 4], 4, &root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_profile_resume_reconciles_complete_bundle() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-foundation-v2-reconcile-profile-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let bundle = root.join("profile/update-000000000002");
+        fs::create_dir_all(&bundle)?;
+        fs::write(bundle.join("application.jsonl"), b"{}\n")?;
+        fs::write(bundle.join("evidence.json"), b"{}\n")?;
+        let mut published = Vec::new();
+        validate_foundation_v2_profile_resume(&[2], &mut published, 1, &root)?;
+        assert_eq!(published, [2]);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_loss_log_flushes_complete_jsonl_rows() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-foundation-v2-loss-log-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let values = FoundationV2LossMeans {
+            total: 1.0,
+            rollout: 0.25,
+            pre_clip_gradient_norm: 2.0,
+            gradient_clip_scale: 0.5,
+            ..FoundationV2LossMeans::default()
+        };
+        {
+            let mut log = FoundationV2LossLog::open(&root)?;
+            log.append(7, &values, 1e-3)?;
+        }
+        let contents = fs::read_to_string(root.join("loss_log.jsonl"))?;
+        let rows = contents.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(rows[0])?;
+        assert_eq!(row["global_step"], 7);
+        assert_eq!(row["rollout"], 0.25);
+        assert_eq!(row["learning_rate"], 1e-3);
+        let active = foundation_v2_active_loss_means(&values, 1);
+        assert_eq!(active.total, 1.0);
+        assert_eq!(active.rollout, 0.25);
+        assert_eq!(active.pre_clip_gradient_norm, 2.0);
+        assert_eq!(active.gradient_clip_scale, 0.5);
+        assert_eq!(active.next_latent, 0.0);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_rollout_zero_streak_tracks_enabled_realized_loss() {
+        let mut streak = FOUNDATION_V2_GATE_EVERY - 1;
+        update_foundation_v2_rollout_zero_streak(&mut streak, true, 0.0, 1_024);
+        assert_eq!(streak, FOUNDATION_V2_GATE_EVERY);
+        update_foundation_v2_rollout_zero_streak(&mut streak, true, 0.1, 1_025);
+        assert_eq!(streak, 0);
+        update_foundation_v2_rollout_zero_streak(&mut streak, false, 0.0, 1_026);
+        assert_eq!(streak, 0);
     }
 
     #[test]
     fn foundation_v2_profile_update_publishes_tensor_stats_bundle() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "tofy-foundation-v2-profile-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tofy-foundation-v2-profile-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut cfg = TrainConfig::default();
         cfg.apply_foundation_v2_recipe();
@@ -10410,6 +10625,51 @@ mod tests {
             .foundation_v2
             .as_ref()
             .expect("foundation-v2 report exists");
+        let loss_rows = fs::read_to_string(cfg.output_dir.join("loss_log.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(loss_rows.len(), 2);
+        for (index, row) in loss_rows.iter().enumerate() {
+            assert_eq!(row["global_step"], index as u64 + 1);
+            for field in [
+                "total",
+                "pred_ce",
+                "gate",
+                "latent",
+                "enc_ce",
+                "separation",
+                "pull",
+                "inverse_action",
+                "ep",
+                "rollout",
+                "event",
+                "q",
+                "reliability",
+                "pre_clip_gradient_norm",
+                "gradient_clip_scale",
+                "learning_rate",
+            ] {
+                assert!(row[field].is_number(), "loss row missing numeric {field}");
+            }
+        }
+        let checkpoint_state: TrainerState =
+            read_json(&report.latest_checkpoint.join("trainer_state.json"))?;
+        assert_eq!(
+            checkpoint_state.active_sums,
+            foundation_v2_active_loss_means(
+                &checkpoint_state
+                    .foundation_v2
+                    .as_ref()
+                    .expect("foundation-v2 checkpoint state")
+                    .loss_sums,
+                checkpoint_state
+                    .foundation_v2
+                    .as_ref()
+                    .expect("foundation-v2 checkpoint state")
+                    .loss_steps,
+            )
+        );
         assert_eq!(foundation.profile_bundles.len(), 1);
         let bundle = &foundation.profile_bundles[0];
         for name in ["application.jsonl", "evidence.json", "EVIDENCE.md"] {
@@ -10479,6 +10739,9 @@ mod tests {
                 "a treatment field failed to participate in the resume contract"
             );
         }
+        let mut changed_profiles = cfg.clone();
+        changed_profiles.profile_updates = vec![2, 4];
+        assert_ne!(contract, TrainingContract::from(&changed_profiles));
         // Applicability is enforced for the silently-inert combinations.
         let mut inert = ModelConfig {
             spatial_action_field: false,
@@ -10491,6 +10754,23 @@ mod tests {
         inert.decode_composition = DecodeComposition::JointCopyMixture;
         assert!(!inert.world_core_v4);
         assert!(inert.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_contract_adopts_configured_profile_updates() -> Result<()> {
+        let mut cfg = TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        cfg.profile_updates = vec![2, 1_024];
+        let requested = TrainingContract::from(&cfg);
+        let mut json = serde_json::to_value(&requested)?;
+        json.as_object_mut()
+            .expect("contract serializes as an object")
+            .remove("profile_updates");
+        let mut legacy: TrainingContract = serde_json::from_value(json)?;
+        assert_eq!(legacy.profile_updates, None);
+        legacy.profile_updates = requested.profile_updates.clone();
+        assert_eq!(legacy, requested);
         Ok(())
     }
 }

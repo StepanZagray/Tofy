@@ -14,6 +14,13 @@ use crate::perf::NvtxRange;
 
 const ENTRYPOINT: &str = "tofy::p2::train::optimizer_update";
 
+pub fn profile_bundle_is_complete(output_dir: &Path, update: u64) -> bool {
+    let directory = output_dir
+        .join("profile")
+        .join(format!("update-{update:012}"));
+    directory.join("evidence.json").is_file() && directory.join("application.jsonl").is_file()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileArtifacts {
     pub update: u64,

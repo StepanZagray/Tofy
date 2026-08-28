@@ -3,8 +3,9 @@
 Legacy training targets one configurable, one-based representative optimizer update
 (`--profile-update`, default `2`, after one warm-up update). Foundation-v2 accepts a unique,
 one-based `profile_updates` list and publishes one independent bundle for every selected optimizer
-update; instrumentation is inactive on all other updates. A resume fails closed when a selected
-update is already complete but its publication is absent from trainer state.
+update; instrumentation is inactive on all other updates. A resume reconciles complete bundles
+whose publication marker missed the checkpoint and fails closed when a completed selected update
+has no complete bundle.
 
 ## Artifact bundle
 
@@ -16,6 +17,11 @@ immutable representative trace. Run-owned paths are relative, so the bundle rema
 The manifest excludes itself and excludes derived profile reports and optional Nsight output,
 because the Nsight wrapper can regenerate those after training; they remain reproducible from the
 bound trace and explicitly listed profile paths in `train_report.json`.
+
+Foundation-v2 also appends one record per optimizer update to `OUTPUT/loss_log.jsonl`. Each line
+contains the update number, every realized foundation-v2 loss scalar, pre-clip gradient norm,
+gradient clip scale, and the WSD learning rate used for that update. The writer is buffered and
+durably flushed with every checkpoint and when training exits.
 
 The default update 2 profile publishes atomically under:
 
@@ -29,7 +35,9 @@ OUTPUT/profile/update-000000000002/
 ```
 
 `train_report.json` and resumable trainer state carry the legacy structured `profile` status plus
-Foundation-v2's ordered published-bundle list. Every published bundle forces a durable checkpoint.
+Foundation-v2's ordered published-bundle list. Every published bundle forces a durable checkpoint;
+on resume, a complete bundle whose publication marker missed that checkpoint is reconciled before
+capture selection. A preregistered completed update with no complete bundle still fails closed.
 Its trace contains ordinary tensor metadata and numerical `tensor_stats` for each Foundation-v2
 loss scalar and the `out_y`, current/predicted canonical, and copy-gate-logit mechanism seams.
 
