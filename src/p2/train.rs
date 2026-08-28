@@ -250,25 +250,39 @@ pub struct FoundationV2GateResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GateDiagnostic {
+    pub name: String,
+    pub measured: Option<f64>,
+    pub interpretation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FoundationV2GateEvaluation {
     pub step: u64,
     pub metrics: GateSupportMetrics,
     pub running_best_before: Option<f64>,
     pub running_best_after: Option<f64>,
     pub gates: Vec<FoundationV2GateResult>,
+    /// Non-enforcing measurements. The default accepts gate histories written
+    /// before diagnostics were separated from the enforceable gate vector.
+    #[serde(default)]
+    pub diagnostics: Vec<FoundationV2GateDiagnostic>,
 }
 
 /// Checkpoint-promotion selection metric. `ChangedExact` is the historical
 /// default; `FullExact` selects on full-transition exactness (unchanged
 /// pixels included) without touching the gate or collapse-floor semantics.
-/// `ComposedExactGuarded` selects on composed all-row exactness (the deployed
-/// copy-gate output, no-op rows included) and additionally refuses a
-/// candidate whose content or padding false-edit rate regresses versus the
-/// incumbent best — a guarded rule motivated by the canonical library's
-/// requirement to add composed decoding and false-change protection before
-/// selection; preregister it for new evidence runs. Note: `PromotionMetric`
-/// names in-run best-checkpoint *election* (a selection_only mechanism per
-/// ADR 0003 §6), not the promotion-evidence class.
+/// `ComposedExactGuarded` selects lexicographically on composed changed-row
+/// exactness and then composed all-row exactness. Changed-row exactness is the
+/// primary key because an all-row score can be dominated by no-op copies; a
+/// zero-changed-exact copy model therefore cannot freeze out a candidate that
+/// predicts any changed row exactly. Both false-edit rates remain regression
+/// guards with 10% relative plus 0.1 percentage-point absolute tolerance, so
+/// quantization-scale movement away from a near-zero incumbent does not make
+/// the first useful edit impossible while material hallucination still fails
+/// closed. Note: `PromotionMetric` names in-run best-checkpoint *election* (a
+/// selection_only mechanism per ADR 0003 §6), not the promotion-evidence
+/// class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionMetric {
@@ -286,22 +300,31 @@ pub fn foundation_v2_promotion_value(
     match metric {
         PromotionMetric::ChangedExact => metrics.one_step_changed_exact,
         PromotionMetric::FullExact => metrics.one_step_full_exact,
-        PromotionMetric::ComposedExactGuarded => metrics.one_step_all_rows_exact,
+        PromotionMetric::ComposedExactGuarded => metrics.one_step_composed_changed_exact,
     }
 }
 
 /// Guard for `ComposedExactGuarded`: a candidate may not regress either
-/// false-edit rate versus the incumbent best. A measured incumbent rate with
-/// a missing candidate rate fails conservatively.
+/// false-edit rate beyond a small relative-plus-absolute tolerance versus the
+/// incumbent best. All four selection measurements must be present and
+/// finite on the candidate; incomplete evaluations fail conservatively.
 fn foundation_v2_false_edit_guard(
     incumbent: &GateSupportMetrics,
     candidate: &GateSupportMetrics,
 ) -> bool {
+    const RELATIVE_TOLERANCE: f64 = 0.10;
+    const ABSOLUTE_TOLERANCE: f64 = 0.001;
+
     fn not_regressed(incumbent: Option<f64>, candidate: Option<f64>) -> bool {
         match (incumbent, candidate) {
-            (None, _) => true,
+            (None, Some(current)) => current.is_finite(),
+            (None, None) => false,
             (Some(_), None) => false,
-            (Some(prior), Some(current)) => current <= prior + 1e-12,
+            (Some(prior), Some(current)) => {
+                prior.is_finite()
+                    && current.is_finite()
+                    && current <= prior * (1.0 + RELATIVE_TOLERANCE) + ABSOLUTE_TOLERANCE
+            }
         }
     }
     not_regressed(incumbent.false_edit_rate, candidate.false_edit_rate)
@@ -311,9 +334,21 @@ fn foundation_v2_false_edit_guard(
         )
 }
 
+fn foundation_v2_composed_selection_complete(metrics: &GateSupportMetrics) -> bool {
+    [
+        metrics.one_step_composed_changed_exact,
+        metrics.one_step_all_rows_exact,
+        metrics.false_edit_rate,
+        metrics.padding_false_edit_rate,
+    ]
+    .into_iter()
+    .all(|metric| metric.is_some_and(f64::is_finite))
+}
+
 /// Whether `candidate` replaces `incumbent` under the configured promotion
-/// metric: a strictly larger metric value, plus the false-edit guard for
-/// `ComposedExactGuarded`.
+/// metric. `ComposedExactGuarded` uses a strict lexicographic improvement on
+/// composed changed-row exactness and all-row exactness, subject to the
+/// false-edit guard.
 pub fn foundation_v2_candidate_improves(
     metric: PromotionMetric,
     incumbent: Option<&GateSupportMetrics>,
@@ -322,17 +357,69 @@ pub fn foundation_v2_candidate_improves(
     let Some(value) = foundation_v2_promotion_value(metric, candidate) else {
         return false;
     };
-    let better = incumbent
-        .and_then(|metrics| foundation_v2_promotion_value(metric, metrics))
-        .is_none_or(|best| value > best);
     match metric {
         PromotionMetric::ComposedExactGuarded => {
-            better
-                && incumbent
-                    .is_none_or(|metrics| foundation_v2_false_edit_guard(metrics, candidate))
+            if !foundation_v2_composed_selection_complete(candidate) {
+                return false;
+            }
+            incumbent.is_none_or(|metrics| {
+                let better = match (
+                    metrics.one_step_composed_changed_exact,
+                    metrics.one_step_all_rows_exact,
+                ) {
+                    (Some(best_changed), Some(best_all_rows)) => {
+                        value > best_changed
+                            || value == best_changed
+                                && candidate
+                                    .one_step_all_rows_exact
+                                    .is_some_and(|current| current > best_all_rows)
+                    }
+                    _ => true,
+                };
+                better && foundation_v2_false_edit_guard(metrics, candidate)
+            })
         }
-        _ => better,
+        _ => incumbent
+            .and_then(|metrics| foundation_v2_promotion_value(metric, metrics))
+            .is_none_or(|best| value > best),
     }
+}
+
+/// Whether a named gate is enforced at this evaluation step. Historical
+/// `positive_improvement` entries remain diagnostic when old gate-history
+/// JSON is replayed.
+pub fn foundation_v2_gate_is_armed(evaluation: &FoundationV2GateEvaluation, name: &str) -> bool {
+    match name {
+        "positive_improvement" => false,
+        "shuffled_action_ratio" | "composed_changed_exact_collapse" => evaluation.step >= 4_096,
+        "foreground_reconstruction" => evaluation.step >= 8_192,
+        "one_step_collapse" => true,
+        // Unknown gates fail closed instead of silently becoming diagnostics.
+        _ => true,
+    }
+}
+
+/// Look up a gate by stable name rather than its position in the serialized
+/// vector. Missing gates fail closed for consumers that depend on them.
+pub fn foundation_v2_named_gate_passed(
+    evaluation: &FoundationV2GateEvaluation,
+    name: &str,
+) -> bool {
+    evaluation
+        .gates
+        .iter()
+        .find(|gate| gate.name == name)
+        .is_some_and(|gate| gate.passed)
+}
+
+/// Promotion is allowed only when every gate armed for the same evaluation
+/// passed. Warmup PASS-by-fiat results are explicitly not evidence here.
+pub fn foundation_v2_armed_gates_passed(evaluation: &FoundationV2GateEvaluation) -> bool {
+    evaluation
+        .gates
+        .iter()
+        .filter(|gate| foundation_v2_gate_is_armed(evaluation, &gate.name))
+        .all(|gate| gate.passed)
 }
 
 /// The gate evaluation currently holding the promotion under `metric`,
@@ -343,11 +430,13 @@ pub fn foundation_v2_best_evaluation<'a>(
 ) -> Option<&'a FoundationV2GateEvaluation> {
     let mut best: Option<&FoundationV2GateEvaluation> = None;
     for evaluation in gate_history {
-        if foundation_v2_candidate_improves(
-            metric,
-            best.map(|evaluation| &evaluation.metrics),
-            &evaluation.metrics,
-        ) {
+        if foundation_v2_armed_gates_passed(evaluation)
+            && foundation_v2_candidate_improves(
+                metric,
+                best.map(|evaluation| &evaluation.metrics),
+                &evaluation.metrics,
+            )
+        {
             best = Some(evaluation);
         }
     }
@@ -355,16 +444,16 @@ pub fn foundation_v2_best_evaluation<'a>(
 }
 
 /// Whether the new measurement beats the running best of the configured
-/// promotion metric. `ChangedExact` compares against the persisted
-/// `best_changed_exact` exactly as before; the other metrics replay the gate
-/// history through the same strict-improvement rule used for selection.
+/// promotion metric. Gate history is replayed through the same strict rule
+/// used for selection; `best_changed_exact` is retained only as a compatibility
+/// fallback for old checkpoints whose gate history is empty.
 pub fn foundation_v2_promotion_improved(
     metric: PromotionMetric,
     best_changed_exact: Option<f64>,
     gate_history: &[FoundationV2GateEvaluation],
     metrics: &GateSupportMetrics,
 ) -> bool {
-    if metric == PromotionMetric::ChangedExact {
+    if metric == PromotionMetric::ChangedExact && gate_history.is_empty() {
         return foundation_v2_promotion_value(metric, metrics)
             .is_some_and(|current| best_changed_exact.is_none_or(|best| current > best));
     }
@@ -373,6 +462,22 @@ pub fn foundation_v2_promotion_improved(
         foundation_v2_best_evaluation(metric, gate_history).map(|evaluation| &evaluation.metrics),
         metrics,
     )
+}
+
+/// Gate-aware promotion decision for one complete evaluation.
+pub fn foundation_v2_evaluation_improves(
+    metric: PromotionMetric,
+    best_changed_exact: Option<f64>,
+    gate_history: &[FoundationV2GateEvaluation],
+    evaluation: &FoundationV2GateEvaluation,
+) -> bool {
+    foundation_v2_armed_gates_passed(evaluation)
+        && foundation_v2_promotion_improved(
+            metric,
+            best_changed_exact,
+            gate_history,
+            &evaluation.metrics,
+        )
 }
 
 /// The step whose gate evaluation last strictly improved the configured
@@ -390,6 +495,7 @@ pub fn foundation_v2_gate_evaluation(
     step: u64,
     metrics: GateSupportMetrics,
     running_best: Option<f64>,
+    composed_running_best: Option<f64>,
 ) -> FoundationV2GateEvaluation {
     let current_exact = metrics.one_step_changed_exact;
     let running_best_after = match (running_best, current_exact) {
@@ -398,6 +504,13 @@ pub fn foundation_v2_gate_evaluation(
         (best, None) => best,
     };
     let collapse_floor = running_best_after.map(|best| best * 0.8);
+    let current_composed_exact = metrics.one_step_composed_changed_exact;
+    let composed_running_best_after = match (composed_running_best, current_composed_exact) {
+        (Some(best), Some(current)) => Some(best.max(current)),
+        (None, Some(current)) => Some(current),
+        (best, None) => best,
+    };
+    let composed_collapse_floor = composed_running_best_after.map(|best| best * 0.8);
     // Absolute-quality gates get the same warmup grace as foreground
     // reconstruction: before step 4096 the model cannot yet be expected to
     // beat latent copy or show action sensitivity, so those gates are
@@ -409,18 +522,15 @@ pub fn foundation_v2_gate_evaluation(
     // CE (0.086 -> 0.639 over the first 4096 steps of the first launch);
     // enforce it once the decoder has had half the pre-decay run to mature.
     let foreground_active = step >= 8_192;
+    let diagnostics = vec![FoundationV2GateDiagnostic {
+        // Latent-MSE improvement over copy measures proximity in a space the
+        // v5 objective does not optimize; it cannot be represented as a
+        // passing enforceable gate.
+        name: "positive_improvement".into(),
+        measured: metrics.improvement_fraction,
+        interpretation: "latent-MSE diagnostic; superseded by pixel-space gates".into(),
+    }];
     let gates = vec![
-        FoundationV2GateResult {
-            // Latent-MSE improvement over copy measures proximity in a space
-            // the v5 objective does not optimize: pixel CE trains exact
-            // decodability, and the pixel-space copy baseline scores zero on
-            // changed pixels by definition while changed-exact is tracked by
-            // the collapse gate. Kept as a logged diagnostic; never enforced.
-            name: "positive_improvement".into(),
-            passed: true,
-            measured: metrics.improvement_fraction,
-            threshold: "diagnostic-only (latent-MSE; superseded by pixel-space gates)".into(),
-        },
         FoundationV2GateResult {
             name: "shuffled_action_ratio".into(),
             passed: !warmup_done
@@ -463,6 +573,21 @@ pub fn foundation_v2_gate_evaluation(
                 .map(|floor| format!(">= {floor:.8} (0.8 x running best)"))
                 .unwrap_or_else(|| "metric required".into()),
         },
+        FoundationV2GateResult {
+            name: "composed_changed_exact_collapse".into(),
+            passed: !warmup_done
+                || current_composed_exact
+                    .zip(composed_collapse_floor)
+                    .is_some_and(|(current, floor)| current > 0.0 && current >= floor),
+            measured: current_composed_exact,
+            threshold: if warmup_done {
+                composed_collapse_floor
+                    .map(|floor| format!("> 0 and >= {floor:.8} (0.8 x running best)"))
+                    .unwrap_or_else(|| "> 0; metric required".into())
+            } else {
+                "warmup PASS until step 4096".into()
+            },
+        },
     ];
     FoundationV2GateEvaluation {
         step,
@@ -470,6 +595,7 @@ pub fn foundation_v2_gate_evaluation(
         running_best_before: running_best,
         running_best_after,
         gates,
+        diagnostics,
     }
 }
 
@@ -1912,7 +2038,8 @@ pub struct GatePopulationIdentity {
 /// Version of the in-trainer gate policy (thresholds, warmups, abort rule,
 /// shuffle construction). Bump on any change so a resumed run cannot compare
 /// new measurements against bests recorded under a different policy.
-const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v2";
+const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v3";
+const FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v2";
 
 fn foundation_v2_gate_population_identity(
     samples: &[TransitionSample],
@@ -6374,11 +6501,12 @@ fn build_report(
     resumed_from: Option<PathBuf>,
 ) -> TrainReport {
     let foundation_v2 = state.foundation_v2.as_ref().map(|foundation| {
-        let best_promotion_value = match cfg.promotion_metric {
-            PromotionMetric::ChangedExact => foundation.best_changed_exact,
-            metric => foundation_v2_best_evaluation(metric, &foundation.gate_history)
-                .and_then(|evaluation| foundation_v2_promotion_value(metric, &evaluation.metrics)),
-        };
+        let best_promotion_value =
+            foundation_v2_best_evaluation(cfg.promotion_metric, &foundation.gate_history).and_then(
+                |evaluation| {
+                    foundation_v2_promotion_value(cfg.promotion_metric, &evaluation.metrics)
+                },
+            );
         // Advertise the best-bundle path only when it passes the same
         // selection verification as the export claim; a foreign or stale
         // `checkpoints/best` must not be published as this run's best.
@@ -6755,6 +6883,16 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             foundation_v2_gate_population_identity(&gate_samples, &gate_content_masks)?;
         let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
         match &foundation.gate_population_identity {
+            Some(stored)
+                if stored.rows_sha256 == identity.rows_sha256
+                    && stored.masks_sha256 == identity.masks_sha256
+                    && stored.policy_schema == FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA =>
+            {
+                // v3 changes only gate interpretation over metrics already
+                // serialized in v2 history, so the policy identity can be
+                // migrated without crossing gate populations.
+                foundation.gate_population_identity = Some(identity);
+            }
             Some(stored) if *stored != identity => bail!(
                 "resumed gate population/policy identity mismatch: stored {:?} vs \
                  regenerated {:?}; best/collapse comparisons would span incomparable \
@@ -7101,15 +7239,27 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             })?;
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             let prior_best = foundation.best_changed_exact;
-            let evaluation = foundation_v2_gate_evaluation(state.global_step, metrics, prior_best);
-            improved_best = foundation_v2_promotion_improved(
+            let prior_composed_best = foundation
+                .gate_history
+                .iter()
+                .filter_map(|evaluation| evaluation.metrics.one_step_composed_changed_exact)
+                .filter(|value| value.is_finite())
+                .reduce(f64::max);
+            let evaluation = foundation_v2_gate_evaluation(
+                state.global_step,
+                metrics,
+                prior_best,
+                prior_composed_best,
+            );
+            improved_best = foundation_v2_evaluation_improves(
                 cfg.promotion_metric,
                 prior_best,
                 &foundation.gate_history,
-                &evaluation.metrics,
+                &evaluation,
             );
             foundation.best_changed_exact = evaluation.running_best_after;
-            foundation.rollout_enabled = evaluation.gates[3].passed;
+            foundation.rollout_enabled =
+                foundation_v2_named_gate_passed(&evaluation, "one_step_collapse");
             foundation.gate_history.push(evaluation);
             foundation.mechanism_history.push(mechanism_sample);
             abort = foundation_v2_gate_history_aborts(&foundation.gate_history);

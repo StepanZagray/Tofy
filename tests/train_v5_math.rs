@@ -1,11 +1,13 @@
 use candle_core::{Device, Tensor};
 use tofy::p2::eval::GateSupportMetrics;
 use tofy::p2::train::{
-    foundation_v2_ep_weight_update, foundation_v2_gate_evaluation,
+    foundation_v2_candidate_improves, foundation_v2_ep_weight_update,
+    foundation_v2_evaluation_improves, foundation_v2_gate_evaluation,
     foundation_v2_gate_history_aborts, foundation_v2_loss_weights_from_masks,
-    foundation_v2_promotion_improved, foundation_v2_promotion_value,
-    foundation_v2_selected_best_step, foundation_v2_wsd_learning_rate, separation_hinge_term,
-    split_ce_with_weighting, split_weighted_ce, PromotionMetric, SplitCeWeighting, TrainConfig,
+    foundation_v2_named_gate_passed, foundation_v2_promotion_improved,
+    foundation_v2_promotion_value, foundation_v2_selected_best_step,
+    foundation_v2_wsd_learning_rate, separation_hinge_term, split_ce_with_weighting,
+    split_weighted_ce, FoundationV2GateEvaluation, PromotionMetric, SplitCeWeighting, TrainConfig,
 };
 
 #[test]
@@ -166,32 +168,40 @@ fn metrics(shuffled_ratio: f64) -> GateSupportMetrics {
     }
 }
 
+fn gate(evaluation: &FoundationV2GateEvaluation, name: &str) -> bool {
+    evaluation
+        .gates
+        .iter()
+        .find(|gate| gate.name == name)
+        .unwrap_or_else(|| panic!("missing gate {name}"))
+        .passed
+}
+
 #[test]
 fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
-    let pass = foundation_v2_gate_evaluation(4_096, metrics(0.9), Some(0.6));
+    let pass = foundation_v2_gate_evaluation(4_096, metrics(0.9), Some(0.6), Some(0.45));
     assert!(pass.gates.iter().all(|gate| gate.passed));
-    // Latent-MSE improvement is diagnostic-only: deeply negative yet passing.
-    assert_eq!(pass.gates[0].name, "positive_improvement");
-    assert_eq!(pass.gates[0].measured, Some(-25.0));
+    // Latent-MSE improvement is diagnostic-only, never a passing gate.
+    assert_eq!(pass.diagnostics[0].name, "positive_improvement");
+    assert_eq!(pass.diagnostics[0].measured, Some(-25.0));
 
-    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.97), Some(0.6));
-    assert!(first_fail.gates[0].passed);
-    assert!(!first_fail.gates[1].passed);
+    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.97), Some(0.6), Some(0.45));
+    assert!(!gate(&first_fail, "shuffled_action_ratio"));
     assert!(!foundation_v2_gate_history_aborts(&[first_fail.clone()]));
 
-    let recovery = foundation_v2_gate_evaluation(6_144, metrics(0.9), Some(0.6));
+    let recovery = foundation_v2_gate_evaluation(6_144, metrics(0.9), Some(0.6), Some(0.45));
     assert!(!foundation_v2_gate_history_aborts(&[
         first_fail.clone(),
         recovery.clone()
     ]));
 
-    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(0.98), Some(0.6));
+    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(0.98), Some(0.6), Some(0.45));
     assert!(!foundation_v2_gate_history_aborts(&[
         first_fail.clone(),
         recovery,
         second_fail.clone()
     ]));
-    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(0.99), Some(0.6));
+    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(0.99), Some(0.6), Some(0.45));
     assert!(foundation_v2_gate_history_aborts(&[
         first_fail,
         second_fail,
@@ -395,23 +405,44 @@ fn split_ce_budget_validation_is_strict_and_recipe_keeps_the_knob_caller_owned()
 #[test]
 fn absolute_gates_warm_up_and_foreground_enforces_at_8192() {
     // Before 4096: shuffled-action gate passes by warmup fiat even when awful.
-    let early = foundation_v2_gate_evaluation(1_024, metrics(0.99), None);
-    assert!(early.gates[1].passed);
+    let early = foundation_v2_gate_evaluation(1_024, metrics(0.99), None, None);
+    assert!(gate(&early, "shuffled_action_ratio"));
     // 4096..8192: foreground below the floor still passes (warmup).
     let mut mid_metrics = metrics(0.9);
     mid_metrics.foreground_reconstruction_accuracy = Some(0.55);
-    let mid = foundation_v2_gate_evaluation(5_120, mid_metrics, Some(0.6));
-    assert!(mid.gates[2].passed);
+    let mid = foundation_v2_gate_evaluation(5_120, mid_metrics, Some(0.6), Some(0.45));
+    assert!(gate(&mid, "foreground_reconstruction"));
     // From 8192 the collapse floor is enforced: the observed asymptote
     // (~0.67) passes, genuine regression below 0.60 fails.
     let mut ok_metrics = metrics(0.9);
     ok_metrics.foreground_reconstruction_accuracy = Some(0.67);
-    let ok = foundation_v2_gate_evaluation(8_192, ok_metrics, Some(0.6));
-    assert!(ok.gates[2].passed);
+    let ok = foundation_v2_gate_evaluation(8_192, ok_metrics, Some(0.6), Some(0.45));
+    assert!(gate(&ok, "foreground_reconstruction"));
     let mut late_metrics = metrics(0.9);
     late_metrics.foreground_reconstruction_accuracy = Some(0.55);
-    let late = foundation_v2_gate_evaluation(8_192, late_metrics, Some(0.6));
-    assert!(!late.gates[2].passed);
+    let late = foundation_v2_gate_evaluation(8_192, late_metrics, Some(0.6), Some(0.45));
+    assert!(!gate(&late, "foreground_reconstruction"));
+}
+
+#[test]
+fn composed_changed_exact_gate_arms_at_4096_and_tracks_its_own_best() {
+    let mut copy_only = metrics(0.9);
+    copy_only.one_step_composed_changed_exact = Some(0.0);
+    let warmup = foundation_v2_gate_evaluation(3_072, copy_only.clone(), Some(0.6), None);
+    assert!(gate(&warmup, "composed_changed_exact_collapse"));
+
+    let armed = foundation_v2_gate_evaluation(4_096, copy_only, Some(0.6), None);
+    assert!(!gate(&armed, "composed_changed_exact_collapse"));
+
+    let mut collapsed = metrics(0.9);
+    collapsed.one_step_composed_changed_exact = Some(0.39);
+    let collapsed = foundation_v2_gate_evaluation(5_120, collapsed, Some(0.6), Some(0.5));
+    assert!(!gate(&collapsed, "composed_changed_exact_collapse"));
+
+    let mut retained = metrics(0.9);
+    retained.one_step_composed_changed_exact = Some(0.4);
+    let retained = foundation_v2_gate_evaluation(5_120, retained, Some(0.6), Some(0.5));
+    assert!(gate(&retained, "composed_changed_exact_collapse"));
 }
 
 #[test]
@@ -427,6 +458,7 @@ fn promotion_default_matches_the_historical_changed_exact_rule() {
                 first
             },
             None,
+            None,
         ),
         foundation_v2_gate_evaluation(
             5_120,
@@ -437,6 +469,7 @@ fn promotion_default_matches_the_historical_changed_exact_rule() {
                 second
             },
             Some(0.4),
+            Some(0.45),
         ),
     ];
     let best_changed = Some(0.6);
@@ -485,6 +518,7 @@ fn promotion_metric_full_exact_switches_selection_to_the_full_frame_best() {
                 first
             },
             None,
+            None,
         ),
         foundation_v2_gate_evaluation(
             5_120,
@@ -495,6 +529,7 @@ fn promotion_metric_full_exact_switches_selection_to_the_full_frame_best() {
                 second
             },
             Some(0.4),
+            Some(0.45),
         ),
     ];
     // Worse on changed-exact, better on full-exact than the history best 0.35.
@@ -546,10 +581,11 @@ fn composed_exact_guarded_rejects_false_edit_regressions() {
             best
         },
         None,
+        None,
     );
     let history = vec![incumbent];
 
-    // Higher composed all-row exactness with non-regressed false edits wins.
+    // Equal composed changed-exact uses all-row exactness as its tiebreak.
     let mut clean = metrics(0.9);
     clean.one_step_all_rows_exact = Some(0.55);
     clean.false_edit_rate = Some(0.01);
@@ -582,7 +618,7 @@ fn composed_exact_guarded_rejects_false_edit_regressions() {
     ));
 
     // The raw-decoder checkpoint with a closed copy gate cannot outrank the
-    // composed-correct one: selection reads the composed all-row metric only.
+    // composed-correct one: selection reads composed metrics only.
     let mut raw_only = metrics(0.9);
     raw_only.one_step_changed_exact = Some(0.9);
     raw_only.one_step_all_rows_exact = Some(0.4);
@@ -595,6 +631,111 @@ fn composed_exact_guarded_rejects_false_edit_regressions() {
 }
 
 #[test]
+fn copy_only_composed_checkpoint_cannot_freeze_the_first_useful_edit() {
+    let mut copy_only = metrics(0.9);
+    copy_only.one_step_composed_changed_exact = Some(0.0);
+    copy_only.one_step_all_rows_exact = Some(0.30);
+    copy_only.false_edit_rate = Some(0.00045);
+    copy_only.padding_false_edit_rate = Some(0.0);
+    let incumbent = copy_only.clone();
+    let history = vec![foundation_v2_gate_evaluation(
+        4_096,
+        copy_only,
+        Some(0.5),
+        None,
+    )];
+
+    let mut useful = metrics(0.9);
+    useful.one_step_composed_changed_exact = Some(0.01);
+    useful.one_step_all_rows_exact = Some(0.20);
+    useful.false_edit_rate = Some(0.001);
+    useful.padding_false_edit_rate = Some(0.0005);
+    assert_eq!(
+        foundation_v2_promotion_value(PromotionMetric::ComposedExactGuarded, &useful),
+        Some(0.01),
+    );
+    assert!(foundation_v2_candidate_improves(
+        PromotionMetric::ComposedExactGuarded,
+        Some(&incumbent),
+        &useful,
+    ));
+    assert!(foundation_v2_promotion_improved(
+        PromotionMetric::ComposedExactGuarded,
+        None,
+        &history,
+        &useful,
+    ));
+}
+
+#[test]
+fn promotion_is_blocked_when_an_armed_gate_fails() {
+    let incumbent = foundation_v2_gate_evaluation(4_096, metrics(0.9), Some(0.5), Some(0.45));
+    let history = vec![incumbent];
+    let mut candidate_metrics = metrics(0.99);
+    candidate_metrics.one_step_changed_exact = Some(0.9);
+    candidate_metrics.one_step_composed_changed_exact = Some(0.9);
+    let candidate = foundation_v2_gate_evaluation(5_120, candidate_metrics, Some(0.5), Some(0.45));
+    assert!(!gate(&candidate, "shuffled_action_ratio"));
+    assert!(!foundation_v2_evaluation_improves(
+        PromotionMetric::ChangedExact,
+        Some(0.5),
+        &history,
+        &candidate,
+    ));
+}
+
+#[test]
+fn named_gate_lookup_is_independent_of_vector_order() {
+    let mut evaluation = foundation_v2_gate_evaluation(5_120, metrics(0.99), Some(0.6), Some(0.45));
+    evaluation.gates.reverse();
+    assert!(foundation_v2_named_gate_passed(
+        &evaluation,
+        "one_step_collapse"
+    ));
+    assert!(!foundation_v2_named_gate_passed(
+        &evaluation,
+        "shuffled_action_ratio"
+    ));
+    assert!(!foundation_v2_named_gate_passed(&evaluation, "missing"));
+}
+
+#[test]
+fn old_gate_history_with_positive_improvement_gate_deserializes() {
+    let evaluation = foundation_v2_gate_evaluation(4_096, metrics(0.9), Some(0.5), Some(0.45));
+    let mut old = serde_json::to_value(evaluation).unwrap();
+    let object = old.as_object_mut().unwrap();
+    object.remove("diagnostics");
+    let gates = object
+        .get_mut("gates")
+        .and_then(serde_json::Value::as_array_mut)
+        .unwrap();
+    gates.retain(|gate| {
+        gate.get("name").and_then(serde_json::Value::as_str)
+            != Some("composed_changed_exact_collapse")
+    });
+    gates.insert(
+        0,
+        serde_json::json!({
+            "name": "positive_improvement",
+            "passed": true,
+            "measured": -25.0,
+            "threshold": "diagnostic-only (latent-MSE; superseded by pixel-space gates)"
+        }),
+    );
+
+    let restored: FoundationV2GateEvaluation = serde_json::from_value(old).unwrap();
+    assert!(restored.diagnostics.is_empty());
+    assert!(foundation_v2_named_gate_passed(
+        &restored,
+        "positive_improvement"
+    ));
+    assert_eq!(
+        foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &[restored]),
+        Some(4_096),
+    );
+}
+
+#[test]
 fn selected_best_step_replays_the_promotion_scan() {
     let mut first = metrics(0.9);
     first.one_step_changed_exact = Some(0.4);
@@ -603,9 +744,9 @@ fn selected_best_step_replays_the_promotion_scan() {
     let mut third = metrics(0.9);
     third.one_step_changed_exact = Some(0.6); // tie: not a strict improvement
     let history = vec![
-        foundation_v2_gate_evaluation(1_024, first, None),
-        foundation_v2_gate_evaluation(2_048, second, Some(0.4)),
-        foundation_v2_gate_evaluation(3_072, third, Some(0.6)),
+        foundation_v2_gate_evaluation(1_024, first, None, None),
+        foundation_v2_gate_evaluation(2_048, second, Some(0.4), Some(0.45)),
+        foundation_v2_gate_evaluation(3_072, third, Some(0.6), Some(0.45)),
     ];
     assert_eq!(
         foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &history),
