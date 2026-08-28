@@ -645,11 +645,14 @@ mod mixed_stream_tests {
             let digest = training_content_batch_digest(batch.transitions(), batch.content_masks())?;
             Ok::<_, anyhow::Error>(training_content_hash_append(chain, digest))
         })?;
+        // Snapshot of the revision-4 stream: the objective binds the permuted
+        // episode operator, so this value differs from the pre-conditioning
+        // snapshot by design.
         assert_eq!(
             chain,
             [
-                58, 187, 230, 60, 23, 57, 11, 196, 148, 84, 86, 212, 55, 6, 200, 150, 121, 167,
-                230, 199, 39, 156, 181, 68, 61, 31, 145, 79, 15, 0, 70, 166,
+                35, 79, 71, 109, 212, 65, 91, 45, 135, 210, 135, 44, 94, 92, 37, 86, 169, 16,
+                234, 191, 235, 127, 60, 26, 55, 129, 23, 0, 113, 33, 225, 210,
             ]
         );
         Ok(())
