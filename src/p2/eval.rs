@@ -1312,6 +1312,15 @@ fn semantic_population_fingerprint(samples: &[TransitionSample]) -> String {
         digest.update(sample.provenance.source_kind.as_bytes());
         digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
         digest.update(sample.provenance.trajectory_id.as_bytes());
+        match sample.provenance.operator {
+            Some(operator) => digest.update([
+                operator.family.conditioning_token() as u8,
+                operator.agent_color,
+                operator.primary_color,
+                operator.secondary_color,
+            ]),
+            None => digest.update([0, 0, 0, 0]),
+        }
         digest.update([
             sample.action.id,
             sample.action.x.unwrap_or(u8::MAX),
@@ -1373,10 +1382,11 @@ fn board_probe_rows_for_samples(
         let current = model.encode_state(&batch.frames)?;
         let predicted = BoardProbeRows::from_spatial_latent(
             &model
-                .training_latents_from_encoded_state(
+                .training_latents_from_encoded_state_with_operator_conditioning(
                     &current,
                     &batch.actions,
                     &batch.action_coords,
+                    &batch.operator_conditioning,
                     RecursionDepth {
                         inner_steps: model.config().inner_steps,
                         outer_steps: model.config().outer_steps,
@@ -2768,11 +2778,12 @@ fn evaluate_gate_support_impl(
         &owned_encoded
     };
     let prediction = model
-        .forward_from_latent(
+        .forward_from_latent_with_operator_conditioning(
             &encoded.current,
             &encoded.batch.actions,
             &encoded.batch.action_coords,
             &encoded.batch.goals,
+            &encoded.batch.operator_conditioning,
         )?
         .y;
     let shuffled_action_eligible_rows =
@@ -2783,11 +2794,12 @@ fn evaluate_gate_support_impl(
         .filter(|(factual, control)| factual.action != control.action)
         .count();
     let shuffled_prediction = model
-        .forward_from_latent(
+        .forward_from_latent_with_operator_conditioning(
             &encoded.current,
             &encoded.shuffled_actions,
             &encoded.shuffled_coords,
             &encoded.batch.goals,
+            &encoded.batch.operator_conditioning,
         )?
         .y;
     let learned_errors = per_sample_mse(&prediction, &encoded.target)?;
@@ -3448,11 +3460,12 @@ fn ptrm_metrics(
     }
     let max_k = *ks.iter().max().unwrap_or(&1);
     let effective_noise = if max_k == 1 { 0.0 } else { noise };
-    let ptrm = model.forward_ptrm(
+    let ptrm = model.forward_ptrm_with_operator_conditioning(
         &batch.frames,
         &batch.actions,
         &batch.action_coords,
         &batch.goals,
+        &batch.operator_conditioning,
         PtrmConfig {
             k: max_k,
             sigma: effective_noise,
@@ -3521,20 +3534,22 @@ fn eval_one_batch(
     let batch = batch_from_samples(chunk, device)?;
     let out = (cfg.mode == EvalMode::Full)
         .then(|| {
-            model.forward(
+            model.forward_with_operator_conditioning(
                 &batch.frames,
                 &batch.actions,
                 &batch.action_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
             )
         })
         .transpose()?;
-    let diagnostic = model.representation_diagnostic(
+    let diagnostic = model.representation_diagnostic_with_operator_conditioning(
         &batch.frames,
         &batch.next_frames,
         &batch.actions,
         &batch.action_coords,
         &batch.goals,
+        &batch.operator_conditioning,
     )?;
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_z = encoded.current;
@@ -3702,11 +3717,12 @@ fn eval_one_batch(
 
         let ptrm_forward_started = Instant::now();
         if cfg.ensemble_members >= 2 {
-            let ptrm = model.forward_ptrm(
+            let ptrm = model.forward_ptrm_with_operator_conditioning(
                 &batch.frames,
                 &batch.actions,
                 &batch.action_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
                 PtrmConfig {
                     k: cfg.ensemble_members,
                     sigma: cfg.ptrm_noise.max(0.01),
@@ -3750,11 +3766,12 @@ fn eval_one_batch(
                     .outer_steps
                     .checked_mul(k)
                     .ok_or_else(|| anyhow::anyhow!("matched-compute outer_steps overflow"))?;
-                let deterministic = model.forward_with_outer_steps(
+                let deterministic = model.forward_with_outer_steps_and_operator_conditioning(
                     &batch.frames,
                     &batch.actions,
                     &batch.action_coords,
                     &batch.goals,
+                    &batch.operator_conditioning,
                     outer_steps,
                 )?;
                 let values = per_sample_mse(&deterministic.y, &next_z)?;
@@ -3847,11 +3864,12 @@ fn eval_shuffled_action_batch(
     }
     let batch = batch_from_samples(samples, device)?;
     let (shuffled_actions, shuffled_action_coords) = action_tensors_from_samples(shuffled, device)?;
-    let out = model.forward(
+    let out = model.forward_with_operator_conditioning(
         &batch.frames,
         &shuffled_actions,
         &shuffled_action_coords,
         &batch.goals,
+        &batch.operator_conditioning,
     )?;
     let next_z = model.encode_state(&batch.next_frames)?;
     per_sample_mse(&out.y, &next_z)
@@ -4107,11 +4125,12 @@ fn eval_rollout_group(
                 rollout_operation_context(sample, "open-loop", "step batch construction")
             })?;
         let open_pred = model
-            .forward_from_latent(
+            .forward_from_latent_with_operator_conditioning(
                 &open_latent,
                 &batch.actions,
                 &batch.action_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
             )
             .with_context(|| rollout_operation_context(sample, "open-loop", "latent forward"))?
             .y;
@@ -4120,11 +4139,12 @@ fn eval_rollout_group(
             .encode_state(&batch.frames)
             .with_context(|| rollout_operation_context(sample, "closed-loop", "state encoding"))?;
         let closed_pred = model
-            .forward_from_latent(
+            .forward_from_latent_with_operator_conditioning(
                 &closed_latent,
                 &batch.actions,
                 &batch.action_coords,
                 &batch.goals,
+                &batch.operator_conditioning,
             )
             .with_context(|| rollout_operation_context(sample, "closed-loop", "latent forward"))?
             .y;
@@ -4799,7 +4819,13 @@ fn eval_contrastive_probes(
     let batch = batch_from_samples(&probe_rows, device)?;
     let z = model.encode_state(&batch.frames)?;
     let predictions = model
-        .forward_from_latent(&z, &batch.actions, &batch.action_coords, &batch.goals)?
+        .forward_from_latent_with_operator_conditioning(
+            &z,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.goals,
+            &batch.operator_conditioning,
+        )?
         .y;
     let effects = per_sample_mse(&predictions, &z)?;
     let true_prediction = predictions.narrow(0, 0, 1)?;
@@ -5381,11 +5407,12 @@ fn evaluate_outcome_counterfactuals(
     for (start, end) in batch_ranges(samples.len(), eval_batch) {
         let batch = batch_from_samples(&samples[start..end], device)?;
         let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
-        let output = model.forward(
+        let output = model.forward_with_operator_conditioning(
             &batch.frames,
             &batch.actions,
             &batch.action_coords,
             &batch.goals,
+            &batch.operator_conditioning,
         )?;
         let (_, channels, height, width) = encoded.current.dims4()?;
         let mut shared_currents = Vec::new();
@@ -5860,11 +5887,12 @@ fn evaluate_factual_branches(
     for (start, end) in batch_ranges(samples.len(), factual_eval_batch) {
         let batch = batch_from_samples(&samples[start..end], device)?;
         let current = model.encode_state(&batch.frames)?;
-        let output = model.forward(
+        let output = model.forward_with_operator_conditioning(
             &batch.frames,
             &batch.actions,
             &batch.action_coords,
             &batch.goals,
+            &batch.operator_conditioning,
         )?;
         predicted_consumer_latents.extend(
             flatten_latent(&output.y)?
@@ -7138,6 +7166,7 @@ mod tests {
                 content_y: 0,
                 source_kind: "action_diagnostic".into(),
                 trajectory_id: format!("test/action_diagnostic/{episode_id}"),
+                operator: None,
             },
             oracle_latent: None,
         })

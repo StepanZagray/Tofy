@@ -152,6 +152,8 @@ mod tests {
         assert!(uses_muon("encoder.patch.weight", &[32, 8, 4, 4]));
         // Muon: state/input projections into hidden dim
         assert!(uses_muon("action_proj.weight", &[128, 8]));
+        assert!(uses_muon("operator_conditioning_proj.weight", &[128, 54]));
+        assert!(!uses_muon("operator_conditioning_proj.bias", &[128]));
         assert!(uses_muon("goal_proj.weight", &[128, 64]));
         assert!(!uses_muon("coord_proj.weight", &[128, 2]));
         assert!(!uses_muon("spatial_action_proj.weight", &[128, 4, 1, 1]));

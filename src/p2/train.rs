@@ -11,7 +11,7 @@ use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
-    MixedStreamKind, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
+    MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{evaluate_gate_support_with_content_masks, GateSupportMetrics};
 use crate::p2::experiment::{
@@ -21,9 +21,10 @@ use crate::p2::experiment::{
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
     flatten_latent, init_copy_bypass_gate, latent_mse_per_sample, restore_copy_gate_bias_prior,
-    zero_action_film_projections, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
-    TrainingEncodedPair, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
-    PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
+    zero_action_film_projections, zero_operator_conditioning_projection, ModelConfig, PtrmConfig,
+    RecursionDepth, RecursionOpts, TrainingEncodedPair, WorldModel, ACTION_VOCAB,
+    DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, OPERATOR_CONDITION_DIM, OPERATOR_FAMILY_UNKNOWN,
+    OPERATOR_FAMILY_VOCAB, PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
@@ -136,7 +137,8 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// 3 = bounded split-CE amplification, conditioned displacement norm, and the
 /// nonzero copy-bypass alpha init that reopens the candidate gradient path,
 /// plus unchanged-target copy-gate supervision on gameplay PAD pixels.
-pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 3;
+/// 4 = episode-operator family and permuted-color conditioning at the action seam.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 4;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -1893,6 +1895,9 @@ struct TrainingContract {
     world_core_v3: bool,
     #[serde(default)]
     world_core_v4: bool,
+    /// Foundation-v2 topology includes the operator-conditioning projection.
+    #[serde(default)]
+    operator_conditioning: bool,
     #[serde(default)]
     spatial_action_residual: bool,
     #[serde(default = "default_spatial_action_residual_scale")]
@@ -1993,6 +1998,7 @@ impl From<&TrainConfig> for TrainingContract {
             world_core_v2: cfg.world_core_v2,
             world_core_v3: cfg.world_core_v3,
             world_core_v4: cfg.world_core_v4,
+            operator_conditioning: cfg.recipe == TrainingRecipe::FoundationV2,
             spatial_action_field: cfg.spatial_action_field,
             spatial_action_residual: cfg.spatial_action_residual,
             spatial_action_residual_scale: cfg.spatial_action_residual_scale,
@@ -2160,9 +2166,9 @@ fn default_training_population_hash() -> u64 {
 
 /// Append one ordered row to the cryptographic training-content chain.
 ///
-/// Objective revision 3 binds the exact mask sidecar and content origin, so
-/// published identities produced here differ from revision-2 runs even when
-/// their serialized `TransitionSample` rows are otherwise identical.
+/// Objective revision 4 also binds the permuted episode operator consumed by
+/// the model, so published identities differ when conditioning differs even if
+/// the rendered transition happens to be unchanged.
 fn training_content_hash_append(
     previous: [u8; 32],
     sample: &TransitionSample,
@@ -2185,6 +2191,15 @@ fn training_content_hash_append(
     digest.update(sample.provenance.source_kind.as_bytes());
     digest.update((sample.provenance.trajectory_id.len() as u64).to_le_bytes());
     digest.update(sample.provenance.trajectory_id.as_bytes());
+    match sample.provenance.operator {
+        Some(operator) => digest.update([
+            operator.family.conditioning_token() as u8,
+            operator.agent_color,
+            operator.primary_color,
+            operator.secondary_color,
+        ]),
+        None => digest.update([0, 0, 0, 0]),
+    }
     digest.update([sample.action.id]);
     digest.update([
         sample.action.x.unwrap_or(u8::MAX),
@@ -2598,10 +2613,51 @@ pub struct BatchTensors {
     pub actions: Tensor,
     /// Normalized `(x,y)` for ACTION6, zeros for simple actions.
     pub action_coords: Tensor,
+    /// Family one-hot plus three color one-hots. UNKNOWN rows keep only the
+    /// family bit and use an all-zero (neutral) color triple.
+    pub operator_conditioning: Tensor,
     pub goals: Tensor,
     pub event_targets: Tensor,
     pub event_mask: Tensor,
     pub factual: Option<FactualBatch>,
+}
+
+/// Tensorize observable train-family operators. Held-out families and rows
+/// without provenance receive UNKNOWN and a neutral all-zero color triple.
+pub fn operator_conditioning_from_samples(
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<Tensor> {
+    let mut values = vec![0f32; samples.len() * OPERATOR_CONDITION_DIM];
+    for (row, sample) in samples.iter().enumerate() {
+        let base = row * OPERATOR_CONDITION_DIM;
+        let operator = sample.provenance.operator.filter(|operator| {
+            matches!(
+                operator.family,
+                OperatorFamily::Teleport
+                    | OperatorFamily::Toggle
+                    | OperatorFamily::Paint
+                    | OperatorFamily::PushLine
+            )
+        });
+        let family_token = operator
+            .map(|operator| operator.family.conditioning_token())
+            .unwrap_or(OPERATOR_FAMILY_UNKNOWN);
+        values[base + family_token] = 1.0;
+        if let Some(operator) = operator {
+            for (slot, color) in [
+                operator.agent_color,
+                operator.primary_color,
+                operator.secondary_color,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                values[base + OPERATOR_FAMILY_VOCAB + slot * PALETTE_SIZE + color as usize] = 1.0;
+            }
+        }
+    }
+    Tensor::from_vec(values, (samples.len(), OPERATOR_CONDITION_DIM), device).map_err(Into::into)
 }
 
 pub struct OrderedTraceTensors {
@@ -2729,6 +2785,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
     let frames = frames?;
     let next_frames = next_frames?;
     let (actions, action_coords) = action_tensors_from_samples(rows, device)?;
+    let operator_conditioning = operator_conditioning_from_samples(rows, device)?;
     let goals: Vec<f32> = rows
         .iter()
         .flat_map(|s| s.goal_features.values.iter().copied())
@@ -2740,6 +2797,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         next_frames,
         actions,
         action_coords,
+        operator_conditioning,
         goals,
         event_targets,
         event_mask,
@@ -4433,14 +4491,21 @@ fn foundation_v2_rollout_loss_inner(
     let target_h2 = encoded.next.index_select(&second_indices, 0)?;
     let first_actions = batch.actions.index_select(&first_indices, 0)?;
     let first_action_coords = batch.action_coords.index_select(&first_indices, 0)?;
+    let first_operator_conditioning = batch
+        .operator_conditioning
+        .index_select(&first_indices, 0)?;
     let second_actions = batch.actions.index_select(&second_indices, 0)?;
     let second_action_coords = batch.action_coords.index_select(&second_indices, 0)?;
+    let second_operator_conditioning = batch
+        .operator_conditioning
+        .index_select(&second_indices, 0)?;
     let current_canonical = model.canonical_representation(&current)?;
-    let first_out = model.full_v4_training_latents_from_encoded_state(
+    let first_out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
         &current,
         &current_canonical,
         &first_actions,
         &first_action_coords,
+        &first_operator_conditioning,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -4452,11 +4517,12 @@ fn foundation_v2_rollout_loss_inner(
         first_out.y.clone()
     };
     let h1_canonical = model.canonical_representation(&open_loop_input)?;
-    let second_out = model.full_v4_training_latents_from_encoded_state(
+    let second_out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
         &open_loop_input,
         &h1_canonical,
         &second_actions,
         &second_action_coords,
+        &second_operator_conditioning,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -4586,11 +4652,12 @@ pub fn foundation_v2_training_loss(
     let batch = batch_from_samples(&samples, device)?;
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_canonical = model.canonical_representation(&encoded.current)?;
-    let out = model.full_v4_training_latents_from_encoded_state(
+    let out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
         &encoded.current,
         &current_canonical,
         &batch.actions,
         &batch.action_coords,
+        &batch.operator_conditioning,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -6644,6 +6711,13 @@ fn load_training_checkpoint(
         bail!("unsupported trainer state schema {}", state.schema);
     }
     let requested = TrainingContract::from(cfg);
+    if state.contract.foundation_objective_revision != requested.foundation_objective_revision {
+        bail!(
+            "foundation-v2 objective revision mismatch: checkpoint={} requested={}",
+            state.contract.foundation_objective_revision,
+            requested.foundation_objective_revision
+        );
+    }
     // Older V5 bundles predate the derived experiment field. Their legacy
     // contract already carries every input used to resolve it, and those fields
     // are compared below; hydrate only the absent derived value for exact resume.
@@ -7547,12 +7621,13 @@ fn foundation_v2_mechanism_sample(
     let rows = &samples[..samples.len().min(128)];
     let batch = batch_from_samples(rows, device)?;
     let current = model.encode_state(&batch.frames)?;
-    let out = model.forward_from_encoded_state(
+    let out = model.forward_from_encoded_state_with_operator_conditioning(
         &current,
         &batch.frames,
         &batch.actions,
         &batch.action_coords,
         &batch.goals,
+        &batch.operator_conditioning,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -7632,6 +7707,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         // configured prior into a 50/50 gate). Checkpoint loads must retain
         // the learned values.
         zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
         init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
     }
@@ -8277,6 +8353,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
         // Treatment initializations survive the generic reinit on every
         // fresh-init path, not only foundation-v2.
+        zero_operator_conditioning_projection(&varmap)?;
         init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
         TrainerState {
@@ -9064,7 +9141,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
 mod tests {
     use super::*;
     use crate::domain::Split;
-    use crate::p2::data::{ArcAction, GoalFeatures};
+    use crate::p2::data::{palette, ArcAction, EpisodeOperator, GoalFeatures, OperatorFamily};
 
     #[test]
     fn foundation_v2_unimix_ce_matches_materialized_reference() -> Result<()> {
@@ -9672,6 +9749,94 @@ mod tests {
             batch.action_coords.to_vec2::<f32>()?,
             vec![vec![0.0, 0.0], vec![1.0, 21.0 / 63.0],]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operator_tensorization_maps_train_held_out_and_missing_provenance() -> Result<()> {
+        let device = Device::Cpu;
+        let mut samples = vec![toy_sample(1), toy_sample(2), toy_sample(3)];
+        samples[0].provenance.operator = Some(EpisodeOperator {
+            family: OperatorFamily::Toggle,
+            agent_color: 7,
+            primary_color: 11,
+            secondary_color: 4,
+        });
+        samples[1].provenance.operator = Some(EpisodeOperator {
+            family: OperatorFamily::SwapRegion,
+            agent_color: 7,
+            primary_color: 11,
+            secondary_color: 4,
+        });
+        let rows = operator_conditioning_from_samples(&samples, &device)?.to_vec2::<f32>()?;
+
+        assert_eq!(rows[0][OperatorFamily::Toggle.conditioning_token()], 1.0);
+        assert_eq!(rows[0][OPERATOR_FAMILY_VOCAB + 7], 1.0);
+        assert_eq!(rows[0][OPERATOR_FAMILY_VOCAB + PALETTE_SIZE + 11], 1.0);
+        assert_eq!(rows[0][OPERATOR_FAMILY_VOCAB + 2 * PALETTE_SIZE + 4], 1.0);
+        for row in [&rows[1], &rows[2]] {
+            assert_eq!(row[OPERATOR_FAMILY_UNKNOWN], 1.0);
+            assert!(row[OPERATOR_FAMILY_VOCAB..]
+                .iter()
+                .all(|value| *value == 0.0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operator_tensorization_uses_conjugated_toggle_colors() -> Result<()> {
+        let device = Device::Cpu;
+        let config = MixedStreamConfig {
+            batch_size: 128,
+            seed: 73,
+            ..MixedStreamConfig::default()
+        };
+        let sample = (0..64)
+            .find_map(|batch_index| {
+                let batch =
+                    compose_mixed_stream_batch(&config, 1.0, batch_index, V5DataSplit::Train)
+                        .ok()?;
+                batch.into_samples().into_iter().find(|sample| {
+                    sample.provenance.operator.family == OperatorFamily::Toggle
+                        && sample.provenance.augmentation.color_permutation[palette::AGENT as usize]
+                            != palette::AGENT
+                })
+            })
+            .expect("deterministic search finds a color-permuted Toggle row");
+        let operator = sample.provenance.operator;
+        let permutation = sample.provenance.augmentation.color_permutation;
+        assert_eq!(operator.agent_color, permutation[palette::AGENT as usize]);
+        assert_eq!(
+            operator.primary_color,
+            permutation[palette::SWITCH_BASE as usize]
+        );
+        assert_eq!(
+            operator.secondary_color,
+            permutation[(palette::SWITCH_BASE + 1) as usize]
+        );
+        assert_eq!(sample.transition.provenance.operator, Some(operator));
+        let row =
+            operator_conditioning_from_samples(std::slice::from_ref(&sample.transition), &device)?
+                .to_vec2::<f32>()?
+                .remove(0);
+        for (slot, color) in [
+            operator.agent_color,
+            operator.primary_color,
+            operator.secondary_color,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                row[OPERATOR_FAMILY_VOCAB + slot * PALETTE_SIZE + color as usize],
+                1.0
+            );
+            assert!(
+                sample.transition.current.pixels.contains(&color)
+                    || sample.transition.next.pixels.contains(&color),
+                "conjugated color {color} is absent from the recolored row"
+            );
+        }
         Ok(())
     }
 
@@ -11824,6 +11989,7 @@ mod tests {
         // the exact weights a run starts from.
         reinit_varmap_deterministic(&varmap, 23)?;
         zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
         init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
 
@@ -11926,6 +12092,7 @@ mod tests {
         )?;
         reinit_varmap_deterministic(&varmap, 71)?;
         zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, None)?;
         let mixed = compose_mixed_stream_batch(
             &MixedStreamConfig {

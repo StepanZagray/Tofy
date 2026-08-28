@@ -314,6 +314,7 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
                     curr.guid,
                     curr.source_path.display()
                 ),
+                operator: None,
             },
             oracle_latent: None,
         });
