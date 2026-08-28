@@ -969,6 +969,21 @@ impl WorldModel {
             .compose_gameplay_pixels(predicted, current_frames)
     }
 
+    /// Compose precomputed exact-decoder logits and copy-gate probabilities.
+    /// This avoids repeating both projections when an observer target shares
+    /// the primary prediction latent.
+    pub fn composed_gameplay_decode_from_parts(
+        &self,
+        gameplay_logits: &Tensor,
+        copy_gate: &Tensor,
+        current_pixels: &Tensor,
+    ) -> Result<Tensor> {
+        self.exact_patch_grounding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("composed decode requires world-core-v4"))?
+            .compose_gameplay_pixels_from_parts(gameplay_logits, copy_gate, current_pixels)
+    }
+
     /// Compatibility seam for observer labels. This intentionally uses the
     /// deployed copy-gate composition rather than raw decoder colours.
     pub fn exact_transition_correctness(

@@ -232,20 +232,48 @@ impl ExactPatchGrounding {
             current_frames.dims4()? == (batch, 1, FRAME_SIDE, FRAME_SIDE),
             "current frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}"
         );
-        let logits = self.gameplay_logits(predicted)?.detach();
         let current = current_frames
             .narrow(2, 0, FRAME_SIDE - 1)?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
-        let gate = self.copy_gate(predicted)?.detach();
+        let logits = self.gameplay_logits(predicted)?;
+        let gate = self.copy_gate(predicted)?;
+        self.compose_gameplay_pixels_from_parts(&logits, &gate, &current)
+    }
+
+    /// Compose already-decoded gameplay logits and copy-gate probabilities.
+    /// The parts are detached here because deployed composition is a discrete
+    /// observer seam, never a decoder objective.
+    pub fn compose_gameplay_pixels_from_parts(
+        &self,
+        logits: &Tensor,
+        gate: &Tensor,
+        current_pixels: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, height, width, palette) = logits.dims4()?;
+        ensure!(
+            (height, width, palette) == (FRAME_SIDE - 1, FRAME_SIDE, PALETTE_SIZE),
+            "gameplay logits must be Bx{}x{FRAME_SIDE}x{PALETTE_SIZE}",
+            FRAME_SIDE - 1
+        );
+        ensure!(
+            gate.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
+            "copy gate must be Bx{}x{FRAME_SIDE}",
+            FRAME_SIDE - 1
+        );
+        ensure!(
+            current_pixels.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
+            "current pixels must be Bx{}x{FRAME_SIDE}",
+            FRAME_SIDE - 1
+        );
+        let logits = logits.detach();
+        let gate = gate.detach();
+        let current = current_pixels.to_dtype(DType::U32)?;
         // Fail closed on numerical corruption: comparison ops treat NaN as
         // false, so a NaN gate or logit row would otherwise decode as a
         // spuriously valid copy and inflate copy-heavy exactness metrics.
         for (tensor, label) in [(&logits, "gameplay logits"), (&gate, "copy gate")] {
-            let sum = tensor
-                .to_dtype(DType::F32)?
-                .sum_all()?
-                .to_scalar::<f32>()?;
+            let sum = tensor.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
             ensure!(
                 sum.is_finite(),
                 "composed decode received non-finite {label}"
@@ -611,7 +639,17 @@ mod tests {
             )?;
             let current = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
             let finite = Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?;
-            head.compose_gameplay_pixels(&finite, &current)?;
+            let composed = head.compose_gameplay_pixels(&finite, &current)?;
+            let logits = head.gameplay_logits(&finite)?;
+            let gate = head.copy_gate(&finite)?;
+            let current_pixels = current.narrow(2, 0, FRAME_SIDE - 1)?.squeeze(1)?;
+            let reused =
+                head.compose_gameplay_pixels_from_parts(&logits, &gate, &current_pixels)?;
+            assert_eq!(
+                composed.to_vec3::<u32>()?,
+                reused.to_vec3::<u32>()?,
+                "precomputed composition changed {composition:?} decode"
+            );
             let poisoned = Tensor::full(f32::NAN, (1, 4, 16, 16), &device)?;
             assert!(head.compose_gameplay_pixels(&poisoned, &current).is_err());
         }
