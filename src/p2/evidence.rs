@@ -403,21 +403,34 @@ mod tests {
             ),
             (checkpoint.join("trainer_state.json"), b"state".as_slice()),
             (root.join("checkpoints/latest.json"), b"latest".as_slice()),
-            (profile_dir.join("application.jsonl"), b"trace".as_slice()),
+            (profile_dir.join("bundle.json"), b"bundle".as_slice()),
+            (profile_dir.join("trace.jsonl"), b"trace".as_slice()),
             (profile_dir.join("evidence.json"), b"evidence".as_slice()),
-            (profile_dir.join("EVIDENCE.md"), b"markdown".as_slice()),
+            (profile_dir.join("report.md"), b"markdown".as_slice()),
             (profile_dir.join("viewer.html"), b"viewer".as_slice()),
             (
                 profile_dir.join("nsight/status.txt"),
                 b"available".as_slice(),
             ),
             (
-                foundation_profile_dir.join("application.jsonl"),
+                foundation_profile_dir.join("bundle.json"),
+                b"foundation bundle".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("trace.jsonl"),
                 b"foundation trace".as_slice(),
             ),
             (
                 foundation_profile_dir.join("evidence.json"),
                 b"foundation evidence".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("report.md"),
+                b"foundation report".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("viewer.html"),
+                b"foundation viewer".as_slice(),
             ),
             (
                 foundation_profile_dir.join("nsight/status.txt"),
@@ -470,9 +483,9 @@ mod tests {
             profile: ProfileState::Published(ProfileArtifacts {
                 update: 2,
                 directory: profile_dir.clone(),
-                trace: profile_dir.join("application.jsonl"),
+                trace: profile_dir.join("trace.jsonl"),
                 evidence_json: profile_dir.join("evidence.json"),
-                evidence_markdown: profile_dir.join("EVIDENCE.md"),
+                evidence_markdown: profile_dir.join("report.md"),
                 viewer_html: profile_dir.join("viewer.html"),
                 nsight_directory: profile_dir.join("nsight"),
             }),
@@ -520,7 +533,7 @@ mod tests {
         let manifest: EvidenceManifest = serde_json::from_reader(File::open(&path)?)?;
 
         assert_eq!(manifest.schema, EVIDENCE_MANIFEST_SCHEMA);
-        assert_eq!(manifest.artifacts.len(), 12);
+        assert_eq!(manifest.artifacts.len(), 15);
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.role == "checkpoint_optimizer"
                 && artifact.path == "checkpoints/step-000000000007/optimizer.safetensors"
@@ -536,7 +549,7 @@ mod tests {
                 .iter()
                 .filter(|artifact| artifact.role == "foundation_v2_profile_bundle")
                 .count(),
-            3
+            6
         );
         assert_eq!(manifest.gradient_pressure.unwrap().updates, vec![3]);
         assert!(manifest.bundle_sha256.starts_with("sha256:"));

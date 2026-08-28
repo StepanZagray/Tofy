@@ -1,18 +1,22 @@
 //! One representative optimizer-update evidence bundle for candle-graph.
 
-use anyhow::{bail, Context, Result};
-use candle_core::{backprop::GradStore, DType, Device, Tensor};
-use candle_graph::instrument::candle::{self, CandleCapture};
-use candle_graph::trace::schema::GradientState;
-use candle_graph::{ExecutionStep, ProfileRun, SpanKind, TraceSession};
+use anyhow::{Context, Result};
+use candle_core::{backprop::GradStore, Device, Tensor};
+use candle_graph::candle::{self, CandleCapture, GradientCapturePlan};
+use candle_graph::{
+    reconcile_published_bundle, CaptureBegin, CaptureContract, CaptureRun, CoverageLevel,
+    ExecutionStep, GradientFamilyContract, MeasurementScope, ProfileRun, PublicationReceipt,
+    SpanId, SpanKind,
+};
 use candle_nn::VarMap;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::perf::NvtxRange;
 
-const ENTRYPOINT: &str = "tofy::p2::train::optimizer_update";
+pub(crate) const PROFILE_ENTRYPOINT: &str = "tofy::p2::train::optimizer_update";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientClipState {
@@ -27,13 +31,6 @@ impl GradientClipState {
             Self::PostClip => "vb/post_clip",
         }
     }
-}
-
-pub fn profile_bundle_is_complete(output_dir: &Path, update: u64) -> bool {
-    let directory = output_dir
-        .join("profile")
-        .join(format!("update-{update:012}"));
-    directory.join("evidence.json").is_file() && directory.join("application.jsonl").is_file()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,11 +52,12 @@ pub enum ProfileState {
 }
 
 pub struct RepresentativeUpdateCapture {
-    session: Option<TraceSession>,
-    staging_dir: Option<PathBuf>,
-    final_dir: Option<PathBuf>,
-    artifacts: Option<ProfileArtifacts>,
+    capture: Option<CaptureRun>,
+    reconciled: Option<PublicationReceipt>,
+    gradient_plan: Option<GradientCapturePlan>,
+    update: Option<u64>,
     correlation_id: String,
+    failure_reason: RefCell<Option<String>>,
 }
 
 pub struct ProfileRange<'a> {
@@ -81,6 +79,8 @@ pub struct CaptureSpec<'a> {
     pub inner_steps: usize,
     pub outer_steps: usize,
     pub precision: &'a str,
+    pub varmap: &'a VarMap,
+    pub gradient_clip_state: GradientClipState,
 }
 
 impl RepresentativeUpdateCapture {
@@ -89,30 +89,53 @@ impl RepresentativeUpdateCapture {
         if update != spec.selected_update || !matches!(spec.state, ProfileState::Pending) {
             return Ok(Self::inactive());
         }
-        let profile_root = spec.output_dir.join("profile");
-        let final_dir = profile_root.join(format!("update-{update:012}"));
-        if final_dir.exists() {
-            bail!(
-                "profile bundle already exists while state is pending: {}",
-                final_dir.display()
-            );
-        }
-        fs::create_dir_all(&profile_root)
-            .with_context(|| format!("create {}", profile_root.display()))?;
-        let staging_dir = profile_root.join(format!(
-            ".update-{update:012}.staging-{}",
-            std::process::id()
-        ));
-        if staging_dir.exists() {
-            fs::remove_dir_all(&staging_dir).with_context(|| {
-                format!("remove stale staging bundle {}", staging_dir.display())
-            })?;
-        }
-        fs::create_dir_all(&staging_dir)
-            .with_context(|| format!("create {}", staging_dir.display()))?;
-
         let correlation_id = format!("tofy.p2/update-{update:012}");
-        let mut run = ProfileRun::training(ENTRYPOINT, update, spec.device)
+        let vars = spec
+            .varmap
+            .data()
+            .lock()
+            .expect("VarMap lock poisoned")
+            .iter()
+            .map(|(key, var)| (key.clone(), var.clone()))
+            .collect::<Vec<_>>();
+        let families = vars
+            .iter()
+            .map(|(key, _)| gradient_family(key))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|family| GradientFamilyContract::data_conditional(family, 1))
+            .collect();
+        let gradient_plan = GradientCapturePlan::from_named_vars(
+            spec.gradient_clip_state.root(),
+            vars,
+            gradient_family,
+            families,
+        )?;
+        let required_semantic_labels = required_semantic_labels(&correlation_id, spec.lesson);
+        let (gpu_expected_semantic_labels, cpu_only_semantic_labels) =
+            if spec.measured_region_device_synchronized {
+                (required_semantic_labels.clone(), Vec::new())
+            } else {
+                (Vec::new(), required_semantic_labels.clone())
+            };
+        let contract = CaptureContract {
+            // Synchronization and mechanism probes deliberately add work to the
+            // selected update, so this is representative diagnostic work rather
+            // than an uninstrumented production-equivalent timing claim.
+            measurement_scope: MeasurementScope::ProfiledWork,
+            operations: CoverageLevel::None,
+            tensors: CoverageLevel::Partial,
+            gradients: CoverageLevel::Complete,
+            gradient_contract: Some(gradient_plan.contract().clone()),
+            logical_memory: CoverageLevel::None,
+            physical_memory: CoverageLevel::None,
+            device_timing: CoverageLevel::None,
+            required_semantic_labels,
+            gpu_expected_semantic_labels,
+            cpu_only_semantic_labels,
+        };
+        let mut run = planned_profile_run(update, spec.device)
+            .capture_contract(contract)
             .correlation_id(correlation_id.clone())
             .tag("lesson", spec.lesson)
             .tag("physical_batch", spec.physical_batch.to_string())
@@ -133,42 +156,44 @@ impl RepresentativeUpdateCapture {
         if let Ok(revision) = std::env::var("TOFY_SOURCE_REVISION") {
             run = run.tag("source_revision", revision);
         }
-        let trace = staging_dir.join("application.jsonl");
-        let session = TraceSession::open(&trace, run)?;
-        let artifacts = ProfileArtifacts {
-            update,
-            directory: final_dir.clone(),
-            trace: final_dir.join("application.jsonl"),
-            evidence_json: final_dir.join("evidence.json"),
-            evidence_markdown: final_dir.join("EVIDENCE.md"),
-            viewer_html: final_dir.join("viewer.html"),
-            nsight_directory: final_dir.join("nsight"),
-        };
-        Ok(Self {
-            session: Some(session),
-            staging_dir: Some(staging_dir),
-            final_dir: Some(final_dir),
-            artifacts: Some(artifacts),
-            correlation_id,
-        })
+        let destination = profile_destination(spec.output_dir, update);
+        match CaptureRun::begin(destination, run)? {
+            CaptureBegin::AlreadyPublished(receipt) => Ok(Self {
+                capture: None,
+                reconciled: Some(*receipt),
+                gradient_plan: None,
+                update: Some(update),
+                correlation_id,
+                failure_reason: RefCell::new(None),
+            }),
+            CaptureBegin::Active(capture) => Ok(Self {
+                capture: Some(capture),
+                reconciled: None,
+                gradient_plan: Some(gradient_plan),
+                update: Some(update),
+                correlation_id,
+                failure_reason: RefCell::new(None),
+            }),
+        }
     }
 
     fn inactive() -> Self {
         Self {
-            session: None,
-            staging_dir: None,
-            final_dir: None,
-            artifacts: None,
+            capture: None,
+            reconciled: None,
+            gradient_plan: None,
+            update: None,
             correlation_id: String::new(),
+            failure_reason: RefCell::new(None),
         }
     }
 
     pub fn active(&self) -> bool {
-        self.session.is_some()
+        self.capture.is_some()
     }
 
     pub fn measurement(&self) -> Option<ProfileRange<'_>> {
-        let session = self.session.as_ref()?;
+        let session = self.capture.as_ref()?.session();
         Some(ProfileRange {
             _candle: Some(session.begin_measurement(self.correlation_id.clone())),
             _nvtx: NvtxRange::new(&self.correlation_id),
@@ -181,7 +206,7 @@ impl RepresentativeUpdateCapture {
         kind: SpanKind,
         step: Option<ExecutionStep>,
     ) -> Option<ProfileRange<'_>> {
-        let session = self.session.as_ref()?;
+        let session = self.capture.as_ref()?.session();
         let label = format!("{}/{}", self.correlation_id, name);
         let candle = match step {
             Some(step) => session.begin_step_span(label.clone(), step, kind),
@@ -249,6 +274,11 @@ impl RepresentativeUpdateCapture {
         let result = f(range.as_ref());
         let final_sync = synchronize();
         drop(range);
+        if let Err(error) = &result {
+            self.failure_reason.replace(Some(format!("{error:#}")));
+        } else if let Err(error) = &final_sync {
+            self.failure_reason.replace(Some(format!("{error:#}")));
+        }
         match (result, final_sync) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -263,11 +293,12 @@ impl RepresentativeUpdateCapture {
         tensor: &Tensor,
         step: Option<ExecutionStep>,
     ) -> Result<()> {
-        let (Some(session), Some(guard)) = (self.session.as_ref(), range._candle.as_ref()) else {
+        let (Some(capture_run), Some(guard)) = (self.capture.as_ref(), range._candle.as_ref())
+        else {
             return Ok(());
         };
         let capture = CandleCapture::from_tensor(tensor, step).with_label(name);
-        candle::record_tensor(session, guard.id(), &capture)
+        candle::record_tensor(capture_run.session(), guard.id(), &capture)
     }
 
     pub fn record_tensor_stats(
@@ -276,101 +307,181 @@ impl RepresentativeUpdateCapture {
         label: &str,
         tensor: &Tensor,
     ) -> Result<()> {
-        let (Some(session), Some(guard)) = (self.session.as_ref(), range._candle.as_ref()) else {
+        let (Some(capture), Some(guard)) = (self.capture.as_ref(), range._candle.as_ref()) else {
             return Ok(());
         };
-        session.record_tensor_stats(&format!("s{}", guard.id().raw()), label, tensor)
+        capture
+            .session()
+            .record_tensor_stats(guard.id(), label, tensor)
     }
 
-    pub fn record_gradients(
-        &self,
-        varmap: &VarMap,
-        grads: &GradStore,
-        clip_state: GradientClipState,
-    ) -> Result<()> {
-        let Some(session) = self.session.as_ref() else {
+    pub fn record_scalar(&self, span_id: Option<SpanId>, label: &str, value: f64) -> Result<()> {
+        let (Some(capture), Some(span_id)) = (self.capture.as_ref(), span_id) else {
             return Ok(());
         };
-        let data = varmap.data().lock().unwrap();
-        let mut names: Vec<_> = data.keys().cloned().collect();
-        names.sort();
-        let mut entries = Vec::with_capacity(names.len());
-        let mut norm_tensors = Vec::new();
-        for name in names {
-            let var = data
-                .get(&name)
-                .ok_or_else(|| anyhow::anyhow!("missing var {name}"))?;
-            let norm_index = if let Some(grad) = grads.get(var.as_tensor()) {
-                let norm = grad
-                    .to_dtype(DType::F32)?
-                    .sqr()?
-                    .sum_all()?
-                    .sqrt()?
-                    .reshape(1)?;
-                norm_tensors.push(norm);
-                Some(norm_tensors.len() - 1)
-            } else {
-                None
-            };
-            entries.push((name, norm_index));
-        }
-        let norms = if norm_tensors.is_empty() {
-            Vec::new()
-        } else {
-            Tensor::cat(&norm_tensors, 0)?.to_vec1::<f32>()?
+        capture.session().record_scalar(span_id, label, value)
+    }
+
+    pub fn record_gradients(&self, grads: &GradStore) -> Result<()> {
+        let (Some(capture), Some(plan)) = (self.capture.as_ref(), self.gradient_plan.as_ref())
+        else {
+            return Ok(());
         };
-        for (name, norm_index) in entries {
-            let (state, norm) = match norm_index {
-                None => (GradientState::Missing, None),
-                Some(index) if !norms[index].is_finite() => (GradientState::NonFinite, None),
-                Some(index) if norms[index] == 0.0 => (GradientState::Zero, Some(0.0)),
-                Some(index) => (GradientState::Present, Some(norms[index] as f64)),
-            };
-            session.record_gradient(clip_state.root(), name, state, norm)?;
-        }
-        Ok(())
+        plan.record(capture.session(), grads)
     }
 
     pub fn finish(mut self) -> Result<Option<ProfileArtifacts>> {
-        let Some(session) = self.session.take() else {
+        let receipt = if let Some(receipt) = self.reconciled.take() {
+            receipt
+        } else if let Some(capture) = self.capture.take() {
+            capture.publish()?
+        } else {
             return Ok(None);
         };
-        let staging = self.staging_dir.take().expect("active capture staging dir");
-        let final_dir = self.final_dir.take().expect("active capture final dir");
-        let artifacts = self.artifacts.take().expect("active capture artifacts");
-        let trace = session.finish()?;
-        let evidence = candle_graph::build_evidence(&trace, None)?;
-        fs::write(
-            staging.join("evidence.json"),
-            serde_json::to_vec_pretty(&evidence)?,
-        )?;
-        fs::write(staging.join("EVIDENCE.md"), evidence.markdown())?;
-        fs::write(
-            staging.join("viewer.html"),
-            candle_graph::viewer::render_evidence_html(&evidence),
-        )?;
-        fs::create_dir_all(staging.join("nsight"))?;
-        fs::rename(&staging, &final_dir).with_context(|| {
-            format!(
-                "publish profile bundle {} -> {}",
-                staging.display(),
-                final_dir.display()
-            )
-        })?;
-        Ok(Some(artifacts))
+        Ok(Some(profile_artifacts(
+            self.update.expect("published capture update"),
+            &receipt,
+        )))
     }
+
+    pub fn finish_failed(mut self, reason: impl Into<String>) -> Result<Option<ProfileArtifacts>> {
+        let receipt = if let Some(receipt) = self.reconciled.take() {
+            receipt
+        } else if let Some(capture) = self.capture.take() {
+            capture.publish_failed(reason)?
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(profile_artifacts(
+            self.update.expect("published capture update"),
+            &receipt,
+        )))
+    }
+}
+
+impl ProfileRange<'_> {
+    pub fn span_id(&self) -> Option<SpanId> {
+        self._candle.as_ref().map(|guard| guard.id())
+    }
+}
+
+impl Drop for RepresentativeUpdateCapture {
+    fn drop(&mut self) {
+        let Some(capture) = self.capture.take() else {
+            return;
+        };
+        // Every `?` that exits a selected training step before `finish` reaches
+        // this guard, so caught step failures become verified failed bundles
+        // instead of unterminated staging traces.
+        let fallback = if std::thread::panicking() {
+            "training step panicked before profile publication"
+        } else {
+            "training step exited before profile publication"
+        };
+        let reason = self
+            .failure_reason
+            .get_mut()
+            .take()
+            .unwrap_or_else(|| fallback.to_owned());
+        if let Err(error) = capture.publish_failed(reason) {
+            tracing::error!("failed to publish diagnostic candle-graph bundle: {error:#}");
+        }
+    }
+}
+
+pub fn reconcile_profile_bundle(
+    output_dir: &Path,
+    update: u64,
+    device: &str,
+) -> Result<Option<ProfileArtifacts>> {
+    let destination = profile_destination(output_dir, update);
+    let run = planned_profile_run(update, device);
+    reconcile_published_bundle(&destination, &run)
+        .with_context(|| format!("reconcile profile bundle {}", destination.display()))
+        .map(|receipt| receipt.map(|receipt| profile_artifacts(update, &receipt)))
+}
+
+fn planned_profile_run(update: u64, device: &str) -> ProfileRun {
+    ProfileRun::training(PROFILE_ENTRYPOINT, update, device)
+        .correlation_id(format!("tofy.p2/update-{update:012}"))
+}
+
+fn profile_destination(output_dir: &Path, update: u64) -> PathBuf {
+    output_dir
+        .join("profile")
+        .join(format!("update-{update:012}"))
+}
+
+fn profile_artifacts(update: u64, receipt: &PublicationReceipt) -> ProfileArtifacts {
+    let directory = receipt.bundle_path.clone();
+    ProfileArtifacts {
+        update,
+        trace: directory.join("trace.jsonl"),
+        evidence_json: directory.join("evidence.json"),
+        evidence_markdown: directory.join("report.md"),
+        viewer_html: directory.join("viewer.html"),
+        nsight_directory: directory.join("nsight"),
+        directory,
+    }
+}
+
+fn gradient_family(key: &str) -> String {
+    let prefix = key.split('.').next().unwrap_or(key);
+    match prefix {
+        "exact_grounding_head" => "exact_decoder",
+        "event_head" | "q_head" | "reliability_head" | "consumer_readout" => "observers",
+        "action_decoder"
+        | "coordinate_decoder"
+        | "grounding_head"
+        | "prefix_head"
+        | "spatial_prefix_head" => "auxiliary_decoders",
+        _ => "world",
+    }
+    .to_owned()
+}
+
+fn required_semantic_labels(correlation_id: &str, lesson: &str) -> Vec<String> {
+    let phases: &[&str] = if lesson == "foundation_v2" {
+        &[
+            "forward_loss",
+            "loss_tensors",
+            "backward",
+            "gradients",
+            "gradient_clip",
+            "optimizer",
+        ]
+    } else {
+        &[
+            "loss_readback",
+            "gradient_clip",
+            "gradients",
+            "optimizer",
+            "metrics",
+        ]
+    };
+    std::iter::once(correlation_id.to_owned())
+        .chain(
+            phases
+                .iter()
+                .map(|phase| format!("{correlation_id}/{phase}")),
+        )
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use anyhow::bail;
+    use candle_core::DType;
+    use candle_nn::VarBuilder;
+    use std::fs;
 
     #[test]
     fn selected_update_is_one_based() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("tofy-profile-selection-{}", std::process::id()));
         let pending = ProfileState::Pending;
+        let varmap = VarMap::new();
         let inactive = RepresentativeUpdateCapture::begin(CaptureSpec {
             completed_updates: 0,
             selected_update: 2,
@@ -385,6 +496,8 @@ mod tests {
             inner_steps: 1,
             outer_steps: 1,
             precision: "f32",
+            varmap: &varmap,
+            gradient_clip_state: GradientClipState::PostClip,
         })?;
         assert!(!inactive.active());
         let _ = fs::remove_dir_all(dir);
@@ -398,6 +511,9 @@ mod tests {
             std::process::id()
         ));
         let pending = ProfileState::Pending;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let _linear = candle_nn::linear(1, 1, vb.pp("test"))?;
         let capture = RepresentativeUpdateCapture::begin(CaptureSpec {
             completed_updates: 0,
             selected_update: 1,
@@ -412,6 +528,8 @@ mod tests {
             inner_steps: 1,
             outer_steps: 1,
             precision: "f32",
+            varmap: &varmap,
+            gradient_clip_state: GradientClipState::PostClip,
         })?;
         let events = RefCell::new(Vec::new());
         let error = capture
@@ -432,6 +550,18 @@ mod tests {
         assert!(error.to_string().contains("expected body failure"));
         assert_eq!(*events.borrow(), ["sync", "body", "sync"]);
         drop(capture);
+        let bundle = dir.join("profile/update-000000000001");
+        candle_graph::verify_bundle(&bundle)?;
+        let trace = candle_graph::parse_trace(bundle.join("trace.jsonl"))?;
+        assert_eq!(
+            trace.terminal.outcome,
+            candle_graph::trace::RunOutcome::Failed
+        );
+        assert!(trace
+            .terminal
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("expected body failure")));
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }

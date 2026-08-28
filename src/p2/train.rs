@@ -4,8 +4,8 @@ use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
 use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, BranchLearningConfig};
 use crate::p2::cg_profile::{
-    profile_bundle_is_complete, CaptureSpec, GradientClipState, ProfileRange, ProfileState,
-    RepresentativeUpdateCapture,
+    reconcile_profile_bundle, CaptureSpec, GradientClipState, ProfileRange, ProfileState,
+    RepresentativeUpdateCapture, PROFILE_ENTRYPOINT,
 };
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
@@ -36,7 +36,9 @@ use crate::p2::prefetch::{
 use crate::p2::sigreg::{sigreg_epps_pulley_seeded, sigreg_quantile_seeded};
 use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var, D};
-use candle_graph::{ExecutionStep, SpanKind};
+use candle_graph::{
+    CampaignManifest, ExecutionStep, PlannedCapture, SpanId, SpanKind, CAMPAIGN_SCHEMA,
+};
 use candle_nn::init::FanInOut;
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::{VarBuilder, VarMap};
@@ -5843,6 +5845,39 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn ensure_profile_campaign_manifest(cfg: &TrainConfig, capture_steps: &[u64]) -> Result<()> {
+    if capture_steps.is_empty() {
+        return Ok(());
+    }
+    let mut steps = capture_steps.to_vec();
+    steps.sort_unstable();
+    let manifest = CampaignManifest {
+        schema: CAMPAIGN_SCHEMA.into(),
+        campaign_id: format!("tofy.p2.{:?}.seed-{}", cfg.recipe, cfg.seed).to_lowercase(),
+        entrypoint: PROFILE_ENTRYPOINT.into(),
+        planned: steps
+            .into_iter()
+            .map(|capture_step| PlannedCapture {
+                capture_step,
+                bundle: format!("update-{capture_step:012}"),
+            })
+            .collect(),
+    };
+    manifest.validate()?;
+    let path = cfg.output_dir.join("profile/campaign.json");
+    if path.exists() {
+        let existing = CampaignManifest::load(&path)?;
+        if existing != manifest {
+            bail!(
+                "profile campaign manifest {} conflicts with the requested capture plan",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    write_json_atomic(&path, &manifest)
+}
+
 pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport) -> Result<()> {
     fs::create_dir_all(&cfg.output_dir)
         .with_context(|| format!("create {}", cfg.output_dir.display()))?;
@@ -7348,17 +7383,19 @@ fn validate_foundation_v2_profile_resume(
     profiles_published: &mut Vec<u64>,
     global_step: u64,
     output_dir: &Path,
+    device: &str,
 ) -> Result<()> {
+    let recorded = profiles_published.iter().copied().collect::<BTreeSet<_>>();
+    profiles_published.clear();
     for &update in profile_updates {
-        if !profiles_published.contains(&update) && profile_bundle_is_complete(output_dir, update) {
+        if let Some(artifacts) = reconcile_profile_bundle(output_dir, update, device)? {
             profiles_published.push(update);
-            tracing::warn!(
-                "reconciled foundation-v2 profile update {update} from complete bundle {}",
-                output_dir
-                    .join("profile")
-                    .join(format!("update-{update:012}"))
-                    .display()
-            );
+            if !recorded.contains(&update) {
+                tracing::warn!(
+                    "reconciled foundation-v2 profile update {update} from verified bundle {}",
+                    artifacts.directory.display()
+                );
+            }
         }
     }
     profiles_published.sort_unstable();
@@ -7401,7 +7438,6 @@ fn record_foundation_v2_profile_tensors(
     ] {
         let label = format!("loss/{name}");
         profile.record_tensor(range, &label, tensor, Some(ExecutionStep::Forward))?;
-        profile.record_tensor_stats(range, &label, tensor)?;
     }
     let seams = losses
         .mechanism_seams
@@ -7415,6 +7451,86 @@ fn record_foundation_v2_profile_tensors(
     ] {
         profile.record_tensor(range, label, tensor, Some(ExecutionStep::Forward))?;
         profile.record_tensor_stats(range, label, tensor)?;
+    }
+    Ok(())
+}
+
+fn record_foundation_v2_profile_scalars(
+    profile: &RepresentativeUpdateCapture,
+    span_id: Option<SpanId>,
+    values: &FoundationV2LossMeans,
+    learning_rate: f64,
+    ep_weight: f64,
+) -> Result<()> {
+    for (label, value) in [
+        ("loss/total", values.total),
+        ("loss/pred_ce", values.pred_ce),
+        ("loss/gate", values.gate),
+        ("loss/latent", values.latent),
+        ("loss/enc_ce", values.enc_ce),
+        ("loss/separation", values.separation),
+        ("loss/pull", values.pull),
+        ("loss/inverse_action", values.inverse_action),
+        ("loss/ep", values.ep),
+        ("loss/rollout", values.rollout),
+        ("loss/event", values.event),
+        ("loss/q", values.q),
+        ("loss/reliability", values.reliability),
+        (
+            "optimizer/pre_clip_gradient_norm",
+            values.pre_clip_gradient_norm,
+        ),
+        ("optimizer/clip_scale", values.gradient_clip_scale),
+        ("optimizer/clipped", values.clipped_fraction),
+        ("optimizer/learning_rate", learning_rate),
+        ("objective/ep_weight", ep_weight),
+    ] {
+        profile.record_scalar(span_id, label, value)?;
+    }
+    Ok(())
+}
+
+fn record_training_profile_scalars(
+    profile: &RepresentativeUpdateCapture,
+    span_id: Option<SpanId>,
+    values: &LessonLossMeans,
+    learning_rate: f64,
+) -> Result<()> {
+    for (label, value) in [
+        ("loss/total", values.total),
+        ("loss/next_latent", values.next_latent),
+        ("loss/rollout", values.rollout),
+        ("loss/sigreg_raw", values.sigreg_raw),
+        ("loss/sigreg_bounded", values.sigreg_bounded),
+        ("loss/patch_grounding", values.patch_grounding),
+        ("loss/event", values.event),
+        ("loss/q", values.q),
+        ("loss/prefix", values.prefix),
+        ("loss/reliability", values.reliability),
+        ("loss/branch_total", values.branch_total),
+        ("loss/outcome_pull", values.outcome_pull),
+        ("loss/outcome_push", values.outcome_push),
+        ("loss/action_recovery", values.action_recovery),
+        ("loss/coordinate_recovery", values.coordinate_recovery),
+        ("loss/changed_margin", values.changed_margin),
+        ("loss/spatial_variance", values.spatial_variance),
+        ("loss/spatial_covariance", values.spatial_covariance),
+        ("loss/pooled_variance", values.pooled_variance),
+        ("loss/pooled_covariance", values.pooled_covariance),
+        ("loss/displacement_variance", values.displacement_variance),
+        (
+            "loss/displacement_covariance",
+            values.displacement_covariance,
+        ),
+        (
+            "optimizer/pre_clip_gradient_norm",
+            values.pre_clip_gradient_norm,
+        ),
+        ("optimizer/clip_scale", values.gradient_clip_scale),
+        ("optimizer/clipped", values.clipped_updates),
+        ("optimizer/learning_rate", learning_rate),
+    ] {
+        profile.record_scalar(span_id, label, value)?;
     }
     Ok(())
 }
@@ -7559,6 +7675,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             }),
         }
     };
+    ensure_profile_campaign_manifest(&cfg, &cfg.profile_updates)?;
     if resumed_from.is_some() {
         ensure_foundation_v2_resume_not_aborted(
             &cfg,
@@ -7618,6 +7735,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             .profiles_published,
         state.global_step,
         &cfg.output_dir,
+        &cfg.device,
     )?;
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
@@ -7713,6 +7831,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 } else {
                     "f32"
                 },
+                varmap: &varmap,
+                gradient_clip_state: GradientClipState::PreClip,
             })?)
         } else {
             None
@@ -7723,6 +7843,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let profile_measurement = cg_profile
             .as_ref()
             .and_then(RepresentativeUpdateCapture::measurement);
+        let profile_measurement_span = profile_measurement.as_ref().and_then(ProfileRange::span_id);
         let mixed = if let Some(prefetcher) = data_prefetcher.as_mut() {
             let (batch_index, batch) = if let Some(profile) = &cg_profile {
                 profile.synchronized_phase(
@@ -7796,7 +7917,9 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             rollout_enabled,
             split_ce_weighting: cfg.split_ce_weighting,
             split_ce_changed_budget: cfg.split_ce_changed_budget,
-            capture_mechanism_seams: cg_profile.is_some(),
+            capture_mechanism_seams: cg_profile
+                .as_ref()
+                .is_some_and(RepresentativeUpdateCapture::active),
         };
         let losses = if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
@@ -7872,13 +7995,23 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 "gradients",
                 SpanKind::Module,
                 Some(ExecutionStep::Backward),
-                || profile.record_gradients(&varmap, &grads, GradientClipState::PreClip),
+                || profile.record_gradients(&grads),
             )?;
         }
         // ADR 0003's documented approximation: the adaptive controller bounds
         // EP's encoder contribution first, then one combined gradient store is
         // clipped at 1.0. There is no separately clipped EP accumulation.
-        let clip = clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        let clip = if let Some(profile) = &cg_profile {
+            profile.synchronized_phase(
+                &device,
+                "gradient_clip",
+                SpanKind::Module,
+                Some(ExecutionStep::Backward),
+                || clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM),
+            )?
+        } else {
+            clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?
+        };
         let learning_rate = foundation_v2_wsd_learning_rate(next_step as usize, total_steps);
         optimizer.set_learning_rate(learning_rate)?;
         if let Some(profile) = &cg_profile {
@@ -7892,29 +8025,18 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         } else {
             optimizer.step(&grads)?;
         }
-        drop(profile_measurement);
-        let published_profile = if let Some(profile) = cg_profile {
-            let artifacts = profile
-                .finish()?
-                .ok_or_else(|| anyhow::anyhow!("selected foundation-v2 profile was inactive"))?;
-            if artifacts.update != next_step {
-                bail!(
-                    "foundation-v2 profile published update {} while update {next_step} was selected",
-                    artifacts.update
-                );
-            }
-            state
-                .foundation_v2
-                .as_mut()
-                .expect("foundation-v2 state")
-                .profiles_published
-                .push(next_step);
-            true
-        } else {
-            false
-        };
-        ema.update(&varmap)?;
         let values = foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
+        if let Some(profile) = &cg_profile {
+            record_foundation_v2_profile_scalars(
+                profile,
+                profile_measurement_span,
+                &values,
+                learning_rate,
+                effective_ep_weight,
+            )?;
+        }
+        drop(profile_measurement);
+        ema.update(&varmap)?;
         loss_log.append(next_step, &values, learning_rate)?;
         state.active_sums = {
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
@@ -7959,6 +8081,15 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 )?;
                 Ok((metrics, mechanism_sample))
             })?;
+            if let (Some(profile), Some(copy_bypass_alpha)) =
+                (&cg_profile, mechanism_sample.copy_bypass_alpha)
+            {
+                profile.record_scalar(
+                    profile_measurement_span,
+                    "mechanism/copy_bypass_alpha",
+                    copy_bypass_alpha,
+                )?;
+            }
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             let prior_best = foundation.best_changed_exact;
             let prior_composed_best = foundation
@@ -7986,6 +8117,26 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             foundation.mechanism_history.push(mechanism_sample);
             abort = foundation_v2_gate_history_aborts(&foundation.gate_history);
         }
+        let published_profile = if let Some(profile) = cg_profile {
+            let artifacts = profile
+                .finish()?
+                .ok_or_else(|| anyhow::anyhow!("selected foundation-v2 profile was inactive"))?;
+            if artifacts.update != next_step {
+                bail!(
+                    "foundation-v2 profile published update {} while update {next_step} was selected",
+                    artifacts.update
+                );
+            }
+            state
+                .foundation_v2
+                .as_mut()
+                .expect("foundation-v2 state")
+                .profiles_published
+                .push(next_step);
+            true
+        } else {
+            false
+        };
 
         let complete = state.global_step >= total_steps as u64;
         let requested_pause = PAUSE_REQUESTED.load(Ordering::SeqCst)
@@ -8148,6 +8299,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             foundation_v2: None,
         }
     };
+    ensure_profile_campaign_manifest(cfg, &[cfg.profile_update])?;
     let mut latest_checkpoint = resumed_from.clone();
     let mut latest_checkpoint_step = resumed_from.as_ref().map(|_| state.global_step);
     if resumed_from.is_none() {
@@ -8160,10 +8312,21 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         device.synchronize()?;
     }
     if state.global_step >= cfg.profile_update && matches!(state.profile, ProfileState::Pending) {
-        bail!(
-            "resume state has passed profile update {} without a published evidence bundle",
-            cfg.profile_update
-        );
+        if let Some(artifacts) =
+            reconcile_profile_bundle(&cfg.output_dir, cfg.profile_update, &cfg.device)?
+        {
+            tracing::warn!(
+                "reconciled profile update {} from verified bundle {}",
+                cfg.profile_update,
+                artifacts.directory.display()
+            );
+            state.profile = ProfileState::Published(artifacts);
+        } else {
+            bail!(
+                "resume state has passed profile update {} without a publishable evidence bundle",
+                cfg.profile_update
+            );
+        }
     }
     // Derived state only: never checkpointed, since a cold cache regenerates the
     // identical episodes on resume.
@@ -8245,12 +8408,15 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             } else {
                 "f32"
             },
+            varmap: &varmap,
+            gradient_clip_state: GradientClipState::PostClip,
         })?;
+        let prof = profile.enabled();
         if cg_profile.active() {
             sync_cuda_device(&device)?;
         }
         let profile_measurement = cg_profile.measurement();
-        let prof = profile.enabled();
+        let profile_measurement_span = profile_measurement.as_ref().and_then(ProfileRange::span_id);
         let accum = cfg.grad_accum.max(1);
         let loss_weights =
             lesson_loss_weights(lesson, cfg, state.step_in_lesson, state.global_step);
@@ -8734,7 +8900,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 "gradients",
                 SpanKind::Module,
                 Some(ExecutionStep::Backward),
-                || cg_profile.record_gradients(&varmap, &grads, GradientClipState::PostClip),
+                || cg_profile.record_gradients(&grads),
             )?;
         }
         cg_profile.synchronized_phase(
@@ -8797,6 +8963,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 Ok(())
             })
         })?;
+        record_training_profile_scalars(
+            &cg_profile,
+            profile_measurement_span,
+            &step_metrics,
+            cfg.lr,
+        )?;
         if cg_profile.active() {
             sync_cuda_device(&device)?;
         }
@@ -11785,13 +11957,30 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let mut published = vec![4];
-        let error = validate_foundation_v2_profile_resume(&[2, 4], &mut published, 4, &root)
-            .expect_err("completed preregistered update 2 has no published evidence");
+        let error = validate_foundation_v2_profile_resume(&[2, 4], &mut published, 4, &root, "cpu")
+            .expect_err("checkpoint bookkeeping without bundles cannot satisfy the guard");
         assert!(
-            error.to_string().contains("completed updates [2]"),
+            error.to_string().contains("completed updates [2, 4]"),
             "{error:#}"
         );
-        validate_foundation_v2_profile_resume(&[2, 4], &mut vec![2, 4], 4, &root)?;
+        for update in [2, 4] {
+            let bundle = root
+                .join("profile")
+                .join(format!("update-{update:012}"));
+            let run = candle_graph::ProfileRun::training(PROFILE_ENTRYPOINT, update, "cpu")
+                .correlation_id(format!("tofy.p2/update-{update:012}"));
+            let capture = match candle_graph::CaptureRun::begin(&bundle, run)? {
+                candle_graph::CaptureBegin::Active(capture) => capture,
+                candle_graph::CaptureBegin::AlreadyPublished(_) => unreachable!(),
+            };
+            let measured = capture.session().begin_measurement("resume/guard");
+            drop(measured);
+            capture.publish()?;
+        }
+        let mut repaired = vec![2, 4];
+        validate_foundation_v2_profile_resume(&[2, 4], &mut repaired, 4, &root, "cpu")?;
+        assert_eq!(repaired, [2, 4]);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -11803,11 +11992,19 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let bundle = root.join("profile/update-000000000002");
-        fs::create_dir_all(&bundle)?;
-        fs::write(bundle.join("application.jsonl"), b"{}\n")?;
-        fs::write(bundle.join("evidence.json"), b"{}\n")?;
+        let run = candle_graph::ProfileRun::training(PROFILE_ENTRYPOINT, 2, "cpu")
+            .correlation_id("tofy.p2/update-000000000002");
+        let capture = match candle_graph::CaptureRun::begin(&bundle, run)? {
+            candle_graph::CaptureBegin::Active(capture) => capture,
+            candle_graph::CaptureBegin::AlreadyPublished(_) => {
+                unreachable!("test destination starts absent")
+            }
+        };
+        let measured = capture.session().begin_measurement("resume/reconcile");
+        drop(measured);
+        capture.publish()?;
         let mut published = Vec::new();
-        validate_foundation_v2_profile_resume(&[2], &mut published, 1, &root)?;
+        validate_foundation_v2_profile_resume(&[2], &mut published, 1, &root, "cpu")?;
         assert_eq!(published, [2]);
         fs::remove_dir_all(&root)?;
         Ok(())
@@ -11936,9 +12133,58 @@ mod tests {
         }
         assert_eq!(foundation.profile_bundles.len(), 1);
         let bundle = &foundation.profile_bundles[0];
-        for name in ["application.jsonl", "evidence.json", "EVIDENCE.md"] {
+        for name in [
+            "bundle.json",
+            "trace.jsonl",
+            "evidence.json",
+            "report.md",
+            "viewer.html",
+        ] {
             assert!(bundle.join(name).is_file(), "missing {name}");
         }
+        candle_graph::verify_bundle(bundle)?;
+        let trace_document = candle_graph::parse_trace(bundle.join("trace.jsonl"))?;
+        let contract = &trace_document.run.capture_contract;
+        assert_eq!(
+            contract.measurement_scope,
+            candle_graph::MeasurementScope::ProfiledWork
+        );
+        assert_eq!(contract.operations, candle_graph::CoverageLevel::None);
+        assert_eq!(contract.tensors, candle_graph::CoverageLevel::Partial);
+        assert_eq!(contract.gradients, candle_graph::CoverageLevel::Complete);
+        let gradient_contract = contract
+            .gradient_contract
+            .as_ref()
+            .expect("complete gradient coverage has an exact contract");
+        assert!(gradient_contract
+            .expected
+            .iter()
+            .all(|gradient| gradient.root == "vb/pre_clip"));
+        assert_eq!(
+            gradient_contract
+                .families
+                .iter()
+                .map(|family| family.family.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "auxiliary_decoders",
+                "exact_decoder",
+                "observers",
+                "world",
+            ])
+        );
+        assert!(fs::read_dir(bundle.parent().expect("profile directory"))?
+            .filter_map(std::result::Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with('.')));
+        let campaign = CampaignManifest::load(&cfg.output_dir.join("profile/campaign.json"))?;
+        assert_eq!(campaign.entrypoint, PROFILE_ENTRYPOINT);
+        assert_eq!(campaign.planned.len(), 1);
+        assert_eq!(campaign.planned[0].capture_step, 2);
+        assert_eq!(campaign.planned[0].bundle, "update-000000000002");
+        let campaign_status =
+            candle_graph::campaign_status(&cfg.output_dir.join("profile/campaign.json"))?;
+        assert_eq!(campaign_status.published, 1);
+        assert_eq!(campaign_status.missing, 0);
         let required = [
             "seam/out_y",
             "seam/current_canonical",
@@ -11947,7 +12193,7 @@ mod tests {
         ];
         let mut seen = BTreeMap::new();
         let mut saw_pre_clip_gradients = false;
-        for line in fs::read_to_string(bundle.join("application.jsonl"))?.lines() {
+        for line in fs::read_to_string(bundle.join("trace.jsonl"))?.lines() {
             let event: serde_json::Value = serde_json::from_str(line)?;
             if event.get("kind").and_then(serde_json::Value::as_str) == Some("tensor_stats") {
                 if let Some(label) = event.get("label").and_then(serde_json::Value::as_str) {
@@ -11962,6 +12208,19 @@ mod tests {
         }
         for label in required {
             assert!(seen.contains_key(label), "missing tensor stats for {label}");
+        }
+        for label in [
+            "loss/total",
+            "optimizer/pre_clip_gradient_norm",
+            "optimizer/clip_scale",
+            "optimizer/clipped",
+            "optimizer/learning_rate",
+            "objective/ep_weight",
+        ] {
+            assert!(
+                seen.contains_key(label),
+                "missing scalar evidence for {label}"
+            );
         }
         assert!(saw_pre_clip_gradients);
         fs::remove_dir_all(&root)?;

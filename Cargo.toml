@@ -37,7 +37,7 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-chrome = { version = "0.7", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
-candle-graph = { path = "../candle_graph", features = ["all"] }
+candle-graph = { version = "0.9.5", path = "../candle_graph", features = ["all"] }
 
 [dev-dependencies]
 criterion = "0.5"

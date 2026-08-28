@@ -5,10 +5,10 @@ use candle_graph::cli::trace_cli;
 use clap::Parser;
 use std::path::PathBuf;
 
-/// Render HTML from a representative-update bundle or its application trace.
+/// Render HTML from a representative-update bundle or a readable raw trace.
 #[derive(Debug, Parser)]
 pub struct P2ViewArgs {
-    /// Profile bundle directory or `application.jsonl` (`candle-graph/trace/6`).
+    /// Finalized profile bundle directory or raw trace; use `candle-graph protocol` for schemas.
     #[arg(value_name = "PROFILE")]
     pub profile: PathBuf,
 
@@ -16,24 +16,29 @@ pub struct P2ViewArgs {
     #[arg(long, value_name = "FILE")]
     pub output: PathBuf,
 
-    /// Override normalized Nsight CSV directory.
+    /// Nsight CSV directory for a raw-trace input.
     #[arg(long, value_name = "DIR")]
     pub nsight_dir: Option<PathBuf>,
 }
 
 pub fn run_p2_view(args: P2ViewArgs) -> Result<()> {
-    let trace = if args.profile.is_dir() {
-        args.profile.join("application.jsonl")
+    let input = if args.profile.is_dir() {
+        let manifest = args.profile.join("bundle.json");
+        if !manifest.is_file() {
+            bail!("bundle manifest not found: {}", manifest.display());
+        }
+        if args.nsight_dir.is_some() {
+            bail!("--nsight-dir cannot augment an already-finalized bundle");
+        }
+        args.profile.clone()
     } else {
         args.profile.clone()
     };
-    if !trace.is_file() {
-        bail!("trace not found: {}", trace.display());
+    if !input.exists() {
+        bail!("profile input not found: {}", input.display());
     }
-    let inferred_nsight = args.profile.is_dir().then(|| args.profile.join("nsight"));
-    let nsight_dir = args.nsight_dir.as_deref().or(inferred_nsight.as_deref());
-    trace_cli::run_view(&trace, &args.output, nsight_dir)
-        .with_context(|| format!("render HTML from {}", trace.display()))?;
+    trace_cli::run_view(&input, &args.output, args.nsight_dir.as_deref())
+        .with_context(|| format!("render HTML from {}", input.display()))?;
     eprintln!("wrote {}", args.output.display());
     Ok(())
 }

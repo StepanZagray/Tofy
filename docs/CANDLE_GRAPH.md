@@ -4,8 +4,9 @@ Legacy training targets one configurable, one-based representative optimizer upd
 (`--profile-update`, default `2`, after one warm-up update). Foundation-v2 accepts a unique,
 one-based `profile_updates` list and publishes one independent bundle for every selected optimizer
 update; instrumentation is inactive on all other updates. A resume reconciles complete bundles
-whose publication marker missed the checkpoint and fails closed when a completed selected update
-has no complete bundle.
+through candle-graph's deep bundle verification and planned-capture identity. If publication beat
+the trainer checkpoint, `CaptureRun::begin` returns `AlreadyPublished`; Tofy records the update and
+continues. A completed selected update with no publishable bundle still fails closed.
 
 ## Artifact bundle
 
@@ -13,92 +14,100 @@ Every completed or paused run publishes `OUTPUT/evidence_manifest.json`
 (`tofy/p2/evidence/1`) as the run-level entry point. It records comparison invariants and treatment,
 terminal state, source/binary provenance, a digest of ordered gradient-pressure samples, and
 SHA-256/byte-length bindings for the exported model, exact resume checkpoint, config, report, and
-immutable representative trace. Run-owned paths are relative, so the bundle remains relocatable.
-The manifest excludes itself and excludes derived profile reports and optional Nsight output,
-because the Nsight wrapper can regenerate those after training; they remain reproducible from the
-bound trace and explicitly listed profile paths in `train_report.json`.
+immutable representative evidence. Run-owned paths are relative, so the bundle remains relocatable.
+The manifest excludes itself; Foundation-v2 binds every file in each finalized candle-graph bundle,
+while the legacy structured profile field retains its trace binding.
 
 Foundation-v2 also appends one record per optimizer update to `OUTPUT/loss_log.jsonl`. Each line
 contains the update number, every realized foundation-v2 loss scalar, pre-clip gradient norm,
 gradient clip scale, and the WSD learning rate used for that update. The writer is buffered and
 durably flushed with every checkpoint and when training exits.
 
-The default update 2 profile publishes atomically under:
+At training start Tofy writes the preregistered plan as
+`OUTPUT/profile/campaign.json` (`candle-graph/campaign/1`). The default update 2 capture is then
+published atomically under:
 
 ```text
-OUTPUT/profile/update-000000000002/
-├── application.jsonl   # candle-graph/trace/10
-├── evidence.json       # candle-graph/evidence/4
-├── EVIDENCE.md         # bounded repair/research handoff
-├── viewer.html         # Evidence + Trace + Span costs + Memory + GPU
-└── nsight/             # optional raw .nsys-rep, CSV reports, status
+OUTPUT/profile/
+├── campaign.json       # candle-graph/campaign/1
+└── update-000000000002/
+    ├── bundle.json     # candle-graph/bundle/1 content manifest
+    ├── trace.jsonl     # current trace schema; query `candle-graph protocol`
+    ├── evidence.json   # candle-graph/evidence/4
+    ├── report.md       # bounded evidence report
+    ├── viewer.html     # Evidence + Trace + Span costs + Memory + GPU
+    └── nsight/         # present only when official Nsight inputs were supplied
 ```
 
 `train_report.json` and resumable trainer state carry the legacy structured `profile` status plus
 Foundation-v2's ordered published-bundle list. Every published bundle forces a durable checkpoint;
-on resume, a complete bundle whose publication marker missed that checkpoint is reconciled before
-capture selection. A preregistered completed update with no complete bundle still fails closed.
-Its trace contains ordinary tensor metadata and numerical `tensor_stats` for each Foundation-v2
-loss scalar and the `out_y`, current/predicted canonical, and copy-gate-logit mechanism seams.
+on resume, `CaptureRun`/`reconcile_published_bundle` verifies bundle content and capture identity
+before repairing bookkeeping. Tofy does not write evidence files, probe for a pair of expected
+files, or rename profile directories itself. A caught profiled-step error calls `publish_failed`,
+leaving a verified diagnostic bundle that `campaign-status` reports as `failed_run`.
+
+The trace contains labelled tensor metadata and GPU-reduced `tensor_stats` only for the four
+mechanism seams: `seam/out_y`, `seam/current_canonical`, `seam/predicted_canonical`, and
+`seam/gate_logits`. Loss terms, pre-clip gradient norm, clip scale/flag, learning rate, current EP
+weight, and gate-cadence copy-bypass alpha are recorded with `record_scalar` from values already on
+the host. These scalar events share the tensor-statistics plane without launching reduction kernels
+or adding readbacks. `GradientCapturePlan` binds a complete exact manifest to the recorded
+`world`, `observers`, `exact_decoder`, and `auxiliary_decoders` families; the root states whether
+the capture is `vb/pre_clip` or `vb/post_clip`.
 
 The root measured region is device-synchronized once before and once after the complete update.
 Generation, staging, forward, backward, gradient inspection, optimizer, and metrics retain typed
 semantic spans; the trace therefore uses `timing_mode=host` and records
 `measured_region_device_synchronized=true`, rather than overstating every nested duration as
 synchronized. This flag is derived from the resolved Candle device, not from its display label.
-Nsight supplies kernel durations. Gradient norms use one batched device read. Batch frames, loss storage, and every
-parameter gradient are captured. Tensor metadata is not misrepresented as allocation lifetime.
+Nsight supplies kernel durations when retained in the bundle. The capture contract declares the
+instrumented update as `profiled_work`, labelled-subset tensor coverage, and complete gradient
+coverage. Operations, logical/physical allocation lifetime, and device intervals remain honestly
+declared unavailable because Tofy does not record those planes. Tensor metadata is not misrepresented as
+allocation lifetime.
 
 ## Agent workflow
 
-Start with the run manifest, then the bounded packet—not raw JSONL:
+Bind to the installed protocol first, then inspect the run manifest and bounded bundle overview:
 
 ```bash
+cargo candle-graph protocol
 sed -n '1,240p' runs/p2/example/evidence_manifest.json
-sed -n '1,220p' runs/p2/example/profile/update-000000000002/EVIDENCE.md
-cargo candle-graph summary runs/p2/example/profile/update-000000000002/application.jsonl
-cargo candle-graph query runs/p2/example/profile/update-000000000002/application.jsonl --kind gradients
-cargo candle-graph query runs/p2/example/profile/update-000000000002/application.jsonl --kind tensors
+cargo candle-graph overview runs/p2/example/profile/update-000000000002
+cargo candle-graph campaign-status \
+  --manifest runs/p2/example/profile/campaign.json
+cargo candle-graph query runs/p2/example/profile/update-000000000002 --kind gradients
+cargo candle-graph query runs/p2/example/profile/update-000000000002 \
+  --kind tensor-stats --label-prefix loss/
+cargo candle-graph series \
+  --manifest runs/p2/example/profile/campaign.json --label-prefix loss/
 ```
 
 Compare an explicit baseline:
 
 ```bash
 cargo candle-graph compare \
-  runs/p2/baseline/profile/update-000000000002/application.jsonl \
-  runs/p2/candidate/profile/update-000000000002/application.jsonl
+  --baseline runs/p2/baseline/profile/update-000000000002 \
+  --candidate runs/p2/candidate/profile/update-000000000002
 ```
 
 ## Human workflow
 
-Open the already-published `viewer.html`, or regenerate with a baseline/Nsight directory:
+Open the already-published `viewer.html`, or regenerate from the verified bundle to a path outside
+that immutable bundle:
 
 ```bash
 cargo p2-view runs/p2/example/profile/update-000000000002 \
-  --baseline runs/p2/baseline/profile/update-000000000002/application.jsonl \
-  --output runs/p2/example/profile/update-000000000002/viewer.html
+  --output /tmp/tofy-update-2-viewer.html
 ```
 
 ## Optional Nsight capture
 
-Use the wrapper; normal training succeeds when Nsight is absent or fails in `auto` mode:
-
-```bash
-P2_NSYS=auto P2_PROFILE_UPDATE=2 scripts/p2_profile_nsys.sh runs/p2/example -- \
-  cargo run --release --features cudnn,profiling -- p2-train \
-  --device cuda --output-dir runs/p2/example --profile-update 2 ...
-```
-
-The wrapper retains `.nsys-rep`, exports official CSV reports, and regenerates the same
-`evidence.json`, `EVIDENCE.md`, and `viewer.html`. Candle and NVTX use exact labels such as
+`CaptureRun::with_nsight_dir` is the supported publication seam for a flat directory of official
+Nsight artifacts; it binds those files into `bundle.json` before atomic publication. Do not mutate
+or regenerate files inside an already-published bundle. Candle and NVTX use exact labels such as
 `tofy.p2/update-000000000002/forward`, allowing `nvtx_gpu_proj_trace` to connect semantic phases to
 GPU work. Global kernel/runtime summaries remain explicitly global.
-
-`P2_NSYS=off|auto|require`: `auto` never changes the training command's exit status and reruns
-normally if the profiler ends without a child result; `require` fails when Nsight evidence cannot
-be produced. A previously published representative bundle bypasses capture on resume. Nsight
-augmentation is assembled beside the published bundle and exchanged atomically only after JSON,
-Markdown, and HTML all succeed.
 
 ## Full-update capacity gate
 
