@@ -40,6 +40,17 @@ pub struct ParsedActionInput {
     pub reasoning: Option<Value>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RecordedDecisionObservation {
+    pub game_id: String,
+    pub guid: String,
+    pub frame: ArcFrame,
+    pub state: String,
+    pub levels_completed: u16,
+    pub win_levels: u16,
+    pub available_actions: Vec<u8>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LineEnvelope {
     timestamp: String,
@@ -421,6 +432,52 @@ pub fn import_recordings_dir(root: &Path) -> Result<Vec<TransitionSample>> {
         all.extend(events_to_transitions(&events)?);
     }
     Ok(all)
+}
+
+/// First non-terminal candidate-scoring observation for every recorded game.
+/// The deterministic file/event order matches the offline importer.
+pub fn first_recorded_decision_observations(
+    root: &Path,
+) -> Result<Vec<RecordedDecisionObservation>> {
+    let mut observations = std::collections::BTreeMap::new();
+    for events in load_recordings_dir(root)? {
+        for event in events {
+            if observations.contains_key(&event.game_id)
+                || event.state != "NOT_FINISHED"
+                || event.available_actions.is_empty()
+            {
+                continue;
+            }
+            let available_actions = event
+                .available_actions
+                .iter()
+                .map(|value| {
+                    let value =
+                        u8::try_from(*value).context("recorded action id does not fit u8")?;
+                    ensure!(
+                        (1..=7).contains(&value),
+                        "recorded available action {value} is outside 1..=7"
+                    );
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            observations.insert(
+                event.game_id.clone(),
+                RecordedDecisionObservation {
+                    game_id: event.game_id,
+                    guid: event.guid,
+                    frame: event.frame,
+                    state: event.state,
+                    levels_completed: u16::try_from(event.levels_completed)
+                        .context("recorded levels_completed does not fit u16")?,
+                    win_levels: u16::try_from(event.win_levels)
+                        .context("recorded win_levels does not fit u16")?,
+                    available_actions,
+                },
+            );
+        }
+    }
+    Ok(observations.into_values().collect())
 }
 
 /// Parse each sorted recording file once and derive both transfer samples and

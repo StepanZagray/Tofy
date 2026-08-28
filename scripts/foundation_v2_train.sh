@@ -46,10 +46,13 @@ fi
   --train-config "$RUN_DIR/config.json" \
   --physical-batch 64 --synthetic-episodes 64 --ptrm-k 1,2,4,8 \
   --seed 1000002 --iid-seed 1000003 \
+  --profile-eval true \
   --output "$RUN_DIR/eval_report.json"
 
 "$BIN" p2-arc3-live-eval \
   --device "$DEVICE" \
   --checkpoint "$CHECKPOINT" \
   --train-config "$RUN_DIR/config.json" \
+  --recordings-dir "$RUN_DIR/recordings" \
+  --profile-eval true \
   --output "$RUN_DIR/arc3_live_report.json"

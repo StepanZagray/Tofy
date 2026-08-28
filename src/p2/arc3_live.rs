@@ -6,6 +6,11 @@
 
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::agent_session::AgentSession;
+use crate::p2::arc3::{first_recorded_decision_observations, ParsedActionInput, RecordingEvent};
+use crate::p2::cg_profile::{
+    ensure_eval_profile_campaign, EvalCaptureSpec, RepresentativeUpdateCapture,
+    ARC3_PROFILE_ENTRYPOINT,
+};
 use crate::p2::data::{palette, ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::eval::load_model;
 use crate::p2::model::{
@@ -18,6 +23,7 @@ use crate::p2::rhae::{
 use crate::p2::train::{frames_to_indices, load_train_config, resolve_device};
 use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
+use candle_graph::{ExecutionStep, PlannedCapture, SpanKind};
 use candle_nn::ops;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -29,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -67,6 +73,8 @@ pub struct LiveEvalConfig {
     pub request_timeout_secs: u64,
     pub driver: LiveDriverOptions,
     pub output: PathBuf,
+    pub recordings_dir: PathBuf,
+    pub profile_eval: bool,
 }
 
 impl LiveEvalConfig {
@@ -91,6 +99,10 @@ impl LiveEvalConfig {
         ensure!(
             !self.api_key_env.trim().is_empty(),
             "api_key_env must not be empty"
+        );
+        ensure!(
+            !self.recordings_dir.as_os_str().is_empty(),
+            "recordings_dir must not be empty"
         );
         self.driver.validate()?;
         Ok(())
@@ -231,6 +243,244 @@ impl ArcObservation {
     fn terminal(&self) -> bool {
         self.state != "NOT_FINISHED" || self.won()
     }
+}
+
+#[derive(Debug)]
+struct PendingRecordingEvent {
+    parsed: RecordingEvent,
+    frame_layers: Vec<ArcFrame>,
+}
+
+#[derive(Debug)]
+struct LiveRecordingRun {
+    final_path: PathBuf,
+    events: Vec<PendingRecordingEvent>,
+}
+
+impl LiveRecordingRun {
+    fn start(root: &Path, observation: &ArcObservation) -> Result<Self> {
+        let game = recording_component(&observation.game_id);
+        let session = if observation.guid.is_empty() {
+            format!("run-{}", unix_ms())
+        } else {
+            recording_component(&observation.guid)
+        };
+        let final_path = root.join(game).join(format!("{session}.jsonl"));
+        ensure!(
+            !final_path.exists(),
+            "refusing to overwrite live recording {}",
+            final_path.display()
+        );
+        let mut run = Self {
+            final_path,
+            events: Vec::new(),
+        };
+        run.push(observation, Some(reset_recording_action()))?;
+        Ok(run)
+    }
+
+    fn push_reset(&mut self, observation: &ArcObservation) -> Result<()> {
+        self.push(observation, Some(reset_recording_action()))
+    }
+
+    fn push_action(
+        &mut self,
+        observation: &ArcObservation,
+        action: &ArcAction,
+        reasoning: &Value,
+    ) -> Result<()> {
+        self.push(
+            observation,
+            Some(ParsedActionInput {
+                action: action.clone(),
+                is_reset: false,
+                reasoning: Some(reasoning.clone()),
+            }),
+        )
+    }
+
+    fn push(
+        &mut self,
+        observation: &ArcObservation,
+        action: Option<ParsedActionInput>,
+    ) -> Result<()> {
+        observation.validate()?;
+        let frame_layers = if observation.animation.is_empty() {
+            vec![observation.frame.clone()]
+        } else {
+            observation.animation.clone()
+        };
+        self.events.push(PendingRecordingEvent {
+            parsed: RecordingEvent {
+                timestamp: unix_ms().to_string(),
+                game_id: observation.game_id.clone(),
+                state: observation.state.clone(),
+                levels_completed: i64::from(observation.levels_completed),
+                win_levels: i64::from(observation.win_levels),
+                action,
+                guid: observation.guid.clone(),
+                full_reset: observation.full_reset,
+                available_actions: observation
+                    .available_actions
+                    .iter()
+                    .map(|value| i64::from(*value))
+                    .collect(),
+                frame: observation.frame.clone(),
+                source_path: self.final_path.clone(),
+                line: self.events.len() + 1,
+            },
+            frame_layers,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn parsed_events(&self) -> Vec<RecordingEvent> {
+        self.events
+            .iter()
+            .map(|event| event.parsed.clone())
+            .collect()
+    }
+
+    fn finish(self) -> Result<PathBuf> {
+        let parent = self
+            .final_path
+            .parent()
+            .context("live recording path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        ensure!(
+            !self.final_path.exists(),
+            "refusing to overwrite live recording {}",
+            self.final_path.display()
+        );
+        let temporary = parent.join(format!(
+            ".{}.tmp-{}-{}",
+            self.final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("recording.jsonl"),
+            std::process::id(),
+            unix_ms()
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .with_context(|| format!("create {}", temporary.display()))?;
+            for event in &self.events {
+                serde_json::to_writer(&mut file, &recording_envelope(event))
+                    .with_context(|| format!("serialize {}", temporary.display()))?;
+                file.write_all(b"\n")
+                    .with_context(|| format!("write {}", temporary.display()))?;
+            }
+            file.flush()
+                .with_context(|| format!("flush {}", temporary.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", temporary.display()))?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        fs::rename(&temporary, &self.final_path).with_context(|| {
+            format!(
+                "rename {} -> {}",
+                temporary.display(),
+                self.final_path.display()
+            )
+        })?;
+        fs::File::open(parent)
+            .with_context(|| format!("open {} for sync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync {}", parent.display()))?;
+        Ok(self.final_path)
+    }
+}
+
+fn reset_recording_action() -> ParsedActionInput {
+    ParsedActionInput {
+        action: ArcAction {
+            id: 1,
+            x: None,
+            y: None,
+        },
+        is_reset: true,
+        reasoning: None,
+    }
+}
+
+fn recording_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        "unnamed".into()
+    } else {
+        sanitized
+    }
+}
+
+fn frame_layers_json(layers: &[ArcFrame]) -> Value {
+    Value::Array(
+        layers
+            .iter()
+            .map(|frame| {
+                Value::Array(
+                    frame
+                        .pixels
+                        .chunks(frame.width as usize)
+                        .map(|row| Value::Array(row.iter().map(|pixel| json!(pixel)).collect()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn recording_action_json(action: &ParsedActionInput) -> Value {
+    if action.is_reset {
+        return json!({ "id": "RESET", "data": {} });
+    }
+    let mut data = json!({});
+    if action.action.id == 6 {
+        data["x"] = json!(action.action.x);
+        data["y"] = json!(action.action.y);
+    }
+    let mut value = json!({
+        "id": format!("ACTION{}", action.action.id),
+        "data": data,
+    });
+    if let Some(reasoning) = &action.reasoning {
+        value["reasoning"] = reasoning.clone();
+    }
+    value
+}
+
+fn recording_envelope(pending: &PendingRecordingEvent) -> Value {
+    let event = &pending.parsed;
+    json!({
+        "timestamp": event.timestamp,
+        "data": {
+            "game_id": event.game_id,
+            "state": event.state,
+            "levels_completed": event.levels_completed,
+            "win_levels": event.win_levels,
+            "action_input": event.action.as_ref().map(recording_action_json),
+            "guid": event.guid,
+            "full_reset": event.full_reset,
+            "available_actions": event.available_actions,
+            "frame": frame_layers_json(&pending.frame_layers),
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -724,6 +974,11 @@ pub struct ActionDecision {
 pub trait LivePolicy {
     fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision>;
 
+    /// Register the fixed public-game population before any scorecard action.
+    fn on_suite_start(&mut self, _games: &[PublicGame]) -> Result<()> {
+        Ok(())
+    }
+
     /// Fires after the session-opening RESET of a game succeeds.
     fn on_game_start(&mut self, _game_id: &str) {}
 
@@ -747,6 +1002,29 @@ pub struct ModelPolicy<'a> {
     action6_grid_stride: usize,
     tried_penalty: f64,
     tried: BTreeMap<u64, BTreeSet<String>>,
+    profile: Option<Arc3ProfileCampaign>,
+}
+
+struct Arc3ProfileCampaign {
+    profile_dir: PathBuf,
+    campaign_id: String,
+    device: String,
+    captures: BTreeMap<String, (u64, String)>,
+    started: BTreeSet<String>,
+}
+
+fn arc3_profile_phase<T>(
+    profile: Option<&RepresentativeUpdateCapture>,
+    device: &Device,
+    name: &str,
+    kind: SpanKind,
+    step: Option<ExecutionStep>,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match profile {
+        Some(profile) => profile.synchronized_phase(device, name, kind, step, f),
+        None => f(),
+    }
 }
 
 // TODO(ADR 0003 §7): replace this confidence/effect ranking only when the
@@ -769,71 +1047,184 @@ impl<'a> ModelPolicy<'a> {
             action6_grid_stride,
             tried_penalty,
             tried: BTreeMap::new(),
+            profile: None,
         }
+    }
+
+    pub fn enable_eval_profile(&mut self, output_dir: &Path, campaign_id: String, device: &str) {
+        self.profile = Some(Arc3ProfileCampaign {
+            profile_dir: output_dir.join("profile"),
+            campaign_id,
+            device: device.into(),
+            captures: BTreeMap::new(),
+            started: BTreeSet::new(),
+        });
+    }
+
+    fn prepare_profile_campaign(&mut self, games: &[PublicGame]) -> Result<()> {
+        let Some(profile) = self.profile.as_mut() else {
+            return Ok(());
+        };
+        let captures = games
+            .iter()
+            .enumerate()
+            .map(|(index, game)| {
+                (
+                    game.game_id.clone(),
+                    (
+                        index as u64 + 1,
+                        format!("arc3-{}", recording_component(&game.game_id)),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            captures.len() == games.len(),
+            "ARC profile plan contains duplicate game ids"
+        );
+        ensure_eval_profile_campaign(
+            &profile.profile_dir,
+            "arc3-campaign.json",
+            profile.campaign_id.clone(),
+            ARC3_PROFILE_ENTRYPOINT,
+            captures
+                .values()
+                .map(|(capture_step, bundle)| PlannedCapture {
+                    capture_step: *capture_step,
+                    bundle: bundle.clone(),
+                })
+                .collect(),
+        )?;
+        profile.captures = captures;
+        Ok(())
+    }
+
+    fn begin_decision_profile(
+        &mut self,
+        game_id: &str,
+        candidate_count: usize,
+    ) -> Result<Option<RepresentativeUpdateCapture>> {
+        let Some(profile) = self.profile.as_mut() else {
+            return Ok(None);
+        };
+        if !profile.started.insert(game_id.into()) {
+            return Ok(None);
+        }
+        let (capture_step, bundle) = profile
+            .captures
+            .get(game_id)
+            .with_context(|| format!("ARC profile game {game_id} was not preregistered"))?;
+        let destination = profile.profile_dir.join(bundle);
+        RepresentativeUpdateCapture::begin_eval(EvalCaptureSpec {
+            destination: &destination,
+            capture_step: *capture_step,
+            entrypoint: ARC3_PROFILE_ENTRYPOINT,
+            correlation_id: format!("tofy.p2/arc3-{}", recording_component(game_id)),
+            device: &profile.device,
+            required_phases: &["encode", "forward", "decode", "metrics"],
+            tags: &[
+                ("game_id", game_id.into()),
+                ("candidate_count", candidate_count.to_string()),
+                ("physical_batch", self.physical_batch.to_string()),
+            ],
+        })
+        .map(Some)
     }
 
     fn score_candidates(
         &self,
         frame: &ArcFrame,
         candidates: &[ArcAction],
+        profile: Option<&RepresentativeUpdateCapture>,
     ) -> Result<Vec<ActionScore>> {
-        let frames = frames_to_indices(std::slice::from_ref(frame), self.device)?;
-        let encoded = self.model.encode_state(&frames)?;
+        let (frames, encoded) = arc3_profile_phase(
+            profile,
+            self.device,
+            "encode",
+            SpanKind::Module,
+            None,
+            || {
+                let frames = frames_to_indices(std::slice::from_ref(frame), self.device)?;
+                let encoded = self.model.encode_state(&frames)?;
+                Ok((frames, encoded))
+            },
+        )?;
         let (_, channels, height, width) = encoded.dims4()?;
         let mut scores = Vec::with_capacity(candidates.len());
-        for chunk in candidates.chunks(self.physical_batch) {
+        for (chunk_index, chunk) in candidates.chunks(self.physical_batch).enumerate() {
             let n = chunk.len();
-            let actions = Tensor::from_vec(
-                chunk.iter().map(|a| u32::from(a.id)).collect::<Vec<_>>(),
-                n,
+            let selected_profile = (chunk_index == 0).then_some(profile).flatten();
+            let (output, state) = arc3_profile_phase(
+                selected_profile,
                 self.device,
+                "forward",
+                SpanKind::Module,
+                Some(ExecutionStep::Forward),
+                || {
+                    let actions = Tensor::from_vec(
+                        chunk.iter().map(|a| u32::from(a.id)).collect::<Vec<_>>(),
+                        n,
+                        self.device,
+                    )?;
+                    let coords = Tensor::from_vec(
+                        chunk
+                            .iter()
+                            .flat_map(|a| {
+                                [
+                                    a.x.map_or(0.0, |x| f32::from(x) / 63.0),
+                                    a.y.map_or(0.0, |y| f32::from(y) / 63.0),
+                                ]
+                            })
+                            .collect::<Vec<_>>(),
+                        (n, 2),
+                        self.device,
+                    )?;
+                    // The all-zero goal is in-distribution because
+                    // foundation-v2 applies goal dropout during training.
+                    let goals = Tensor::zeros((n, GOAL_FEATURES_DIM), DType::F32, self.device)?;
+                    let operator_conditioning = unknown_operator_conditioning(n, self.device)?;
+                    let state = encoded.broadcast_as((n, channels, height, width))?;
+                    let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
+                    let output = self
+                        .model
+                        .forward_from_encoded_state_with_operator_conditioning(
+                            &state,
+                            &frame_batch,
+                            &actions,
+                            &coords,
+                            &goals,
+                            &operator_conditioning,
+                            RecursionDepth::from_config(self.model.config()),
+                            0.0,
+                            None,
+                            RecursionOpts::EVAL,
+                        )?;
+                    Ok((output, state))
+                },
             )?;
-            let coords = Tensor::from_vec(
-                chunk
-                    .iter()
-                    .flat_map(|a| {
-                        [
-                            a.x.map_or(0.0, |x| f32::from(x) / 63.0),
-                            a.y.map_or(0.0, |y| f32::from(y) / 63.0),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
-                (n, 2),
+            let (q, reliability, noop, effect) = arc3_profile_phase(
+                selected_profile,
                 self.device,
+                "decode",
+                SpanKind::Module,
+                None,
+                || {
+                    Ok((
+                        ops::sigmoid(&output.q_logit)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        ops::sigmoid(&output.reliability_logit)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                        latent_mse_per_sample(&output.y, &state)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                    ))
+                },
             )?;
-            // Foundation-v2 applies 30% goal dropout during training. The live
-            // goal-free query is therefore deliberately the in-distribution
-            // all-zero vector, not a fabricated hidden-goal guess.
-            let goals = Tensor::zeros((n, GOAL_FEATURES_DIM), DType::F32, self.device)?;
-            let operator_conditioning = unknown_operator_conditioning(n, self.device)?;
-            let state = encoded.broadcast_as((n, channels, height, width))?;
-            let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
-            let output = self
-                .model
-                .forward_from_encoded_state_with_operator_conditioning(
-                    &state,
-                    &frame_batch,
-                    &actions,
-                    &coords,
-                    &goals,
-                    &operator_conditioning,
-                    RecursionDepth::from_config(self.model.config()),
-                    0.0,
-                    None,
-                    RecursionOpts::EVAL,
-                )?;
-            let q = ops::sigmoid(&output.q_logit)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let reliability = ops::sigmoid(&output.reliability_logit)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let noop = ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let effect = latent_mse_per_sample(&output.y, &state)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
             for index in 0..n {
                 let effect_scaled = f64::from(effect[index]).max(0.0);
                 let effect_unit = effect_scaled / (1.0 + effect_scaled);
@@ -867,7 +1258,12 @@ impl LivePolicy for ModelPolicy<'_> {
             self.action6_max_candidates,
             self.action6_grid_stride,
         )?;
-        let mut scores = self.score_candidates(&observation.frame, &candidates)?;
+        let mut profile = self.begin_decision_profile(&observation.game_id, candidates.len())?;
+        let measurement = profile
+            .as_ref()
+            .and_then(RepresentativeUpdateCapture::measurement);
+        let mut scores =
+            self.score_candidates(&observation.frame, &candidates, profile.as_ref())?;
         let hash = observation_hash(observation);
         let tried = self.tried.entry(hash).or_default();
         apply_tried_penalty(&mut scores, tried, self.tried_penalty);
@@ -883,10 +1279,45 @@ impl LivePolicy for ModelPolicy<'_> {
             .cloned()
             .context("policy generated no action candidates")?;
         tried.insert(action_key(&chosen.action));
-        Ok(ActionDecision {
+        let decision = ActionDecision {
             chosen,
             candidate_count: candidates.len(),
-        })
+        };
+        if let Some(capture) = profile.as_ref() {
+            let metrics = capture.phase("metrics", SpanKind::Function, None);
+            let span_id = metrics.as_ref().and_then(|range| range.span_id());
+            capture.record_scalar(span_id, "arc3/chosen_score", decision.chosen.score)?;
+            capture.record_scalar(
+                span_id,
+                "arc3/chosen_q_probability",
+                decision.chosen.q_probability,
+            )?;
+            capture.record_scalar(
+                span_id,
+                "arc3/chosen_reliability_probability",
+                decision.chosen.reliability_probability,
+            )?;
+            capture.record_scalar(
+                span_id,
+                "arc3/chosen_noop_probability",
+                decision.chosen.noop_probability,
+            )?;
+            capture.record_scalar(
+                span_id,
+                "arc3/chosen_predicted_effect",
+                decision.chosen.predicted_effect,
+            )?;
+            drop(metrics);
+        }
+        drop(measurement);
+        if let Some(capture) = profile.take() {
+            capture.finish()?;
+        }
+        Ok(decision)
+    }
+
+    fn on_suite_start(&mut self, games: &[PublicGame]) -> Result<()> {
+        self.prepare_profile_campaign(games)
     }
 
     fn on_game_start(&mut self, _game_id: &str) {
@@ -1219,6 +1650,7 @@ pub struct LiveRunSettings {
     pub build_profile: String,
     pub cli_args: Vec<String>,
     pub evidence_class: String,
+    pub recordings_dir: Option<PathBuf>,
 }
 
 /// Evidence class at scorecard-open time. A clean worktree earns only
@@ -1253,6 +1685,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     discovered.sort_by(|a, b| a.game_id.cmp(&b.game_id));
     ensure!(!discovered.is_empty(), "ARC API returned no public games");
     let selected = select_games(&discovered, &settings.requested_games)?;
+    policy.on_suite_start(&selected)?;
     let evaluating_all = settings.requested_games.is_empty() && selected.len() == discovered.len();
     let metadata = json!({
         "tags": ["tofy", "p2", "held-out", "live-eval"],
@@ -1267,6 +1700,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
     });
     let card_id = api.open_scorecard(&metadata)?;
     let mut game_reports = Vec::with_capacity(selected.len());
+    let mut recording_failure = None;
 
     for game in &selected {
         let started = Instant::now();
@@ -1281,11 +1715,28 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         let mut full_reset_detected = false;
         let mut level_usage = BTreeMap::<u16, LiveLevelUsage>::new();
         let mut action_since_reset_or_transition = false;
+        let mut recording = None;
         let mut last = match api.reset(&game.game_id, &card_id, None) {
             Ok(observation) => {
                 agent_session.observe(&observation)?;
                 policy.on_game_start(&game.game_id);
-                Some(observation)
+                match settings
+                    .recordings_dir
+                    .as_deref()
+                    .map(|root| LiveRecordingRun::start(root, &observation))
+                    .transpose()
+                {
+                    Ok(started) => {
+                        recording = started;
+                        Some(observation)
+                    }
+                    Err(err) => {
+                        error = Some(format!("recording: {err:#}"));
+                        stop_reason = "recording_error".into();
+                        recording_failure = Some(err);
+                        None
+                    }
+                }
             }
             Err(MutationError::Ambiguous(mutation)) => {
                 error = Some(mutation.to_string());
@@ -1357,6 +1808,15 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                             break;
                         }
                     };
+                if let Some(recording) = recording.as_mut() {
+                    if let Err(err) = recording.push_reset(&retry) {
+                        error = Some(format!("recording retry RESET: {err:#}"));
+                        stop_reason = "recording_error".into();
+                        recording_failure = Some(err);
+                        last = Some(retry);
+                        break;
+                    }
+                }
                 if retry.full_reset || retry.levels_completed != level_before {
                     full_reset_detected = retry.full_reset;
                     error = Some(format!(
@@ -1457,6 +1917,16 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                     break;
                 }
             };
+            if let Some(recording) = recording.as_mut() {
+                if let Err(err) = recording.push_action(&next, &decision.chosen.action, &reasoning)
+                {
+                    error = Some(format!("recording ACTION response: {err:#}"));
+                    stop_reason = "recording_error".into();
+                    recording_failure = Some(err);
+                    last = Some(next);
+                    break;
+                }
+            }
             if next.levels_completed < observation.levels_completed {
                 mutation_attempts.push(MutationAttempt {
                     index: attempt_index,
@@ -1545,6 +2015,13 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             attempted_actions == mutation_attempts.len() && confirmed_actions == trace.len(),
             "action totals do not reconcile with the mutation ledger"
         );
+        if let Some(recording) = recording {
+            if let Err(err) = recording.finish() {
+                error = Some(format!("persist recording: {err:#}"));
+                stop_reason = "recording_error".into();
+                recording_failure = Some(err);
+            }
+        }
         policy.on_game_end(&stop_reason);
         game_reports.push(LiveGameReport {
             game_id: game.game_id.clone(),
@@ -1566,12 +2043,18 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             level_usage: level_usage.into_values().collect(),
             agent_session,
         });
+        if recording_failure.is_some() {
+            break;
+        }
     }
 
     let (scorecard, scorecard_close_error) = match api.close_scorecard(&card_id) {
         Ok(card) => (Some(card), None),
         Err(err) => (None, Some(format!("{err:#}"))),
     };
+    if let Some(error) = recording_failure {
+        return Err(error).context("live ARC recording persistence failed");
+    }
     let (official_scorecard, official_scorecard_parse_error) = match scorecard.as_ref() {
         Some(card) => match benchmark_from_scorecard_str(&card.to_string()) {
             Ok(benchmark) => (Some(benchmark), None),
@@ -1685,6 +2168,18 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         config.action6_grid_stride,
         config.driver.tried_penalty,
     );
+    if config.profile_eval {
+        let output_dir = config
+            .output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        policy.enable_eval_profile(
+            output_dir,
+            format!("tofy.p2.arc3.{checkpoint_sha256}"),
+            &config.device,
+        );
+    }
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -1706,10 +2201,76 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         build_profile: provenance.build_profile,
         cli_args: provenance.cli_args,
         evidence_class: live_evidence_class(&config.driver).into(),
+        recordings_dir: Some(config.recordings_dir.clone()),
     };
     let report = run_public_suite(&mut api, &mut policy, &settings)?;
     write_json_atomic(&config.output, &report)?;
     Ok(report)
+}
+
+pub fn profile_recorded_decisions(
+    checkpoint: &Path,
+    train_config_path: &Path,
+    device_name: &str,
+    recordings_dir: &Path,
+    report_output: &Path,
+    physical_batch: usize,
+) -> Result<()> {
+    let train_config = load_train_config(train_config_path)?;
+    let _gpu_guard = if device_name == "cuda" || device_name.starts_with("cuda:") {
+        Some(GpuSessionGuard::acquire(&train_config.output_dir)?)
+    } else {
+        None
+    };
+    let device = resolve_device(device_name)?;
+    let (model, _varmap) = load_model(&train_config, checkpoint, &device)?;
+    let observations = first_recorded_decision_observations(recordings_dir)?;
+    ensure!(
+        !observations.is_empty(),
+        "ARC recordings contain no non-terminal observations with available actions to profile"
+    );
+    let games = observations
+        .iter()
+        .map(|observation| PublicGame {
+            game_id: observation.game_id.clone(),
+            title: observation.game_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let output_dir = report_output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut policy = ModelPolicy::new(
+        &model,
+        &device,
+        physical_batch,
+        128,
+        8,
+        DEFAULT_TRIED_PENALTY,
+    );
+    policy.enable_eval_profile(
+        output_dir,
+        format!("tofy.p2.arc3.{}", sha256_file(checkpoint)?),
+        device_name,
+    );
+    policy.on_suite_start(&games)?;
+    for recorded in observations {
+        let observation = ArcObservation {
+            game_id: recorded.game_id.clone(),
+            guid: recorded.guid,
+            frame: recorded.frame,
+            animation: Vec::new(),
+            full_reset: false,
+            state: recorded.state,
+            levels_completed: recorded.levels_completed,
+            win_levels: recorded.win_levels,
+            available_actions: recorded.available_actions,
+        };
+        policy.on_game_start(&recorded.game_id);
+        policy.choose_action(&observation)?;
+        policy.on_game_end("offline_replay_profiled");
+    }
+    Ok(())
 }
 
 struct LiveRunProvenance {
@@ -2301,6 +2862,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn model_policy_publishes_one_profile_bundle_per_game() -> Result<()> {
+        use crate::p2::model::ModelConfig;
+        use candle_nn::{VarBuilder, VarMap};
+
+        let root =
+            std::env::temp_dir().join(format!("tofy-arc3-decision-profile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 1,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            config,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+        policy.enable_eval_profile(&root, "tofy.p2.arc3.test".into(), "cpu");
+        policy.on_suite_start(&[PublicGame {
+            game_id: "demo".into(),
+            title: "Demo".into(),
+        }])?;
+        policy.choose_action(&observation("demo", "NOT_FINISHED", vec![1, 2, 6]))?;
+
+        let bundle = root.join("profile/arc3-demo");
+        candle_graph::verify_bundle(&bundle)?;
+        let trace = candle_graph::parse_trace(bundle.join("trace.jsonl"))?;
+        for label in [
+            "arc3/chosen_q_probability",
+            "arc3/chosen_reliability_probability",
+            "arc3/chosen_noop_probability",
+            "arc3/chosen_predicted_effect",
+        ] {
+            assert!(trace.tensor_stats.iter().any(|event| event.label == label));
+        }
+        let status = candle_graph::campaign_status(&root.join("profile/arc3-campaign.json"))?;
+        assert_eq!(status.published, 1);
+        assert_eq!(status.missing, 0);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     struct FirstPolicy;
 
     impl LivePolicy for FirstPolicy {
@@ -2438,7 +3047,54 @@ mod tests {
             build_profile: "test".into(),
             cli_args: vec!["p2-arc3-live-eval".into()],
             evidence_class,
+            recordings_dir: None,
         }
+    }
+
+    #[test]
+    fn live_recording_round_trips_through_offline_importer() -> Result<()> {
+        use crate::p2::arc3::{events_to_transitions, import_recordings_dir};
+
+        let root = std::env::temp_dir().join(format!(
+            "tofy-arc3-live-recording-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mut after_action = scripted_observation("NOT_FINISHED", 0);
+        after_action.frame.pixels[0] = 3;
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        win.frame.pixels[1] = 4;
+
+        let mut recording = LiveRecordingRun::start(&root, &opening)?;
+        recording.push_action(
+            &after_action,
+            &ArcAction::new(6, Some(3), Some(4))?,
+            &json!({
+                "q_probability": 0.7,
+                "reliability_probability": 0.8,
+                "noop_probability": 0.1,
+                "predicted_effect": 0.5,
+            }),
+        )?;
+        recording.push_action(
+            &win,
+            &ArcAction::new(1, None, None)?,
+            &json!({ "q_probability": 0.9 }),
+        )?;
+        let direct = events_to_transitions(&recording.parsed_events())?;
+        let path = recording.finish()?;
+        let imported = import_recordings_dir(&root)?;
+        assert_eq!(imported, direct);
+        assert_eq!(path, root.join("game/guid-game.jsonl"));
+        let jsonl = fs::read_to_string(&path)?;
+        assert!(jsonl.contains("ACTION6"));
+        assert!(jsonl.contains("q_probability"));
+        assert!(!jsonl.contains("API_KEY"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

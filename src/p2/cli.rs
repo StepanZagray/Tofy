@@ -612,6 +612,10 @@ pub struct P2EvalArgs {
     /// Evaluation graph: complete, representation-only, or rollout-only.
     #[arg(long, value_enum, default_value_t = EvalMode::Full)]
     pub eval_mode: EvalMode,
+
+    /// Publish one representative candle-graph evaluation bundle.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub profile_eval: bool,
 }
 
 impl P2EvalArgs {
@@ -634,6 +638,7 @@ impl P2EvalArgs {
             ensemble_members: self.ensemble_members,
             mode: self.eval_mode,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
+            profile_eval: self.profile_eval,
         }
     }
 }
@@ -719,6 +724,10 @@ pub struct P2Arc3EvalArgs {
 
     #[arg(long, default_value = "runs/p2/smoke/arc3_eval_report.json")]
     pub output: PathBuf,
+
+    /// Publish one representative candle-graph decision bundle per recorded game.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub profile_eval: bool,
 }
 
 impl P2Arc3EvalArgs {
@@ -741,6 +750,7 @@ impl P2Arc3EvalArgs {
             ensemble_members: 8,
             mode: EvalMode::Full,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
+            profile_eval: self.profile_eval,
         }
     }
 }
@@ -830,6 +840,14 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, default_value = "runs/p2/arc3_live_report.json")]
     pub output: PathBuf,
 
+    /// Recording root; defaults to `<output parent>/recordings`.
+    #[arg(long)]
+    pub recordings_dir: Option<PathBuf>,
+
+    /// Publish one representative candle-graph decision bundle per game.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub profile_eval: bool,
+
     /// Authenticate and list public games without opening a scorecard or loading a checkpoint.
     #[arg(long, default_value_t = false)]
     pub list_only: bool,
@@ -837,6 +855,10 @@ pub struct P2Arc3LiveEvalArgs {
 
 impl P2Arc3LiveEvalArgs {
     pub fn to_config(&self) -> LiveEvalConfig {
+        let output_parent = self
+            .output
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         LiveEvalConfig {
             checkpoint: self.checkpoint.clone(),
             train_config: self.train_config.clone(),
@@ -857,6 +879,11 @@ impl P2Arc3LiveEvalArgs {
                 exploratory: self.exploratory,
             },
             output: self.output.clone(),
+            recordings_dir: self
+                .recordings_dir
+                .clone()
+                .unwrap_or_else(|| output_parent.join("recordings")),
+            profile_eval: self.profile_eval,
         }
     }
 }

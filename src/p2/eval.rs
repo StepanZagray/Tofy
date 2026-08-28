@@ -7,6 +7,10 @@ use crate::p2::board_probe::{
     BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
 };
 use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
+use crate::p2::cg_profile::{
+    ensure_eval_profile_campaign, EvalCaptureSpec, RepresentativeUpdateCapture,
+    EVAL_PROFILE_ENTRYPOINT,
+};
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum,
     generate_factual_branch_group, generate_hazard_one_step, palette, ArcAction, BranchGroup,
@@ -41,6 +45,7 @@ use crate::p2::train::{
 };
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, Var, D};
+use candle_graph::{ExecutionStep, PlannedCapture, SpanKind};
 use candle_nn::{ops, VarBuilder, VarMap};
 use clap::ValueEnum;
 use rand::Rng;
@@ -147,6 +152,10 @@ pub struct EvalConfig {
     pub mode: EvalMode,
     #[serde(default = "default_representation_row_cap")]
     pub representation_row_cap: usize,
+    /// Publish representative candle-graph inference evidence. CLI defaults
+    /// this on; the serde/default path stays off for legacy embedded configs.
+    #[serde(default)]
+    pub profile_eval: bool,
 }
 
 fn default_ensemble_members() -> usize {
@@ -181,6 +190,7 @@ impl Default for EvalConfig {
             ensemble_members: 8,
             mode: default_eval_mode(),
             representation_row_cap: default_representation_row_cap(),
+            profile_eval: false,
         }
     }
 }
@@ -2502,6 +2512,7 @@ fn foundation_v2_v5_holdout_gates(
     cfg: &EvalConfig,
     train_seed: u64,
     device: &Device,
+    profile: Option<&RepresentativeUpdateCapture>,
 ) -> Result<(
     BTreeMap<String, GateSupportMetrics>,
     Vec<TransitionSample>,
@@ -2560,12 +2571,14 @@ fn foundation_v2_v5_holdout_gates(
             .iter()
             .map(|sample| sample.provenance.clone())
             .collect::<Vec<_>>();
-        let metrics = evaluate_gate_support_with_v5_provenance(
+        let metrics = evaluate_gate_support_impl(
             model,
             &samples,
-            &masks,
-            &provenance,
+            Some(&masks),
+            Some(&provenance),
             device,
+            None,
+            if lane == 0 { profile } else { None },
         )?;
         if lane == 0 {
             ablation_population = Some((samples.clone(), masks.clone(), provenance.clone()));
@@ -2747,6 +2760,20 @@ fn encode_gate_support_population(
     })
 }
 
+fn eval_profile_phase<T>(
+    profile: Option<&RepresentativeUpdateCapture>,
+    device: &Device,
+    name: &str,
+    kind: SpanKind,
+    step: Option<ExecutionStep>,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match profile {
+        Some(profile) => profile.synchronized_phase(device, name, kind, step, f),
+        None => f(),
+    }
+}
+
 /// Foundation-v2 gate evaluation with the exact V5 content-mask sidecar.
 /// Legacy callers may use [`evaluate_gate_support`], whose origin-aligned
 /// fallback is valid for the non-translated curriculum rows it accepts.
@@ -2756,7 +2783,7 @@ pub fn evaluate_gate_support_with_content_masks(
     content_masks: Option<&[ContentMask]>,
     device: &Device,
 ) -> Result<GateSupportMetrics> {
-    evaluate_gate_support_impl(model, samples, content_masks, None, device, None)
+    evaluate_gate_support_impl(model, samples, content_masks, None, device, None, None)
 }
 
 /// Foundation-v2 gate evaluation with the exact V5 operator provenance needed
@@ -2775,6 +2802,7 @@ pub fn evaluate_gate_support_with_v5_provenance(
         Some(provenance),
         device,
         None,
+        None,
     )
 }
 
@@ -2785,6 +2813,7 @@ fn evaluate_gate_support_impl(
     provenance: Option<&[V5SampleProvenance]>,
     device: &Device,
     encoded: Option<&EncodedGateSupportPopulation>,
+    profile: Option<&RepresentativeUpdateCapture>,
 ) -> Result<GateSupportMetrics> {
     if content_masks.is_some_and(|masks| masks.len() != samples.len()) {
         bail!("gate content-mask rows do not match the sample count");
@@ -2834,38 +2863,78 @@ fn evaluate_gate_support_impl(
     if !model.config().world_core_v4 {
         bail!("foundation-v2 gate support requires the exact gameplay decoder");
     }
+    let measurement = profile.and_then(RepresentativeUpdateCapture::measurement);
     let owned_encoded;
     let encoded = if let Some(encoded) = encoded {
         encoded
     } else {
-        owned_encoded = encode_gate_support_population(model, samples, provenance, device)?;
+        owned_encoded =
+            eval_profile_phase(profile, device, "encode", SpanKind::Module, None, || {
+                encode_gate_support_population(model, samples, provenance, device)
+            })?;
         &owned_encoded
     };
-    let prediction = model
-        .forward_from_latent_with_operator_conditioning(
-            &encoded.current,
-            &encoded.batch.actions,
-            &encoded.batch.action_coords,
-            &encoded.batch.goals,
-            &encoded.batch.operator_conditioning,
-        )?
-        .y;
     let shuffled_action_eligible_rows = encoded.shuffled.eligible_rows;
     let shuffled_action_changed_tuples = encoded.shuffled.changed_tuples(samples);
     let shuffled_action_outcome_changing = encoded.shuffled.outcome_changing(samples);
-    let shuffled_action_outcome_changing_tuples =
-        encoded.shuffled.outcome_changing_tuples(samples);
-    let shuffled_prediction = model
-        .forward_from_latent_with_operator_conditioning(
-            &encoded.current,
-            &encoded.shuffled_actions,
-            &encoded.shuffled_coords,
-            &encoded.batch.goals,
-            &encoded.batch.operator_conditioning,
-        )?
-        .y;
-    let learned_errors = per_sample_mse(&prediction, &encoded.target)?;
-    let copy_errors = per_sample_mse(&encoded.current, &encoded.target)?;
+    let shuffled_action_outcome_changing_tuples = encoded.shuffled.outcome_changing_tuples(samples);
+    let (prediction, shuffled_prediction) = eval_profile_phase(
+        profile,
+        device,
+        "forward",
+        SpanKind::Module,
+        Some(ExecutionStep::Forward),
+        || {
+            let prediction = model
+                .forward_from_latent_with_operator_conditioning(
+                    &encoded.current,
+                    &encoded.batch.actions,
+                    &encoded.batch.action_coords,
+                    &encoded.batch.goals,
+                    &encoded.batch.operator_conditioning,
+                )?
+                .y;
+            let shuffled_prediction = model
+                .forward_from_latent_with_operator_conditioning(
+                    &encoded.current,
+                    &encoded.shuffled_actions,
+                    &encoded.shuffled_coords,
+                    &encoded.batch.goals,
+                    &encoded.batch.operator_conditioning,
+                )?
+                .y;
+            Ok((prediction, shuffled_prediction))
+        },
+    )?;
+    let (
+        learned_errors,
+        copy_errors,
+        true_predictions,
+        composed_predictions,
+        shuffled_predictions,
+        target_reconstructions,
+    ) = eval_profile_phase(profile, device, "decode", SpanKind::Module, None, || {
+        let learned_errors = per_sample_mse(&prediction, &encoded.target)?;
+        let copy_errors = per_sample_mse(&encoded.current, &encoded.target)?;
+        let true_predictions = exact_palette_predictions(model, &prediction)?;
+        let composed_predictions = model
+            .composed_gameplay_decode(&prediction, &encoded.batch.frames)?
+            .reshape((samples.len(), (FRAME_SIDE - 1) * FRAME_SIDE))?
+            .to_dtype(DType::U8)?
+            .to_vec2::<u8>()?;
+        let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
+        let target_reconstructions = exact_palette_predictions(model, &encoded.target)?;
+        Ok((
+            learned_errors,
+            copy_errors,
+            true_predictions,
+            composed_predictions,
+            shuffled_predictions,
+            target_reconstructions,
+        ))
+    })?;
+    let metrics_range =
+        profile.and_then(|profile| profile.phase("metrics", SpanKind::Function, None));
     let changed_indices = samples
         .iter()
         .enumerate()
@@ -2879,14 +2948,6 @@ fn evaluate_gate_support_impl(
         .iter()
         .map(|index| copy_errors[*index])
         .collect::<Vec<_>>();
-    let true_predictions = exact_palette_predictions(model, &prediction)?;
-    let composed_predictions = model
-        .composed_gameplay_decode(&prediction, &encoded.batch.frames)?
-        .reshape((samples.len(), (FRAME_SIDE - 1) * FRAME_SIDE))?
-        .to_dtype(DType::U8)?
-        .to_vec2::<u8>()?;
-    let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
-    let target_reconstructions = exact_palette_predictions(model, &encoded.target)?;
     let changed_pixels = samples
         .iter()
         .filter(|sample| is_board_changed_transition(sample))
@@ -2905,7 +2966,7 @@ fn evaluate_gate_support_impl(
                 .count()
         })
         .sum();
-    Ok(GateSupportMetrics {
+    let metrics = GateSupportMetrics {
         samples: samples.len(),
         population_fingerprint,
         content_mask_fingerprint,
@@ -2963,7 +3024,53 @@ fn evaluate_gate_support_impl(
         } else {
             "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use provenance-origin rectangle reconstruction; action tuples use the maximum-change cyclic shuffle within provenance.source_kind, with ACTION6 rectangle-relative coordinates conjugated onto each target content rectangle; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without V5 operator provenance and rows retain the historical tuple-difference ratio behavior; one encode batch plus true/shuffled forwards".into()
         },
-    })
+    };
+    if let Some(profile) = profile {
+        let span_id = metrics_range.as_ref().and_then(|range| range.span_id());
+        let scalar = |label: &str, value: Option<f64>| -> Result<()> {
+            if let Some(value) = value {
+                profile.record_scalar(span_id, label, value)?;
+            }
+            Ok(())
+        };
+        scalar("eval/changed_exact", metrics.one_step_changed_exact)?;
+        scalar("eval/full_exact_composed", metrics.one_step_full_exact)?;
+        scalar("eval/full_exact_raw", metrics.one_step_raw_full_exact)?;
+        scalar(
+            "eval/changed_exact_composed",
+            metrics.one_step_composed_changed_exact,
+        )?;
+        scalar(
+            "eval/all_rows_exact_composed",
+            metrics.one_step_all_rows_exact,
+        )?;
+        scalar("eval/false_edit_rate", metrics.false_edit_rate)?;
+        scalar(
+            "eval/padding_false_edit_rate",
+            metrics.padding_false_edit_rate,
+        )?;
+        scalar("eval/raw_false_edit_rate", metrics.raw_false_edit_rate)?;
+        scalar(
+            "eval/raw_padding_false_edit_rate",
+            metrics.raw_padding_false_edit_rate,
+        )?;
+        scalar(
+            "eval/shuffled_action_changed_pixel_ratio",
+            metrics.shuffled_action_changed_pixel_ratio,
+        )?;
+        scalar(
+            "eval/foreground_reconstruction_accuracy",
+            metrics.foreground_reconstruction_accuracy,
+        )?;
+        profile.record_scalar(
+            span_id,
+            "eval/foreground_pixels",
+            metrics.foreground_pixels as f64,
+        )?;
+    }
+    drop(metrics_range);
+    drop(measurement);
+    Ok(metrics)
 }
 
 fn ablation_metrics(metrics: &GateSupportMetrics) -> AblationMetrics {
@@ -3054,6 +3161,7 @@ pub fn evaluate_mechanism_ablations(
             provenance,
             device,
             encoded.as_ref(),
+            None,
         )
     };
     let baseline_gate = evaluate_variant(model)?;
@@ -6477,8 +6585,55 @@ fn evaluate_factual_branches(
     Ok(metrics)
 }
 
+fn begin_gate_eval_profile(
+    cfg: &EvalConfig,
+    train_cfg: &TrainConfig,
+) -> Result<Option<RepresentativeUpdateCapture>> {
+    if !cfg.profile_eval
+        || cfg.mode != EvalMode::Full
+        || train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FoundationV2
+    {
+        return Ok(None);
+    }
+    let output_dir = cfg
+        .output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let profile_dir = output_dir.join("profile");
+    let bundle_name = "eval-000000000001";
+    ensure_eval_profile_campaign(
+        &profile_dir,
+        "eval-campaign.json",
+        format!("tofy.p2.eval.{}", file_sha256(&cfg.checkpoint)?),
+        EVAL_PROFILE_ENTRYPOINT,
+        vec![PlannedCapture {
+            capture_step: 1,
+            bundle: bundle_name.into(),
+        }],
+    )?;
+    let destination = profile_dir.join(bundle_name);
+    RepresentativeUpdateCapture::begin_eval(EvalCaptureSpec {
+        destination: &destination,
+        capture_step: 1,
+        entrypoint: EVAL_PROFILE_ENTRYPOINT,
+        correlation_id: "tofy.p2/eval-000000000001".into(),
+        device: &cfg.device,
+        required_phases: &["encode", "forward", "decode", "metrics"],
+        tags: &[
+            ("population", "v5_unseen_seed_7x7".into()),
+            ("physical_batch", "512".into()),
+        ],
+    })
+    .map(Some)
+}
+
 /// Full evaluation: synthetic held-out (+ optional ARC recordings dir).
 pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
+    evaluate_impl(cfg, true)
+}
+
+fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalReport> {
     let evaluation_started = Instant::now();
     cfg.validate()?;
     let train_cfg = load_train_config(&cfg.train_config)?;
@@ -6862,14 +7017,28 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
         .as_ref()
         .and_then(official_rhae_from_benchmark);
 
+    let mut eval_profile = if allow_gate_profile {
+        begin_gate_eval_profile(cfg, &train_cfg)?
+    } else {
+        None
+    };
     let foundation_holdout = (cfg.mode == EvalMode::Full
         && train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2)
         .then(|| {
             timed_eval_phase("population_generation", "v5_holdout_gates", || {
-                foundation_v2_v5_holdout_gates(&model, cfg, train_cfg.seed, &device)
+                foundation_v2_v5_holdout_gates(
+                    &model,
+                    cfg,
+                    train_cfg.seed,
+                    &device,
+                    eval_profile.as_ref(),
+                )
             })
         })
         .transpose()?;
+    if let Some(profile) = eval_profile.take() {
+        profile.finish()?;
+    }
     let (v5_holdout_gates, mechanism_ablations) = if let Some((
         gates,
         samples,
@@ -7002,7 +7171,20 @@ pub fn evaluate_arc3(cfg: &EvalConfig) -> Result<EvalReport> {
     if cfg.arc_recordings_dir.is_none() {
         bail!("p2-arc3-eval requires --arc-recordings-dir");
     }
-    evaluate(cfg)
+    let report = evaluate_impl(cfg, false)?;
+    if cfg.profile_eval {
+        crate::p2::arc3_live::profile_recorded_decisions(
+            &cfg.checkpoint,
+            &cfg.train_config,
+            &cfg.device,
+            cfg.arc_recordings_dir
+                .as_deref()
+                .expect("recordings path checked above"),
+            &cfg.output,
+            cfg.physical_batch,
+        )?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -7196,6 +7378,100 @@ mod tests {
         assert_eq!(partial.q_labels.len(), samples.len());
         assert!(partial.ptrm_acc.is_empty());
         assert!(partial.matched_acc.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn gate_support_profile_publishes_eval_bundle_and_scalars() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("tofy-p2-gate-eval-profile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let device = Device::Cpu;
+        let mut train_cfg = TrainConfig::default();
+        train_cfg.apply_foundation_v2_recipe();
+        train_cfg.hidden_dim = 8;
+        train_cfg.action_dim = 4;
+        train_cfg.inner_steps = 1;
+        train_cfg.outer_steps = 1;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            train_cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 32,
+                seed: 0xE7A1_0006,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::UnseenSeed7x7,
+        )?;
+        let samples = mixed.transitions().cloned().collect::<Vec<_>>();
+        let masks = mixed
+            .samples()
+            .iter()
+            .map(|sample| sample.content_mask.clone())
+            .collect::<Vec<_>>();
+        let provenance = mixed
+            .samples()
+            .iter()
+            .map(|sample| sample.provenance.clone())
+            .collect::<Vec<_>>();
+        let profile_dir = root.join("profile");
+        ensure_eval_profile_campaign(
+            &profile_dir,
+            "eval-campaign.json",
+            "tofy.p2.eval.test".into(),
+            EVAL_PROFILE_ENTRYPOINT,
+            vec![PlannedCapture {
+                capture_step: 1,
+                bundle: "eval-000000000001".into(),
+            }],
+        )?;
+        let destination = profile_dir.join("eval-000000000001");
+        let capture = RepresentativeUpdateCapture::begin_eval(EvalCaptureSpec {
+            destination: &destination,
+            capture_step: 1,
+            entrypoint: EVAL_PROFILE_ENTRYPOINT,
+            correlation_id: "tofy.p2/eval-000000000001".into(),
+            device: "cpu",
+            required_phases: &["encode", "forward", "decode", "metrics"],
+            tags: &[("population", "test".into())],
+        })?;
+        evaluate_gate_support_impl(
+            &model,
+            &samples,
+            Some(&masks),
+            Some(&provenance),
+            &device,
+            None,
+            Some(&capture),
+        )?;
+        capture.finish()?;
+
+        candle_graph::verify_bundle(&destination)?;
+        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+        assert_eq!(trace.run.phase, candle_graph::ExecutionPhase::Infer);
+        assert_eq!(
+            trace.run.tags.get("phase").map(String::as_str),
+            Some("eval")
+        );
+        for phase in ["encode", "forward", "decode", "metrics"] {
+            let label = format!("tofy.p2/eval-000000000001/{phase}");
+            assert!(trace.spans.iter().any(|span| span.name == label));
+        }
+        assert!(trace
+            .tensor_stats
+            .iter()
+            .any(|event| event.label == "eval/foreground_pixels"));
+        let status = candle_graph::campaign_status(&profile_dir.join("eval-campaign.json"))?;
+        assert_eq!(status.published, 1);
+        assert_eq!(status.missing, 0);
+
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -8368,6 +8644,7 @@ mod tests {
             ensemble_members: 4,
             mode: EvalMode::Full,
             representation_row_cap: 7,
+            profile_eval: false,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);

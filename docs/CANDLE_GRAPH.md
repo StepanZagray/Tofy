@@ -66,6 +66,36 @@ coverage. Operations, logical/physical allocation lifetime, and device intervals
 declared unavailable because Tofy does not record those planes. Tensor metadata is not misrepresented as
 allocation lifetime.
 
+## Post-training evaluation capture
+
+`p2-eval`, `p2-arc3-eval`, and `p2-arc3-live-eval` enable evaluation profiling by default.
+Pass `--profile-eval false` to disable it. A full foundation-v2 `p2-eval` publishes the fixed
+unseen-seed V5 gate-support population pass under the report output directory:
+
+```text
+REPORT_PARENT/profile/
+├── eval-campaign.json
+└── eval-000000000001/
+```
+
+The capture has phase `infer`, tag `phase=eval`, and spans for encode, forward, decode, and host
+metric reduction. It records the changed/full/composed exactness variants, content and padding
+false-edit rates, shuffled-action ratio, and foreground metrics already computed by the evaluator.
+
+Both ARC evaluators capture only the first candidate-scoring forward for each game and publish
+`profile/arc3-<game_id>/` bundles listed by `profile/arc3-campaign.json`. The chosen action's score,
+Q probability, reliability probability, no-op probability, and predicted effect are scalar events.
+Later live decisions retain the uninstrumented pacing path. Live evaluation also writes replayable
+toolkit-schema JSONL atomically under `--recordings-dir`; when omitted, that directory defaults to
+`<report output parent>/recordings`.
+
+Inspect the evaluation campaigns with:
+
+```bash
+cargo candle-graph campaign-status --manifest RUN/profile/eval-campaign.json
+cargo candle-graph campaign-status --manifest RUN/profile/arc3-campaign.json
+```
+
 ## Agent workflow
 
 Bind to the installed protocol first, then inspect the run manifest and bounded bundle overview:

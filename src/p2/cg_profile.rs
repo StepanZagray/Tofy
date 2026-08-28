@@ -4,19 +4,22 @@ use anyhow::{Context, Result};
 use candle_core::{backprop::GradStore, Device, Tensor};
 use candle_graph::candle::{self, CandleCapture, GradientCapturePlan};
 use candle_graph::{
-    reconcile_published_bundle, CaptureBegin, CaptureContract, CaptureRun, CoverageLevel,
-    ExecutionStep, GradientFamilyContract, MeasurementScope, ProfileRun, PublicationReceipt,
-    SpanId, SpanKind,
+    reconcile_published_bundle, CampaignManifest, CaptureBegin, CaptureContract, CaptureRun,
+    CoverageLevel, ExecutionStep, GradientFamilyContract, MeasurementScope, PlannedCapture,
+    ProfileRun, PublicationReceipt, SpanId, SpanKind, CAMPAIGN_SCHEMA,
 };
 use candle_nn::VarMap;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::perf::NvtxRange;
 
 pub(crate) const PROFILE_ENTRYPOINT: &str = "tofy::p2::train::optimizer_update";
+pub(crate) const EVAL_PROFILE_ENTRYPOINT: &str = "tofy::p2::eval::gate_support_forward";
+pub(crate) const ARC3_PROFILE_ENTRYPOINT: &str = "tofy::p2::arc3::decision_forward";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientClipState {
@@ -57,6 +60,8 @@ pub struct RepresentativeUpdateCapture {
     gradient_plan: Option<GradientCapturePlan>,
     update: Option<u64>,
     correlation_id: String,
+    incomplete_reason: &'static str,
+    panic_reason: &'static str,
     failure_reason: RefCell<Option<String>>,
 }
 
@@ -81,6 +86,16 @@ pub struct CaptureSpec<'a> {
     pub precision: &'a str,
     pub varmap: &'a VarMap,
     pub gradient_clip_state: GradientClipState,
+}
+
+pub struct EvalCaptureSpec<'a> {
+    pub destination: &'a Path,
+    pub capture_step: u64,
+    pub entrypoint: &'a str,
+    pub correlation_id: String,
+    pub device: &'a str,
+    pub required_phases: &'a [&'a str],
+    pub tags: &'a [(&'a str, String)],
 }
 
 impl RepresentativeUpdateCapture {
@@ -164,6 +179,8 @@ impl RepresentativeUpdateCapture {
                 gradient_plan: None,
                 update: Some(update),
                 correlation_id,
+                incomplete_reason: "training step exited before profile publication",
+                panic_reason: "training step panicked before profile publication",
                 failure_reason: RefCell::new(None),
             }),
             CaptureBegin::Active(capture) => Ok(Self {
@@ -172,6 +189,87 @@ impl RepresentativeUpdateCapture {
                 gradient_plan: Some(gradient_plan),
                 update: Some(update),
                 correlation_id,
+                incomplete_reason: "training step exited before profile publication",
+                panic_reason: "training step panicked before profile publication",
+                failure_reason: RefCell::new(None),
+            }),
+        }
+    }
+
+    pub fn begin_eval(spec: EvalCaptureSpec<'_>) -> Result<Self> {
+        let required_semantic_labels = std::iter::once(spec.correlation_id.clone())
+            .chain(
+                spec.required_phases
+                    .iter()
+                    .map(|phase| format!("{}/{}", spec.correlation_id, phase)),
+            )
+            .collect::<Vec<_>>();
+        let cpu_only_semantic_labels = spec
+            .required_phases
+            .iter()
+            .filter(|phase| **phase == "metrics")
+            .map(|phase| format!("{}/{}", spec.correlation_id, phase))
+            .collect::<Vec<_>>();
+        let cuda = spec.device == "cuda" || spec.device.starts_with("cuda:");
+        let gpu_expected_semantic_labels = if !cuda {
+            Vec::new()
+        } else {
+            required_semantic_labels
+                .iter()
+                .filter(|label| !cpu_only_semantic_labels.contains(label))
+                .cloned()
+                .collect()
+        };
+        let cpu_only_semantic_labels = if !cuda {
+            required_semantic_labels.clone()
+        } else {
+            cpu_only_semantic_labels
+        };
+        let contract = CaptureContract {
+            measurement_scope: MeasurementScope::ProfiledWork,
+            operations: CoverageLevel::None,
+            tensors: CoverageLevel::None,
+            gradients: CoverageLevel::None,
+            gradient_contract: None,
+            logical_memory: CoverageLevel::None,
+            physical_memory: CoverageLevel::None,
+            device_timing: CoverageLevel::None,
+            required_semantic_labels,
+            gpu_expected_semantic_labels,
+            cpu_only_semantic_labels,
+        };
+        let mut run = ProfileRun::inference(spec.entrypoint, spec.capture_step, spec.device)
+            .capture_contract(contract)
+            .correlation_id(spec.correlation_id.clone())
+            .tag("phase", "eval");
+        if cuda {
+            run = run.measured_region_device_synchronized();
+        }
+        for (key, value) in spec.tags {
+            run = run.tag(*key, value);
+        }
+        if let Ok(revision) = std::env::var("TOFY_SOURCE_REVISION") {
+            run = run.tag("source_revision", revision);
+        }
+        match CaptureRun::begin(spec.destination, run)? {
+            CaptureBegin::AlreadyPublished(receipt) => Ok(Self {
+                capture: None,
+                reconciled: Some(*receipt),
+                gradient_plan: None,
+                update: Some(spec.capture_step),
+                correlation_id: spec.correlation_id,
+                incomplete_reason: "evaluation exited before profile publication",
+                panic_reason: "evaluation panicked before profile publication",
+                failure_reason: RefCell::new(None),
+            }),
+            CaptureBegin::Active(capture) => Ok(Self {
+                capture: Some(capture),
+                reconciled: None,
+                gradient_plan: None,
+                update: Some(spec.capture_step),
+                correlation_id: spec.correlation_id,
+                incomplete_reason: "evaluation exited before profile publication",
+                panic_reason: "evaluation panicked before profile publication",
                 failure_reason: RefCell::new(None),
             }),
         }
@@ -184,6 +282,8 @@ impl RepresentativeUpdateCapture {
             gradient_plan: None,
             update: None,
             correlation_id: String::new(),
+            incomplete_reason: "inactive profile capture",
+            panic_reason: "inactive profile capture",
             failure_reason: RefCell::new(None),
         }
     }
@@ -370,13 +470,13 @@ impl Drop for RepresentativeUpdateCapture {
         let Some(capture) = self.capture.take() else {
             return;
         };
-        // Every `?` that exits a selected training step before `finish` reaches
-        // this guard, so caught step failures become verified failed bundles
-        // instead of unterminated staging traces.
+        // Every `?` that exits selected work before `finish` reaches this guard,
+        // so caught failures become verified failed bundles instead of
+        // unterminated staging traces.
         let fallback = if std::thread::panicking() {
-            "training step panicked before profile publication"
+            self.panic_reason
         } else {
-            "training step exited before profile publication"
+            self.incomplete_reason
         };
         let reason = self
             .failure_reason
@@ -387,6 +487,47 @@ impl Drop for RepresentativeUpdateCapture {
             tracing::error!("failed to publish diagnostic candle-graph bundle: {error:#}");
         }
     }
+}
+
+pub fn ensure_eval_profile_campaign(
+    profile_dir: &Path,
+    manifest_name: &str,
+    campaign_id: String,
+    entrypoint: &str,
+    planned: Vec<PlannedCapture>,
+) -> Result<()> {
+    let manifest = CampaignManifest {
+        schema: CAMPAIGN_SCHEMA.into(),
+        campaign_id,
+        entrypoint: entrypoint.into(),
+        planned,
+    };
+    manifest.validate()?;
+    fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
+    let path = profile_dir.join(manifest_name);
+    if path.exists() {
+        let existing = CampaignManifest::load(&path)?;
+        if existing != manifest {
+            anyhow::bail!(
+                "profile campaign manifest {} conflicts with the requested eval capture plan",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest).context("serialize eval profile campaign")?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes).with_context(|| format!("write {}", temporary.display()))?;
+    fs::File::open(&temporary)
+        .with_context(|| format!("open {} for sync", temporary.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("rename {} -> {}", temporary.display(), path.display()))?;
+    fs::File::open(profile_dir)
+        .with_context(|| format!("open {} for sync", profile_dir.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", profile_dir.display()))
 }
 
 pub fn reconcile_profile_bundle(
