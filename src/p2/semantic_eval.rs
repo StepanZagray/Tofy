@@ -1282,6 +1282,7 @@ mod tests {
             content_y: 0,
             source_kind: "operator_control".into(),
             trajectory_id: format!("test/operator_control/{episode_id}"),
+            operator: Some(operator),
         };
         let noop = current.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE]
             == next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE];
