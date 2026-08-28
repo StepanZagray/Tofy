@@ -116,7 +116,8 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// newer one; the resume contract carries this value without a serde default.
 /// 1 = pre-content-mask objective; 2 = 2026-08-27 content-masked objective
 /// with the reachable separation hinge and budget-exact EP controller;
-/// 3 = bounded split-CE amplification and conditioned displacement norm.
+/// 3 = bounded split-CE amplification, conditioned displacement norm, and the
+/// nonzero copy-bypass alpha init that reopens the candidate gradient path.
 pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 3;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -10933,21 +10934,31 @@ mod tests {
         }
         let checkpoint_state: TrainerState =
             read_json(&report.latest_checkpoint.join("trainer_state.json"))?;
-        assert_eq!(
-            checkpoint_state.active_sums,
-            foundation_v2_active_loss_means(
-                &checkpoint_state
-                    .foundation_v2
-                    .as_ref()
-                    .expect("foundation-v2 checkpoint state")
-                    .loss_sums,
-                checkpoint_state
-                    .foundation_v2
-                    .as_ref()
-                    .expect("foundation-v2 checkpoint state")
-                    .loss_steps,
-            )
+        // Compare field-wise with a 1-ulp-scale tolerance: the persisted
+        // means were divided from in-memory sums while this recomputation
+        // divides the JSON-round-tripped sums.
+        let expected_active = foundation_v2_active_loss_means(
+            &checkpoint_state
+                .foundation_v2
+                .as_ref()
+                .expect("foundation-v2 checkpoint state")
+                .loss_sums,
+            checkpoint_state
+                .foundation_v2
+                .as_ref()
+                .expect("foundation-v2 checkpoint state")
+                .loss_steps,
         );
+        let persisted = serde_json::to_value(&checkpoint_state.active_sums)?;
+        let expected = serde_json::to_value(&expected_active)?;
+        for (field, expected_value) in expected.as_object().expect("loss-means object") {
+            let a = persisted[field].as_f64().expect("numeric loss-mean field");
+            let b = expected_value.as_f64().expect("numeric loss-mean field");
+            assert!(
+                (a - b).abs() <= 1e-12 * b.abs().max(1.0),
+                "active_sums.{field} diverged: {a} vs {b}"
+            );
+        }
         assert_eq!(foundation.profile_bundles.len(), 1);
         let bundle = &foundation.profile_bundles[0];
         for name in ["application.jsonl", "evidence.json", "EVIDENCE.md"] {
