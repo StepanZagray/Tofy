@@ -45,10 +45,10 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
@@ -98,6 +98,21 @@ const FOUNDATION_V2_EP_GRADIENT_BUDGET: f64 = 0.3;
 const FOUNDATION_V2_GATE_EVERY: u64 = 1_024;
 const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
+const FOUNDATION_V2_ABORT_MARKER: &str = "foundation_v2_abort.json";
+const LEGACY_CHECKPOINT_ARTIFACTS: &[&str] = &[
+    "model.safetensors",
+    "optimizer.safetensors",
+    "trainer_state.json",
+    "config.json",
+];
+const FOUNDATION_V2_CHECKPOINT_ARTIFACTS: &[&str] = &[
+    "model.safetensors",
+    "optimizer.safetensors",
+    "trainer_state.json",
+    "config.json",
+    "ema.safetensors",
+    "gate_history.json",
+];
 pub(crate) const FOUNDATION_V2_GATE_SEED: u64 = 0xF0A2_DA7A_0000_0005;
 const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 16;
 /// ADR 0003 §3.5 hinge margin on the L2 distance of normalized displacements.
@@ -710,6 +725,10 @@ pub struct TrainConfig {
     pub output_dir: PathBuf,
     /// Optional complete checkpoint bundle (or run/checkpoints directory) to resume.
     pub resume: Option<PathBuf>,
+    /// Explicitly permit continuing a foundation-v2 run whose durable state
+    /// records a gate abort.
+    #[serde(default)]
+    pub resume_after_abort: bool,
     /// Explicitly migrate an equal-effective-batch physical/accumulation schedule.
     /// This is trajectory-changing and is recorded; it is never an exact resume.
     #[serde(default)]
@@ -974,6 +993,7 @@ fn sync_cuda_device(device: &Device) -> Result<()> {
 fn persist_train_config(cfg: &TrainConfig) -> TrainConfig {
     let mut persisted = cfg.clone();
     persisted.resume = None;
+    persisted.resume_after_abort = false;
     persisted.max_steps_this_run = None;
     persisted.allow_batch_schedule_migration = false;
     persisted
@@ -1008,6 +1028,7 @@ impl Default for TrainConfig {
             device: "cpu".into(),
             output_dir: PathBuf::from("runs/p2/smoke"),
             resume: None,
+            resume_after_abort: false,
             allow_batch_schedule_migration: false,
             checkpoint_every_steps: 100,
             max_steps_this_run: None,
@@ -1367,6 +1388,7 @@ impl TrainConfig {
         canonical.device = self.device.clone();
         canonical.output_dir = self.output_dir.clone();
         canonical.resume = self.resume.clone();
+        canonical.resume_after_abort = self.resume_after_abort;
         canonical.allow_batch_schedule_migration = self.allow_batch_schedule_migration;
         canonical.checkpoint_every_steps = self.checkpoint_every_steps;
         canonical.max_steps_this_run = self.max_steps_this_run;
@@ -2087,6 +2109,37 @@ fn foundation_v2_gate_population_identity(
     })
 }
 
+fn reconcile_foundation_v2_gate_population_identity(
+    foundation: &mut FoundationV2TrainerState,
+    identity: GatePopulationIdentity,
+) -> Result<()> {
+    match &foundation.gate_population_identity {
+        Some(stored)
+            if stored.rows_sha256 == identity.rows_sha256
+                && stored.masks_sha256 == identity.masks_sha256
+                && stored.policy_schema == FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA =>
+        {
+            // v3 changes only gate interpretation over metrics already
+            // serialized in v2 history, so this migration does not cross
+            // gate populations.
+            foundation.gate_population_identity = Some(identity);
+        }
+        Some(stored) if *stored != identity => bail!(
+            "resumed gate population/policy identity mismatch: stored {:?} vs regenerated {:?}; best/collapse comparisons would span incomparable populations",
+            stored,
+            identity
+        ),
+        Some(_) => {}
+        None if foundation.gate_history.is_empty() => {
+            foundation.gate_population_identity = Some(identity)
+        }
+        None => bail!(
+            "resumed checkpoint has foundation-v2 gate history but no gate population identity; refusing to compare promotions or collapse gates across an unknown population"
+        ),
+    }
+    Ok(())
+}
+
 fn default_training_population_hash() -> u64 {
     FNV1A64_OFFSET
 }
@@ -2210,6 +2263,13 @@ struct CheckpointBundleManifest {
     /// Hashes over named raw safetensor payloads. Comparing `world` between
     /// lesson-boundary bundles proves whether an observer-only stage moved it.
     parameter_groups: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FoundationV2AbortMarker {
+    schema: String,
+    global_step: u64,
+    checkpoint: PathBuf,
 }
 
 /// Map a lesson name to a `generate_curriculum` kind. Never ARC recordings.
@@ -5725,6 +5785,13 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
                 weights_tmp.display()
             )
         })?;
+        if cfg.recipe == TrainingRecipe::FoundationV2 {
+            let bundle = export
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("best EMA export has no bundle directory"))?;
+            verify_checkpoint_artifact_hash(bundle, "ema.safetensors", export)?;
+            verify_checkpoint_artifact_hash(bundle, "ema.safetensors", &weights_tmp)?;
+        }
     } else if bundle_weights.is_file() {
         fs::copy(&bundle_weights, &weights_tmp).with_context(|| {
             format!(
@@ -5741,6 +5808,7 @@ pub fn save_checkpoint(varmap: &VarMap, cfg: &TrainConfig, report: &TrainReport)
     File::open(&weights_tmp)?.sync_all()?;
     fs::rename(&weights_tmp, &weights)
         .with_context(|| format!("rename {} -> {}", weights_tmp.display(), weights.display()))?;
+    File::open(&cfg.output_dir)?.sync_all()?;
     write_json_atomic(
         &cfg.output_dir.join("config.json"),
         &persist_train_config(cfg),
@@ -5784,16 +5852,31 @@ fn foundation_v2_verified_best_export(
 ) -> Result<Option<PathBuf>> {
     let best_dir = cfg.output_dir.join("checkpoints/best");
     let ema = best_dir.join("ema.safetensors");
+    let expected_step = foundation_v2_selected_best_step(metric, gate_history);
     if !ema.is_file() {
+        if let Some(expected_step) = expected_step {
+            bail!(
+                "gate history selected checkpoint step {expected_step}, but {} is missing; refusing to fall back to latest EMA weights",
+                best_dir.display()
+            );
+        }
+        if best_dir.exists() {
+            bail!(
+                "{} exists without ema.safetensors; refusing an incomplete best checkpoint",
+                best_dir.display()
+            );
+        }
         return Ok(None);
     }
-    let Some(expected_step) = foundation_v2_selected_best_step(metric, gate_history) else {
+    let Some(expected_step) = expected_step else {
         bail!(
             "{} exists but this run's gate history has promoted no checkpoint; \
              refusing to export an unattributed best",
             best_dir.display()
         );
     };
+    verify_checkpoint_bundle(&best_dir)
+        .with_context(|| format!("verify selected best checkpoint {}", best_dir.display()))?;
     let bundle: BundleGlobalStep = read_json(&best_dir.join("trainer_state.json"))?;
     if bundle.global_step != expected_step {
         bail!(
@@ -5805,6 +5888,29 @@ fn foundation_v2_verified_best_export(
         );
     }
     Ok(Some(ema))
+}
+
+fn verify_checkpoint_artifact_hash(bundle: &Path, artifact: &str, path: &Path) -> Result<()> {
+    let manifest: CheckpointBundleManifest = read_json(&bundle.join("bundle-manifest.json"))?;
+    let expected = manifest
+        .artifacts
+        .iter()
+        .find(|entry| entry.path == artifact)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "checkpoint manifest {} does not bind {artifact}",
+                bundle.display()
+            )
+        })?;
+    let actual = sha256_file(path)?;
+    if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+        bail!(
+            "checkpoint artifact integrity mismatch for export {} against {}",
+            path.display(),
+            bundle.display()
+        );
+    }
+    Ok(())
 }
 
 fn export_checkpoint_path(cfg: &TrainConfig, state: &TrainerState) -> Option<PathBuf> {
@@ -5975,8 +6081,8 @@ fn batch_schedule_migration(
 }
 
 fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
-    let bundle = if path.join("trainer_state.json").is_file() {
-        path.to_path_buf()
+    let (bundle, latest) = if path.join("trainer_state.json").is_file() {
+        (path.to_path_buf(), None)
     } else {
         let latest_path = if path.is_file() {
             path.to_path_buf()
@@ -5997,7 +6103,20 @@ fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
         let parent = latest_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("latest checkpoint path has no parent"))?;
-        parent.join(latest.directory)
+        if latest.directory.contains('/') || latest.directory.contains('\\') {
+            bail!(
+                "latest checkpoint directory must be a plain child name: {}",
+                latest.directory
+            );
+        }
+        let mut components = Path::new(&latest.directory).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!(
+                "latest checkpoint directory must be a plain child name: {}",
+                latest.directory
+            );
+        }
+        (parent.join(&latest.directory), Some(latest))
     };
     if bundle
         .file_name()
@@ -6009,13 +6128,11 @@ fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
             bundle.display()
         );
     }
-    for required in [
-        "trainer_state.json",
-        "model.safetensors",
-        "optimizer.safetensors",
-        "config.json",
-        "bundle-manifest.json",
-    ] {
+    for required in checkpoint_required_artifacts(&bundle)?
+        .iter()
+        .copied()
+        .chain(["bundle-manifest.json"])
+    {
         if !bundle.join(required).is_file() {
             bail!(
                 "checkpoint bundle is incomplete (missing {required}): {}",
@@ -6024,7 +6141,33 @@ fn resolve_resume_checkpoint(path: &Path) -> Result<PathBuf> {
         }
     }
     verify_checkpoint_bundle(&bundle)?;
+    let state: BundleGlobalStep = read_json(&bundle.join("trainer_state.json"))?;
+    if let Some(latest) = latest {
+        if latest.global_step != state.global_step {
+            bail!(
+                "latest checkpoint step {} disagrees with restored trainer state step {} in {}",
+                latest.global_step,
+                state.global_step,
+                bundle.display()
+            );
+        }
+    }
     Ok(bundle)
+}
+
+fn checkpoint_required_artifacts(bundle: &Path) -> Result<&'static [&'static str]> {
+    #[derive(Deserialize)]
+    struct RecipeOnly {
+        #[serde(default)]
+        recipe: TrainingRecipe,
+    }
+
+    let config: RecipeOnly = read_json(&bundle.join("config.json"))?;
+    Ok(if config.recipe == TrainingRecipe::FoundationV2 {
+        FOUNDATION_V2_CHECKPOINT_ARTIFACTS
+    } else {
+        LEGACY_CHECKPOINT_ARTIFACTS
+    })
 }
 
 fn sha256_file(path: &Path) -> Result<CheckpointArtifactDigest> {
@@ -6144,10 +6287,33 @@ pub(crate) fn verify_checkpoint_bundle(bundle: &Path) -> Result<()> {
     if manifest.schema != "p2.checkpoint_bundle.v1" {
         bail!("unsupported checkpoint bundle schema {}", manifest.schema);
     }
+    let required = checkpoint_required_artifacts(bundle)?
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let mut declared = BTreeSet::new();
     for expected in &manifest.artifacts {
-        if expected.path.contains('/') || expected.path.contains('\\') || expected.path == "." {
+        let mut components = Path::new(&expected.path).components();
+        if expected.path.contains('/')
+            || expected.path.contains('\\')
+            || !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+        {
             bail!("unsafe checkpoint artifact path {}", expected.path);
         }
+        if !declared.insert(expected.path.clone()) {
+            bail!("duplicate checkpoint artifact path {}", expected.path);
+        }
+    }
+    if declared != required {
+        bail!(
+            "checkpoint manifest artifact set mismatch in {}: declared {:?}, required {:?}",
+            bundle.display(),
+            declared,
+            required
+        );
+    }
+    for expected in &manifest.artifacts {
         let actual = sha256_file(&bundle.join(&expected.path))?;
         if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
             bail!(
@@ -6155,6 +6321,15 @@ pub(crate) fn verify_checkpoint_bundle(bundle: &Path) -> Result<()> {
                 bundle.join(&expected.path).display()
             );
         }
+    }
+    let state: BundleGlobalStep = read_json(&bundle.join("trainer_state.json"))?;
+    if manifest.global_step != state.global_step {
+        bail!(
+            "checkpoint manifest step {} disagrees with trainer state step {} in {}",
+            manifest.global_step,
+            state.global_step,
+            bundle.display()
+        );
     }
     let actual_groups = model_parameter_group_hashes(&bundle.join("model.safetensors"))?;
     if actual_groups != manifest.parameter_groups {
@@ -6164,6 +6339,27 @@ pub(crate) fn verify_checkpoint_bundle(bundle: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn unused_checkpoint_sibling(parent: &Path, stem: &str) -> PathBuf {
+    for sequence in 0u64.. {
+        let candidate = parent.join(format!(".{stem}-{}-{sequence}", std::process::id()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u64 checkpoint sibling namespace exhausted")
+}
+
+fn write_latest_checkpoint(checkpoints: &Path, directory: String, global_step: u64) -> Result<()> {
+    write_json_atomic(
+        &checkpoints.join("latest.json"),
+        &LatestCheckpoint {
+            schema: TRAINER_STATE_SCHEMA.into(),
+            directory,
+            global_step,
+        },
+    )
 }
 
 fn save_training_checkpoint(
@@ -6180,20 +6376,44 @@ fn save_training_checkpoint(
     let directory = format!("step-{:012}", state.global_step);
     let final_dir = checkpoints.join(&directory);
     if final_dir.exists() {
-        let complete = final_dir.join("model.safetensors").is_file()
-            && final_dir.join("optimizer.safetensors").is_file()
-            && final_dir.join("trainer_state.json").is_file()
-            && (state.foundation_v2.is_none() || final_dir.join("ema.safetensors").is_file());
-        if complete {
-            bail!(
-                "refusing to overwrite existing checkpoint {}",
-                final_dir.display()
-            );
+        match verify_checkpoint_bundle(&final_dir) {
+            Ok(()) => {
+                let existing: BundleGlobalStep = read_json(&final_dir.join("trainer_state.json"))?;
+                if existing.global_step != state.global_step {
+                    bail!(
+                        "existing checkpoint {} holds step {}, expected {}",
+                        final_dir.display(),
+                        existing.global_step,
+                        state.global_step
+                    );
+                }
+                tracing::warn!(
+                    "adopting verified deterministic checkpoint {} and repairing latest.json",
+                    final_dir.display()
+                );
+                write_latest_checkpoint(&checkpoints, directory, state.global_step)?;
+                return Ok(final_dir);
+            }
+            Err(error) => {
+                let backup =
+                    unused_checkpoint_sibling(&checkpoints, &format!("{directory}.corrupt"));
+                fs::rename(&final_dir, &backup).with_context(|| {
+                    format!(
+                        "preserve corrupt checkpoint {} -> {}",
+                        final_dir.display(),
+                        backup.display()
+                    )
+                })?;
+                File::open(&checkpoints)?.sync_all()?;
+                tracing::warn!(
+                    "preserved unverifiable checkpoint {} at {} before replacement: {error:#}",
+                    final_dir.display(),
+                    backup.display()
+                );
+            }
         }
-        fs::remove_dir_all(&final_dir)
-            .with_context(|| format!("remove incomplete checkpoint {}", final_dir.display()))?;
     }
-    let staging = checkpoints.join(format!(".{directory}.tmp-{}", std::process::id()));
+    let staging = unused_checkpoint_sibling(&checkpoints, &format!("{directory}.tmp"));
     fs::create_dir(&staging).with_context(|| format!("create {}", staging.display()))?;
 
     let model_path = staging.join("model.safetensors");
@@ -6269,14 +6489,7 @@ fn save_training_checkpoint(
         )
     })?;
     File::open(&checkpoints)?.sync_all()?;
-    write_json_atomic(
-        &checkpoints.join("latest.json"),
-        &LatestCheckpoint {
-            schema: TRAINER_STATE_SCHEMA.into(),
-            directory,
-            global_step: state.global_step,
-        },
-    )?;
+    write_latest_checkpoint(&checkpoints, directory, state.global_step)?;
     Ok(final_dir)
 }
 
@@ -6409,56 +6622,245 @@ fn copy_checkpoint_bundle(source: &Path, destination: &Path) -> Result<()> {
         if !entry.file_type()?.is_file() {
             bail!("checkpoint bundle contains a non-file artifact");
         }
-        fs::copy(entry.path(), destination.join(entry.file_name())).with_context(|| {
+        let copied = destination.join(entry.file_name());
+        fs::copy(entry.path(), &copied).with_context(|| {
             format!(
                 "copy checkpoint artifact {} -> {}",
                 entry.path().display(),
                 destination.display()
             )
         })?;
+        File::open(&copied)
+            .with_context(|| format!("open copied artifact {} for sync", copied.display()))?
+            .sync_all()
+            .with_context(|| format!("sync copied artifact {}", copied.display()))?;
     }
+    File::open(destination)
+        .with_context(|| format!("open copied bundle {} for sync", destination.display()))?
+        .sync_all()
+        .with_context(|| format!("sync copied bundle {}", destination.display()))?;
     verify_checkpoint_bundle(destination)
 }
 
 fn publish_permanent_checkpoint(cfg: &TrainConfig, checkpoint: &Path) -> Result<PathBuf> {
-    let destination = cfg.output_dir.join("checkpoints/permanent").join(
-        checkpoint
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("checkpoint path has no directory name"))?,
-    );
+    verify_checkpoint_bundle(checkpoint)?;
+    let source_step = checkpoint_step(checkpoint)?;
+    let parent = cfg.output_dir.join("checkpoints/permanent");
+    fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+    let name = checkpoint
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint path has no directory name"))?;
+    let destination = parent.join(name);
     if destination.exists() {
-        verify_checkpoint_bundle(&destination)?;
-        return Ok(destination);
+        let existing = verify_checkpoint_bundle(&destination).and_then(|()| {
+            let destination_step = checkpoint_step(&destination)?;
+            if destination_step != source_step {
+                bail!(
+                    "permanent checkpoint {} holds step {destination_step}, expected {source_step}",
+                    destination.display()
+                );
+            }
+            Ok(())
+        });
+        match existing {
+            Ok(()) => return Ok(destination),
+            Err(error) => {
+                let backup = unused_checkpoint_sibling(
+                    &parent,
+                    &format!("{}.corrupt", name.to_string_lossy()),
+                );
+                fs::rename(&destination, &backup).with_context(|| {
+                    format!(
+                        "preserve corrupt permanent checkpoint {} -> {}",
+                        destination.display(),
+                        backup.display()
+                    )
+                })?;
+                File::open(&parent)?.sync_all()?;
+                tracing::warn!(
+                    "preserved unverifiable permanent checkpoint {} at {} before replacement: {error:#}",
+                    destination.display(),
+                    backup.display()
+                );
+            }
+        }
     }
-    copy_checkpoint_bundle(checkpoint, &destination)?;
+    let staging = unused_checkpoint_sibling(&parent, &format!("{}.tmp", name.to_string_lossy()));
+    copy_checkpoint_bundle(checkpoint, &staging)?;
+    fs::rename(&staging, &destination).with_context(|| {
+        format!(
+            "publish permanent checkpoint {} -> {}",
+            staging.display(),
+            destination.display()
+        )
+    })?;
+    File::open(&parent)?.sync_all()?;
+    verify_checkpoint_bundle(&destination)?;
     Ok(destination)
+}
+
+fn checkpoint_step(bundle: &Path) -> Result<u64> {
+    Ok(read_json::<BundleGlobalStep>(&bundle.join("trainer_state.json"))?.global_step)
+}
+
+fn checkpoint_step_directory(cfg: &TrainConfig, step: u64) -> PathBuf {
+    cfg.output_dir
+        .join("checkpoints")
+        .join(format!("step-{step:012}"))
+}
+
+fn recorded_permanent_destination(cfg: &TrainConfig, recorded: &Path) -> Result<PathBuf> {
+    let name = recorded
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("recorded permanent checkpoint has no UTF-8 directory name")
+        })?;
+    let step = name
+        .strip_prefix("step-")
+        .and_then(|step| (step.len() == 12).then_some(step))
+        .and_then(|step| step.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "recorded permanent checkpoint has invalid step directory {}",
+                recorded.display()
+            )
+        })?;
+    Ok(cfg
+        .output_dir
+        .join("checkpoints/permanent")
+        .join(format!("step-{step:012}")))
 }
 
 fn publish_best_checkpoint(cfg: &TrainConfig, checkpoint: &Path) -> Result<PathBuf> {
     let checkpoints = cfg.output_dir.join("checkpoints");
     let best = checkpoints.join("best");
-    let staging = checkpoints.join(format!(".best.tmp-{}", std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("remove incomplete {}", staging.display()))?;
-    }
+    let staging = unused_checkpoint_sibling(&checkpoints, "best.tmp");
     copy_checkpoint_bundle(checkpoint, &staging)?;
     if best.exists() {
-        let old = checkpoints.join(format!(".best.old-{}", std::process::id()));
-        if old.exists() {
-            fs::remove_dir_all(&old).with_context(|| format!("remove stale {}", old.display()))?;
-        }
+        let old = unused_checkpoint_sibling(&checkpoints, "best.old");
         fs::rename(&best, &old)
             .with_context(|| format!("rotate {} -> {}", best.display(), old.display()))?;
+        File::open(&checkpoints)?.sync_all()?;
         fs::rename(&staging, &best)
             .with_context(|| format!("publish {} -> {}", staging.display(), best.display()))?;
+        File::open(&checkpoints)?.sync_all()?;
         fs::remove_dir_all(&old).with_context(|| format!("remove replaced {}", old.display()))?;
+        File::open(&checkpoints)?.sync_all()?;
     } else {
         fs::rename(&staging, &best)
             .with_context(|| format!("publish {} -> {}", staging.display(), best.display()))?;
+        File::open(&checkpoints)?.sync_all()?;
     }
     verify_checkpoint_bundle(&best)?;
     Ok(best)
+}
+
+fn reconcile_foundation_v2_best_checkpoint(
+    cfg: &TrainConfig,
+    foundation: &FoundationV2TrainerState,
+) -> Result<()> {
+    let Some(expected_step) =
+        foundation_v2_selected_best_step(cfg.promotion_metric, &foundation.gate_history)
+    else {
+        return Ok(());
+    };
+    let best = cfg.output_dir.join("checkpoints/best");
+    let matches = verify_checkpoint_bundle(&best)
+        .and_then(|()| checkpoint_step(&best))
+        .is_ok_and(|step| step == expected_step);
+    if matches {
+        return Ok(());
+    }
+    let source = checkpoint_step_directory(cfg, expected_step);
+    verify_checkpoint_bundle(&source).with_context(|| {
+        format!(
+            "cannot reconcile selected best step {expected_step}: source bundle {} is unavailable or corrupt",
+            source.display()
+        )
+    })?;
+    if checkpoint_step(&source)? != expected_step {
+        bail!(
+            "selected best source {} does not hold step {expected_step}",
+            source.display()
+        );
+    }
+    tracing::warn!(
+        "reconciling checkpoints/best to gate-history-selected step {expected_step} from {}",
+        source.display()
+    );
+    publish_best_checkpoint(cfg, &source)?;
+    Ok(())
+}
+
+fn reconcile_foundation_v2_permanent_checkpoints(
+    cfg: &TrainConfig,
+    permanent_checkpoints: &mut [PathBuf],
+) -> Result<()> {
+    for recorded in permanent_checkpoints {
+        let destination = recorded_permanent_destination(cfg, recorded)?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("validated permanent checkpoint name");
+        let step = name
+            .strip_prefix("step-")
+            .expect("validated permanent checkpoint prefix")
+            .parse::<u64>()?;
+        let source = checkpoint_step_directory(cfg, step);
+        let needs_copy = match verify_checkpoint_bundle(&destination)
+            .and_then(|()| checkpoint_step(&destination))
+        {
+            Ok(published_step) => published_step != step,
+            Err(_) => true,
+        };
+        if needs_copy {
+            tracing::warn!(
+                "reconciling recorded permanent checkpoint step {step} from {}",
+                source.display()
+            );
+            publish_permanent_checkpoint(cfg, &source)?;
+        }
+        *recorded = destination;
+    }
+    Ok(())
+}
+
+fn ensure_foundation_v2_resume_not_aborted(
+    cfg: &TrainConfig,
+    foundation: Option<&FoundationV2TrainerState>,
+) -> Result<()> {
+    if cfg.resume_after_abort {
+        return Ok(());
+    }
+    let marker = cfg.output_dir.join(FOUNDATION_V2_ABORT_MARKER);
+    if marker.is_file() {
+        bail!(
+            "foundation-v2 run is durably aborted at {}; pass --resume-after-abort to continue explicitly",
+            marker.display()
+        );
+    }
+    if foundation.is_some_and(|state| foundation_v2_gate_history_aborts(&state.gate_history)) {
+        bail!(
+            "restored foundation-v2 gate history records an abort; pass --resume-after-abort to continue explicitly"
+        );
+    }
+    Ok(())
+}
+
+fn persist_foundation_v2_abort_marker(
+    cfg: &TrainConfig,
+    global_step: u64,
+    checkpoint: &Path,
+) -> Result<()> {
+    write_json_atomic(
+        &cfg.output_dir.join(FOUNDATION_V2_ABORT_MARKER),
+        &FoundationV2AbortMarker {
+            schema: "p2.foundation_v2_abort.v1".into(),
+            global_step,
+            checkpoint: checkpoint.to_path_buf(),
+        },
+    )
 }
 
 fn seal_foundation_v2_abort(
@@ -6973,12 +7375,13 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     cfg.validate()?;
     fs::create_dir_all(&cfg.output_dir)
         .with_context(|| format!("create {}", cfg.output_dir.display()))?;
-    let _train_pid = TrainPidGuard::install(&cfg.output_dir)?;
+    ensure_foundation_v2_resume_not_aborted(&cfg, None)?;
     let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
         Some(GpuSessionGuard::acquire(&cfg.output_dir)?)
     } else {
         None
     };
+    let _train_pid = TrainPidGuard::install(&cfg.output_dir)?;
     PAUSE_REQUESTED.store(false, Ordering::SeqCst);
     install_pause_handler()?;
     let device = resolve_device(&cfg.device)?;
@@ -7051,6 +7454,12 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             }),
         }
     };
+    if resumed_from.is_some() {
+        ensure_foundation_v2_resume_not_aborted(
+            &cfg,
+            state.foundation_v2.as_ref(),
+        )?;
+    }
     let mut loss_log = FoundationV2LossLog::open(&cfg.output_dir)?;
     let mut latest_checkpoint = if resumed_from.is_none() {
         loss_log.flush()?;
@@ -7085,27 +7494,15 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let identity =
             foundation_v2_gate_population_identity(&gate_samples, &gate_content_masks)?;
         let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
-        match &foundation.gate_population_identity {
-            Some(stored)
-                if stored.rows_sha256 == identity.rows_sha256
-                    && stored.masks_sha256 == identity.masks_sha256
-                    && stored.policy_schema == FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA =>
-            {
-                // v3 changes only gate interpretation over metrics already
-                // serialized in v2 history, so the policy identity can be
-                // migrated without crossing gate populations.
-                foundation.gate_population_identity = Some(identity);
-            }
-            Some(stored) if *stored != identity => bail!(
-                "resumed gate population/policy identity mismatch: stored {:?} vs \
-                 regenerated {:?}; best/collapse comparisons would span incomparable \
-                 populations",
-                stored,
-                identity
-            ),
-            Some(_) => {}
-            None => foundation.gate_population_identity = Some(identity),
-        }
+        reconcile_foundation_v2_gate_population_identity(foundation, identity)?;
+    }
+    if resumed_from.is_some() {
+        let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+        reconcile_foundation_v2_best_checkpoint(&cfg, foundation)?;
+        reconcile_foundation_v2_permanent_checkpoints(
+            &cfg,
+            &mut foundation.permanent_checkpoints,
+        )?;
     }
     validate_foundation_v2_profile_resume(
         &cfg.profile_updates,
@@ -7530,6 +7927,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         }
         if abort {
             let checkpoint = latest_checkpoint.clone().expect("abort saves checkpoint");
+            persist_foundation_v2_abort_marker(&cfg, state.global_step, &checkpoint)?;
             let report = build_report(
                 &cfg,
                 &state,
@@ -7579,12 +7977,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
     cfg.validate()?;
     fs::create_dir_all(&cfg.output_dir)
         .with_context(|| format!("create {}", cfg.output_dir.display()))?;
-    let _train_pid = TrainPidGuard::install(&cfg.output_dir)?;
     let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
         Some(GpuSessionGuard::acquire(&cfg.output_dir)?)
     } else {
         None
     };
+    let _train_pid = TrainPidGuard::install(&cfg.output_dir)?;
     PAUSE_REQUESTED.store(false, Ordering::SeqCst);
     install_pause_handler()?;
     let device = resolve_device(&cfg.device)?;
@@ -8427,6 +8825,344 @@ mod tests {
             output_dir,
             ..TrainConfig::default()
         }
+    }
+
+    fn checkpoint_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tofy-{label}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    fn write_fake_checkpoint_bundle(bundle: &Path, step: u64, foundation_v2: bool) -> Result<()> {
+        fs::create_dir_all(bundle)?;
+        let mut safetensors = Vec::from((2u64).to_le_bytes());
+        safetensors.extend_from_slice(b"{}");
+        fs::write(bundle.join("model.safetensors"), &safetensors)?;
+        fs::write(bundle.join("optimizer.safetensors"), b"optimizer")?;
+        write_json_atomic(
+            &bundle.join("trainer_state.json"),
+            &serde_json::json!({"global_step": step}),
+        )?;
+        write_json_atomic(
+            &bundle.join("config.json"),
+            &serde_json::json!({
+                "recipe": if foundation_v2 { "foundation_v2" } else { "legacy_experimental" }
+            }),
+        )?;
+        if foundation_v2 {
+            fs::write(bundle.join("ema.safetensors"), &safetensors)?;
+            write_json_atomic(
+                &bundle.join("gate_history.json"),
+                &Vec::<serde_json::Value>::new(),
+            )?;
+        }
+        let artifacts = checkpoint_required_artifacts(bundle)?
+            .iter()
+            .map(|name| sha256_file(&bundle.join(name)))
+            .collect::<Result<Vec<_>>>()?;
+        write_json_atomic(
+            &bundle.join("bundle-manifest.json"),
+            &CheckpointBundleManifest {
+                schema: "p2.checkpoint_bundle.v1".into(),
+                global_step: step,
+                artifacts,
+                parameter_groups: BTreeMap::new(),
+            },
+        )?;
+        verify_checkpoint_bundle(bundle)
+    }
+
+    fn checkpoint_gate_metrics(value: f64) -> GateSupportMetrics {
+        GateSupportMetrics {
+            samples: 1,
+            population_fingerprint: "sha256:test".into(),
+            content_mask_fingerprint: Some("sha256:masks".into()),
+            evidence_class: "selection_only".into(),
+            changed_transitions: 1,
+            changed_pixels: 1,
+            foreground_pixels: 1,
+            improvement_fraction: Some(1.0),
+            shuffled_action_changed_pixel_ratio: Some(0.0),
+            shuffled_action_rows: 1,
+            shuffled_action_eligible_rows: 1,
+            shuffled_action_changed_tuples: 1,
+            shuffled_action_outcome_changing_tuples: None,
+            foreground_reconstruction_accuracy: Some(1.0),
+            one_step_changed_exact: Some(value),
+            one_step_full_exact: Some(value),
+            one_step_raw_full_exact: Some(value),
+            one_step_composed_changed_exact: Some(value),
+            one_step_all_rows_exact: Some(value),
+            false_edit_rate: Some(0.0),
+            padding_false_edit_rate: Some(0.0),
+            raw_false_edit_rate: Some(0.0),
+            raw_padding_false_edit_rate: Some(0.0),
+            population_contract: "test".into(),
+        }
+    }
+
+    fn checkpoint_gate_evaluation(
+        step: u64,
+        value: f64,
+        passed: bool,
+    ) -> FoundationV2GateEvaluation {
+        FoundationV2GateEvaluation {
+            step,
+            metrics: checkpoint_gate_metrics(value),
+            running_best_before: None,
+            running_best_after: Some(value),
+            gates: vec![FoundationV2GateResult {
+                name: "one_step_collapse".into(),
+                passed,
+                measured: Some(value),
+                threshold: "test".into(),
+            }],
+            diagnostics: vec![],
+        }
+    }
+
+    fn checkpoint_foundation_state(
+        gate_history: Vec<FoundationV2GateEvaluation>,
+    ) -> FoundationV2TrainerState {
+        FoundationV2TrainerState {
+            total_steps: 24_576,
+            ep_weight: 0.01,
+            ep_gradient_budget: vec![],
+            gate_history,
+            best_changed_exact: None,
+            rollout_enabled: true,
+            loss_sums: FoundationV2LossMeans::default(),
+            loss_steps: 0,
+            permanent_checkpoints: vec![],
+            event_label_census: EventLabelCensus::default(),
+            event_label_census_complete: true,
+            mechanism_history: vec![],
+            profiles_published: vec![],
+            rollout_zero_loss_consecutive_steps: 0,
+            gate_population_identity: None,
+        }
+    }
+
+    #[test]
+    fn checkpoint_save_adopts_verified_target_and_preserves_corrupt_target_on_replace() -> Result<()>
+    {
+        let root = checkpoint_test_root("checkpoint-collision");
+        let mut cfg = resume_test_config(root.clone());
+        cfg.steps_per_lesson = 1;
+        let varmap = VarMap::new();
+        varmap.data().lock().unwrap().insert(
+            "test.weight".into(),
+            Var::from_tensor(&Tensor::ones((1,), DType::F32, &Device::Cpu)?)?,
+        );
+        let optimizer = CheckpointHybridOptimizer::new(
+            &varmap,
+            adam_params(&cfg),
+            cfg.muon_momentum,
+            cfg.muon_rms_scale,
+        )?;
+        let state = TrainerState {
+            schema: TRAINER_STATE_SCHEMA.into(),
+            contract: TrainingContract::from(&cfg),
+            global_step: 0,
+            lesson_index: 0,
+            step_in_lesson: 0,
+            optimizer_step: 0,
+            completed_lessons: vec![],
+            active_sums: LessonLossMeans::default(),
+            parameter_names: optimizer.parameter_names(),
+            training_population_hash: default_training_population_hash(),
+            training_content_hash: [0; 32],
+            training_population_rows: 0,
+            batch_schedule_migrations: vec![],
+            profile: ProfileState::Pending,
+            gradient_pressure: None,
+            gradient_pressure_samples: vec![],
+            foundation_v2: None,
+        };
+
+        let checkpoint = save_training_checkpoint(&varmap, &optimizer, None, &state, &cfg)?;
+        fs::write(checkpoint.join("adoption-sentinel"), b"preserve")?;
+        fs::remove_file(root.join("checkpoints/latest.json"))?;
+        assert_eq!(
+            save_training_checkpoint(&varmap, &optimizer, None, &state, &cfg)?,
+            checkpoint
+        );
+        assert_eq!(fs::read(checkpoint.join("adoption-sentinel"))?, b"preserve");
+        let latest: LatestCheckpoint = read_json(&root.join("checkpoints/latest.json"))?;
+        assert_eq!(latest.global_step, 0);
+
+        fs::write(checkpoint.join("model.safetensors"), b"corrupt")?;
+        save_training_checkpoint(&varmap, &optimizer, None, &state, &cfg)?;
+        verify_checkpoint_bundle(&checkpoint)?;
+        let backup = fs::read_dir(root.join("checkpoints"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".step-000000000000.corrupt-"))
+            })
+            .expect("corrupt checkpoint was preserved");
+        assert_eq!(fs::read(backup.join("model.safetensors"))?, b"corrupt");
+        assert!(backup.join("adoption-sentinel").is_file());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn best_resume_reconciliation_repairs_missing_and_mismatched_rotation() -> Result<()> {
+        let root = checkpoint_test_root("best-reconcile");
+        let mut cfg = TrainConfig::default();
+        cfg.recipe = TrainingRecipe::FoundationV2;
+        cfg.output_dir = root.clone();
+        let selected = checkpoint_step_directory(&cfg, 1_024);
+        write_fake_checkpoint_bundle(&selected, 1_024, true)?;
+        let foundation = checkpoint_foundation_state(vec![checkpoint_gate_evaluation(
+            1_024, 0.5, true,
+        )]);
+        assert!(foundation_v2_verified_best_export(
+            &cfg,
+            PromotionMetric::ChangedExact,
+            &foundation.gate_history
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("refusing to fall back"));
+
+        reconcile_foundation_v2_best_checkpoint(&cfg, &foundation)?;
+        assert_eq!(checkpoint_step(&root.join("checkpoints/best"))?, 1_024);
+        assert!(foundation_v2_verified_best_export(
+            &cfg,
+            PromotionMetric::ChangedExact,
+            &foundation.gate_history
+        )?
+        .is_some());
+
+        let wrong = checkpoint_step_directory(&cfg, 2_048);
+        write_fake_checkpoint_bundle(&wrong, 2_048, true)?;
+        publish_best_checkpoint(&cfg, &wrong)?;
+        assert_eq!(checkpoint_step(&root.join("checkpoints/best"))?, 2_048);
+        reconcile_foundation_v2_best_checkpoint(&cfg, &foundation)?;
+        assert_eq!(checkpoint_step(&root.join("checkpoints/best"))?, 1_024);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn permanent_resume_reconciliation_recopies_missing_and_corrupt_bundle() -> Result<()> {
+        let root = checkpoint_test_root("permanent-reconcile");
+        let mut cfg = TrainConfig::default();
+        cfg.recipe = TrainingRecipe::FoundationV2;
+        cfg.output_dir = root.clone();
+        let source = checkpoint_step_directory(&cfg, 2_048);
+        write_fake_checkpoint_bundle(&source, 2_048, true)?;
+        let permanent = root.join("checkpoints/permanent/step-000000002048");
+        let mut recorded = vec![permanent.clone()];
+        reconcile_foundation_v2_permanent_checkpoints(&cfg, &mut recorded)?;
+        verify_checkpoint_bundle(&permanent)?;
+
+        fs::write(permanent.join("ema.safetensors"), b"corrupt")?;
+        reconcile_foundation_v2_permanent_checkpoints(&cfg, &mut recorded)?;
+        verify_checkpoint_bundle(&permanent)?;
+        assert!(fs::read_dir(root.join("checkpoints/permanent"))?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".step-000000002048.corrupt-"))
+        }));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn aborted_resume_requires_explicit_override_for_history_or_marker() -> Result<()> {
+        let root = checkpoint_test_root("abort-marker");
+        fs::create_dir_all(&root)?;
+        let mut cfg = TrainConfig::default();
+        cfg.output_dir = root.clone();
+        let foundation = checkpoint_foundation_state(vec![
+            checkpoint_gate_evaluation(1_024, 0.1, false),
+            checkpoint_gate_evaluation(2_048, 0.1, false),
+        ]);
+        assert!(ensure_foundation_v2_resume_not_aborted(&cfg, Some(&foundation)).is_err());
+        cfg.resume_after_abort = true;
+        ensure_foundation_v2_resume_not_aborted(&cfg, Some(&foundation))?;
+
+        cfg.resume_after_abort = false;
+        persist_foundation_v2_abort_marker(&cfg, 2_048, Path::new("checkpoint"))?;
+        assert!(ensure_foundation_v2_resume_not_aborted(&cfg, None).is_err());
+        cfg.resume_after_abort = true;
+        ensure_foundation_v2_resume_not_aborted(&cfg, None)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gate_identity_is_backfilled_only_before_gate_history_exists() -> Result<()> {
+        let identity = GatePopulationIdentity {
+            rows_sha256: "sha256:rows".into(),
+            masks_sha256: "sha256:masks".into(),
+            policy_schema: FOUNDATION_V2_GATE_POLICY_SCHEMA.into(),
+        };
+        let mut fresh = checkpoint_foundation_state(vec![]);
+        reconcile_foundation_v2_gate_population_identity(&mut fresh, identity.clone())?;
+        assert_eq!(fresh.gate_population_identity, Some(identity.clone()));
+
+        let mut historical = checkpoint_foundation_state(vec![checkpoint_gate_evaluation(
+            1_024, 0.5, true,
+        )]);
+        let error = reconcile_foundation_v2_gate_population_identity(&mut historical, identity)
+            .expect_err("history without identity must fail closed");
+        assert!(error.to_string().contains("gate history"));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_manifest_and_latest_pointer_are_complete_and_step_bound() -> Result<()> {
+        let root = checkpoint_test_root("checkpoint-manifest");
+        let checkpoints = root.join("checkpoints");
+        let bundle = checkpoints.join("step-000000000007");
+        write_fake_checkpoint_bundle(&bundle, 7, true)?;
+
+        let mut manifest: CheckpointBundleManifest =
+            read_json(&bundle.join("bundle-manifest.json"))?;
+        manifest.artifacts.retain(|artifact| artifact.path != "ema.safetensors");
+        write_json_atomic(&bundle.join("bundle-manifest.json"), &manifest)?;
+        assert!(verify_checkpoint_bundle(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("artifact set mismatch"));
+        write_fake_checkpoint_bundle(&bundle, 7, true)?;
+
+        write_json_atomic(
+            &checkpoints.join("latest.json"),
+            &LatestCheckpoint {
+                schema: TRAINER_STATE_SCHEMA.into(),
+                directory: "../step-000000000007".into(),
+                global_step: 7,
+            },
+        )?;
+        assert!(resolve_resume_checkpoint(&checkpoints)
+            .unwrap_err()
+            .to_string()
+            .contains("plain child name"));
+        write_json_atomic(
+            &checkpoints.join("latest.json"),
+            &LatestCheckpoint {
+                schema: TRAINER_STATE_SCHEMA.into(),
+                directory: "step-000000000007".into(),
+                global_step: 8,
+            },
+        )?;
+        assert!(resolve_resume_checkpoint(&checkpoints)
+            .unwrap_err()
+            .to_string()
+            .contains("disagrees with restored trainer state"));
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

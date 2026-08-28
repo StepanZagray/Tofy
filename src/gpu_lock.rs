@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -111,20 +111,50 @@ pub fn wait_for_gpu_idle(output_dir: &Path) -> Result<()> {
 /// RAII marker file so watchers can find the live `p2-train` PID (not the shell).
 pub struct TrainPidGuard {
     path: PathBuf,
+    pid: u32,
 }
 
 impl TrainPidGuard {
     pub fn install(output_dir: &Path) -> Result<Self> {
         let path = train_pid_path(output_dir);
-        fs::write(&path, format!("{}\n", std::process::id()))
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(Self { path })
+        let pid = std::process::id();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{pid}").with_context(|| format!("write {}", path.display()))?;
+                    file.sync_all()
+                        .with_context(|| format!("sync {}", path.display()))?;
+                    return Ok(Self { path, pid });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if let Some(existing) = read_pid_file(&path).filter(|pid| process_alive(*pid)) {
+                        bail!(
+                            "refusing to overwrite {} naming live process {existing}",
+                            path.display()
+                        );
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("remove stale {}", path.display()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("create {}", path.display()));
+                }
+            }
+        }
     }
 }
 
 impl Drop for TrainPidGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if read_pid_file(&self.path) == Some(self.pid) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -137,16 +167,22 @@ impl GpuSessionGuard {
     pub fn acquire(output_dir: &Path) -> Result<Self> {
         fs::create_dir_all(output_dir)
             .with_context(|| format!("create {}", output_dir.display()))?;
-        wait_for_gpu_idle(output_dir)?;
         let path = lock_path(output_dir);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("acquire gpu lock {}", path.display()))?;
-        writeln!(file, "{}", std::process::id())
-            .with_context(|| format!("write gpu lock {}", path.display()))?;
-        Ok(Self { path })
+        loop {
+            wait_for_gpu_idle(output_dir)?;
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())
+                        .with_context(|| format!("write gpu lock {}", path.display()))?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("acquire gpu lock {}", path.display()));
+                }
+            }
+        }
     }
 }
 
@@ -171,6 +207,24 @@ mod tests {
         }
         assert!(!lock_path(&dir).exists());
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn train_pid_refuses_live_owner_and_drop_preserves_replacement() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("tofy-train-pid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = train_pid_path(&dir);
+        fs::write(&path, format!("{}\n", std::process::id()))?;
+        assert!(TrainPidGuard::install(&dir).is_err());
+
+        fs::remove_file(&path)?;
+        let guard = TrainPidGuard::install(&dir)?;
+        fs::write(&path, "1\n")?;
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path)?, "1\n");
+        fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }

@@ -118,6 +118,10 @@ pub struct P2TrainArgs {
     #[arg(long)]
     pub resume: Option<PathBuf>,
 
+    /// Continue a foundation-v2 run after its durable gate-abort marker.
+    #[arg(long, default_value_t = false)]
+    pub resume_after_abort: bool,
+
     /// Explicitly migrate physical batch / accumulation at equal effective batch.
     /// This changes the trajectory and is durably labeled as a migration.
     #[arg(long, default_value_t = false)]
@@ -423,6 +427,7 @@ impl P2TrainArgs {
             device: self.device.clone(),
             output_dir: self.output_dir.clone(),
             resume: self.resume.clone(),
+            resume_after_abort: self.resume_after_abort,
             allow_batch_schedule_migration: self.allow_batch_schedule_migration,
             checkpoint_every_steps: self.checkpoint_every_steps.unwrap_or(if foundation_v2 {
                 256

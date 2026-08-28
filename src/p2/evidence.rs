@@ -152,6 +152,16 @@ fn publish_training_evidence_with_provenance(
             false,
         )?;
     }
+    if let Some(foundation) = report.foundation_v2.as_ref() {
+        for bundle in &foundation.profile_bundles {
+            push_directory_artifacts(
+                &mut artifacts,
+                &canonical_run_dir,
+                "foundation_v2_profile_bundle",
+                bundle,
+            )?;
+        }
+    }
 
     let pressure_samples = &report.gradient_pressure_samples;
     let gradient_pressure = (!pressure_samples.is_empty())
@@ -237,6 +247,49 @@ fn push_artifact(
     Ok(())
 }
 
+fn push_directory_artifacts(
+    artifacts: &mut Vec<ArtifactDigest>,
+    run_dir: &Path,
+    role: &str,
+    directory: &Path,
+) -> Result<()> {
+    if !directory.is_dir() {
+        bail!(
+            "required evidence bundle directory is missing: {}",
+            directory.display()
+        );
+    }
+    let mut pending = vec![directory.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(current) = pending.pop() {
+        let mut entries = fs::read_dir(&current)
+            .with_context(|| format!("read evidence bundle {}", current.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            } else {
+                bail!(
+                    "evidence bundle contains unsupported artifact {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        bail!("evidence bundle is empty: {}", directory.display());
+    }
+    for path in files {
+        push_artifact(artifacts, run_dir, role, &path, false)?;
+    }
+    Ok(())
+}
+
 fn bundle_sha256(
     artifacts: &[ArtifactDigest],
     pressure: Option<&GradientPressureBinding>,
@@ -319,6 +372,8 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use crate::p2::cg_profile::ProfileArtifacts;
+    use crate::p2::data::EventLabelCensus;
+    use crate::p2::train::{FoundationV2LossMeans, FoundationV2TrainingReport, PromotionMetric};
 
     fn write(path: &Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {
@@ -336,6 +391,7 @@ mod tests {
         ));
         let checkpoint = root.join("checkpoints/step-000000000007");
         let profile_dir = root.join("profile/update-000000000002");
+        let foundation_profile_dir = root.join("profile/update-000000000004");
         let binary = root.join("test-tofy");
         for (path, contents) in [
             (root.join("model.safetensors"), b"export".as_slice()),
@@ -354,6 +410,18 @@ mod tests {
             (
                 profile_dir.join("nsight/status.txt"),
                 b"available".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("application.jsonl"),
+                b"foundation trace".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("evidence.json"),
+                b"foundation evidence".as_slice(),
+            ),
+            (
+                foundation_profile_dir.join("nsight/status.txt"),
+                b"not requested".as_slice(),
             ),
             (binary.clone(), b"binary".as_slice()),
         ] {
@@ -410,7 +478,24 @@ mod tests {
             }),
             gradient_pressure: Some(pressure.clone()),
             gradient_pressure_samples: vec![pressure],
-            foundation_v2: None,
+            foundation_v2: Some(FoundationV2TrainingReport {
+                total_steps: 7,
+                mean_losses: FoundationV2LossMeans::default(),
+                ep_weight: 0.01,
+                ep_gradient_budget: vec![],
+                gate_history: vec![],
+                best_changed_exact: None,
+                promotion_metric: PromotionMetric::ChangedExact,
+                best_promotion_value: None,
+                best_checkpoint: None,
+                rollout_enabled: true,
+                permanent_checkpoints: vec![],
+                event_label_census: EventLabelCensus::default(),
+                event_label_census_complete: true,
+                mechanism_history: vec![],
+                profile_bundles: vec![foundation_profile_dir.clone()],
+                clip_strategy: "test".into(),
+            }),
             research_claim: false,
         };
         write(
@@ -435,7 +520,7 @@ mod tests {
         let manifest: EvidenceManifest = serde_json::from_reader(File::open(&path)?)?;
 
         assert_eq!(manifest.schema, EVIDENCE_MANIFEST_SCHEMA);
-        assert_eq!(manifest.artifacts.len(), 9);
+        assert_eq!(manifest.artifacts.len(), 12);
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.role == "checkpoint_optimizer"
                 && artifact.path == "checkpoints/step-000000000007/optimizer.safetensors"
@@ -445,6 +530,14 @@ mod tests {
             .artifacts
             .iter()
             .all(|artifact| artifact.path != EVIDENCE_MANIFEST_FILE));
+        assert_eq!(
+            manifest
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.role == "foundation_v2_profile_bundle")
+                .count(),
+            3
+        );
         assert_eq!(manifest.gradient_pressure.unwrap().updates, vec![3]);
         assert!(manifest.bundle_sha256.starts_with("sha256:"));
         assert!(manifest.gaps.is_empty());
