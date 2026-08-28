@@ -21,8 +21,8 @@ use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
     flatten_latent, init_copy_bypass_gate, latent_mse_per_sample, restore_copy_gate_bias_prior,
     zero_action_film_projections, ModelConfig, PtrmConfig, RecursionDepth, RecursionOpts,
-    WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, PALETTE_SIZE, PATCH_SIZE,
-    PREFIX_HORIZONS,
+    TrainingEncodedPair, WorldModel, ACTION_VOCAB, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE,
+    PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
@@ -3908,9 +3908,22 @@ fn mean_tensors_or_zero(values: Vec<Tensor>, zero: &Tensor) -> Result<Tensor> {
 
 fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
     let pixels = labels.elem_count();
-    let probs =
-        candle_nn::ops::softmax(logits, D::Minus1)?.affine(0.99, 0.01 / PALETTE_SIZE as f64)?;
-    probs
+    let selected = candle_nn::ops::softmax(logits, D::Minus1)?
+        .reshape((pixels, PALETTE_SIZE))?
+        .gather(&labels.contiguous()?.flatten_all()?.unsqueeze(1)?, 1)?
+        .reshape(labels.dims())?;
+    selected
+        .affine(0.99, 0.01 / PALETTE_SIZE as f64)?
+        .log()?
+        .neg()
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+fn foundation_v2_unimix_ce_reference(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+    let pixels = labels.elem_count();
+    candle_nn::ops::softmax(logits, D::Minus1)?
+        .affine(0.99, 0.01 / PALETTE_SIZE as f64)?
         .log()?
         .reshape((pixels, PALETTE_SIZE))?
         .gather(&labels.contiguous()?.flatten_all()?.unsqueeze(1)?, 1)?
@@ -4075,9 +4088,11 @@ fn masked_spatial_huber(input: &Tensor, target: &Tensor, mask: &Tensor) -> Resul
 fn foundation_v2_rollout_loss(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
+    batch: &BatchTensors,
+    encoded: &TrainingEncodedPair,
     device: &Device,
 ) -> Result<(Tensor, usize)> {
-    foundation_v2_rollout_loss_inner(model, mixed, device, false)
+    foundation_v2_rollout_loss_inner(model, mixed, batch, encoded, device, false)
 }
 
 /// `detach_open_loop_input` exists only for the gradient-attribution premise
@@ -4087,15 +4102,18 @@ fn foundation_v2_rollout_loss(
 fn foundation_v2_rollout_loss_inner(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
+    batch: &BatchTensors,
+    encoded: &TrainingEncodedPair,
     device: &Device,
     detach_open_loop_input: bool,
 ) -> Result<(Tensor, usize)> {
     let mut fragments =
-        BTreeMap::<(u64, u64, String), Vec<(&TransitionSample, &ContentMask)>>::new();
-    for sample in mixed
+        BTreeMap::<(u64, u64, String), Vec<(usize, &TransitionSample, &ContentMask)>>::new();
+    for (row, sample) in mixed
         .samples()
         .iter()
-        .filter(|sample| sample.provenance.stream == MixedStreamKind::SequentialFragments)
+        .enumerate()
+        .filter(|(_, sample)| sample.provenance.stream == MixedStreamKind::SequentialFragments)
     {
         let transition = sample.transition();
         fragments
@@ -4105,36 +4123,43 @@ fn foundation_v2_rollout_loss_inner(
                 transition.family.clone(),
             ))
             .or_default()
-            .push((transition, &sample.content_mask));
+            .push((row, transition, &sample.content_mask));
     }
-    let mut first = Vec::new();
-    let mut second = Vec::new();
+    let mut first_rows = Vec::new();
+    let mut second_rows = Vec::new();
     let mut second_masks = Vec::new();
     for fragment in fragments.values_mut() {
-        fragment.sort_by_key(|(sample, _)| sample.transition_index);
+        fragment.sort_by_key(|(_, sample, _)| sample.transition_index);
         if let Some(pair) = fragment
             .windows(2)
-            .find(|pair| pair[1].0.transition_index == pair[0].0.transition_index + 1)
+            .find(|pair| pair[1].1.transition_index == pair[0].1.transition_index + 1)
         {
-            first.push(pair[0].0.clone());
-            second.push(pair[1].0.clone());
-            second_masks.push(pair[1].1);
+            first_rows.push(pair[0].0 as u32);
+            second_rows.push(pair[1].0 as u32);
+            second_masks.push(pair[1].2);
         }
     }
-    if first.len() < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
-        return Ok((Tensor::zeros((), DType::F32, device)?, first.len()));
+    if first_rows.len() < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
+        return Ok((Tensor::zeros((), DType::F32, device)?, first_rows.len()));
     }
-    let first_batch = batch_from_samples(&first, device)?;
-    let second_batch = batch_from_samples(&second, device)?;
-    let (current, target_h2) = model
-        .encode_state_pair_for_training(&first_batch.frames, &second_batch.next_frames)
-        .map(|encoded| (encoded.current, encoded.next))?;
+    // These are exact row selections from the batch encoded above: Foundation
+    // V2 applies neither frame augmentation nor encoder noise, and recurrence
+    // noise is independently fixed to zero. Reusing the shared tensors keeps
+    // the encoder graph while removing the duplicate convolutional pass.
+    let first_indices = Tensor::from_vec(first_rows.clone(), (first_rows.len(),), device)?;
+    let second_indices = Tensor::from_vec(second_rows.clone(), (second_rows.len(),), device)?;
+    let current = encoded.current.index_select(&first_indices, 0)?;
+    let target_h2 = encoded.next.index_select(&second_indices, 0)?;
+    let first_actions = batch.actions.index_select(&first_indices, 0)?;
+    let first_action_coords = batch.action_coords.index_select(&first_indices, 0)?;
+    let second_actions = batch.actions.index_select(&second_indices, 0)?;
+    let second_action_coords = batch.action_coords.index_select(&second_indices, 0)?;
     let current_canonical = model.canonical_representation(&current)?;
     let first_out = model.full_v4_training_latents_from_encoded_state(
         &current,
         &current_canonical,
-        &first_batch.actions,
-        &first_batch.action_coords,
+        &first_actions,
+        &first_action_coords,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -4149,8 +4174,8 @@ fn foundation_v2_rollout_loss_inner(
     let second_out = model.full_v4_training_latents_from_encoded_state(
         &open_loop_input,
         &h1_canonical,
-        &second_batch.actions,
-        &second_batch.action_coords,
+        &second_actions,
+        &second_action_coords,
         RecursionDepth::from_config(model.config()),
         0.0,
         None,
@@ -4169,7 +4194,7 @@ fn foundation_v2_rollout_loss_inner(
             &target_canonical,
             1.0,
         )?)?,
-        first.len(),
+        first_rows.len(),
     ))
 }
 
@@ -4184,7 +4209,28 @@ pub fn foundation_v2_graded_q_targets(
     next_frames: &Tensor,
     content: &Tensor,
 ) -> Result<Tensor> {
-    let batch_size = predicted_latent.dim(0)?;
+    let predicted_latent = predicted_latent.detach();
+    let predicted_logits = model.exact_gameplay_logits_detached(&predicted_latent)?;
+    let copy_gate = model.exact_copy_gate(&predicted_latent)?.detach();
+    foundation_v2_graded_q_targets_from_parts(
+        model,
+        &predicted_logits,
+        &copy_gate,
+        current_frames,
+        next_frames,
+        content,
+    )
+}
+
+fn foundation_v2_graded_q_targets_from_parts(
+    model: &WorldModel,
+    predicted_logits: &Tensor,
+    copy_gate: &Tensor,
+    current_frames: &Tensor,
+    next_frames: &Tensor,
+    content: &Tensor,
+) -> Result<Tensor> {
+    let batch_size = predicted_logits.dim(0)?;
     if content.dims() != [batch_size, FRAME_SIDE - 1, FRAME_SIDE] {
         bail!("foundation-v2 Q content mask has the wrong shape");
     }
@@ -4197,7 +4243,8 @@ pub fn foundation_v2_graded_q_targets(
         .squeeze(1)?
         .to_dtype(DType::U32)?;
     let changed = current_labels.ne(&target_labels)?.to_dtype(DType::F32)?;
-    let composed = model.composed_gameplay_decode(&predicted_latent.detach(), current_frames)?;
+    let composed =
+        model.composed_gameplay_decode_from_parts(predicted_logits, copy_gate, &current_labels)?;
     let correct = composed.eq(&target_labels)?.to_dtype(DType::F32)?;
     let changed_count_per_sample = changed.sum(2)?.sum(1)?;
     let content_count_per_sample = content.sum(2)?.sum(1)?;
@@ -4511,8 +4558,18 @@ pub fn foundation_v2_training_loss(
         &batch.event_mask,
         Some(&event_slot_weight_tensor(device)?),
     )?;
-    let graded_targets =
-        foundation_v2_graded_q_targets(model, &out.y, &batch.frames, &batch.next_frames, &content)?;
+    // Both projections above consumed this exact post-outer-step `out.y`.
+    // Reuse their detached values for the observer targets instead of
+    // repeating the full exact decoder and copy-gate convolution.
+    let predicted_copy_gate = candle_nn::ops::sigmoid(&gate_logits.detach())?;
+    let graded_targets = foundation_v2_graded_q_targets_from_parts(
+        model,
+        &predicted_logits.detach(),
+        &predicted_copy_gate,
+        &batch.frames,
+        &batch.next_frames,
+        &content,
+    )?;
     let q = bce_with_logits(
         &model.q_logit_from_canonical(&detached_canonical)?,
         &graded_targets,
@@ -4522,7 +4579,7 @@ pub fn foundation_v2_training_loss(
         &graded_targets,
     )?;
     let (rollout, rollout_fragments) = if objective.rollout_enabled {
-        foundation_v2_rollout_loss(model, mixed, device)?
+        foundation_v2_rollout_loss(model, mixed, &batch, &encoded, device)?
     } else {
         (zero.clone(), 0)
     };
@@ -8027,6 +8084,40 @@ mod tests {
     use crate::domain::Split;
     use crate::p2::data::{ArcAction, GoalFeatures};
 
+    #[test]
+    fn foundation_v2_unimix_ce_matches_materialized_reference() -> Result<()> {
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCE_F005);
+        let logits = Tensor::from_vec(
+            (0..3 * 5 * 7 * PALETTE_SIZE)
+                .map(|_| rng.random_range(-8.0f32..8.0f32))
+                .collect::<Vec<_>>(),
+            (3, 5, 7, PALETTE_SIZE),
+            &device,
+        )?;
+        let labels = Tensor::from_vec(
+            (0..3 * 5 * 7)
+                .map(|_| rng.random_range(0..PALETTE_SIZE as u32))
+                .collect::<Vec<_>>(),
+            (3, 5, 7),
+            &device,
+        )?;
+        let fused = foundation_v2_unimix_ce(&logits, &labels)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let reference = foundation_v2_unimix_ce_reference(&logits, &labels)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (index, (got, want)) in fused.iter().zip(&reference).enumerate() {
+            let relative_error = (got - want).abs() / want.abs().max(f32::MIN_POSITIVE);
+            assert!(
+                relative_error <= 1e-6,
+                "unimix CE differs at {index}: got {got}, want {want}, relative error {relative_error}"
+            );
+        }
+        Ok(())
+    }
+
     fn resume_test_config(output_dir: PathBuf) -> TrainConfig {
         TrainConfig {
             lessons: vec!["sequential".into()],
@@ -10307,8 +10398,12 @@ mod tests {
             0,
             V5DataSplit::Train,
         )?;
+        let small_samples = small.transitions().cloned().collect::<Vec<_>>();
+        let small_batch = batch_from_samples(&small_samples, &device)?;
+        let small_encoded =
+            model.encode_state_pair_for_training(&small_batch.frames, &small_batch.next_frames)?;
         let (small_loss, small_fragments) =
-            foundation_v2_rollout_loss(&model, &small, &device)?;
+            foundation_v2_rollout_loss(&model, &small, &small_batch, &small_encoded, &device)?;
         assert!(small_fragments < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
         assert_eq!(small_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?, 0.0);
 
@@ -10323,7 +10418,12 @@ mod tests {
             0,
             V5DataSplit::Train,
         )?;
-        let (loss, fragments) = foundation_v2_rollout_loss(&model, &full, &device)?;
+        let full_samples = full.transitions().cloned().collect::<Vec<_>>();
+        let full_batch = batch_from_samples(&full_samples, &device)?;
+        let full_encoded =
+            model.encode_state_pair_for_training(&full_batch.frames, &full_batch.next_frames)?;
+        let (loss, fragments) =
+            foundation_v2_rollout_loss(&model, &full, &full_batch, &full_encoded, &device)?;
         assert!(fragments >= FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
         let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         assert!(value.is_finite() && value > 0.0, "rollout loss {value}");
@@ -10345,7 +10445,14 @@ mod tests {
         // first transition's contribution. A shared core means a nonzero
         // final gradient alone cannot prove the graph traverses transition
         // one; the attached/detached difference can.
-        let (detached_loss, _) = foundation_v2_rollout_loss_inner(&model, &full, &device, true)?;
+        let (detached_loss, _) = foundation_v2_rollout_loss_inner(
+            &model,
+            &full,
+            &full_batch,
+            &full_encoded,
+            &device,
+            true,
+        )?;
         let detached = core_grad_vec(&detached_loss)?;
         assert!(
             attached
