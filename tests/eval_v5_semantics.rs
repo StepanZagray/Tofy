@@ -185,7 +185,7 @@ fn mechanism_ablations_cover_parameter_free_variants_without_alpha_gate() -> Res
     let device = Device::Cpu;
     let (model, varmap) = tiny_foundation_model(false)?;
     let rows = ablation_rows()?;
-    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, None, &device)?;
     assert_eq!(report.rows, rows.len());
     assert_eq!(report.evidence_class, "selection_only");
     assert!(report.decode_composition.is_some());
@@ -211,7 +211,7 @@ fn alpha_sweep_preserves_main_weights_and_starts_at_trained_baseline() -> Result
     }
     let rows = ablation_rows()?;
     let before = evaluate_gate_support(&model, &rows, &device)?;
-    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, None, &device)?;
     let after = evaluate_gate_support(&model, &rows, &device)?;
     assert_eq!(before, after, "alpha sweep mutated the main evaluation model");
     assert_eq!(serde_json::to_vec(&before)?, serde_json::to_vec(&after)?);
@@ -247,7 +247,7 @@ fn mechanism_ablation_field_round_trips_present_and_absent() -> Result<()> {
     let device = Device::Cpu;
     let (model, varmap) = tiny_foundation_model(false)?;
     let rows = ablation_rows()?;
-    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, &device)?;
+    let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, None, &device)?;
     let encoded = serde_json::to_string(&AblationFieldCompatibility {
         mechanism_ablations: Some(report.clone()),
     })?;

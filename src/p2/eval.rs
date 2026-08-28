@@ -11,7 +11,8 @@ use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum,
     generate_factual_branch_group, generate_hazard_one_step, palette, ArcAction, BranchGroup,
     ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
-    TransitionSample, V5DataSplit, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
+    TransitionSample, V5DataSplit, V5SampleProvenance, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE,
+    ORACLE_LATENT_DIM,
 };
 use crate::p2::grounding::DecodeComposition;
 use crate::p2::model::{
@@ -27,9 +28,10 @@ use crate::p2::rhae::{
 };
 use crate::p2::semantic_eval::{
     action_controllability_probe, aggregate_decoder_metrics, ambiguity_ceiling, collision_census,
-    evaluate_semantics_with_control, latent_semantic_metrics, shuffled_action_control_samples,
-    ActionControllabilityMetrics, AmbiguityCeiling, CollisionCensus, SemanticControlConfig,
-    SemanticDecoderMetrics, SemanticEvaluation,
+    evaluate_semantics_with_control, latent_semantic_metrics, shuffled_action_control_population,
+    shuffled_action_control_samples, ActionControllabilityMetrics, AmbiguityCeiling,
+    CollisionCensus, SemanticControlConfig, SemanticDecoderMetrics, SemanticEvaluation,
+    ShuffledActionControlPopulation,
 };
 use crate::p2::train::{
     action_tensors_from_samples, batch_from_samples, foundation_v2_graded_q_targets,
@@ -410,7 +412,8 @@ pub struct ChangedTransitionMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateSupportMetrics {
     pub samples: usize,
-    /// SHA-256 of the exact ordered serialized transition rows.
+    /// SHA-256 of the exact ordered serialized transition rows, plus aligned
+    /// V5 provenance when counterfactual evaluation uses it.
     #[serde(default)]
     pub population_fingerprint: String,
     /// SHA-256 of the exact ordered V5 content masks when the caller supplies
@@ -427,7 +430,8 @@ pub struct GateSupportMetrics {
     /// `1 - mean(prediction_mse) / mean(copy_forward_mse)` on Changed Transitions.
     pub improvement_fraction: Option<f64>,
     /// Shuffled-action changed-pixel accuracy divided by true-action
-    /// changed-pixel accuracy; lower means stronger action conditioning.
+    /// changed-pixel accuracy on known outcome-changing interventions, divided
+    /// by true-action accuracy; lower means stronger action conditioning.
     pub shuffled_action_changed_pixel_ratio: Option<f64>,
     /// Rows in the shuffled-action control population.
     #[serde(default)]
@@ -439,10 +443,9 @@ pub struct GateSupportMetrics {
     /// source-local marginal-preserving shuffle.
     #[serde(default)]
     pub shuffled_action_changed_tuples: usize,
-    /// Rows where the alternative tuple is known to change the simulator
-    /// outcome. `None` because `TransitionSample` has no counterfactual
-    /// simulator/operator sidecar; tuple sensitivity must not be read as
-    /// correct alternative-state prediction.
+    /// Rows where replaying the alternative tuple under the recorded V5
+    /// operator changes the status-excluded simulator outcome. `None` means
+    /// the population supplied no counterfactual operator sidecar.
     #[serde(default)]
     pub shuffled_action_outcome_changing_tuples: Option<usize>,
     /// Exact-decoder pixel accuracy on non-empty pixels of the encoded next state.
@@ -2344,28 +2347,50 @@ fn gameplay_pixels(sample: &TransitionSample) -> (&[u8], &[u8]) {
     )
 }
 
+pub const MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS: usize = 32;
+
 pub fn shuffled_action_changed_pixel_ratio(
     samples: &[TransitionSample],
     shuffled_samples: &[TransitionSample],
+    outcome_changing: &[Option<bool>],
     true_action_predictions: &[Vec<u8>],
     shuffled_action_predictions: &[Vec<u8>],
 ) -> Result<Option<f64>> {
     if samples.len() != true_action_predictions.len()
         || samples.len() != shuffled_samples.len()
+        || samples.len() != outcome_changing.len()
         || samples.len() != shuffled_action_predictions.len()
     {
         bail!("gate changed-pixel rows do not match the sample count");
     }
+    let known_outcome_changing = outcome_changing
+        .iter()
+        .copied()
+        .try_fold(0usize, |count, changed| {
+            changed.map(|changed| count + usize::from(changed))
+        });
+    if known_outcome_changing
+        .is_some_and(|rows| rows < MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS)
+    {
+        return Ok(None);
+    }
     let mut changed_pixels = 0usize;
     let mut true_correct = 0usize;
     let mut shuffled_correct = 0usize;
-    for (((sample, shuffled_sample), true_prediction), shuffled_prediction) in samples
+    for ((((sample, shuffled_sample), outcome_changing), true_prediction), shuffled_prediction) in
+        samples
         .iter()
         .zip(shuffled_samples)
+        .zip(outcome_changing)
         .zip(true_action_predictions)
         .zip(shuffled_action_predictions)
     {
-        if sample.action == shuffled_sample.action || !is_board_changed_transition(sample) {
+        // Unknown counterfactuals retain the historical per-row behavior;
+        // known outcome-equivalent tuples are not causal interventions.
+        if sample.action == shuffled_sample.action
+            || outcome_changing == &Some(false)
+            || !is_board_changed_transition(sample)
+        {
             continue;
         }
         let (current, target) = gameplay_pixels(sample);
@@ -2471,6 +2496,7 @@ fn foundation_v2_v5_holdout_gates(
     BTreeMap<String, GateSupportMetrics>,
     Vec<TransitionSample>,
     Vec<ContentMask>,
+    Vec<V5SampleProvenance>,
 )> {
     const V5_HOLDOUT_ROWS: usize = 512;
     const V5_HOLDOUT_SEED_DOMAIN: u64 = 0x5645_4C35_1D00_0000;
@@ -2519,16 +2545,26 @@ fn foundation_v2_v5_holdout_gates(
             .iter()
             .map(|sample| sample.content_mask.clone())
             .collect::<Vec<_>>();
-        let metrics =
-            evaluate_gate_support_with_content_masks(model, &samples, Some(&masks), device)?;
+        let provenance = batch
+            .samples()
+            .iter()
+            .map(|sample| sample.provenance.clone())
+            .collect::<Vec<_>>();
+        let metrics = evaluate_gate_support_with_v5_provenance(
+            model,
+            &samples,
+            &masks,
+            &provenance,
+            device,
+        )?;
         if lane == 0 {
-            ablation_population = Some((samples.clone(), masks.clone()));
+            ablation_population = Some((samples.clone(), masks.clone(), provenance.clone()));
         }
         gates.insert(name, metrics);
     }
-    let (samples, masks) =
+    let (samples, masks, provenance) =
         ablation_population.expect("unseen-seed V5 holdout population is always present");
-    Ok((gates, samples, masks))
+    Ok((gates, samples, masks, provenance))
 }
 
 /// Full-transition exactness on the same changed-transition rows counted by
@@ -2675,7 +2711,7 @@ struct EncodedGateSupportPopulation {
     batch: BatchTensors,
     current: Tensor,
     target: Tensor,
-    shuffled: Vec<TransitionSample>,
+    shuffled: ShuffledActionControlPopulation,
     shuffled_actions: Tensor,
     shuffled_coords: Tensor,
 }
@@ -2683,12 +2719,14 @@ struct EncodedGateSupportPopulation {
 fn encode_gate_support_population(
     model: &WorldModel,
     samples: &[TransitionSample],
+    provenance: Option<&[V5SampleProvenance]>,
     device: &Device,
 ) -> Result<EncodedGateSupportPopulation> {
     let batch = batch_from_samples(samples, device)?;
     let (current, target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
-    let shuffled = shuffled_action_control_samples(samples);
-    let (shuffled_actions, shuffled_coords) = action_tensors_from_samples(&shuffled, device)?;
+    let shuffled = shuffled_action_control_population(samples, provenance)?;
+    let (shuffled_actions, shuffled_coords) =
+        action_tensors_from_samples(&shuffled.samples, device)?;
     Ok(EncodedGateSupportPopulation {
         batch,
         current,
@@ -2708,21 +2746,47 @@ pub fn evaluate_gate_support_with_content_masks(
     content_masks: Option<&[ContentMask]>,
     device: &Device,
 ) -> Result<GateSupportMetrics> {
-    evaluate_gate_support_impl(model, samples, content_masks, device, None)
+    evaluate_gate_support_impl(model, samples, content_masks, None, device, None)
+}
+
+/// Foundation-v2 gate evaluation with the exact V5 operator provenance needed
+/// to replay shuffled ACTION5/ACTION6 tuples on each target current board.
+pub fn evaluate_gate_support_with_v5_provenance(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    content_masks: &[ContentMask],
+    provenance: &[V5SampleProvenance],
+    device: &Device,
+) -> Result<GateSupportMetrics> {
+    evaluate_gate_support_impl(
+        model,
+        samples,
+        Some(content_masks),
+        Some(provenance),
+        device,
+        None,
+    )
 }
 
 fn evaluate_gate_support_impl(
     model: &WorldModel,
     samples: &[TransitionSample],
     content_masks: Option<&[ContentMask]>,
+    provenance: Option<&[V5SampleProvenance]>,
     device: &Device,
     encoded: Option<&EncodedGateSupportPopulation>,
 ) -> Result<GateSupportMetrics> {
     if content_masks.is_some_and(|masks| masks.len() != samples.len()) {
         bail!("gate content-mask rows do not match the sample count");
     }
-    let population_fingerprint =
-        format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(samples)?));
+    if provenance.is_some_and(|provenance| provenance.len() != samples.len()) {
+        bail!("gate V5 provenance rows do not match the sample count");
+    }
+    let population_bytes = match provenance {
+        Some(provenance) => serde_json::to_vec(&(samples, provenance))?,
+        None => serde_json::to_vec(samples)?,
+    };
+    let population_fingerprint = format!("sha256:{:x}", Sha256::digest(population_bytes));
     let content_mask_fingerprint = content_masks
         .map(|masks| {
             serde_json::to_vec(masks).map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
@@ -2742,7 +2806,7 @@ fn evaluate_gate_support_impl(
             shuffled_action_rows: 0,
             shuffled_action_eligible_rows: 0,
             shuffled_action_changed_tuples: 0,
-            shuffled_action_outcome_changing_tuples: None,
+            shuffled_action_outcome_changing_tuples: provenance.map(|_| 0),
             foreground_reconstruction_accuracy: None,
             one_step_changed_exact: None,
             one_step_full_exact: None,
@@ -2764,7 +2828,7 @@ fn evaluate_gate_support_impl(
     let encoded = if let Some(encoded) = encoded {
         encoded
     } else {
-        owned_encoded = encode_gate_support_population(model, samples, device)?;
+        owned_encoded = encode_gate_support_population(model, samples, provenance, device)?;
         &owned_encoded
     };
     let prediction = model
@@ -2775,13 +2839,11 @@ fn evaluate_gate_support_impl(
             &encoded.batch.goals,
         )?
         .y;
-    let shuffled_action_eligible_rows =
-        crate::p2::semantic_eval::shuffled_action_eligible_rows(samples);
-    let shuffled_action_changed_tuples = samples
-        .iter()
-        .zip(&encoded.shuffled)
-        .filter(|(factual, control)| factual.action != control.action)
-        .count();
+    let shuffled_action_eligible_rows = encoded.shuffled.eligible_rows;
+    let shuffled_action_changed_tuples = encoded.shuffled.changed_tuples(samples);
+    let shuffled_action_outcome_changing = encoded.shuffled.outcome_changing(samples);
+    let shuffled_action_outcome_changing_tuples =
+        encoded.shuffled.outcome_changing_tuples(samples);
     let shuffled_prediction = model
         .forward_from_latent(
             &encoded.current,
@@ -2842,14 +2904,15 @@ fn evaluate_gate_support_impl(
         improvement_fraction: improvement_fraction(&changed_learned, &changed_copy),
         shuffled_action_changed_pixel_ratio: shuffled_action_changed_pixel_ratio(
             samples,
-            &encoded.shuffled,
+            &encoded.shuffled.samples,
+            &shuffled_action_outcome_changing,
             &true_predictions,
             &shuffled_predictions,
         )?,
         shuffled_action_rows: samples.len(),
         shuffled_action_eligible_rows,
         shuffled_action_changed_tuples,
-        shuffled_action_outcome_changing_tuples: None,
+        shuffled_action_outcome_changing_tuples,
         foreground_reconstruction_accuracy: foreground_reconstruction_accuracy(
             samples,
             &target_reconstructions,
@@ -2883,7 +2946,11 @@ fn evaluate_gate_support_impl(
             content_masks,
             true,
         )?,
-        population_contract: "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks when supplied (provenance-origin rectangle reconstruction otherwise); action tuples use the maximum-change cyclic shuffle within provenance.source_kind, with ACTION6 rectangle-relative coordinates conjugated onto each target content rectangle; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without a counterfactual sidecar and the ratio excludes unchanged tuples; one encode batch plus true/shuffled forwards".into(),
+        population_contract: if provenance.is_some() {
+            "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use exact V5 masks; ACTION5/ACTION6 tuples use the maximum-change cyclic shuffle within provenance.source_kind, with ACTION6 rectangle-relative coordinates conjugated onto each target content rectangle; every shuffled tuple is replayed under the target row's recorded episode operator; total/eligible/genuinely changed/outcome-changing counts are explicit; the shuffled-action ratio includes only genuinely changed tuples whose counterfactual gameplay outcome differs from the factual next board; one encode batch plus true/shuffled forwards".into()
+        } else {
+            "caller-owned fixed selection-only transition set; board-changed rows are exactly noop==Some(false); status row 63 excluded; full exactness and primary false-edit rates use the composed copy-gate decode; raw counterparts are diagnostic; content false edits use provenance-origin rectangle reconstruction; action tuples use the maximum-change cyclic shuffle within provenance.source_kind, with ACTION6 rectangle-relative coordinates conjugated onto each target content rectangle; total/eligible/genuinely changed counts are explicit, while outcome-changing count is unavailable without V5 operator provenance and rows retain the historical tuple-difference ratio behavior; one encode batch plus true/shuffled forwards".into()
+        },
     })
 }
 
@@ -2961,16 +3028,18 @@ pub fn evaluate_mechanism_ablations(
     varmap: &VarMap,
     samples: &[TransitionSample],
     content_masks: Option<&[ContentMask]>,
+    provenance: Option<&[V5SampleProvenance]>,
     device: &Device,
 ) -> Result<MechanismAblationReport> {
     let encoded = (!samples.is_empty())
-        .then(|| encode_gate_support_population(model, samples, device))
+        .then(|| encode_gate_support_population(model, samples, provenance, device))
         .transpose()?;
     let evaluate_variant = |candidate: &WorldModel| {
         evaluate_gate_support_impl(
             candidate,
             samples,
             content_masks,
+            provenance,
             device,
             encoded.as_ref(),
         )
@@ -6752,8 +6821,12 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
             })
         })
         .transpose()?;
-    let (v5_holdout_gates, mechanism_ablations) = if let Some((gates, samples, masks)) =
-        foundation_holdout
+    let (v5_holdout_gates, mechanism_ablations) = if let Some((
+        gates,
+        samples,
+        masks,
+        provenance,
+    )) = foundation_holdout
     {
         let ablations = timed_eval_phase("mechanism_ablations", "v5_unseen_seed_7x7", || {
             evaluate_mechanism_ablations(
@@ -6761,6 +6834,7 @@ pub fn evaluate(cfg: &EvalConfig) -> Result<EvalReport> {
                 &varmap,
                 &samples,
                 Some(&masks),
+                Some(&provenance),
                 &device,
             )
         })?;
@@ -7141,6 +7215,78 @@ mod tests {
             },
             oracle_latent: None,
         })
+    }
+
+    #[test]
+    fn shuffled_action_ratio_excludes_known_outcome_equivalent_rows() -> Result<()> {
+        let samples = (0..32)
+            .map(|episode_id| {
+                action_diagnostic_sample(ArcAction::new(5, None, None)?, episode_id % 15)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shuffled = samples
+            .iter()
+            .map(|sample| {
+                let mut sample = sample.clone();
+                sample.action = ArcAction::new(6, Some(0), Some(0))?;
+                Ok(sample)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predictions = samples
+            .iter()
+            .map(|sample| sample.next.pixels.clone())
+            .collect::<Vec<_>>();
+        let outcome_changing = vec![Some(false); samples.len()];
+
+        assert_eq!(
+            shuffled_action_changed_pixel_ratio(
+                &samples,
+                &shuffled,
+                &outcome_changing,
+                &predictions,
+                &predictions,
+            )?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn perfect_counterfactual_oracle_has_a_low_shuffled_action_ratio() -> Result<()> {
+        let samples = (0..MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS as u64)
+            .map(|episode_id| {
+                action_diagnostic_sample(ArcAction::new(5, None, None)?, episode_id % 15)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shuffled = samples
+            .iter()
+            .map(|sample| {
+                let mut sample = sample.clone();
+                sample.action = ArcAction::new(6, Some(0), Some(0))?;
+                Ok(sample)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let factual_predictions = samples
+            .iter()
+            .map(|sample| sample.next.pixels.clone())
+            .collect::<Vec<_>>();
+        let counterfactual_predictions = samples
+            .iter()
+            .map(|sample| sample.current.pixels.clone())
+            .collect::<Vec<_>>();
+        let outcome_changing = vec![Some(true); samples.len()];
+
+        assert_eq!(
+            shuffled_action_changed_pixel_ratio(
+                &samples,
+                &shuffled,
+                &outcome_changing,
+                &factual_predictions,
+                &counterfactual_predictions,
+            )?,
+            Some(0.0)
+        );
+        Ok(())
     }
 
     fn rollout_fixture_sample(

@@ -11,9 +11,13 @@ use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
-    MixedStreamKind, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
+    MixedStreamKind, TransitionSample, V5DataSplit, V5SampleProvenance, FRAME_SIDE,
+    GOAL_FEATURES_DIM,
 };
-use crate::p2::eval::{evaluate_gate_support_with_content_masks, GateSupportMetrics};
+use crate::p2::eval::{
+    evaluate_gate_support_with_v5_provenance, GateSupportMetrics,
+    MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS,
+};
 use crate::p2::experiment::{
     ConsumerReadoutTopology, ExperimentRequest, ResolvedExperiment, SigregPopulation,
     SigregStatistic, TrainingRecipe,
@@ -525,7 +529,22 @@ pub fn foundation_v2_gate_evaluation(
     metrics: GateSupportMetrics,
     running_best: Option<f64>,
     composed_running_best: Option<f64>,
-) -> FoundationV2GateEvaluation {
+) -> Result<FoundationV2GateEvaluation> {
+    let outcome_changing_rows = metrics
+        .shuffled_action_outcome_changing_tuples
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "foundation-v2 shuffled-action gate has no counterfactual outcome coverage; \
+                 evaluate it with aligned V5 operator provenance"
+            )
+        })?;
+    if outcome_changing_rows < MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS {
+        bail!(
+            "foundation-v2 shuffled-action gate has only {outcome_changing_rows} \
+             outcome-changing tuples; at least {MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS} \
+             are required to certify action sensitivity"
+        );
+    }
     let current_exact = metrics.one_step_changed_exact;
     let running_best_after = match (running_best, current_exact) {
         (Some(best), Some(current)) => Some(best.max(current)),
@@ -568,7 +587,7 @@ pub fn foundation_v2_gate_evaluation(
                     .is_some_and(|value| value <= 0.95),
             measured: metrics.shuffled_action_changed_pixel_ratio,
             threshold: if warmup_done {
-                "<= 0.95".into()
+                "<= 0.95 on outcome-changing counterfactual rows (action-blind ~= 1.0)".into()
             } else {
                 "warmup PASS until step 4096".into()
             },
@@ -618,14 +637,14 @@ pub fn foundation_v2_gate_evaluation(
             },
         },
     ];
-    FoundationV2GateEvaluation {
+    Ok(FoundationV2GateEvaluation {
         step,
         metrics,
         running_best_before: running_best,
         running_best_after,
         gates,
         diagnostics,
-    }
+    })
 }
 
 /// Fail closed after the same named gate fails in the two latest evaluations.
@@ -2089,19 +2108,24 @@ struct FoundationV2TrainerState {
 pub struct GatePopulationIdentity {
     pub rows_sha256: String,
     pub masks_sha256: String,
+    #[serde(default)]
+    pub provenance_sha256: String,
     pub policy_schema: String,
 }
 
 /// Version of the in-trainer gate policy (thresholds, warmups, abort rule,
 /// shuffle construction). Bump on any change so a resumed run cannot compare
 /// new measurements against bests recorded under a different policy.
-const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v3";
-const FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v2";
+const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v4";
 
 fn foundation_v2_gate_population_identity(
     samples: &[TransitionSample],
     masks: &[ContentMask],
+    provenance: &[V5SampleProvenance],
 ) -> Result<GatePopulationIdentity> {
+    if samples.len() != masks.len() || samples.len() != provenance.len() {
+        bail!("gate population identity rows, masks, and provenance must align");
+    }
     let mut rows = Sha256::new();
     for sample in samples {
         let bytes = serde_json::to_vec(sample)?;
@@ -2114,9 +2138,16 @@ fn foundation_v2_gate_population_identity(
         mask_digest.update((bytes.len() as u64).to_le_bytes());
         mask_digest.update(&bytes);
     }
+    let mut provenance_digest = Sha256::new();
+    for provenance in provenance {
+        let bytes = serde_json::to_vec(provenance)?;
+        provenance_digest.update((bytes.len() as u64).to_le_bytes());
+        provenance_digest.update(&bytes);
+    }
     Ok(GatePopulationIdentity {
         rows_sha256: format!("sha256:{:x}", rows.finalize()),
         masks_sha256: format!("sha256:{:x}", mask_digest.finalize()),
+        provenance_sha256: format!("sha256:{:x}", provenance_digest.finalize()),
         policy_schema: FOUNDATION_V2_GATE_POLICY_SCHEMA.into(),
     })
 }
@@ -2126,16 +2157,6 @@ fn reconcile_foundation_v2_gate_population_identity(
     identity: GatePopulationIdentity,
 ) -> Result<()> {
     match &foundation.gate_population_identity {
-        Some(stored)
-            if stored.rows_sha256 == identity.rows_sha256
-                && stored.masks_sha256 == identity.masks_sha256
-                && stored.policy_schema == FOUNDATION_V2_COMPATIBLE_GATE_POLICY_SCHEMA =>
-        {
-            // v3 changes only gate interpretation over metrics already
-            // serialized in v2 history, so this migration does not cross
-            // gate populations.
-            foundation.gate_population_identity = Some(identity);
-        }
         Some(stored) if *stored != identity => bail!(
             "resumed gate population/policy identity mismatch: stored {:?} vs regenerated {:?}; best/collapse comparisons would span incomparable populations",
             stored,
@@ -7712,9 +7733,17 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .iter()
         .map(|sample| sample.content_mask.clone())
         .collect::<Vec<_>>();
+    let gate_provenance = gate_batch
+        .samples()
+        .iter()
+        .map(|sample| sample.provenance.clone())
+        .collect::<Vec<V5SampleProvenance>>();
     {
-        let identity =
-            foundation_v2_gate_population_identity(&gate_samples, &gate_content_masks)?;
+        let identity = foundation_v2_gate_population_identity(
+            &gate_samples,
+            &gate_content_masks,
+            &gate_provenance,
+        )?;
         let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
         reconcile_foundation_v2_gate_population_identity(foundation, identity)?;
     }
@@ -8067,10 +8096,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         let mut abort = false;
         if state.global_step.is_multiple_of(FOUNDATION_V2_GATE_EVERY) {
             let (metrics, mechanism_sample) = ema.with_eval_weights(&varmap, || {
-                let metrics = evaluate_gate_support_with_content_masks(
+                let metrics = evaluate_gate_support_with_v5_provenance(
                     &model,
                     &gate_samples,
-                    Some(&gate_content_masks),
+                    &gate_content_masks,
+                    &gate_provenance,
                     &device,
                 )?;
                 let mechanism_sample = foundation_v2_mechanism_sample(
@@ -8103,7 +8133,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 metrics,
                 prior_best,
                 prior_composed_best,
-            );
+            )?;
             improved_best = foundation_v2_evaluation_improves(
                 cfg.promotion_metric,
                 prior_best,
@@ -9460,6 +9490,7 @@ mod tests {
         let identity = GatePopulationIdentity {
             rows_sha256: "sha256:rows".into(),
             masks_sha256: "sha256:masks".into(),
+            provenance_sha256: "sha256:provenance".into(),
             policy_schema: FOUNDATION_V2_GATE_POLICY_SCHEMA.into(),
         };
         let mut fresh = checkpoint_foundation_state(vec![]);
