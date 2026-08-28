@@ -11,7 +11,7 @@ use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
-    MixedStreamKind, TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
+    MixedStreamKind, TransitionSample, V5DataSplit, V5Sample, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{evaluate_gate_support_with_content_masks, GateSupportMetrics};
 use crate::p2::experiment::{
@@ -2158,18 +2158,21 @@ fn default_training_population_hash() -> u64 {
     FNV1A64_OFFSET
 }
 
-/// Append one ordered row to the cryptographic training-content chain.
+/// Feed one ordered row into a cryptographic training-content digest.
 ///
 /// Objective revision 3 binds the exact mask sidecar and content origin, so
 /// published identities produced here differ from revision-2 runs even when
-/// their serialized `TransitionSample` rows are otherwise identical.
-fn training_content_hash_append(
-    previous: [u8; 32],
+/// their serialized `TransitionSample` rows are otherwise identical. The
+/// foundation-v2 loop now feeds this unchanged per-row byte layout into one
+/// digest per delivered batch, then chains that digest with
+/// `training_content_hash_append`. This intentionally changes its published
+/// identity once from a chain of rows to a chain of batches while preserving
+/// deterministic row order and mask/origin binding.
+fn training_content_digest_update(
+    digest: &mut Sha256,
     sample: &TransitionSample,
     content_mask: &ContentMask,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(previous);
+) {
     digest.update(sample.seed.to_le_bytes());
     digest.update(sample.episode_id.to_le_bytes());
     digest.update(sample.transition_index.to_le_bytes());
@@ -2201,13 +2204,50 @@ fn training_content_hash_append(
     digest.update(&sample.current.pixels);
     digest.update((sample.next.pixels.len() as u64).to_le_bytes());
     digest.update(&sample.next.pixels);
+}
+
+fn training_content_row_hash_append(
+    previous: [u8; 32],
+    sample: &TransitionSample,
+    content_mask: &ContentMask,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(previous);
+    training_content_digest_update(&mut digest, sample, content_mask);
     digest.finalize().into()
 }
 
-fn update_training_population(
+pub(crate) fn training_content_batch_digest<'a>(
+    samples: impl ExactSizeIterator<Item = &'a TransitionSample>,
+    content_masks: impl ExactSizeIterator<Item = &'a ContentMask>,
+) -> Result<[u8; 32]> {
+    if samples.len() != content_masks.len() {
+        bail!("training population rows and content masks differ in length");
+    }
+    let mut digest = Sha256::new();
+    for (sample, content_mask) in samples.zip(content_masks) {
+        training_content_digest_update(&mut digest, sample, content_mask);
+    }
+    Ok(digest.finalize().into())
+}
+
+/// Fold one delivered foundation-v2 batch into the persisted content chain.
+/// Only the previous chain and the worker-computed 32-byte batch digest are
+/// hashed on the training thread. Resuming continues from the persisted
+/// `previous` value, and ordered delivery makes the result independent of
+/// worker completion timing.
+pub(crate) fn training_content_hash_append(previous: [u8; 32], batch_digest: [u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(previous);
+    digest.update(batch_digest);
+    digest.finalize().into()
+}
+
+fn update_training_population<'a>(
     state: &mut TrainerState,
-    samples: &[TransitionSample],
-    content_masks: &[&ContentMask],
+    samples: impl ExactSizeIterator<Item = &'a TransitionSample>,
+    content_masks: impl ExactSizeIterator<Item = &'a ContentMask>,
+    content_batch_digest: Option<[u8; 32]>,
 ) -> Result<()> {
     if samples.len() != content_masks.len() {
         bail!("training population rows and content masks differ in length");
@@ -2220,9 +2260,15 @@ fn update_training_population(
         }
     }
 
-    for (sample, content_mask) in samples.iter().zip(content_masks) {
+    if let Some(batch_digest) = content_batch_digest {
         state.training_content_hash =
-            training_content_hash_append(state.training_content_hash, sample, content_mask);
+            training_content_hash_append(state.training_content_hash, batch_digest);
+    }
+    for (sample, content_mask) in samples.zip(content_masks) {
+        if content_batch_digest.is_none() {
+            state.training_content_hash =
+                training_content_row_hash_append(state.training_content_hash, sample, content_mask);
+        }
         bytes(
             &mut state.training_population_hash,
             &sample.seed.to_le_bytes(),
@@ -2505,8 +2551,24 @@ pub fn frames_to_indices(frames: &[ArcFrame], device: &Device) -> Result<Tensor>
     Tensor::from_vec(indices, (b, 1, FRAME_SIDE, FRAME_SIDE), device).map_err(Into::into)
 }
 
-fn sample_frames_to_indices(
-    samples: &[TransitionSample],
+trait TransitionSampleView: Sync {
+    fn transition_sample(&self) -> &TransitionSample;
+}
+
+impl TransitionSampleView for TransitionSample {
+    fn transition_sample(&self) -> &TransitionSample {
+        self
+    }
+}
+
+impl TransitionSampleView for V5Sample {
+    fn transition_sample(&self) -> &TransitionSample {
+        self.transition()
+    }
+}
+
+fn sample_frames_to_indices<T: TransitionSampleView>(
+    samples: &[T],
     next: bool,
     device: &Device,
 ) -> Result<Tensor> {
@@ -2519,6 +2581,7 @@ fn sample_frames_to_indices(
         .par_chunks_mut(pixels)
         .zip(samples.par_iter())
         .try_for_each(|(slot, sample)| -> Result<()> {
+            let sample = sample.transition_sample();
             let frame = if next { &sample.next } else { &sample.current };
             ensure_fixed_frame(frame)?;
             if let Some(&pix) = frame.pixels.iter().find(|&&p| p as usize >= PALETTE_SIZE) {
@@ -2531,8 +2594,8 @@ fn sample_frames_to_indices(
         .map_err(Into::into)
 }
 
-fn sample_frame_pair_to_indices(
-    samples: &[TransitionSample],
+fn sample_frame_pair_to_indices<T: TransitionSampleView>(
+    samples: &[T],
     device: &Device,
 ) -> (Result<Tensor>, Result<Tensor>) {
     // CUDA tensor construction shares one device stream. Building both frame
@@ -2572,10 +2635,18 @@ pub fn event_targets_and_mask(
     samples: &[TransitionSample],
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
+    event_targets_and_mask_from_rows(samples, device)
+}
+
+fn event_targets_and_mask_from_rows<T: TransitionSampleView>(
+    samples: &[T],
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     let b = samples.len();
     let mut targets = vec![0f32; b * DEFAULT_NUM_EVENTS];
     let mut mask = vec![0f32; b * DEFAULT_NUM_EVENTS];
     for (i, s) in samples.iter().enumerate() {
+        let s = s.transition_sample();
         let row = i * DEFAULT_NUM_EVENTS;
         for (j, opt) in [s.noop, s.goal_satisfied, s.goal_failed, s.exhausted]
             .into_iter()
@@ -2679,9 +2750,17 @@ pub fn action_tensors_from_samples(
     samples: &[TransitionSample],
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
+    action_tensors_from_rows(samples, device)
+}
+
+fn action_tensors_from_rows<T: TransitionSampleView>(
+    samples: &[T],
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     let actions: Vec<u32> = samples
         .par_iter()
         .map(|sample| {
+            let sample = sample.transition_sample();
             let id = sample.action.id as u32;
             if id >= ACTION_VOCAB as u32 {
                 bail!("action id {id} out of official range 0..{ACTION_VOCAB}");
@@ -2699,10 +2778,13 @@ pub fn action_tensors_from_samples(
     let actions = Tensor::from_vec(actions, (samples.len(),), device)?;
     let coords: Vec<f32> = samples
         .par_iter()
-        .map(|sample| match (sample.action.x, sample.action.y) {
-            (Some(x), Some(y)) => Ok([f32::from(x) / 63.0, f32::from(y) / 63.0]),
-            (None, None) => Ok([0.0, 0.0]),
-            _ => Err(anyhow::anyhow!("action coordinate pair is incomplete")),
+        .map(|sample| {
+            let sample = sample.transition_sample();
+            match (sample.action.x, sample.action.y) {
+                (Some(x), Some(y)) => Ok([f32::from(x) / 63.0, f32::from(y) / 63.0]),
+                (None, None) => Ok([0.0, 0.0]),
+                _ => Err(anyhow::anyhow!("action coordinate pair is incomplete")),
+            }
         })
         .collect::<Result<Vec<[f32; 2]>>>()?
         .into_iter()
@@ -2724,17 +2806,41 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         .all(|sample| sample.family.starts_with("factual_"))
         .then(|| FactualBatch::from_rows(samples))
         .transpose()?;
-    let rows = factual.as_ref().map_or(samples, FactualBatch::rows);
-    let (frames, next_frames) = sample_frame_pair_to_indices(rows, device);
+    if let Some(factual) = factual {
+        let mut batch = batch_from_rows(factual.rows(), device)?;
+        batch.factual = Some(factual);
+        return Ok(batch);
+    }
+    batch_from_rows(samples, device)
+}
+
+fn batch_from_rows<T: TransitionSampleView>(
+    samples: &[T],
+    device: &Device,
+) -> Result<BatchTensors> {
+    if samples.is_empty() {
+        bail!("empty batch");
+    }
+    for sample in samples {
+        sample.transition_sample().provenance.validate()?;
+    }
+    let (frames, next_frames) = sample_frame_pair_to_indices(samples, device);
     let frames = frames?;
     let next_frames = next_frames?;
-    let (actions, action_coords) = action_tensors_from_samples(rows, device)?;
-    let goals: Vec<f32> = rows
+    let (actions, action_coords) = action_tensors_from_rows(samples, device)?;
+    let goals: Vec<f32> = samples
         .iter()
-        .flat_map(|s| s.goal_features.values.iter().copied())
+        .flat_map(|sample| {
+            sample
+                .transition_sample()
+                .goal_features
+                .values
+                .iter()
+                .copied()
+        })
         .collect();
-    let goals = Tensor::from_vec(goals, (rows.len(), GOAL_FEATURES_DIM), device)?;
-    let (event_targets, event_mask) = event_targets_and_mask(rows, device)?;
+    let goals = Tensor::from_vec(goals, (samples.len(), GOAL_FEATURES_DIM), device)?;
+    let (event_targets, event_mask) = event_targets_and_mask_from_rows(samples, device)?;
     Ok(BatchTensors {
         frames,
         next_frames,
@@ -2743,7 +2849,7 @@ pub fn batch_from_samples(samples: &[TransitionSample], device: &Device) -> Resu
         goals,
         event_targets,
         event_mask,
-        factual,
+        factual: None,
     })
 }
 
@@ -4303,13 +4409,14 @@ pub fn split_ce_with_weighting(
         .map_err(Into::into)
 }
 
-pub(crate) fn latent_content_mask(
-    masks: &[&ContentMask],
+pub(crate) fn latent_content_mask<'a>(
+    masks: impl ExactSizeIterator<Item = &'a ContentMask>,
     latent_height: usize,
     latent_width: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    if masks.is_empty()
+    let batch_size = masks.len();
+    if batch_size == 0
         || latent_height == 0
         || latent_width == 0
         || !FRAME_SIDE.is_multiple_of(latent_height)
@@ -4319,7 +4426,7 @@ pub(crate) fn latent_content_mask(
     }
     let patch_height = FRAME_SIDE / latent_height;
     let patch_width = FRAME_SIDE / latent_width;
-    let mut values = Vec::with_capacity(masks.len() * latent_height * latent_width);
+    let mut values = Vec::with_capacity(batch_size * latent_height * latent_width);
     for mask in masks {
         if mask.values.len() != FRAME_SIDE * FRAME_SIDE {
             bail!("content mask is not fixed 64x64");
@@ -4337,12 +4444,8 @@ pub(crate) fn latent_content_mask(
             }
         }
     }
-    Tensor::from_vec(
-        values,
-        (masks.len(), 1, latent_height, latent_width),
-        device,
-    )
-    .map_err(Into::into)
+    Tensor::from_vec(values, (batch_size, 1, latent_height, latent_width), device)
+        .map_err(Into::into)
 }
 
 fn masked_spatial_huber(input: &Tensor, target: &Tensor, mask: &Tensor) -> Result<Tensor> {
@@ -4463,7 +4566,7 @@ fn foundation_v2_rollout_loss_inner(
         RecursionOpts::training(true),
     )?;
     let (_, _, height, width) = second_out.y.dims4()?;
-    let content_mask = latent_content_mask(&second_masks, height, width, device)?;
+    let content_mask = latent_content_mask(second_masks.iter().copied(), height, width, device)?;
     let spatial = masked_spatial_huber(&second_out.y, &target_h2, &content_mask)?;
     let predicted_canonical =
         model.canonical_representation(&second_out.y.broadcast_mul(&content_mask)?)?;
@@ -4579,11 +4682,27 @@ pub fn foundation_v2_training_loss(
     device: &Device,
     objective: FoundationV2ObjectiveConfig,
 ) -> Result<FoundationV2LossBreakdown> {
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    foundation_v2_training_loss_with_event_weights(
+        model,
+        mixed,
+        device,
+        objective,
+        &event_slot_weights,
+    )
+}
+
+fn foundation_v2_training_loss_with_event_weights(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+    objective: FoundationV2ObjectiveConfig,
+    event_slot_weights: &Tensor,
+) -> Result<FoundationV2LossBreakdown> {
     if !model.config().world_core_v4 || model.config().patch_size != PATCH_SIZE {
         bail!("foundation-v2 loss requires the patch-4 exact-decoder topology");
     }
-    let samples = mixed.transitions().cloned().collect::<Vec<_>>();
-    let batch = batch_from_samples(&samples, device)?;
+    let batch = batch_from_rows(mixed.samples(), device)?;
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_canonical = model.canonical_representation(&encoded.current)?;
     let out = model.full_v4_training_latents_from_encoded_state(
@@ -4598,22 +4717,22 @@ pub fn foundation_v2_training_loss(
     )?;
     let predicted_canonical = model.canonical_representation(&out.y)?;
     let (_, _, latent_height, latent_width) = out.y.dims4()?;
-    let content_masks = mixed.content_masks().collect::<Vec<_>>();
-    let latent_mask = latent_content_mask(&content_masks, latent_height, latent_width, device)?;
+    let latent_mask =
+        latent_content_mask(mixed.content_masks(), latent_height, latent_width, device)?;
     let content_current_canonical =
         model.canonical_representation(&encoded.current.broadcast_mul(&latent_mask)?)?;
     let content_target_canonical =
         model.canonical_representation(&encoded.next.broadcast_mul(&latent_mask)?)?;
     let content_predicted_canonical =
         model.canonical_representation(&out.y.broadcast_mul(&latent_mask)?)?;
-    let batch_size = samples.len();
+    let batch_size = mixed.samples().len();
     let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
-    let current_pixels = samples
-        .iter()
+    let current_pixels = mixed
+        .transitions()
         .flat_map(|sample| sample.current.pixels[..gameplay_pixels].iter().copied())
         .collect::<Vec<_>>();
-    let target_pixels = samples
-        .iter()
+    let target_pixels = mixed
+        .transitions()
         .flat_map(|sample| sample.next.pixels[..gameplay_pixels].iter().copied())
         .collect::<Vec<_>>();
     let content_values = mixed
@@ -4794,7 +4913,7 @@ pub fn foundation_v2_training_loss(
         let action_targets = Tensor::from_vec(
             inverse_rows
                 .iter()
-                .map(|&row| u32::from(samples[row as usize].action.id))
+                .map(|&row| u32::from(mixed.samples()[row as usize].transition().action.id))
                 .collect::<Vec<_>>(),
             (inverse_rows.len(),),
             device,
@@ -4804,7 +4923,8 @@ pub fn foundation_v2_training_loss(
             .iter()
             .enumerate()
             .filter_map(|(selected_row, &mixed_row)| {
-                (samples[mixed_row as usize].action.id == 6).then_some((selected_row, mixed_row))
+                (mixed.samples()[mixed_row as usize].transition().action.id == 6)
+                    .then_some((selected_row, mixed_row))
             })
             .collect::<Vec<_>>();
         if action6.is_empty() {
@@ -4823,7 +4943,7 @@ pub fn foundation_v2_training_loss(
                 action6
                     .iter()
                     .flat_map(|(_, mixed_row)| {
-                        let action = &samples[*mixed_row as usize].action;
+                        let action = &mixed.samples()[*mixed_row as usize].transition().action;
                         [
                             f32::from(action.x.expect("ACTION6 x")) / 63.0,
                             f32::from(action.y.expect("ACTION6 y")) / 63.0,
@@ -4857,7 +4977,7 @@ pub fn foundation_v2_training_loss(
         &event_logits,
         &batch.event_targets,
         &batch.event_mask,
-        Some(&event_slot_weight_tensor(device)?),
+        Some(event_slot_weights),
     )?;
     // Both projections above consumed this exact post-outer-step `out.y`.
     // Reuse their detached values for the observer targets instead of
@@ -7749,6 +7869,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         .as_ref()
         .expect("foundation-v2 state")
         .total_steps;
+    let event_slot_weights = event_slot_weight_tensor(&device)?;
     let mut data_prefetcher = if cfg.prefetch_batches {
         Some(MixedStreamBatchPrefetcher::new(
             stream_config.clone(),
@@ -7761,11 +7882,6 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     };
 
     loop {
-        let total_steps = state
-            .foundation_v2
-            .as_ref()
-            .expect("foundation-v2 state")
-            .total_steps;
         let complete = state.global_step >= total_steps as u64;
         if complete || PAUSE_REQUESTED.load(Ordering::SeqCst) {
             if let Some(prefetcher) = data_prefetcher.as_mut() {
@@ -7844,8 +7960,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             .as_ref()
             .and_then(RepresentativeUpdateCapture::measurement);
         let profile_measurement_span = profile_measurement.as_ref().and_then(ProfileRange::span_id);
-        let mixed = if let Some(prefetcher) = data_prefetcher.as_mut() {
-            let (batch_index, batch) = if let Some(profile) = &cg_profile {
+        let (mixed, content_batch_digest) = if let Some(prefetcher) = data_prefetcher.as_mut() {
+            let (batch_index, prepared) = if let Some(profile) = &cg_profile {
                 profile.synchronized_phase(
                     &device,
                     "prefetched_receive",
@@ -7862,31 +7978,31 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                     state.global_step
                 );
             }
-            batch
+            prepared.into_parts()
         } else {
             let progress = state.global_step as f32 / total_steps.max(1) as f32;
             if let Some(profile) = &cg_profile {
-                profile.synchronized_phase(
-                    &device,
-                    "generation",
-                    SpanKind::Module,
-                    None,
-                    || {
-                        compose_mixed_stream_batch(
-                            &stream_config,
-                            progress,
-                            state.global_step,
-                            V5DataSplit::Train,
-                        )
-                    },
-                )?
+                profile.synchronized_phase(&device, "generation", SpanKind::Module, None, || {
+                    let batch = compose_mixed_stream_batch(
+                        &stream_config,
+                        progress,
+                        state.global_step,
+                        V5DataSplit::Train,
+                    )?;
+                    let digest =
+                        training_content_batch_digest(batch.transitions(), batch.content_masks())?;
+                    Ok((batch, digest))
+                })?
             } else {
-                compose_mixed_stream_batch(
+                let batch = compose_mixed_stream_batch(
                     &stream_config,
                     progress,
                     state.global_step,
                     V5DataSplit::Train,
-                )?
+                )?;
+                let digest =
+                    training_content_batch_digest(batch.transitions(), batch.content_masks())?;
+                (batch, digest)
             }
         };
         let batch_event_census = mixed.event_label_census();
@@ -7902,9 +8018,12 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 total.positive[slot] += batch_event_census.positive[slot];
             }
         }
-        let consumed = mixed.transitions().cloned().collect::<Vec<_>>();
-        let consumed_masks = mixed.content_masks().collect::<Vec<_>>();
-        update_training_population(&mut state, &consumed, &consumed_masks)?;
+        update_training_population(
+            &mut state,
+            mixed.transitions(),
+            mixed.content_masks(),
+            Some(content_batch_digest),
+        )?;
         let (ep_weight, rollout_enabled) = {
             let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
             (foundation.ep_weight, foundation.rollout_enabled)
@@ -7927,10 +8046,24 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 "forward_loss",
                 SpanKind::Function,
                 Some(ExecutionStep::Forward),
-                || foundation_v2_training_loss(&model, &mixed, &device, objective),
+                || {
+                    foundation_v2_training_loss_with_event_weights(
+                        &model,
+                        &mixed,
+                        &device,
+                        objective,
+                        &event_slot_weights,
+                    )
+                },
             )?
         } else {
-            foundation_v2_training_loss(&model, &mixed, &device, objective)?
+            foundation_v2_training_loss_with_event_weights(
+                &model,
+                &mixed,
+                &device,
+                objective,
+                &event_slot_weights,
+            )?
         };
         if next_step.is_multiple_of(128) {
             // These two attribution stores are read-only. Their graphs are
@@ -8487,8 +8620,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 .iter()
                 .map(training_content_mask_from_provenance)
                 .collect::<Result<Vec<_>>>()?;
-            let content_mask_refs = content_masks.iter().collect::<Vec<_>>();
-            update_training_population(&mut state, &samples, &content_mask_refs)?;
+            update_training_population(&mut state, samples.iter(), content_masks.iter(), None)?;
             if micro == 0 && use_prefetch {
                 top_up_prefetch(
                     &mut prefetched_through_step,
@@ -9158,9 +9290,55 @@ mod tests {
         let mask = training_content_mask_from_provenance(&sample)?;
         let mut changed_mask = mask.clone();
         changed_mask.values[0] ^= 1;
-        let first = training_content_hash_append([0; 32], &sample, &mask);
-        let second = training_content_hash_append([0; 32], &sample, &changed_mask);
+        let first_digest =
+            training_content_batch_digest(std::iter::once(&sample), std::iter::once(&mask))?;
+        let second_digest = training_content_batch_digest(
+            std::iter::once(&sample),
+            std::iter::once(&changed_mask),
+        )?;
+        let first = training_content_hash_append([0; 32], first_digest);
+        let second = training_content_hash_append([0; 32], second_digest);
         assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_training_content_chain_resumes_at_batch_boundary() -> Result<()> {
+        let config = MixedStreamConfig {
+            batch_size: 20,
+            seed: 0xDA7A_0007,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        };
+        let total_steps = 5usize;
+        let digests = (0..total_steps as u64)
+            .map(|batch_index| {
+                let batch = compose_mixed_stream_batch(
+                    &config,
+                    batch_index as f32 / total_steps as f32,
+                    batch_index,
+                    V5DataSplit::Train,
+                )?;
+                training_content_batch_digest(batch.transitions(), batch.content_masks())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let uninterrupted = digests
+            .iter()
+            .copied()
+            .fold([0; 32], training_content_hash_append);
+
+        let paused = digests[..2]
+            .iter()
+            .copied()
+            .fold([0; 32], training_content_hash_append);
+        // TrainerState persists this field as the same fixed byte array. Round
+        // trip it before continuing so the test covers the checkpoint seam.
+        let persisted: [u8; 32] = serde_json::from_slice(&serde_json::to_vec(&paused)?)?;
+        let resumed = digests[2..]
+            .iter()
+            .copied()
+            .fold(persisted, training_content_hash_append);
+        assert_eq!(resumed, uninterrupted);
         Ok(())
     }
 
@@ -11461,6 +11639,10 @@ mod tests {
             read_json(&resumed.latest_checkpoint.join("trainer_state.json"))?;
         assert_eq!(resumed_state.global_step, full_state.global_step);
         assert_eq!(resumed_state.optimizer_step, full_state.optimizer_step);
+        assert_eq!(
+            resumed_state.training_content_hash,
+            full_state.training_content_hash
+        );
         lessons_match_within_eps(
             &resumed_state.completed_lessons,
             &full_state.completed_lessons,

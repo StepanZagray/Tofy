@@ -3566,9 +3566,8 @@ fn eval_one_batch(
                 .iter()
                 .map(provenance_content_mask)
                 .collect::<Result<Vec<_>>>()?;
-            let mask_refs = masks.iter().collect::<Vec<_>>();
             let latent_mask =
-                latent_content_mask(&mask_refs, latent_height, latent_width, device)?;
+                latent_content_mask(masks.iter(), latent_height, latent_width, device)?;
             let current = model
                 .canonical_representation(&current_z.broadcast_mul(&latent_mask)?)?
                 .to_dtype(DType::F32)?

@@ -4,7 +4,7 @@ use crate::domain::Split;
 use crate::p2::data::{
     compose_mixed_stream_batch, MixedStreamBatch, MixedStreamConfig, TransitionSample, V5DataSplit,
 };
-use crate::p2::train::collect_batch_uncached;
+use crate::p2::train::{collect_batch_uncached, training_content_batch_digest};
 use anyhow::{ensure, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -315,6 +315,20 @@ struct MixedStreamWorkQueue {
     notify: Condvar,
 }
 
+/// A deterministic mixed-stream batch plus the digest of its exact ordered
+/// training rows and content masks. Workers prepare both together so the
+/// training thread never re-hashes full frames.
+pub struct PreparedMixedStreamBatch {
+    batch: MixedStreamBatch,
+    training_content_digest: [u8; 32],
+}
+
+impl PreparedMixedStreamBatch {
+    pub fn into_parts(self) -> (MixedStreamBatch, [u8; 32]) {
+        (self.batch, self.training_content_digest)
+    }
+}
+
 /// Ordered, bounded foundation-v2 batch pipeline.
 ///
 /// Every worker composes from the immutable `(config, progress, batch_index,
@@ -324,8 +338,8 @@ pub struct MixedStreamBatchPrefetcher {
     cancelled: Arc<AtomicBool>,
     accepting: bool,
     work: Arc<MixedStreamWorkQueue>,
-    result_rx: Receiver<(u64, Result<MixedStreamBatch>)>,
-    ready: BTreeMap<u64, Result<MixedStreamBatch>>,
+    result_rx: Receiver<(u64, Result<PreparedMixedStreamBatch>)>,
+    ready: BTreeMap<u64, Result<PreparedMixedStreamBatch>>,
     workers: Vec<JoinHandle<()>>,
     total_steps: u64,
     queue_depth: usize,
@@ -404,14 +418,24 @@ impl MixedStreamBatchPrefetcher {
                         break;
                     };
                     let progress = batch_index as f32 / total_steps_u64.max(1) as f32;
-                    let composed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        compose_mixed_stream_batch(
-                            &worker_config,
-                            progress,
-                            batch_index,
-                            V5DataSplit::Train,
-                        )
-                    }))
+                    let composed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<PreparedMixedStreamBatch> {
+                            let batch = compose_mixed_stream_batch(
+                                &worker_config,
+                                progress,
+                                batch_index,
+                                V5DataSplit::Train,
+                            )?;
+                            let training_content_digest = training_content_batch_digest(
+                                batch.transitions(),
+                                batch.content_masks(),
+                            )?;
+                            Ok(PreparedMixedStreamBatch {
+                                batch,
+                                training_content_digest,
+                            })
+                        },
+                    ))
                     .unwrap_or_else(|_| {
                         Err(anyhow::anyhow!(
                             "foundation-v2 data worker panicked at batch {batch_index}"
@@ -468,7 +492,7 @@ impl MixedStreamBatchPrefetcher {
         self.work.notify.notify_all();
     }
 
-    pub fn recv_next(&mut self) -> Result<(u64, MixedStreamBatch)> {
+    pub fn recv_next(&mut self) -> Result<(u64, PreparedMixedStreamBatch)> {
         loop {
             if let Some(batch) = self.ready.remove(&self.next_to_receive) {
                 let batch_index = self.next_to_receive;
@@ -519,6 +543,7 @@ impl Drop for MixedStreamBatchPrefetcher {
 mod mixed_stream_tests {
     use super::*;
     use crate::p2::data::foundation_v2_stream_schedule;
+    use crate::p2::train::training_content_hash_append;
 
     #[test]
     fn mixed_stream_prefetch_is_ordered_and_uses_index_progress_on_resume() -> Result<()> {
@@ -538,19 +563,57 @@ mod mixed_stream_tests {
             3,
         )?;
         for expected_index in first_batch_index..first_batch_index + 3 {
-            let (batch_index, prefetched) = prefetcher.recv_next()?;
+            let (batch_index, prepared) = prefetcher.recv_next()?;
             assert_eq!(batch_index, expected_index);
+            let (prefetched, prefetched_digest) = prepared.into_parts();
             let direct = compose_mixed_stream_batch(
                 &config,
                 expected_index as f32 / total_steps as f32,
                 expected_index,
                 V5DataSplit::Train,
             )?;
+            let direct_digest =
+                training_content_batch_digest(direct.transitions(), direct.content_masks())?;
             assert_eq!(prefetched, direct);
+            assert_eq!(prefetched_digest, direct_digest);
         }
         prefetcher.shutdown();
         assert!(prefetcher.workers.is_empty());
         assert!(!prefetcher.accepting);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_stream_prefetch_and_inline_content_chains_match() -> Result<()> {
+        let config = MixedStreamConfig {
+            batch_size: 20,
+            seed: 0xDA7A_0006,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        };
+        let total_steps = 6usize;
+        let mut prefetcher =
+            MixedStreamBatchPrefetcher::with_queue_depth(config.clone(), total_steps, 0, 3, 3)?;
+        let mut prefetched_chain = [0; 32];
+        let mut inline_chain = [0; 32];
+        for expected_index in 0..total_steps as u64 {
+            let (batch_index, prepared) = prefetcher.recv_next()?;
+            assert_eq!(batch_index, expected_index);
+            let (_, prefetched_digest) = prepared.into_parts();
+            prefetched_chain = training_content_hash_append(prefetched_chain, prefetched_digest);
+
+            let inline = compose_mixed_stream_batch(
+                &config,
+                expected_index as f32 / total_steps as f32,
+                expected_index,
+                V5DataSplit::Train,
+            )?;
+            let inline_digest =
+                training_content_batch_digest(inline.transitions(), inline.content_masks())?;
+            inline_chain = training_content_hash_append(inline_chain, inline_digest);
+        }
+        assert_eq!(prefetched_chain, inline_chain);
+        prefetcher.shutdown();
         Ok(())
     }
 }
