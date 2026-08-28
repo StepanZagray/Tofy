@@ -1,5 +1,6 @@
 pub mod agent_session;
 pub mod arc3;
+pub mod arc3_bridge;
 pub mod arc3_live;
 pub mod board_probe;
 pub mod branch_learning;
