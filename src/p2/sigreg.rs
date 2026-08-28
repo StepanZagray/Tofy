@@ -1,4 +1,4 @@
-//! Exact differentiable SIGReg (Epps–Pulley) matching official LeWorldModel.
+//! Differentiable SIGReg (Epps–Pulley) with reference trapezoidal integration.
 
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor, D};
@@ -40,9 +40,9 @@ fn sigreg_knots(num_points: usize) -> Vec<(f32, f32, f32)> {
             let t = index as f32 * dt;
             let normal_cf = (-0.5 * t * t).exp();
             let trapezoid = if index == 0 || index + 1 == knots {
-                dt
+                0.5 * dt
             } else {
-                2.0 * dt
+                dt
             };
             (t, normal_cf, trapezoid * normal_cf)
         })
@@ -70,7 +70,7 @@ fn validate_sigreg_args(
     Ok(())
 }
 
-/// Exact LeWorldModel SIGReg discretization.
+/// LeWorldModel SIGReg discretization using the true trapezoid rule.
 ///
 /// Accepts embeddings shaped `B×D` or `T×B×D`. Rank-3 inputs apply the
 /// statistic independently at each timestep over the batch. Projection
@@ -254,6 +254,18 @@ fn inverse_standard_normal(p: f64) -> f64 {
 mod tests {
     use super::*;
     use candle_core::{Device, Var};
+
+    #[test]
+    fn sigreg_knots_use_true_trapezoid_weights() {
+        let knots = sigreg_knots(4);
+        let normalized_weights = knots
+            .iter()
+            .map(|(_, normal_cf, weighted)| weighted / normal_cf)
+            .collect::<Vec<_>>();
+        for (actual, expected) in normalized_weights.iter().zip([0.5, 1.0, 1.0, 0.5]) {
+            assert!((actual - expected).abs() <= f32::EPSILON);
+        }
+    }
 
     #[test]
     fn sigreg_finite_for_bxd_and_txbxd() -> Result<()> {

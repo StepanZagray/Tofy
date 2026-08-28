@@ -86,8 +86,17 @@ impl ModelEma {
             .map(|(name, var)| Ok((name.clone(), var.as_tensor().copy()?.detach())))
             .collect::<Result<Vec<_>>>()?;
         self.eval_backup = Some(backup);
-        for ((_, model), (_, ema)) in model.iter().zip(&ema) {
-            model.set(&ema.as_tensor().detach())?;
+        for ((name, model), (_, ema)) in model.iter().zip(&ema) {
+            if let Err(install) = model.set(&ema.as_tensor().detach()) {
+                let install =
+                    anyhow::Error::from(install).context(format!("install EMA parameter {name}"));
+                return match self.restore_after_eval(model_vars) {
+                    Ok(()) => Err(install),
+                    Err(rollback) => Err(install.context(format!(
+                        "partial EMA install also failed to roll back training weights: {rollback:#}"
+                    ))),
+                };
+            }
         }
         Ok(())
     }
@@ -124,9 +133,13 @@ impl ModelEma {
         model_vars: &VarMap,
         evaluate: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        self.swap_in_for_eval(model_vars)?;
+        let mut guard = EvalWeightsGuard {
+            ema: self,
+            model_vars,
+        };
+        guard.install()?;
         let evaluated = evaluate();
-        let restored = self.restore_after_eval(model_vars);
+        let restored = guard.restore();
         match (evaluated, restored) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),
@@ -134,6 +147,29 @@ impl ModelEma {
             (Err(eval), Err(restore)) => Err(eval.context(format!(
                 "EMA evaluation also failed to restore training weights: {restore:#}"
             ))),
+        }
+    }
+}
+
+struct EvalWeightsGuard<'a> {
+    ema: &'a mut ModelEma,
+    model_vars: &'a VarMap,
+}
+
+impl EvalWeightsGuard<'_> {
+    fn install(&mut self) -> Result<()> {
+        self.ema.swap_in_for_eval(self.model_vars)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        self.ema.restore_after_eval(self.model_vars)
+    }
+}
+
+impl Drop for EvalWeightsGuard<'_> {
+    fn drop(&mut self) {
+        if self.ema.eval_backup.is_some() {
+            let _ = self.ema.restore_after_eval(self.model_vars);
         }
     }
 }
@@ -206,6 +242,12 @@ impl CheckpointHybridOptimizer {
         muon_momentum: f64,
         muon_rms_scale: f64,
     ) -> Result<Self> {
+        if !muon_momentum.is_finite() || !(0.0..1.0).contains(&muon_momentum) {
+            bail!("muon_momentum must be finite and in [0,1), got {muon_momentum}");
+        }
+        if !muon_rms_scale.is_finite() || muon_rms_scale <= 0.0 {
+            bail!("muon_rms_scale must be finite and > 0, got {muon_rms_scale}");
+        }
         let data = varmap.data().lock().unwrap();
         let mut names: Vec<_> = data.keys().cloned().collect();
         names.sort();
@@ -587,6 +629,86 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn ema_eval_error_restores_training_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let initial = Tensor::new(&[1.0f32, -2.0], &device)?;
+        let weight = Var::from_tensor(&initial)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("probe.weight".into(), weight.clone());
+        let mut ema = ModelEma::new(&varmap, 0.9)?;
+        let training = Tensor::new(&[3.0f32, 4.0], &device)?;
+        weight.set(&training)?;
+
+        let error = ema
+            .with_eval_weights(&varmap, || -> Result<()> {
+                assert_tensor_close(weight.as_tensor(), &initial, 0.0)?;
+                bail!("expected evaluation failure")
+            })
+            .expect_err("evaluation failure must propagate");
+
+        assert!(error.to_string().contains("expected evaluation failure"));
+        assert_tensor_close(weight.as_tensor(), &training, 0.0)?;
+        assert!(ema.eval_backup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ema_eval_panic_restores_training_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let initial = Tensor::new(&[1.0f32, -2.0], &device)?;
+        let weight = Var::from_tensor(&initial)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("probe.weight".into(), weight.clone());
+        let mut ema = ModelEma::new(&varmap, 0.9)?;
+        let training = Tensor::new(&[3.0f32, 4.0], &device)?;
+        weight.set(&training)?;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ema.with_eval_weights(&varmap, || -> Result<()> {
+                assert_tensor_close(weight.as_tensor(), &initial, 0.0)?;
+                panic!("expected evaluation panic")
+            });
+        }));
+
+        assert!(panic.is_err());
+        assert_tensor_close(weight.as_tensor(), &training, 0.0)?;
+        assert!(ema.eval_backup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_optimizer_rejects_invalid_muon_hyperparameters() {
+        let varmap = VarMap::new();
+        for (momentum, rms_scale, expected) in [
+            (f64::NAN, MUON_RMS_SCALE, "muon_momentum"),
+            (-0.1, MUON_RMS_SCALE, "muon_momentum"),
+            (1.0, MUON_RMS_SCALE, "muon_momentum"),
+            (0.95, f64::NAN, "muon_rms_scale"),
+            (0.95, 0.0, "muon_rms_scale"),
+            (0.95, -1.0, "muon_rms_scale"),
+        ] {
+            let error = match CheckpointHybridOptimizer::new(
+                &varmap,
+                ParamsAdamW::default(),
+                momentum,
+                rms_scale,
+            ) {
+                Ok(_) => panic!("invalid {expected} was accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]

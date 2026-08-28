@@ -4,7 +4,7 @@ use crate::domain::Split;
 use crate::gpu_lock::{GpuSessionGuard, TrainPidGuard};
 use crate::p2::branch_learning::{branch_learning_loss, BranchLearningAudit, BranchLearningConfig};
 use crate::p2::cg_profile::{
-    profile_bundle_is_complete, CaptureSpec, ProfileRange, ProfileState,
+    profile_bundle_is_complete, CaptureSpec, GradientClipState, ProfileRange, ProfileState,
     RepresentativeUpdateCapture,
 };
 use crate::p2::consumer_transition::ConsumerTransition;
@@ -1154,6 +1154,12 @@ impl TrainConfig {
         }
         if !(self.weight_decay.is_finite() && self.weight_decay >= 0.0) {
             bail!("weight_decay must be finite and >= 0");
+        }
+        if !self.muon_momentum.is_finite() || !(0.0..1.0).contains(&self.muon_momentum) {
+            bail!("muon_momentum must be finite and in [0,1)");
+        }
+        if !self.muon_rms_scale.is_finite() || self.muon_rms_scale <= 0.0 {
+            bail!("muon_rms_scale must be finite and > 0");
         }
         for (name, weight) in [
             ("sigreg_weight", self.sigreg_weight),
@@ -2677,6 +2683,16 @@ pub fn scheduled_episode_start(
         .wrapping_mul(grad_accum as u64)
         .wrapping_add(micro as u64);
     splitmix64(seed ^ 0x5EED_E001 ^ slot)
+}
+
+fn legacy_sigreg_projection_seed(
+    seed: u64,
+    effective_step: u64,
+    grad_accum: usize,
+    micro: usize,
+) -> u64 {
+    seed.wrapping_add(effective_step.wrapping_mul(grad_accum as u64))
+        .wrapping_add(micro as u64)
 }
 
 pub(crate) fn collect_batch_uncached(
@@ -7361,7 +7377,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 "gradients",
                 SpanKind::Module,
                 Some(ExecutionStep::Backward),
-                || profile.record_gradients(&varmap, &grads),
+                || profile.record_gradients(&varmap, &grads, GradientClipState::PreClip),
             )?;
         }
         // ADR 0003's documented approximation: the adaptive controller bounds
@@ -7740,7 +7756,6 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         let profile_measurement = cg_profile.measurement();
         let prof = profile.enabled();
         let accum = cfg.grad_accum.max(1);
-        let sigreg_seed = cfg.seed.wrapping_add(state.global_step);
         let loss_weights =
             lesson_loss_weights(lesson, cfg, state.step_in_lesson, state.global_step);
         let depth = sample_recursion_depth(cfg, state.global_step);
@@ -7878,7 +7893,8 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                     Ok(staged)
                 },
             )?;
-            let micro_sigreg_seed = sigreg_seed.wrapping_add(micro as u64);
+            let micro_sigreg_seed =
+                legacy_sigreg_projection_seed(cfg.seed, state.global_step, accum, micro);
             let run_rollout = micro == 0
                 && loss_weights.rollout > 0.0
                 && matches!(lesson.as_str(), "sequential" | "retarget");
@@ -8217,7 +8233,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 "gradients",
                 SpanKind::Module,
                 Some(ExecutionStep::Backward),
-                || cg_profile.record_gradients(&varmap, &grads),
+                || cg_profile.record_gradients(&varmap, &grads, GradientClipState::PostClip),
             )?;
         }
         cg_profile.synchronized_phase(
@@ -10118,6 +10134,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sigreg_projection_seeds_stride_by_accumulation() {
+        let seed = 41;
+        let accum = 4;
+        let first = (0..accum)
+            .map(|micro| legacy_sigreg_projection_seed(seed, 7, accum, micro))
+            .collect::<Vec<_>>();
+        let second = (0..accum)
+            .map(|micro| legacy_sigreg_projection_seed(seed, 8, accum, micro))
+            .collect::<Vec<_>>();
+        assert_eq!(first, vec![69, 70, 71, 72]);
+        assert_eq!(second, vec![73, 74, 75, 76]);
+        assert!(first.iter().all(|value| !second.contains(value)));
+        assert_eq!(
+            legacy_sigreg_projection_seed(seed, 7, 1, 0),
+            seed.wrapping_add(7)
+        );
+    }
+
+    #[test]
+    fn train_config_rejects_invalid_muon_hyperparameters() {
+        for (momentum, rms_scale, expected) in [
+            (f64::NAN, MUON_RMS_SCALE, "muon_momentum"),
+            (-0.1, MUON_RMS_SCALE, "muon_momentum"),
+            (1.0, MUON_RMS_SCALE, "muon_momentum"),
+            (0.95, f64::NAN, "muon_rms_scale"),
+            (0.95, 0.0, "muon_rms_scale"),
+            (0.95, -1.0, "muon_rms_scale"),
+        ] {
+            let cfg = TrainConfig {
+                muon_momentum: momentum,
+                muon_rms_scale: rms_scale,
+                ..TrainConfig::default()
+            };
+            let error = cfg.validate().expect_err("invalid Muon config must reject");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
     fn scheduled_episode_ids_are_disjoint_per_microbatch() {
         let a = scheduled_episode_start(1, 5, 0, 2, false);
         let b = scheduled_episode_start(1, 5, 1, 2, false);
@@ -10259,6 +10314,19 @@ mod tests {
         assert!(evidence.health.coverage.forward_spans > 0);
         assert!(evidence.health.coverage.backward_spans > 0);
         assert!(evidence.health.coverage.optimizer_spans > 0);
+        let trace_events = fs::read_to_string(&artifacts.trace)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(trace_events.iter().any(|event| {
+            event.get("kind").and_then(serde_json::Value::as_str) == Some("gradient")
+                && event.get("root").and_then(serde_json::Value::as_str) == Some("vb/post_clip")
+        }));
+        assert!(trace_events.iter().any(|event| {
+            event.get("kind").and_then(serde_json::Value::as_str) == Some("tensor")
+                && event.get("label").and_then(serde_json::Value::as_str) == Some("loss.total")
+                && event.get("tensor_id").and_then(serde_json::Value::as_str) != Some("loss.total")
+        }));
 
         cfg.max_steps_this_run = None;
         cfg.resume = None;
@@ -10971,6 +11039,7 @@ mod tests {
             "seam/gate_logits",
         ];
         let mut seen = BTreeMap::new();
+        let mut saw_pre_clip_gradients = false;
         for line in fs::read_to_string(bundle.join("application.jsonl"))?.lines() {
             let event: serde_json::Value = serde_json::from_str(line)?;
             if event.get("kind").and_then(serde_json::Value::as_str) == Some("tensor_stats") {
@@ -10978,10 +11047,16 @@ mod tests {
                     seen.insert(label.to_string(), ());
                 }
             }
+            if event.get("kind").and_then(serde_json::Value::as_str) == Some("gradient")
+                && event.get("root").and_then(serde_json::Value::as_str) == Some("vb/pre_clip")
+            {
+                saw_pre_clip_gradients = true;
+            }
         }
         for label in required {
             assert!(seen.contains_key(label), "missing tensor stats for {label}");
         }
+        assert!(saw_pre_clip_gradients);
         fs::remove_dir_all(&root)?;
         Ok(())
     }

@@ -14,6 +14,21 @@ use crate::perf::NvtxRange;
 
 const ENTRYPOINT: &str = "tofy::p2::train::optimizer_update";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientClipState {
+    PreClip,
+    PostClip,
+}
+
+impl GradientClipState {
+    fn root(self) -> &'static str {
+        match self {
+            Self::PreClip => "vb/pre_clip",
+            Self::PostClip => "vb/post_clip",
+        }
+    }
+}
+
 pub fn profile_bundle_is_complete(output_dir: &Path, update: u64) -> bool {
     let directory = output_dir
         .join("profile")
@@ -251,8 +266,7 @@ impl RepresentativeUpdateCapture {
         let (Some(session), Some(guard)) = (self.session.as_ref(), range._candle.as_ref()) else {
             return Ok(());
         };
-        let mut capture = CandleCapture::from_tensor(tensor, step);
-        capture.tensor_id = name.to_string();
+        let capture = CandleCapture::from_tensor(tensor, step).with_label(name);
         candle::record_tensor(session, guard.id(), &capture)
     }
 
@@ -268,7 +282,12 @@ impl RepresentativeUpdateCapture {
         session.record_tensor_stats(&format!("s{}", guard.id().raw()), label, tensor)
     }
 
-    pub fn record_gradients(&self, varmap: &VarMap, grads: &GradStore) -> Result<()> {
+    pub fn record_gradients(
+        &self,
+        varmap: &VarMap,
+        grads: &GradStore,
+        clip_state: GradientClipState,
+    ) -> Result<()> {
         let Some(session) = self.session.as_ref() else {
             return Ok(());
         };
@@ -307,7 +326,7 @@ impl RepresentativeUpdateCapture {
                 Some(index) if norms[index] == 0.0 => (GradientState::Zero, Some(0.0)),
                 Some(index) => (GradientState::Present, Some(norms[index] as f64)),
             };
-            session.record_gradient("vb", name, state, norm)?;
+            session.record_gradient(clip_state.root(), name, state, norm)?;
         }
         Ok(())
     }
