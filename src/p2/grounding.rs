@@ -29,20 +29,24 @@ pub struct PatchGroundingLoss {
     pub unchanged_patches: usize,
 }
 
-fn ensure_composed_decode_finite(tensor: &Tensor, label: &str) -> Result<()> {
-    let tensor = tensor.to_dtype(DType::F32)?;
-    // Count a bounded 0/1 mask instead of summing the values themselves:
-    // finite f32 values can overflow a sum even when every element is valid.
-    let finite_count = tensor
-        .eq(&tensor)?
-        .to_dtype(DType::F32)?
-        .mul(&tensor.abs()?.le(f32::MAX)?.to_dtype(DType::F32)?)?
-        .sum_all()?
-        .to_scalar::<f32>()?;
-    ensure!(
-        finite_count == tensor.elem_count() as f32,
-        "composed decode received non-finite {label}"
-    );
+fn ensure_composed_decode_finite(tensors: &[(&Tensor, &str)]) -> Result<()> {
+    let sentinels = tensors
+        .iter()
+        .map(|(tensor, _)| -> candle_core::Result<Tensor> {
+            let tensor = tensor.to_dtype(DType::F32)?;
+            // finite - finite is exactly zero, including very large values;
+            // NaN and either infinity produce NaN, which survives the sum.
+            tensor.sub(&tensor)?.sum_all()?.reshape((1,))
+        })
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let sentinel_refs = sentinels.iter().collect::<Vec<_>>();
+    let values = Tensor::cat(&sentinel_refs, 0)?.to_vec1::<f32>()?;
+    for ((_, label), value) in tensors.iter().zip(values) {
+        ensure!(
+            value.is_finite(),
+            "composed decode received non-finite {label}"
+        );
+    }
     Ok(())
 }
 
@@ -289,9 +293,7 @@ impl ExactPatchGrounding {
         // Fail closed on numerical corruption: comparison ops treat NaN as
         // false, so a NaN gate or logit row would otherwise decode as a
         // spuriously valid copy and inflate copy-heavy exactness metrics.
-        for (tensor, label) in [(&logits, "gameplay logits"), (&gate, "copy gate")] {
-            ensure_composed_decode_finite(tensor, label)?;
-        }
+        ensure_composed_decode_finite(&[(&logits, "gameplay logits"), (&gate, "copy gate")])?;
         match self.composition {
             DecodeComposition::LegacyHardGate => {
                 let predicted_pixels = logits.argmax(D::Minus1)?;
@@ -673,11 +675,11 @@ mod tests {
     fn composed_decode_finiteness_check_does_not_overflow() -> Result<()> {
         let device = candle_core::Device::Cpu;
         let large_finite = Tensor::full(1e38f32, (1024,), &device)?;
-        ensure_composed_decode_finite(&large_finite, "test tensor")?;
+        ensure_composed_decode_finite(&[(&large_finite, "test tensor")])?;
 
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let poisoned = Tensor::from_vec(vec![1.0f32, value], (2,), &device)?;
-            assert!(ensure_composed_decode_finite(&poisoned, "test tensor").is_err());
+            assert!(ensure_composed_decode_finite(&[(&poisoned, "test tensor")]).is_err());
         }
         Ok(())
     }

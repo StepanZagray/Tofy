@@ -521,7 +521,7 @@ struct GridResidualBlock {
 
 #[derive(Clone)]
 struct ActionFilm {
-    gamma_delta: Tensor,
+    gamma: Tensor,
     beta: Tensor,
 }
 
@@ -530,7 +530,7 @@ impl ActionFilm {
         let (batch, channels, _, _) = latent.dims4()?;
         let zeros = Tensor::zeros((batch, channels, 1, 1), latent.dtype(), latent.device())?;
         Ok(Self {
-            gamma_delta: zeros.clone(),
+            gamma: zeros.ones_like()?,
             beta: zeros,
         })
     }
@@ -550,8 +550,9 @@ impl GridResidualBlock {
 
     fn forward(&self, h: &Tensor, film: &ActionFilm) -> Result<Tensor> {
         let hidden = self.c1.forward(h)?.silu()?;
-        let gamma = film.gamma_delta.affine(1.0, 1.0)?;
-        let hidden = hidden.broadcast_mul(&gamma)?.broadcast_add(&film.beta)?;
+        let hidden = hidden
+            .broadcast_mul(&film.gamma)?
+            .broadcast_add(&film.beta)?;
         let delta = self.c2.forward(&hidden)?;
         h.add(&delta).map_err(Into::into)
     }
@@ -1057,7 +1058,7 @@ impl WorldModel {
 
     /// Encode palette-index frames into the shared latent space.
     pub fn encode_state(&self, frames: &Tensor) -> Result<Tensor> {
-        let embedded = self.embed_frames(frames)?;
+        let embedded = self.embed_frames(frames, false)?;
         rms_norm_latent(&self.encoder.forward(&embedded, self.config.bf16_conv)?)
     }
 
@@ -1065,6 +1066,7 @@ impl WorldModel {
         &self,
         frames: &Tensor,
         next_frames: &Tensor,
+        status_already_empty: bool,
     ) -> Result<(Tensor, Tensor)> {
         let batch = frames.dim(0)?;
         if next_frames.dim(0)? != batch {
@@ -1075,7 +1077,7 @@ impl WorldModel {
             );
         }
         let both = Tensor::cat(&[frames, next_frames], 0)?;
-        let embedded = self.embed_frames(&both)?;
+        let embedded = self.embed_frames(&both, status_already_empty)?;
         let encoded = self.encoder.forward(&embedded, self.config.bf16_conv)?;
         let current = encoded.narrow(0, 0, batch)?;
         let next = encoded.narrow(0, batch, batch)?;
@@ -1088,7 +1090,7 @@ impl WorldModel {
         frames: &Tensor,
         next_frames: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (current, next) = self.encode_state_pair_raw(frames, next_frames)?;
+        let (current, next) = self.encode_state_pair_raw(frames, next_frames, false)?;
         Ok((rms_norm_latent(&current)?, rms_norm_latent(&next)?))
     }
 
@@ -1099,7 +1101,26 @@ impl WorldModel {
         frames: &Tensor,
         next_frames: &Tensor,
     ) -> Result<TrainingEncodedPair> {
-        let (current_raw, next_raw) = self.encode_state_pair_raw(frames, next_frames)?;
+        self.encode_state_pair_for_training_impl(frames, next_frames, false)
+    }
+
+    /// Paired training encode for host-staged EMPTY status rows.
+    pub fn encode_state_pair_for_training_staged(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+    ) -> Result<TrainingEncodedPair> {
+        self.encode_state_pair_for_training_impl(frames, next_frames, true)
+    }
+
+    fn encode_state_pair_for_training_impl(
+        &self,
+        frames: &Tensor,
+        next_frames: &Tensor,
+        status_already_empty: bool,
+    ) -> Result<TrainingEncodedPair> {
+        let (current_raw, next_raw) =
+            self.encode_state_pair_raw(frames, next_frames, status_already_empty)?;
         let projected = self
             .sigreg_projector
             .as_ref()
@@ -1131,11 +1152,10 @@ impl WorldModel {
         action_coords: &Tensor,
         _goal_features: &Tensor,
     ) -> Result<RepresentationDiagnosticOutput> {
-        let (current_raw, target_raw) = self.encode_state_pair_raw(frames, next_frames)?;
+        let (current_raw, target_raw) = self.encode_state_pair_raw(frames, next_frames, false)?;
         let current = rms_norm_latent(&current_raw)?;
         let target = rms_norm_latent(&target_raw)?;
-        let x = self.add_action(&current, actions, action_coords)?;
-        let film = self.action_film(actions, current.dim(0)?)?;
+        let (x, film) = self.prepare_action_conditioning(&current, None, actions, action_coords)?;
         let y_init = self.config.warm_start_y.then(|| current.clone());
         let recursion = self.run_latent_recursion(
             &x,
@@ -1202,7 +1222,7 @@ impl WorldModel {
         Ok(RepresentationDiagnosticOutput { seams })
     }
 
-    fn embed_frames(&self, frames: &Tensor) -> Result<Tensor> {
+    fn embed_frames(&self, frames: &Tensor, status_already_empty: bool) -> Result<Tensor> {
         let (b, c, h, w) = frames.dims4()?;
         if h != FRAME_SIDE || w != FRAME_SIDE {
             bail!("embed_frames: expected {FRAME_SIDE}x{FRAME_SIDE}, got {h}x{w}");
@@ -1219,7 +1239,9 @@ impl WorldModel {
         } else {
             bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
         };
-        if !(self.config.world_core_v2 || self.config.world_core_v4) {
+        if !(self.config.world_core_v2 || self.config.world_core_v4)
+            || (status_already_empty && c == 1)
+        {
             return Ok(embedded);
         }
 
@@ -1249,7 +1271,7 @@ impl WorldModel {
         self.add_action_with_canonical(state, None, actions, action_coords)
     }
 
-    fn action_film(&self, actions: &Tensor, batch: usize) -> Result<ActionFilm> {
+    fn action_embedding(&self, actions: &Tensor, batch: usize) -> Result<(Tensor, Tensor)> {
         let actions = match actions.rank() {
             1 => actions.clone(),
             2 if actions.dim(1)? == 1 => actions.reshape((batch,))?,
@@ -1262,14 +1284,17 @@ impl WorldModel {
             );
         }
         let embedding = self.action_emb.forward(&actions)?;
+        Ok((actions, embedding))
+    }
+
+    fn action_film_from_embedding(&self, embedding: &Tensor, batch: usize) -> Result<ActionFilm> {
         Ok(ActionFilm {
-            gamma_delta: self.action_film_gamma.forward(&embedding)?.reshape((
-                batch,
-                self.config.hidden_dim,
-                1,
-                1,
-            ))?,
-            beta: self.action_film_beta.forward(&embedding)?.reshape((
+            gamma: self
+                .action_film_gamma
+                .forward(embedding)?
+                .affine(1.0, 1.0)?
+                .reshape((batch, self.config.hidden_dim, 1, 1))?,
+            beta: self.action_film_beta.forward(embedding)?.reshape((
                 batch,
                 self.config.hidden_dim,
                 1,
@@ -1289,6 +1314,19 @@ impl WorldModel {
         action_coords: &Tensor,
     ) -> Result<Tensor> {
         let b = state.dim(0)?;
+        let (actions, embedding) = self.action_embedding(actions, b)?;
+        self.add_action_with_embedding(state, canonical, &actions, &embedding, action_coords)
+    }
+
+    fn add_action_with_embedding(
+        &self,
+        state: &Tensor,
+        canonical: Option<&Tensor>,
+        actions: &Tensor,
+        action_embedding: &Tensor,
+        action_coords: &Tensor,
+    ) -> Result<Tensor> {
+        let b = state.dim(0)?;
         let latent_grid = self.config.latent_grid();
         if state.dims4()? != (b, self.config.hidden_dim, latent_grid, latent_grid) {
             bail!(
@@ -1299,23 +1337,10 @@ impl WorldModel {
                 state.dims()
             );
         }
-        let actions = match actions.rank() {
-            1 => actions.clone(),
-            2 if actions.dim(1)? == 1 => actions.reshape((b,))?,
-            rank => bail!("actions must be shape [B] or [B,1], got rank {rank}"),
-        };
-        if actions.dim(0)? != b {
-            bail!(
-                "action batch {} does not match state batch {b}",
-                actions.dim(0)?
-            );
-        }
         if action_coords.dims2()? != (b, 2) {
             bail!("action_coords must have shape [B,2]");
         }
-        let action = self
-            .action_proj
-            .forward(&self.action_emb.forward(&actions)?)?;
+        let action = self.action_proj.forward(action_embedding)?;
         let action_bias = action.reshape((b, self.config.hidden_dim, 1, 1))?;
         let conditioned = state.broadcast_add(&action_bias)?;
         let coord_bias = if !self.config.spatial_action_field || self.config.spatial_action_residual
@@ -1349,7 +1374,7 @@ impl WorldModel {
                 .map_err(Into::into);
         }
 
-        let field = self.spatial_action_field(&actions, action_coords)?;
+        let field = self.spatial_action_field(actions, action_coords)?;
         let mut projection = self
             .spatial_action_proj
             .as_ref()
@@ -1373,6 +1398,21 @@ impl WorldModel {
         } else {
             conditioned.add(&projection).map_err(Into::into)
         }
+    }
+
+    fn prepare_action_conditioning(
+        &self,
+        state: &Tensor,
+        canonical: Option<&Tensor>,
+        actions: &Tensor,
+        action_coords: &Tensor,
+    ) -> Result<(Tensor, ActionFilm)> {
+        let batch = state.dim(0)?;
+        let (actions, embedding) = self.action_embedding(actions, batch)?;
+        let conditioned =
+            self.add_action_with_embedding(state, canonical, &actions, &embedding, action_coords)?;
+        let film = self.action_film_from_embedding(&embedding, batch)?;
+        Ok((conditioned, film))
     }
 
     /// ACTION6 coordinate conditioning over the latent grid.
@@ -1457,16 +1497,9 @@ impl WorldModel {
         action_coords: &Tensor,
         goal_features: &Tensor,
     ) -> Result<(Tensor, ActionFilm, Tensor, Option<Tensor>)> {
-        let state = if self.config.warm_start_y {
-            Some(self.encode_state(frames)?)
-        } else {
-            None
-        };
-        let x = match &state {
-            Some(s) => self.add_action(s, actions, action_coords)?,
-            None => self.encode_x(frames, actions, action_coords)?,
-        };
-        let film = self.action_film(actions, x.dim(0)?)?;
+        let encoded = self.encode_state(frames)?;
+        let (x, film) = self.prepare_action_conditioning(&encoded, None, actions, action_coords)?;
+        let state = self.config.warm_start_y.then(|| encoded.clone());
         let goal_h = self.project_goal(goal_features)?;
         Ok((x, film, goal_h, state))
     }
@@ -1546,7 +1579,7 @@ impl WorldModel {
         &self,
         x: &Tensor,
         y: &Tensor,
-        z: &Tensor,
+        z: Option<&Tensor>,
         film: &ActionFilm,
         inner_steps: usize,
         sigma: f64,
@@ -1559,7 +1592,7 @@ impl WorldModel {
                 self.config.inner_steps
             );
         }
-        let mut z = z.clone();
+        let mut z = z.cloned();
         let mut y = y.clone();
         let xy = if self.config.world_core_v4 {
             Some(x.add(&y)?)
@@ -1569,13 +1602,18 @@ impl WorldModel {
         for _ in 0..inner_steps {
             let step_seed = noise_seed_base.map(|s| s.wrapping_add(*noise_counter));
             *noise_counter = noise_counter.wrapping_add(1);
-            z = self.maybe_noise_z(&z, sigma, step_seed)?;
-            let inp = match &xy {
-                Some(xy) => xy.add(&z)?,
-                None => x.add(&y)?.add(&z)?,
+            z = z
+                .map(|z| self.maybe_noise_z(&z, sigma, step_seed))
+                .transpose()?;
+            let inp = match (&xy, &z) {
+                (Some(xy), Some(z)) => xy.add(z)?,
+                (Some(xy), None) => xy.clone(),
+                (None, Some(z)) => x.add(&y)?.add(z)?,
+                (None, None) => x.add(&y)?,
             };
-            z = self.block.forward(&inp, film)?;
+            z = Some(self.block.forward(&inp, film)?);
         }
+        let z = z.expect("inner_steps >= 1 initializes z");
         let inp = if self.config.world_core_v4 {
             xy.expect("Full V4 x+y was prepared").add(&z)?
         } else {
@@ -1612,7 +1650,11 @@ impl WorldModel {
             Some(y0) => y0,
             None => Tensor::zeros((b, c, hh, ww), x.dtype(), device)?,
         };
-        let mut z = Tensor::zeros((b, c, hh, ww), x.dtype(), device)?;
+        // At zero noise the mathematical initial state is absent: the first
+        // refinement consumes x+y directly and materializes z from its output.
+        let mut z = (sigma != 0.0)
+            .then(|| Tensor::zeros((b, c, hh, ww), x.dtype(), device))
+            .transpose()?;
         let mut steps = Vec::with_capacity(depth.outer_steps);
         let mut probes = if opts.record_probes {
             Vec::with_capacity(depth.outer_steps)
@@ -1629,7 +1671,7 @@ impl WorldModel {
             let (ny, nz) = self.deep_step(
                 x,
                 &y,
-                &z,
+                z.as_ref(),
                 film,
                 depth.inner_steps,
                 sigma,
@@ -1654,7 +1696,7 @@ impl WorldModel {
                     .clamp(-32.0, 32.0)?,
                 None => candidate,
             };
-            z = nz;
+            z = Some(nz);
             if let Some(y_before) = y_before {
                 probes.push(Self::probe_step(&y_before, &y, outer_idx)?);
             }
@@ -1888,8 +1930,8 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<ForwardOutput> {
-        let x = self.add_action(cur_state, actions, action_coords)?;
-        let film = self.action_film(actions, cur_state.dim(0)?)?;
+        let (x, film) =
+            self.prepare_action_conditioning(cur_state, None, actions, action_coords)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
             Some(cur_state.clone())
@@ -1924,8 +1966,8 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
-        let x = self.add_action(cur_state, actions, action_coords)?;
-        let film = self.action_film(actions, cur_state.dim(0)?)?;
+        let (x, film) =
+            self.prepare_action_conditioning(cur_state, None, actions, action_coords)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(
             &x,
@@ -1956,13 +1998,12 @@ impl WorldModel {
         if !self.config.world_core_v4 {
             bail!("Full V4 training recursion requires world_core_v4");
         }
-        let x = self.add_action_with_canonical(
+        let (x, film) = self.prepare_action_conditioning(
             cur_state,
             Some(current_canonical),
             actions,
             action_coords,
         )?;
-        let film = self.action_film(actions, cur_state.dim(0)?)?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(
             &x,
@@ -2046,8 +2087,7 @@ impl WorldModel {
         goal_features: &Tensor,
         depth: RecursionDepth,
     ) -> Result<ForwardOutput> {
-        let x = self.add_action(state, actions, action_coords)?;
-        let film = self.action_film(actions, state.dim(0)?)?;
+        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
             Some(state.clone())
@@ -2074,8 +2114,7 @@ impl WorldModel {
         action_coords: &Tensor,
         depth: RecursionDepth,
     ) -> Result<Tensor> {
-        let x = self.add_action(state, actions, action_coords)?;
-        let film = self.action_film(actions, state.dim(0)?)?;
+        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         Ok(self
             .run_latent_recursion(
@@ -2142,8 +2181,7 @@ impl WorldModel {
         depth: RecursionDepth,
         ptrm: PtrmConfig,
     ) -> Result<PtrmOutput> {
-        let x = self.add_action(state, actions, action_coords)?;
-        let film = self.action_film(actions, state.dim(0)?)?;
+        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords)?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
@@ -2253,8 +2291,7 @@ impl WorldModel {
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
-        let x = self.add_action(state, actions, action_coords)?;
-        let film = self.action_film(actions, state.dim(0)?)?;
+        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         self.ptrm_latent_trajectories(&x, &film, y_init, depth, ptrm)?
             .into_iter()
@@ -2701,6 +2738,49 @@ mod tests {
     }
 
     #[test]
+    fn staged_empty_status_pair_matches_post_embedding_replacement_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.world_core_v2 = true;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
+        reinit_varmap_deterministic(&varmap, 73)?;
+
+        let mut current = (0..2 * FRAME_SIDE * FRAME_SIDE)
+            .map(|index| (index % PALETTE_SIZE) as u8)
+            .collect::<Vec<_>>();
+        let mut next = current
+            .iter()
+            .map(|value| (usize::from(*value) + 3) as u8 % PALETTE_SIZE as u8)
+            .collect::<Vec<_>>();
+        let original_current =
+            Tensor::from_vec(current.clone(), (2, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+        let original_next =
+            Tensor::from_vec(next.clone(), (2, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+        for frame in current.chunks_mut(FRAME_SIDE * FRAME_SIDE) {
+            frame[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+        }
+        for frame in next.chunks_mut(FRAME_SIDE * FRAME_SIDE) {
+            frame[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+        }
+        let staged_current = Tensor::from_vec(current, (2, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+        let staged_next = Tensor::from_vec(next, (2, 1, FRAME_SIDE, FRAME_SIDE), &device)?;
+
+        let (legacy_current, legacy_next) =
+            model.encode_state_pair(&original_current, &original_next)?;
+        let staged = model.encode_state_pair_for_training_staged(&staged_current, &staged_next)?;
+        assert_eq!(
+            legacy_current.flatten_all()?.to_vec1::<f32>()?,
+            staged.current.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            legacy_next.flatten_all()?.to_vec1::<f32>()?,
+            staged.next.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn world_core_v2_latent_is_invariant_to_status_strip() -> Result<()> {
         let device = Device::Cpu;
         let mut cfg = tiny_cfg();
@@ -2772,6 +2852,52 @@ mod tests {
         assert!(
             y_norm > 1e-4,
             "recurrence should move y away from zero at init, got norm {y_norm}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_initial_z_is_bit_identical_to_explicit_zero_at_zero_noise() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.inner_steps = 2;
+        cfg.world_core_v4 = true;
+        cfg.spatial_action_field = true;
+        cfg.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
+        reinit_varmap_deterministic(&varmap, 89)?;
+        let grid = model.config.latent_grid();
+        let shape = (2, model.config.hidden_dim, grid, grid);
+        let elem_count = shape.0 * shape.1 * shape.2 * shape.3;
+        let x = Tensor::arange(0f32, elem_count as f32, &device)?
+            .affine(1.0 / 1024.0, -1.0)?
+            .reshape(shape)?;
+        let y = Tensor::zeros(shape, DType::F32, &device)?;
+        let actions = Tensor::new(&[1u32, 6], &device)?;
+        let (_, action_embedding) = model.action_embedding(&actions, 2)?;
+        let film = model.action_film_from_embedding(&action_embedding, 2)?;
+
+        let mut optimized_counter = 0;
+        let optimized =
+            model.deep_step(&x, &y, None, &film, 2, 0.0, None, &mut optimized_counter)?;
+
+        let mut legacy_z = Tensor::zeros(shape, DType::F32, &device)?;
+        let mut legacy_y = y.clone();
+        let xy = x.add(&legacy_y)?;
+        for _ in 0..2 {
+            let input = xy.add(&legacy_z)?;
+            legacy_z = model.block.forward(&input, &film)?;
+        }
+        legacy_y = model.block.forward(&xy.add(&legacy_z)?, &film)?;
+
+        assert_eq!(
+            optimized.0.flatten_all()?.to_vec1::<f32>()?,
+            legacy_y.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            optimized.1.flatten_all()?.to_vec1::<f32>()?,
+            legacy_z.flatten_all()?.to_vec1::<f32>()?
         );
         Ok(())
     }

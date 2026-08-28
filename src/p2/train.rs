@@ -2593,6 +2593,7 @@ impl TransitionSampleView for V5Sample {
 fn sample_frames_to_indices<T: TransitionSampleView>(
     samples: &[T],
     next: bool,
+    empty_status: bool,
     device: &Device,
 ) -> Result<Tensor> {
     if samples.is_empty() {
@@ -2611,6 +2612,9 @@ fn sample_frames_to_indices<T: TransitionSampleView>(
                 bail!("palette value {pix} out of 0..{PALETTE_SIZE}");
             }
             slot.copy_from_slice(&frame.pixels);
+            if empty_status {
+                slot[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+            }
             Ok(())
         })?;
     Tensor::from_vec(indices, (samples.len(), 1, FRAME_SIDE, FRAME_SIDE), device)
@@ -2619,6 +2623,7 @@ fn sample_frames_to_indices<T: TransitionSampleView>(
 
 fn sample_frame_pair_to_indices<T: TransitionSampleView>(
     samples: &[T],
+    empty_status: bool,
     device: &Device,
 ) -> (Result<Tensor>, Result<Tensor>) {
     // CUDA tensor construction shares one device stream. Building both frame
@@ -2628,13 +2633,13 @@ fn sample_frame_pair_to_indices<T: TransitionSampleView>(
     // the parallel path.
     if device.is_cuda() {
         (
-            sample_frames_to_indices(samples, false, device),
-            sample_frames_to_indices(samples, true, device),
+            sample_frames_to_indices(samples, false, empty_status, device),
+            sample_frames_to_indices(samples, true, empty_status, device),
         )
     } else {
         rayon::join(
-            || sample_frames_to_indices(samples, false, device),
-            || sample_frames_to_indices(samples, true, device),
+            || sample_frames_to_indices(samples, false, empty_status, device),
+            || sample_frames_to_indices(samples, true, empty_status, device),
         )
     }
 }
@@ -2689,6 +2694,9 @@ fn event_targets_and_mask_from_rows<T: TransitionSampleView>(
 pub struct BatchTensors {
     pub frames: Tensor,
     pub next_frames: Tensor,
+    /// Encoder inputs with the synthetic status row staged as EMPTY.
+    pub model_frames: Tensor,
+    pub model_next_frames: Tensor,
     pub actions: Tensor,
     /// Normalized `(x,y)` for ACTION6, zeros for simple actions.
     pub action_coords: Tensor,
@@ -2847,9 +2855,12 @@ fn batch_from_rows<T: TransitionSampleView>(
     for sample in samples {
         sample.transition_sample().provenance.validate()?;
     }
-    let (frames, next_frames) = sample_frame_pair_to_indices(samples, device);
+    let (frames, next_frames) = sample_frame_pair_to_indices(samples, false, device);
     let frames = frames?;
     let next_frames = next_frames?;
+    let (model_frames, model_next_frames) = sample_frame_pair_to_indices(samples, true, device);
+    let model_frames = model_frames?;
+    let model_next_frames = model_next_frames?;
     let (actions, action_coords) = action_tensors_from_rows(samples, device)?;
     let goals: Vec<f32> = samples
         .iter()
@@ -2867,6 +2878,8 @@ fn batch_from_rows<T: TransitionSampleView>(
     Ok(BatchTensors {
         frames,
         next_frames,
+        model_frames,
+        model_next_frames,
         actions,
         action_coords,
         goals,
@@ -2883,7 +2896,7 @@ pub fn ordered_trace_from_samples(
     if samples.len() < 2 {
         bail!("ordered trace requires at least two transitions");
     }
-    let (frames, next_frames) = sample_frame_pair_to_indices(samples, device);
+    let (frames, next_frames) = sample_frame_pair_to_indices(samples, false, device);
     let (actions, action_coords) = action_tensors_from_samples(samples, device)?;
     Ok(OrderedTraceTensors {
         frames: frames?,
@@ -4319,7 +4332,7 @@ fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
     let pixels = labels.elem_count();
     let selected = candle_nn::ops::softmax(logits, D::Minus1)?
         .reshape((pixels, PALETTE_SIZE))?
-        .gather(&labels.contiguous()?.flatten_all()?.unsqueeze(1)?, 1)?
+        .gather(&labels.flatten_all()?.unsqueeze(1)?, 1)?
         .reshape(labels.dims())?;
     selected
         .affine(0.99, 0.01 / PALETTE_SIZE as f64)?
@@ -4744,7 +4757,8 @@ fn foundation_v2_training_loss_with_event_weights(
         bail!("foundation-v2 loss requires the patch-4 exact-decoder topology");
     }
     let batch = batch_from_rows(mixed.samples(), device)?;
-    let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
+    let encoded = model
+        .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?;
     let current_canonical = model.canonical_representation(&encoded.current)?;
     let out = model.full_v4_training_latents_from_encoded_state(
         &encoded.current,
@@ -4815,12 +4829,14 @@ fn foundation_v2_training_loss_with_event_weights(
         .frames
         .narrow(2, 0, FRAME_SIDE - 1)?
         .squeeze(1)?
-        .to_dtype(DType::U32)?;
+        .to_dtype(DType::U32)?
+        .contiguous()?;
     let target_labels = batch
         .next_frames
         .narrow(2, 0, FRAME_SIDE - 1)?
         .squeeze(1)?
-        .to_dtype(DType::U32)?;
+        .to_dtype(DType::U32)?
+        .contiguous()?;
 
     let predicted_logits = model.exact_gameplay_logits_trainable(&out.y)?;
     let pred_per_pixel = foundation_v2_unimix_ce(&predicted_logits, &target_labels)?;
@@ -5163,8 +5179,10 @@ impl FullV4Objective<'_> {
             "objective.encode_pair",
             Some(ExecutionStep::Forward),
             || {
-                self.model
-                    .encode_state_pair_for_training(&self.batch.frames, &self.batch.next_frames)
+                self.model.encode_state_pair_for_training_staged(
+                    &self.batch.model_frames,
+                    &self.batch.model_next_frames,
+                )
             },
         )?;
         let current_canonical = self.phase(
@@ -9949,7 +9967,11 @@ mod tests {
         assert_eq!(batch.frames.dims(), &[2, 1, 64, 64]);
         let f0 = batch.frames.get(0)?;
         let pix = f0.flatten_all()?.to_vec1::<u8>()?;
+        let status_start = (FRAME_SIDE - 1) * FRAME_SIDE;
         assert!(pix.iter().all(|&v| v == 3));
+        let model_pix = batch.model_frames.get(0)?.flatten_all()?.to_vec1::<u8>()?;
+        assert_eq!(&model_pix[..status_start], &pix[..status_start]);
+        assert!(model_pix[status_start..].iter().all(|&v| v == 0));
 
         let targets = batch.event_targets.to_vec2::<f32>()?;
         let mask = batch.event_mask.to_vec2::<f32>()?;
