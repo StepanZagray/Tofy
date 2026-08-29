@@ -4,8 +4,9 @@
 //! the `p1` git branch.
 
 use crate::p2::cli::{
-    run_p2_arc3_eval, run_p2_arc3_live_eval, run_p2_eval, run_p2_train, P2Arc3EvalArgs,
-    P2Arc3LiveEvalArgs, P2EvalArgs, P2TrainArgs,
+    run_p2_arc3_eval, run_p2_arc3_live_eval, run_p2_bf16_bench, run_p2_bf16_drift, run_p2_eval,
+    run_p2_train, P2Arc3EvalArgs, P2Arc3LiveEvalArgs, P2Bf16BenchArgs, P2Bf16DriftArgs, P2EvalArgs,
+    P2TrainArgs,
 };
 use crate::p2::view::{run_p2_view, P2ViewArgs};
 use anyhow::Result;
@@ -26,6 +27,12 @@ enum Commands {
     /// P2: train the recursive world model through synthetic curriculum lessons
     #[command(name = "p2-train")]
     P2Train(Box<P2TrainArgs>),
+    /// P2: compare frozen-checkpoint F32 and recurrent-core BF16 numerics
+    #[command(name = "p2-bf16-drift")]
+    P2Bf16Drift(P2Bf16DriftArgs),
+    /// P2: benchmark warmed synchronized full updates with BF16 off/on
+    #[command(name = "p2-bf16-bench")]
+    P2Bf16Bench(P2Bf16BenchArgs),
     /// P2: held-out synthetic world-model and PTRM evaluation
     #[command(name = "p2-eval")]
     P2Eval(P2EvalArgs),
@@ -45,6 +52,8 @@ pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::P2Train(args) => run_p2_train(*args)?,
+        Commands::P2Bf16Drift(args) => run_p2_bf16_drift(args)?,
+        Commands::P2Bf16Bench(args) => run_p2_bf16_bench(args)?,
         Commands::P2Eval(args) => run_p2_eval(args)?,
         Commands::P2Arc3Eval(args) => run_p2_arc3_eval(args)?,
         Commands::P2Arc3LiveEval(args) => run_p2_arc3_live_eval(args)?,

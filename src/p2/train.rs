@@ -4383,6 +4383,212 @@ pub struct FoundationV2LossBreakdown {
     pub mechanism_seams: Option<FoundationV2MechanismSeams>,
 }
 
+pub const BF16_BENCHMARK_SCHEMA: &str = "p2.bf16_recurrent_core_benchmark.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16BenchmarkArm {
+    pub bf16_recurrent_core: bool,
+    pub median_step_ms: f64,
+    pub min_step_ms: f64,
+    pub max_step_ms: f64,
+    pub step_ms: Vec<f64>,
+    pub last_loss: f64,
+    pub rollout_fragments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16BenchmarkReport {
+    pub schema: String,
+    pub checkpoint: PathBuf,
+    pub device: String,
+    pub physical_batch: usize,
+    pub grad_accum: usize,
+    pub warmup_updates: usize,
+    pub measured_updates: usize,
+    /// Batch construction is excluded; each sample is one complete
+    /// forward/loss/backward/clip/optimizer/EMA update bounded by device syncs.
+    pub measured_region: String,
+    pub f32: Bf16BenchmarkArm,
+    pub bf16: Bf16BenchmarkArm,
+    /// `f32 median / bf16 median`; values above one favor the treatment.
+    pub speedup: f64,
+}
+
+fn median_f64(values: &[f64]) -> Result<f64> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        bail!("BF16 benchmark requires non-empty finite timing samples");
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    Ok(if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) * 0.5
+    } else {
+        sorted[middle]
+    })
+}
+
+fn benchmark_bf16_arm(
+    baseline_cfg: &TrainConfig,
+    checkpoint: &Path,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+    bf16_recurrent_core: bool,
+    warmup_updates: usize,
+    measured_updates: usize,
+) -> Result<Bf16BenchmarkArm> {
+    let mut cfg = baseline_cfg.clone();
+    cfg.bf16_recurrent_core = bf16_recurrent_core;
+    cfg.validate()?;
+    let varmap = VarMap::new();
+    let model = WorldModel::new(
+        cfg.model_config(),
+        VarBuilder::from_varmap(&varmap, DType::F32, device),
+    )?;
+    load_varmap_exact(&varmap, checkpoint)
+        .with_context(|| format!("load BF16 benchmark checkpoint {}", checkpoint.display()))?;
+    let mut optimizer = CheckpointHybridOptimizer::new(
+        &varmap,
+        adam_params(&cfg),
+        cfg.muon_momentum,
+        cfg.muon_rms_scale,
+    )?;
+    let mut ema = ModelEma::with_default_decay(&varmap)?;
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    let total_updates = warmup_updates + measured_updates;
+    let mut step_ms = Vec::with_capacity(measured_updates);
+    let mut last_loss = f64::NAN;
+    let mut rollout_fragments = 0usize;
+
+    for update in 0..total_updates {
+        sync_cuda_device(device)?;
+        let started = std::time::Instant::now();
+        let losses = foundation_v2_training_loss_with_event_weights(
+            &model,
+            mixed,
+            device,
+            FoundationV2ObjectiveConfig {
+                ep_weight: 0.01,
+                sigreg_projections: cfg.sigreg_projections,
+                sigreg_knots: cfg.sigreg_knots,
+                sigreg_seed: cfg.seed.wrapping_add(update as u64),
+                q_mse_threshold: cfg.q_mse_threshold,
+                rollout_enabled: true,
+                split_ce_weighting: cfg.split_ce_weighting,
+                split_ce_changed_budget: cfg.split_ce_changed_budget,
+                capture_mechanism_seams: false,
+            },
+            &event_slot_weights,
+        )?;
+        let total = losses.total.clone();
+        let mut grads = total.backward()?;
+        clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        let learning_rate = foundation_v2_wsd_learning_rate(
+            update + 1,
+            cfg.steps_per_lesson.max(total_updates),
+        );
+        optimizer.set_learning_rate(learning_rate)?;
+        optimizer.step(&grads)?;
+        ema.update(&varmap)?;
+        sync_cuda_device(device)?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        last_loss = f64::from(total.to_dtype(DType::F32)?.to_scalar::<f32>()?);
+        if !last_loss.is_finite() {
+            bail!("BF16 benchmark update {} produced non-finite loss", update + 1);
+        }
+        rollout_fragments = losses.rollout_fragments;
+        if update >= warmup_updates {
+            step_ms.push(elapsed_ms);
+        }
+        drop(grads);
+        drop(total);
+        drop(losses);
+    }
+
+    let median_step_ms = median_f64(&step_ms)?;
+    let min_step_ms = step_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_step_ms = step_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok(Bf16BenchmarkArm {
+        bf16_recurrent_core,
+        median_step_ms,
+        min_step_ms,
+        max_step_ms,
+        step_ms,
+        last_loss,
+        rollout_fragments,
+    })
+}
+
+/// Run the preregistered warmed throughput comparison from identical F32
+/// checkpoint weights and a single fixed foundation-v2 batch. This deliberately
+/// excludes data generation while retaining the complete training update.
+pub fn benchmark_bf16_recurrent_core(
+    baseline_cfg: &TrainConfig,
+    checkpoint: &Path,
+    device_spec: &str,
+    warmup_updates: usize,
+    measured_updates: usize,
+) -> Result<Bf16BenchmarkReport> {
+    if warmup_updates < 20 || measured_updates < 100 {
+        bail!(
+            "BF16 benchmark protocol requires at least 20 warmup and 100 measured updates"
+        );
+    }
+    if baseline_cfg.bf16_recurrent_core {
+        bail!("BF16 benchmark requires an F32 baseline config");
+    }
+    baseline_cfg.validate()?;
+    let device = resolve_device(device_spec)?;
+    let mixed = compose_mixed_stream_batch(
+        &MixedStreamConfig {
+            batch_size: baseline_cfg.physical_batch,
+            seed: baseline_cfg.seed,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        },
+        0.0,
+        0,
+        V5DataSplit::Train,
+    )?;
+    let f32 = benchmark_bf16_arm(
+        baseline_cfg,
+        checkpoint,
+        &mixed,
+        &device,
+        false,
+        warmup_updates,
+        measured_updates,
+    )?;
+    let bf16 = benchmark_bf16_arm(
+        baseline_cfg,
+        checkpoint,
+        &mixed,
+        &device,
+        true,
+        warmup_updates,
+        measured_updates,
+    )?;
+    let speedup = f32.median_step_ms / bf16.median_step_ms;
+    if !speedup.is_finite() {
+        bail!("BF16 benchmark produced non-finite speedup");
+    }
+    Ok(Bf16BenchmarkReport {
+        schema: BF16_BENCHMARK_SCHEMA.into(),
+        checkpoint: checkpoint.to_path_buf(),
+        device: device_spec.into(),
+        physical_batch: baseline_cfg.physical_batch,
+        grad_accum: baseline_cfg.grad_accum,
+        warmup_updates,
+        measured_updates,
+        measured_region:
+            "device-synchronized forward+loss+backward+clip+optimizer+ema; fixed batch".into(),
+        f32,
+        bf16,
+        speedup,
+    })
+}
+
 fn masked_mean_with_count(values: &Tensor, mask: &Tensor, count: usize) -> Result<Tensor> {
     if count == 0 {
         return values.zeros_like()?.sum_all().map_err(Into::into);

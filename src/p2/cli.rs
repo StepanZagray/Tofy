@@ -7,6 +7,9 @@ use crate::p2::arc3_live::{
     evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
     DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
 };
+use crate::p2::bf16_falsifier::{
+    compare_bf16_recurrent_core, run_bf16_benchmark, write_json_report,
+};
 use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
@@ -560,6 +563,98 @@ pub fn run_p2_train(args: P2TrainArgs) -> Result<()> {
             lesson.lesson, lesson.curriculum, lesson.mean_losses.total, lesson.mean_losses.rollout
         );
     }
+    Ok(())
+}
+
+/// Frozen-checkpoint F32-versus-BF16 recurrent-core drift comparison.
+#[derive(Debug, Clone, Args)]
+pub struct P2Bf16DriftArgs {
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+
+    #[arg(long)]
+    pub train_config: PathBuf,
+
+    #[arg(long, default_value = "cuda")]
+    pub device: String,
+
+    #[arg(long, default_value_t = 0xBF16_DA7A)]
+    pub seed: u64,
+
+    /// Fixed held-out rows. 128 supplies the H2 rollout activation premise.
+    #[arg(long, default_value_t = 128)]
+    pub batch_size: usize,
+
+    #[arg(long, default_value = "bf16-drift.json")]
+    pub output: PathBuf,
+}
+
+pub fn run_p2_bf16_drift(args: P2Bf16DriftArgs) -> Result<()> {
+    let report = compare_bf16_recurrent_core(
+        &args.train_config,
+        &args.checkpoint,
+        &args.device,
+        args.seed,
+        args.batch_size,
+    )?;
+    write_json_report(&args.output, &report)?;
+    println!(
+        "p2-bf16-drift latent_max={:.8} logit_max={:.8} changed_flips={}/{} composed_flips={}/{} f32_h2={:.8}/{} bf16_h2={:.8}/{} output={}",
+        report.latent_max_abs_drift,
+        report.logit_max_abs_drift,
+        report.changed_pixel_prediction_flips,
+        report.changed_pixels,
+        report.composed_decode_flips,
+        report.content_pixels,
+        report.f32_rollout_loss,
+        report.f32_rollout_fragments,
+        report.bf16_rollout_loss,
+        report.bf16_rollout_fragments,
+        args.output.display(),
+    );
+    Ok(())
+}
+
+/// Device-synchronized warmed full-update throughput comparison.
+#[derive(Debug, Clone, Args)]
+pub struct P2Bf16BenchArgs {
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+
+    #[arg(long)]
+    pub train_config: PathBuf,
+
+    #[arg(long, default_value = "cuda")]
+    pub device: String,
+
+    #[arg(long, default_value_t = 20)]
+    pub warmup_updates: usize,
+
+    #[arg(long, default_value_t = 100)]
+    pub measured_updates: usize,
+
+    #[arg(long, default_value = "bf16-benchmark.json")]
+    pub output: PathBuf,
+}
+
+pub fn run_p2_bf16_bench(args: P2Bf16BenchArgs) -> Result<()> {
+    let report = run_bf16_benchmark(
+        &args.train_config,
+        &args.checkpoint,
+        &args.device,
+        args.warmup_updates,
+        args.measured_updates,
+    )?;
+    write_json_report(&args.output, &report)?;
+    println!(
+        "p2-bf16-bench f32_median_ms={:.3} bf16_median_ms={:.3} speedup={:.4}x warmup={} measured={} output={}",
+        report.f32.median_step_ms,
+        report.bf16.median_step_ms,
+        report.speedup,
+        report.warmup_updates,
+        report.measured_updates,
+        args.output.display(),
+    );
     Ok(())
 }
 

@@ -593,11 +593,12 @@ impl GridResidualBlock {
         let config = *conv.config();
         let input = input.to_dtype(DType::BF16)?;
         let weight = conv.weight().to_dtype(DType::BF16)?;
-        // Candle's generic CPU conv lowers through a matmul implementation
-        // that currently rejects BF16. Round both already-quantized operands
-        // back to F32 there to emulate BF16 operands with F32 accumulation;
-        // CUDA keeps the actual BF16 convolution required by the treatment.
-        let (input, weight) = if input.device().is_cpu() {
+        // The vendored CPU tiled-im2col path still lowers BF16 through a
+        // matmul that rejects it. Preserve the treatment's BF16 operand and
+        // output rounding boundaries there while using F32 accumulation;
+        // CUDA executes the actual BF16 convolution through this same call.
+        let cpu_emulation = input.device().is_cpu();
+        let (input, weight) = if cpu_emulation {
             (input.to_dtype(DType::F32)?, weight.to_dtype(DType::F32)?)
         } else {
             (input, weight)
@@ -610,7 +611,11 @@ impl GridResidualBlock {
             config.groups,
             config.cudnn_fwd_algo,
         )?;
-        let output = output.to_dtype(DType::F32)?;
+        let output = if cpu_emulation {
+            output.to_dtype(DType::BF16)?.to_dtype(DType::F32)?
+        } else {
+            output.to_dtype(DType::F32)?
+        };
         match conv.bias() {
             None => Ok(output),
             Some(bias) => {
