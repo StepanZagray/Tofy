@@ -830,6 +830,10 @@ pub struct TrainConfig {
     /// BF16 conv encoder path (Phase B).
     #[serde(default)]
     pub bf16_conv: bool,
+    /// Preregistered recurrent-core-only BF16 convolution treatment. F32
+    /// master parameters and all recurrent state boundaries remain F32.
+    #[serde(default)]
+    pub bf16_recurrent_core: bool,
     /// Bootstrap ensemble size for eval uncertainty (Phase D).
     #[serde(default = "default_ensemble_members")]
     pub ensemble_members: usize,
@@ -1081,6 +1085,7 @@ impl Default for TrainConfig {
             prefix_weight: 0.0,
             reliability_weight: 0.0,
             bf16_conv: false,
+            bf16_recurrent_core: false,
             ensemble_members: 8,
             muon_momentum: 0.95,
             muon_rms_scale: MUON_RMS_SCALE,
@@ -1230,7 +1235,8 @@ impl TrainConfig {
             bail!("train_z_noise must be finite and >= 0");
         }
         self.branch_learning.validate(self.grad_accum)?;
-        let enabled_treatments = usize::from(self.copy_bypass_gate)
+        let enabled_treatments = usize::from(self.bf16_recurrent_core)
+            + usize::from(self.copy_bypass_gate)
             + usize::from(self.copy_gate_bias_prior.is_some())
             + usize::from(self.grid_scaled_action_impulse)
             + usize::from(self.decode_composition != DecodeComposition::LegacyHardGate)
@@ -1279,6 +1285,7 @@ impl TrainConfig {
             residual_y_update: self.residual_y_update,
             warm_start_y: self.warm_start_y,
             bf16_conv: self.bf16_conv,
+            bf16_recurrent_core: self.bf16_recurrent_core,
             sigreg_projector: self.sigreg_projector,
             sigreg_projector_dim: self.sigreg_projector_dim,
             spatial_action_field: self.spatial_action_field,
@@ -1342,6 +1349,7 @@ impl TrainConfig {
         self.muon_momentum = 0.95;
         self.muon_rms_scale = MUON_RMS_SCALE;
         self.bf16_conv = false;
+        self.bf16_recurrent_core = false;
         self.shuffled_episodes = true;
         self.world_core_v2 = false;
         self.world_core_v3 = false;
@@ -1433,6 +1441,7 @@ impl TrainConfig {
         // Preregistered model-treatment arms: caller-owned by design, recorded
         // in the training contract so a resume across arms fails closed. At
         // most one should be enabled per matched run.
+        canonical.bf16_recurrent_core = self.bf16_recurrent_core;
         canonical.copy_bypass_gate = self.copy_bypass_gate;
         canonical.copy_gate_bias_prior = self.copy_gate_bias_prior;
         canonical.grid_scaled_action_impulse = self.grid_scaled_action_impulse;
@@ -1485,6 +1494,7 @@ impl TrainConfig {
                 && self.muon_momentum == 0.95
                 && self.muon_rms_scale == MUON_RMS_SCALE
                 && !self.bf16_conv
+                && !self.bf16_recurrent_core
                 && self.shuffled_episodes,
             "fixed optimizer, precision, and episode-order contract",
         )?;
@@ -1904,6 +1914,8 @@ struct TrainingContract {
     prefix_weight: f64,
     reliability_weight: f64,
     bf16_conv: bool,
+    #[serde(default)]
+    bf16_recurrent_core: bool,
     sigreg_max_rows: usize,
     sigreg_target: SigregTarget,
     sigreg_temporal_window: usize,
@@ -2012,6 +2024,7 @@ impl From<&TrainConfig> for TrainingContract {
             prefix_weight: cfg.prefix_weight,
             reliability_weight: cfg.reliability_weight,
             bf16_conv: cfg.bf16_conv,
+            bf16_recurrent_core: cfg.bf16_recurrent_core,
             sigreg_max_rows: cfg.sigreg_max_rows,
             sigreg_target: cfg.sigreg_target,
             sigreg_temporal_window: cfg.sigreg_temporal_window,
@@ -4370,6 +4383,212 @@ pub struct FoundationV2LossBreakdown {
     pub mechanism_seams: Option<FoundationV2MechanismSeams>,
 }
 
+pub const BF16_BENCHMARK_SCHEMA: &str = "p2.bf16_recurrent_core_benchmark.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16BenchmarkArm {
+    pub bf16_recurrent_core: bool,
+    pub median_step_ms: f64,
+    pub min_step_ms: f64,
+    pub max_step_ms: f64,
+    pub step_ms: Vec<f64>,
+    pub last_loss: f64,
+    pub rollout_fragments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16BenchmarkReport {
+    pub schema: String,
+    pub checkpoint: PathBuf,
+    pub device: String,
+    pub physical_batch: usize,
+    pub grad_accum: usize,
+    pub warmup_updates: usize,
+    pub measured_updates: usize,
+    /// Batch construction is excluded; each sample is one complete
+    /// forward/loss/backward/clip/optimizer/EMA update bounded by device syncs.
+    pub measured_region: String,
+    pub f32: Bf16BenchmarkArm,
+    pub bf16: Bf16BenchmarkArm,
+    /// `f32 median / bf16 median`; values above one favor the treatment.
+    pub speedup: f64,
+}
+
+fn median_f64(values: &[f64]) -> Result<f64> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        bail!("BF16 benchmark requires non-empty finite timing samples");
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    Ok(if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) * 0.5
+    } else {
+        sorted[middle]
+    })
+}
+
+fn benchmark_bf16_arm(
+    baseline_cfg: &TrainConfig,
+    checkpoint: &Path,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+    bf16_recurrent_core: bool,
+    warmup_updates: usize,
+    measured_updates: usize,
+) -> Result<Bf16BenchmarkArm> {
+    let mut cfg = baseline_cfg.clone();
+    cfg.bf16_recurrent_core = bf16_recurrent_core;
+    cfg.validate()?;
+    let varmap = VarMap::new();
+    let model = WorldModel::new(
+        cfg.model_config(),
+        VarBuilder::from_varmap(&varmap, DType::F32, device),
+    )?;
+    load_varmap_exact(&varmap, checkpoint)
+        .with_context(|| format!("load BF16 benchmark checkpoint {}", checkpoint.display()))?;
+    let mut optimizer = CheckpointHybridOptimizer::new(
+        &varmap,
+        adam_params(&cfg),
+        cfg.muon_momentum,
+        cfg.muon_rms_scale,
+    )?;
+    let mut ema = ModelEma::with_default_decay(&varmap)?;
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    let total_updates = warmup_updates + measured_updates;
+    let mut step_ms = Vec::with_capacity(measured_updates);
+    let mut last_loss = f64::NAN;
+    let mut rollout_fragments = 0usize;
+
+    for update in 0..total_updates {
+        sync_cuda_device(device)?;
+        let started = std::time::Instant::now();
+        let losses = foundation_v2_training_loss_with_event_weights(
+            &model,
+            mixed,
+            device,
+            FoundationV2ObjectiveConfig {
+                ep_weight: 0.01,
+                sigreg_projections: cfg.sigreg_projections,
+                sigreg_knots: cfg.sigreg_knots,
+                sigreg_seed: cfg.seed.wrapping_add(update as u64),
+                q_mse_threshold: cfg.q_mse_threshold,
+                rollout_enabled: true,
+                split_ce_weighting: cfg.split_ce_weighting,
+                split_ce_changed_budget: cfg.split_ce_changed_budget,
+                capture_mechanism_seams: false,
+            },
+            &event_slot_weights,
+        )?;
+        let total = losses.total.clone();
+        let mut grads = total.backward()?;
+        clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
+        let learning_rate = foundation_v2_wsd_learning_rate(
+            update + 1,
+            cfg.steps_per_lesson.max(total_updates),
+        );
+        optimizer.set_learning_rate(learning_rate)?;
+        optimizer.step(&grads)?;
+        ema.update(&varmap)?;
+        sync_cuda_device(device)?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        last_loss = f64::from(total.to_dtype(DType::F32)?.to_scalar::<f32>()?);
+        if !last_loss.is_finite() {
+            bail!("BF16 benchmark update {} produced non-finite loss", update + 1);
+        }
+        rollout_fragments = losses.rollout_fragments;
+        if update >= warmup_updates {
+            step_ms.push(elapsed_ms);
+        }
+        drop(grads);
+        drop(total);
+        drop(losses);
+    }
+
+    let median_step_ms = median_f64(&step_ms)?;
+    let min_step_ms = step_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_step_ms = step_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok(Bf16BenchmarkArm {
+        bf16_recurrent_core,
+        median_step_ms,
+        min_step_ms,
+        max_step_ms,
+        step_ms,
+        last_loss,
+        rollout_fragments,
+    })
+}
+
+/// Run the preregistered warmed throughput comparison from identical F32
+/// checkpoint weights and a single fixed foundation-v2 batch. This deliberately
+/// excludes data generation while retaining the complete training update.
+pub fn benchmark_bf16_recurrent_core(
+    baseline_cfg: &TrainConfig,
+    checkpoint: &Path,
+    device_spec: &str,
+    warmup_updates: usize,
+    measured_updates: usize,
+) -> Result<Bf16BenchmarkReport> {
+    if warmup_updates < 20 || measured_updates < 100 {
+        bail!(
+            "BF16 benchmark protocol requires at least 20 warmup and 100 measured updates"
+        );
+    }
+    if baseline_cfg.bf16_recurrent_core {
+        bail!("BF16 benchmark requires an F32 baseline config");
+    }
+    baseline_cfg.validate()?;
+    let device = resolve_device(device_spec)?;
+    let mixed = compose_mixed_stream_batch(
+        &MixedStreamConfig {
+            batch_size: baseline_cfg.physical_batch,
+            seed: baseline_cfg.seed,
+            schedule: foundation_v2_stream_schedule,
+            ..MixedStreamConfig::default()
+        },
+        0.0,
+        0,
+        V5DataSplit::Train,
+    )?;
+    let f32 = benchmark_bf16_arm(
+        baseline_cfg,
+        checkpoint,
+        &mixed,
+        &device,
+        false,
+        warmup_updates,
+        measured_updates,
+    )?;
+    let bf16 = benchmark_bf16_arm(
+        baseline_cfg,
+        checkpoint,
+        &mixed,
+        &device,
+        true,
+        warmup_updates,
+        measured_updates,
+    )?;
+    let speedup = f32.median_step_ms / bf16.median_step_ms;
+    if !speedup.is_finite() {
+        bail!("BF16 benchmark produced non-finite speedup");
+    }
+    Ok(Bf16BenchmarkReport {
+        schema: BF16_BENCHMARK_SCHEMA.into(),
+        checkpoint: checkpoint.to_path_buf(),
+        device: device_spec.into(),
+        physical_batch: baseline_cfg.physical_batch,
+        grad_accum: baseline_cfg.grad_accum,
+        warmup_updates,
+        measured_updates,
+        measured_region:
+            "device-synchronized forward+loss+backward+clip+optimizer+ema; fixed batch".into(),
+        f32,
+        bf16,
+        speedup,
+    })
+}
+
 fn masked_mean_with_count(values: &Tensor, mask: &Tensor, count: usize) -> Result<Tensor> {
     if count == 0 {
         return values.zeros_like()?.sum_all().map_err(Into::into);
@@ -4577,6 +4796,25 @@ fn foundation_v2_rollout_loss(
     device: &Device,
 ) -> Result<(Tensor, usize)> {
     foundation_v2_rollout_loss_inner(model, mixed, batch, encoded, device, false)
+}
+
+/// Read-only H2 rollout seam used by the frozen-checkpoint BF16 falsifier.
+/// It deliberately evaluates only the rollout term, avoiding unrelated EP and
+/// observer work while preserving the production fragment floor and graph.
+pub fn foundation_v2_rollout_falsifier(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+) -> Result<(f64, usize)> {
+    let batch = batch_from_rows(mixed.samples(), device)?;
+    let encoded = model
+        .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?;
+    let (loss, fragments) = foundation_v2_rollout_loss(model, mixed, &batch, &encoded, device)?;
+    let value = f64::from(loss.to_dtype(DType::F32)?.to_scalar::<f32>()?);
+    if !value.is_finite() {
+        bail!("BF16 falsifier H2 rollout loss is non-finite");
+    }
+    Ok((value, fragments))
 }
 
 /// `detach_open_loop_input` exists only for the gradient-attribution premise
@@ -8096,7 +8334,9 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 hidden_dim: cfg.hidden_dim,
                 inner_steps: cfg.inner_steps,
                 outer_steps: cfg.outer_steps,
-                precision: if cfg.bf16_conv {
+                precision: if cfg.bf16_recurrent_core {
+                    "bf16-recurrent-core/f32-rest"
+                } else if cfg.bf16_conv {
                     "bf16-conv/f32-rest"
                 } else {
                     "f32"
@@ -8693,7 +8933,9 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             hidden_dim: cfg.hidden_dim,
             inner_steps: cfg.inner_steps,
             outer_steps: cfg.outer_steps,
-            precision: if cfg.bf16_conv {
+            precision: if cfg.bf16_recurrent_core {
+                "bf16-recurrent-core/f32-rest"
+            } else if cfg.bf16_conv {
                 "bf16-conv/f32-rest"
             } else {
                 "f32"
@@ -12097,6 +12339,9 @@ mod tests {
         cfg.bf16_conv = !cfg.bf16_conv;
         changed.push(("bf16_conv", cfg));
         let mut cfg = base.clone();
+        cfg.bf16_recurrent_core = !cfg.bf16_recurrent_core;
+        changed.push(("bf16_recurrent_core", cfg));
+        let mut cfg = base.clone();
         cfg.sigreg_max_rows += 1;
         changed.push(("sigreg_max_rows", cfg));
         let mut cfg = base.clone();
@@ -12720,6 +12965,7 @@ mod tests {
         cfg.apply_foundation_v2_recipe();
         cfg.seed = 3;
         cfg.physical_batch = 16;
+        cfg.bf16_recurrent_core = true;
         cfg.copy_bypass_gate = true;
         cfg.grid_scaled_action_impulse = true;
         cfg.copy_gate_bias_prior = Some(0.02);
@@ -12729,6 +12975,7 @@ mod tests {
         cfg.allow_multi_treatment_arm = true;
         cfg.validate()?;
         let model_cfg = cfg.model_config();
+        assert!(model_cfg.bf16_recurrent_core);
         assert!(model_cfg.copy_bypass_gate);
         assert!(model_cfg.grid_scaled_action_impulse);
         assert_eq!(model_cfg.copy_gate_bias_prior, Some(0.02));
@@ -12739,7 +12986,8 @@ mod tests {
         // A resume across arms must fail closed: every treatment field and
         // the waiver must individually break contract equality.
         let contract = TrainingContract::from(&cfg);
-        let variants: [fn(&mut TrainConfig); 6] = [
+        let variants: [fn(&mut TrainConfig); 7] = [
+            |c| c.bf16_recurrent_core = false,
             |c| c.copy_bypass_gate = false,
             |c| c.copy_gate_bias_prior = None,
             |c| c.grid_scaled_action_impulse = false,
