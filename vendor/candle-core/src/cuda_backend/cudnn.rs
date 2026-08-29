@@ -56,8 +56,8 @@ pub(crate) fn launch_conv2d<
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
     if T::DTYPE == crate::DType::BF16 {
-        // BF16 operands use an FP32 compute descriptor. Explicit tensor-op math keeps this path
-        // on native BF16 Tensor Cores instead of leaving the choice at cuDNN's default math mode.
+        // BF16 operands use an FP32 compute descriptor. Explicit tensor-op math requests native
+        // BF16 Tensor Core kernels instead of leaving the choice at cuDNN's default math mode.
         conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
     }
     let x_shape = [
@@ -158,7 +158,7 @@ pub(crate) fn launch_conv2d_bwd_filter<
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
     if T::DTYPE == crate::DType::BF16 {
-        // The descriptor compute type is FP32; tensor-op math selects native BF16 products.
+        // The descriptor compute type is FP32; tensor-op math requests native BF16 products.
         conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
     }
     let x_shape = [
@@ -253,7 +253,7 @@ pub(crate) fn launch_conv2d_bwd_data<
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
     if T::DTYPE == crate::DType::BF16 {
-        // The descriptor compute type is FP32; tensor-op math selects native BF16 products.
+        // The descriptor compute type is FP32; tensor-op math requests native BF16 products.
         conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
     }
     let dx_shape = [

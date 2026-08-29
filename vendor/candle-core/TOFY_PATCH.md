@@ -60,6 +60,13 @@ Run the A40 kernel/timing probe with:
 cargo run --release --features cudnn --example conv_kernel_probe -- --warmup 20 --iters 100
 ```
 
+The ignored parity tests can exercise either CUDA implementation explicitly:
+
+```console
+cargo test --no-default-features --features cuda --test bf16_conv_parity -- --ignored
+cargo test --no-default-features --features cudnn --test bf16_conv_parity -- --ignored
+```
+
 The probe binary is named `conv_kernel_probe`, benchmarks the Foundation-V2 recurrent shape,
 and synchronizes every forward/backward sample. Candle has no convolution-level TF32 toggle, so
 the F32 arm measures cuDNN's existing default math behavior; use an Nsight Systems trace of this

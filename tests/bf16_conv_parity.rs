@@ -57,10 +57,16 @@ fn evaluate(dtype: DType, device: &Device) -> Result<Evaluation> {
     let loss = output.to_dtype(DType::F32)?.sqr()?.sum_all()?;
     let gradients = loss.backward()?;
     device.synchronize()?;
+    let input_grad = gradients.get(&input).expect("input gradient");
+    let kernel_grad = gradients.get(&kernel).expect("kernel gradient");
+    // Conv backward follows Candle's same-dtype storage contract. A surrounding cast then
+    // promotes these gradients to the dtype of an F32 master, as checked separately below.
+    assert_eq!(input_grad.dtype(), dtype);
+    assert_eq!(kernel_grad.dtype(), dtype);
     Ok(Evaluation {
         output: f32_values(&output)?,
-        input_grad: f32_values(gradients.get(&input).expect("input gradient"))?,
-        kernel_grad: f32_values(gradients.get(&kernel).expect("kernel gradient"))?,
+        input_grad: f32_values(input_grad)?,
+        kernel_grad: f32_values(kernel_grad)?,
     })
 }
 
@@ -152,16 +158,16 @@ fn cpu_cast_chain_reaches_f32_masters() -> Result<()> {
     assert_cast_gradient_flow(&Device::Cpu)
 }
 
-#[cfg(feature = "cudnn")]
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires a CUDA device with BF16 support"]
-fn cudnn_bf16_conv_matches_f32_forward_and_backward() -> Result<()> {
+fn cuda_bf16_conv_matches_f32_forward_and_backward() -> Result<()> {
     assert_parity(&Device::new_cuda(0)?)
 }
 
-#[cfg(feature = "cudnn")]
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires a CUDA device with BF16 support"]
-fn cudnn_cast_chain_reaches_f32_masters() -> Result<()> {
+fn cuda_cast_chain_reaches_f32_masters() -> Result<()> {
     assert_cast_gradient_flow(&Device::new_cuda(0)?)
 }

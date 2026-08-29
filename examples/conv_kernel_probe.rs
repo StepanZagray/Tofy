@@ -26,7 +26,9 @@ struct Args {
 
 fn step(input: &Var, kernel: &Var, device: &Device) -> Result<()> {
     let output = input.conv2d(kernel, 1, 1, 1, 1)?;
-    let gradients = output.sum_all()?.backward()?;
+    // Candle seeds a non-scalar backward with an all-ones output gradient, avoiding an unrelated
+    // reduction kernel in the timed region while exercising both convolution gradients.
+    let gradients = output.backward()?;
     device.synchronize()?;
     black_box(gradients);
     Ok(())
