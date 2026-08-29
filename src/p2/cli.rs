@@ -3,6 +3,7 @@
 //! Defaults are tiny smoke settings and must not be treated as a research result.
 //! Wiring into the top-level CLI is owned by the primary agent.
 
+use crate::p2::arc3_bridge::{run_arc3_bridge, Arc3BridgeConfig, Arc3BridgeMode};
 use crate::p2::arc3_live::{
     evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
     DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
@@ -917,4 +918,45 @@ pub fn run_p2_arc3_live_eval(args: P2Arc3LiveEvalArgs) -> Result<()> {
         config.output.display(),
     );
     Ok(())
+}
+
+/// `p2-arc3-bridge` — connect the frozen ARC policy to a local toolkit process.
+#[derive(Debug, Clone, Args)]
+pub struct P2Arc3BridgeArgs {
+    #[arg(long, value_enum)]
+    pub mode: Arc3BridgeMode,
+
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+
+    #[arg(long)]
+    pub train_config: PathBuf,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long)]
+    pub recordings_dir: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub profile_eval: bool,
+
+    #[arg(long)]
+    pub seed: Option<u64>,
+}
+
+pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
+    run_arc3_bridge(&Arc3BridgeConfig {
+        mode: args.mode,
+        device: args.device,
+        checkpoint: args.checkpoint,
+        train_config: args.train_config,
+        output: args.output,
+        recordings_dir: args.recordings_dir,
+        profile_eval: args.profile_eval,
+        seed: args.seed,
+    })
 }

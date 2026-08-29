@@ -61,7 +61,8 @@ fn is_tofy_gpu_process(pid: u32) -> bool {
             cmd.contains("tofy")
                 && (cmd.contains("p2-train")
                     || cmd.contains("p2-eval")
-                    || cmd.contains("p2-arc3-live-eval"))
+                    || cmd.contains("p2-arc3-live-eval")
+                    || cmd.contains("p2-arc3-bridge"))
         })
         .unwrap_or(false)
 }
