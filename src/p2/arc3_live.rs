@@ -549,6 +549,7 @@ impl TryFrom<ApiObservation> for ArcObservation {
     type Error = anyhow::Error;
 
     fn try_from(value: ApiObservation) -> Result<Self> {
+        ensure!(!value.guid.is_empty(), "ARC response has empty guid");
         value.into_arc_observation(false)
     }
 }
@@ -1356,7 +1357,14 @@ impl LivePolicy for ModelPolicy<'_> {
         }
         drop(measurement);
         if let Some(capture) = profile.take() {
-            capture.finish()?;
+            if let Some(artifacts) = capture.finish()? {
+                candle_graph::verify_bundle(&artifacts.directory).with_context(|| {
+                    format!(
+                        "verify ARC profile bundle {}",
+                        artifacts.directory.display()
+                    )
+                })?;
+            }
         }
         Ok(decision)
     }
@@ -2760,6 +2768,24 @@ mod tests {
         assert_eq!(parsed.animation.len(), 2);
         assert_eq!(parsed.animation[0].pixel(0, 0), Some(1));
         assert_eq!(parsed.animation[1].pixel(0, 0), Some(7));
+    }
+
+    #[test]
+    fn live_api_observation_rejects_empty_guid() {
+        let api = ApiObservation {
+            game_id: "demo".into(),
+            guid: String::new(),
+            frame: vec![vec![vec![0]]],
+            full_reset: false,
+            state: "NOT_FINISHED".into(),
+            levels_completed: 0,
+            win_levels: 1,
+            available_actions: vec![1],
+        };
+        assert!(ArcObservation::try_from(api)
+            .unwrap_err()
+            .to_string()
+            .contains("empty guid"));
     }
 
     #[test]

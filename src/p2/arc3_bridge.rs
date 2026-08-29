@@ -218,12 +218,22 @@ impl<R: BufRead, W: Write> StdioArcApi<R, W> {
             self.fatal_error = Some("unexpected EOF while waiting for response".into());
             bail!("unexpected EOF while waiting for bridge response");
         }
-        let response: WireResponse = serde_json::from_str(&line)
-            .with_context(|| format!("parse bridge response line {line:?}"))?;
+        let response: WireResponse = match serde_json::from_str(&line) {
+            Ok(response) => response,
+            Err(error) => {
+                let message = format!("parse bridge response line {line:?}: {error}");
+                self.fatal_error = Some(message.clone());
+                bail!(message);
+            }
+        };
         match (response.ok, response.err) {
             (Some(ok), None) => Ok(Ok(ok)),
             (None, Some(error)) => Ok(Err(error)),
-            _ => bail!("bridge response must contain exactly one of ok or err"),
+            _ => {
+                let message = "bridge response must contain exactly one of ok or err";
+                self.fatal_error = Some(message.into());
+                bail!(message);
+            }
         }
     }
 
@@ -304,6 +314,7 @@ impl<R: BufRead, W: Write> ArcApi for StdioArcApi<R, W> {
         )?;
         let observation = parse_observation_payload(value).map_err(MutationError::Failed)?;
         if observation.game_id != game_id
+            || observation.guid.is_empty()
             || guid.is_some_and(|expected| observation.guid != expected)
         {
             return Err(MutationError::Ambiguous(AmbiguousMutation {
@@ -381,7 +392,7 @@ fn parse_observation_payload(value: Value) -> Result<ArcObservation> {
 }
 
 enum PendingServeAction {
-    Reset,
+    Reset { retry: bool },
     Action { action: ArcAction, telemetry: Value },
 }
 
@@ -389,6 +400,7 @@ struct ServeStream {
     recording: Option<LiveRecordingRun>,
     pending: Option<PendingServeAction>,
     levels_completed: u16,
+    policy_started: bool,
 }
 
 fn run_serve_loop<R: BufRead, W: Write, P: LivePolicy>(
@@ -474,17 +486,20 @@ fn serve_observation<P: LivePolicy>(
                 recording,
                 pending: None,
                 levels_completed: observation.levels_completed,
+                policy_started: false,
             },
         );
     }
     let stream = streams.get_mut(&key).expect("stream was inserted");
     if let Some(pending) = stream.pending.take() {
         match pending {
-            PendingServeAction::Reset => {
+            PendingServeAction::Reset { retry } => {
                 if let Some(recording) = stream.recording.as_mut() {
                     recording.push_reset(&observation)?;
                 }
-                policy.on_reset_retry("serve_reset");
+                if retry {
+                    policy.on_reset_retry("serve_game_over");
+                }
             }
             PendingServeAction::Action { action, telemetry } => {
                 if let Some(recording) = stream.recording.as_mut() {
@@ -498,8 +513,22 @@ fn serve_observation<P: LivePolicy>(
     }
     stream.levels_completed = observation.levels_completed;
 
+    if !stream.policy_started && observation.state == "NOT_FINISHED" {
+        policy.on_game_start(&observation.game_id);
+        stream.policy_started = true;
+    }
+
     if observation.terminal() {
-        stream.pending = Some(PendingServeAction::Reset);
+        let retry = observation.state == "GAME_OVER";
+        if !retry && stream.policy_started {
+            policy.on_game_end(if observation.state == "WIN" {
+                "completed"
+            } else {
+                "serve_terminal"
+            });
+            stream.policy_started = false;
+        }
+        stream.pending = Some(PendingServeAction::Reset { retry });
         return Ok(json!({
             "ok": {
                 "action_id": 0,
@@ -540,11 +569,18 @@ fn finish_serve_session<P: LivePolicy>(
     policy: &mut P,
 ) -> Result<()> {
     for stream in streams.values_mut() {
+        if stream.policy_started {
+            policy.on_game_end("serve_session_finished");
+            stream.policy_started = false;
+        }
+    }
+    policy.finish_session()?;
+    for stream in streams.values_mut() {
         if let Some(recording) = stream.recording.take() {
             recording.finish()?;
         }
     }
-    policy.finish_session()
+    Ok(())
 }
 
 fn write_serve_error(writer: &mut impl Write, message: impl Into<String>) -> Result<()> {
@@ -648,6 +684,20 @@ mod tests {
             Err(MutationError::Ambiguous(_))
         ));
         assert!(api.list_games().is_err());
+        assert!(api
+            .take_fatal_error()
+            .is_some_and(|error| error.contains("parse bridge response")));
+
+        let empty_guid = wire_observation("game", "", "NOT_FINISHED", &[1]);
+        let mut api = StdioArcApi::new(
+            response_lines(&[json!({ "ok": { "observation": empty_guid } })]),
+            Vec::new(),
+        );
+        assert!(matches!(
+            api.reset("game", "card", None),
+            Err(MutationError::Ambiguous(_))
+        ));
+        assert!(api.take_fatal_error().is_none());
         Ok(())
     }
 
@@ -743,6 +793,74 @@ mod tests {
                 candidate_count: 1,
             })
         }
+    }
+
+    struct LifecyclePolicy {
+        events: Vec<String>,
+    }
+
+    impl LivePolicy for LifecyclePolicy {
+        fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+            let mut first = FirstPolicy;
+            first.choose_action(observation)
+        }
+
+        fn on_game_start(&mut self, game_id: &str) {
+            self.events.push(format!("start:{game_id}"));
+        }
+
+        fn on_reset_retry(&mut self, reason: &str) {
+            self.events.push(format!("retry:{reason}"));
+        }
+
+        fn on_game_end(&mut self, outcome: &str) {
+            self.events.push(format!("end:{outcome}"));
+        }
+    }
+
+    #[test]
+    fn serve_loop_preserves_live_policy_lifecycle_callbacks() -> Result<()> {
+        let input = response_lines(&[
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_STARTED", &[])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "GAME_OVER", &[])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "WIN", &[])
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = LifecyclePolicy { events: Vec::new() };
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        let lines = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(lines[1]["ok"]["action_id"], 0);
+        assert_eq!(lines[2]["ok"]["action_id"], 1);
+        assert_eq!(lines[3]["ok"]["action_id"], 0);
+        assert_eq!(lines[4]["ok"]["action_id"], 1);
+        assert_eq!(lines[5]["ok"]["action_id"], 0);
+        assert_eq!(lines[6], json!({ "ok": { "bye": true } }));
+        assert_eq!(
+            policy.events,
+            ["start:game", "retry:serve_game_over", "end:completed"]
+        );
+        Ok(())
     }
 
     #[test]
