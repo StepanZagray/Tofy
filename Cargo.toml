@@ -46,6 +46,11 @@ criterion = "0.5"
 name = "p2_hotpath"
 harness = false
 
+[[example]]
+name = "conv_kernel_probe"
+path = "examples/conv_kernel_probe.rs"
+required-features = ["cudnn"]
+
 # candle 0.11.0 only routes *forward* conv through cuDNN; weight grads are rewritten
 # as a pathological forward conv. This patch adds ConvBackwardFilter / ConvBackwardData.
 [patch.crates-io]

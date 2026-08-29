@@ -207,9 +207,8 @@ pub struct ArcObservation {
 }
 
 impl ArcObservation {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.game_id.is_empty(), "ARC response has empty game_id");
-        ensure!(!self.guid.is_empty(), "ARC response has empty guid");
         ensure!(
             matches!(
                 self.state.as_str(),
@@ -240,7 +239,7 @@ impl ArcObservation {
         self.state == "WIN" || (self.win_levels > 0 && self.levels_completed >= self.win_levels)
     }
 
-    fn terminal(&self) -> bool {
+    pub(crate) fn terminal(&self) -> bool {
         self.state != "NOT_FINISHED" || self.won()
     }
 }
@@ -252,13 +251,13 @@ struct PendingRecordingEvent {
 }
 
 #[derive(Debug)]
-struct LiveRecordingRun {
+pub(crate) struct LiveRecordingRun {
     final_path: PathBuf,
     events: Vec<PendingRecordingEvent>,
 }
 
 impl LiveRecordingRun {
-    fn start(root: &Path, observation: &ArcObservation) -> Result<Self> {
+    pub(crate) fn start(root: &Path, observation: &ArcObservation) -> Result<Self> {
         let game = recording_component(&observation.game_id);
         let session = if observation.guid.is_empty() {
             format!("run-{}", unix_ms())
@@ -279,11 +278,11 @@ impl LiveRecordingRun {
         Ok(run)
     }
 
-    fn push_reset(&mut self, observation: &ArcObservation) -> Result<()> {
+    pub(crate) fn push_reset(&mut self, observation: &ArcObservation) -> Result<()> {
         self.push(observation, Some(reset_recording_action()))
     }
 
-    fn push_action(
+    pub(crate) fn push_action(
         &mut self,
         observation: &ArcObservation,
         action: &ArcAction,
@@ -342,7 +341,7 @@ impl LiveRecordingRun {
             .collect()
     }
 
-    fn finish(self) -> Result<PathBuf> {
+    pub(crate) fn finish(self) -> Result<PathBuf> {
         let parent = self
             .final_path
             .parent()
@@ -484,7 +483,7 @@ fn recording_envelope(pending: &PendingRecordingEvent) -> Value {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiObservation {
+pub(crate) struct ApiObservation {
     game_id: String,
     guid: String,
     frame: Vec<Vec<Vec<u8>>>,
@@ -495,10 +494,9 @@ struct ApiObservation {
     available_actions: Vec<u8>,
 }
 
-impl TryFrom<ApiObservation> for ArcObservation {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ApiObservation) -> Result<Self> {
+impl ApiObservation {
+    pub(crate) fn into_arc_observation(self, require_fixed_64: bool) -> Result<ArcObservation> {
+        let value = self;
         ensure!(!value.frame.is_empty(), "ARC response contains no frames");
         let mut animation = Vec::with_capacity(value.frame.len());
         for layer in &value.frame {
@@ -511,6 +509,14 @@ impl TryFrom<ApiObservation> for ArcObservation {
                 width,
                 layer.len()
             );
+            if require_fixed_64 {
+                ensure!(
+                    width == FRAME_SIDE && layer.len() == FRAME_SIDE,
+                    "bridge observation frame is {}x{}; expected {FRAME_SIDE}x{FRAME_SIDE}",
+                    width,
+                    layer.len()
+                );
+            }
             ensure!(
                 layer.iter().all(|row| row.len() == width),
                 "ARC response frame is ragged"
@@ -523,7 +529,7 @@ impl TryFrom<ApiObservation> for ArcObservation {
             .cloned()
             .context("ARC response contains no frames")?
             .to_fixed_64()?;
-        let observation = Self {
+        let observation = ArcObservation {
             game_id: value.game_id,
             guid: value.guid,
             frame,
@@ -536,6 +542,15 @@ impl TryFrom<ApiObservation> for ArcObservation {
         };
         observation.validate()?;
         Ok(observation)
+    }
+}
+
+impl TryFrom<ApiObservation> for ArcObservation {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ApiObservation) -> Result<Self> {
+        ensure!(!value.guid.is_empty(), "ARC response has empty guid");
+        value.into_arc_observation(false)
     }
 }
 
@@ -992,6 +1007,13 @@ pub trait LivePolicy {
     /// Fires once per attempted game with the final stop reason, even when
     /// the opening RESET failed and `on_game_start` never fired.
     fn on_game_end(&mut self, _outcome: &str) {}
+
+    /// Flush session-scoped policy artifacts. Live evaluation publishes its
+    /// fixed campaign up front; streaming callers use this to publish a plan
+    /// after all game ids have been observed.
+    fn finish_session(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct ModelPolicy<'a> {
@@ -1011,6 +1033,7 @@ struct Arc3ProfileCampaign {
     device: String,
     captures: BTreeMap<String, (u64, String)>,
     started: BTreeSet<String>,
+    defer_manifest: bool,
 }
 
 fn arc3_profile_phase<T>(
@@ -1058,7 +1081,21 @@ impl<'a> ModelPolicy<'a> {
             device: device.into(),
             captures: BTreeMap::new(),
             started: BTreeSet::new(),
+            defer_manifest: false,
         });
+    }
+
+    pub fn enable_streaming_eval_profile(
+        &mut self,
+        output_dir: &Path,
+        campaign_id: String,
+        device: &str,
+    ) {
+        self.enable_eval_profile(output_dir, campaign_id, device);
+        self.profile
+            .as_mut()
+            .expect("profile was just enabled")
+            .defer_manifest = true;
     }
 
     fn prepare_profile_campaign(&mut self, games: &[PublicGame]) -> Result<()> {
@@ -1107,6 +1144,15 @@ impl<'a> ModelPolicy<'a> {
         let Some(profile) = self.profile.as_mut() else {
             return Ok(None);
         };
+        if profile.defer_manifest && !profile.captures.contains_key(game_id) {
+            profile.captures.insert(
+                game_id.into(),
+                (
+                    profile.captures.len() as u64 + 1,
+                    format!("arc3-{}", recording_component(game_id)),
+                ),
+            );
+        }
         if !profile.started.insert(game_id.into()) {
             return Ok(None);
         }
@@ -1311,7 +1357,14 @@ impl LivePolicy for ModelPolicy<'_> {
         }
         drop(measurement);
         if let Some(capture) = profile.take() {
-            capture.finish()?;
+            if let Some(artifacts) = capture.finish()? {
+                candle_graph::verify_bundle(&artifacts.directory).with_context(|| {
+                    format!(
+                        "verify ARC profile bundle {}",
+                        artifacts.directory.display()
+                    )
+                })?;
+            }
         }
         Ok(decision)
     }
@@ -1335,6 +1388,45 @@ impl LivePolicy for ModelPolicy<'_> {
     fn on_game_end(&mut self, _outcome: &str) {
         self.tried.clear();
     }
+
+    fn finish_session(&mut self) -> Result<()> {
+        let Some(profile) = self.profile.as_mut() else {
+            return Ok(());
+        };
+        if !profile.defer_manifest || profile.captures.is_empty() {
+            return Ok(());
+        }
+        let mut planned = profile
+            .captures
+            .values()
+            .map(|(capture_step, bundle)| PlannedCapture {
+                capture_step: *capture_step,
+                bundle: bundle.clone(),
+            })
+            .collect::<Vec<_>>();
+        planned.sort_by_key(|capture| capture.capture_step);
+        ensure_eval_profile_campaign(
+            &profile.profile_dir,
+            "arc3-campaign.json",
+            profile.campaign_id.clone(),
+            ARC3_PROFILE_ENTRYPOINT,
+            planned,
+        )?;
+        profile.defer_manifest = false;
+        Ok(())
+    }
+}
+
+pub(crate) fn decision_telemetry(decision: &ActionDecision) -> Value {
+    json!({
+        "policy": LIVE_POLICY,
+        "score": decision.chosen.score,
+        "q_probability": decision.chosen.q_probability,
+        "reliability_probability": decision.chosen.reliability_probability,
+        "noop_probability": decision.chosen.noop_probability,
+        "predicted_effect": decision.chosen.predicted_effect,
+        "candidate_count": decision.candidate_count,
+    })
 }
 
 /// Soft tried-action demotion. Once every candidate has been tried the
@@ -1659,7 +1751,7 @@ pub struct LiveRunSettings {
 /// driver cannot certify at open time. The report builder downgrades to
 /// `failed_integrity_or_evaluation` when the run records a scorecard-close
 /// error or an unexpected full reset.
-fn live_evidence_class(driver: &LiveDriverOptions) -> &'static str {
+pub(crate) fn live_evidence_class(driver: &LiveDriverOptions) -> &'static str {
     if driver.exploratory {
         "exploratory_driver_repair"
     } else {
@@ -1858,15 +1950,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                     break;
                 }
             };
-            let reasoning = json!({
-                "policy": LIVE_POLICY,
-                "score": decision.chosen.score,
-                "q_probability": decision.chosen.q_probability,
-                "reliability_probability": decision.chosen.reliability_probability,
-                "noop_probability": decision.chosen.noop_probability,
-                "predicted_effect": decision.chosen.predicted_effect,
-                "candidate_count": decision.candidate_count,
-            });
+            let reasoning = decision_telemetry(&decision);
             let call_started = Instant::now();
             attempted_actions += 1;
             usage.attempted_actions += 1;
@@ -2273,16 +2357,16 @@ pub fn profile_recorded_decisions(
     Ok(())
 }
 
-struct LiveRunProvenance {
-    git_revision: String,
-    git_dirty: bool,
-    dirty_diff_sha256: Option<String>,
-    executable_sha256: Option<String>,
-    build_profile: String,
-    cli_args: Vec<String>,
+pub(crate) struct LiveRunProvenance {
+    pub(crate) git_revision: String,
+    pub(crate) git_dirty: bool,
+    pub(crate) dirty_diff_sha256: Option<String>,
+    pub(crate) executable_sha256: Option<String>,
+    pub(crate) build_profile: String,
+    pub(crate) cli_args: Vec<String>,
 }
 
-fn live_run_provenance() -> Result<LiveRunProvenance> {
+pub(crate) fn live_run_provenance() -> Result<LiveRunProvenance> {
     let git_revision = git_output(&["rev-parse", "HEAD"])?;
     let status = git_output(&["status", "--porcelain", "--untracked-files=all"])?;
     let git_dirty = !status.trim().is_empty();
@@ -2323,7 +2407,7 @@ fn git_output(args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("git output is not UTF-8")
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -2345,7 +2429,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -2684,6 +2768,24 @@ mod tests {
         assert_eq!(parsed.animation.len(), 2);
         assert_eq!(parsed.animation[0].pixel(0, 0), Some(1));
         assert_eq!(parsed.animation[1].pixel(0, 0), Some(7));
+    }
+
+    #[test]
+    fn live_api_observation_rejects_empty_guid() {
+        let api = ApiObservation {
+            game_id: "demo".into(),
+            guid: String::new(),
+            frame: vec![vec![vec![0]]],
+            full_reset: false,
+            state: "NOT_FINISHED".into(),
+            levels_completed: 0,
+            win_levels: 1,
+            available_actions: vec![1],
+        };
+        assert!(ArcObservation::try_from(api)
+            .unwrap_err()
+            .to_string()
+            .contains("empty guid"));
     }
 
     #[test]
@@ -3621,7 +3723,11 @@ mod tests {
         for (path, source) in &sources {
             if matches!(
                 path.as_str(),
-                "p2/agent_session.rs" | "p2/arc3.rs" | "p2/arc3_live.rs" | "p2/cli.rs"
+                "p2/agent_session.rs"
+                    | "p2/arc3.rs"
+                    | "p2/arc3_bridge.rs"
+                    | "p2/arc3_live.rs"
+                    | "p2/cli.rs"
             ) {
                 continue;
             }

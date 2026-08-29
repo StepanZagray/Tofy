@@ -123,9 +123,37 @@
   rule. Rows without synthetic operator provenance, including live ARC games,
   use the same honest deployment posture.
 
-## Preregistered model-treatment flags (2026-08-27, all default off)
+## Implementation amendment (2026-08-29 — recurrent-core BF16 cast islands)
 
-Five config-gated model treatments exist for the next matched runs. Every
+- `bf16_recurrent_core` is a default-off, caller-owned foundation-v2
+  treatment. Only `block.c1` and `block.c2` use BF16 operands: activations and
+  F32 master weights are differentiably cast at each use, the convolution is
+  performed with F32 accumulation, and its result returns to F32 immediately.
+  Bias addition stays F32. FiLM, SiLU, residual additions, RMS normalization,
+  clamps, encoder/decoder paths, and every recurrent-state boundary remain
+  F32. Parameters are never stored in BF16.
+- The empirical hypothesis is a 1.3–1.5x full-update throughput gain. Promotion
+  requires at least 1.20x median warmed throughput over the matched F32 arm and
+  no material quality regression. The throughput protocol is 20 synchronized
+  warmup updates followed by at least 100 synchronized measured updates from
+  the same frozen checkpoint, physical batch, and fixed batch population.
+- Before training, the frozen-checkpoint falsifier records maximum recurrent
+  latent and decoder-logit drift, raw-prediction flips on factually changed
+  pixels, composed-decode flips on content pixels, and the repaired H2 rollout
+  premise (at least 16 fragments and finite nonzero loss) in both precision
+  arms. These are mechanism and numerical diagnostics, not a quality claim;
+  the latter remains `NEEDS-3-SEED` until fresh matched runs pass the existing
+  quality gates.
+- This follows the "Next falsifier" protocol in
+  `/home/stepan/Research/Knowledge/ml/tofy/mixed-precision-bf16-speed.md`.
+  The execution dtype changes, but the population, objective, reductions,
+  optimizer, and schedule do not, so `FOUNDATION_OBJECTIVE_REVISION` is not
+  bumped. The flag is nevertheless persisted in `config.json` and the resume
+  contract so crossing precision arms fails closed.
+
+## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
+
+Six config-gated model treatments exist for the next matched runs. Every
 flag defaults to the exact legacy behavior, adds parameters only when
 enabled, is recorded in the training contract (a resume across arms fails
 closed), and is caller-owned under foundation-v2 validation. At most one
@@ -176,6 +204,11 @@ them is "worth a matched test".
    positional values (removes the proved 2x2 pooling alias; +57,344
    parameters). New runs only: loading a checkpoint without the embeddings
    fails closed. Not recommended for the same arm as `copy_bypass_gate`.
+6. `bf16_recurrent_core` — recurrent residual-block convolution products use
+   the cast-island boundary specified in the 2026-08-29 amendment. It adds no
+   parameters and contains an exact flag-off baseline path. Its intended
+   benefit is throughput; numerical drift and multi-seed quality are explicit
+   falsifiers rather than assumed consequences of BF16 support.
 
 Prerequisite control for every arm: the repaired H2 rollout path must
 demonstrably fire (>=16 fragments -> finite nonzero loss reaching the
