@@ -1240,6 +1240,33 @@ impl Map2 for ConvTranspose1D<'_> {
 
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
 
+impl ConvTranspose2D<'_> {
+    fn map(
+        &self,
+        inp: &CpuStorage,
+        inp_l: &Layout,
+        kernel: &CpuStorage,
+        kernel_l: &Layout,
+    ) -> Result<CpuStorage> {
+        match (inp, kernel) {
+            (CpuStorage::BF16(inp), CpuStorage::BF16(kernel)) => {
+                // Conv2D backward-data is expressed through this operator on CPU. Preserve the
+                // BF16 storage contract while accumulating each result in F32.
+                let inp = inp.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+                let kernel = kernel
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>();
+                let output = self.f(&inp, inp_l, &kernel, kernel_l)?;
+                Ok(CpuStorage::BF16(
+                    output.into_iter().map(bf16::from_f32).collect(),
+                ))
+            }
+            _ => <Self as Map2>::map(self, inp, inp_l, kernel, kernel_l),
+        }
+    }
+}
+
 impl Map2 for ConvTranspose2D<'_> {
     const OP: &'static str = "conv_transpose2d";
     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {

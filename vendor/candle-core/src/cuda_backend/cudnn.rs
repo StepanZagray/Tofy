@@ -49,12 +49,17 @@ pub(crate) fn launch_conv2d<
         }
         c
     })?;
-    let conv = cudnn.create_conv2d::<Y>(
+    let mut conv = cudnn.create_conv2d::<Y>(
         /* pad */ [params.padding as i32, params.padding as i32],
         /* stride */ [params.stride as i32, params.stride as i32],
         /* dilation */ [params.dilation as i32, params.dilation as i32],
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
+    if T::DTYPE == crate::DType::BF16 {
+        // BF16 operands use an FP32 compute descriptor. Explicit tensor-op math requests native
+        // BF16 Tensor Core kernels instead of leaving the choice at cuDNN's default math mode.
+        conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
+    }
     let x_shape = [
         params.b_size as i32,
         params.c_in as i32,
@@ -146,12 +151,16 @@ pub(crate) fn launch_conv2d_bwd_filter<
         }
         c
     })?;
-    let conv = cudnn.create_conv2d::<Y>(
+    let mut conv = cudnn.create_conv2d::<Y>(
         [params.padding as i32, params.padding as i32],
         [params.stride as i32, params.stride as i32],
         [params.dilation as i32, params.dilation as i32],
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
+    if T::DTYPE == crate::DType::BF16 {
+        // The descriptor compute type is FP32; tensor-op math requests native BF16 products.
+        conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
+    }
     let x_shape = [
         params.b_size as i32,
         params.c_in as i32,
@@ -180,12 +189,7 @@ pub(crate) fn launch_conv2d_bwd_filter<
         ],
     )?;
     let (w_out, h_out) = (params.out_w() as i32, params.out_h() as i32);
-    let dy_shape = [
-        params.b_size as i32,
-        params.c_out as i32,
-        h_out,
-        w_out,
-    ];
+    let dy_shape = [params.b_size as i32, params.c_out as i32, h_out, w_out];
     let dy_desc = if dy_l.is_contiguous() {
         cudnn.create_4d_tensor::<T>(
             cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
@@ -242,12 +246,16 @@ pub(crate) fn launch_conv2d_bwd_data<
         }
         c
     })?;
-    let conv = cudnn.create_conv2d::<Y>(
+    let mut conv = cudnn.create_conv2d::<Y>(
         [params.padding as i32, params.padding as i32],
         [params.stride as i32, params.stride as i32],
         [params.dilation as i32, params.dilation as i32],
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
+    if T::DTYPE == crate::DType::BF16 {
+        // The descriptor compute type is FP32; tensor-op math requests native BF16 products.
+        conv.set_math_type(cudarc::cudnn::sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH)?;
+    }
     let dx_shape = [
         params.b_size as i32,
         params.c_in as i32,
@@ -268,12 +276,7 @@ pub(crate) fn launch_conv2d_bwd_data<
         ],
     )?;
     let (w_out, h_out) = (params.out_w() as i32, params.out_h() as i32);
-    let dy_shape = [
-        params.b_size as i32,
-        params.c_out as i32,
-        h_out,
-        w_out,
-    ];
+    let dy_shape = [params.b_size as i32, params.c_out as i32, h_out, w_out];
     let dy_desc = if dy_l.is_contiguous() {
         cudnn.create_4d_tensor::<T>(
             cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
