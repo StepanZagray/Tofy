@@ -514,6 +514,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--profile-eval", choices=("true", "false"), default="false")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--max-actions-per-game", type=int)
     return parser.parse_args()
 
 
@@ -555,6 +556,10 @@ def main() -> int:
             command.extend(("--profile-eval", "true"))
         if args.seed is not None:
             command.extend(("--seed", str(args.seed)))
+        if args.max_actions_per_game is not None:
+            command.extend(
+                ("--max-actions-per-game", str(args.max_actions_per_game))
+            )
 
         process = subprocess.Popen(
             command,

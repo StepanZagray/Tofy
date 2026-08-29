@@ -1047,6 +1047,10 @@ pub struct P2Arc3BridgeArgs {
 
     #[arg(long)]
     pub seed: Option<u64>,
+
+    /// Optional game-wide action cap for bounded offline toolkit checks.
+    #[arg(long)]
+    pub max_actions_per_game: Option<u32>,
 }
 
 pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
@@ -1059,5 +1063,6 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         recordings_dir: args.recordings_dir,
         profile_eval: args.profile_eval,
         seed: args.seed,
+        max_actions_per_game: args.max_actions_per_game,
     })
 }

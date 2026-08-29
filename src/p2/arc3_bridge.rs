@@ -40,6 +40,7 @@ pub struct Arc3BridgeConfig {
     pub recordings_dir: Option<PathBuf>,
     pub profile_eval: bool,
     pub seed: Option<u64>,
+    pub max_actions_per_game: Option<u32>,
 }
 
 impl Arc3BridgeConfig {
@@ -95,6 +96,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
             let provenance = live_run_provenance()?;
             let driver = LiveDriverOptions {
                 exploratory: provenance.git_dirty,
+                max_actions_per_game: config.max_actions_per_game,
                 ..LiveDriverOptions::default()
             };
             let settings = LiveRunSettings {
