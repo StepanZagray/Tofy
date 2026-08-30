@@ -11,8 +11,8 @@ use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
-    MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample,
-    V5SampleProvenance, FRAME_SIDE, GOAL_FEATURES_DIM,
+    MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance,
+    FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{
     evaluate_gate_support_with_v5_provenance, GateSupportMetrics,
@@ -57,6 +57,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
 
@@ -220,8 +221,7 @@ pub fn foundation_v2_ep_weight_update(
     if ep_gradient_l2 == 0.0 {
         return FOUNDATION_V2_EP_MAX_WEIGHT;
     }
-    let target =
-        FOUNDATION_V2_EP_GRADIENT_BUDGET * prediction_gradient_l2 / ep_gradient_l2;
+    let target = FOUNDATION_V2_EP_GRADIENT_BUDGET * prediction_gradient_l2 / ep_gradient_l2;
     if target < FOUNDATION_V2_EP_MIN_WEIGHT {
         return 0.0;
     }
@@ -234,11 +234,7 @@ pub fn foundation_v2_ep_weight_update(
 /// and can never satisfy the 0.3 margin). The epsilon offset keeps the
 /// gradient finite at exact displacement equality, where a bare
 /// `sqrt(0)` backward is non-finite.
-pub fn separation_hinge_term(
-    left: &Tensor,
-    right: &Tensor,
-    margin: f64,
-) -> Result<Tensor> {
+pub fn separation_hinge_term(left: &Tensor, right: &Tensor, margin: f64) -> Result<Tensor> {
     const EPS: f64 = 1e-12;
     let distance = left
         .sub(right)?
@@ -539,14 +535,15 @@ pub fn foundation_v2_gate_evaluation(
     composed_running_best: Option<f64>,
     gate_history: &[FoundationV2GateEvaluation],
 ) -> Result<FoundationV2GateEvaluation> {
-    let outcome_changing_rows = metrics
-        .shuffled_action_outcome_changing_tuples
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "foundation-v2 shuffled-action gate has no counterfactual outcome coverage; \
+    let outcome_changing_rows =
+        metrics
+            .shuffled_action_outcome_changing_tuples
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "foundation-v2 shuffled-action gate has no counterfactual outcome coverage; \
                  evaluate it with aligned V5 operator provenance"
-            )
-        })?;
+                )
+            })?;
     if outcome_changing_rows < MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS {
         bail!(
             "foundation-v2 shuffled-action gate has only {outcome_changing_rows} \
@@ -2815,6 +2812,263 @@ pub struct BatchTensors {
     pub factual: Option<FactualBatch>,
 }
 
+/// All CPU-only work needed for one foundation-v2 batch.
+///
+/// This is constructed by `MixedStreamBatchPrefetcher` workers and intentionally
+/// contains only ordinary host vectors. Candle CUDA tensor construction remains
+/// serialized on the training thread; constructing those tensors in workers has
+/// previously raced host-to-device copies.
+#[derive(Debug)]
+pub(crate) struct PreparedFoundationV2BatchHost {
+    batch_size: usize,
+    frames: Vec<u8>,
+    next_frames: Vec<u8>,
+    model_frames: Vec<u8>,
+    model_next_frames: Vec<u8>,
+    actions: Vec<u32>,
+    action_coords: Vec<f32>,
+    operator_conditioning: Vec<f32>,
+    goals: Vec<f32>,
+    event_targets: Vec<f32>,
+    event_mask: Vec<f32>,
+    latent_content_mask: Vec<f32>,
+    content_values: Vec<f32>,
+    changed_values: Vec<f32>,
+    unchanged_values: Vec<f32>,
+    foreground_values: Vec<f32>,
+    changed_weights: ChangedPixelWeights,
+    foreground_count: usize,
+    background_count: usize,
+    foreground_weight: f64,
+}
+
+fn validate_frame_pixels(frame: &ArcFrame) -> Result<()> {
+    ensure_fixed_frame(frame)?;
+    if let Some(&pixel) = frame
+        .pixels
+        .iter()
+        .find(|&&pixel| pixel as usize >= PALETTE_SIZE)
+    {
+        bail!("palette value {pixel} out of 0..{PALETTE_SIZE}");
+    }
+    Ok(())
+}
+
+/// Expand a deterministic mixed batch without creating tensors. The vector
+/// order exactly follows `MixedStreamBatch::samples`, so ordered prefetching
+/// preserves both content digests and the training RNG stream.
+pub(crate) fn prepare_foundation_v2_batch_host(
+    mixed: &MixedStreamBatch,
+) -> Result<PreparedFoundationV2BatchHost> {
+    let samples = mixed.samples();
+    if samples.is_empty() {
+        bail!("empty batch");
+    }
+    let batch_size = samples.len();
+    let frame_pixels = FRAME_SIDE * FRAME_SIDE;
+    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let mut frames = Vec::with_capacity(batch_size * frame_pixels);
+    let mut next_frames = Vec::with_capacity(batch_size * frame_pixels);
+    let mut actions = Vec::with_capacity(batch_size);
+    let mut action_coords = Vec::with_capacity(batch_size * 2);
+    let mut operator_conditioning = vec![0.0; batch_size * OPERATOR_CONDITION_DIM];
+    let mut goals = Vec::with_capacity(batch_size * GOAL_FEATURES_DIM);
+    let mut event_targets = vec![0.0; batch_size * DEFAULT_NUM_EVENTS];
+    let mut event_mask = vec![0.0; batch_size * DEFAULT_NUM_EVENTS];
+    let mut current_pixels = Vec::with_capacity(batch_size * gameplay_pixels);
+    let mut target_pixels = Vec::with_capacity(batch_size * gameplay_pixels);
+    let mut content_mask_u8 = Vec::with_capacity(batch_size * gameplay_pixels);
+    let mut latent_content_mask = Vec::with_capacity(batch_size * (FRAME_SIDE / PATCH_SIZE).pow(2));
+
+    for (row, sample) in samples.iter().enumerate() {
+        let transition = sample.transition();
+        transition.provenance.validate()?;
+        validate_frame_pixels(&transition.current)?;
+        validate_frame_pixels(&transition.next)?;
+        if sample.content_mask.values.len() != frame_pixels {
+            bail!("content mask is not fixed 64x64");
+        }
+        frames.extend_from_slice(&transition.current.pixels);
+        next_frames.extend_from_slice(&transition.next.pixels);
+        current_pixels.extend_from_slice(&transition.current.pixels[..gameplay_pixels]);
+        target_pixels.extend_from_slice(&transition.next.pixels[..gameplay_pixels]);
+        content_mask_u8.extend_from_slice(&sample.content_mask.values[..gameplay_pixels]);
+
+        let id = u32::from(transition.action.id);
+        if id >= ACTION_VOCAB as u32 {
+            bail!("action id {id} out of official range 0..{ACTION_VOCAB}");
+        }
+        match (id, transition.action.x, transition.action.y) {
+            (6, Some(x), Some(y)) => {
+                actions.push(id);
+                action_coords.extend([f32::from(x) / 63.0, f32::from(y) / 63.0]);
+            }
+            (0..=5, None, None) | (7, None, None) => {
+                actions.push(id);
+                action_coords.extend([0.0, 0.0]);
+            }
+            (6, _, _) => bail!("ACTION6 requires a complete coordinate pair"),
+            (_, Some(_), _) | (_, _, Some(_)) => bail!("coordinates are only valid for ACTION6"),
+            _ => bail!("invalid action conditioning"),
+        }
+
+        let base = row * OPERATOR_CONDITION_DIM;
+        let operator = transition.provenance.operator.filter(|operator| {
+            matches!(
+                operator.family,
+                OperatorFamily::Teleport
+                    | OperatorFamily::Toggle
+                    | OperatorFamily::Paint
+                    | OperatorFamily::PushLine
+            )
+        });
+        let family_token = operator
+            .map(|operator| operator.family.conditioning_token())
+            .unwrap_or(OPERATOR_FAMILY_UNKNOWN);
+        operator_conditioning[base + family_token] = 1.0;
+        if let Some(operator) = operator {
+            for (slot, color) in [
+                operator.agent_color,
+                operator.primary_color,
+                operator.secondary_color,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                operator_conditioning
+                    [base + OPERATOR_FAMILY_VOCAB + slot * PALETTE_SIZE + color as usize] = 1.0;
+            }
+        }
+        goals.extend_from_slice(&transition.goal_features.values);
+        for (slot, label) in [
+            transition.noop,
+            transition.goal_satisfied,
+            transition.goal_failed,
+            transition.exhausted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(label) = label {
+                event_targets[row * DEFAULT_NUM_EVENTS + slot] = f32::from(label);
+                event_mask[row * DEFAULT_NUM_EVENTS + slot] = 1.0;
+            }
+        }
+
+        let latent_side = FRAME_SIDE / PATCH_SIZE;
+        for latent_y in 0..latent_side {
+            for latent_x in 0..latent_side {
+                let occupied = (0..PATCH_SIZE).any(|dy| {
+                    (0..PATCH_SIZE).any(|dx| {
+                        sample.content_mask.values
+                            [(latent_y * PATCH_SIZE + dy) * FRAME_SIDE + latent_x * PATCH_SIZE + dx]
+                            != 0
+                    })
+                });
+                latent_content_mask.push(f32::from(occupied));
+            }
+        }
+    }
+    let changed_weights =
+        foundation_v2_loss_weights_from_masks(&current_pixels, &target_pixels, &content_mask_u8)?;
+    let content_values = content_mask_u8
+        .iter()
+        .map(|&value| f32::from(value))
+        .collect::<Vec<_>>();
+    let changed_values = current_pixels
+        .iter()
+        .zip(&target_pixels)
+        .zip(&content_mask_u8)
+        .map(|((before, after), content)| f32::from(*content != 0 && before != after))
+        .collect::<Vec<_>>();
+    let unchanged_values = changed_values
+        .iter()
+        .zip(&content_mask_u8)
+        .map(|(changed, content)| f32::from(*content != 0) - changed)
+        .collect::<Vec<_>>();
+    let foreground_values = current_pixels
+        .iter()
+        .zip(&content_mask_u8)
+        .map(|(pixel, content)| f32::from(*content != 0 && *pixel != 0))
+        .collect::<Vec<_>>();
+    let foreground_count = foreground_values
+        .iter()
+        .filter(|&&value| value != 0.0)
+        .count();
+    let background_count = changed_weights.content_pixels - foreground_count;
+    let foreground_weight = if foreground_count == 0 {
+        64.0
+    } else {
+        ((background_count as f64) / foreground_count as f64).clamp(1.0, 64.0)
+    };
+    let mut model_frames = frames.clone();
+    let mut model_next_frames = next_frames.clone();
+    for pixels in model_frames.chunks_exact_mut(frame_pixels) {
+        pixels[gameplay_pixels..].fill(0);
+    }
+    for pixels in model_next_frames.chunks_exact_mut(frame_pixels) {
+        pixels[gameplay_pixels..].fill(0);
+    }
+    Ok(PreparedFoundationV2BatchHost {
+        batch_size,
+        frames,
+        next_frames,
+        model_frames,
+        model_next_frames,
+        actions,
+        action_coords,
+        operator_conditioning,
+        goals,
+        event_targets,
+        event_mask,
+        latent_content_mask,
+        content_values,
+        changed_values,
+        unchanged_values,
+        foreground_values,
+        changed_weights,
+        foreground_count,
+        background_count,
+        foreground_weight,
+    })
+}
+
+fn batch_from_foundation_v2_host(
+    host: &PreparedFoundationV2BatchHost,
+    device: &Device,
+) -> Result<BatchTensors> {
+    let shape = (host.batch_size, 1, FRAME_SIDE, FRAME_SIDE);
+    Ok(BatchTensors {
+        frames: Tensor::from_vec(host.frames.clone(), shape, device)?,
+        next_frames: Tensor::from_vec(host.next_frames.clone(), shape, device)?,
+        model_frames: Tensor::from_vec(host.model_frames.clone(), shape, device)?,
+        model_next_frames: Tensor::from_vec(host.model_next_frames.clone(), shape, device)?,
+        actions: Tensor::from_vec(host.actions.clone(), (host.batch_size,), device)?,
+        action_coords: Tensor::from_vec(host.action_coords.clone(), (host.batch_size, 2), device)?,
+        operator_conditioning: Tensor::from_vec(
+            host.operator_conditioning.clone(),
+            (host.batch_size, OPERATOR_CONDITION_DIM),
+            device,
+        )?,
+        goals: Tensor::from_vec(
+            host.goals.clone(),
+            (host.batch_size, GOAL_FEATURES_DIM),
+            device,
+        )?,
+        event_targets: Tensor::from_vec(
+            host.event_targets.clone(),
+            (host.batch_size, DEFAULT_NUM_EVENTS),
+            device,
+        )?,
+        event_mask: Tensor::from_vec(
+            host.event_mask.clone(),
+            (host.batch_size, DEFAULT_NUM_EVENTS),
+            device,
+        )?,
+        factual: None,
+    })
+}
+
 /// Tensorize observable train-family operators. Held-out families and rows
 /// without provenance receive UNKNOWN and a neutral all-zero color triple.
 pub(crate) fn operator_conditioning_from_samples<T: TransitionSampleView>(
@@ -4139,7 +4393,11 @@ pub(crate) fn bounded_sigreg_loss(raw: &Tensor) -> Result<Tensor> {
     smooth_cap_nonnegative(raw, SIGREG_LOSS_CAP)
 }
 
-pub(crate) fn sigreg_loss_for_stack(stack: &Tensor, cfg: &TrainConfig, seed: u64) -> Result<Tensor> {
+pub(crate) fn sigreg_loss_for_stack(
+    stack: &Tensor,
+    cfg: &TrainConfig,
+    seed: u64,
+) -> Result<Tensor> {
     match cfg.sigreg_statistic {
         SigregStatistic::EppsPulley => {
             sigreg_epps_pulley_seeded(stack, cfg.sigreg_projections, cfg.sigreg_knots, seed)
@@ -4530,6 +4788,7 @@ fn benchmark_bf16_arm(
     )?;
     let mut ema = ModelEma::with_default_decay(&varmap)?;
     let event_slot_weights = event_slot_weight_tensor(device)?;
+    let host = prepare_foundation_v2_batch_host(mixed)?;
     let total_updates = warmup_updates + measured_updates;
     let mut step_ms = Vec::with_capacity(measured_updates);
     let mut last_loss = f64::NAN;
@@ -4541,6 +4800,7 @@ fn benchmark_bf16_arm(
         let losses = foundation_v2_training_loss_with_event_weights(
             &model,
             mixed,
+            &host,
             device,
             FoundationV2ObjectiveConfig {
                 ep_weight: 0.01,
@@ -4558,10 +4818,8 @@ fn benchmark_bf16_arm(
         let total = losses.total.clone();
         let mut grads = total.backward()?;
         clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
-        let learning_rate = foundation_v2_wsd_learning_rate(
-            update + 1,
-            cfg.steps_per_lesson.max(total_updates),
-        );
+        let learning_rate =
+            foundation_v2_wsd_learning_rate(update + 1, cfg.steps_per_lesson.max(total_updates));
         optimizer.set_learning_rate(learning_rate)?;
         optimizer.step(&grads)?;
         ema.update(&varmap)?;
@@ -4570,7 +4828,10 @@ fn benchmark_bf16_arm(
 
         last_loss = f64::from(total.to_dtype(DType::F32)?.to_scalar::<f32>()?);
         if !last_loss.is_finite() {
-            bail!("BF16 benchmark update {} produced non-finite loss", update + 1);
+            bail!(
+                "BF16 benchmark update {} produced non-finite loss",
+                update + 1
+            );
         }
         rollout_fragments = losses.rollout_fragments;
         if update >= warmup_updates {
@@ -4606,9 +4867,7 @@ pub fn benchmark_bf16_recurrent_core(
     measured_updates: usize,
 ) -> Result<Bf16BenchmarkReport> {
     if warmup_updates < 20 || measured_updates < 100 {
-        bail!(
-            "BF16 benchmark protocol requires at least 20 warmup and 100 measured updates"
-        );
+        bail!("BF16 benchmark protocol requires at least 20 warmup and 100 measured updates");
     }
     if baseline_cfg.bf16_recurrent_core {
         bail!("BF16 benchmark requires an F32 baseline config");
@@ -5120,9 +5379,11 @@ pub fn foundation_v2_training_loss(
     objective: FoundationV2ObjectiveConfig,
 ) -> Result<FoundationV2LossBreakdown> {
     let event_slot_weights = event_slot_weight_tensor(device)?;
+    let host = prepare_foundation_v2_batch_host(mixed)?;
     foundation_v2_training_loss_with_event_weights(
         model,
         mixed,
+        &host,
         device,
         objective,
         &event_slot_weights,
@@ -5132,6 +5393,7 @@ pub fn foundation_v2_training_loss(
 fn foundation_v2_training_loss_with_event_weights(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
+    host: &PreparedFoundationV2BatchHost,
     device: &Device,
     objective: FoundationV2ObjectiveConfig,
     event_slot_weights: &Tensor,
@@ -5139,7 +5401,7 @@ fn foundation_v2_training_loss_with_event_weights(
     if !model.config().world_core_v4 || model.config().patch_size != PATCH_SIZE {
         bail!("foundation-v2 loss requires the patch-4 exact-decoder topology");
     }
-    let batch = batch_from_rows(mixed.samples(), device)?;
+    let batch = batch_from_foundation_v2_host(host, device)?;
     let encoded = model
         .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?;
     let current_canonical = model.canonical_representation(&encoded.current)?;
@@ -5156,56 +5418,35 @@ fn foundation_v2_training_loss_with_event_weights(
     )?;
     let predicted_canonical = model.canonical_representation(&out.y)?;
     let (_, _, latent_height, latent_width) = out.y.dims4()?;
-    let latent_mask =
-        latent_content_mask(mixed.content_masks(), latent_height, latent_width, device)?;
+    let expected_latent_side = FRAME_SIDE / PATCH_SIZE;
+    if latent_height != expected_latent_side || latent_width != expected_latent_side {
+        bail!("foundation-v2 latent geometry differs from patch-4 host preparation");
+    }
+    let latent_mask = Tensor::from_vec(
+        host.latent_content_mask.clone(),
+        (host.batch_size, 1, latent_height, latent_width),
+        device,
+    )?;
     let content_current_canonical =
         model.canonical_representation(&encoded.current.broadcast_mul(&latent_mask)?)?;
     let content_target_canonical =
         model.canonical_representation(&encoded.next.broadcast_mul(&latent_mask)?)?;
     let content_predicted_canonical =
         model.canonical_representation(&out.y.broadcast_mul(&latent_mask)?)?;
-    let batch_size = mixed.samples().len();
-    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
-    let current_pixels = mixed
-        .transitions()
-        .flat_map(|sample| sample.current.pixels[..gameplay_pixels].iter().copied())
-        .collect::<Vec<_>>();
-    let target_pixels = mixed
-        .transitions()
-        .flat_map(|sample| sample.next.pixels[..gameplay_pixels].iter().copied())
-        .collect::<Vec<_>>();
-    let content_values = mixed
-        .content_masks()
-        .flat_map(|mask| mask.values[..gameplay_pixels].iter().copied())
-        .collect::<Vec<_>>();
-    let changed_weights =
-        foundation_v2_loss_weights_from_masks(&current_pixels, &target_pixels, &content_values)?;
-    let changed_values = current_pixels
-        .iter()
-        .zip(&target_pixels)
-        .zip(&content_values)
-        .map(|((before, after), content)| f32::from(*content != 0 && before != after))
-        .collect::<Vec<_>>();
-    let unchanged_values = changed_values
-        .iter()
-        .zip(&content_values)
-        .map(|(changed, content)| f32::from(*content != 0) - changed)
-        .collect::<Vec<_>>();
+    let batch_size = host.batch_size;
+    let changed_weights = host.changed_weights;
     let content = Tensor::from_vec(
-        content_values
-            .iter()
-            .map(|&value| f32::from(value))
-            .collect(),
+        host.content_values.clone(),
         (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
         device,
     )?;
     let changed = Tensor::from_vec(
-        changed_values,
+        host.changed_values.clone(),
         (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
         device,
     )?;
     let unchanged = Tensor::from_vec(
-        unchanged_values,
+        host.unchanged_values.clone(),
         (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
         device,
     )?;
@@ -5243,23 +5484,8 @@ fn foundation_v2_training_loss_with_event_weights(
         &candle_nn::loss::huber(&content_predicted_canonical, &content_target_canonical, 1.0)?,
     )?;
 
-    let foreground_values = current_pixels
-        .iter()
-        .zip(&content_values)
-        .map(|(pixel, content)| f32::from(*content != 0 && *pixel != 0))
-        .collect::<Vec<_>>();
-    let foreground_count = foreground_values
-        .iter()
-        .filter(|&&value| value != 0.0)
-        .count();
-    let background_count = changed_weights.content_pixels - foreground_count;
-    let foreground_weight = if foreground_count == 0 {
-        64.0
-    } else {
-        ((background_count as f64) / foreground_count as f64).clamp(1.0, 64.0)
-    };
     let foreground = Tensor::from_vec(
-        foreground_values,
+        host.foreground_values.clone(),
         (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
         device,
     )?;
@@ -5274,9 +5500,9 @@ fn foundation_v2_training_loss_with_event_weights(
         )?,
         &foreground,
         &background,
-        foreground_count,
-        background_count,
-        foreground_weight,
+        host.foreground_count,
+        host.background_count,
+        host.foreground_weight,
     )?;
     let encoded_next_ce = split_ce_with_weighting(
         &foundation_v2_unimix_ce(
@@ -7709,14 +7935,11 @@ fn build_report(
         // Advertise the best-bundle path only when it passes the same
         // selection verification as the export claim; a foreign or stale
         // `checkpoints/best` must not be published as this run's best.
-        let best_checkpoint = foundation_v2_verified_best_export(
-            cfg,
-            cfg.promotion_metric,
-            &foundation.gate_history,
-        )
-        .ok()
-        .flatten()
-        .map(|_| cfg.output_dir.join("checkpoints/best"));
+        let best_checkpoint =
+            foundation_v2_verified_best_export(cfg, cfg.promotion_metric, &foundation.gate_history)
+                .ok()
+                .flatten()
+                .map(|_| cfg.output_dir.join("checkpoints/best"));
         FoundationV2TrainingReport {
             total_steps: foundation.total_steps,
             mean_losses: foundation_v2_loss_means(&foundation.loss_sums, foundation.loss_steps),
@@ -7834,17 +8057,24 @@ fn foundation_v2_loss_values(
     })
 }
 
+enum FoundationV2LossLogCommand {
+    Append(FoundationV2LossLogEntryOwned),
+    Flush(mpsc::Sender<Result<()>>),
+    Shutdown(mpsc::Sender<Result<()>>),
+}
+
 #[derive(Serialize)]
-struct FoundationV2LossLogEntry<'a> {
+struct FoundationV2LossLogEntryOwned {
     global_step: u64,
     #[serde(flatten)]
-    values: &'a FoundationV2LossMeans,
+    values: FoundationV2LossMeans,
     learning_rate: f64,
 }
 
 struct FoundationV2LossLog {
     path: PathBuf,
-    writer: BufWriter<File>,
+    sender: SyncSender<FoundationV2LossLogCommand>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl FoundationV2LossLog {
@@ -7855,9 +8085,73 @@ impl FoundationV2LossLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("open append-only loss log {}", path.display()))?;
+        // Disk writes and JSON serialization are intentionally isolated from
+        // the training thread. `flush` remains a synchronous durability gate
+        // before every checkpoint and at shutdown.
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let worker_path = path.clone();
+        let worker = thread::Builder::new()
+            .name("foundation-v2-loss-log".into())
+            .spawn(move || {
+                let mut writer = BufWriter::new(file);
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        FoundationV2LossLogCommand::Append(entry) => {
+                            let result = (|| -> Result<()> {
+                                serde_json::to_writer(&mut writer, &entry).with_context(|| {
+                                    format!("append loss record to {}", worker_path.display())
+                                })?;
+                                writer.write_all(b"\n").with_context(|| {
+                                    format!("terminate loss record in {}", worker_path.display())
+                                })
+                            })();
+                            if let Err(error) = result {
+                                tracing::error!(
+                                    "failed to append foundation-v2 loss log {}: {error:#}",
+                                    worker_path.display()
+                                );
+                                break;
+                            }
+                        }
+                        FoundationV2LossLogCommand::Flush(reply) => {
+                            let result = writer
+                                .flush()
+                                .with_context(|| {
+                                    format!("flush loss log {}", worker_path.display())
+                                })
+                                .and_then(|_| {
+                                    writer.get_ref().sync_data().with_context(|| {
+                                        format!("sync loss log {}", worker_path.display())
+                                    })
+                                });
+                            let stop = result.is_err();
+                            let _ = reply.send(result);
+                            if stop {
+                                break;
+                            }
+                        }
+                        FoundationV2LossLogCommand::Shutdown(reply) => {
+                            let result = writer
+                                .flush()
+                                .with_context(|| {
+                                    format!("flush loss log {}", worker_path.display())
+                                })
+                                .and_then(|_| {
+                                    writer.get_ref().sync_data().with_context(|| {
+                                        format!("sync loss log {}", worker_path.display())
+                                    })
+                                });
+                            let _ = reply.send(result);
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("spawn foundation-v2 loss-log worker")?;
         Ok(Self {
             path,
-            writer: BufWriter::new(file),
+            sender,
+            worker: Some(worker),
         })
     }
 
@@ -7867,32 +8161,46 @@ impl FoundationV2LossLog {
         values: &FoundationV2LossMeans,
         learning_rate: f64,
     ) -> Result<()> {
-        let entry = FoundationV2LossLogEntry {
+        let entry = FoundationV2LossLogEntryOwned {
             global_step,
-            values,
+            values: values.clone(),
             learning_rate,
         };
-        serde_json::to_writer(&mut self.writer, &entry)
-            .with_context(|| format!("append loss record to {}", self.path.display()))?;
-        self.writer
-            .write_all(b"\n")
-            .with_context(|| format!("terminate loss record in {}", self.path.display()))
+        self.sender
+            .send(FoundationV2LossLogCommand::Append(entry))
+            .with_context(|| format!("queue loss record for {}", self.path.display()))
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .with_context(|| format!("flush loss log {}", self.path.display()))?;
-        self.writer
-            .get_ref()
-            .sync_data()
-            .with_context(|| format!("sync loss log {}", self.path.display()))
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(FoundationV2LossLogCommand::Flush(reply_tx))
+            .with_context(|| format!("request loss-log flush for {}", self.path.display()))?;
+        reply_rx
+            .recv()
+            .with_context(|| format!("await loss-log flush for {}", self.path.display()))?
     }
 }
 
 impl Drop for FoundationV2LossLog {
     fn drop(&mut self) {
-        if let Err(error) = self.flush() {
+        let result = if let Some(worker) = self.worker.take() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            let result = self
+                .sender
+                .send(FoundationV2LossLogCommand::Shutdown(reply_tx))
+                .with_context(|| format!("request loss-log shutdown for {}", self.path.display()))
+                .and_then(|_| {
+                    reply_rx.recv().with_context(|| {
+                        format!("await loss-log shutdown for {}", self.path.display())
+                    })?
+                });
+            let _ = worker.join();
+            result
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
             tracing::error!(
                 "failed to flush foundation-v2 loss log {} on drop: {error:#}",
                 self.path.display()
@@ -8138,7 +8446,10 @@ fn foundation_v2_mechanism_sample(
             store_intermediate_steps: false,
         },
     )?;
-    let gate = model.exact_copy_gate(&out.y)?.detach().to_dtype(DType::F32)?;
+    let gate = model
+        .exact_copy_gate(&out.y)?
+        .detach()
+        .to_dtype(DType::F32)?;
     let gate_mean_probability = gate.mean_all()?.to_scalar::<f32>()? as f64;
     let gate_open_rate = gate
         .ge(0.5)?
@@ -8255,10 +8566,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     };
     ensure_profile_campaign_manifest(&cfg, &cfg.profile_updates)?;
     if resumed_from.is_some() {
-        ensure_foundation_v2_resume_not_aborted(
-            &cfg,
-            state.foundation_v2.as_ref(),
-        )?;
+        ensure_foundation_v2_resume_not_aborted(&cfg, state.foundation_v2.as_ref())?;
     }
     let mut loss_log = FoundationV2LossLog::open(&cfg.output_dir)?;
     let mut latest_checkpoint = if resumed_from.is_none() {
@@ -8307,10 +8615,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     if resumed_from.is_some() {
         let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
         reconcile_foundation_v2_best_checkpoint(&cfg, foundation)?;
-        reconcile_foundation_v2_permanent_checkpoints(
-            &cfg,
-            &mut foundation.permanent_checkpoints,
-        )?;
+        reconcile_foundation_v2_permanent_checkpoints(&cfg, &mut foundation.permanent_checkpoints)?;
     }
     validate_foundation_v2_profile_resume(
         &cfg.profile_updates,
@@ -8429,7 +8734,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             .as_ref()
             .and_then(RepresentativeUpdateCapture::measurement);
         let profile_measurement_span = profile_measurement.as_ref().and_then(ProfileRange::span_id);
-        let (mixed, content_batch_digest) = if let Some(prefetcher) = data_prefetcher.as_mut() {
+        let (mixed, host, content_batch_digest) = if let Some(prefetcher) = data_prefetcher.as_mut()
+        {
             let (batch_index, prepared) = if let Some(profile) = &cg_profile {
                 profile.synchronized_phase(
                     &device,
@@ -8460,7 +8766,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                     )?;
                     let digest =
                         training_content_batch_digest(batch.transitions(), batch.content_masks())?;
-                    Ok((batch, digest))
+                    let host = prepare_foundation_v2_batch_host(&batch)?;
+                    Ok((batch, host, digest))
                 })?
             } else {
                 let batch = compose_mixed_stream_batch(
@@ -8471,7 +8778,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 )?;
                 let digest =
                     training_content_batch_digest(batch.transitions(), batch.content_masks())?;
-                (batch, digest)
+                let host = prepare_foundation_v2_batch_host(&batch)?;
+                (batch, host, digest)
             }
         };
         let batch_event_census = mixed.event_label_census();
@@ -8520,6 +8828,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                     foundation_v2_training_loss_with_event_weights(
                         &model,
                         &mixed,
+                        &host,
                         &device,
                         objective,
                         &event_slot_weights,
@@ -8530,6 +8839,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             foundation_v2_training_loss_with_event_weights(
                 &model,
                 &mixed,
+                &host,
                 &device,
                 objective,
                 &event_slot_weights,
@@ -10274,9 +10584,8 @@ mod tests {
         cfg.output_dir = root.clone();
         let selected = checkpoint_step_directory(&cfg, 1_024);
         write_fake_checkpoint_bundle(&selected, 1_024, true)?;
-        let foundation = checkpoint_foundation_state(vec![checkpoint_gate_evaluation(
-            1_024, 0.5, true,
-        )]);
+        let foundation =
+            checkpoint_foundation_state(vec![checkpoint_gate_evaluation(1_024, 0.5, true)]);
         assert!(foundation_v2_verified_best_export(
             &cfg,
             PromotionMetric::ChangedExact,
@@ -10321,12 +10630,14 @@ mod tests {
         fs::write(permanent.join("ema.safetensors"), b"corrupt")?;
         reconcile_foundation_v2_permanent_checkpoints(&cfg, &mut recorded)?;
         verify_checkpoint_bundle(&permanent)?;
-        assert!(fs::read_dir(root.join("checkpoints/permanent"))?.any(|entry| {
-            entry
-                .ok()
-                .and_then(|entry| entry.file_name().into_string().ok())
-                .is_some_and(|name| name.starts_with(".step-000000002048.corrupt-"))
-        }));
+        assert!(
+            fs::read_dir(root.join("checkpoints/permanent"))?.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .is_some_and(|name| name.starts_with(".step-000000002048.corrupt-"))
+            })
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -10366,9 +10677,8 @@ mod tests {
         reconcile_foundation_v2_gate_population_identity(&mut fresh, identity.clone())?;
         assert_eq!(fresh.gate_population_identity, Some(identity.clone()));
 
-        let mut historical = checkpoint_foundation_state(vec![checkpoint_gate_evaluation(
-            1_024, 0.5, true,
-        )]);
+        let mut historical =
+            checkpoint_foundation_state(vec![checkpoint_gate_evaluation(1_024, 0.5, true)]);
         let error = reconcile_foundation_v2_gate_population_identity(&mut historical, identity)
             .expect_err("history without identity must fail closed");
         assert!(error.to_string().contains("gate history"));
@@ -10384,7 +10694,9 @@ mod tests {
 
         let mut manifest: CheckpointBundleManifest =
             read_json(&bundle.join("bundle-manifest.json"))?;
-        manifest.artifacts.retain(|artifact| artifact.path != "ema.safetensors");
+        manifest
+            .artifacts
+            .retain(|artifact| artifact.path != "ema.safetensors");
         write_json_atomic(&bundle.join("bundle-manifest.json"), &manifest)?;
         assert!(verify_checkpoint_bundle(&bundle)
             .unwrap_err()
@@ -12944,7 +13256,10 @@ mod tests {
         assert_eq!(sample.step, 1_024);
         assert_eq!(sample.copy_bypass_alpha, None);
         assert_eq!(sample.outer_step_cosines.len(), 2);
-        assert!(sample.outer_step_cosines.iter().all(|value| value.is_finite()));
+        assert!(sample
+            .outer_step_cosines
+            .iter()
+            .all(|value| value.is_finite()));
         assert!((0.0..=1.0).contains(&sample.gate_open_rate));
         assert!((0.0..=1.0).contains(&sample.gate_mean_probability));
         Ok(())
@@ -12965,9 +13280,7 @@ mod tests {
             "{error:#}"
         );
         for update in [2, 4] {
-            let bundle = root
-                .join("profile")
-                .join(format!("update-{update:012}"));
+            let bundle = root.join("profile").join(format!("update-{update:012}"));
             let run = candle_graph::ProfileRun::training(PROFILE_ENTRYPOINT, update, "cpu")
                 .correlation_id(format!("tofy.p2/update-{update:012}"));
             let capture = match candle_graph::CaptureRun::begin(&bundle, run)? {
@@ -13167,12 +13480,7 @@ mod tests {
                 .iter()
                 .map(|family| family.family.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "auxiliary_decoders",
-                "exact_decoder",
-                "observers",
-                "world",
-            ])
+            BTreeSet::from(["auxiliary_decoders", "exact_decoder", "observers", "world",])
         );
         assert!(fs::read_dir(bundle.parent().expect("profile directory"))?
             .filter_map(std::result::Result::ok)

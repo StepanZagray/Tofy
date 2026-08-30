@@ -4,7 +4,10 @@ use crate::domain::Split;
 use crate::p2::data::{
     compose_mixed_stream_batch, MixedStreamBatch, MixedStreamConfig, TransitionSample, V5DataSplit,
 };
-use crate::p2::train::{collect_batch_uncached, training_content_batch_digest};
+use crate::p2::train::{
+    collect_batch_uncached, prepare_foundation_v2_batch_host, training_content_batch_digest,
+    PreparedFoundationV2BatchHost,
+};
 use anyhow::{ensure, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -320,12 +323,19 @@ struct MixedStreamWorkQueue {
 /// training thread never re-hashes full frames.
 pub struct PreparedMixedStreamBatch {
     batch: MixedStreamBatch,
+    /// CPU-only row expansion. Candle tensor construction stays on the
+    /// training thread because CUDA device use is not worker-thread safe.
+    foundation_v2_host: PreparedFoundationV2BatchHost,
     training_content_digest: [u8; 32],
 }
 
 impl PreparedMixedStreamBatch {
-    pub fn into_parts(self) -> (MixedStreamBatch, [u8; 32]) {
-        (self.batch, self.training_content_digest)
+    pub(crate) fn into_parts(self) -> (MixedStreamBatch, PreparedFoundationV2BatchHost, [u8; 32]) {
+        (
+            self.batch,
+            self.foundation_v2_host,
+            self.training_content_digest,
+        )
     }
 }
 
@@ -431,8 +441,10 @@ impl MixedStreamBatchPrefetcher {
                                 batch.transitions(),
                                 batch.content_masks(),
                             )?;
+                            let foundation_v2_host = prepare_foundation_v2_batch_host(&batch)?;
                             Ok(PreparedMixedStreamBatch {
                                 batch,
+                                foundation_v2_host,
                                 training_content_digest,
                             })
                         },
@@ -566,7 +578,7 @@ mod mixed_stream_tests {
         for expected_index in first_batch_index..first_batch_index + 3 {
             let (batch_index, prepared) = prefetcher.recv_next()?;
             assert_eq!(batch_index, expected_index);
-            let (prefetched, prefetched_digest) = prepared.into_parts();
+            let (prefetched, _host, prefetched_digest) = prepared.into_parts();
             let direct = compose_mixed_stream_batch(
                 &config,
                 expected_index as f32 / total_steps as f32,
@@ -608,7 +620,7 @@ mod mixed_stream_tests {
         for expected_index in 0..total_steps as u64 {
             let (batch_index, prepared) = prefetcher.recv_next()?;
             assert_eq!(batch_index, expected_index);
-            let (_, prefetched_digest) = prepared.into_parts();
+            let (_, _host, prefetched_digest) = prepared.into_parts();
             prefetched_chain = training_content_hash_append(prefetched_chain, prefetched_digest);
 
             let inline = compose_mixed_stream_batch(
@@ -651,8 +663,8 @@ mod mixed_stream_tests {
         assert_eq!(
             chain,
             [
-                35, 79, 71, 109, 212, 65, 91, 45, 135, 210, 135, 44, 94, 92, 37, 86, 169, 16,
-                234, 191, 235, 127, 60, 26, 55, 129, 23, 0, 113, 33, 225, 210,
+                35, 79, 71, 109, 212, 65, 91, 45, 135, 210, 135, 44, 94, 92, 37, 86, 169, 16, 234,
+                191, 235, 127, 60, 26, 55, 129, 23, 0, 113, 33, 225, 210,
             ]
         );
         Ok(())
