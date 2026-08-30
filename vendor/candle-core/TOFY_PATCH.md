@@ -60,6 +60,23 @@ Run the A40 kernel/timing probe with:
 cargo run --release --features cudnn --example conv_kernel_probe -- --warmup 20 --iters 100
 ```
 
+That historical `native-dtype` mode does use `Tensor::backward`, including the real
+`Op::Conv2D` autograd branch and both cuDNN backward launches. It nevertheless gives the input
+and weight BF16 `Var` roots directly, so it does not measure the differentiable dtype casts around
+the training model's F32 states and master weights. Use the mandatory cast-island acceptance mode
+for the training graph:
+
+```console
+cargo run --release --features cudnn --example conv_kernel_probe -- \
+  --mode cast-island --warmup 20 --iters 100 --min-speedup 1.3
+```
+
+This mode builds one complete `GridResidualBlock` application with F32 `Var` roots, F32
+bias/SiLU/FiLM/residual math, and exactly the activation/weight/output casts used by
+`GridResidualBlock::conv_product_f32`. It synchronizes and reports forward, backward, and complete
+autograd medians independently, verifies that every root receives an F32 gradient, and fails if
+the complete F32/BF16 median ratio is below the requested threshold.
+
 The ignored parity tests can exercise either CUDA implementation explicitly:
 
 ```console
