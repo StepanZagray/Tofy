@@ -330,7 +330,7 @@ pub struct PreparedMixedStreamBatch {
 }
 
 impl PreparedMixedStreamBatch {
-    pub(crate) fn into_parts(self) -> (MixedStreamBatch, PreparedFoundationV2BatchHost, [u8; 32]) {
+    pub fn into_parts(self) -> (MixedStreamBatch, PreparedFoundationV2BatchHost, [u8; 32]) {
         (
             self.batch,
             self.foundation_v2_host,

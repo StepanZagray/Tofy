@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         for expected_index in 0..measured_batches as u64 {
             let (batch_index, prepared) = prefetcher.recv_next()?;
             ensure!(batch_index == expected_index, "out-of-order batch");
-            let (batch, _) = prepared.into_parts();
+            let (batch, _host, _) = prepared.into_parts();
             ensure!(batch.samples().len() == BATCH_ROWS, "wrong row count");
             hashes.push(batch_hash(&batch)?);
         }

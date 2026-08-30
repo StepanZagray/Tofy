@@ -2819,7 +2819,7 @@ pub struct BatchTensors {
 /// serialized on the training thread; constructing those tensors in workers has
 /// previously raced host-to-device copies.
 #[derive(Debug)]
-pub(crate) struct PreparedFoundationV2BatchHost {
+pub struct PreparedFoundationV2BatchHost {
     batch_size: usize,
     frames: Vec<u8>,
     next_frames: Vec<u8>,
