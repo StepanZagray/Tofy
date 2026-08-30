@@ -284,6 +284,10 @@ pub struct FoundationV2GateResult {
     pub passed: bool,
     pub measured: Option<f64>,
     pub threshold: String,
+    #[serde(default)]
+    pub abort_exempt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_exemption_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -533,6 +537,7 @@ pub fn foundation_v2_gate_evaluation(
     metrics: GateSupportMetrics,
     running_best: Option<f64>,
     composed_running_best: Option<f64>,
+    gate_history: &[FoundationV2GateEvaluation],
 ) -> Result<FoundationV2GateEvaluation> {
     let outcome_changing_rows = metrics
         .shuffled_action_outcome_changing_tuples
@@ -574,6 +579,32 @@ pub fn foundation_v2_gate_evaluation(
     // CE (0.086 -> 0.639 over the first 4096 steps of the first launch);
     // enforce it once the decoder has had half the pre-decay run to mature.
     let foreground_active = step >= 8_192;
+    let shuffled_passed = !warmup_done
+        || metrics
+            .shuffled_action_changed_pixel_ratio
+            .is_some_and(|value| value <= 0.95);
+    let shuffled_abort_exemption = (!shuffled_passed)
+        .then(|| {
+            foundation_v2_floor_gate_abort_exemption(
+                "shuffled_action_ratio",
+                metrics.shuffled_action_changed_pixel_ratio,
+                gate_history,
+            )
+        })
+        .flatten();
+    let foreground_passed = !foreground_active
+        || metrics
+            .foreground_reconstruction_accuracy
+            .is_some_and(|value| value >= 0.60);
+    let foreground_abort_exemption = (!foreground_passed)
+        .then(|| {
+            foundation_v2_floor_gate_abort_exemption(
+                "foreground_reconstruction",
+                metrics.foreground_reconstruction_accuracy,
+                gate_history,
+            )
+        })
+        .flatten();
     let diagnostics = vec![FoundationV2GateDiagnostic {
         // Latent-MSE improvement over copy measures proximity in a space the
         // v5 objective does not optimize; it cannot be represented as a
@@ -585,16 +616,15 @@ pub fn foundation_v2_gate_evaluation(
     let gates = vec![
         FoundationV2GateResult {
             name: "shuffled_action_ratio".into(),
-            passed: !warmup_done
-                || metrics
-                    .shuffled_action_changed_pixel_ratio
-                    .is_some_and(|value| value <= 0.95),
+            passed: shuffled_passed,
             measured: metrics.shuffled_action_changed_pixel_ratio,
             threshold: if warmup_done {
                 "<= 0.95 on outcome-changing counterfactual rows (action-blind ~= 1.0)".into()
             } else {
                 "warmup PASS until step 4096".into()
             },
+            abort_exempt: shuffled_abort_exemption.is_some(),
+            abort_exemption_reason: shuffled_abort_exemption,
         },
         FoundationV2GateResult {
             // Under changed-pixel-weighted CE the encoded-state foreground
@@ -604,16 +634,15 @@ pub fn foundation_v2_gate_evaluation(
             // a regression floor below the observed asymptote, not an
             // aspirational target.
             name: "foreground_reconstruction".into(),
-            passed: !foreground_active
-                || metrics
-                    .foreground_reconstruction_accuracy
-                    .is_some_and(|value| value >= 0.60),
+            passed: foreground_passed,
             measured: metrics.foreground_reconstruction_accuracy,
             threshold: if foreground_active {
                 ">= 0.60 (collapse floor)".into()
             } else {
                 "warmup PASS until step 8192".into()
             },
+            abort_exempt: foreground_abort_exemption.is_some(),
+            abort_exemption_reason: foreground_abort_exemption,
         },
         FoundationV2GateResult {
             name: "one_step_collapse".into(),
@@ -624,6 +653,8 @@ pub fn foundation_v2_gate_evaluation(
             threshold: collapse_floor
                 .map(|floor| format!(">= {floor:.8} (0.8 x running best)"))
                 .unwrap_or_else(|| "metric required".into()),
+            abort_exempt: false,
+            abort_exemption_reason: None,
         },
         FoundationV2GateResult {
             name: "composed_changed_exact_collapse".into(),
@@ -639,6 +670,8 @@ pub fn foundation_v2_gate_evaluation(
             } else {
                 "warmup PASS until step 4096".into()
             },
+            abort_exempt: false,
+            abort_exemption_reason: None,
         },
     ];
     Ok(FoundationV2GateEvaluation {
@@ -648,6 +681,44 @@ pub fn foundation_v2_gate_evaluation(
         running_best_after,
         gates,
         diagnostics,
+    })
+}
+
+fn foundation_v2_floor_gate_abort_exemption(
+    name: &str,
+    measured: Option<f64>,
+    history: &[FoundationV2GateEvaluation],
+) -> Option<String> {
+    let current = measured?;
+    let prior = history
+        .last()?
+        .gates
+        .iter()
+        .find(|gate| gate.name == name)?;
+    let before_prior = history
+        .get(history.len().checked_sub(2)?)?
+        .gates
+        .iter()
+        .find(|gate| gate.name == name)?;
+    let prior = prior.measured?;
+    let before_prior = before_prior.measured?;
+    if ![before_prior, prior, current]
+        .into_iter()
+        .all(f64::is_finite)
+    {
+        return None;
+    }
+    let (improving, direction) = match name {
+        "foreground_reconstruction" => {
+            (current > prior && prior > before_prior, "higher is better")
+        }
+        "shuffled_action_ratio" => (current < prior && prior < before_prior, "lower is better"),
+        _ => return None,
+    };
+    improving.then(|| {
+        format!(
+            "two consecutive strict improvements ({before_prior:.8} -> {prior:.8} -> {current:.8}; {direction})"
+        )
     })
 }
 
@@ -661,6 +732,10 @@ pub fn foundation_v2_gate_history_aborts(history: &[FoundationV2GateEvaluation])
     };
     latest.gates.iter().any(|gate| {
         !gate.passed
+            && !(matches!(
+                gate.name.as_str(),
+                "foreground_reconstruction" | "shuffled_action_ratio"
+            ) && gate.abort_exempt)
             && prior
                 .gates
                 .iter()
@@ -8632,6 +8707,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 metrics,
                 prior_best,
                 prior_composed_best,
+                &foundation.gate_history,
             )?;
             improved_best = foundation_v2_evaluation_improves(
                 cfg.promotion_metric,
@@ -9888,6 +9964,110 @@ mod tests {
         }
     }
 
+    fn floor_gate_metrics(foreground: f64, shuffled: f64) -> GateSupportMetrics {
+        GateSupportMetrics {
+            shuffled_action_changed_pixel_ratio: Some(shuffled),
+            shuffled_action_outcome_changing_tuples: Some(
+                MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS,
+            ),
+            foreground_reconstruction_accuracy: Some(foreground),
+            ..checkpoint_gate_metrics(1.0)
+        }
+    }
+
+    #[test]
+    fn foundation_v2_improving_foreground_floor_replays_s5_without_abort() -> Result<()> {
+        let mut history = Vec::new();
+        for (step, foreground) in [0.5077, 0.5500, 0.5672, 0.5742, 0.5887, 0.5985]
+            .into_iter()
+            .enumerate()
+        {
+            let evaluation = foundation_v2_gate_evaluation(
+                4_096 + step as u64 * 1_024,
+                floor_gate_metrics(foreground, 0.0),
+                Some(1.0),
+                Some(1.0),
+                &history,
+            )?;
+            history.push(evaluation);
+            assert!(!foundation_v2_gate_history_aborts(&history));
+        }
+        let foreground = history
+            .last()
+            .and_then(|evaluation| {
+                evaluation
+                    .gates
+                    .iter()
+                    .find(|gate| gate.name == "foreground_reconstruction")
+            })
+            .expect("foreground-reconstruction gate");
+        assert!(!foreground.passed);
+        assert!(foreground.abort_exempt);
+        assert!(foreground
+            .abort_exemption_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("higher is better")));
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_foreground_floor_plateau_or_decline_aborts() -> Result<()> {
+        for tail in [[0.589, 0.589], [0.589, 0.575]] {
+            let mut history = Vec::new();
+            for (step, foreground) in [0.570, 0.580, tail[0], tail[1]].into_iter().enumerate() {
+                let evaluation = foundation_v2_gate_evaluation(
+                    6_144 + step as u64 * 1_024,
+                    floor_gate_metrics(foreground, 0.0),
+                    Some(1.0),
+                    Some(1.0),
+                    &history,
+                )?;
+                history.push(evaluation);
+            }
+            assert!(foundation_v2_gate_history_aborts(&history));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_shuffled_floor_improves_only_when_decreasing() -> Result<()> {
+        for (trajectory, aborts) in [
+            ([0.99, 0.98, 0.97, 0.96], false),
+            ([0.94, 0.95, 0.96, 0.97], true),
+        ] {
+            let mut history = Vec::new();
+            for (step, shuffled) in trajectory.into_iter().enumerate() {
+                let evaluation = foundation_v2_gate_evaluation(
+                    2_048 + step as u64 * 1_024,
+                    floor_gate_metrics(1.0, shuffled),
+                    Some(1.0),
+                    Some(1.0),
+                    &history,
+                )?;
+                history.push(evaluation);
+            }
+            assert_eq!(foundation_v2_gate_history_aborts(&history), aborts);
+            let shuffled = history
+                .last()
+                .and_then(|evaluation| {
+                    evaluation
+                        .gates
+                        .iter()
+                        .find(|gate| gate.name == "shuffled_action_ratio")
+                })
+                .expect("shuffled-action gate");
+            assert!(!shuffled.passed);
+            assert_eq!(shuffled.abort_exempt, !aborts);
+            if !aborts {
+                assert!(shuffled
+                    .abort_exemption_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("lower is better")));
+            }
+        }
+        Ok(())
+    }
+
     fn checkpoint_gate_evaluation(
         step: u64,
         value: f64,
@@ -9903,9 +10083,98 @@ mod tests {
                 passed,
                 measured: Some(value),
                 threshold: "test".into(),
+                abort_exempt: false,
+                abort_exemption_reason: None,
             }],
             diagnostics: vec![],
         }
+    }
+
+    #[test]
+    fn foundation_v2_old_gate_history_defaults_to_non_exempt_replay() -> Result<()> {
+        let original = vec![
+            checkpoint_gate_evaluation(1_024, 0.5, true),
+            checkpoint_gate_evaluation(2_048, 0.4, false),
+            checkpoint_gate_evaluation(3_072, 0.3, false),
+        ];
+        let expected_abort = foundation_v2_gate_history_aborts(&original);
+        let expected_best =
+            foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &original);
+        let mut old_format = serde_json::to_value(&original)?;
+        for evaluation in old_format
+            .as_array_mut()
+            .expect("serialized gate-history array")
+        {
+            for gate in evaluation["gates"]
+                .as_array_mut()
+                .expect("serialized gates")
+            {
+                let gate = gate.as_object_mut().expect("serialized gate");
+                gate.remove("abort_exempt");
+                gate.remove("abort_exemption_reason");
+            }
+        }
+
+        let replayed: Vec<FoundationV2GateEvaluation> = serde_json::from_value(old_format)?;
+        assert_eq!(replayed, original);
+        assert_eq!(foundation_v2_gate_history_aborts(&replayed), expected_abort);
+        assert!(expected_abort);
+        assert_eq!(
+            foundation_v2_selected_best_step(PromotionMetric::ChangedExact, &replayed),
+            expected_best
+        );
+        assert_eq!(expected_best, Some(1_024));
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_exempt_floor_failure_still_blocks_promotion() -> Result<()> {
+        let mut history = Vec::new();
+        for (step, foreground) in [0.570, 0.580, 0.590].into_iter().enumerate() {
+            let evaluation = foundation_v2_gate_evaluation(
+                6_144 + step as u64 * 1_024,
+                floor_gate_metrics(foreground, 0.0),
+                Some(1.0),
+                Some(1.0),
+                &history,
+            )?;
+            history.push(evaluation);
+        }
+        let evaluation = history.last().expect("latest gate evaluation");
+        let foreground = evaluation
+            .gates
+            .iter()
+            .find(|gate| gate.name == "foreground_reconstruction")
+            .expect("foreground-reconstruction gate");
+        assert!(foreground.abort_exempt);
+        assert!(foundation_v2_promotion_improved(
+            PromotionMetric::ChangedExact,
+            None,
+            &[],
+            &evaluation.metrics,
+        ));
+        assert!(!foundation_v2_evaluation_improves(
+            PromotionMetric::ChangedExact,
+            None,
+            &[],
+            evaluation,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_collapse_gate_cannot_be_abort_exempt() {
+        let mut history = vec![
+            checkpoint_gate_evaluation(1_024, 0.5, false),
+            checkpoint_gate_evaluation(2_048, 0.4, false),
+        ];
+        let latest = history
+            .last_mut()
+            .and_then(|evaluation| evaluation.gates.last_mut())
+            .expect("latest collapse gate");
+        latest.abort_exempt = true;
+        latest.abort_exemption_reason = Some("forged trend exemption".into());
+        assert!(foundation_v2_gate_history_aborts(&history));
     }
 
     fn checkpoint_foundation_state(

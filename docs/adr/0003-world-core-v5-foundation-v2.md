@@ -151,6 +151,21 @@
   bumped. The flag is nevertheless persisted in `config.json` and the resume
   contract so crossing precision arms fails closed.
 
+## Implementation amendment (2026-08-30 — floor-gate trend exemption)
+
+- An armed `foreground_reconstruction` or `shuffled_action_ratio` floor
+  failure remains `passed: false` and blocks best-checkpoint promotion, but it
+  is exempt from the two-consecutive-failure abort when the same measurement
+  has made two consecutive strict improvements (`foreground_reconstruction`
+  higher, `shuffled_action_ratio` lower). Gate history records the exemption
+  and its measured trend explicitly. This prevents a repeat of s5, where
+  foreground reconstruction rose monotonically `0.508 -> 0.550 -> 0.567 ->
+  0.574 -> 0.589 -> 0.598` yet the armed 0.60 floor aborted after exact
+  measurements 0.5887 at step 8192 and 0.5985 at step 9216. Plateauing or
+  worsening failures still abort, and the relative-to-running-best
+  `one_step_collapse` and composed changed-exact collapse/floor gates have no
+  exemption.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every

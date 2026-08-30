@@ -199,6 +199,7 @@ fn foundation_v2_gate_evaluation(
         metrics,
         running_best,
         composed_running_best,
+        &[],
     )
     .expect("test gate population is causally eligible")
 }
@@ -249,7 +250,7 @@ fn gate_rejects_a_zero_outcome_changing_population_during_warmup() {
     let mut degenerate = metrics(0.9);
     degenerate.shuffled_action_changed_pixel_ratio = None;
     degenerate.shuffled_action_outcome_changing_tuples = Some(0);
-    let error = try_foundation_v2_gate_evaluation(1_024, degenerate, None, None)
+    let error = try_foundation_v2_gate_evaluation(1_024, degenerate, None, None, &[])
         .expect_err("degenerate gate population must fail before warmup PASS");
     assert!(error.to_string().contains("outcome-changing tuples"));
     assert!(error.to_string().contains("at least 32"));
