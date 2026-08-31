@@ -194,6 +194,37 @@ the operative failure mode, not model collapse. `p2.gate_policy.v4` -> `v5`:
   counts. Exempt failures remain `passed: false` and never promote.
 - The relative `one_step_collapse` gate is unchanged and keeps no exemption.
 
+## Implementation amendment (2026-08-31 — gate policy v6: noise-aware abort significance, patience 3)
+
+Evidence: under v5, arm s8 aborted at step 5120 on `shuffled_action_ratio`
+measuring 0.9756 against the 0.95 floor — on only 115 outcome-changing
+counterfactual tuples, where the one-sided 95% binomial standard error at the
+floor is ~0.020 and the noise margin ~0.033. The abort fired on a violation
+statistically indistinguishable from evaluation noise, compounded by the
+platform's non-reproducible cuDNN f32 kernels. This is the fourth arm killed
+by a marginal floor gate. Established practice for run-health monitoring
+(early stopping with patience and minimum-delta, loss-spike detection against
+smoothed baselines requiring sustained significant deviation, confidence
+intervals for proportion metrics) separates the promotion bar from the kill
+criterion: only sustained, significant degradation justifies destroying a
+run. `p2.gate_policy.v5` -> `v6`:
+
+- Every armed floor/collapse gate records a structured `floor` and a
+  one-sided 95% binomial `noise_margin` computed on the gate's real
+  denominator (outcome-changing tuples, changed transitions, foreground
+  pixels). `passed` remains the plain threshold comparison — a noise-level
+  failure still blocks best-checkpoint promotion.
+- Abort accounting counts only significant failures: the violation must
+  exceed the recorded margin. Significance is recomputed from the structured
+  numbers, never trusted from `abort_exempt`, so forged exemption flags on
+  collapse gates still fail closed. Legacy history entries without floors
+  count as significant (fail-closed).
+- Abort patience rises from two to three consecutive counting failures of
+  the same gate. Trend exemptions for the absolute floor gates are retained.
+- Composed exact-zero remains catastrophic and aborts regardless of margins.
+- Resume migration: a stored v4/v5 gate-population identity is accepted when
+  the population digests are bit-identical, adopting the v6 schema durably.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every

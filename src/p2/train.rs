@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -288,6 +288,17 @@ pub struct FoundationV2GateResult {
     pub abort_exempt: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_exemption_reason: Option<String>,
+    /// Structured floor for abort significance (gate policy v6). Absent on
+    /// warmup entries and on histories written before v6; absent means the
+    /// legacy fail-closed abort accounting applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<f64>,
+    /// One-sided 95% binomial noise margin of the floor on this gate's
+    /// denominator. A failure must violate the floor by more than this to
+    /// count toward an abort; recorded so replayed histories are auditable
+    /// and recomputed accounting cannot be forged through `abort_exempt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_margin: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -608,6 +619,21 @@ pub fn foundation_v2_gate_evaluation(
             )
         })
         .flatten();
+    // Gate policy v6: structured floors + one-sided 95% binomial noise
+    // margins on each gate's real denominator. `passed` stays the plain
+    // threshold comparison (promotion bar unchanged); only the abort
+    // accounting uses the margins.
+    let shuffled_floor = warmup_done.then_some(0.95);
+    let shuffled_margin =
+        shuffled_floor.map(|floor| foundation_v2_noise_margin(floor, outcome_changing_rows));
+    let foreground_floor = foreground_active.then_some(0.60);
+    let foreground_margin = foreground_floor
+        .map(|floor| foundation_v2_noise_margin(floor, metrics.foreground_pixels));
+    let one_step_margin = collapse_floor
+        .map(|floor| foundation_v2_noise_margin(floor, metrics.changed_transitions));
+    let composed_floor_field = if warmup_done { composed_collapse_floor } else { None };
+    let composed_margin = composed_floor_field
+        .map(|floor| foundation_v2_noise_margin(floor, metrics.changed_transitions));
     let diagnostics = vec![FoundationV2GateDiagnostic {
         // Latent-MSE improvement over copy measures proximity in a space the
         // v5 objective does not optimize; it cannot be represented as a
@@ -628,6 +654,8 @@ pub fn foundation_v2_gate_evaluation(
             },
             abort_exempt: shuffled_abort_exemption.is_some(),
             abort_exemption_reason: shuffled_abort_exemption,
+            floor: shuffled_floor,
+            noise_margin: shuffled_margin,
         },
         FoundationV2GateResult {
             // Under changed-pixel-weighted CE the encoded-state foreground
@@ -646,6 +674,8 @@ pub fn foundation_v2_gate_evaluation(
             },
             abort_exempt: foreground_abort_exemption.is_some(),
             abort_exemption_reason: foreground_abort_exemption,
+            floor: foreground_floor,
+            noise_margin: foreground_margin,
         },
         FoundationV2GateResult {
             name: "one_step_collapse".into(),
@@ -658,6 +688,8 @@ pub fn foundation_v2_gate_evaluation(
                 .unwrap_or_else(|| "metric required".into()),
             abort_exempt: false,
             abort_exemption_reason: None,
+            floor: collapse_floor,
+            noise_margin: one_step_margin,
         },
         FoundationV2GateResult {
             name: "composed_changed_exact_collapse".into(),
@@ -675,6 +707,8 @@ pub fn foundation_v2_gate_evaluation(
             },
             abort_exempt: false,
             abort_exemption_reason: None,
+            floor: composed_floor_field,
+            noise_margin: composed_margin,
         },
     ];
     Ok(FoundationV2GateEvaluation {
@@ -721,26 +755,75 @@ fn foundation_v2_floor_gate_abort_exemption(
     })
 }
 
-/// Fail closed after the same named gate fails in the two latest evaluations.
+/// Abort = sustained, significant degradation (gate policy v6): the same
+/// named gate must fail in the three latest evaluations, and each failure
+/// must violate its recorded floor by more than its one-sided 95% binomial
+/// noise margin. Failures within measurement noise still record
+/// `passed: false` (they block promotion) but cannot kill the run. Entries
+/// without structured floors — legacy histories — count as significant so
+/// old evidence still fails closed.
+pub const FOUNDATION_V2_ABORT_PATIENCE: usize = 3;
+
 pub fn foundation_v2_gate_history_aborts(history: &[FoundationV2GateEvaluation]) -> bool {
-    if history.len() < 2 {
+    if history.len() < FOUNDATION_V2_ABORT_PATIENCE {
         return false;
     }
-    let Some((latest, prior)) = history.last().zip(history.get(history.len() - 2)) else {
-        return false;
-    };
+    let window = &history[history.len() - FOUNDATION_V2_ABORT_PATIENCE..];
+    let latest = window.last().expect("non-empty abort window");
     latest.gates.iter().any(|gate| {
-        !gate.passed
-            && !(matches!(
-                gate.name.as_str(),
-                "foreground_reconstruction" | "shuffled_action_ratio"
-            ) && gate.abort_exempt)
-            && prior
+        window.iter().all(|evaluation| {
+            evaluation
                 .gates
                 .iter()
                 .find(|candidate| candidate.name == gate.name)
-                .is_some_and(|candidate| !candidate.passed)
+                .is_some_and(foundation_v2_gate_failure_counts_toward_abort)
+        })
     })
+}
+
+/// Whether one recorded gate result contributes to the abort window.
+/// Significance is recomputed from the structured floor and margin rather
+/// than trusted from `abort_exempt`, so a forged exemption flag on a
+/// collapse gate still fails closed; the trend exemption remains honored
+/// only for the two absolute floor gates that legitimately record it.
+fn foundation_v2_gate_failure_counts_toward_abort(gate: &FoundationV2GateResult) -> bool {
+    if gate.passed {
+        return false;
+    }
+    if matches!(
+        gate.name.as_str(),
+        "foreground_reconstruction" | "shuffled_action_ratio"
+    ) && gate.abort_exempt
+    {
+        return false;
+    }
+    let (Some(floor), Some(margin), Some(measured)) =
+        (gate.floor, gate.noise_margin, gate.measured)
+    else {
+        return true;
+    };
+    // Structural copy collapse is catastrophic regardless of noise.
+    if gate.name == "composed_changed_exact_collapse" && measured == 0.0 {
+        return true;
+    }
+    let violation = match gate.name.as_str() {
+        "shuffled_action_ratio" => measured - floor,
+        _ => floor - measured,
+    };
+    violation > margin
+}
+
+/// One-sided 95% binomial noise margin for a proportion floor measured on
+/// `n` effectively independent rows of the fixed gate population. Gate
+/// metrics are sample proportions; a violation smaller than ~1.645 standard
+/// errors is indistinguishable from evaluation noise (compounded by the
+/// platform's non-reproducible cuDNN f32 kernels) and must not abort a run.
+fn foundation_v2_noise_margin(floor: f64, n: usize) -> f64 {
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    let p = floor.clamp(0.0, 1.0);
+    1.645 * (p * (1.0 - p) / n as f64).sqrt()
 }
 
 fn default_sigreg_target() -> SigregTarget {
@@ -2211,7 +2294,7 @@ pub struct GatePopulationIdentity {
 /// Version of the in-trainer gate policy (thresholds, warmups, abort rule,
 /// shuffle construction). Bump on any change so a resumed run cannot compare
 /// new measurements against bests recorded under a different policy.
-const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v5";
+const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v6";
 
 fn foundation_v2_gate_population_identity(
     samples: &[TransitionSample],
@@ -2251,6 +2334,29 @@ fn reconcile_foundation_v2_gate_population_identity(
     foundation: &mut FoundationV2TrainerState,
     identity: GatePopulationIdentity,
 ) -> Result<()> {
+    // Documented one-way migration (ADR 0003, gate policy v6): accept a
+    // stored v4/v5 identity when the population digests are bit-identical —
+    // only the abort accounting became noise-aware. The stored identity
+    // adopts the new schema so the migration is durably visible.
+    if let Some(stored) = &foundation.gate_population_identity {
+        if stored.rows_sha256 == identity.rows_sha256
+            && stored.masks_sha256 == identity.masks_sha256
+            && stored.provenance_sha256 == identity.provenance_sha256
+            && matches!(
+                stored.policy_schema.as_str(),
+                "p2.gate_policy.v4" | "p2.gate_policy.v5"
+            )
+            && identity.policy_schema == FOUNDATION_V2_GATE_POLICY_SCHEMA
+        {
+            tracing::warn!(
+                "gate policy migration on resume: {} -> {}",
+                stored.policy_schema,
+                identity.policy_schema
+            );
+            foundation.gate_population_identity = Some(identity);
+            return Ok(());
+        }
+    }
     match &foundation.gate_population_identity {
         Some(stored) if *stored != identity => bail!(
             "resumed gate population/policy identity mismatch: stored {:?} vs regenerated {:?}; best/collapse comparisons would span incomparable populations",
@@ -10334,13 +10440,22 @@ mod tests {
     }
 
     fn floor_gate_metrics(foreground: f64, shuffled: f64) -> GateSupportMetrics {
+        // Denominators large enough that floor violations in these tests are
+        // statistically significant under the v6 noise margins.
         GateSupportMetrics {
             shuffled_action_changed_pixel_ratio: Some(shuffled),
-            shuffled_action_outcome_changing_tuples: Some(
-                MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS,
-            ),
+            shuffled_action_outcome_changing_tuples: Some(2_000),
             foreground_reconstruction_accuracy: Some(foreground),
+            foreground_pixels: 20_000,
+            changed_transitions: 400,
             ..checkpoint_gate_metrics(1.0)
+        }
+    }
+
+    fn shuffled_gate_metrics_with_rows(shuffled: f64, rows: usize) -> GateSupportMetrics {
+        GateSupportMetrics {
+            shuffled_action_outcome_changing_tuples: Some(rows),
+            ..floor_gate_metrics(1.0, shuffled)
         }
     }
 
@@ -10381,11 +10496,11 @@ mod tests {
 
     #[test]
     fn foundation_v2_foreground_floor_plateau_or_decline_aborts() -> Result<()> {
-        for tail in [[0.589, 0.589], [0.589, 0.575]] {
+        for trajectory in [[0.589, 0.589, 0.589], [0.589, 0.575, 0.560]] {
             let mut history = Vec::new();
-            for (step, foreground) in [0.570, 0.580, tail[0], tail[1]].into_iter().enumerate() {
+            for (step, foreground) in trajectory.into_iter().enumerate() {
                 let evaluation = foundation_v2_gate_evaluation(
-                    6_144 + step as u64 * 1_024,
+                    8_192 + step as u64 * 1_024,
                     floor_gate_metrics(foreground, 0.0),
                     Some(1.0),
                     Some(1.0),
@@ -10401,13 +10516,13 @@ mod tests {
     #[test]
     fn foundation_v2_shuffled_floor_improves_only_when_decreasing() -> Result<()> {
         for (trajectory, aborts) in [
-            ([0.99, 0.98, 0.97, 0.96], false),
-            ([0.94, 0.95, 0.96, 0.97], true),
+            ([0.99, 0.985, 0.98, 0.975, 0.97], false),
+            ([0.955, 0.96, 0.97, 0.98, 0.99], true),
         ] {
             let mut history = Vec::new();
             for (step, shuffled) in trajectory.into_iter().enumerate() {
                 let evaluation = foundation_v2_gate_evaluation(
-                    2_048 + step as u64 * 1_024,
+                    4_096 + step as u64 * 1_024,
                     floor_gate_metrics(1.0, shuffled),
                     Some(1.0),
                     Some(1.0),
@@ -10473,17 +10588,71 @@ mod tests {
             .expect("shuffled-action gate");
         assert!(!shuffled.passed);
         assert!(shuffled.abort_exempt);
-        // A subsequent worsening failure is not exempt and aborts against the
-        // still-failing prior evaluation.
-        let evaluation = foundation_v2_gate_evaluation(
-            6_144,
-            floor_gate_metrics(1.0, 0.97),
-            Some(1.0),
-            Some(1.0),
-            &history,
-        )?;
-        history.push(evaluation);
+        // Under v6, sustained significant regression still aborts: three
+        // consecutive worsening, significant failures.
+        for (step, shuffled) in [(6_144u64, 0.97), (7_168, 0.98), (8_192, 0.99)] {
+            let evaluation = foundation_v2_gate_evaluation(
+                step,
+                floor_gate_metrics(1.0, shuffled),
+                Some(1.0),
+                Some(1.0),
+                &history,
+            )?;
+            history.push(evaluation);
+        }
         assert!(foundation_v2_gate_history_aborts(&history));
+        Ok(())
+    }
+
+    /// Replays the s8 step-5120 abort under v6: on 115 outcome-changing
+    /// tuples the one-sided 95% noise margin at the 0.95 floor is ~0.033, so
+    /// violations of 0.0021 and 0.0256 are within measurement noise — they
+    /// block promotion but must not abort, even three in a row. A truly
+    /// action-blind arm (ratio 1.0, violation 0.05 > margin) still aborts.
+    #[test]
+    fn foundation_v2_shuffled_floor_noise_replays_s8_without_abort() -> Result<()> {
+        let mut history = Vec::new();
+        for (step, shuffled) in [
+            (1_024u64, 1.0),
+            (2_048, 0.927632),
+            (3_072, 0.979592),
+            (4_096, 0.952153),
+            (5_120, 0.975610),
+            (6_144, 0.970200),
+        ] {
+            let evaluation = foundation_v2_gate_evaluation(
+                step,
+                shuffled_gate_metrics_with_rows(shuffled, 115),
+                Some(1.0),
+                Some(1.0),
+                &history,
+            )?;
+            history.push(evaluation);
+            assert!(
+                !foundation_v2_gate_history_aborts(&history),
+                "aborted at step {step} on a noise-level violation"
+            );
+        }
+        let latest = history.last().expect("history");
+        let shuffled = latest
+            .gates
+            .iter()
+            .find(|gate| gate.name == "shuffled_action_ratio")
+            .expect("shuffled gate");
+        assert!(!shuffled.passed, "noise-level failure must still block promotion");
+
+        let mut blind_history = Vec::new();
+        for step in [4_096u64, 5_120, 6_144] {
+            let evaluation = foundation_v2_gate_evaluation(
+                step,
+                shuffled_gate_metrics_with_rows(1.0, 115),
+                Some(1.0),
+                Some(1.0),
+                &blind_history,
+            )?;
+            blind_history.push(evaluation);
+        }
+        assert!(foundation_v2_gate_history_aborts(&blind_history));
         Ok(())
     }
 
@@ -10559,6 +10728,8 @@ mod tests {
                 threshold: "test".into(),
                 abort_exempt: false,
                 abort_exemption_reason: None,
+                floor: None,
+                noise_margin: None,
             }],
             diagnostics: vec![],
         }
@@ -10569,7 +10740,8 @@ mod tests {
         let original = vec![
             checkpoint_gate_evaluation(1_024, 0.5, true),
             checkpoint_gate_evaluation(2_048, 0.4, false),
-            checkpoint_gate_evaluation(3_072, 0.3, false),
+            checkpoint_gate_evaluation(3_072, 0.35, false),
+            checkpoint_gate_evaluation(4_096, 0.3, false),
         ];
         let expected_abort = foundation_v2_gate_history_aborts(&original);
         let expected_best =
@@ -10640,7 +10812,8 @@ mod tests {
     fn foundation_v2_collapse_gate_cannot_be_abort_exempt() {
         let mut history = vec![
             checkpoint_gate_evaluation(1_024, 0.5, false),
-            checkpoint_gate_evaluation(2_048, 0.4, false),
+            checkpoint_gate_evaluation(2_048, 0.45, false),
+            checkpoint_gate_evaluation(3_072, 0.4, false),
         ];
         let latest = history
             .last_mut()
