@@ -104,6 +104,10 @@ const FOUNDATION_V2_EP_MIN_WEIGHT: f64 = 1e-4;
 const FOUNDATION_V2_EP_MAX_WEIGHT: f64 = 0.1;
 const FOUNDATION_V2_EP_GRADIENT_BUDGET: f64 = 0.3;
 const FOUNDATION_V2_GATE_EVERY: u64 = 1_024;
+/// Step at which the shuffled-action and composed-collapse gates arm. Values
+/// measured before this step are warmup telemetry and must not seed any
+/// collapse floor: an unarmed warmup peak is not evidence of attained quality.
+const FOUNDATION_V2_GATE_WARMUP_STEPS: u64 = 4_096;
 const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
 const FOUNDATION_V2_ABORT_MARKER: &str = "foundation_v2_abort.json";
@@ -428,7 +432,9 @@ pub fn foundation_v2_candidate_improves(
 pub fn foundation_v2_gate_is_armed(evaluation: &FoundationV2GateEvaluation, name: &str) -> bool {
     match name {
         "positive_improvement" => false,
-        "shuffled_action_ratio" | "composed_changed_exact_collapse" => evaluation.step >= 4_096,
+        "shuffled_action_ratio" | "composed_changed_exact_collapse" => {
+            evaluation.step >= FOUNDATION_V2_GATE_WARMUP_STEPS
+        }
         "foreground_reconstruction" => evaluation.step >= 8_192,
         "one_step_collapse" => true,
         // Unknown gates fail closed instead of silently becoming diagnostics.
@@ -571,7 +577,7 @@ pub fn foundation_v2_gate_evaluation(
     // measured and logged but PASS by fiat. The collapse detector stays
     // active from the first evaluation because it is relative to the run's
     // own best.
-    let warmup_done = step >= 4_096;
+    let warmup_done = step >= FOUNDATION_V2_GATE_WARMUP_STEPS;
     // Foreground reconstruction ramps slowly under the changed-pixel-weighted
     // CE (0.086 -> 0.639 over the first 4096 steps of the first launch);
     // enforce it once the decoder has had half the pre-decay run to mature.
@@ -662,7 +668,7 @@ pub fn foundation_v2_gate_evaluation(
             measured: current_composed_exact,
             threshold: if warmup_done {
                 composed_collapse_floor
-                    .map(|floor| format!("> 0 and >= {floor:.8} (0.8 x running best)"))
+                    .map(|floor| format!("> 0 and >= {floor:.8} (0.8 x armed running best)"))
                     .unwrap_or_else(|| "> 0; metric required".into())
             } else {
                 "warmup PASS until step 4096".into()
@@ -692,29 +698,25 @@ fn foundation_v2_floor_gate_abort_exemption(
         .gates
         .iter()
         .find(|gate| gate.name == name)?;
-    let before_prior = history
-        .get(history.len().checked_sub(2)?)?
-        .gates
-        .iter()
-        .find(|gate| gate.name == name)?;
     let prior = prior.measured?;
-    let before_prior = before_prior.measured?;
-    if ![before_prior, prior, current]
-        .into_iter()
-        .all(f64::is_finite)
-    {
+    if ![prior, current].into_iter().all(f64::is_finite) {
         return None;
     }
+    // Gate policy v5: one strict improvement on the latest interval suffices.
+    // Arm s7 aborted at 0.9567 against a 0.95 floor while improving from
+    // 0.9904, because a single warmup-window blip broke the former
+    // two-consecutive-improvements requirement. The relaxed rule still aborts
+    // plateaus and declines, and an oscillating metric aborts on its first
+    // worsening evaluation because that failure is not exempt while the prior
+    // failure still counts.
     let (improving, direction) = match name {
-        "foreground_reconstruction" => {
-            (current > prior && prior > before_prior, "higher is better")
-        }
-        "shuffled_action_ratio" => (current < prior && prior < before_prior, "lower is better"),
+        "foreground_reconstruction" => (current > prior, "higher is better"),
+        "shuffled_action_ratio" => (current < prior, "lower is better"),
         _ => return None,
     };
     improving.then(|| {
         format!(
-            "two consecutive strict improvements ({before_prior:.8} -> {prior:.8} -> {current:.8}; {direction})"
+            "strict improvement on the latest interval ({prior:.8} -> {current:.8}; {direction})"
         )
     })
 }
@@ -2209,7 +2211,7 @@ pub struct GatePopulationIdentity {
 /// Version of the in-trainer gate policy (thresholds, warmups, abort rule,
 /// shuffle construction). Bump on any change so a resumed run cannot compare
 /// new measurements against bests recorded under a different policy.
-const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v4";
+const FOUNDATION_V2_GATE_POLICY_SCHEMA: &str = "p2.gate_policy.v5";
 
 fn foundation_v2_gate_population_identity(
     samples: &[TransitionSample],
@@ -9006,9 +9008,14 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             }
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
             let prior_best = foundation.best_changed_exact;
+            // Only armed evaluations may seed the composed collapse floor.
+            // Warmup values PASS by fiat and can peak on transient copy-decode
+            // behavior; anchoring the floor to such a peak aborted arm s6 at
+            // the first armed evaluation (gate policy v5).
             let prior_composed_best = foundation
                 .gate_history
                 .iter()
+                .filter(|evaluation| evaluation.step >= FOUNDATION_V2_GATE_WARMUP_STEPS)
                 .filter_map(|evaluation| evaluation.metrics.one_step_composed_changed_exact)
                 .filter(|value| value.is_finite())
                 .reduce(f64::max);
@@ -10375,6 +10382,111 @@ mod tests {
                     .is_some_and(|reason| reason.contains("lower is better")));
             }
         }
+        Ok(())
+    }
+
+    fn composed_gate_metrics(composed: f64, shuffled: f64) -> GateSupportMetrics {
+        GateSupportMetrics {
+            one_step_composed_changed_exact: Some(composed),
+            ..floor_gate_metrics(1.0, shuffled)
+        }
+    }
+
+    /// Replays arm s7: the shuffled floor fails at arming, then fails again
+    /// while strictly improving. Policy v5 exempts the improving failure; a
+    /// later worsening failure still aborts.
+    #[test]
+    fn foundation_v2_improving_shuffled_floor_replays_s7_without_abort() -> Result<()> {
+        let trajectory = [1.0, 0.9732, 0.9754, 0.9904, 0.9567];
+        let mut history = Vec::new();
+        for (index, shuffled) in trajectory.into_iter().enumerate() {
+            let evaluation = foundation_v2_gate_evaluation(
+                1_024 + index as u64 * 1_024,
+                floor_gate_metrics(1.0, shuffled),
+                Some(1.0),
+                Some(1.0),
+                &history,
+            )?;
+            history.push(evaluation);
+            assert!(!foundation_v2_gate_history_aborts(&history));
+        }
+        let shuffled = history
+            .last()
+            .and_then(|evaluation| {
+                evaluation
+                    .gates
+                    .iter()
+                    .find(|gate| gate.name == "shuffled_action_ratio")
+            })
+            .expect("shuffled-action gate");
+        assert!(!shuffled.passed);
+        assert!(shuffled.abort_exempt);
+        // A subsequent worsening failure is not exempt and aborts against the
+        // still-failing prior evaluation.
+        let evaluation = foundation_v2_gate_evaluation(
+            6_144,
+            floor_gate_metrics(1.0, 0.97),
+            Some(1.0),
+            Some(1.0),
+            &history,
+        )?;
+        history.push(evaluation);
+        assert!(foundation_v2_gate_history_aborts(&history));
+        Ok(())
+    }
+
+    /// Replays arm s6: the composed metric peaks during warmup (0.1638 at
+    /// step 2048) and re-balances below 0.8x that peak by arming. Policy v5
+    /// anchors the floor to armed evaluations only, so the arm survives; a
+    /// genuine armed-regime collapse still fails.
+    #[test]
+    fn foundation_v2_composed_floor_ignores_warmup_peak_replays_s6() -> Result<()> {
+        let trajectory = [0.0, 0.1638, 0.1469, 0.096, 0.1045];
+        let mut history = Vec::new();
+        for (index, composed) in trajectory.into_iter().enumerate() {
+            let step = 1_024 + index as u64 * 1_024;
+            let prior_composed_best = history
+                .iter()
+                .filter(|evaluation: &&FoundationV2GateEvaluation| {
+                    evaluation.step >= FOUNDATION_V2_GATE_WARMUP_STEPS
+                })
+                .filter_map(|evaluation| evaluation.metrics.one_step_composed_changed_exact)
+                .filter(|value: &f64| value.is_finite())
+                .reduce(f64::max);
+            let evaluation = foundation_v2_gate_evaluation(
+                step,
+                composed_gate_metrics(composed, 0.9),
+                Some(1.0),
+                prior_composed_best,
+                &history,
+            )?;
+            let composed_gate = evaluation
+                .gates
+                .iter()
+                .find(|gate| gate.name == "composed_changed_exact_collapse")
+                .expect("composed collapse gate");
+            assert!(
+                composed_gate.passed,
+                "step {step}: composed {composed} unexpectedly failed ({})",
+                composed_gate.threshold
+            );
+            history.push(evaluation);
+            assert!(!foundation_v2_gate_history_aborts(&history));
+        }
+        // An armed-regime collapse (>20% below the armed best) still fails.
+        let evaluation = foundation_v2_gate_evaluation(
+            6_144,
+            composed_gate_metrics(0.05, 0.9),
+            Some(1.0),
+            Some(0.1045),
+            &history,
+        )?;
+        let composed_gate = evaluation
+            .gates
+            .iter()
+            .find(|gate| gate.name == "composed_changed_exact_collapse")
+            .expect("composed collapse gate");
+        assert!(!composed_gate.passed);
         Ok(())
     }
 

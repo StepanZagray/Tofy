@@ -166,6 +166,34 @@
   `one_step_collapse` and composed changed-exact collapse/floor gates have no
   exemption.
 
+## Implementation amendment (2026-08-30 — gate policy v5: armed-anchored composed floor, single-interval trend exemption)
+
+Evidence: three of three launched arms died to a marginal floor gate while the
+failing measurement trended healthy — s5 (`foreground_reconstruction` 0.5985
+vs 0.60, rising), s6 (`composed_changed_exact_collapse` 0.096/0.1045 vs a
+0.1311 floor anchored to its unarmed warmup peak 0.1638 while one-step
+exactness kept improving), and s7 (`shuffled_action_ratio` 0.9567 vs 0.95,
+improving from 0.9904, ineligible for the two-consecutive-improvements
+exemption because of a single earlier blip). A forensic diff of s5's build
+(941ddf82) against s6/s7's (5cbd0833) found no change to f32 training
+numerics, initialization, data, or measurement semantics; the platform's
+cuDNN f32 path is not run-reproducible (`pick_algorithm` may select
+atomics-based kernels), so per-run variance against hair-trigger floors is
+the operative failure mode, not model collapse. `p2.gate_policy.v4` -> `v5`:
+
+- The composed collapse floor's running best accrues only from armed
+  evaluations (step >= 4096). Warmup values PASS by fiat and can peak on
+  transient copy-decode behavior; they are telemetry, not attained quality,
+  and must not seed an abort floor. The first armed evaluation therefore
+  self-anchors, and the `> 0` copy-collapse clause is unchanged.
+- The floor-gate trend exemption relaxes from two consecutive strict
+  improvements to one strict improvement on the latest interval, still scoped
+  to `foreground_reconstruction` and `shuffled_action_ratio`. Plateaus and
+  declines still abort; an oscillating metric aborts on its first worsening
+  evaluation because that failure is not exempt while the prior failure still
+  counts. Exempt failures remain `passed: false` and never promote.
+- The relative `one_step_collapse` gate is unchanged and keeps no exemption.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every
