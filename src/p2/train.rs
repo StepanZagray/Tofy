@@ -8079,6 +8079,22 @@ struct FoundationV2LossLog {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+/// Destination of the loss-log worker. Seam so tests can inject transient and
+/// persistent I/O failures; production uses an append-mode [`File`].
+trait FoundationV2LossLogSink: Write + Send + 'static {
+    fn sync(&mut self) -> std::io::Result<()>;
+}
+
+impl FoundationV2LossLogSink for File {
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+}
+
+/// Number of write attempts per record before the worker gives up and the
+/// training thread is allowed to fail loudly.
+const LOSS_LOG_WRITE_ATTEMPTS: u32 = 5;
+
 impl FoundationV2LossLog {
     fn open(output_dir: &Path) -> Result<Self> {
         let path = output_dir.join("loss_log.jsonl");
@@ -8087,44 +8103,84 @@ impl FoundationV2LossLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("open append-only loss log {}", path.display()))?;
-        // Disk writes and JSON serialization are intentionally isolated from
-        // the training thread. `flush` remains a synchronous durability gate
-        // before every checkpoint and at shutdown.
+        Self::with_sink(file, path, true)
+    }
+
+    /// Disk writes and JSON serialization are intentionally isolated from the
+    /// training thread. `flush` remains a synchronous durability gate before
+    /// every checkpoint and at shutdown. `backoff` is disabled in tests.
+    fn with_sink<S: FoundationV2LossLogSink>(
+        mut sink: S,
+        path: PathBuf,
+        backoff: bool,
+    ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         let worker_path = path.clone();
         let worker = thread::Builder::new()
             .name("foundation-v2-loss-log".into())
             .spawn(move || {
-                let mut writer = BufWriter::new(file);
                 while let Ok(command) = receiver.recv() {
                     match command {
                         FoundationV2LossLogCommand::Append(entry) => {
-                            let result = (|| -> Result<()> {
-                                serde_json::to_writer(&mut writer, &entry).with_context(|| {
-                                    format!("append loss record to {}", worker_path.display())
-                                })?;
-                                writer.write_all(b"\n").with_context(|| {
-                                    format!("terminate loss record in {}", worker_path.display())
-                                })
-                            })();
-                            if let Err(error) = result {
-                                tracing::error!(
-                                    "failed to append foundation-v2 loss log {}: {error:#}",
-                                    worker_path.display()
-                                );
+                            // Network mounts (/workspace on RunPod) can return
+                            // transient write errors; a single blip must not
+                            // silently kill the writer, because the training
+                            // thread then dies one step later on a closed
+                            // channel. Track the byte offset so a retry
+                            // resumes mid-line and never duplicates output;
+                            // give up only after persistent failure, and say
+                            // so on stderr because tracing has no subscriber
+                            // in normal builds.
+                            let mut line = match serde_json::to_vec(&entry) {
+                                Ok(line) => line,
+                                Err(error) => {
+                                    eprintln!(
+                                        "loss-log record for {} does not serialize: {error:#}",
+                                        worker_path.display()
+                                    );
+                                    break;
+                                }
+                            };
+                            line.push(b'\n');
+                            let mut written = 0usize;
+                            let mut attempt = 0u32;
+                            let gave_up = loop {
+                                if written == line.len() {
+                                    break false;
+                                }
+                                match sink.write(&line[written..]) {
+                                    Ok(0) => break true,
+                                    Ok(count) => written += count,
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                    Err(error) => {
+                                        attempt += 1;
+                                        if attempt >= LOSS_LOG_WRITE_ATTEMPTS {
+                                            eprintln!(
+                                                "loss-log writer giving up on {} after \
+                                                 {attempt} attempts: {error:#}",
+                                                worker_path.display()
+                                            );
+                                            break true;
+                                        }
+                                        if backoff {
+                                            thread::sleep(std::time::Duration::from_millis(
+                                                200 << attempt.min(4),
+                                            ));
+                                        }
+                                    }
+                                }
+                            };
+                            if gave_up {
                                 break;
                             }
                         }
                         FoundationV2LossLogCommand::Flush(reply) => {
-                            let result = writer
+                            let result = sink
                                 .flush()
+                                .and_then(|_| sink.sync())
                                 .with_context(|| {
                                     format!("flush loss log {}", worker_path.display())
-                                })
-                                .and_then(|_| {
-                                    writer.get_ref().sync_data().with_context(|| {
-                                        format!("sync loss log {}", worker_path.display())
-                                    })
                                 });
                             let stop = result.is_err();
                             let _ = reply.send(result);
@@ -8133,15 +8189,11 @@ impl FoundationV2LossLog {
                             }
                         }
                         FoundationV2LossLogCommand::Shutdown(reply) => {
-                            let result = writer
+                            let result = sink
                                 .flush()
+                                .and_then(|_| sink.sync())
                                 .with_context(|| {
                                     format!("flush loss log {}", worker_path.display())
-                                })
-                                .and_then(|_| {
-                                    writer.get_ref().sync_data().with_context(|| {
-                                        format!("sync loss log {}", worker_path.display())
-                                    })
                                 });
                             let _ = reply.send(result);
                             break;
@@ -13433,6 +13485,106 @@ mod tests {
         validate_foundation_v2_profile_resume(&[2], &mut published, 1, &root, "cpu")?;
         assert_eq!(published, [2]);
         fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+
+    /// Sink that fails a configured number of write calls before succeeding,
+    /// recording all bytes that were accepted. Models the transient I/O blips
+    /// of a network-mounted /workspace.
+    struct FlakyLossLogSink {
+        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        remaining_failures: usize,
+        fail_forever: bool,
+    }
+
+    impl Write for FlakyLossLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_forever {
+                return Err(std::io::Error::other("persistent write failure"));
+            }
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err(std::io::Error::other("transient write failure"));
+            }
+            // Partial writes are legal for Write; exercise offset tracking.
+            let take = buf.len().min(3).max(1).min(buf.len());
+            self.data.lock().unwrap().extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl FoundationV2LossLogSink for FlakyLossLogSink {
+        fn sync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a transient write failure must not silently kill the
+    /// writer thread — the s8 trainer died one step after exactly that, with
+    /// "sending on a closed channel". Every appended row must come through
+    /// exactly once, uncorrupted, despite failures and partial writes.
+    #[test]
+    fn foundation_v2_loss_log_survives_transient_write_failures() -> Result<()> {
+        let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = FlakyLossLogSink {
+            data: data.clone(),
+            remaining_failures: 3,
+            fail_forever: false,
+        };
+        let values = FoundationV2LossMeans::default();
+        let mut log = FoundationV2LossLog::with_sink(
+            sink,
+            PathBuf::from("test-loss-log.jsonl"),
+            false,
+        )?;
+        for step in 0..4u64 {
+            log.append(step, &values, 1e-3)?;
+        }
+        log.flush()?;
+        drop(log);
+        let contents = String::from_utf8(data.lock().unwrap().clone())?;
+        let steps: Vec<u64> = contents
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).expect("valid JSONL row");
+                row["global_step"].as_u64().expect("global_step")
+            })
+            .collect();
+        assert_eq!(steps, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    /// Regression: a persistent write failure must surface as a training-side
+    /// error (fail loudly) instead of hanging or panicking.
+    #[test]
+    fn foundation_v2_loss_log_persistent_failure_fails_loudly() -> Result<()> {
+        let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = FlakyLossLogSink {
+            data,
+            remaining_failures: 0,
+            fail_forever: true,
+        };
+        let values = FoundationV2LossMeans::default();
+        let mut log = FoundationV2LossLog::with_sink(
+            sink,
+            PathBuf::from("test-loss-log.jsonl"),
+            false,
+        )?;
+        // The worker gives up while draining the bounded queue; subsequent
+        // appends or the flush must report the failure to the caller.
+        let mut failed = false;
+        for step in 0..8u64 {
+            if log.append(step, &values, 1e-3).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        failed = failed || log.flush().is_err();
+        assert!(failed, "persistent sink failure never surfaced to the caller");
         Ok(())
     }
 
