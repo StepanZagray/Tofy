@@ -515,6 +515,7 @@ const LATENT_RMS_EPS: f32 = 1e-6;
 
 /// Per-batch RMS normalization on `B×C×H×W` latents (scale control, no extra params).
 pub fn rms_norm_latent(z: &Tensor) -> Result<Tensor> {
+    let minimum_mean_square = f64::from(LATENT_RMS_EPS).powi(2);
     match z.rank() {
         4 => {
             let (batch, _, _, _) = z.dims4()?;
@@ -522,8 +523,11 @@ pub fn rms_norm_latent(z: &Tensor) -> Result<Tensor> {
             let rms = flat
                 .sqr()?
                 .mean_keepdim(D::Minus1)?
-                .sqrt()?
-                .clamp(LATENT_RMS_EPS as f64, f64::INFINITY)?;
+                // Clamp before sqrt. This is forward-equivalent to clamping
+                // the RMS afterward, but it avoids recording sqrt(0), whose
+                // backward divides by zero even when the later clamp masks it.
+                .clamp(minimum_mean_square, f64::INFINITY)?
+                .sqrt()?;
             let scale = rms.reshape((batch, 1, 1, 1))?;
             z.broadcast_div(&scale).map_err(Into::into)
         }
@@ -532,8 +536,8 @@ pub fn rms_norm_latent(z: &Tensor) -> Result<Tensor> {
             let rms = z
                 .sqr()?
                 .mean_keepdim(D::Minus1)?
-                .sqrt()?
-                .clamp(LATENT_RMS_EPS as f64, f64::INFINITY)?;
+                .clamp(minimum_mean_square, f64::INFINITY)?
+                .sqrt()?;
             let scale = rms.reshape((batch, 1))?;
             z.broadcast_div(&scale).map_err(Into::into)
         }
@@ -3125,6 +3129,27 @@ mod tests {
                 (mean_sq.sqrt() - 1.0).abs() < 1e-5,
                 "batch {batch} expected unit RMS, got {}",
                 mean_sq.sqrt()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rms_norm_latent_zero_rows_have_finite_backward() -> Result<()> {
+        let device = Device::Cpu;
+        let rank2 = Var::zeros((2, 4), DType::F32, &device)?;
+        let rank4 = Var::zeros((2, 1, 2, 2), DType::F32, &device)?;
+        for input in [&rank2, &rank4] {
+            let loss = rms_norm_latent(input.as_tensor())?.sum_all()?;
+            let gradients = loss.backward()?;
+            let gradient = gradients
+                .get(input)
+                .expect("RMS normalization should remain attached to its input")
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(
+                gradient.iter().all(|value| value.is_finite()),
+                "zero-row RMS backward produced non-finite values: {gradient:?}"
             );
         }
         Ok(())
