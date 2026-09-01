@@ -544,11 +544,25 @@ pub struct GradientClipStats {
 }
 
 /// Clip gradients and expose the global scale that mediates treatment effects.
+/// Fails closed on a non-finite norm; callers that can skip an update should
+/// use [`try_clip_gradients_gpu_with_stats`].
 pub fn clip_gradients_gpu_with_stats(
     grads: &mut GradStore,
     varmap: &VarMap,
     max_norm: f64,
 ) -> Result<GradientClipStats> {
+    try_clip_gradients_gpu_with_stats(grads, varmap, max_norm)?
+        .ok_or_else(|| anyhow::anyhow!("gradient norm is not finite: NaN"))
+}
+
+/// Like [`clip_gradients_gpu_with_stats`] but reports a non-finite global
+/// norm as `Ok(None)` so the caller can skip the update (standard loss-scaler
+/// behavior for data/state-specific NaN gradients) instead of dying.
+pub fn try_clip_gradients_gpu_with_stats(
+    grads: &mut GradStore,
+    varmap: &VarMap,
+    max_norm: f64,
+) -> Result<Option<GradientClipStats>> {
     let mut sum_sq: Option<Tensor> = None;
     for var in varmap.all_vars() {
         let t = var.as_tensor();
@@ -561,20 +575,20 @@ pub fn clip_gradients_gpu_with_stats(
         }
     }
     let Some(sum_sq) = sum_sq else {
-        return Ok(GradientClipStats {
+        return Ok(Some(GradientClipStats {
             pre_clip_norm: 0.0,
             scale: 1.0,
-        });
+        }));
     };
     let norm = sum_sq.sqrt()?.to_scalar::<f32>()? as f64;
     if !norm.is_finite() {
-        bail!("gradient norm is not finite: {norm}");
+        return Ok(None);
     }
     if norm <= max_norm {
-        return Ok(GradientClipStats {
+        return Ok(Some(GradientClipStats {
             pre_clip_norm: norm,
             scale: 1.0,
-        });
+        }));
     }
     let scale = max_norm / norm;
     for var in varmap.all_vars() {
@@ -583,10 +597,10 @@ pub fn clip_gradients_gpu_with_stats(
             grads.insert(t, g.affine(scale, 0.0)?);
         }
     }
-    Ok(GradientClipStats {
+    Ok(Some(GradientClipStats {
         pre_clip_norm: norm,
         scale,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -979,6 +993,36 @@ mod tests {
 
         let error = clip_gradients_gpu(&mut grads, &varmap, 1.0).unwrap_err();
         assert!(error.to_string().contains("gradient norm is not finite"));
+        Ok(())
+    }
+    /// The checked variant reports a non-finite norm as a skippable outcome
+    /// instead of an error, and leaves finite gradients clipped as before.
+    #[test]
+    fn try_clip_reports_non_finite_norm_as_skippable() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let variable = Var::from_tensor(&Tensor::zeros((2,), DType::F32, &device)?)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("probe.weight".to_string(), variable.clone());
+        let mut grads = GradStore::default();
+        grads.insert(
+            variable.as_tensor(),
+            Tensor::from_vec(vec![f32::NAN, 0.0], (2,), &device)?,
+        );
+        assert!(try_clip_gradients_gpu_with_stats(&mut grads, &varmap, 1.0)?.is_none());
+
+        let mut finite = GradStore::default();
+        finite.insert(
+            variable.as_tensor(),
+            Tensor::from_vec(vec![3.0f32, 4.0], (2,), &device)?,
+        );
+        let stats = try_clip_gradients_gpu_with_stats(&mut finite, &varmap, 1.0)?
+            .expect("finite gradients clip normally");
+        assert!((stats.pre_clip_norm - 5.0).abs() < 1e-6);
+        assert!((stats.scale - 0.2).abs() < 1e-6);
         Ok(())
     }
 }

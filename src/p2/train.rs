@@ -32,7 +32,8 @@ use crate::p2::model::{
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
-    accumulate_parameter_gradients, clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
+    accumulate_parameter_gradients, clip_gradients_gpu_with_stats,
+    try_clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
     ModelEma,
 };
 use crate::p2::prefetch::{
@@ -2241,6 +2242,12 @@ struct TrainerState {
     training_population_rows: u64,
     #[serde(default)]
     batch_schedule_migrations: Vec<BatchScheduleMigration>,
+    /// Global steps whose optimizer update was skipped because the gradient
+    /// norm was non-finite (data/state-specific NaN in backward). Skipped
+    /// steps advance `global_step` but not `optimizer_step`; the resume
+    /// cursor check accounts for this list, keeping it auditable.
+    #[serde(default)]
+    nonfinite_skipped_updates: Vec<u64>,
     profile: ProfileState,
     #[serde(default)]
     gradient_pressure: Option<GradientPressureDiagnostics>,
@@ -7590,11 +7597,14 @@ fn load_training_checkpoint(
     if state.parameter_names != optimizer.parameter_names() {
         bail!("resume parameter names do not exactly match the current model");
     }
-    if state.global_step != state.optimizer_step as u64 {
+    if state.global_step
+        != state.optimizer_step as u64 + state.nonfinite_skipped_updates.len() as u64
+    {
         bail!(
-            "checkpoint cursor mismatch: global_step={} optimizer_step={}",
+            "checkpoint cursor mismatch: global_step={} optimizer_step={} nonfinite_skips={}",
             state.global_step,
-            state.optimizer_step
+            state.optimizer_step,
+            state.nonfinite_skipped_updates.len()
         );
     }
     if cfg.recipe == TrainingRecipe::FoundationV2 {
@@ -8119,6 +8129,37 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
     save_checkpoint(varmap, cfg, report)?;
     crate::p2::evidence::publish_training_evidence(&cfg.output_dir, report)?;
     Ok(())
+}
+
+/// Bounded skip budget for non-finite-gradient updates. Returns the abort
+/// reason when the budget is exhausted: isolated data/state-specific NaNs are
+/// skippable (standard loss-scaler practice), but many skips — or NaNs on
+/// consecutive batches — indicate genuine divergence and must fail closed.
+fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<String> {
+    const MAX_TOTAL_SKIPS: usize = 16;
+    const MAX_CONSECUTIVE_SKIPS: usize = 3;
+    if skipped_steps.len() >= MAX_TOTAL_SKIPS {
+        return Some(format!(
+            "{} updates skipped for non-finite gradients (budget {MAX_TOTAL_SKIPS})",
+            skipped_steps.len()
+        ));
+    }
+    let tail = skipped_steps
+        .iter()
+        .rev()
+        .take(MAX_CONSECUTIVE_SKIPS)
+        .copied()
+        .collect::<Vec<_>>();
+    if tail.len() == MAX_CONSECUTIVE_SKIPS
+        && tail.windows(2).all(|pair| pair[0] == pair[1] + 1)
+    {
+        return Some(format!(
+            "{MAX_CONSECUTIVE_SKIPS} consecutive updates ending at step {} produced \
+             non-finite gradients; this is divergence, not an isolated bad batch",
+            tail[0]
+        ));
+    }
+    None
 }
 
 fn foundation_v2_loss_values(
@@ -8702,6 +8743,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             training_content_hash: [0; 32],
             training_population_rows: 0,
             batch_schedule_migrations: Vec::new(),
+            nonfinite_skipped_updates: Vec::new(),
             profile: ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: Vec::new(),
@@ -9080,49 +9122,76 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 "gradient_clip",
                 SpanKind::Module,
                 Some(ExecutionStep::Backward),
-                || clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM),
+                || try_clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM),
             )?
         } else {
-            clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?
+            try_clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?
         };
         let learning_rate = foundation_v2_wsd_learning_rate(next_step as usize, total_steps);
-        optimizer.set_learning_rate(learning_rate)?;
-        if let Some(profile) = &cg_profile {
-            profile.synchronized_phase(
-                &device,
-                "optimizer",
-                SpanKind::Function,
-                Some(ExecutionStep::Optimizer),
-                || optimizer.step(&grads),
-            )?;
+        if let Some(clip) = clip {
+            optimizer.set_learning_rate(learning_rate)?;
+            if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "optimizer",
+                    SpanKind::Function,
+                    Some(ExecutionStep::Optimizer),
+                    || optimizer.step(&grads),
+                )?;
+            } else {
+                optimizer.step(&grads)?;
+            }
+            let values =
+                foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
+            if let Some(profile) = &cg_profile {
+                record_foundation_v2_profile_scalars(
+                    profile,
+                    profile_measurement_span,
+                    &values,
+                    learning_rate,
+                    effective_ep_weight,
+                )?;
+            }
+            drop(profile_measurement);
+            ema.update(&varmap)?;
+            loss_log.append(next_step, &values, learning_rate)?;
+            state.active_sums = {
+                let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+                add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
+                foundation.loss_steps += 1;
+                update_foundation_v2_rollout_zero_streak(
+                    &mut foundation.rollout_zero_loss_consecutive_steps,
+                    rollout_enabled,
+                    values.rollout,
+                    next_step,
+                );
+                foundation_v2_active_loss_means(&foundation.loss_sums, foundation.loss_steps)
+            };
         } else {
-            optimizer.step(&grads)?;
-        }
-        let values = foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
-        if let Some(profile) = &cg_profile {
-            record_foundation_v2_profile_scalars(
-                profile,
-                profile_measurement_span,
-                &values,
-                learning_rate,
-                effective_ep_weight,
-            )?;
-        }
-        drop(profile_measurement);
-        ema.update(&varmap)?;
-        loss_log.append(next_step, &values, learning_rate)?;
-        state.active_sums = {
-            let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
-            add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
-            foundation.loss_steps += 1;
-            update_foundation_v2_rollout_zero_streak(
-                &mut foundation.rollout_zero_loss_consecutive_steps,
-                rollout_enabled,
-                values.rollout,
-                next_step,
+            // Data/state-specific non-finite gradient: skip this update
+            // (standard loss-scaler practice) instead of killing the run.
+            // Weights, EMA, optimizer moments, and loss statistics are
+            // untouched; the step is recorded in trainer state and the skip
+            // budget fails closed on divergence-shaped patterns.
+            if cg_profile.is_some() {
+                bail!(
+                    "non-finite gradient on preregistered profile update {next_step}; \
+                     rerun with a different profile step"
+                );
+            }
+            eprintln!(
+                "skipping update {next_step}: non-finite gradient norm \
+                 ({} skipped so far this run lineage)",
+                state.nonfinite_skipped_updates.len() + 1
             );
-            foundation_v2_active_loss_means(&foundation.loss_sums, foundation.loss_steps)
-        };
+            state.nonfinite_skipped_updates.push(next_step);
+            if let Some(reason) =
+                foundation_v2_nonfinite_skip_exhausted(&state.nonfinite_skipped_updates)
+            {
+                bail!("non-finite gradient skip budget exhausted: {reason}");
+            }
+            drop(profile_measurement);
+        }
         // Release the training step's entire autograd graph, batch tensors,
         // and gradient store before any same-step evaluation work. The first
         // bundle run OOMed exactly at step 1024, where the gate evaluation,
@@ -9374,6 +9443,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
             training_content_hash: [0; 32],
             training_population_rows: 0,
             batch_schedule_migrations: Vec::new(),
+            nonfinite_skipped_updates: Vec::new(),
             profile: ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: Vec::new(),
@@ -10552,6 +10622,22 @@ mod tests {
         Ok(())
     }
 
+    /// Isolated non-finite-gradient skips stay within budget; sixteen total
+    /// or three consecutive skipped steps are divergence and must abort.
+    #[test]
+    fn foundation_v2_nonfinite_skip_budget() {
+        assert!(foundation_v2_nonfinite_skip_exhausted(&[]).is_none());
+        assert!(foundation_v2_nonfinite_skip_exhausted(&[10_613]).is_none());
+        assert!(foundation_v2_nonfinite_skip_exhausted(&[100, 102, 103]).is_none());
+        let scattered: Vec<u64> = (0..15).map(|i| i * 100).collect();
+        assert!(foundation_v2_nonfinite_skip_exhausted(&scattered).is_none());
+        let capped: Vec<u64> = (0..16).map(|i| i * 100).collect();
+        assert!(foundation_v2_nonfinite_skip_exhausted(&capped)
+            .is_some_and(|reason| reason.contains("budget")));
+        assert!(foundation_v2_nonfinite_skip_exhausted(&[50, 100, 101, 102])
+            .is_some_and(|reason| reason.contains("consecutive")));
+    }
+
     fn composed_gate_metrics(composed: f64, shuffled: f64) -> GateSupportMetrics {
         GateSupportMetrics {
             one_step_composed_changed_exact: Some(composed),
@@ -10877,6 +10963,7 @@ mod tests {
             training_content_hash: [0; 32],
             training_population_rows: 0,
             batch_schedule_migrations: vec![],
+            nonfinite_skipped_updates: vec![],
             profile: ProfileState::Pending,
             gradient_pressure: None,
             gradient_pressure_samples: vec![],
