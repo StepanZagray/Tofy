@@ -8135,10 +8135,11 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
 /// reason when the budget is exhausted: isolated data/state-specific NaNs are
 /// skippable (standard loss-scaler practice), but a dense cluster of skips —
 /// or NaNs on consecutive batches — indicates genuine divergence and must
-/// fail closed. The density window matches gate cadence so sparse skips cannot
-/// exhaust a run-lineage lifetime cap while each gate interval remains sound.
+/// fail closed. The short density window catches local numerical bursts while
+/// preventing sparse skips from exhausting a run-lineage lifetime cap.
 fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<String> {
-    const MAX_SKIPS_PER_GATE_WINDOW: usize = 16;
+    const NONFINITE_SKIP_WINDOW_STEPS: u64 = 256;
+    const MAX_SKIPS_PER_WINDOW: usize = 16;
     const MAX_CONSECUTIVE_SKIPS: usize = 3;
     let tail = skipped_steps
         .iter()
@@ -8156,17 +8157,17 @@ fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<Strin
         ));
     }
     if let Some(&latest_step) = skipped_steps.last() {
-        let window_start = latest_step.saturating_sub(FOUNDATION_V2_GATE_EVERY - 1);
+        let window_start = latest_step.saturating_sub(NONFINITE_SKIP_WINDOW_STEPS - 1);
         let skips_in_window = skipped_steps
             .iter()
             .rev()
             .take_while(|&&step| step >= window_start)
             .count();
-        if skips_in_window >= MAX_SKIPS_PER_GATE_WINDOW {
+        if skips_in_window >= MAX_SKIPS_PER_WINDOW {
             return Some(format!(
                 "{skips_in_window} updates skipped for non-finite gradients in steps \
-                 {window_start}..={latest_step} (rolling {FOUNDATION_V2_GATE_EVERY}-step \
-                 budget {MAX_SKIPS_PER_GATE_WINDOW})"
+                 {window_start}..={latest_step} (rolling {NONFINITE_SKIP_WINDOW_STEPS}-step \
+                 budget {MAX_SKIPS_PER_WINDOW})"
             ));
         }
     }
@@ -10634,7 +10635,7 @@ mod tests {
     }
 
     /// Isolated non-finite-gradient skips stay within budget; sixteen within
-    /// one rolling gate interval or three consecutive skips must abort.
+    /// one short rolling window or three consecutive skips must abort.
     #[test]
     fn foundation_v2_nonfinite_skip_budget() {
         assert!(foundation_v2_nonfinite_skip_exhausted(&[]).is_none());
@@ -10642,25 +10643,26 @@ mod tests {
         assert!(foundation_v2_nonfinite_skip_exhausted(&[100, 102, 103]).is_none());
         let scattered: Vec<u64> = (0..16).map(|i| i * 100).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&scattered).is_none());
-        let under_cap: Vec<u64> = (0..15).map(|i| 1_000 + i * 64).collect();
+        let under_cap: Vec<u64> = (0..15).map(|i| 1_000 + i * 16).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&under_cap).is_none());
-        let capped: Vec<u64> = (0..16).map(|i| 1_000 + i * 64).collect();
+        let capped: Vec<u64> = (0..16).map(|i| 1_000 + i * 16).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&capped)
             .is_some_and(|reason| reason.contains("budget")));
         let mut boundary: Vec<u64> = (0..15).map(|i| 1_000 + i * 10).collect();
-        boundary.push(2_023);
+        boundary.push(1_255);
         assert!(foundation_v2_nonfinite_skip_exhausted(&boundary).is_some());
         let mut outside_boundary = boundary;
-        *outside_boundary.last_mut().unwrap() = 2_024;
+        *outside_boundary.last_mut().unwrap() = 1_256;
         assert!(foundation_v2_nonfinite_skip_exhausted(&outside_boundary).is_none());
         assert!(foundation_v2_nonfinite_skip_exhausted(&[50, 100, 101, 102])
             .is_some_and(|reason| reason.contains("consecutive")));
 
-        // Regression for bundle-s8: skip 16 at step 13,062 is sparse over
-        // the run lineage and remains below the rolling gate-window budget.
+        // Regression for bundle-s8 through the failed 1,024-step-window
+        // repair: 21 lineage skips remain below the local burst budget.
         let bundle_s8 = [
             10_613, 11_015, 11_599, 11_934, 12_040, 12_120, 12_501, 12_553, 12_581, 12_585,
-            12_838, 12_848, 12_895, 12_911, 13_055, 13_062,
+            12_838, 12_848, 12_895, 12_911, 13_055, 13_062, 13_073, 13_075, 13_077, 13_116,
+            13_133,
         ];
         assert!(foundation_v2_nonfinite_skip_exhausted(&bundle_s8).is_none());
     }
