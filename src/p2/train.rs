@@ -8133,17 +8133,13 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
 
 /// Bounded skip budget for non-finite-gradient updates. Returns the abort
 /// reason when the budget is exhausted: isolated data/state-specific NaNs are
-/// skippable (standard loss-scaler practice), but many skips — or NaNs on
-/// consecutive batches — indicate genuine divergence and must fail closed.
+/// skippable (standard loss-scaler practice), but a dense cluster of skips —
+/// or NaNs on consecutive batches — indicates genuine divergence and must
+/// fail closed. The density window matches gate cadence so sparse skips cannot
+/// exhaust a run-lineage lifetime cap while each gate interval remains sound.
 fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<String> {
-    const MAX_TOTAL_SKIPS: usize = 16;
+    const MAX_SKIPS_PER_GATE_WINDOW: usize = 16;
     const MAX_CONSECUTIVE_SKIPS: usize = 3;
-    if skipped_steps.len() >= MAX_TOTAL_SKIPS {
-        return Some(format!(
-            "{} updates skipped for non-finite gradients (budget {MAX_TOTAL_SKIPS})",
-            skipped_steps.len()
-        ));
-    }
     let tail = skipped_steps
         .iter()
         .rev()
@@ -8158,6 +8154,21 @@ fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<Strin
              non-finite gradients; this is divergence, not an isolated bad batch",
             tail[0]
         ));
+    }
+    if let Some(&latest_step) = skipped_steps.last() {
+        let window_start = latest_step.saturating_sub(FOUNDATION_V2_GATE_EVERY - 1);
+        let skips_in_window = skipped_steps
+            .iter()
+            .rev()
+            .take_while(|&&step| step >= window_start)
+            .count();
+        if skips_in_window >= MAX_SKIPS_PER_GATE_WINDOW {
+            return Some(format!(
+                "{skips_in_window} updates skipped for non-finite gradients in steps \
+                 {window_start}..={latest_step} (rolling {FOUNDATION_V2_GATE_EVERY}-step \
+                 budget {MAX_SKIPS_PER_GATE_WINDOW})"
+            ));
+        }
     }
     None
 }
@@ -10622,20 +10633,36 @@ mod tests {
         Ok(())
     }
 
-    /// Isolated non-finite-gradient skips stay within budget; sixteen total
-    /// or three consecutive skipped steps are divergence and must abort.
+    /// Isolated non-finite-gradient skips stay within budget; sixteen within
+    /// one rolling gate interval or three consecutive skips must abort.
     #[test]
     fn foundation_v2_nonfinite_skip_budget() {
         assert!(foundation_v2_nonfinite_skip_exhausted(&[]).is_none());
         assert!(foundation_v2_nonfinite_skip_exhausted(&[10_613]).is_none());
         assert!(foundation_v2_nonfinite_skip_exhausted(&[100, 102, 103]).is_none());
-        let scattered: Vec<u64> = (0..15).map(|i| i * 100).collect();
+        let scattered: Vec<u64> = (0..16).map(|i| i * 100).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&scattered).is_none());
-        let capped: Vec<u64> = (0..16).map(|i| i * 100).collect();
+        let under_cap: Vec<u64> = (0..15).map(|i| 1_000 + i * 64).collect();
+        assert!(foundation_v2_nonfinite_skip_exhausted(&under_cap).is_none());
+        let capped: Vec<u64> = (0..16).map(|i| 1_000 + i * 64).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&capped)
             .is_some_and(|reason| reason.contains("budget")));
+        let mut boundary: Vec<u64> = (0..15).map(|i| 1_000 + i * 10).collect();
+        boundary.push(2_023);
+        assert!(foundation_v2_nonfinite_skip_exhausted(&boundary).is_some());
+        let mut outside_boundary = boundary;
+        *outside_boundary.last_mut().unwrap() = 2_024;
+        assert!(foundation_v2_nonfinite_skip_exhausted(&outside_boundary).is_none());
         assert!(foundation_v2_nonfinite_skip_exhausted(&[50, 100, 101, 102])
             .is_some_and(|reason| reason.contains("consecutive")));
+
+        // Regression for bundle-s8: skip 16 at step 13,062 is sparse over
+        // the run lineage and remains below the rolling gate-window budget.
+        let bundle_s8 = [
+            10_613, 11_015, 11_599, 11_934, 12_040, 12_120, 12_501, 12_553, 12_581, 12_585,
+            12_838, 12_848, 12_895, 12_911, 13_055, 13_062,
+        ];
+        assert!(foundation_v2_nonfinite_skip_exhausted(&bundle_s8).is_none());
     }
 
     fn composed_gate_metrics(composed: f64, shuffled: f64) -> GateSupportMetrics {
