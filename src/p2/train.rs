@@ -8138,7 +8138,7 @@ fn publish_run_artifacts(varmap: &VarMap, cfg: &TrainConfig, report: &TrainRepor
 /// fail closed. The short density window catches local numerical bursts while
 /// preventing sparse skips from exhausting a run-lineage lifetime cap.
 fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<String> {
-    const NONFINITE_SKIP_WINDOW_STEPS: u64 = 256;
+    const NONFINITE_SKIP_WINDOW_STEPS: u64 = 64;
     const MAX_SKIPS_PER_WINDOW: usize = 16;
     const MAX_CONSECUTIVE_SKIPS: usize = 3;
     let tail = skipped_steps
@@ -10643,26 +10643,26 @@ mod tests {
         assert!(foundation_v2_nonfinite_skip_exhausted(&[100, 102, 103]).is_none());
         let scattered: Vec<u64> = (0..16).map(|i| i * 100).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&scattered).is_none());
-        let under_cap: Vec<u64> = (0..15).map(|i| 1_000 + i * 16).collect();
+        let under_cap: Vec<u64> = (0..15).map(|i| 1_000 + i * 4).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&under_cap).is_none());
-        let capped: Vec<u64> = (0..16).map(|i| 1_000 + i * 16).collect();
+        let capped: Vec<u64> = (0..16).map(|i| 1_000 + i * 4).collect();
         assert!(foundation_v2_nonfinite_skip_exhausted(&capped)
             .is_some_and(|reason| reason.contains("budget")));
-        let mut boundary: Vec<u64> = (0..15).map(|i| 1_000 + i * 10).collect();
-        boundary.push(1_255);
+        let mut boundary: Vec<u64> = (0..15).map(|i| 1_000 + i * 2).collect();
+        boundary.push(1_063);
         assert!(foundation_v2_nonfinite_skip_exhausted(&boundary).is_some());
         let mut outside_boundary = boundary;
-        *outside_boundary.last_mut().unwrap() = 1_256;
+        *outside_boundary.last_mut().unwrap() = 1_064;
         assert!(foundation_v2_nonfinite_skip_exhausted(&outside_boundary).is_none());
         assert!(foundation_v2_nonfinite_skip_exhausted(&[50, 100, 101, 102])
             .is_some_and(|reason| reason.contains("consecutive")));
 
-        // Regression for bundle-s8 through the failed 1,024-step-window
-        // repair: 21 lineage skips remain below the local burst budget.
+        // Regression for bundle-s8 through the failed broad-window repairs:
+        // 30 lineage skips remain below the truly local burst budget.
         let bundle_s8 = [
             10_613, 11_015, 11_599, 11_934, 12_040, 12_120, 12_501, 12_553, 12_581, 12_585,
             12_838, 12_848, 12_895, 12_911, 13_055, 13_062, 13_073, 13_075, 13_077, 13_116,
-            13_133,
+            13_133, 13_137, 13_155, 13_158, 13_166, 13_171, 13_181, 13_183, 13_190, 13_191,
         ];
         assert!(foundation_v2_nonfinite_skip_exhausted(&bundle_s8).is_none());
     }
