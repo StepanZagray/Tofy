@@ -225,6 +225,27 @@ run. `p2.gate_policy.v5` -> `v6`:
 - Resume migration: a stored v4/v5 gate-population identity is accepted when
   the population digests are bit-identical, adopting the v6 schema durably.
 
+## Implementation amendment (2026-09-02 — degenerate incumbents cannot latch composed_exact_guarded)
+
+Run s8 completed with composed changed-exact 0.514 (peak 0.5198 at step
+20480) yet exported its untrained step-1024 checkpoint as `best`: that
+checkpoint's composed changed-exact was exactly 0.0 — a pure-copy model —
+so its near-zero false-edit rate (0.00115, trivially earned by editing
+nothing) became an unbeatable incumbent under the false-edit non-regression
+guard, and every real candidate (false-edit 0.30 -> 0.099) was blocked for
+the rest of the run.
+
+- `composed_exact_guarded` candidates with composed changed-exact <= 0 are
+  never eligible for selection. This mirrors the armed collapse gate, which
+  already treats composed == 0 as catastrophic: selection must not crown
+  what the gate condemns. The false-edit guard is unchanged between real
+  candidates.
+- Best-checkpoint reconciliation may source the selected step from the
+  permanent mirror when the rolling step bundle has been pruned.
+- Regression test replays s8's full recorded gate history and asserts the
+  selection lands on step 20480, and that a real candidate with a doubled
+  false-edit rate is still rejected by the guard.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every

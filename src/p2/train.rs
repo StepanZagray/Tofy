@@ -415,6 +415,19 @@ pub fn foundation_v2_candidate_improves(
             if !foundation_v2_composed_selection_complete(candidate) {
                 return false;
             }
+            // A model with zero composed changed-exact never edits anything;
+            // its trivially tiny false-edit rate would otherwise become an
+            // unbeatable incumbent under the non-regression guard and latch
+            // promotion forever (run s8 exported its untrained step-1024
+            // checkpoint this way). The collapse gate already treats
+            // composed == 0 as catastrophic once armed; selection must not
+            // crown what the gate condemns.
+            if candidate
+                .one_step_composed_changed_exact
+                .is_some_and(|value| value <= 0.0)
+            {
+                return false;
+            }
             incumbent.is_none_or(|metrics| {
                 let better = match (
                     metrics.one_step_composed_changed_exact,
@@ -7832,6 +7845,16 @@ fn reconcile_foundation_v2_best_checkpoint(
         return Ok(());
     }
     let source = checkpoint_step_directory(cfg, expected_step);
+    // Rolling step checkpoints are pruned; the permanent mirror keeps every
+    // FOUNDATION_V2_PERMANENT_EVERY bundle, so a late re-selection (e.g.
+    // after a promotion-rule correction) must be able to source from it.
+    let source = if verify_checkpoint_bundle(&source).is_ok() {
+        source
+    } else {
+        cfg.output_dir
+            .join("checkpoints/permanent")
+            .join(format!("step-{expected_step:012}"))
+    };
     verify_checkpoint_bundle(&source).with_context(|| {
         format!(
             "cannot reconcile selected best step {expected_step}: source bundle {} is unavailable or corrupt",
@@ -10632,6 +10655,84 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Replays run s8's full recorded gate history: the untrained step-1024
+    /// checkpoint (composed 0.0, near-zero false edits because it never
+    /// edits) must not latch promotion; the peak real candidate at step
+    /// 20480 must be selected.
+    #[test]
+    fn foundation_v2_degenerate_copy_model_cannot_latch_best_selection() {
+        let history: Vec<FoundationV2GateEvaluation> = [
+            (1024, true, 0.0, 0.296875, 0.001153402537, 0.0),
+            (2048, true, 0.1242937853, 0.041015625, 0.2967128028, 0.0001878099109),
+            (3072, true, 0.1666666667, 0.048828125, 0.226314055, 0.0008257751695),
+            (4096, false, 0.1525423729, 0.072265625, 0.1644834404, 0.0007272117437),
+            (5120, false, 0.1581920904, 0.044921875, 0.1536496952, 0.0008748116997),
+            (6144, true, 0.2033898305, 0.052734375, 0.1384906904, 0.0008890322935),
+            (7168, true, 0.2966101695, 0.0625, 0.1362250783, 0.0007806615616),
+            (8192, false, 0.3276836158, 0.064453125, 0.1351952546, 0.0006404170851),
+            (9216, false, 0.3870056497, 0.052734375, 0.1328884495, 0.000646791834),
+            (10240, true, 0.3926553672, 0.05859375, 0.1393969352, 0.0007532011047),
+            (11264, true, 0.4491525424, 0.056640625, 0.1356071841, 0.0007522203741),
+            (12288, true, 0.4548022599, 0.05859375, 0.1279452958, 0.00075369147),
+            (13312, true, 0.4689265537, 0.0625, 0.1231257209, 0.0007728157168),
+            (14336, true, 0.4604519774, 0.06640625, 0.1211896523, 0.0007904688677),
+            (15360, true, 0.4576271186, 0.072265625, 0.1150107102, 0.0007791904657),
+            (16384, true, 0.4576271186, 0.05078125, 0.1139808865, 0.0007448648946),
+            (17408, true, 0.4661016949, 0.04296875, 0.1108914154, 0.0007953725207),
+            (18432, true, 0.4802259887, 0.052734375, 0.1073076289, 0.0007688927944),
+            (19456, true, 0.488700565, 0.04296875, 0.1037650354, 0.0008061605574),
+            (20480, true, 0.5197740113, 0.048828125, 0.1058658758, 0.000823323343),
+            (21504, true, 0.5141242938, 0.044921875, 0.1051655957, 0.0008247944389),
+            (22528, true, 0.5, 0.05078125, 0.09976931949, 0.0008110642104),
+            (23552, true, 0.5084745763, 0.05078125, 0.09729774263, 0.0008502934346),
+            (24576, true, 0.5141242938, 0.044921875, 0.09853353106, 0.0008826575446),
+        ]
+        .into_iter()
+        .map(|(step, armed_ok, composed, all_rows, fe, pad_fe)| {
+            let metrics = GateSupportMetrics {
+                one_step_composed_changed_exact: Some(composed),
+                one_step_all_rows_exact: Some(all_rows),
+                false_edit_rate: Some(fe),
+                padding_false_edit_rate: Some(pad_fe),
+                ..checkpoint_gate_metrics(composed)
+            };
+            FoundationV2GateEvaluation {
+                step,
+                metrics,
+                running_best_before: None,
+                running_best_after: Some(composed),
+                gates: vec![FoundationV2GateResult {
+                    name: "one_step_collapse".into(),
+                    passed: armed_ok,
+                    measured: Some(composed),
+                    threshold: "replay".into(),
+                    abort_exempt: false,
+                    abort_exemption_reason: None,
+                    floor: None,
+                    noise_margin: None,
+                }],
+                diagnostics: vec![],
+            }
+        })
+        .collect();
+        assert_eq!(
+            foundation_v2_selected_best_step(PromotionMetric::ComposedExactGuarded, &history),
+            Some(20_480)
+        );
+        // The false-edit guard still binds between real candidates: a higher
+        // composed value with a doubled false-edit rate is not promoted.
+        let mut guarded = history.clone();
+        let mut regressed = guarded.last().expect("history").clone();
+        regressed.step = 25_600;
+        regressed.metrics.one_step_composed_changed_exact = Some(0.60);
+        regressed.metrics.false_edit_rate = Some(0.25);
+        guarded.push(regressed);
+        assert_eq!(
+            foundation_v2_selected_best_step(PromotionMetric::ComposedExactGuarded, &guarded),
+            Some(20_480)
+        );
     }
 
     /// Isolated non-finite-gradient skips stay within budget; sixteen within
