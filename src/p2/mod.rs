@@ -1,3 +1,4 @@
+pub mod adaptation;
 pub mod agent_session;
 pub mod arc3;
 pub mod arc3_bridge;
