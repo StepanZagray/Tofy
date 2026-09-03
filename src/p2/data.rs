@@ -5154,3 +5154,15 @@ mod tests {
         assert!(big.to_fixed_64().is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0005 model-side helper (added by the model/context-channel change; the
+// generator owner may relocate it). Mutable access to composed rows so the
+// trainer's context plumbing can be tested with hand-built context windows
+// before the v6 generator emits them.
+// ---------------------------------------------------------------------------
+impl MixedStreamBatch {
+    pub fn transitions_mut(&mut self) -> impl Iterator<Item = &mut TransitionSample> {
+        self.samples.iter_mut().map(|sample| &mut sample.transition)
+    }
+}

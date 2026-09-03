@@ -156,6 +156,12 @@ pub struct ModelConfig {
     /// enabling only the inverse-action heads required by ADR 0003.
     #[serde(default)]
     pub world_core_v5: bool,
+    /// ADR 0005 adaptation-first world core: the V5 topology plus a context
+    /// channel (`ContextBatch` → context FiLM in the dynamics block). Whole
+    /// frames are board content: `embed_frames` keeps row 63 and no path
+    /// treats rendered palette index 0 specially.
+    #[serde(default)]
+    pub world_core_v6: bool,
     /// Readout used only by Q/event/reliability planning heads.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -228,6 +234,7 @@ impl Default for ModelConfig {
             world_core_v3: false,
             world_core_v4: false,
             world_core_v5: false,
+            world_core_v6: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
             copy_bypass_gate: false,
             copy_gate_bias_prior: None,
@@ -331,6 +338,9 @@ impl ModelConfig {
         if self.world_core_v5 && !self.world_core_v4 {
             bail!("world_core_v5 requires the world_core_v4 exact-decoder topology");
         }
+        if self.world_core_v6 && !self.world_core_v5 {
+            bail!("world_core_v6 requires the world_core_v5 foundation topology");
+        }
         if self.world_core_v4
             && (!self.spatial_action_field
                 || self.consumer_readout != ConsumerReadoutTopology::SpatialQuery)
@@ -405,6 +415,49 @@ pub fn zero_action_film_projections(varmap: &VarMap) -> Result<()> {
         bail!("expected four action FiLM parameters, found {matched}");
     }
     Ok(())
+}
+
+/// Restore context FiLM's identity initialization after the generic
+/// reinitializer (ADR 0005 §3.1). Non-v6 topologies have no such parameters
+/// and are a deliberate no-op.
+pub fn zero_context_film_projections(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().unwrap();
+    let mut matched = 0usize;
+    for (name, var) in data
+        .iter()
+        .filter(|(name, _)| name.starts_with(CONTEXT_FILM_PREFIX))
+    {
+        var.set(&Tensor::zeros(var.shape(), var.dtype(), var.device())?)
+            .map_err(|error| anyhow::anyhow!("zero {name}: {error}"))?;
+        matched += 1;
+    }
+    if matched != 0 && matched != 4 {
+        bail!("expected zero or four context FiLM parameters, found {matched}");
+    }
+    Ok(())
+}
+
+/// Name prefix shared by every ADR 0005 context-channel parameter. The v5
+/// warm-start loader may leave exactly these tensors at their fresh init.
+pub const CONTEXT_PARAMETER_PREFIX: &str = "context_";
+const CONTEXT_FILM_PREFIX: &str = "context_film_";
+
+/// ADR 0005 §3.3 fast-weight subset: the only parameters test-time gradient
+/// adaptation may touch, by checkpoint name prefix. `encoder.patch` is the
+/// first convolution of the shared frame encoder (`GridEncoder::patch`).
+pub const FAST_WEIGHT_PREFIXES: &[&str] = &[
+    "action_film_",
+    "context_film_",
+    "pixel_emb",
+    "encoder.patch",
+    "exact_grounding_head",
+];
+
+/// Whether a checkpoint parameter name belongs to the fast-weight subset.
+pub fn is_fast_weight(name: &str) -> bool {
+    FAST_WEIGHT_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Restore the operator pathway's identity-preserving zero initialization
@@ -579,6 +632,219 @@ impl ActionFilm {
             beta: zeros,
         })
     }
+}
+
+/// Host-side (worker-thread safe) expansion of the ADR 0005 §1.5 context
+/// windows of one batch. Row order follows the batch; `k` is the widest
+/// window in the batch and shorter windows are zero-padded with `valid = 0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextBatchHost {
+    pub batch: usize,
+    pub k: usize,
+    /// `B*K*64*64` palette indices of the context `current` frames.
+    pub current: Vec<u8>,
+    /// `B*K*64*64` palette indices of the context `next` frames.
+    pub next: Vec<u8>,
+    /// `B*K` official action ids.
+    pub actions: Vec<u32>,
+    /// `B*K*2` normalized ACTION6 coordinates (zeros for simple actions).
+    pub coords: Vec<f32>,
+    /// `B*K` occupancy mask.
+    pub valid: Vec<f32>,
+}
+
+fn encode_context_action(action: &crate::p2::data::ArcAction) -> Result<(u32, [f32; 2])> {
+    let id = u32::from(action.id);
+    if id >= ACTION_VOCAB as u32 {
+        bail!("context action id {id} out of official range 0..{ACTION_VOCAB}");
+    }
+    match (id, action.x, action.y) {
+        (6, Some(x), Some(y)) => Ok((id, [f32::from(x) / 63.0, f32::from(y) / 63.0])),
+        (0..=5, None, None) | (7, None, None) => Ok((id, [0.0, 0.0])),
+        (6, _, _) => bail!("context ACTION6 requires a complete coordinate pair"),
+        _ => bail!("context coordinates are only valid for ACTION6"),
+    }
+}
+
+impl ContextBatchHost {
+    /// `None` when no row carries context (`K = 0`, ADR 0005 §3.1: `c = 0`).
+    pub fn from_rows<'a>(
+        rows: impl IntoIterator<Item = &'a TransitionSample>,
+    ) -> Result<Option<Self>> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        let k = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
+        if k == 0 {
+            return Ok(None);
+        }
+        if k > crate::p2::data::CONTEXT_WINDOW_MAX {
+            bail!(
+                "context window {k} exceeds CONTEXT_WINDOW_MAX {}",
+                crate::p2::data::CONTEXT_WINDOW_MAX
+            );
+        }
+        let pixels = FRAME_SIDE * FRAME_SIDE;
+        let batch = rows.len();
+        let mut current = vec![0u8; batch * k * pixels];
+        let mut next = vec![0u8; batch * k * pixels];
+        let mut actions = vec![0u32; batch * k];
+        let mut coords = vec![0f32; batch * k * 2];
+        let mut valid = vec![0f32; batch * k];
+        for (row, sample) in rows.iter().enumerate() {
+            for (slot, transition) in sample.context.iter().enumerate() {
+                let flat = row * k + slot;
+                for (frame, target) in [
+                    (&transition.current, &mut current),
+                    (&transition.next, &mut next),
+                ] {
+                    if frame.pixels.len() != pixels {
+                        bail!("context frame is not fixed {FRAME_SIDE}x{FRAME_SIDE}");
+                    }
+                    if frame.pixels.iter().any(|&p| p as usize >= PALETTE_SIZE) {
+                        bail!("context palette value out of 0..{PALETTE_SIZE}");
+                    }
+                    target[flat * pixels..(flat + 1) * pixels].copy_from_slice(&frame.pixels);
+                }
+                let (id, xy) = encode_context_action(&transition.action)?;
+                actions[flat] = id;
+                coords[flat * 2..flat * 2 + 2].copy_from_slice(&xy);
+                valid[flat] = 1.0;
+            }
+        }
+        Ok(Some(Self {
+            batch,
+            k,
+            current,
+            next,
+            actions,
+            coords,
+            valid,
+        }))
+    }
+}
+
+/// Device tensors of one batch's context windows (ADR 0005 §3.1).
+///
+/// `current`/`next` are `B×K×64×64` U8 palette indices (U8 rather than U32:
+/// at `B=2048, K=16` the pair costs 268 MB instead of 1 GB of device memory;
+/// `embed_frames` widens to U32 at the gather). `actions` is `B×K` U32,
+/// `coords` is `B×K×2` F32 with the trainer's ACTION6 normalization and zeros
+/// for coordinate-free actions, `valid` is `B×K` F32.
+#[derive(Debug, Clone)]
+pub struct ContextBatch {
+    pub current: Tensor,
+    pub next: Tensor,
+    pub actions: Tensor,
+    pub coords: Tensor,
+    pub valid: Tensor,
+    /// Flat `B*K` slot indices of the valid transitions, so the encoder runs
+    /// on `N = sum(valid)` frames instead of the zero-padded `B*K`.
+    packed: Tensor,
+    /// Per-row slot of the chronologically last valid transition (0 if none).
+    last_slot: Tensor,
+    valid_host: Vec<f32>,
+}
+
+impl ContextBatch {
+    pub fn from_host(host: &ContextBatchHost, device: &candle_core::Device) -> Result<Self> {
+        let (b, k) = (host.batch, host.k);
+        let packed = host
+            .valid
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, v)| (*v != 0.0).then_some(slot as u32))
+            .collect::<Vec<_>>();
+        if packed.is_empty() {
+            bail!("ContextBatch requires at least one valid context transition");
+        }
+        let last_slot = host
+            .valid
+            .chunks_exact(k)
+            .map(|row| row.iter().filter(|v| **v != 0.0).count().saturating_sub(1) as u32)
+            .collect::<Vec<_>>();
+        let packed_len = packed.len();
+        Ok(Self {
+            current: Tensor::from_vec(
+                host.current.clone(),
+                (b, k, FRAME_SIDE, FRAME_SIDE),
+                device,
+            )?,
+            next: Tensor::from_vec(host.next.clone(), (b, k, FRAME_SIDE, FRAME_SIDE), device)?,
+            actions: Tensor::from_vec(host.actions.clone(), (b, k), device)?,
+            coords: Tensor::from_vec(host.coords.clone(), (b, k, 2), device)?,
+            valid: Tensor::from_vec(host.valid.clone(), (b, k), device)?,
+            packed: Tensor::from_vec(packed, (packed_len,), device)?,
+            last_slot: Tensor::from_vec(last_slot, (b,), device)?,
+            valid_host: host.valid.clone(),
+        })
+    }
+
+    /// `None` when no row carries context.
+    pub fn from_samples(
+        samples: &[TransitionSample],
+        device: &candle_core::Device,
+    ) -> Result<Option<Self>> {
+        ContextBatchHost::from_rows(samples)?
+            .map(|host| Self::from_host(&host, device))
+            .transpose()
+    }
+
+    pub fn batch(&self) -> usize {
+        self.valid_host.len() / self.k().max(1)
+    }
+
+    pub fn k(&self) -> usize {
+        self.valid.dims2().map(|(_, k)| k).unwrap_or(0)
+    }
+
+    /// Context of a row subset (e.g. rollout fragments); `None` if the subset
+    /// carries no context.
+    pub fn select_rows(&self, rows: &[u32]) -> Result<Option<Self>> {
+        let k = self.k();
+        let rows = rows.iter().map(|row| *row as usize).collect::<Vec<_>>();
+        if !rows.iter().any(|row| {
+            self.valid_host[row * k..(row + 1) * k]
+                .iter()
+                .any(|v| *v != 0.0)
+        }) {
+            return Ok(None);
+        }
+        let device = self.valid.device();
+        let index = Tensor::from_vec(
+            rows.iter().map(|row| *row as u32).collect::<Vec<_>>(),
+            (rows.len(),),
+            device,
+        )?;
+        let valid_host = rows
+            .iter()
+            .flat_map(|row| self.valid_host[row * k..(row + 1) * k].iter().copied())
+            .collect::<Vec<_>>();
+        let packed = valid_host
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, v)| (*v != 0.0).then_some(slot as u32))
+            .collect::<Vec<_>>();
+        let packed_len = packed.len();
+        Ok(Some(Self {
+            current: self.current.index_select(&index, 0)?,
+            next: self.next.index_select(&index, 0)?,
+            actions: self.actions.index_select(&index, 0)?,
+            coords: self.coords.index_select(&index, 0)?,
+            valid: self.valid.index_select(&index, 0)?,
+            packed: Tensor::from_vec(packed, (packed_len,), device)?,
+            last_slot: self.last_slot.index_select(&index, 0)?,
+            valid_host,
+        }))
+    }
+}
+
+/// Learned context channel (ADR 0005 §3.1), present only on `world_core_v6`.
+struct ContextChannel {
+    /// 1×1 fusion of the pooled-latent difference with the ACTION6 field.
+    fuse: Conv2d,
+    mlp_in: Linear,
+    mlp_out: Linear,
+    film_gamma: Linear,
+    film_beta: Linear,
 }
 
 impl GridResidualBlock {
@@ -836,6 +1102,8 @@ pub struct WorldModel {
     /// Present in every arm; its loss is switched by the training contract.
     patch_histogram_grounding: PatchHistogramGrounding,
     exact_patch_grounding: Option<ExactPatchGrounding>,
+    /// ADR 0005 context channel; `Some` exactly when `world_core_v6`.
+    context: Option<ContextChannel>,
 }
 
 impl WorldModel {
@@ -972,8 +1240,152 @@ impl WorldModel {
                     )
                 })
                 .transpose()?,
+            context: cfg
+                .world_core_v6
+                .then(|| -> Result<ContextChannel> {
+                    Ok(ContextChannel {
+                        fuse: conv2d(
+                            cfg.hidden_dim + 4,
+                            cfg.hidden_dim,
+                            1,
+                            Default::default(),
+                            vb.pp("context_fuse"),
+                        )?,
+                        mlp_in: linear(
+                            2 * cfg.hidden_dim + cfg.action_dim,
+                            cfg.hidden_dim,
+                            vb.pp("context_mlp_in"),
+                        )?,
+                        mlp_out: linear(cfg.hidden_dim, cfg.hidden_dim, vb.pp("context_mlp_out"))?,
+                        film_gamma: zero_initialized_linear(
+                            cfg.hidden_dim,
+                            cfg.hidden_dim,
+                            vb.pp("context_film_gamma"),
+                        )?,
+                        film_beta: zero_initialized_linear(
+                            cfg.hidden_dim,
+                            cfg.hidden_dim,
+                            vb.pp("context_film_beta"),
+                        )?,
+                    })
+                })
+                .transpose()?,
             positional_value_readout,
             config: cfg,
+        })
+    }
+
+    /// ADR 0005 §3.1 context summary `c ∈ R^{B×hidden}`.
+    ///
+    /// Only the `N = sum(valid)` real transitions are encoded (packed by
+    /// `ContextBatch::packed`), then scattered back to `B×K` for the masked
+    /// mean and last-element aggregation. Context does not influence
+    /// `encode_state`: the state encoder stays a pure function of the frame so
+    /// targets, context frames and the current frame share one latent space;
+    /// context enters only through the dynamics FiLM.
+    pub fn context_summary(&self, context: &ContextBatch) -> Result<Tensor> {
+        let channel = self
+            .context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("context requires a world_core_v6 model"))?;
+        let (b, k, h, w) = context.current.dims4()?;
+        let hidden = self.config.hidden_dim;
+        // Pack: gather only valid slots so the encoder cost scales with real context.
+        let current = context
+            .current
+            .reshape((b * k, 1, h, w))?
+            .index_select(&context.packed, 0)?;
+        let next = context
+            .next
+            .reshape((b * k, 1, h, w))?
+            .index_select(&context.packed, 0)?;
+        let actions = context
+            .actions
+            .reshape((b * k,))?
+            .index_select(&context.packed, 0)?;
+        let coords = context
+            .coords
+            .reshape((b * k, 2))?
+            .index_select(&context.packed, 0)?;
+        // Shared frame encoder on current and next in one 2N pass, RMS-normalized
+        // like `encode_state` so the difference lives on the dynamics support.
+        let (current_z, next_z) = self.encode_state_pair_raw(&current, &next, false)?;
+        let current_z = rms_norm_latent(&current_z)?;
+        let diff = rms_norm_latent(&next_z)?.sub(&current_z)?;
+        // Spatial ACTION6 field lets the 1×1 fusion weight the change at the click.
+        let field = self.spatial_action_field(&actions, &coords)?;
+        let fused = channel
+            .fuse
+            .forward(&Tensor::cat(&[&diff, &field], 1)?)?
+            .silu()?;
+        let embedding = self.action_emb.forward(&actions)?;
+        let features = Tensor::cat(
+            &[&pool_latent(&current_z)?, &pool_latent(&fused)?, &embedding],
+            1,
+        )?;
+        let encoded = channel
+            .mlp_out
+            .forward(&channel.mlp_in.forward(&features)?.silu()?)?;
+        // Scatter back: padded slots stay exactly zero, so the plain sum is the masked sum.
+        let slots = Tensor::zeros((b * k, hidden), encoded.dtype(), encoded.device())?
+            .index_add(&context.packed, &encoded, 0)?
+            .reshape((b, k, hidden))?;
+        let count = context.valid.sum_keepdim(1)?;
+        let mean = slots
+            .sum(1)?
+            .broadcast_div(&count.clamp(1.0, f64::INFINITY)?)?;
+        // Order-aware summary: the chronologically last valid transition.
+        let last = slots
+            .gather(
+                &context
+                    .last_slot
+                    .reshape((b, 1, 1))?
+                    .broadcast_as((b, 1, hidden))?
+                    .contiguous()?,
+                1,
+            )?
+            .squeeze(1)?;
+        // Rows without context (count = 0) are forced to c = 0.
+        let present = count.gt(0.0)?.to_dtype(encoded.dtype())?;
+        mean.add(&last)?.broadcast_mul(&present).map_err(Into::into)
+    }
+
+    /// Compose context FiLM next to action FiLM. Zero-initialized projections
+    /// give `gamma_c = 1`, `beta_c = 0` exactly, so the v5 computation is
+    /// recovered bit-for-bit at init (ADR 0005 §3.1).
+    fn apply_context_film(
+        &self,
+        film: ActionFilm,
+        context: Option<&ContextBatch>,
+        batch: usize,
+    ) -> Result<ActionFilm> {
+        let Some(context) = context else {
+            return Ok(film);
+        };
+        let channel = self
+            .context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("context was supplied to a non-v6 model"))?;
+        if context.batch() != batch {
+            bail!(
+                "context batch {} does not match transition batch {batch}",
+                context.batch()
+            );
+        }
+        let c = self.context_summary(context)?;
+        let hidden = self.config.hidden_dim;
+        let gamma = channel
+            .film_gamma
+            .forward(&c)?
+            .affine(1.0, 1.0)?
+            .reshape((batch, hidden, 1, 1))?;
+        let beta = channel
+            .film_beta
+            .forward(&c)?
+            .reshape((batch, hidden, 1, 1))?;
+        Ok(ActionFilm {
+            gamma: film.gamma.mul(&gamma)?,
+            beta: film.beta.add(&beta)?,
         })
     }
 
@@ -1358,7 +1770,10 @@ impl WorldModel {
         } else {
             bail!("embed_frames: expected 1 or {PIXEL_EMB_DIM} channels, got {c}");
         };
-        if !(self.config.world_core_v2 || self.config.world_core_v4)
+        // ADR 0005 §1.3: v6 frames have no reserved status row, so row 63 is
+        // board content and is never replaced (nor is index 0 special, §1.2).
+        if self.config.world_core_v6
+            || !(self.config.world_core_v2 || self.config.world_core_v4)
             || (status_already_empty && c == 1)
         {
             return Ok(embedded);
@@ -1558,6 +1973,27 @@ impl WorldModel {
         action_coords: &Tensor,
         operator_conditioning: Option<&Tensor>,
     ) -> Result<(Tensor, ActionFilm)> {
+        self.prepare_action_conditioning_with_context(
+            state,
+            canonical,
+            actions,
+            action_coords,
+            operator_conditioning,
+            None,
+        )
+    }
+
+    /// Action conditioning plus ADR 0005 context FiLM (`None` context keeps
+    /// the exact legacy FiLM; `Some` requires `world_core_v6`).
+    fn prepare_action_conditioning_with_context(
+        &self,
+        state: &Tensor,
+        canonical: Option<&Tensor>,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: Option<&Tensor>,
+        context: Option<&ContextBatch>,
+    ) -> Result<(Tensor, ActionFilm)> {
         let batch = state.dim(0)?;
         let unknown;
         let operator_conditioning = match operator_conditioning {
@@ -1577,6 +2013,7 @@ impl WorldModel {
             operator_conditioning,
         )?;
         let film = self.action_film_from_embedding(&embedding, batch)?;
+        let film = self.apply_context_film(film, context, batch)?;
         Ok((conditioned, film))
     }
 
@@ -1661,14 +2098,16 @@ impl WorldModel {
         action_coords: &Tensor,
         goal_features: &Tensor,
         operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
     ) -> Result<(Tensor, ActionFilm, Tensor, Option<Tensor>)> {
         let encoded = self.encode_state(frames)?;
-        let (x, film) = self.prepare_action_conditioning(
+        let (x, film) = self.prepare_action_conditioning_with_context(
             &encoded,
             None,
             actions,
             action_coords,
             Some(operator_conditioning),
+            context,
         )?;
         let state = self.config.warm_start_y.then(|| encoded.clone());
         let goal_h = self.project_goal(goal_features)?;
@@ -2103,12 +2542,39 @@ impl WorldModel {
         z_noise_sigma: f64,
         noise_seed: Option<u64>,
     ) -> Result<ForwardOutput> {
+        self.forward_with_depth_and_operator_conditioning_with_context(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            None,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_depth_and_operator_conditioning_with_context(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+    ) -> Result<ForwardOutput> {
         let (x, film, goal_h, y_init) = self.prepare_transition_with_operator_conditioning(
             frames,
             actions,
             action_coords,
             goal_features,
             operator_conditioning,
+            context,
         )?;
         self.run_recursion(
             &x,
@@ -2156,7 +2622,7 @@ impl WorldModel {
     pub fn forward_from_encoded_state_with_operator_conditioning(
         &self,
         cur_state: &Tensor,
-        _frames: &Tensor,
+        frames: &Tensor,
         actions: &Tensor,
         action_coords: &Tensor,
         goal_features: &Tensor,
@@ -2166,12 +2632,44 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<ForwardOutput> {
-        let (x, film) = self.prepare_action_conditioning(
+        self.forward_from_encoded_state_with_operator_conditioning_with_context(
+            cur_state,
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            None,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    /// Live-policy / evaluator seam with the ADR 0005 context window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_from_encoded_state_with_operator_conditioning_with_context(
+        &self,
+        cur_state: &Tensor,
+        _frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<ForwardOutput> {
+        let (x, film) = self.prepare_action_conditioning_with_context(
             cur_state,
             None,
             actions,
             action_coords,
             Some(operator_conditioning),
+            context,
         )?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
@@ -2233,12 +2731,39 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
-        let (x, film) = self.prepare_action_conditioning(
+        self.training_latents_from_encoded_state_with_operator_conditioning_with_context(
+            cur_state,
+            actions,
+            action_coords,
+            operator_conditioning,
+            None,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn training_latents_from_encoded_state_with_operator_conditioning_with_context(
+        &self,
+        cur_state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
+        let (x, film) = self.prepare_action_conditioning_with_context(
             cur_state,
             None,
             actions,
             action_coords,
             Some(operator_conditioning),
+            context,
         )?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(
@@ -2295,15 +2820,45 @@ impl WorldModel {
         noise_seed: Option<u64>,
         recursion: RecursionOpts,
     ) -> Result<LatentRecursionOutput> {
+        self.full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+            cur_state,
+            current_canonical,
+            actions,
+            action_coords,
+            operator_conditioning,
+            None,
+            depth,
+            z_noise_sigma,
+            noise_seed,
+            recursion,
+        )
+    }
+
+    /// Foundation-v2 trainer seam with the ADR 0005 context window (§4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+        &self,
+        cur_state: &Tensor,
+        current_canonical: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+        z_noise_sigma: f64,
+        noise_seed: Option<u64>,
+        recursion: RecursionOpts,
+    ) -> Result<LatentRecursionOutput> {
         if !self.config.world_core_v4 {
             bail!("Full V4 training recursion requires world_core_v4");
         }
-        let (x, film) = self.prepare_action_conditioning(
+        let (x, film) = self.prepare_action_conditioning_with_context(
             cur_state,
             Some(current_canonical),
             actions,
             action_coords,
             Some(operator_conditioning),
+            context,
         )?;
         let y_init = self.config.warm_start_y.then(|| cur_state.clone());
         self.run_latent_recursion(
@@ -2386,12 +2941,35 @@ impl WorldModel {
         operator_conditioning: &Tensor,
         outer_steps: usize,
     ) -> Result<ForwardOutput> {
+        self.forward_with_outer_steps_and_operator_conditioning_with_context(
+            frames,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            None,
+            outer_steps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_outer_steps_and_operator_conditioning_with_context(
+        &self,
+        frames: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        outer_steps: usize,
+    ) -> Result<ForwardOutput> {
         let (x, film, goal_h, y_init) = self.prepare_transition_with_operator_conditioning(
             frames,
             actions,
             action_coords,
             goal_features,
             operator_conditioning,
+            context,
         )?;
         self.run_recursion(
             &x,
@@ -2471,12 +3049,36 @@ impl WorldModel {
         operator_conditioning: &Tensor,
         depth: RecursionDepth,
     ) -> Result<ForwardOutput> {
-        let (x, film) = self.prepare_action_conditioning(
+        self.forward_from_latent_with_depth_and_operator_conditioning_with_context(
+            state,
+            actions,
+            action_coords,
+            goal_features,
+            operator_conditioning,
+            None,
+            depth,
+        )
+    }
+
+    /// Gate-support evaluator / Phase A seam with the ADR 0005 context window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_from_latent_with_depth_and_operator_conditioning_with_context(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        goal_features: &Tensor,
+        operator_conditioning: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+    ) -> Result<ForwardOutput> {
+        let (x, film) = self.prepare_action_conditioning_with_context(
             state,
             None,
             actions,
             action_coords,
             Some(operator_conditioning),
+            context,
         )?;
         let goal_h = self.project_goal(goal_features)?;
         let y_init = if self.config.warm_start_y {
@@ -2504,7 +3106,53 @@ impl WorldModel {
         action_coords: &Tensor,
         depth: RecursionDepth,
     ) -> Result<Tensor> {
-        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords, None)?;
+        self.predict_latent_with_depth_with_context(state, actions, action_coords, None, depth)
+    }
+
+    /// One-step prefix prediction with the ADR 0005 context window. V4+
+    /// topologies (v6 included) route `prefix_predict` through the single-step
+    /// recursion, so this is the context-aware prefix seam.
+    pub fn prefix_predict_with_context(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        context: Option<&ContextBatch>,
+    ) -> Result<Tensor> {
+        if !self.config.world_core_v4 {
+            if context.is_some() {
+                bail!("context prefix prediction requires the world_core_v4 recursion path");
+            }
+            return self.prefix_predict(state, actions, action_coords);
+        }
+        self.predict_latent_with_depth_with_context(
+            state,
+            actions,
+            action_coords,
+            context,
+            RecursionDepth {
+                inner_steps: 1,
+                outer_steps: 1,
+            },
+        )
+    }
+
+    pub fn predict_latent_with_depth_with_context(
+        &self,
+        state: &Tensor,
+        actions: &Tensor,
+        action_coords: &Tensor,
+        context: Option<&ContextBatch>,
+        depth: RecursionDepth,
+    ) -> Result<Tensor> {
+        let (x, film) = self.prepare_action_conditioning_with_context(
+            state,
+            None,
+            actions,
+            action_coords,
+            None,
+            context,
+        )?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         Ok(self
             .run_latent_recursion(
@@ -2604,6 +3252,7 @@ impl WorldModel {
             action_coords,
             goal_features,
             operator_conditioning,
+            None,
         )?;
         self.forward_ptrm_prepared_with_film(&x, &film, &goal_h, y_init, depth, ptrm)
     }
