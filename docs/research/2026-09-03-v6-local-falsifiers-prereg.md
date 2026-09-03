@@ -34,8 +34,15 @@ or unblock the v6 pod run, it cannot satisfy a promotion gate.
 - Arms: one v6 model; evaluation with the context masked (K = 0) versus the
   full context (K = 16) on 512 held-out twin-pair meta-episodes, fixed
   evaluation seed 1000002.
-- Budget: local run, physical batch 256 (accumulation 4 → effective 1024),
-  4096 optimizer steps, seed 2, evaluation at 1024/2048/3072/4096.
+- Budget: local run, 4096 optimizer steps, seed 2, evaluation at 1024/2048/3072/4096.
+  Batch pair measured before launch (AGENTS.md): physical 256 OOMs on the 8 GB GPU under
+  the v6 context channel; physical 128 × accumulation 2 (effective 256) peaks at 5.8 GB and
+  is the launched configuration. This is a smaller effective batch than the ADR 0003 recipe
+  (1024); the run is a data-contract screen, not a recipe comparison.
+- Launch (2026-09-03, revision 975832f9, binary sha256 in the run root):
+  `tofy p2-train --recipe foundation-v2 --world-core-v6 --data-contract-v6 --device cuda
+  --seed 2 --init-seed 2 --physical-batch 128 --grad-accum 2 --steps 4096
+  --checkpoint-every-steps 512 --output-dir runs/p2/v6-memorization-e2-20260903`.
 - Threshold: Δ ≥ 0.05 absolute at step 4096. Below threshold ⇒ DATA failure:
   the generator is not mutually exclusive; the pod run is blocked.
 - Also recorded (no threshold): the same delta on the legacy streams
