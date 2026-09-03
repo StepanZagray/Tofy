@@ -371,7 +371,8 @@ fn transition_correctness_from_gameplay(
         "exact decoder produced an invalid gameplay grid"
     );
     ensure!(
-        current.dims3()? == (batch, rows, FRAME_SIDE) && target.dims3()? == (batch, rows, FRAME_SIDE),
+        current.dims3()? == (batch, rows, FRAME_SIDE)
+            && target.dims3()? == (batch, rows, FRAME_SIDE),
         "exact correctness inputs must share a Bx{rows}x64 gameplay grid"
     );
     let correct = predicted.eq(target)?.to_dtype(DType::F32)?;
@@ -703,6 +704,38 @@ mod tests {
     }
 
     #[test]
+    fn whole_frame_head_decodes_and_supervises_row_63() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let vars = VarMap::new();
+        let head = ExactPatchGrounding::new(
+            4,
+            4,
+            None,
+            DecodeComposition::default(),
+            true,
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+        )?;
+        let latents = Tensor::randn(0f32, 1.0, (1, 4, 16, 16), &device)?;
+        assert_eq!(
+            head.gameplay_logits(&latents)?.dims(),
+            &[1, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE]
+        );
+        assert_eq!(head.copy_gate(&latents)?.dims(), &[1, FRAME_SIDE, FRAME_SIDE]);
+        let clean = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
+        let row_63 = Tensor::ones((1, 1, 1, FRAME_SIDE), DType::U32, &device)?;
+        let edited = Tensor::cat(&[&clean.narrow(2, 0, FRAME_SIDE - 1)?, &row_63], 2)?;
+        let clean_loss = head.loss(&latents, &clean)?.to_scalar::<f32>()?;
+        let edited_loss = head.loss(&latents, &edited)?.to_scalar::<f32>()?;
+        assert_ne!(clean_loss, edited_loss, "row 63 must be supervised");
+        let current = clean.narrow(2, 0, FRAME_SIDE)?.squeeze(1)?;
+        assert_eq!(
+            head.compose_gameplay_pixels(&latents, &clean)?.dims(),
+            current.dims()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_grounding_ignores_status_only_differences() -> Result<()> {
         let device = candle_core::Device::Cpu;
         let vars = VarMap::new();
@@ -786,12 +819,14 @@ mod tests {
         let current = vec![0; FRAME_SIDE * FRAME_SIDE];
         let mut next = current.clone();
         next[(FRAME_SIDE - 1) * FRAME_SIDE] = 2;
-        let (_, _, changed_count) = patch_targets(&[sample(current.clone(), next)], 8, 8, false).unwrap();
+        let (_, _, changed_count) =
+            patch_targets(&[sample(current.clone(), next)], 8, 8, false).unwrap();
         assert_eq!(changed_count, 0, "status-only change must be ignored");
 
         let mut next = current.clone();
         next[(FRAME_SIDE - 2) * FRAME_SIDE] = 1;
-        let (histograms, _, changed_count) = patch_targets(&[sample(current, next)], 8, 8, false).unwrap();
+        let (histograms, _, changed_count) =
+            patch_targets(&[sample(current, next)], 8, 8, false).unwrap();
         assert_eq!(changed_count, 1);
         let bottom_left = (7 * 8) * PALETTE_SIZE;
         assert!((histograms[bottom_left] - 55.0 / 56.0).abs() < 1e-6);

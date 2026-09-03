@@ -11527,6 +11527,61 @@ mod tests {
     }
 
     #[test]
+    fn v6_batch_trains_a_whole_frame_decoder_and_rejects_a_legacy_one() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        let mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 64,
+                seed: 0x7607,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            0.0,
+            0,
+            V5DataSplit::Train,
+        )?;
+        let objective = FoundationV2ObjectiveConfig {
+            ep_weight: 0.01,
+            sigreg_projections: 8,
+            sigreg_knots: 5,
+            sigreg_seed: 1,
+            q_mse_threshold: cfg.q_mse_threshold,
+            rollout_enabled: false,
+            split_ce_weighting: Default::default(),
+            split_ce_changed_budget: None,
+            capture_mechanism_seams: false,
+        };
+        let host = prepare_foundation_v2_batch_host(&mixed)?;
+        assert_eq!(host.gameplay_rows, FRAME_SIDE);
+        assert_eq!(host.content_values.len(), 64 * FRAME_SIDE * FRAME_SIDE);
+
+        let mut model_cfg = cfg.model_config();
+        model_cfg.world_core_v6 = true;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            model_cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let losses = foundation_v2_training_loss(&model, &mixed, &device, objective.clone())?;
+        assert!(losses.total.to_dtype(DType::F32)?.to_scalar::<f32>()?.is_finite());
+
+        let legacy_varmap = VarMap::new();
+        let legacy = WorldModel::new(
+            cfg.model_config(),
+            VarBuilder::from_varmap(&legacy_varmap, DType::F32, &device),
+        )?;
+        let err = match foundation_v2_training_loss(&legacy, &mixed, &device, objective) {
+            Ok(_) => panic!("a 63-row decoder cannot supervise whole-frame rows"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("supervises 64 rows"));
+        Ok(())
+    }
+
+    #[test]
     fn v6_batch_conditions_unknown_and_keeps_row_63_in_model_frames() -> Result<()> {
         let mixed = compose_mixed_stream_batch(
             &MixedStreamConfig {

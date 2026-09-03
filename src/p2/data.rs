@@ -6036,8 +6036,12 @@ mod tests {
     fn learning_history_context_is_chronological_and_bounded() -> Result<()> {
         let families = OperatorFamilySplit::default();
         for meta_episode_id in 0..12u64 {
-            let (primary, twin) =
-                generate_learning_history_pair(0x4C48, meta_episode_id, V5DataSplit::Train, &families)?;
+            let (primary, twin) = generate_learning_history_pair(
+                0x4C48,
+                meta_episode_id,
+                V5DataSplit::Train,
+                &families,
+            )?;
             for history in [&primary, &twin] {
                 assert!(LEARNING_HISTORY_LEVELS.contains(&history.levels));
                 assert_eq!(
@@ -6093,8 +6097,12 @@ mod tests {
         let mut zero = 0usize;
         let mut max_k = 0usize;
         for meta_episode_id in 0..120u64 {
-            let (primary, _) =
-                generate_learning_history_pair(0x4B4B, meta_episode_id, V5DataSplit::Train, &families)?;
+            let (primary, _) = generate_learning_history_pair(
+                0x4B4B,
+                meta_episode_id,
+                V5DataSplit::Train,
+                &families,
+            )?;
             for (index, row) in primary.rows.iter().enumerate() {
                 if history_time(&primary, index) < CONTEXT_WINDOW_MAX {
                     continue;
@@ -6119,7 +6127,12 @@ mod tests {
         let families = OperatorFamilySplit::default();
         let pairs = (0..64u64)
             .map(|meta_episode_id| {
-                generate_learning_history_pair(0x5457_494E, meta_episode_id, V5DataSplit::Train, &families)
+                generate_learning_history_pair(
+                    0x5457_494E,
+                    meta_episode_id,
+                    V5DataSplit::Train,
+                    &families,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let census = census_twin_exclusivity(&pairs);
@@ -6143,7 +6156,8 @@ mod tests {
 
     #[test]
     fn v6_learning_history_rows_keep_context_under_the_row_augmentation() -> Result<()> {
-        let batch = compose_mixed_stream_batch(&v6_config(128, 0x4348), 1.0, 2, V5DataSplit::Train)?;
+        let batch =
+            compose_mixed_stream_batch(&v6_config(128, 0x4348), 1.0, 2, V5DataSplit::Train)?;
         let mut chained = 0usize;
         let mut with_context = 0usize;
         for sample in batch
@@ -6217,7 +6231,10 @@ mod tests {
                 Some(0)
             )
         );
-        assert_ne!(hidden_rule_id(operator, Some(0)), hidden_rule_id(operator, Some(1)));
+        assert_ne!(
+            hidden_rule_id(operator, Some(0)),
+            hidden_rule_id(operator, Some(1))
+        );
         Ok(())
     }
 }
