@@ -3981,6 +3981,10 @@ mod tests {
                     | "p2/arc3_bridge.rs"
                     | "p2/arc3_live.rs"
                     | "p2/arc3_phase_a.rs"
+                    // ADR 0005 §5.3 frozen-checkpoint probe: reads toolkit
+                    // recordings for evaluation only and is reachable solely
+                    // from the CLI dispatcher, never from training code.
+                    | "p2/residual_probe.rs"
                     | "p2/cli.rs"
             ) {
                 continue;
