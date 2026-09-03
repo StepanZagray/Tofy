@@ -64,3 +64,30 @@ or unblock the v6 pod run, it cannot satisfy a promotion gate.
   E3 ≤ 2 h. Any integrity failure (hash, seed, evaluator) fails closed.
 - Data-access boundary: public ARC-AGI-3 frames appear only in E1 and only
   as evaluation inputs; no public frame enters any training path.
+
+## E1 outcome (2026-09-03, selection-only)
+
+Run: `runs/p2/residual-probe-20260903/REPORT.md`, commits 95013dc7 / adcd918c.
+Checkpoint actually probed: foundation-v2 2026-08-27 EMA-best (sha256 117f786b…),
+plus the final export (e5457dd4…); conclusions identical. NOT the s8 model.
+
+| task | residual (pixel-CE) AUROC | 1 − reliability AUROC |
+|---|---|---|
+| real vs synthetic, all rows (n=7,500) | 0.905 [0.896, 0.914] | 0.634 [0.620, 0.647] |
+| real vs synthetic, changed rows only | 0.866 | 0.494 (chance) |
+| wrong-prediction within synthetic | 0.488 (chance) | 0.719 |
+| shuffled-label control | 0.502 | 0.498 |
+
+Against the preregistered rule (residual ≥ 0.80 AND reliability ≤ 0.60): the
+residual condition is met; the reliability condition is **narrowly missed**
+(0.634, CI excludes 0.60). The switch of Phase A trust to residual-derived
+calibration is therefore NOT triggered by the rule; it is recorded as a
+recommended exploratory follow-up with a fresh recording seed, because the
+head is at chance on exactly the rows that matter (changed transitions).
+
+Additional facts that change earlier statements: the "~1e-8 reliability on
+real frames" observation from the s8 run is NOT reproduced on foundation-v2
+(real-frame median reliability 0.511); it is s8-specific and remains
+untested. Residual is a distribution-shift detector, not a per-transition
+correctness signal (chance within synthetic). Only 1.2% of real changed
+transitions were predicted exactly (28/2,410); 0/3,750 full-frame exact.
