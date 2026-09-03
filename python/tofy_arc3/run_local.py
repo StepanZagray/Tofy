@@ -515,6 +515,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-eval", choices=("true", "false"), default="false")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--max-actions-per-game", type=int)
+    parser.add_argument(
+        "--policy",
+        choices=("greedy", "phase-a"),
+        default="greedy",
+        help="decision controller passed through to p2-arc3-bridge",
+    )
+    parser.add_argument(
+        "--phase-a-calibration",
+        help="Phase A calibration artifact; absent means fail-closed frontier mode",
+    )
     return parser.parse_args()
 
 
@@ -552,6 +562,10 @@ def main() -> int:
             "--recordings-dir",
             str(recordings_dir),
         ]
+        if args.policy != "greedy":
+            command.extend(("--policy", args.policy))
+        if args.phase_a_calibration is not None:
+            command.extend(("--phase-a-calibration", args.phase_a_calibration))
         if args.profile_eval == "true":
             command.extend(("--profile-eval", "true"))
         if args.seed is not None:

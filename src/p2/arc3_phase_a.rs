@@ -135,8 +135,9 @@ pub fn load_phase_a_calibration(path: Option<&std::path::Path>) -> Result<PhaseA
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("read Phase A calibration {}", path.display()))?;
-            PhaseACalibration::from_json(&text)
-                .map_err(|error| anyhow::anyhow!("invalid Phase A calibration {}: {error}", path.display()))
+            PhaseACalibration::from_json(&text).map_err(|error| {
+                anyhow::anyhow!("invalid Phase A calibration {}: {error}", path.display())
+            })
         }
         None => Ok(PhaseACalibration::fail_closed()),
     }
@@ -181,8 +182,9 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
         let parsed = actions
             .iter()
             .map(|key| {
-                parse_action_key(key)
-                    .ok_or_else(|| ModelCallError::Backend(format!("unparseable action key {}", key.0)))
+                parse_action_key(key).ok_or_else(|| {
+                    ModelCallError::Backend(format!("unparseable action key {}", key.0))
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (_, channels, height, width) = Self::backend(from.tensor.dims4().map_err(Into::into))?;
@@ -222,18 +224,19 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                         .as_ref()
                         .context("root latent has no encoded frame")?;
                     let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
-                    self.model.forward_from_encoded_state_with_operator_conditioning(
-                        &state,
-                        &frame_batch,
-                        &action_ids,
-                        &coords,
-                        &zero_goals,
-                        &operator,
-                        RecursionDepth::from_config(self.model.config()),
-                        0.0,
-                        None,
-                        RecursionOpts::EVAL,
-                    )
+                    self.model
+                        .forward_from_encoded_state_with_operator_conditioning(
+                            &state,
+                            &frame_batch,
+                            &action_ids,
+                            &coords,
+                            &zero_goals,
+                            &operator,
+                            RecursionDepth::from_config(self.model.config()),
+                            0.0,
+                            None,
+                            RecursionOpts::EVAL,
+                        )
                 } else {
                     self.model
                         .forward_from_latent_with_depth_and_operator_conditioning(
@@ -247,7 +250,9 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                 }
             })())?;
             let q = Self::backend((|| -> Result<Vec<f32>> {
-                Ok(ops::sigmoid(&output.q_logit)?.flatten_all()?.to_vec1::<f32>()?)
+                Ok(ops::sigmoid(&output.q_logit)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?)
             })())?;
             let reliability = Self::backend((|| -> Result<Vec<f32>> {
                 Ok(ops::sigmoid(&output.reliability_logit)?
@@ -255,17 +260,20 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                     .to_vec1::<f32>()?)
             })())?;
             let noop = Self::backend((|| -> Result<Vec<f32>> {
-                Ok(ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?)
+                Ok(
+                    ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                )
             })())?;
             // Event-head fan-out across goal vectors: reported, not charged.
             let mut per_goal: Vec<Vec<GoalEventReadout>> = vec![Vec::new(); n];
             for goal in goal_vectors {
                 let events = Self::backend((|| -> Result<Vec<f32>> {
-                    let goal_tensor = Tensor::from_slice(goal, (1, GOAL_FEATURES_DIM), self.device)?
-                        .broadcast_as((n, GOAL_FEATURES_DIM))?
-                        .contiguous()?;
+                    let goal_tensor =
+                        Tensor::from_slice(goal, (1, GOAL_FEATURES_DIM), self.device)?
+                            .broadcast_as((n, GOAL_FEATURES_DIM))?
+                            .contiguous()?;
                     let logits = self.model.event_logits_from(&output.y, &goal_tensor)?;
                     Ok(ops::sigmoid(&logits)?.flatten_all()?.to_vec1::<f32>()?)
                 })())?;
@@ -307,7 +315,9 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
             .as_ref()
             .ok_or_else(|| ModelCallError::Backend("decode before encode".into()))?;
         Self::backend((|| -> Result<Vec<u8>> {
-            let decoded = self.model.composed_gameplay_decode(&latent.tensor, frames)?;
+            let decoded = self
+                .model
+                .composed_gameplay_decode(&latent.tensor, frames)?;
             Ok(decoded
                 .flatten_all()?
                 .to_vec1::<u32>()?
@@ -379,16 +389,23 @@ impl<'a> PhaseAPolicy<TensorPhaseAAdapter<'a>> {
         let capabilities = model.phase_a_inference_capabilities();
         let failures = [
             ("patch4_grid", &capabilities.patch4_grid),
-            ("spatial_prefix_faithful", &capabilities.spatial_prefix_faithful),
+            (
+                "spatial_prefix_faithful",
+                &capabilities.spatial_prefix_faithful,
+            ),
             ("action_faithful_ptrm", &capabilities.action_faithful_ptrm),
-            ("composed_decode_available", &capabilities.composed_decode_available),
-            ("null_action_row_present", &capabilities.null_action_row_present),
+            (
+                "composed_decode_available",
+                &capabilities.composed_decode_available,
+            ),
+            (
+                "null_action_row_present",
+                &capabilities.null_action_row_present,
+            ),
         ]
         .into_iter()
         .filter(|(_, check)| !check.passed)
-        .map(|(name, check)| {
-            format!("{name}: {}", check.reason.clone().unwrap_or_default())
-        })
+        .map(|(name, check)| format!("{name}: {}", check.reason.clone().unwrap_or_default()))
         .collect::<Vec<_>>();
         if !failures.is_empty() {
             bail!(
@@ -461,7 +478,12 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
     }
 
     /// Fold the previous real transition into the graph and posterior.
-    fn observe_pending(&mut self, observation: &ArcObservation, id: RawObservationId, pixels: &[u8]) {
+    fn observe_pending(
+        &mut self,
+        observation: &ArcObservation,
+        id: RawObservationId,
+        pixels: &[u8],
+    ) {
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -505,14 +527,14 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         if keys != pending.candidate_keys || pending.per_goal_events.len() < keys.len() {
             return;
         }
-        let eta = match self.calibration.edge_trust(
-            pending.q_raw,
-            pending.reliability_raw,
-            &self.config,
-        ) {
-            EdgeTrust::Trusted { eta } => eta,
-            EdgeTrust::Untrusted => 0.0,
-        };
+        let eta =
+            match self
+                .calibration
+                .edge_trust(pending.q_raw, pending.reliability_raw, &self.config)
+            {
+                EdgeTrust::Trusted { eta } => eta,
+                EdgeTrust::Untrusted => 0.0,
+            };
         let likelihoods = pending
             .per_goal_events
             .iter()
@@ -547,15 +569,15 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
             proposals.extend(existing.restore_dormant());
         }
         let unknown_prior = self.config.unknown_prior;
-        let candidates = match build_candidate_set(proposals, self.config.max_candidates, unknown_prior)
-        {
-            Ok(set) if !set.candidates.is_empty() => set,
-            _ => {
-                self.candidates = None;
-                self.belief = None;
-                return;
-            }
-        };
+        let candidates =
+            match build_candidate_set(proposals, self.config.max_candidates, unknown_prior) {
+                Ok(set) if !set.candidates.is_empty() => set,
+                _ => {
+                    self.candidates = None;
+                    self.belief = None;
+                    return;
+                }
+            };
         let new_keys = candidate_keys(&candidates);
         let reuse = self
             .candidates
@@ -583,7 +605,11 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         self.candidates = Some(candidates);
     }
 
-    fn frontier_action(&self, id: RawObservationId, legal: &[ActionKey]) -> (Option<ActionKey>, Vec<String>) {
+    fn frontier_action(
+        &self,
+        id: RawObservationId,
+        legal: &[ActionKey],
+    ) -> (Option<ActionKey>, Vec<String>) {
         if let Some(frontier) = self.graph.nearest_untried_frontier(id) {
             if frontier.prefix.is_empty() {
                 return (frontier.untried_actions.first().cloned(), Vec::new());
@@ -671,7 +697,10 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             .map(|action| (phase_a_action_key(action), action.clone()))
             .collect();
         let legal: Vec<ActionKey> = actions.iter().map(phase_a_action_key).collect();
-        match self.graph.insert_node(id, pixels.clone(), legal.iter().cloned()) {
+        match self
+            .graph
+            .insert_node(id, pixels.clone(), legal.iter().cloned())
+        {
             Ok(()) | Err(ObservedGraphError::ObservationCollision(_)) => {}
             Err(error) => bail!("observed-state graph rejected node: {error}"),
         }
@@ -784,10 +813,11 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                             if extensions.is_empty() {
                                 break;
                             }
-                            let Ok(predictions) =
-                                self.adapter
-                                    .step_batch(&finalist.latent, &extensions, &goal_vectors)
-                            else {
+                            let Ok(predictions) = self.adapter.step_batch(
+                                &finalist.latent,
+                                &extensions,
+                                &goal_vectors,
+                            ) else {
                                 break;
                             };
                             verify_used += extensions.len();
@@ -866,13 +896,21 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                                 let events = prefix.per_goal_events.get(index)?;
                                 let lcb = self.calibration.satisfaction_lcb(events.satisfied)?;
                                 if events.satisfied < CLAIM_RAW_THRESHOLD
-                                    || !evaluate_predicate(candidate, start_inventory, &end_inventory)
+                                    || !evaluate_predicate(
+                                        candidate,
+                                        start_inventory,
+                                        &end_inventory,
+                                    )
                                 {
                                     return None;
                                 }
                                 Some(ProbeClaim {
                                     candidate_index: index,
-                                    posterior_mass: belief.concrete_weights.get(index).copied().unwrap_or(0.0),
+                                    posterior_mass: belief
+                                        .concrete_weights
+                                        .get(index)
+                                        .copied()
+                                        .unwrap_or(0.0),
                                     satisfaction_lcb: lcb,
                                     protected: protected.contains(&index),
                                 })
@@ -886,18 +924,24 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                             summed_noop_probability: prefix.noop_sum,
                             graph_repeats: 0,
                         };
-                        if accept_finalist(probe.claim_mass(), min_claim, self.calibration.score_error_bound) {
+                        if accept_finalist(
+                            probe.claim_mass(),
+                            min_claim,
+                            self.calibration.score_error_bound,
+                        ) {
                             probes.push(probe);
                         }
                     }
                     let frontier = self.graph.nearest_untried_frontier(id);
                     match choose_probe(probes, frontier) {
-                        Some(ProbeChoice::MultiGoal(probe)) | Some(ProbeChoice::SingleGoal(probe)) => {
+                        Some(ProbeChoice::MultiGoal(probe))
+                        | Some(ProbeChoice::SingleGoal(probe)) => {
                             mode = "goal_probe";
                             claim_mass = probe.claim_mass();
                             chosen_prefix = probe.actions.iter().map(|k| k.0.clone()).collect();
                             chosen_key = probe.actions.first().cloned();
-                            if let Some(prefix) = prefixes.iter().find(|p| p.keys == probe.actions) {
+                            if let Some(prefix) = prefixes.iter().find(|p| p.keys == probe.actions)
+                            {
                                 chosen_q = prefix.q_raw;
                                 chosen_rel = prefix.reliability_raw;
                                 chosen_noop = prefix.noop_sum as f32;
@@ -925,7 +969,10 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                         }
                     }
                     if let Some(key) = &chosen_key {
-                        if let Some(prefix) = prefixes.iter().find(|p| p.keys.len() == 1 && &p.keys[0] == key) {
+                        if let Some(prefix) = prefixes
+                            .iter()
+                            .find(|p| p.keys.len() == 1 && &p.keys[0] == key)
+                        {
                             chosen_q = prefix.q_raw;
                             chosen_rel = prefix.reliability_raw;
                             chosen_noop = prefix.noop_sum as f32;
@@ -967,7 +1014,11 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             calibration_missing,
             prefix: chosen_prefix,
         };
-        let candidate_keys_now = self.candidates.as_ref().map(candidate_keys).unwrap_or_default();
+        let candidate_keys_now = self
+            .candidates
+            .as_ref()
+            .map(candidate_keys)
+            .unwrap_or_default();
         self.pending = Some(PendingTransition {
             prev_id: id,
             prev_pixels: pixels,
@@ -1066,7 +1117,11 @@ mod tests {
                         .iter()
                         .map(|_| GoalEventReadout {
                             ordinary: 0.7,
-                            satisfied: if index == 0 { self.satisfied_for_first_action } else { 0.1 },
+                            satisfied: if index == 0 {
+                                self.satisfied_for_first_action
+                            } else {
+                                0.1
+                            },
                             failed: 0.0,
                             exhausted: 0.0,
                         })
@@ -1119,7 +1174,12 @@ mod tests {
     }
 
     fn permissive_calibration() -> PhaseACalibration {
-        let bin = || Some(CalibrationBin { upper_error_bound_95: 0.01, support: 1_000 });
+        let bin = || {
+            Some(CalibrationBin {
+                upper_error_bound_95: 0.01,
+                support: 1_000,
+            })
+        };
         PhaseACalibration {
             q_direction: 1,
             tau_unknown: 0.5,
@@ -1164,7 +1224,11 @@ mod tests {
             let decision = policy.choose_action(&observation(step / 4, true))?;
             let trace = decision.phase_a.expect("trace");
             assert!(trace.model_evals <= PhaseAConfig::default().max_model_evals);
-            assert!(trace.prefix.len() <= 2, "horizon exceeded: {:?}", trace.prefix);
+            assert!(
+                trace.prefix.len() <= 2,
+                "horizon exceeded: {:?}",
+                trace.prefix
+            );
             assert_ne!(trace.mode, "fail_closed_frontier");
         }
         Ok(())
@@ -1205,4 +1269,3 @@ mod tests {
         Ok(())
     }
 }
-

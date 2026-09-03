@@ -37,7 +37,11 @@ pub struct StepPrediction<L> {
 pub enum ModelCallError {
     /// A whole batch was refused because it would exceed the decision budget.
     /// Partial batches are never executed.
-    BudgetExhausted { requested: usize, used: usize, cap: usize },
+    BudgetExhausted {
+        requested: usize,
+        used: usize,
+        cap: usize,
+    },
     Backend(String),
 }
 
@@ -136,7 +140,10 @@ mod tests {
                 cap: 10
             }
         ));
-        assert_eq!(budget.used, 6, "a refused batch must not be partially charged");
+        assert_eq!(
+            budget.used, 6,
+            "a refused batch must not be partially charged"
+        );
         assert!(budget.charge(4).is_ok());
         assert_eq!(budget.used, 10);
     }

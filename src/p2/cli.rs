@@ -4,7 +4,8 @@
 //! Wiring into the top-level CLI is owned by the primary agent.
 
 use crate::p2::arc3_bridge::{run_arc3_bridge, Arc3BridgeConfig, Arc3BridgeMode};
-use crate::p2::arc3_live::{LivePolicyKind, 
+use crate::p2::arc3_live::{
+    LivePolicyKind,
     evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
     DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
 };
