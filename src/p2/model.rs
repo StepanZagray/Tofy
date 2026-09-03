@@ -671,8 +671,29 @@ impl ContextBatchHost {
     pub fn from_rows<'a>(
         rows: impl IntoIterator<Item = &'a TransitionSample>,
     ) -> Result<Option<Self>> {
-        let rows = rows.into_iter().collect::<Vec<_>>();
-        let k = rows.iter().map(|row| row.context.len()).max().unwrap_or(0);
+        Self::from_windows(rows.into_iter().map(|row| row.context.iter()))
+    }
+
+    /// Live-policy seam (ADR 0005 §6.1): one window replicated for every
+    /// candidate row being scored. `None` when the window is empty.
+    pub fn broadcast(
+        window: &[crate::p2::data::ContextTransition],
+        rows: usize,
+    ) -> Result<Option<Self>> {
+        Self::from_windows((0..rows).map(|_| window.iter()))
+    }
+
+    /// One context window per batch row, in batch order.
+    pub fn from_windows<'a>(
+        windows: impl IntoIterator<
+            Item = impl IntoIterator<Item = &'a crate::p2::data::ContextTransition>,
+        >,
+    ) -> Result<Option<Self>> {
+        let rows = windows
+            .into_iter()
+            .map(|window| window.into_iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let k = rows.iter().map(Vec::len).max().unwrap_or(0);
         if k == 0 {
             return Ok(None);
         }
@@ -689,8 +710,8 @@ impl ContextBatchHost {
         let mut actions = vec![0u32; batch * k];
         let mut coords = vec![0f32; batch * k * 2];
         let mut valid = vec![0f32; batch * k];
-        for (row, sample) in rows.iter().enumerate() {
-            for (slot, transition) in sample.context.iter().enumerate() {
+        for (row, window) in rows.iter().enumerate() {
+            for (slot, transition) in window.iter().enumerate() {
                 let flat = row * k + slot;
                 for (frame, target) in [
                     (&transition.current, &mut current),
@@ -3405,7 +3426,8 @@ impl WorldModel {
         if !ptrm.sigma.is_finite() || ptrm.sigma < 0.0 {
             bail!("PTRM sigma must be finite and non-negative");
         }
-        let (x, film) = self.prepare_action_conditioning(state, None, actions, action_coords, None)?;
+        let (x, film) =
+            self.prepare_action_conditioning(state, None, actions, action_coords, None)?;
         let y_init = self.config.warm_start_y.then(|| state.clone());
         self.ptrm_latent_trajectories(&x, &film, y_init, depth, ptrm)?
             .into_iter()
@@ -4247,7 +4269,9 @@ mod tests {
         let expected_hidden = expected_hidden
             .broadcast_mul(&film.gamma)?
             .broadcast_add(&film.beta)?;
-        let expected = input.as_tensor().add(&block.c2.forward(&expected_hidden)?)?;
+        let expected = input
+            .as_tensor()
+            .add(&block.c2.forward(&expected_hidden)?)?;
         assert_eq!(
             actual.flatten_all()?.to_vec1::<f32>()?,
             expected.flatten_all()?.to_vec1::<f32>()?
@@ -4528,7 +4552,8 @@ mod tests {
                 let flat = row * k + slot;
                 for p in 0..pixels {
                     host.current[flat * pixels + p] = ((p + 3 * row + slot) % PALETTE_SIZE) as u8;
-                    host.next[flat * pixels + p] = ((p + 5 * row + 2 * slot + 1) % PALETTE_SIZE) as u8;
+                    host.next[flat * pixels + p] =
+                        ((p + 5 * row + 2 * slot + 1) % PALETTE_SIZE) as u8;
                 }
                 if slot % 2 == 0 {
                     host.actions[flat] = 6;
@@ -4612,7 +4637,8 @@ mod tests {
         assert_bit_identical("training latent", &legacy.y, &contextual.y)?;
         // The prefix seam is context-aware on v4+ topologies.
         let prefix = model.prefix_predict(&state, &actions, &coords)?;
-        let prefix_ctx = model.prefix_predict_with_context(&state, &actions, &coords, Some(&context))?;
+        let prefix_ctx =
+            model.prefix_predict_with_context(&state, &actions, &coords, Some(&context))?;
         assert_bit_identical("prefix", &prefix, &prefix_ctx)?;
         Ok(())
     }
@@ -4667,7 +4693,10 @@ mod tests {
         let rows = summary.to_vec2::<f32>()?;
         assert!(rows[0].iter().all(|v| *v == 0.0), "K=0 row must give c = 0");
         assert!(rows[1].iter().any(|v| *v != 0.0));
-        assert!(rows[1] != rows[2], "different windows must give different summaries");
+        assert!(
+            rows[1] != rows[2],
+            "different windows must give different summaries"
+        );
 
         let (frames, actions, coords, goals) = sample_batch(&device, 3, model.config.goal_dim)?;
         let operator = unknown_operator_conditioning(3, &device)?;
@@ -4692,12 +4721,22 @@ mod tests {
         // Gradients reach the context channel and the shared encoder through it.
         let grads = with.y.sqr()?.mean_all()?.backward()?;
         let data = varmap.data().lock().unwrap();
-        for name in ["context_mlp_in.weight", "context_fuse.weight", "context_film_gamma.weight"] {
+        for name in [
+            "context_mlp_in.weight",
+            "context_fuse.weight",
+            "context_film_gamma.weight",
+        ] {
             let var = data.get(name).expect("context parameter exists");
             let grad = grads
                 .get(var.as_tensor())
                 .unwrap_or_else(|| panic!("{name} receives no gradient"));
-            assert!(grad.flatten_all()?.to_vec1::<f32>()?.iter().any(|g| *g != 0.0), "{name}");
+            assert!(
+                grad.flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .any(|g| *g != 0.0),
+                "{name}"
+            );
         }
         Ok(())
     }
@@ -4716,7 +4755,10 @@ mod tests {
         assert_eq!(selected[0], full[2]);
         assert_eq!(selected[1], full[1]);
         assert_eq!(selected[2], full[3]);
-        assert!(context.select_rows(&[1])?.is_none(), "rows without context select to None");
+        assert!(
+            context.select_rows(&[1])?.is_none(),
+            "rows without context select to None"
+        );
         Ok(())
     }
 
@@ -4759,7 +4801,10 @@ mod tests {
         };
         let v5 = count(false)?;
         let v6 = count(true)?;
-        println!("parameter count: default v5 = {v5}, default v6 = {v6} (context channel = {})", v6 - v5);
+        println!(
+            "parameter count: default v5 = {v5}, default v6 = {v6} (context channel = {})",
+            v6 - v5
+        );
         assert!(v6 <= 650_000, "ADR 0005 §3.2 budget exceeded: {v6}");
         assert!(v6 > v5);
         Ok(())
@@ -4790,9 +4835,14 @@ mod tests {
             "context_film_gamma.weight",
             "context_film_beta.bias",
         ] {
-            assert!(fast.contains(expected), "{expected} missing from fast set {fast:?}");
+            assert!(
+                fast.contains(expected),
+                "{expected} missing from fast set {fast:?}"
+            );
         }
-        assert!(fast.iter().any(|name| name.starts_with("exact_grounding_head.")));
+        assert!(fast
+            .iter()
+            .any(|name| name.starts_with("exact_grounding_head.")));
         for frozen in [
             "encoder.c2.weight",
             "encoder.proj.weight",
