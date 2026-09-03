@@ -5,6 +5,7 @@
 //! checkpoint selection, or curriculum hooks back to `p2::train`.
 
 use crate::gpu_lock::GpuSessionGuard;
+use crate::p2::adaptation::{AdaptationMode, AdaptationTrace, FastWeightAdapter};
 use crate::p2::agent_session::AgentSession;
 use crate::p2::arc3::{first_recorded_decision_observations, ParsedActionInput, RecordingEvent};
 use crate::p2::cg_profile::{
@@ -122,11 +123,19 @@ pub struct LiveEvalConfig {
     pub policy: LivePolicyKind,
     /// ADR 0004 Phase A calibration artifact; absent => fail-closed frontier mode.
     pub phase_a_calibration: Option<PathBuf>,
+    /// ADR 0005 §6.2 Channel B test-time adaptation of the fast-weight subset.
+    pub adapt: bool,
+    /// Preregistered carry arm: adapted fast weights persist across levels.
+    pub adapt_carry: bool,
 }
 
 impl LiveEvalConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.physical_batch > 0, "physical_batch must be > 0");
+        ensure!(
+            self.adapt || !self.adapt_carry,
+            "--adapt-carry requires --adapt"
+        );
         ensure!(
             self.action6_max_candidates > 0,
             "action6_max_candidates must be > 0"
@@ -1035,6 +1044,10 @@ pub struct ActionDecision {
     /// serialized) for the greedy policy so its traces stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_a: Option<crate::p2::arc3_phase_a::PhaseADecisionTrace>,
+    /// ADR 0005 §6.2 Channel B telemetry (updates, skips, reverts, prequential
+    /// loss); present only under `--adapt`, never serialized otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptation: Option<AdaptationTrace>,
 }
 
 pub trait LivePolicy {
@@ -1053,6 +1066,16 @@ pub trait LivePolicy {
     /// Fires after the session-opening RESET of a game succeeds.
     fn on_game_start(&mut self, _game_id: &str) {}
 
+    /// Fires for every confirmed factual transition, before any level
+    /// transition it may have caused. Predictions never reach this hook.
+    fn on_confirmed_transition(
+        &mut self,
+        _current: &ArcObservation,
+        _action: &ArcAction,
+        _next: &ArcObservation,
+    ) {
+    }
+
     /// Fires whenever a confirmed action advances `levels_completed`.
     fn on_level_transition(&mut self, _levels_completed: u16) {}
 
@@ -1069,6 +1092,130 @@ pub trait LivePolicy {
     /// after all game ids have been observed.
     fn finish_session(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Build the ADR 0005 §6.2 adapter when `--adapt` is set. `varmap` must be the
+/// VarMap `model` was constructed from; the adapter never sees the checkpoint path.
+pub fn adaptation_for<'a>(
+    model: &'a WorldModel,
+    varmap: &candle_nn::VarMap,
+    device: &'a Device,
+    adapt: bool,
+    carry: bool,
+) -> Result<Option<FastWeightAdapter<'a>>> {
+    if !adapt {
+        return Ok(None);
+    }
+    let mode = if carry {
+        AdaptationMode::Carry
+    } else {
+        AdaptationMode::Reset
+    };
+    FastWeightAdapter::new(model, varmap, device, mode).map(Some)
+}
+
+/// Wraps any controller with Channel B adaptation (ADR 0005 §6.2). With no
+/// adapter it is a transparent pass-through, so `--adapt` off stays
+/// byte-identical. `maybe_update` runs before every decision; every confirmed
+/// transition is observed; level boundaries reset (or carry) the fast weights;
+/// game end restores theta_0. A failed restore poisons the policy so the next
+/// decision fails closed instead of running a contaminated model.
+pub struct AdaptingPolicy<'a, P: LivePolicy> {
+    inner: P,
+    adapter: Option<FastWeightAdapter<'a>>,
+    poisoned: Option<String>,
+}
+
+impl<'a, P: LivePolicy> AdaptingPolicy<'a, P> {
+    pub fn new(inner: P, adapter: Option<FastWeightAdapter<'a>>) -> Self {
+        Self {
+            inner,
+            adapter,
+            poisoned: None,
+        }
+    }
+
+    pub fn adapter(&self) -> Option<&FastWeightAdapter<'a>> {
+        self.adapter.as_ref()
+    }
+
+    fn guard(&mut self, what: &str, result: Result<()>) {
+        if let Err(err) = result {
+            self.poisoned = Some(format!("{what}: {err:#}"));
+        }
+    }
+}
+
+impl<P: LivePolicy> LivePolicy for AdaptingPolicy<'_, P> {
+    fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+        if let Some(reason) = &self.poisoned {
+            anyhow::bail!("adaptation poisoned the model: {reason}");
+        }
+        let adaptation = match self.adapter.as_mut() {
+            Some(adapter) => adapter.maybe_update()?,
+            None => None,
+        };
+        let mut decision = self.inner.choose_action(observation)?;
+        decision.adaptation = adaptation;
+        Ok(decision)
+    }
+
+    fn policy_name(&self) -> &'static str {
+        self.inner.policy_name()
+    }
+
+    fn on_suite_start(&mut self, games: &[PublicGame]) -> Result<()> {
+        self.inner.on_suite_start(games)
+    }
+
+    fn on_game_start(&mut self, game_id: &str) {
+        self.inner.on_game_start(game_id);
+        if let Some(adapter) = self.adapter.as_mut() {
+            let result = adapter.begin_game();
+            self.guard("begin_game", result);
+        }
+    }
+
+    fn on_confirmed_transition(
+        &mut self,
+        current: &ArcObservation,
+        action: &ArcAction,
+        next: &ArcObservation,
+    ) {
+        self.inner.on_confirmed_transition(current, action, next);
+        if let Some(adapter) = self.adapter.as_mut() {
+            adapter.observe(
+                &current.frame,
+                action,
+                &next.frame,
+                current.levels_completed,
+            );
+        }
+    }
+
+    fn on_level_transition(&mut self, levels_completed: u16) {
+        self.inner.on_level_transition(levels_completed);
+        if let Some(adapter) = self.adapter.as_mut() {
+            let result = adapter.on_level_transition(levels_completed);
+            self.guard("level transition", result);
+        }
+    }
+
+    fn on_reset_retry(&mut self, reason: &str) {
+        self.inner.on_reset_retry(reason);
+    }
+
+    fn on_game_end(&mut self, outcome: &str) {
+        self.inner.on_game_end(outcome);
+        if let Some(adapter) = self.adapter.as_mut() {
+            let result = adapter.restore_prior();
+            self.guard("restore_prior", result);
+        }
+    }
+
+    fn finish_session(&mut self) -> Result<()> {
+        self.inner.finish_session()
     }
 }
 
@@ -1384,7 +1531,8 @@ impl LivePolicy for ModelPolicy<'_> {
         let decision = ActionDecision {
             chosen,
             candidate_count: candidates.len(),
-        phase_a: None,
+            phase_a: None,
+            adaptation: None,
         };
         if let Some(capture) = profile.as_ref() {
             let metrics = capture.phase("metrics", SpanKind::Function, None);
@@ -1492,6 +1640,11 @@ pub(crate) fn decision_telemetry(decision: &ActionDecision) -> Value {
     if let Some(trace) = &decision.phase_a {
         if let Ok(value) = serde_json::to_value(trace) {
             telemetry["phase_a"] = value;
+        }
+    }
+    if let Some(trace) = &decision.adaptation {
+        if let Ok(value) = serde_json::to_value(trace) {
+            telemetry["adaptation"] = value;
         }
     }
     telemetry
@@ -2122,6 +2275,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
                 break;
             }
             agent_session.record_confirmed(&observation, decision.chosen.action.clone(), &next)?;
+            policy.on_confirmed_transition(&observation, &decision.chosen.action, &next);
             usage.confirmed_actions += 1;
             action_since_reset_or_transition = true;
             let api_latency_ms = call_started.elapsed().as_millis();
@@ -2313,7 +2467,8 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     let checkpoint_sha256 = sha256_file(&config.checkpoint)?;
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
-    let (model, _varmap) = load_model(&train_config, &config.checkpoint, &device)?;
+    let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
+    let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -2360,13 +2515,14 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                     &config.device,
                 );
             }
+            let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
         LivePolicyKind::PhaseA => {
             let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
                 config.phase_a_calibration.as_deref(),
             )?;
-            let mut policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
+            let policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
                 &model,
                 &device,
                 config.physical_batch,
@@ -2375,6 +2531,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                 config.action6_max_candidates,
                 config.action6_grid_stride,
             )?;
+            let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
     };
@@ -3118,6 +3275,7 @@ mod tests {
                 },
                 candidate_count: 1,
                 phase_a: None,
+                adaptation: None,
             })
         }
     }
@@ -3841,5 +3999,104 @@ mod tests {
         let data = &sources["p2/data.rs"];
         let fixture = format!("{data}\nuse crate::p2::arc3::import_recordings_dir;");
         assert!(contains_forbidden_training_import(&fixture));
+    }
+
+    fn varmap_bits(varmap: &candle_nn::VarMap) -> Result<Vec<(String, Vec<u32>)>> {
+        let data = varmap.data().lock().unwrap();
+        let mut out = Vec::new();
+        for (name, var) in data.iter() {
+            let bits = var
+                .as_tensor()
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            out.push((name.clone(), bits));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    #[test]
+    fn adapting_policy_observes_transitions_and_restores_prior_at_game_end() -> Result<()> {
+        use crate::p2::adaptation::AdaptationMode;
+        use crate::p2::experiment::ConsumerReadoutTopology;
+        use crate::p2::model::ModelConfig;
+        use candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            patch_size: 4,
+            hidden_dim: 8,
+            action_dim: 8,
+            goal_dim: 6,
+            inner_steps: 1,
+            outer_steps: 1,
+            spatial_action_field: true,
+            world_core_v4: true,
+            world_core_v5: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            config,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let theta0 = varmap_bits(&varmap)?;
+        let adapter = adaptation_for(&model, &varmap, &device, true, false)?;
+        assert!(adapter.is_some());
+        assert!(adaptation_for(&model, &varmap, &device, false, false)?.is_none());
+        let mut policy = AdaptingPolicy::new(RecordingPolicy::default(), adapter);
+
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mid = scripted_observation("NOT_FINISHED", 0);
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        let mut api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(mid), Ok(win)]);
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )?;
+        let game = &report.games[0];
+        assert_eq!(game.stop_reason, "completed");
+        assert_eq!(game.trace.len(), 2);
+        assert!(
+            game.trace[0].decision.adaptation.is_none(),
+            "no factual transition precedes the first decision"
+        );
+        let trace = game.trace[1]
+            .decision
+            .adaptation
+            .as_ref()
+            .expect("the confirmed transition arms maybe_update before the next decision");
+        assert_eq!(trace.mode, AdaptationMode::Reset);
+        assert_eq!(trace.note.as_deref(), Some("warmup"));
+        assert_eq!(trace.updates, 0);
+        let telemetry = decision_telemetry(&game.trace[1].decision);
+        assert_eq!(
+            telemetry["adaptation"]["mode"],
+            Value::String("reset".into())
+        );
+        let first = serde_json::to_value(&game.trace[0].decision)?;
+        assert!(
+            first.get("adaptation").is_none(),
+            "absent trace is not serialized"
+        );
+
+        // Game end: buffer discarded and every parameter is theta_0 bitwise.
+        let adapter = policy.adapter().expect("adapter retained");
+        assert!(adapter.buffer().is_empty());
+        assert!(adapter.fast_weights_equal_prior()?);
+        assert_eq!(varmap_bits(&varmap)?, theta0);
+        assert_eq!(
+            policy.inner.events,
+            vec!["start:game", "level:1", "end:completed"],
+            "inner controller lifecycle is forwarded unchanged"
+        );
+        Ok(())
     }
 }

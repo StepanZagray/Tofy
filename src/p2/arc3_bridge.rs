@@ -1,6 +1,7 @@
 //! Newline-delimited JSON bridge for the local ARC-AGI-3 toolkit.
 
 use crate::gpu_lock::GpuSessionGuard;
+use crate::p2::arc3_live::{adaptation_for, AdaptingPolicy};
 use crate::p2::arc3_live::{
     decision_telemetry, live_evidence_class, live_run_provenance, run_public_suite, sha256_file,
     write_json_atomic, ActionDecision, AmbiguousMutation, ApiObservation, ArcApi, ArcObservation,
@@ -43,6 +44,9 @@ pub struct Arc3BridgeConfig {
     pub max_actions_per_game: Option<u32>,
     pub policy: LivePolicyKind,
     pub phase_a_calibration: Option<PathBuf>,
+    /// ADR 0005 §6.2 Channel B test-time adaptation.
+    pub adapt: bool,
+    pub adapt_carry: bool,
 }
 
 impl Arc3BridgeConfig {
@@ -50,6 +54,10 @@ impl Arc3BridgeConfig {
         if self.mode == Arc3BridgeMode::Drive {
             ensure!(self.output.is_some(), "--output is required in drive mode");
         }
+        ensure!(
+            self.adapt || !self.adapt_carry,
+            "--adapt-carry requires --adapt"
+        );
         Ok(())
     }
 }
@@ -75,7 +83,8 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
     let checkpoint_sha256 = sha256_file(&config.checkpoint)?;
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
-    let (model, _varmap) = load_model(&train_config, &config.checkpoint, &device)?;
+    let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
+    let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
     let mut policy = match config.policy {
         LivePolicyKind::Greedy => BridgePolicy::Greedy(ModelPolicy::new(
             &model,
@@ -137,6 +146,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 contract: PolicyContract::for_kind(config.policy),
             };
             let mut api = StdioArcApi::new(reader, writer);
+            let mut policy = AdaptingPolicy::new(policy, adapter);
             let report = run_public_suite(&mut api, &mut policy, &settings);
             if let Some(error) = api.take_fatal_error() {
                 bail!("fatal stdio bridge transport error: {error}");
@@ -164,6 +174,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 );
             }
             let _seed = config.seed.unwrap_or(train_config.seed);
+            let mut policy = AdaptingPolicy::new(policy, adapter);
             run_serve_loop(
                 reader,
                 writer,
@@ -422,6 +433,8 @@ struct ServeStream {
     pending: Option<PendingServeAction>,
     levels_completed: u16,
     policy_started: bool,
+    /// Observation the pending action was chosen from (factual transition source).
+    last_observation: Option<ArcObservation>,
 }
 
 /// Either deployed controller behind one `LivePolicy` surface.
@@ -453,6 +466,17 @@ impl LivePolicy for BridgePolicy<'_> {
         match self {
             Self::Greedy(p) => p.on_game_start(game_id),
             Self::PhaseA(p) => p.on_game_start(game_id),
+        }
+    }
+    fn on_confirmed_transition(
+        &mut self,
+        current: &ArcObservation,
+        action: &crate::p2::data::ArcAction,
+        next: &ArcObservation,
+    ) {
+        match self {
+            Self::Greedy(p) => p.on_confirmed_transition(current, action, next),
+            Self::PhaseA(p) => p.on_confirmed_transition(current, action, next),
         }
     }
     fn on_level_transition(&mut self, levels_completed: u16) {
@@ -565,6 +589,7 @@ fn serve_observation<P: LivePolicy>(
                 pending: None,
                 levels_completed: observation.levels_completed,
                 policy_started: false,
+                last_observation: None,
             },
         );
     }
@@ -583,9 +608,18 @@ fn serve_observation<P: LivePolicy>(
                 if let Some(recording) = stream.recording.as_mut() {
                     recording.push_action(&observation, &action, &telemetry)?;
                 }
+                if let Some(previous) = stream.last_observation.as_ref() {
+                    let same_session = previous.guid == observation.guid
+                        && !observation.full_reset
+                        && observation.levels_completed >= previous.levels_completed;
+                    if same_session {
+                        policy.on_confirmed_transition(previous, &action, &observation);
+                    }
+                }
             }
         }
     }
+    stream.last_observation = Some(observation.clone());
     if observation.levels_completed > stream.levels_completed {
         policy.on_level_transition(observation.levels_completed);
     }
@@ -870,6 +904,7 @@ mod tests {
                 },
                 candidate_count: 1,
                 phase_a: None,
+                adaptation: None,
             })
         }
     }
@@ -938,6 +973,68 @@ mod tests {
         assert_eq!(
             policy.events,
             ["start:game", "retry:serve_game_over", "end:completed"]
+        );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct TransitionPolicy {
+        transitions: Vec<(u16, u8, u16, bool)>,
+    }
+
+    impl LivePolicy for TransitionPolicy {
+        fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+            let mut first = FirstPolicy;
+            first.choose_action(observation)
+        }
+
+        fn on_confirmed_transition(
+            &mut self,
+            current: &ArcObservation,
+            action: &crate::p2::data::ArcAction,
+            next: &ArcObservation,
+        ) {
+            self.transitions.push((
+                current.levels_completed,
+                action.id,
+                next.levels_completed,
+                current.frame != next.frame,
+            ));
+        }
+    }
+
+    #[test]
+    fn serve_loop_reports_confirmed_transitions_to_the_policy() -> Result<()> {
+        let mut changed = wire_observation("game", "guid", "NOT_FINISHED", &[1]);
+        changed["frame"][0][0][0] = json!(3);
+        let input = response_lines(&[
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({ "op": "observe", "observation": changed }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "GAME_OVER", &[])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "WIN", &[])
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = TransitionPolicy::default();
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        // Every ACTION response is a factual transition; the RESET after
+        // GAME_OVER is not (no action was chosen from the terminal frame).
+        assert_eq!(
+            policy.transitions,
+            vec![(0, 1, 0, true), (0, 1, 0, true), (0, 1, 1, false)]
         );
         Ok(())
     }
