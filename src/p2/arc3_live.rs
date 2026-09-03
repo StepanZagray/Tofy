@@ -88,7 +88,7 @@ impl PolicyContract {
 }
 const POLICY_LIMITATION: &str = "The checkpoint predicts composed next-frame accuracy, latent self-confidence, no-op probability, and latent action effect; it has no trained reward/value head. Real games provide no synthetic episode operator, so inference uses the UNKNOWN rule token with neutral colors. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
-const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; legacy checkpoints include row 63 only when it contains non-background gameplay content; world_core_v6 checkpoints hash all 64 rows";
+const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content (legacy checkpoints) or unconditionally (world_core_v6 checkpoints)";
 const MAX_HTTP_ATTEMPTS: usize = 5;
 /// Default cap on guid-scoped RESET retries per level after a recoverable
 /// non-WIN terminal such as GAME_OVER.
