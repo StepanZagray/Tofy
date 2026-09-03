@@ -5052,6 +5052,10 @@ const LEARNING_HISTORY_EPSILON: (f32, f32) = (1.0, 0.2);
 /// Rows forced to carry no context so the no-context prior keeps training
 /// (`P(K = 0) >= 0.10`, ADR 0005 §2.2).
 const LEARNING_HISTORY_NO_CONTEXT_PROBABILITY: f64 = 0.10;
+/// Exact-solver lookahead (actions) for the competent arm of the policy. A
+/// goal farther than this falls back to exploration, bounding search cost on
+/// large boards.
+const LEARNING_HISTORY_SOLVER_HORIZON: u16 = 24;
 /// Realized operator row plus its same-state counterfactual alternatives:
 /// ACTION5 and four stratified ACTION6 coordinates.
 const LEARNING_HISTORY_OPERATOR_ACTIONS: usize = 5;
@@ -5175,7 +5179,11 @@ fn generate_learning_history(
             let action = if explore {
                 random_action
             } else {
-                shortest_path(&sim, &state, &goal, scenario.action_budget)
+                let horizon = state
+                    .actions_used
+                    .saturating_add(LEARNING_HISTORY_SOLVER_HORIZON)
+                    .min(scenario.action_budget);
+                shortest_path(&sim, &state, &goal, horizon)
                     .and_then(|plan| plan.actions.first().copied())
                     .unwrap_or(random_action)
             };
