@@ -87,6 +87,16 @@ pub struct PhaseADecisionTrace {
     pub deadline_truncated: bool,
     pub calibration_missing: bool,
     pub prefix: Vec<String>,
+    /// Screening accounting: how many horizon-1 roots were scored and why they
+    /// were dropped. Without these a frontier fallback is unexplainable.
+    pub roots_screened: usize,
+    pub trust_rejected: usize,
+    pub safety_rejected: usize,
+    pub survivors: usize,
+    pub probes: usize,
+    pub max_q_raw: f64,
+    pub max_reliability_raw: f64,
+    pub max_satisfied_raw: f64,
 }
 
 /// Opaque latent handle for the tensor adapter: the root keeps the encoded
@@ -730,6 +740,13 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
         let mut chosen_noop = 0.0f32;
         let mut chosen_events: Vec<GoalEventReadout> = Vec::new();
         let mut chosen_decoded: Option<Vec<u8>> = None;
+        let mut roots_screened = 0usize;
+        let mut trust_rejected = 0usize;
+        let mut safety_rejected = 0usize;
+        let mut probe_count = 0usize;
+        let mut max_q_raw = 0.0f64;
+        let mut max_rel_raw = 0.0f64;
+        let mut max_sat_raw = 0.0f64;
 
         let trusted_path = !calibration_missing && goal_count > 0 && self.belief.is_some();
         if trusted_path {
@@ -757,6 +774,17 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                     let mut survivors: Vec<Prefix<M::Latent>> = Vec::new();
                     if let Ok(predictions) = self.adapter.step_batch(&root, &roots, &goal_vectors) {
                         for prediction in predictions {
+                            roots_screened += 1;
+                            max_q_raw = max_q_raw.max(f64::from(prediction.q_raw));
+                            max_rel_raw = max_rel_raw.max(f64::from(prediction.reliability_raw));
+                            max_sat_raw = max_sat_raw.max(
+                                prediction
+                                    .per_goal_events
+                                    .iter()
+                                    .take(goal_count)
+                                    .map(|e| f64::from(e.satisfied))
+                                    .fold(0.0, f64::max),
+                            );
                             let trusted = matches!(
                                 self.calibration.edge_trust(
                                     prediction.q_raw,
@@ -765,14 +793,17 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                                 ),
                                 EdgeTrust::Trusted { .. }
                             );
-                            if !trusted
-                                || !self.passes_safety(
-                                    &prediction.per_goal_events,
-                                    &protected,
-                                    protect_unknown,
-                                    goal_count,
-                                )
-                            {
+                            if !trusted {
+                                trust_rejected += 1;
+                                continue;
+                            }
+                            if !self.passes_safety(
+                                &prediction.per_goal_events,
+                                &protected,
+                                protect_unknown,
+                                goal_count,
+                            ) {
+                                safety_rejected += 1;
                                 continue;
                             }
                             survivors.push(Prefix {
@@ -931,6 +962,7 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                         ) {
                             probes.push(probe);
                         }
+                        probe_count += 1;
                     }
                     let frontier = self.graph.nearest_untried_frontier(id);
                     match choose_probe(probes, frontier) {
@@ -1013,6 +1045,14 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             deadline_truncated,
             calibration_missing,
             prefix: chosen_prefix,
+            roots_screened,
+            trust_rejected,
+            safety_rejected,
+            survivors: roots_screened.saturating_sub(trust_rejected + safety_rejected),
+            probes: probe_count,
+            max_q_raw,
+            max_reliability_raw: max_rel_raw,
+            max_satisfied_raw: max_sat_raw,
         };
         let candidate_keys_now = self
             .candidates
