@@ -3,8 +3,10 @@
 //! Channel A ([`FactualBuffer::context_window`], exposed through
 //! [`ContextProvider`]) is the bounded Context Window of factual transitions.
 //! Channel B ([`FastWeightAdapter`]) is gradient adaptation of the Fast
-//! Weights (§3.3 subset, [`fast_weight_prefixes`]) on the current game's own
-//! factual transitions.
+//! Weights (§3.3 subset, [`crate::p2::model::FAST_WEIGHT_PREFIXES`]) on the
+//! current game's own factual transitions. [`LiveContext`] is the Channel A
+//! state a live policy owns for every `world_core_v6` checkpoint, with or
+//! without Channel B (§6.1).
 //!
 //! Invariants enforced here:
 //! - Predictions never enter the buffer: [`FactualBuffer::push`] is the only
@@ -33,7 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::p2::data::{ArcAction, ArcFrame, ContextTransition, CONTEXT_WINDOW_MAX};
 use crate::p2::model::{
-    unknown_operator_conditioning, RecursionDepth, RecursionOpts, WorldModel, PALETTE_SIZE,
+    is_fast_weight, unknown_operator_conditioning, ContextBatch, ContextBatchHost, RecursionDepth,
+    RecursionOpts, WorldModel, PALETTE_SIZE,
 };
 use crate::p2::train::frames_to_indices;
 
@@ -58,25 +61,6 @@ pub const ADAPT_COLLAPSE_FACTOR: f64 = 3.0;
 /// Deterministic reservoir-sampling seed (adaptation batches are reproducible per game).
 const RESERVOIR_SEED: u64 = 0x0005_0602;
 
-/// ADR 0005 §3.3 Fast Weights, by VarMap name prefix. `encoder.patch` is the
-/// first convolution of the frame encoder (the ADR's provisional
-/// `encoder.c1`); `context_film_` exists only on `world_core_v6` models.
-pub fn fast_weight_prefixes() -> &'static [&'static str] {
-    &[
-        "action_film_",
-        "context_film_",
-        "pixel_emb",
-        "encoder.patch",
-        "exact_grounding_head",
-    ]
-}
-
-pub fn is_fast_weight(name: &str) -> bool {
-    fast_weight_prefixes()
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-}
-
 /// One confirmed transition from Factual Memory, tagged with its level.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FactualTransition {
@@ -86,6 +70,11 @@ pub struct FactualTransition {
     pub level_index: u16,
     /// Chronological position in the game (0-based, over appended entries).
     pub transition_index: usize,
+    /// The Context Window that preceded this transition when it was observed
+    /// (§6.2 "the row's own context"): `<= CONTEXT_WINDOW_MAX` earlier factual
+    /// transitions of the buffer's scope, chronological. Frames are shared, so
+    /// this is cheap to carry.
+    pub context: Vec<ContextTransition>,
 }
 
 /// Which factual transitions feed the Context Window (§1.5, §6.1).
@@ -102,10 +91,13 @@ pub trait ContextProvider {
 }
 
 /// Level-tagged, append-only store of factual transitions for one game.
+/// Its arm decides the scope of every stored per-row context: the row's own
+/// level (`Reset`, default) or the whole game (`Carry`).
 #[derive(Debug, Default)]
 pub struct FactualBuffer {
     entries: Vec<FactualTransition>,
     seen: HashSet<(u16, u64, String)>,
+    mode: AdaptationMode,
 }
 
 fn raw_observation_identity(frame: &ArcFrame) -> u64 {
@@ -124,9 +116,25 @@ fn action_key(action: &ArcAction) -> String {
 }
 
 impl FactualBuffer {
+    pub fn new(mode: AdaptationMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    /// Context scope of the arm for a decision or row at `level_index`.
+    pub fn scope_for(&self, level_index: u16) -> ContextScope {
+        match self.mode {
+            AdaptationMode::Reset => ContextScope::Level(level_index),
+            AdaptationMode::Carry => ContextScope::Game,
+        }
+    }
+
     /// Append a confirmed transition. Returns `false` (and stores nothing) when
     /// the same raw observation identity + action key was already seen in this
-    /// level; a repeated factual query adds no new evidence.
+    /// level; a repeated factual query adds no new evidence. The entry carries
+    /// the window that preceded it (never itself).
     pub fn push(
         &mut self,
         current: ArcFrame,
@@ -142,12 +150,14 @@ impl FactualBuffer {
         if !self.seen.insert(key) {
             return false;
         }
+        let context = self.context_window(self.scope_for(level_index));
         self.entries.push(FactualTransition {
             current,
             action,
             next,
             level_index,
             transition_index: self.entries.len(),
+            context,
         });
         true
     }
@@ -219,6 +229,77 @@ impl FactualBuffer {
         self.entries.clear();
         self.seen.clear();
     }
+}
+
+/// Channel A state owned by a live policy (ADR 0005 §6.1): the factual
+/// transitions observed so far in the game, from which the window preceding
+/// every decision is drawn. Disabled (`enabled = false`, the only legal state
+/// for non-v6 checkpoints) it observes nothing and yields empty windows, so
+/// every model call stays on the legacy `context = None` path.
+#[derive(Debug, Default)]
+pub struct LiveContext {
+    buffer: FactualBuffer,
+    enabled: bool,
+}
+
+impl LiveContext {
+    pub fn new(enabled: bool, mode: AdaptationMode) -> Self {
+        Self {
+            buffer: FactualBuffer::new(mode),
+            enabled,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// New game: Factual Memory starts empty (§6.3).
+    pub fn begin_game(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Record a confirmed factual transition of `level_index`; call this only
+    /// after the environment confirmed `next` (never for the pending action).
+    pub fn observe(
+        &mut self,
+        current: &ArcFrame,
+        action: &ArcAction,
+        next: &ArcFrame,
+        level_index: u16,
+    ) {
+        if self.enabled {
+            self.buffer
+                .push(current.clone(), action.clone(), next.clone(), level_index);
+        }
+    }
+
+    /// The window for a decision taken at `level_index`: the most recent
+    /// `<= CONTEXT_WINDOW_MAX` factual transitions of the arm's scope, all
+    /// observed strictly before this decision.
+    pub fn window(&self, level_index: u16) -> Vec<ContextTransition> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        self.buffer
+            .context_window(self.buffer.scope_for(level_index))
+    }
+}
+
+/// Device batch of one window replicated for `rows` candidates; `None` for an
+/// empty window (the model then computes `c = 0` exactly, §3.1).
+pub fn context_batch_for(
+    window: &[ContextTransition],
+    rows: usize,
+    device: &Device,
+) -> Result<Option<ContextBatch>> {
+    ContextBatchHost::broadcast(window, rows)?
+        .map(|host| ContextBatch::from_host(&host, device))
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,7 +418,7 @@ impl<'a> FastWeightAdapter<'a> {
             device,
             fast,
             optimizer,
-            buffer: FactualBuffer::default(),
+            buffer: FactualBuffer::new(mode),
             mode,
             level: 0,
             steps_this_level: 0,
@@ -563,6 +644,8 @@ impl<'a> FastWeightAdapter<'a> {
     /// cross-entropy of the decoded next frame against the observed next frame,
     /// mean over every decoded pixel and row. The exact decoder's own row count
     /// governs (legacy heads decode 63 rows; `world_core_v6` decodes all 64).
+    /// On `world_core_v6` every row is conditioned on its own stored context
+    /// (§6.2); legacy checkpoints get `None`.
     fn next_frame_loss(&self, rows: &[&FactualTransition]) -> Result<Tensor> {
         ensure!(
             !rows.is_empty(),
@@ -593,18 +676,26 @@ impl<'a> FastWeightAdapter<'a> {
             self.device,
         )?;
         let operator = unknown_operator_conditioning(n, self.device)?;
+        let context = if self.model.config().world_core_v6 {
+            ContextBatchHost::from_windows(rows.iter().map(|row| row.context.iter()))?
+                .map(|host| ContextBatch::from_host(&host, self.device))
+                .transpose()?
+        } else {
+            None
+        };
         let encoded = self
             .model
             .encode_state_pair_for_training(&frames, &next_frames)?;
         let canonical = self.model.canonical_representation(&encoded.current)?;
         let out = self
             .model
-            .full_v4_training_latents_from_encoded_state_with_operator_conditioning(
+            .full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
                 &encoded.current,
                 &canonical,
                 &actions,
                 &coords,
                 &operator,
+                context.as_ref(),
                 RecursionDepth::from_config(self.model.config()),
                 0.0,
                 None,
@@ -674,11 +765,8 @@ impl<'a> FastWeightAdapter<'a> {
 
 impl ContextProvider for FastWeightAdapter<'_> {
     fn context_window(&self) -> Vec<ContextTransition> {
-        let scope = match self.mode {
-            AdaptationMode::Reset => ContextScope::Level(self.level),
-            AdaptationMode::Carry => ContextScope::Game,
-        };
-        self.buffer.context_window(scope)
+        self.buffer
+            .context_window(self.buffer.scope_for(self.level))
     }
 }
 
@@ -714,6 +802,10 @@ mod tests {
     }
 
     fn tiny_model(device: &Device) -> Result<(WorldModel, VarMap)> {
+        tiny_model_with(device, false)
+    }
+
+    fn tiny_model_with(device: &Device, world_core_v6: bool) -> Result<(WorldModel, VarMap)> {
         let cfg = ModelConfig {
             patch_size: 4,
             hidden_dim: 8,
@@ -724,12 +816,24 @@ mod tests {
             spatial_action_field: true,
             world_core_v4: true,
             world_core_v5: true,
+            world_core_v6,
             consumer_readout: ConsumerReadoutTopology::SpatialQuery,
             ..ModelConfig::default()
         };
         let varmap = VarMap::new();
         let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, device))?;
         Ok((model, varmap))
+    }
+
+    /// The context FiLM is zero-initialised (v5 recovered exactly), so make
+    /// the channel observable before asserting that a window reached the model.
+    fn perturb_context_film(varmap: &VarMap) -> Result<()> {
+        let data = varmap.data().lock().unwrap();
+        let var = data
+            .get("context_film_gamma.weight")
+            .expect("world_core_v6 context FiLM parameter");
+        var.set(&var.as_tensor().ones_like()?.affine(0.5, 0.0)?)?;
+        Ok(())
     }
 
     fn all_var_snapshots(varmap: &VarMap) -> Result<Vec<(String, Tensor)>> {
@@ -799,6 +903,118 @@ mod tests {
         assert_eq!(FactualBuffer::default().newest(4).len(), 0);
         assert_eq!(buffer.newest(4).len(), 4);
         assert_eq!(buffer.newest(4)[3].transition_index, 20);
+    }
+
+    #[test]
+    fn buffer_entries_carry_their_preceding_window() {
+        // Default arm: each row's context is the earlier rows of its own level.
+        let mut buffer = FactualBuffer::default();
+        for i in 0..20u8 {
+            assert!(buffer.push(frame(i), action(1), frame(i + 1), i as u16 / 10));
+        }
+        let entries = buffer.entries();
+        assert!(entries[0].context.is_empty());
+        let firsts: Vec<_> = entries[5]
+            .context
+            .iter()
+            .map(|c| c.current.clone())
+            .collect();
+        assert_eq!(firsts, (0..5).map(frame).collect::<Vec<_>>());
+        assert!(
+            entries[10].context.is_empty(),
+            "level 1 starts with no context"
+        );
+        assert_eq!(entries[19].context.len(), 9);
+        assert_eq!(entries[19].context[0].current, frame(10));
+        for entry in entries {
+            assert!(
+                entry.context.iter().all(|c| c.current != entry.current),
+                "a row never carries itself"
+            );
+        }
+        // Carry arm: game scope, bounded by CONTEXT_WINDOW_MAX.
+        let mut carry = FactualBuffer::new(AdaptationMode::Carry);
+        for i in 0..20u8 {
+            assert!(carry.push(frame(i), action(1), frame(i + 1), i as u16 / 10));
+        }
+        assert_eq!(carry.entries()[10].context.len(), 10);
+        assert_eq!(carry.entries()[19].context.len(), CONTEXT_WINDOW_MAX);
+        assert_eq!(carry.entries()[19].context[0].current, frame(3));
+        assert_eq!(carry.entries()[19].context[15].current, frame(18));
+    }
+
+    #[test]
+    fn live_context_window_precedes_the_decision_and_respects_the_flag() {
+        let mut off = LiveContext::disabled();
+        off.observe(&frame(0), &action(1), &frame(1), 0);
+        assert!(!off.enabled());
+        assert!(off.window(0).is_empty());
+
+        let mut live = LiveContext::new(true, AdaptationMode::Reset);
+        assert!(live.enabled());
+        for i in 0..20u8 {
+            // The window handed to decision `i` never contains transition `i`.
+            let window = live.window(i as u16 / 10);
+            assert!(window.iter().all(|c| c.current != frame(i)));
+            assert_eq!(window.len(), (i as usize % 10).min(CONTEXT_WINDOW_MAX));
+            live.observe(&frame(i), &action(1), &frame(i + 1), i as u16 / 10);
+        }
+        assert_eq!(live.window(1).len(), 10);
+        assert!(live.window(2).is_empty(), "a new level starts empty");
+        live.begin_game();
+        assert!(live.window(1).is_empty());
+
+        let mut carry = LiveContext::new(true, AdaptationMode::Carry);
+        for i in 0..20u8 {
+            carry.observe(&frame(i), &action(1), &frame(i + 1), i as u16 / 10);
+        }
+        assert_eq!(carry.window(2).len(), CONTEXT_WINDOW_MAX);
+        assert_eq!(carry.window(2)[15].current, frame(19));
+    }
+
+    #[test]
+    fn v6_next_frame_loss_conditions_each_row_on_its_own_context() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_model_with(&device, true)?;
+        perturb_context_film(&varmap)?;
+        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        assert!(adapter
+            .fast_weight_names()
+            .contains(&"context_film_gamma.weight"));
+        observe_distinct(&mut adapter, 4, 0);
+        let rows = adapter.buffer.newest(4);
+        assert_eq!(rows[3].context.len(), 3);
+        let with = adapter.next_frame_loss(&rows)?.to_scalar::<f32>()?;
+        let stripped: Vec<FactualTransition> = rows
+            .iter()
+            .map(|row| FactualTransition {
+                context: Vec::new(),
+                ..(*row).clone()
+            })
+            .collect();
+        let refs: Vec<&FactualTransition> = stripped.iter().collect();
+        let without = adapter.next_frame_loss(&refs)?.to_scalar::<f32>()?;
+        assert!(with.is_finite() && without.is_finite());
+        assert_ne!(with, without, "the v6 loss must see the rows' own context");
+        // A full Channel B update runs with per-row context on v6.
+        observe_distinct(&mut adapter, ADAPT_MIN_LEVEL_TRANSITIONS as u8, 1);
+        adapter.on_level_transition(1)?;
+        let trace = adapter.maybe_update()?.expect("pending");
+        assert!(trace.updates > 0, "{trace:?}");
+        adapter.restore_prior()?;
+
+        // Legacy (v5) checkpoints: rows still carry a window, none is passed.
+        let (v5, v5_map) = tiny_model(&device)?;
+        assert!(!v5.config().world_core_v6);
+        let mut legacy = FastWeightAdapter::new(&v5, &v5_map, &device, AdaptationMode::Reset)?;
+        observe_distinct(&mut legacy, 4, 0);
+        let rows = legacy.buffer.newest(4);
+        assert_eq!(rows[3].context.len(), 3);
+        assert!(legacy
+            .next_frame_loss(&rows)?
+            .to_scalar::<f32>()?
+            .is_finite());
+        Ok(())
     }
 
     #[test]

@@ -935,6 +935,12 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, default_value_t = false, requires = "adapt")]
     pub adapt_carry: bool,
 
+    /// ADR 0005 §6.1 Channel A: condition every model call on the Context
+    /// Window of factual transitions. Defaults to on for `world_core_v6`
+    /// checkpoints; forced off (no-op) on checkpoints without a context channel.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub context_window: Option<bool>,
+
     /// Use official competition semantics, where RESET retries the current
     /// level and cannot wipe progress in the game.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1022,6 +1028,7 @@ impl P2Arc3LiveEvalArgs {
             phase_a_calibration: self.phase_a_calibration.clone(),
             adapt: self.adapt,
             adapt_carry: self.adapt_carry,
+            context_window: self.context_window,
         }
     }
 }
@@ -1106,6 +1113,12 @@ pub struct P2Arc3BridgeArgs {
     /// a game instead of resetting to the prior at every level boundary.
     #[arg(long, default_value_t = false, requires = "adapt")]
     pub adapt_carry: bool,
+
+    /// ADR 0005 §6.1 Channel A: condition every model call on the Context
+    /// Window of factual transitions. Defaults to on for `world_core_v6`
+    /// checkpoints; forced off (no-op) on checkpoints without a context channel.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub context_window: Option<bool>,
 }
 
 pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
@@ -1123,6 +1136,7 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         phase_a_calibration: args.phase_a_calibration,
         adapt: args.adapt,
         adapt_carry: args.adapt_carry,
+        context_window: args.context_window,
     })
 }
 
@@ -1149,7 +1163,10 @@ mod tests {
             "--init-context-from-v5",
             "runs/v5/checkpoints/best",
         ]);
-        assert!(orphan.is_err(), "warm start without --world-core-v6 must be rejected");
+        assert!(
+            orphan.is_err(),
+            "warm start without --world-core-v6 must be rejected"
+        );
         let parsed = Wrapper::try_parse_from([
             "p2-train",
             "--recipe",
@@ -1216,5 +1233,45 @@ mod adapt_flag_tests {
         ])
         .unwrap();
         assert!(bridge.args.adapt && !bridge.args.adapt_carry);
+    }
+
+    #[test]
+    fn context_window_flag_parses_on_both_arc3_commands() {
+        let default = LiveWrap::try_parse_from(["x"]).unwrap().args.to_config();
+        assert_eq!(default.context_window, None, "None = checkpoint decides");
+        let on = LiveWrap::try_parse_from(["x", "--context-window"]).unwrap();
+        assert_eq!(on.args.to_config().context_window, Some(true));
+        let off = LiveWrap::try_parse_from(["x", "--context-window=false"]).unwrap();
+        assert_eq!(off.args.to_config().context_window, Some(false));
+        assert!(
+            LiveWrap::try_parse_from(["x", "--context-window", "--adapt"])
+                .unwrap()
+                .args
+                .adapt,
+            "bare --context-window does not swallow the next flag"
+        );
+
+        let base = [
+            "x",
+            "--mode",
+            "serve",
+            "--checkpoint",
+            "m.safetensors",
+            "--train-config",
+            "c.json",
+        ];
+        assert_eq!(
+            BridgeWrap::try_parse_from(base)
+                .unwrap()
+                .args
+                .context_window,
+            None
+        );
+        let mut off = base.to_vec();
+        off.push("--context-window=false");
+        assert_eq!(
+            BridgeWrap::try_parse_from(off).unwrap().args.context_window,
+            Some(false)
+        );
     }
 }

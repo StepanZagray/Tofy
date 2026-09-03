@@ -91,6 +91,11 @@ pub trait PhaseAModel {
     fn event_head_reads(&self) -> usize;
 
     fn reset_decision_budget(&mut self, cap: usize);
+
+    /// ADR 0005 §6.1 Channel A: the factual transitions observed before the
+    /// decision about to be scored; every model call of that decision is
+    /// conditioned on it. Adapters without a context channel ignore it.
+    fn set_context_window(&mut self, _window: Vec<crate::p2::data::ContextTransition>) {}
 }
 
 /// Shared budget accounting for adapter implementations.
