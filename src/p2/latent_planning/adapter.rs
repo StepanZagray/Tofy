@@ -96,6 +96,14 @@ pub trait PhaseAModel {
     /// decision about to be scored; every model call of that decision is
     /// conditioned on it. Adapters without a context channel ignore it.
     fn set_context_window(&mut self, _window: Vec<crate::p2::data::ContextTransition>) {}
+
+    /// ADR 0005 §1.3: `true` for `world_core_v6` models, whose frames are
+    /// whole-frame content, so ACTION6 proposals may target row 63 and the
+    /// tried-action key hashes all 64 rows. Legacy adapters keep the
+    /// reserved status row.
+    fn whole_frame(&self) -> bool {
+        false
+    }
 }
 
 /// Shared budget accounting for adapter implementations.

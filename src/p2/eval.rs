@@ -12,11 +12,11 @@ use crate::p2::cg_profile::{
     EVAL_PROFILE_ENTRYPOINT,
 };
 use crate::p2::data::{
-    compose_mixed_stream_batch, foundation_v2_stream_schedule, gameplay_rows, generate_curriculum,
-    generate_factual_branch_group, generate_hazard_one_step, ArcAction, BranchGroup,
-    ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
-    TransitionSample, V5DataSplit, V5SampleProvenance, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE,
-    ORACLE_LATENT_DIM,
+    adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
+    gameplay_rows, generate_curriculum, generate_factual_branch_group, generate_hazard_one_step,
+    ArcAction, BranchGroup, ContentMask, ContentRect, FactualBatch, MixedStreamConfig,
+    OperatorFamilySplit, TransitionSample, V5DataSplit, V5SampleProvenance,
+    FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
 };
 use crate::p2::grounding::DecodeComposition;
 use crate::p2::model::{
@@ -156,6 +156,12 @@ pub struct EvalConfig {
     /// this on; the serde/default path stays off for legacy embedded configs.
     #[serde(default)]
     pub profile_eval: bool,
+    /// ADR 0005 §5.1 memorization diagnostic: score the v6 held-out rows a
+    /// second time with every context window masked to `K = 0` and report the
+    /// changed-exact delta per context-length stratum. Only meaningful for
+    /// `world_core_v6` checkpoints; off keeps the report byte-identical.
+    #[serde(default)]
+    pub context_ablation: bool,
 }
 
 fn default_ensemble_members() -> usize {
@@ -191,6 +197,7 @@ impl Default for EvalConfig {
             mode: default_eval_mode(),
             representation_row_cap: default_representation_row_cap(),
             profile_eval: false,
+            context_ablation: false,
         }
     }
 }
@@ -1138,6 +1145,12 @@ pub struct EvalReport {
     /// only for `world_core_v6` checkpoints; selection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v6_context_strata: Option<BTreeMap<String, BTreeMap<String, GateSupportMetrics>>>,
+    /// ADR 0005 §5.1 memorization diagnostic (`--context-ablation`): the
+    /// unseen-seed held-out population scored with its full context windows
+    /// and again with every window masked to `K = 0`. Present only when the
+    /// flag is set on a `world_core_v6` checkpoint; selection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_context_ablation: Option<ContextAblationReport>,
     /// Same-checkpoint, same-row mechanism ablations for bundled treatments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanism_ablations: Option<MechanismAblationReport>,
@@ -2395,9 +2408,7 @@ pub fn shuffled_action_changed_pixel_ratio(
         .try_fold(0usize, |count, changed| {
             changed.map(|changed| count + usize::from(changed))
         });
-    if known_outcome_changing
-        .is_some_and(|rows| rows < MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS)
-    {
+    if known_outcome_changing.is_some_and(|rows| rows < MIN_SHUFFLED_ACTION_OUTCOME_CHANGING_ROWS) {
         return Ok(None);
     }
     let mut changed_pixels = 0usize;
@@ -2405,11 +2416,11 @@ pub fn shuffled_action_changed_pixel_ratio(
     let mut shuffled_correct = 0usize;
     for ((((sample, shuffled_sample), outcome_changing), true_prediction), shuffled_prediction) in
         samples
-        .iter()
-        .zip(shuffled_samples)
-        .zip(outcome_changing)
-        .zip(true_action_predictions)
-        .zip(shuffled_action_predictions)
+            .iter()
+            .zip(shuffled_samples)
+            .zip(outcome_changing)
+            .zip(true_action_predictions)
+            .zip(shuffled_action_predictions)
     {
         // Unknown counterfactuals retain the historical per-row behavior;
         // known outcome-equivalent tuples are not causal interventions.
@@ -2519,7 +2530,7 @@ pub fn one_step_changed_exact(
 fn foundation_v2_v5_holdout_gates(
     model: &WorldModel,
     cfg: &EvalConfig,
-    train_seed: u64,
+    train_cfg: &TrainConfig,
     device: &Device,
     profile: Option<&RepresentativeUpdateCapture>,
 ) -> Result<(
@@ -2546,6 +2557,15 @@ fn foundation_v2_v5_holdout_gates(
     let mut gates = BTreeMap::new();
     let mut context_strata = model.config().world_core_v6.then(BTreeMap::new);
     let mut ablation_population = None;
+    // ADR 0005 §2: a v6 data contract draws the held-out rows under the same
+    // whole-frame rendering and stream schedule (LearningHistories with real
+    // context windows) as training; legacy stays byte-identical.
+    let train_seed = train_cfg.seed;
+    let schedule = if train_cfg.data_contract_v6 {
+        adaptation_v6_stream_schedule
+    } else {
+        foundation_v2_stream_schedule
+    };
     for (lane, (name, split)) in splits.into_iter().enumerate() {
         let seed = cfg
             .iid_seed
@@ -2564,7 +2584,8 @@ fn foundation_v2_v5_holdout_gates(
             &MixedStreamConfig {
                 batch_size: V5_HOLDOUT_ROWS,
                 seed,
-                schedule: foundation_v2_stream_schedule,
+                schedule,
+                data_contract_v6: train_cfg.data_contract_v6,
                 ..MixedStreamConfig::default()
             },
             1.0,
@@ -2842,6 +2863,170 @@ fn foundation_v2_context_strata(
             Ok((name, metrics))
         })
         .collect()
+}
+
+/// ADR 0005 §5.1 changed-exact comparison of one row set scored with its
+/// context windows and with the windows masked to `K = 0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextAblationMetrics {
+    pub rows: usize,
+    /// Rows whose window is non-empty; the masked pass only differs on these.
+    pub rows_with_context: usize,
+    pub changed_transitions: usize,
+    pub changed_exact_with_context: Option<f64>,
+    pub changed_exact_without_context: Option<f64>,
+    /// `with - without`; `None` when either side has no changed transition.
+    pub delta: Option<f64>,
+    pub composed_changed_exact_with_context: Option<f64>,
+    pub composed_changed_exact_without_context: Option<f64>,
+    pub composed_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextAblationStratum {
+    /// [`context_len_stratum`] of the rows' original context length.
+    pub stratum: String,
+    #[serde(flatten)]
+    pub metrics: ContextAblationMetrics,
+}
+
+/// ADR 0005 §5.1 memorization diagnostic report. The masked pass drops every
+/// row's `context` before the `ContextBatch` is built, so those rows are
+/// scored exactly like an all-`K = 0` population (no context FiLM).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextAblationReport {
+    /// Held-out population the rows come from (`v5_holdout_gates` key).
+    pub population: String,
+    /// Fingerprint of the with-context rows (matches the gate population).
+    pub population_fingerprint: String,
+    pub evidence_class: String,
+    #[serde(flatten)]
+    pub overall: ContextAblationMetrics,
+    /// Ordered by stratum key (`"0"`, `"1-4"`, `"5-16"`).
+    pub per_stratum: Vec<ContextAblationStratum>,
+}
+
+/// The same rows with every context window dropped (`K = 0`); the V5
+/// sidecar's `context_len` is masked alongside so row and provenance agree.
+fn context_masked_rows(
+    samples: &[TransitionSample],
+    provenance: &[V5SampleProvenance],
+) -> (Vec<TransitionSample>, Vec<V5SampleProvenance>) {
+    let rows = samples
+        .iter()
+        .cloned()
+        .map(|mut sample| {
+            sample.context.clear();
+            sample.provenance.context_len = 0;
+            sample
+        })
+        .collect();
+    let provenance = provenance
+        .iter()
+        .cloned()
+        .map(|mut provenance| {
+            provenance.source.context_len = 0;
+            provenance
+        })
+        .collect();
+    (rows, provenance)
+}
+
+fn context_ablation_metrics(
+    samples: &[TransitionSample],
+    with_context: &GateSupportMetrics,
+    without_context: &GateSupportMetrics,
+) -> ContextAblationMetrics {
+    let delta = |with: Option<f64>, without: Option<f64>| Some(with? - without?);
+    ContextAblationMetrics {
+        rows: samples.len(),
+        rows_with_context: samples
+            .iter()
+            .filter(|sample| !sample.context.is_empty())
+            .count(),
+        changed_transitions: with_context.changed_transitions,
+        changed_exact_with_context: with_context.one_step_changed_exact,
+        changed_exact_without_context: without_context.one_step_changed_exact,
+        delta: delta(
+            with_context.one_step_changed_exact,
+            without_context.one_step_changed_exact,
+        ),
+        composed_changed_exact_with_context: with_context.one_step_composed_changed_exact,
+        composed_changed_exact_without_context: without_context.one_step_composed_changed_exact,
+        composed_delta: delta(
+            with_context.one_step_composed_changed_exact,
+            without_context.one_step_composed_changed_exact,
+        ),
+    }
+}
+
+/// ADR 0005 §5.1: score `samples` with their context windows and again with
+/// every window masked to `K = 0`, overall and per [`context_len_stratum`] of
+/// the original window length. `world_core_v6` checkpoints only.
+fn evaluate_context_ablation(
+    model: &WorldModel,
+    population: &str,
+    samples: &[TransitionSample],
+    masks: &[ContentMask],
+    provenance: &[V5SampleProvenance],
+    device: &Device,
+) -> Result<ContextAblationReport> {
+    if !model.config().world_core_v6 {
+        bail!("the context ablation requires a world_core_v6 checkpoint");
+    }
+    let score = |rows: &[TransitionSample], masks: &[ContentMask], prov: &[V5SampleProvenance]| {
+        let with_context =
+            evaluate_gate_support_impl(model, rows, Some(masks), Some(prov), device, None, None)?;
+        let (masked, masked_prov) = context_masked_rows(rows, prov);
+        let without_context = evaluate_gate_support_impl(
+            model,
+            &masked,
+            Some(masks),
+            Some(&masked_prov),
+            device,
+            None,
+            None,
+        )?;
+        Ok::<_, anyhow::Error>((
+            context_ablation_metrics(rows, &with_context, &without_context),
+            with_context.population_fingerprint,
+        ))
+    };
+    let (overall, population_fingerprint) = score(samples, masks, provenance)?;
+    let mut strata = BTreeMap::<String, Vec<usize>>::new();
+    for (index, sample) in samples.iter().enumerate() {
+        strata
+            .entry(context_len_stratum(sample.context.len()).to_string())
+            .or_default()
+            .push(index);
+    }
+    let per_stratum = strata
+        .into_iter()
+        .map(|(stratum, rows)| {
+            let pick = |source: &[TransitionSample]| {
+                rows.iter()
+                    .map(|row| source[*row].clone())
+                    .collect::<Vec<_>>()
+            };
+            let masks = rows
+                .iter()
+                .map(|row| masks[*row].clone())
+                .collect::<Vec<_>>();
+            let prov = rows
+                .iter()
+                .map(|row| provenance[*row].clone())
+                .collect::<Vec<_>>();
+            let (metrics, _) = score(&pick(samples), &masks, &prov)?;
+            Ok(ContextAblationStratum { stratum, metrics })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ContextAblationReport {
+        population: population.into(),
+        population_fingerprint,
+        evidence_class: "selection_only".into(),
+        overall,
+        per_stratum,
+    })
 }
 
 fn eval_profile_phase<T>(
@@ -3306,9 +3491,7 @@ pub fn evaluate_mechanism_ablations(
         rows: samples.len(),
         population_fingerprint: baseline_gate.population_fingerprint,
         decode_composition: Some(AblationPair {
-            baseline_description: decode_composition_description(
-                baseline_cfg.decode_composition,
-            ),
+            baseline_description: decode_composition_description(baseline_cfg.decode_composition),
             baseline: baseline.clone(),
             variant_description: decode_composition_description(decode_cfg.decode_composition),
             variant: decode_variant,
@@ -3318,9 +3501,7 @@ pub fn evaluate_mechanism_ablations(
                 baseline_cfg.grid_scaled_action_impulse,
             ),
             baseline,
-            variant_description: action_impulse_description(
-                impulse_cfg.grid_scaled_action_impulse,
-            ),
+            variant_description: action_impulse_description(impulse_cfg.grid_scaled_action_impulse),
             variant: impulse_variant,
         }),
         copy_bypass_alpha_sweep,
@@ -3839,8 +4020,7 @@ fn eval_one_batch(
     let encoded = model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?;
     let current_z = encoded.current;
     let next_z = encoded.next;
-    let foundation_recipe =
-        train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2;
+    let foundation_recipe = train_cfg.recipe == crate::p2::experiment::TrainingRecipe::FoundationV2;
     // Foundation-v2 SIGReg is not scored per chunk: training regularizes the
     // content-masked canonical population, and EP is nonlinear in the batch,
     // so chunk-wise statistics change with physical batching. Collect the
@@ -3919,9 +4099,7 @@ fn eval_one_batch(
             .as_ref()
             .map(|(current, _)| current.clone())
             .unwrap_or_default(),
-        foundation_ep_next: foundation_ep
-            .map(|(_, next)| next)
-            .unwrap_or_default(),
+        foundation_ep_next: foundation_ep.map(|(_, next)| next).unwrap_or_default(),
         ..Default::default()
     };
     partial.mse_all.extend(mses.iter().copied());
@@ -6409,7 +6587,8 @@ fn evaluate_factual_branches(
                 let width = usize::from(branch.transition.provenance.content_width)
                     .min(crate::p2::data::FRAME_SIDE);
                 let height = usize::from(branch.transition.provenance.content_height).min(
-                    log_probs.len() / (crate::p2::data::FRAME_SIDE * crate::p2::model::PALETTE_SIZE),
+                    log_probs.len()
+                        / (crate::p2::data::FRAME_SIDE * crate::p2::model::PALETTE_SIZE),
                 );
                 let mut class_nll = Vec::with_capacity(outcome_representatives.len());
                 for representative in &outcome_representatives {
@@ -7126,7 +7305,7 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
                 foundation_v2_v5_holdout_gates(
                     &model,
                     cfg,
-                    train_cfg.seed,
+                    &train_cfg,
                     &device,
                     eval_profile.as_ref(),
                 )
@@ -7136,28 +7315,47 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
     if let Some(profile) = eval_profile.take() {
         profile.finish()?;
     }
-    let (v5_holdout_gates, v6_context_strata, mechanism_ablations) = if let Some((
-        gates,
-        context_strata,
-        samples,
-        masks,
-        provenance,
-    )) = foundation_holdout
-    {
-        let ablations = timed_eval_phase("mechanism_ablations", "v5_unseen_seed_7x7", || {
-            evaluate_mechanism_ablations(
-                &model,
-                &varmap,
-                &samples,
-                Some(&masks),
-                Some(&provenance),
-                &device,
+    let (v5_holdout_gates, v6_context_strata, v6_context_ablation, mechanism_ablations) =
+        if let Some((gates, context_strata, samples, masks, provenance)) = foundation_holdout {
+            let ablations = timed_eval_phase("mechanism_ablations", "v5_unseen_seed_7x7", || {
+                evaluate_mechanism_ablations(
+                    &model,
+                    &varmap,
+                    &samples,
+                    Some(&masks),
+                    Some(&provenance),
+                    &device,
+                )
+            })?;
+            let context_ablation = (cfg.context_ablation && model.config().world_core_v6)
+                .then(|| {
+                    timed_eval_phase("context_ablation", "v5_unseen_seed_7x7", || {
+                        evaluate_context_ablation(
+                            &model,
+                            "unseen_seed_7x7",
+                            &samples,
+                            &masks,
+                            &provenance,
+                            &device,
+                        )
+                    })
+                })
+                .transpose()?;
+            (
+                Some(gates),
+                context_strata,
+                context_ablation,
+                Some(ablations),
             )
-        })?;
-        (Some(gates), context_strata, Some(ablations))
-    } else {
-        (None, None, None)
-    };
+        } else {
+            (None, None, None, None)
+        };
+    if cfg.context_ablation && !model.config().world_core_v6 {
+        eprintln!(
+            "p2-eval: --context-ablation ignored; the checkpoint is not world_core_v6 \
+             (ADR 0005 §5.1 applies to v6 checkpoints only)"
+        );
+    }
 
     let report_reduction_started = Instant::now();
     let mut population_sha256 = BTreeMap::from([
@@ -7253,6 +7451,7 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
         arc3_transfer,
         v5_holdout_gates,
         v6_context_strata,
+        v6_context_ablation,
         mechanism_ablations,
         research_claim: false,
     };
@@ -8760,9 +8959,15 @@ mod tests {
             mode: EvalMode::Full,
             representation_row_cap: 7,
             profile_eval: false,
+            context_ablation: false,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);
+        assert!(eval.v6_context_ablation.is_none());
+        assert!(
+            !fs::read_to_string(dir.join("eval.json"))?.contains("v6_context_ablation"),
+            "legacy report must not gain the ablation key"
+        );
         assert!(eval.official_rhae.is_none());
         assert!(!eval.public_data_used_for_fitting);
         assert!(!eval.research_claim);
@@ -9112,5 +9317,133 @@ mod tests {
         assert_eq!(context_len_stratum(4), "1-4");
         assert_eq!(context_len_stratum(5), "5-16");
         assert_eq!(context_len_stratum(16), "5-16");
+    }
+
+    /// ADR 0005 §5.1: the ablation scores the same rows twice (full context,
+    /// `K = 0`), reports per-stratum deltas, and is exactly zero for a model
+    /// whose context FiLM is at its identity initialization.
+    #[test]
+    fn context_ablation_scores_the_same_rows_with_and_without_context() -> Result<()> {
+        let device = Device::Cpu;
+        let mut train_cfg = TrainConfig::default();
+        train_cfg.apply_foundation_v2_recipe();
+        train_cfg.hidden_dim = 8;
+        train_cfg.action_dim = 4;
+        train_cfg.inner_steps = 1;
+        train_cfg.outer_steps = 1;
+        train_cfg.world_core_v6 = true;
+        train_cfg.data_contract_v6 = true;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            train_cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 32,
+                seed: 0xE7A1_0051,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::UnseenSeed7x7,
+        )?;
+        let samples = mixed.transitions().cloned().collect::<Vec<_>>();
+        let masks = mixed
+            .samples()
+            .iter()
+            .map(|sample| sample.content_mask.clone())
+            .collect::<Vec<_>>();
+        let provenance = mixed
+            .samples()
+            .iter()
+            .map(|sample| sample.provenance.clone())
+            .collect::<Vec<_>>();
+        let with_context = samples
+            .iter()
+            .filter(|sample| !sample.context.is_empty())
+            .count();
+        assert!(
+            with_context > 0,
+            "the v6 data contract must yield LearningHistories rows with context"
+        );
+
+        let report = evaluate_context_ablation(
+            &model,
+            "unseen_seed_7x7",
+            &samples,
+            &masks,
+            &provenance,
+            &device,
+        )?;
+        assert_eq!(report.overall.rows, samples.len());
+        assert_eq!(report.overall.rows_with_context, with_context);
+        assert_eq!(report.evidence_class, "selection_only");
+        let gates = evaluate_gate_support_impl(
+            &model,
+            &samples,
+            Some(&masks),
+            Some(&provenance),
+            &device,
+            None,
+            None,
+        )?;
+        assert_eq!(report.population_fingerprint, gates.population_fingerprint);
+        assert_eq!(
+            report.overall.changed_exact_with_context,
+            gates.one_step_changed_exact
+        );
+        // Identity FiLM: context cannot change the prediction, so both passes agree.
+        assert_eq!(report.overall.delta, Some(0.0));
+        assert_eq!(report.overall.composed_delta, Some(0.0));
+        let strata = report
+            .per_stratum
+            .iter()
+            .map(|stratum| stratum.stratum.as_str())
+            .collect::<Vec<_>>();
+        assert!(strata.contains(&"0"), "{strata:?}");
+        assert!(
+            strata.iter().any(|name| *name != "0"),
+            "rows with context must populate a non-zero stratum: {strata:?}"
+        );
+        assert_eq!(
+            report
+                .per_stratum
+                .iter()
+                .map(|stratum| stratum.metrics.rows)
+                .sum::<usize>(),
+            samples.len()
+        );
+        for stratum in &report.per_stratum {
+            assert_eq!(
+                stratum.metrics.rows_with_context,
+                if stratum.stratum == "0" {
+                    0
+                } else {
+                    stratum.metrics.rows
+                }
+            );
+        }
+        // The masked rows are the same rows with an empty window.
+        let (masked, masked_provenance) = context_masked_rows(&samples, &provenance);
+        assert!(masked.iter().all(|row| row.context.is_empty()));
+        assert!(masked
+            .iter()
+            .zip(&masked_provenance)
+            .all(|(row, provenance)| provenance.source == row.provenance));
+        assert!(masked
+            .iter()
+            .zip(&samples)
+            .all(|(masked, original)| masked.current == original.current
+                && masked.next == original.next
+                && masked.action == original.action));
+        // The report key is serde-flattened and round-trips.
+        let json = serde_json::to_value(&report)?;
+        assert!(json.get("rows").is_some() && json.get("per_stratum").is_some());
+        let back: ContextAblationReport = serde_json::from_value(json)?;
+        assert_eq!(back, report);
+        Ok(())
     }
 }

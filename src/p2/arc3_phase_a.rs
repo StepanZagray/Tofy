@@ -12,7 +12,7 @@
 
 use crate::p2::adaptation::{context_batch_for, LiveContext};
 use crate::p2::arc3_live::{
-    enumerate_actions, ActionDecision, ActionScore, ArcObservation, LivePolicy,
+    enumerate_actions_with, ActionDecision, ActionScore, ArcObservation, LivePolicy,
 };
 use crate::p2::data::{ArcAction, ArcFrame, ContextTransition, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::latent_planning::adapter::{
@@ -359,6 +359,10 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
 
     fn set_context_window(&mut self, window: Vec<ContextTransition>) {
         self.context = window;
+    }
+
+    fn whole_frame(&self) -> bool {
+        self.model.config().world_core_v6
     }
 }
 
@@ -718,10 +722,13 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             );
         }
         let id = Self::raw_id(observation, &pixels);
-        let actions = enumerate_actions(
+        // ADR 0005 §1.3: v6 frames are whole-frame content, so ACTION6 may
+        // target row 63 (mirrors the greedy `ModelPolicy`).
+        let actions = enumerate_actions_with(
             observation,
             self.action6_max_candidates,
             self.action6_grid_stride,
+            self.adapter.whole_frame(),
         )?;
         if actions.is_empty() {
             bail!("Phase A has no legal actions to choose from");
@@ -1156,6 +1163,7 @@ mod tests {
         encode_calls: usize,
         satisfied_for_first_action: f32,
         context_lens: Vec<usize>,
+        whole_frame: bool,
     }
 
     impl FakeModel {
@@ -1166,6 +1174,7 @@ mod tests {
                 encode_calls: 0,
                 satisfied_for_first_action: satisfied,
                 context_lens: Vec::new(),
+                whole_frame: false,
             }
         }
     }
@@ -1233,6 +1242,10 @@ mod tests {
         fn set_context_window(&mut self, window: Vec<ContextTransition>) {
             self.context_lens.push(window.len());
         }
+
+        fn whole_frame(&self) -> bool {
+            self.whole_frame
+        }
     }
 
     fn observation(levels: u16, marker: bool) -> ArcObservation {
@@ -1277,6 +1290,60 @@ mod tests {
             ptrm: bin(),
             uncalibrated: false,
         }
+    }
+
+    /// ADR 0005 §1.3: a v6 Phase A policy enumerates ACTION6 coordinates on
+    /// row 63; a legacy (v5) policy keeps the reserved status row excluded.
+    #[test]
+    fn phase_a_action6_proposals_reach_row_63_only_under_v6() -> Result<()> {
+        let legal_keys = |whole_frame: bool| -> Result<Vec<String>> {
+            let mut model = FakeModel::new(0.9);
+            model.whole_frame = whole_frame;
+            let mut policy = PhaseAPolicy::new(
+                model,
+                PhaseAConfig::default(),
+                permissive_calibration(),
+                64,
+                32,
+            );
+            policy.on_game_start("game");
+            let mut observation = observation(0, true);
+            observation.available_actions = vec![1, 2, 3, 6];
+            // Background colour 5 with a lone palette-0 pixel on row 63 (as in
+            // the arc3_live row-63 test): legacy enumeration treats row 63 as
+            // the status row and index 0 as padding, so it never proposes the
+            // pixel; whole-frame enumeration proposes its component points.
+            let mut pixels = observation
+                .frame
+                .pixels
+                .iter()
+                .map(|&p| if p == 0 { 5 } else { p })
+                .collect::<Vec<u8>>();
+            pixels[63 * FRAME_SIDE + 7] = 0;
+            observation.frame =
+                ArcFrame::new(FRAME_SIDE as u16, FRAME_SIDE as u16, pixels.clone()).unwrap();
+            policy.choose_action(&observation)?;
+            let id = PhaseAPolicy::<FakeModel>::raw_id(&observation, &pixels);
+            let node = policy.graph.node(id).expect("observed node is recorded");
+            Ok(node.legal_actions.iter().map(|k| k.0.clone()).collect())
+        };
+        let on_row_63 = |keys: &[String]| {
+            keys.iter()
+                .any(|key| key.starts_with("6:") && key.ends_with(":63"))
+        };
+        let v6 = legal_keys(true)?;
+        assert!(v6.iter().any(|key| key.starts_with("6:")));
+        assert!(
+            on_row_63(&v6),
+            "v6 Phase A must propose ACTION6 on row 63: {v6:?}"
+        );
+        let v5 = legal_keys(false)?;
+        assert!(v5.iter().any(|key| key.starts_with("6:")));
+        assert!(
+            !on_row_63(&v5),
+            "v5 Phase A must not propose row 63: {v5:?}"
+        );
+        Ok(())
     }
 
     #[test]
