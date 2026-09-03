@@ -1,0 +1,67 @@
+{
+  "checkpoint": "/home/stepan/Coding/Personal/Tofy/runs/p2/_pod_handoffs/6zp5oip7tvokfl-20260827-foundation-v2/foundation-v2/model.safetensors",
+  "checkpoint_sha256": "e5457dd49c46864086faa77b7b6b5f2f52ae4915dee1e629aa1cbff6f7a80fcb",
+  "train_config": "/home/stepan/Coding/Personal/Tofy/runs/p2/_pod_handoffs/6zp5oip7tvokfl-20260827-foundation-v2/foundation-v2/config.json",
+  "device": "cuda",
+  "conditioning": "goal=all-zero(19), operator=UNKNOWN token, no context, eval recursion depth",
+  "legacy_operator_projection_zeroed": true,
+  "synthetic_population": {
+    "goal_dropped_rows_at_source": 1183,
+    "rows": 3750,
+    "schedule": "foundation_v2_stream_schedule(progress=1.0)",
+    "seed": 6216458651658354691,
+    "split": "UnseenSeed7x7",
+    "stream_counts": {
+      "Exploration": 790,
+      "FactualBranches": 1180,
+      "HazardOneStep": 197,
+      "RandomOneStep": 991,
+      "SequentialFragments": 592
+    }
+  },
+  "real": {
+    "rows": 3750,
+    "noop_rows": 1340,
+    "composed_exact_rows": 0,
+    "reliability_mean": 0.5190569582223892,
+    "reliability_median": 0.528579592704773,
+    "residual_pixel_ce_mean": 0.5921564451525608,
+    "residual_changed_pixels_mean": 834.5904
+  },
+  "synthetic": {
+    "rows": 3750,
+    "noop_rows": 1123,
+    "composed_exact_rows": 100,
+    "reliability_mean": 0.6138601766029994,
+    "reliability_median": 0.6783806085586548,
+    "residual_pixel_ce_mean": 0.21493789621741088,
+    "residual_changed_pixels_mean": 373.1773333333333
+  },
+  "real_rows_per_game": {
+    "ar25-0c556536": 150,
+    "bp35-0a0ad940": 150,
+    "cd82-fb555c5d": 150,
+    "cn04-2fe56bfb": 150,
+    "dc22-fdcac232": 150,
+    "ft09-0d8bbf25": 150,
+    "g50t-5849a774": 150,
+    "ka59-38d34dbb": 150,
+    "lf52-271a04aa": 150,
+    "lp85-305b61c3": 150,
+    "ls20-9607627b": 150,
+    "m0r0-492f87ba": 150,
+    "r11l-495a7899": 150,
+    "re86-8af5384d": 150,
+    "s5i5-18d95033": 150,
+    "sb26-7fbdac44": 150,
+    "sc25-635fd71a": 150,
+    "sk48-d8078629": 150,
+    "sp80-589a99af": 150,
+    "su15-1944f8ab": 150,
+    "tn36-ef4dde99": 150,
+    "tr87-cd924810": 150,
+    "tu93-0768757b": 150,
+    "vc33-5430563c": 150,
+    "wa30-ee6fef47": 150
+  }
+}
