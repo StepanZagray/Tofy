@@ -14433,4 +14433,219 @@ mod tests {
         assert_eq!(legacy, requested);
         Ok(())
     }
+
+    // ---- ADR 0005 world-core v6 -------------------------------------------
+
+    fn tiny_v5_model_cfg() -> ModelConfig {
+        ModelConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 2,
+            world_core_v4: true,
+            world_core_v5: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            residual_y_update: true,
+            warm_start_y: true,
+            ..ModelConfig::default()
+        }
+    }
+
+    fn fresh_model(cfg: ModelConfig, seed: u64, device: &Device) -> Result<(WorldModel, VarMap)> {
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, device))?;
+        reinit_varmap_deterministic(&varmap, seed)?;
+        zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
+        zero_context_film_projections(&varmap)?;
+        init_copy_bypass_gate(&varmap)?;
+        Ok((model, varmap))
+    }
+
+    /// Give `every`-th row a context window built from other rows' frames.
+    fn inject_synthetic_context(mixed: &mut MixedStreamBatch, every: usize) -> usize {
+        let donors = mixed
+            .transitions()
+            .map(|row| (row.current.clone(), row.action.clone(), row.next.clone()))
+            .collect::<Vec<_>>();
+        let mut injected = 0;
+        for (index, row) in mixed.transitions_mut().enumerate() {
+            if index % every != 0 {
+                continue;
+            }
+            let len = 1 + (index / every) % 3;
+            row.context = (0..len)
+                .map(|offset| {
+                    let (current, action, next) = &donors[(index + offset + 1) % donors.len()];
+                    crate::p2::data::ContextTransition {
+                        current: current.clone(),
+                        action: action.clone(),
+                        next: next.clone(),
+                    }
+                })
+                .collect();
+            injected += 1;
+        }
+        injected
+    }
+
+    #[test]
+    fn v6_config_requires_foundation_v2_and_flags_compose() {
+        let plain = TrainConfig {
+            world_core_v6: true,
+            ..TrainConfig::default()
+        };
+        assert!(plain.validate().is_err());
+        let mut v6 = TrainConfig::default();
+        v6.apply_foundation_v2_recipe();
+        v6.physical_batch = 64;
+        v6.world_core_v6 = true;
+        v6.validate().expect("foundation-v2 + v6 is a valid arm");
+        assert!(v6.model_config().world_core_v6);
+        let mut orphan_init = v6.clone();
+        orphan_init.world_core_v6 = false;
+        orphan_init.init_context_from_v5 = Some(PathBuf::from("x"));
+        assert!(orphan_init.validate().is_err());
+        let contract = TrainingContract::from(&v6);
+        assert!(contract.world_core_v6);
+    }
+
+    #[test]
+    fn v5_checkpoint_into_v6_fails_closed_unless_warm_started() -> Result<()> {
+        let device = Device::Cpu;
+        let root = checkpoint_test_root("v6-warm-start");
+        fs::create_dir_all(&root)?;
+        let (v5, v5_vars) = fresh_model(tiny_v5_model_cfg(), 41, &device)?;
+        let checkpoint = root.join("model.safetensors");
+        v5_vars.save(&checkpoint)?;
+
+        let v6_cfg = ModelConfig {
+            world_core_v6: true,
+            ..tiny_v5_model_cfg()
+        };
+        let (v6, v6_vars) = fresh_model(v6_cfg, 99, &device)?;
+        let error = load_varmap_exact(&v6_vars, &checkpoint).expect_err("v5 into v6 must fail closed");
+        assert!(error.to_string().contains("missing"), "{error}");
+        // Warm start into a v5 target is meaningless (nothing missing) and must fail too.
+        assert!(load_varmap_warm_start_context(&v5_vars, &checkpoint).is_err());
+        load_varmap_warm_start_context(&v6_vars, &root)?;
+
+        let samples = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 16,
+                seed: 7,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::Train,
+        )?
+        .transitions()
+        .cloned()
+        .collect::<Vec<_>>();
+        let batch = batch_from_samples(&samples, &device)?;
+        let context = {
+            let mut with_context = samples.clone();
+            for (index, row) in with_context.iter_mut().enumerate() {
+                if index % 3 == 0 {
+                    row.context = vec![crate::p2::data::ContextTransition {
+                        current: samples[(index + 1) % samples.len()].current.clone(),
+                        action: samples[(index + 1) % samples.len()].action.clone(),
+                        next: samples[(index + 1) % samples.len()].next.clone(),
+                    }];
+                }
+            }
+            ContextBatch::from_samples(&with_context, &device)?.expect("context present")
+        };
+        // The loaded v6 model computes the v5 function, with or without
+        // context. Row 63 handling differs by design (§1.3), so compare on
+        // frames whose status row is already EMPTY: only weights are under test.
+        let empty_status = {
+            let mut pixels = batch.frames.flatten_all()?.to_vec1::<u8>()?;
+            for frame in pixels.chunks_exact_mut(FRAME_SIDE * FRAME_SIDE) {
+                frame[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+            }
+            Tensor::from_vec(pixels, batch.frames.dims(), &device)?
+        };
+        let reference = v5.forward_with_operator_conditioning(
+            &empty_status,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.goals,
+            &batch.operator_conditioning,
+        )?;
+        for context in [None, Some(&context)] {
+            let out = v6.forward_with_depth_and_operator_conditioning_with_context(
+                &empty_status,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                &batch.operator_conditioning,
+                context,
+                RecursionDepth::from_config(v6.config()),
+                0.0,
+                None,
+            )?;
+            assert_eq!(
+                reference.y.flatten_all()?.to_vec1::<f32>()?,
+                out.y.flatten_all()?.to_vec1::<f32>()?,
+                "warm-started v6 must reproduce v5 (context = {})",
+                context.is_some()
+            );
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_loss_is_unchanged_by_context_plumbing_at_init() -> Result<()> {
+        let device = Device::Cpu;
+        let mut mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 32,
+                seed: 61,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            0.5,
+            0,
+            V5DataSplit::Train,
+        )?;
+        // Legacy rows: no context is ever materialized.
+        assert!(prepare_foundation_v2_batch_host(&mixed)?.context().is_none());
+        let objective = FoundationV2ObjectiveConfig::default();
+        let scalar = |breakdown: FoundationV2LossBreakdown| -> Result<f32> {
+            Ok(breakdown.total.to_dtype(DType::F32)?.to_scalar::<f32>()?)
+        };
+        let (v5, _) = fresh_model(tiny_v5_model_cfg(), 23, &device)?;
+        let (v6, _) = fresh_model(
+            ModelConfig {
+                world_core_v6: true,
+                ..tiny_v5_model_cfg()
+            },
+            23,
+            &device,
+        )?;
+        let v5_plain = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v6_plain = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
+
+        let injected = inject_synthetic_context(&mut mixed, 4);
+        assert!(injected > 0);
+        let host = prepare_foundation_v2_batch_host(&mixed)?;
+        let context = host.context().expect("context rows are materialized");
+        assert_eq!(context.batch, 32);
+        assert_eq!(context.k, 3);
+        // rows 0,4,...,28 carry windows of length 1,2,3,1,2,3,1,2.
+        assert_eq!(context.valid.iter().filter(|v| **v != 0.0).count(), 15);
+
+        // v5 ignores context; v6 at zero context FiLM is bit-identical to no context.
+        let v5_ctx = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v6_ctx = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
+        assert!(v5_plain.is_finite() && v6_plain.is_finite());
+        assert_eq!(v5_plain, v5_ctx, "legacy model must ignore context rows");
+        assert_eq!(v6_plain, v6_ctx, "zero context FiLM must not change the v6 loss");
+        Ok(())
+    }
 }

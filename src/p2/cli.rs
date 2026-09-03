@@ -1102,3 +1102,48 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         phase_a_calibration: args.phase_a_calibration,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: P2TrainArgs,
+    }
+
+    #[test]
+    fn init_context_from_v5_requires_world_core_v6_and_reaches_config() {
+        let orphan = Wrapper::try_parse_from([
+            "p2-train",
+            "--recipe",
+            "foundation-v2",
+            "--init-context-from-v5",
+            "runs/v5/checkpoints/best",
+        ]);
+        assert!(orphan.is_err(), "warm start without --world-core-v6 must be rejected");
+        let parsed = Wrapper::try_parse_from([
+            "p2-train",
+            "--recipe",
+            "foundation-v2",
+            "--world-core-v6",
+            "--init-context-from-v5",
+            "runs/v5/checkpoints/best",
+        ])
+        .expect("v6 warm-start arguments parse");
+        let cfg = parsed.args.to_config();
+        assert!(cfg.world_core_v6);
+        assert_eq!(
+            cfg.init_context_from_v5.as_deref(),
+            Some(std::path::Path::new("runs/v5/checkpoints/best"))
+        );
+        assert!(cfg.model_config().world_core_v6);
+        let legacy = Wrapper::try_parse_from(["p2-train", "--recipe", "foundation-v2"])
+            .expect("legacy arguments parse")
+            .args
+            .to_config();
+        assert!(!legacy.world_core_v6 && legacy.init_context_from_v5.is_none());
+    }
+}

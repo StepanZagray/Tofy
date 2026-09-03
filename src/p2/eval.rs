@@ -9088,4 +9088,13 @@ mod tests {
             .expect("r2");
         assert!(r2 > 0.99, "expected near-perfect linear recovery, got {r2}");
     }
+
+    #[test]
+    fn context_len_stratum_boundaries_follow_adr_0005() {
+        assert_eq!(context_len_stratum(0), "0");
+        assert_eq!(context_len_stratum(1), "1-4");
+        assert_eq!(context_len_stratum(4), "1-4");
+        assert_eq!(context_len_stratum(5), "5-16");
+        assert_eq!(context_len_stratum(16), "5-16");
+    }
 }

@@ -4479,4 +4479,391 @@ mod tests {
         );
         Ok(())
     }
+
+    // ---- ADR 0005 world-core v6 -------------------------------------------
+
+    fn v6_cfg() -> ModelConfig {
+        ModelConfig {
+            world_core_v4: true,
+            world_core_v5: true,
+            world_core_v6: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            residual_y_update: true,
+            warm_start_y: true,
+            ..tiny_cfg()
+        }
+    }
+
+    fn v6_model(device: &Device, seed: u64) -> Result<(WorldModel, VarMap)> {
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            v6_cfg(),
+            VarBuilder::from_varmap(&varmap, DType::F32, device),
+        )?;
+        reinit_varmap_deterministic(&varmap, seed)?;
+        zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
+        zero_context_film_projections(&varmap)?;
+        Ok((model, varmap))
+    }
+
+    /// Deterministic context windows with per-row lengths `lens`, mixing
+    /// ACTION6 (with coordinates) and simple actions.
+    fn synthetic_context(lens: &[usize], device: &Device) -> Result<ContextBatch> {
+        let k = *lens.iter().max().unwrap();
+        let pixels = FRAME_SIDE * FRAME_SIDE;
+        let batch = lens.len();
+        let mut host = ContextBatchHost {
+            batch,
+            k,
+            current: vec![0; batch * k * pixels],
+            next: vec![0; batch * k * pixels],
+            actions: vec![0; batch * k],
+            coords: vec![0.0; batch * k * 2],
+            valid: vec![0.0; batch * k],
+        };
+        for (row, &len) in lens.iter().enumerate() {
+            for slot in 0..len {
+                let flat = row * k + slot;
+                for p in 0..pixels {
+                    host.current[flat * pixels + p] = ((p + 3 * row + slot) % PALETTE_SIZE) as u8;
+                    host.next[flat * pixels + p] = ((p + 5 * row + 2 * slot + 1) % PALETTE_SIZE) as u8;
+                }
+                if slot % 2 == 0 {
+                    host.actions[flat] = 6;
+                    host.coords[flat * 2] = (row as f32 * 7.0) / 63.0;
+                    host.coords[flat * 2 + 1] = (slot as f32 * 11.0) / 63.0;
+                } else {
+                    host.actions[flat] = 1 + (slot % 5) as u32;
+                }
+                host.valid[flat] = 1.0;
+            }
+        }
+        ContextBatch::from_host(&host, device)
+    }
+
+    fn assert_bit_identical(name: &str, left: &Tensor, right: &Tensor) -> Result<()> {
+        assert_eq!(
+            left.flatten_all()?.to_vec1::<f32>()?,
+            right.flatten_all()?.to_vec1::<f32>()?,
+            "{name} differs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v6_zero_context_film_recovers_v5_computation_exactly() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = v6_model(&device, 97)?;
+        let (frames, actions, coords, goals) = sample_batch(&device, 3, model.config.goal_dim)?;
+        let operator = unknown_operator_conditioning(3, &device)?;
+        let context = synthetic_context(&[0, 2, 4], &device)?;
+        let depth = RecursionDepth::from_config(&model.config);
+        let without = model.forward_with_depth_and_operator_conditioning_with_context(
+            &frames, &actions, &coords, &goals, &operator, None, depth, 0.0, None,
+        )?;
+        let with = model.forward_with_depth_and_operator_conditioning_with_context(
+            &frames,
+            &actions,
+            &coords,
+            &goals,
+            &operator,
+            Some(&context),
+            depth,
+            0.0,
+            None,
+        )?;
+        assert_bit_identical("latent", &without.y, &with.y)?;
+        assert_bit_identical("events", &without.event_logits, &with.event_logits)?;
+        assert_bit_identical("q", &without.q_logit, &with.q_logit)?;
+        assert_bit_identical(
+            "reliability",
+            &without.reliability_logit,
+            &with.reliability_logit,
+        )?;
+        // Trainer seam: same identity through the encoded-state recursion.
+        let state = model.encode_state(&frames)?;
+        let canonical = model.canonical_representation(&state)?;
+        let legacy = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
+            &state,
+            &canonical,
+            &actions,
+            &coords,
+            &operator,
+            depth,
+            0.0,
+            None,
+            RecursionOpts::training(true),
+        )?;
+        let contextual = model
+            .full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+                &state,
+                &canonical,
+                &actions,
+                &coords,
+                &operator,
+                Some(&context),
+                depth,
+                0.0,
+                None,
+                RecursionOpts::training(true),
+            )?;
+        assert_bit_identical("training latent", &legacy.y, &contextual.y)?;
+        // The prefix seam is context-aware on v4+ topologies.
+        let prefix = model.prefix_predict(&state, &actions, &coords)?;
+        let prefix_ctx = model.prefix_predict_with_context(&state, &actions, &coords, Some(&context))?;
+        assert_bit_identical("prefix", &prefix, &prefix_ctx)?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_v6_model_rejects_context() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = ModelConfig {
+            world_core_v6: false,
+            ..v6_cfg()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))?;
+        let (frames, actions, coords, _) = sample_batch(&device, 2, model.config.goal_dim)?;
+        let context = synthetic_context(&[1, 1], &device)?;
+        let state = model.encode_state(&frames)?;
+        let error = model
+            .predict_latent_with_depth_with_context(
+                &state,
+                &actions,
+                &coords,
+                Some(&context),
+                RecursionDepth::from_config(&model.config),
+            )
+            .expect_err("a v5 model must not silently ignore context");
+        assert!(error.to_string().contains("non-v6"), "{error}");
+        assert!(ModelConfig {
+            world_core_v5: false,
+            ..v6_cfg()
+        }
+        .validate()
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v6_context_channel_is_wired_and_masks_rows_without_context() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = v6_model(&device, 11)?;
+        // Make context FiLM non-trivial without touching its (zero) biases so
+        // a row with K = 0 (c = 0) must stay bit-identical.
+        {
+            let data = varmap.data().lock().unwrap();
+            for name in ["context_film_gamma.weight", "context_film_beta.weight"] {
+                let var = data.get(name).expect("context FiLM weight exists");
+                var.set(&Tensor::full(0.05f32, var.shape().dims(), &device)?)?;
+            }
+        }
+        let context = synthetic_context(&[0, 3, 5], &device)?;
+        let summary = model.context_summary(&context)?;
+        assert_eq!(summary.dims(), &[3, model.config.hidden_dim]);
+        let rows = summary.to_vec2::<f32>()?;
+        assert!(rows[0].iter().all(|v| *v == 0.0), "K=0 row must give c = 0");
+        assert!(rows[1].iter().any(|v| *v != 0.0));
+        assert!(rows[1] != rows[2], "different windows must give different summaries");
+
+        let (frames, actions, coords, goals) = sample_batch(&device, 3, model.config.goal_dim)?;
+        let operator = unknown_operator_conditioning(3, &device)?;
+        let depth = RecursionDepth::from_config(&model.config);
+        let without = model.forward_with_depth_and_operator_conditioning_with_context(
+            &frames, &actions, &coords, &goals, &operator, None, depth, 0.0, None,
+        )?;
+        let with = model.forward_with_depth_and_operator_conditioning_with_context(
+            &frames,
+            &actions,
+            &coords,
+            &goals,
+            &operator,
+            Some(&context),
+            depth,
+            0.0,
+            None,
+        )?;
+        assert_bit_identical("K=0 row", &without.y.get(0)?, &with.y.get(0)?)?;
+        assert!(max_abs_diff(&without.y.get(1)?, &with.y.get(1)?)? > 0.0);
+        assert!(max_abs_diff(&without.y.get(2)?, &with.y.get(2)?)? > 0.0);
+        // Gradients reach the context channel and the shared encoder through it.
+        let grads = with.y.sqr()?.mean_all()?.backward()?;
+        let data = varmap.data().lock().unwrap();
+        for name in ["context_mlp_in.weight", "context_fuse.weight", "context_film_gamma.weight"] {
+            let var = data.get(name).expect("context parameter exists");
+            let grad = grads
+                .get(var.as_tensor())
+                .unwrap_or_else(|| panic!("{name} receives no gradient"));
+            assert!(grad.flatten_all()?.to_vec1::<f32>()?.iter().any(|g| *g != 0.0), "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_select_rows_matches_full_summary() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = v6_model(&device, 5)?;
+        let context = synthetic_context(&[2, 0, 4, 1], &device)?;
+        let full = model.context_summary(&context)?.to_vec2::<f32>()?;
+        let subset = context
+            .select_rows(&[2, 1, 3])?
+            .expect("subset carries context");
+        assert_eq!(subset.batch(), 3);
+        let selected = model.context_summary(&subset)?.to_vec2::<f32>()?;
+        assert_eq!(selected[0], full[2]);
+        assert_eq!(selected[1], full[1]);
+        assert_eq!(selected[2], full[3]);
+        assert!(context.select_rows(&[1])?.is_none(), "rows without context select to None");
+        Ok(())
+    }
+
+    #[test]
+    fn v6_embed_frames_keeps_row_63_as_content() -> Result<()> {
+        let device = Device::Cpu;
+        let (v6, _) = v6_model(&device, 3)?;
+        let v5_varmap = VarMap::new();
+        let v5 = WorldModel::new(
+            ModelConfig {
+                world_core_v6: false,
+                ..v6_cfg()
+            },
+            VarBuilder::from_varmap(&v5_varmap, DType::F32, &device),
+        )?;
+        reinit_varmap_deterministic(&v5_varmap, 3)?;
+        let (frames, _, _, _) = sample_batch(&device, 1, v6.config.goal_dim)?;
+        let mut pixels = frames.flatten_all()?.to_vec1::<u8>()?;
+        pixels[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+        let cleared = Tensor::from_vec(pixels, frames.dims(), &device)?;
+        assert!(max_abs_diff(&v6.encode_state(&frames)?, &v6.encode_state(&cleared)?)? > 0.0);
+        assert!(max_abs_diff(&v5.encode_state(&frames)?, &v5.encode_state(&cleared)?)? == 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn v6_default_config_parameter_budget() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = crate::p2::train::TrainConfig::default();
+        cfg.apply_foundation_v2_recipe();
+        let count = |v6: bool| -> Result<usize> {
+            let mut cfg = cfg.clone();
+            cfg.world_core_v6 = v6;
+            let varmap = VarMap::new();
+            WorldModel::new(
+                cfg.model_config(),
+                VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            )?;
+            Ok(crate::p2::train::parameter_count(&varmap))
+        };
+        let v5 = count(false)?;
+        let v6 = count(true)?;
+        println!("parameter count: default v5 = {v5}, default v6 = {v6} (context channel = {})", v6 - v5);
+        assert!(v6 <= 650_000, "ADR 0005 §3.2 budget exceeded: {v6}");
+        assert!(v6 > v5);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_weight_prefixes_match_real_parameter_names() -> Result<()> {
+        let device = Device::Cpu;
+        let (_, varmap) = v6_model(&device, 1)?;
+        let names = varmap
+            .data()
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let fast = names
+            .iter()
+            .filter(|name| is_fast_weight(name))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "encoder.patch.weight",
+            "encoder.patch.bias",
+            "pixel_emb.weight",
+            "action_film_gamma.weight",
+            "action_film_beta.bias",
+            "context_film_gamma.weight",
+            "context_film_beta.bias",
+        ] {
+            assert!(fast.contains(expected), "{expected} missing from fast set {fast:?}");
+        }
+        assert!(fast.iter().any(|name| name.starts_with("exact_grounding_head.")));
+        for frozen in [
+            "encoder.c2.weight",
+            "encoder.proj.weight",
+            "block.c1.weight",
+            "context_mlp_in.weight",
+            "context_fuse.weight",
+            "action_proj.weight",
+        ] {
+            assert!(names.contains(&frozen.to_string()), "{frozen} should exist");
+            assert!(!is_fast_weight(frozen), "{frozen} must be frozen");
+        }
+        Ok(())
+    }
+
+    /// The context path uses U8 `index_select`, `index_add` and `gather` on
+    /// the training device; exercise those kernels on CUDA when available and
+    /// check the summary agrees with the CPU reference.
+    #[test]
+    fn v6_context_summary_matches_cpu_on_cuda() -> Result<()> {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return Ok(());
+        };
+        let cpu = Device::Cpu;
+        let (cpu_model, cpu_vars) = v6_model(&cpu, 17)?;
+        let (cuda_model, cuda_vars) = v6_model(&cuda, 17)?;
+        {
+            // Same weights on both devices (name-seeded init is device-independent,
+            // but copy explicitly so the comparison does not rely on that).
+            let source = cpu_vars.data().lock().unwrap();
+            let target = cuda_vars.data().lock().unwrap();
+            for (name, var) in source.iter() {
+                target[name].set(&var.as_tensor().to_device(&cuda)?)?;
+            }
+            for name in ["context_film_gamma.weight", "context_film_beta.weight"] {
+                source[name].set(&Tensor::full(0.05f32, source[name].shape().dims(), &cpu)?)?;
+                target[name].set(&Tensor::full(0.05f32, target[name].shape().dims(), &cuda)?)?;
+            }
+        }
+        let lens = [0, 3, 1, 5];
+        let cpu_context = synthetic_context(&lens, &cpu)?;
+        let cuda_context = synthetic_context(&lens, &cuda)?;
+        let cpu_summary = cpu_model.context_summary(&cpu_context)?;
+        let cuda_summary = cuda_model.context_summary(&cuda_context)?.to_device(&cpu)?;
+        assert!(
+            max_abs_diff(&cpu_summary, &cuda_summary)? < 1e-4,
+            "CUDA context summary diverges from CPU"
+        );
+        let (frames, actions, coords, goals) = sample_batch(&cuda, 4, cuda_model.config.goal_dim)?;
+        let operator = unknown_operator_conditioning(4, &cuda)?;
+        let out = cuda_model.forward_with_depth_and_operator_conditioning_with_context(
+            &frames,
+            &actions,
+            &coords,
+            &goals,
+            &operator,
+            Some(&cuda_context),
+            RecursionDepth::from_config(&cuda_model.config),
+            0.0,
+            None,
+        )?;
+        let grads = out.y.sqr()?.mean_all()?.backward()?;
+        let data = cuda_vars.data().lock().unwrap();
+        let grad = grads
+            .get(data["context_mlp_in.weight"].as_tensor())
+            .expect("context MLP receives a CUDA gradient");
+        assert!(grad
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|g| g.is_finite()));
+        Ok(())
+    }
 }
