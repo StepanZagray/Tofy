@@ -49,6 +49,13 @@ Kaggle milestone regime; the grand prize is not a projected outcome.
 - Deterministic seeds; manifested, hashed checkpoints; fail-closed loaders.
 - Predictions never enter Factual Memory; adaptation trains on factual
   transitions only, never on imagined rollouts.
+- **No state crosses a game boundary** (owner decision, 2026-09-03). Fast
+  weights, context windows, factual buffers, the observed-state graph and any
+  calibration statistics are per game and are discarded when the game ends.
+  Experience across games lives only in the pretrained checkpoint. The Kaggle
+  rules would permit cross-environment persistence; Tofy does not use it,
+  because games differ enough that carried state is judged more likely to
+  mislead than to help, and no evidence shows a benefit at this scale.
 
 ## 1. Interface contract v6
 
