@@ -278,6 +278,11 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub world_core_v3: bool,
 
+    /// Render training rows under the ADR 0005 v6 data contract (whole-frame
+    /// content, free background, no status row, learning-history stream).
+    #[arg(long, default_value_t = false)]
+    pub data_contract_v6: bool,
+
     /// Planning-head readout from the final BxCx8x8 prediction.
     #[arg(long, value_enum, default_value_t = ConsumerReadoutTopology::GlobalMean)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -486,6 +491,7 @@ impl P2TrainArgs {
             world_core_v2: self.world_core_v2 || self.world_core_v3,
             world_core_v3: self.world_core_v3,
             world_core_v4: false,
+            data_contract_v6: self.data_contract_v6,
             consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,

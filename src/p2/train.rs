@@ -9,7 +9,8 @@ use crate::p2::cg_profile::{
 };
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
-    compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcFrame,
+    adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
+    generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
     MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance,
     FRAME_SIDE, GOAL_FEATURES_DIM,
@@ -1034,6 +1035,11 @@ pub struct TrainConfig {
     /// CPU workers allowed to compose foundation-v2 batches ahead of the GPU.
     #[serde(default = "default_data_workers")]
     pub data_workers: usize,
+    /// ADR 0005 data contract: whole-frame content, free background colour, no
+    /// status row, UNKNOWN conditioning, and the `LearningHistories` stream.
+    /// Off keeps every legacy data path byte-identical.
+    #[serde(default)]
+    pub data_contract_v6: bool,
     /// Intentionally checkpoint-incompatible action-faithful world core.
     #[serde(default)]
     pub world_core_v2: bool,
@@ -1267,6 +1273,7 @@ impl Default for TrainConfig {
             sigreg_global_mix: 0.0,
             prefetch_batches: true,
             data_workers: default_data_workers(),
+            data_contract_v6: false,
             world_core_v2: false,
             world_core_v3: false,
             world_core_v4: false,
@@ -1466,6 +1473,7 @@ impl TrainConfig {
             world_core_v3: self.world_core_v3,
             world_core_v4: self.world_core_v4,
             world_core_v5: self.recipe == TrainingRecipe::FoundationV2,
+            world_core_v6: false,
             consumer_readout: self.consumer_readout,
             copy_bypass_gate: self.copy_bypass_gate,
             copy_gate_bias_prior: self.copy_gate_bias_prior,
@@ -3041,7 +3049,8 @@ pub(crate) fn prepare_foundation_v2_batch_host(
         }
 
         let base = row * OPERATOR_CONDITION_DIM;
-        let operator = transition.provenance.operator.filter(|operator| {
+        // v6 rows always condition as UNKNOWN (ADR 0005 §1.4).
+        let operator = sample.provenance.conditioning_operator().filter(|operator| {
             matches!(
                 operator.family,
                 OperatorFamily::Teleport
@@ -3131,11 +3140,15 @@ pub(crate) fn prepare_foundation_v2_batch_host(
     };
     let mut model_frames = frames.clone();
     let mut model_next_frames = next_frames.clone();
-    for pixels in model_frames.chunks_exact_mut(frame_pixels) {
-        pixels[gameplay_pixels..].fill(0);
-    }
-    for pixels in model_next_frames.chunks_exact_mut(frame_pixels) {
-        pixels[gameplay_pixels..].fill(0);
+    // Legacy rows carry a synthetic status strip on row 63 that the model must
+    // not see; v6 rows have no status row (ADR 0005 §1.3), so row 63 stays.
+    if !mixed.contract_v6() {
+        for pixels in model_frames.chunks_exact_mut(frame_pixels) {
+            pixels[gameplay_pixels..].fill(0);
+        }
+        for pixels in model_next_frames.chunks_exact_mut(frame_pixels) {
+            pixels[gameplay_pixels..].fill(0);
+        }
     }
     Ok(PreparedFoundationV2BatchHost {
         batch_size,
@@ -8818,11 +8831,17 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     } else {
         resumed_from.clone()
     };
+    let stream_schedule = if cfg.data_contract_v6 {
+        adaptation_v6_stream_schedule
+    } else {
+        foundation_v2_stream_schedule
+    };
     let gate_batch = compose_mixed_stream_batch(
         &MixedStreamConfig {
             batch_size: FOUNDATION_V2_GATE_ROWS,
             seed: FOUNDATION_V2_GATE_SEED,
-            schedule: foundation_v2_stream_schedule,
+            schedule: stream_schedule,
+            data_contract_v6: cfg.data_contract_v6,
             ..MixedStreamConfig::default()
         },
         1.0,
@@ -8868,7 +8887,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
         seed: cfg.seed,
-        schedule: foundation_v2_stream_schedule,
+        schedule: stream_schedule,
+        data_contract_v6: cfg.data_contract_v6,
         ..MixedStreamConfig::default()
     };
     let mut updates_this_run = 0usize;

@@ -156,6 +156,11 @@ pub struct ModelConfig {
     /// enabling only the inverse-action heads required by ADR 0003.
     #[serde(default)]
     pub world_core_v5: bool,
+    /// ADR 0005 adaptation-first world core (context channel, whole-frame
+    /// content). Field only: consulted by the live driver for whole-frame
+    /// tried-action keys and ACTION6 proposals.
+    #[serde(default)]
+    pub world_core_v6: bool,
     /// Readout used only by Q/event/reliability planning heads.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -228,6 +233,7 @@ impl Default for ModelConfig {
             world_core_v3: false,
             world_core_v4: false,
             world_core_v5: false,
+            world_core_v6: false,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
             copy_bypass_gate: false,
             copy_gate_bias_prior: None,
@@ -3216,6 +3222,7 @@ mod tests {
         let cfg = ModelConfig {
             world_core_v4: true,
             world_core_v5: true,
+            world_core_v6: false,
             spatial_action_field: true,
             consumer_readout: ConsumerReadoutTopology::SpatialQuery,
             ..tiny_cfg()

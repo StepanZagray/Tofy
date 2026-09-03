@@ -5185,28 +5185,32 @@ fn generate_learning_history(
         let realized = policy_rng.random_range(0..actions.len());
         actions.swap(0, realized);
         let t = history.len();
-        for (index, action) in actions.into_iter().enumerate() {
-            let mut row = operator_sample_from_rendered_current(
-                &scenario,
-                &state,
-                current.clone(),
-                action,
-                operator,
-                "learning_history",
-                t as u64,
-            )?;
-            row.goal_features = GoalFeatures::encode(&goal);
-            let row = finalize(row, level_index, &history);
-            if index == 0 {
-                history.push(ContextTransition {
-                    current: row.current.clone(),
-                    action: row.action.clone(),
-                    next: row.next.clone(),
-                });
-                chronological.push(rows.len());
-            }
-            rows.push(row);
-        }
+        // The realized row and its same-state alternatives share one Context
+        // Window of strictly earlier transitions.
+        let operator_rows = actions
+            .into_iter()
+            .map(|action| {
+                let mut row = operator_sample_from_rendered_current(
+                    &scenario,
+                    &state,
+                    current.clone(),
+                    action,
+                    operator,
+                    "learning_history",
+                    t as u64,
+                )?;
+                row.goal_features = GoalFeatures::encode(&goal);
+                Ok(finalize(row, level_index, &history))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let realized_row = &operator_rows[0];
+        history.push(ContextTransition {
+            current: realized_row.current.clone(),
+            action: realized_row.action.clone(),
+            next: realized_row.next.clone(),
+        });
+        chronological.push(rows.len());
+        rows.extend(operator_rows);
     }
     Ok(LearningHistory {
         seed,
