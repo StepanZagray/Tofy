@@ -5,8 +5,7 @@
 
 use crate::p2::arc3_bridge::{run_arc3_bridge, Arc3BridgeConfig, Arc3BridgeMode};
 use crate::p2::arc3_live::{
-    LivePolicyKind,
-    evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
+    evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig, LivePolicyKind,
     DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
 };
 use crate::p2::bf16_falsifier::{
@@ -913,6 +912,16 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long)]
     pub phase_a_calibration: Option<PathBuf>,
 
+    /// ADR 0005 §6.2 Channel B: adapt the fast-weight subset on the current
+    /// game's own factual transitions; adapted weights are discarded at game end.
+    #[arg(long, default_value_t = false)]
+    pub adapt: bool,
+
+    /// Preregistered carry arm: keep adapted fast weights across levels within
+    /// a game instead of resetting to the prior at every level boundary.
+    #[arg(long, default_value_t = false, requires = "adapt")]
+    pub adapt_carry: bool,
+
     /// Use official competition semantics, where RESET retries the current
     /// level and cannot wipe progress in the game.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -998,6 +1007,8 @@ impl P2Arc3LiveEvalArgs {
             profile_eval: self.profile_eval,
             policy: self.policy,
             phase_a_calibration: self.phase_a_calibration.clone(),
+            adapt: self.adapt,
+            adapt_carry: self.adapt_carry,
         }
     }
 }
@@ -1072,6 +1083,16 @@ pub struct P2Arc3BridgeArgs {
     /// Phase A calibration artifact (JSON). Absent => fail-closed frontier mode.
     #[arg(long)]
     pub phase_a_calibration: Option<PathBuf>,
+
+    /// ADR 0005 §6.2 Channel B: adapt the fast-weight subset on the current
+    /// game's own factual transitions; adapted weights are discarded at game end.
+    #[arg(long, default_value_t = false)]
+    pub adapt: bool,
+
+    /// Preregistered carry arm: keep adapted fast weights across levels within
+    /// a game instead of resetting to the prior at every level boundary.
+    #[arg(long, default_value_t = false, requires = "adapt")]
+    pub adapt_carry: bool,
 }
 
 pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
@@ -1087,5 +1108,52 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         max_actions_per_game: args.max_actions_per_game,
         policy: args.policy,
         phase_a_calibration: args.phase_a_calibration,
+        adapt: args.adapt,
+        adapt_carry: args.adapt_carry,
     })
+}
+
+#[cfg(test)]
+mod adapt_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct LiveWrap {
+        #[command(flatten)]
+        args: P2Arc3LiveEvalArgs,
+    }
+
+    #[derive(Parser)]
+    struct BridgeWrap {
+        #[command(flatten)]
+        args: P2Arc3BridgeArgs,
+    }
+
+    #[test]
+    fn adapt_flags_parse_on_both_arc3_commands() {
+        let live = LiveWrap::try_parse_from(["x", "--adapt", "--adapt-carry"]).unwrap();
+        let config = live.args.to_config();
+        assert!(config.adapt && config.adapt_carry);
+        assert!(config.validate().is_ok());
+        let off = LiveWrap::try_parse_from(["x"]).unwrap().args.to_config();
+        assert!(!off.adapt && !off.adapt_carry);
+        assert!(
+            LiveWrap::try_parse_from(["x", "--adapt-carry"]).is_err(),
+            "--adapt-carry requires --adapt"
+        );
+
+        let bridge = BridgeWrap::try_parse_from([
+            "x",
+            "--mode",
+            "serve",
+            "--checkpoint",
+            "m.safetensors",
+            "--train-config",
+            "c.json",
+            "--adapt",
+        ])
+        .unwrap();
+        assert!(bridge.args.adapt && !bridge.args.adapt_carry);
+    }
 }

@@ -1082,6 +1082,7 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             },
             candidate_count: actions.len(),
             phase_a: Some(trace),
+            adaptation: None,
         })
     }
 
