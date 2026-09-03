@@ -4,7 +4,7 @@
 //! Wiring into the top-level CLI is owned by the primary agent.
 
 use crate::p2::arc3_bridge::{run_arc3_bridge, Arc3BridgeConfig, Arc3BridgeMode};
-use crate::p2::arc3_live::{
+use crate::p2::arc3_live::{LivePolicyKind, 
     evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig,
     DEFAULT_MAX_ACTIONS_PER_LEVEL, DEFAULT_MAX_LEVEL_RETRIES, DEFAULT_TRIED_PENALTY,
 };
@@ -903,6 +903,15 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long)]
     pub max_actions_per_game: Option<u32>,
 
+    /// Decision controller. `greedy` is the byte-equivalent historical policy;
+    /// `phase-a` is the ADR 0004 falsification controller.
+    #[arg(long, value_enum, default_value_t = LivePolicyKind::Greedy)]
+    pub policy: LivePolicyKind,
+
+    /// Phase A calibration artifact (JSON). Absent => fail-closed frontier mode.
+    #[arg(long)]
+    pub phase_a_calibration: Option<PathBuf>,
+
     /// Use official competition semantics, where RESET retries the current
     /// level and cannot wipe progress in the game.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -986,6 +995,8 @@ impl P2Arc3LiveEvalArgs {
                 .clone()
                 .unwrap_or_else(|| output_parent.join("recordings")),
             profile_eval: self.profile_eval,
+            policy: self.policy,
+            phase_a_calibration: self.phase_a_calibration.clone(),
         }
     }
 }
@@ -1051,6 +1062,15 @@ pub struct P2Arc3BridgeArgs {
     /// Optional game-wide action cap for bounded offline toolkit checks.
     #[arg(long)]
     pub max_actions_per_game: Option<u32>,
+
+    /// Decision controller. `greedy` is the byte-equivalent historical policy;
+    /// `phase-a` is the ADR 0004 falsification controller.
+    #[arg(long, value_enum, default_value_t = LivePolicyKind::Greedy)]
+    pub policy: LivePolicyKind,
+
+    /// Phase A calibration artifact (JSON). Absent => fail-closed frontier mode.
+    #[arg(long)]
+    pub phase_a_calibration: Option<PathBuf>,
 }
 
 pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
@@ -1064,5 +1084,7 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         profile_eval: args.profile_eval,
         seed: args.seed,
         max_actions_per_game: args.max_actions_per_game,
+        policy: args.policy,
+        phase_a_calibration: args.phase_a_calibration,
     })
 }

@@ -43,6 +43,49 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const LIVE_REPORT_SCHEMA: &str = "p2.arc3_live_report.v4";
 pub const LIVE_POLICY: &str = "model_reliable_effect_v1";
+
+/// Which controller drives live decisions. `Greedy` is the historical
+/// searchless policy and stays byte-equivalent; `PhaseA` is ADR 0004.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LivePolicyKind {
+    #[default]
+    Greedy,
+    PhaseA,
+}
+
+/// Report-facing description of the deployed controller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyContract {
+    pub name: String,
+    pub limitation: String,
+    pub goal_feature_contract: String,
+}
+
+impl PolicyContract {
+    pub fn greedy() -> Self {
+        Self {
+            name: LIVE_POLICY.into(),
+            limitation: POLICY_LIMITATION.into(),
+            goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),
+        }
+    }
+
+    pub fn phase_a() -> Self {
+        Self {
+            name: crate::p2::arc3_phase_a::PHASE_A_POLICY.into(),
+            limitation: crate::p2::arc3_phase_a::PHASE_A_POLICY_LIMITATION.into(),
+            goal_feature_contract: crate::p2::arc3_phase_a::PHASE_A_GOAL_FEATURE_CONTRACT.into(),
+        }
+    }
+
+    pub fn for_kind(kind: LivePolicyKind) -> Self {
+        match kind {
+            LivePolicyKind::Greedy => Self::greedy(),
+            LivePolicyKind::PhaseA => Self::phase_a(),
+        }
+    }
+}
 const POLICY_LIMITATION: &str = "The checkpoint predicts composed next-frame accuracy, latent self-confidence, no-op probability, and latent action effect; it has no trained reward/value head. Real games provide no synthetic episode operator, so inference uses the UNKNOWN rule token with neutral colors. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
 const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content";
@@ -75,6 +118,10 @@ pub struct LiveEvalConfig {
     pub output: PathBuf,
     pub recordings_dir: PathBuf,
     pub profile_eval: bool,
+    /// Decision controller; defaults to the byte-equivalent greedy policy.
+    pub policy: LivePolicyKind,
+    /// ADR 0004 Phase A calibration artifact; absent => fail-closed frontier mode.
+    pub phase_a_calibration: Option<PathBuf>,
 }
 
 impl LiveEvalConfig {
@@ -984,10 +1031,19 @@ pub struct ActionScore {
 pub struct ActionDecision {
     pub chosen: ActionScore,
     pub candidate_count: usize,
+    /// Present only for the ADR 0004 Phase A controller; absent (and never
+    /// serialized) for the greedy policy so its traces stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_a: Option<crate::p2::arc3_phase_a::PhaseADecisionTrace>,
 }
 
 pub trait LivePolicy {
     fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision>;
+
+    /// Stable identifier of the deployed controller for telemetry rows.
+    fn policy_name(&self) -> &'static str {
+        LIVE_POLICY
+    }
 
     /// Register the fixed public-game population before any scorecard action.
     fn on_suite_start(&mut self, _games: &[PublicGame]) -> Result<()> {
@@ -1328,6 +1384,7 @@ impl LivePolicy for ModelPolicy<'_> {
         let decision = ActionDecision {
             chosen,
             candidate_count: candidates.len(),
+        phase_a: None,
         };
         if let Some(capture) = profile.as_ref() {
             let metrics = capture.phase("metrics", SpanKind::Function, None);
@@ -1418,15 +1475,26 @@ impl LivePolicy for ModelPolicy<'_> {
 }
 
 pub(crate) fn decision_telemetry(decision: &ActionDecision) -> Value {
-    json!({
-        "policy": LIVE_POLICY,
+    let policy = if decision.phase_a.is_some() {
+        crate::p2::arc3_phase_a::PHASE_A_POLICY
+    } else {
+        LIVE_POLICY
+    };
+    let mut telemetry = json!({
+        "policy": policy,
         "score": decision.chosen.score,
         "q_probability": decision.chosen.q_probability,
         "reliability_probability": decision.chosen.reliability_probability,
         "noop_probability": decision.chosen.noop_probability,
         "predicted_effect": decision.chosen.predicted_effect,
         "candidate_count": decision.candidate_count,
-    })
+    });
+    if let Some(trace) = &decision.phase_a {
+        if let Ok(value) = serde_json::to_value(trace) {
+            telemetry["phase_a"] = value;
+        }
+    }
+    telemetry
 }
 
 /// Soft tried-action demotion. Once every candidate has been tried the
@@ -1743,6 +1811,8 @@ pub struct LiveRunSettings {
     pub cli_args: Vec<String>,
     pub evidence_class: String,
     pub recordings_dir: Option<PathBuf>,
+    /// Deployed controller contract recorded in the report and scorecard.
+    pub contract: PolicyContract,
 }
 
 /// Evidence class at scorecard-open time. A clean worktree earns only
@@ -1786,7 +1856,7 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
             "schema": LIVE_REPORT_SCHEMA,
             "checkpoint_sha256": settings.checkpoint_sha256,
             "train_config_sha256": settings.train_config_sha256,
-            "policy": LIVE_POLICY,
+            "policy": settings.contract.name,
             "public_data_used_for_fitting": false,
         }
     });
@@ -2176,9 +2246,9 @@ pub fn run_public_suite<A: ArcApi, P: LivePolicy>(
         build_profile: settings.build_profile.clone(),
         cli_args: settings.cli_args.clone(),
         evidence_class,
-        policy: LIVE_POLICY.into(),
-        policy_limitation: POLICY_LIMITATION.into(),
-        goal_feature_contract: GOAL_FEATURE_CONTRACT.into(),
+        policy: settings.contract.name.clone(),
+        policy_limitation: settings.contract.limitation.clone(),
+        goal_feature_contract: settings.contract.goal_feature_contract.clone(),
         tried_action_key_contract: TRIED_ACTION_KEY_CONTRACT.into(),
         driver: settings.driver.clone(),
         held_out_only: true,
@@ -2244,26 +2314,6 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
     let (model, _varmap) = load_model(&train_config, &config.checkpoint, &device)?;
-    let mut policy = ModelPolicy::new(
-        &model,
-        &device,
-        config.physical_batch,
-        config.action6_max_candidates,
-        config.action6_grid_stride,
-        config.driver.tried_penalty,
-    );
-    if config.profile_eval {
-        let output_dir = config
-            .output
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        policy.enable_eval_profile(
-            output_dir,
-            format!("tofy.p2.arc3.{checkpoint_sha256}"),
-            &config.device,
-        );
-    }
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -2271,7 +2321,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     )?;
     let settings = LiveRunSettings {
         checkpoint: config.checkpoint.clone(),
-        checkpoint_sha256,
+        checkpoint_sha256: checkpoint_sha256.clone(),
         train_config: config.train_config.clone(),
         train_config_sha256,
         device: config.device.clone(),
@@ -2286,8 +2336,48 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         cli_args: provenance.cli_args,
         evidence_class: live_evidence_class(&config.driver).into(),
         recordings_dir: Some(config.recordings_dir.clone()),
+        contract: PolicyContract::for_kind(config.policy),
     };
-    let report = run_public_suite(&mut api, &mut policy, &settings)?;
+    let report = match config.policy {
+        LivePolicyKind::Greedy => {
+            let mut policy = ModelPolicy::new(
+                &model,
+                &device,
+                config.physical_batch,
+                config.action6_max_candidates,
+                config.action6_grid_stride,
+                config.driver.tried_penalty,
+            );
+            if config.profile_eval {
+                let output_dir = config
+                    .output
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                policy.enable_eval_profile(
+                    output_dir,
+                    format!("tofy.p2.arc3.{checkpoint_sha256}"),
+                    &config.device,
+                );
+            }
+            run_public_suite(&mut api, &mut policy, &settings)?
+        }
+        LivePolicyKind::PhaseA => {
+            let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
+                config.phase_a_calibration.as_deref(),
+            )?;
+            let mut policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
+                &model,
+                &device,
+                config.physical_batch,
+                crate::p2::latent_planning::config::PhaseAConfig::default(),
+                calibration,
+                config.action6_max_candidates,
+                config.action6_grid_stride,
+            )?;
+            run_public_suite(&mut api, &mut policy, &settings)?
+        }
+    };
     write_json_atomic(&config.output, &report)?;
     Ok(report)
 }
@@ -3027,6 +3117,7 @@ mod tests {
                     predicted_effect: 1.0,
                 },
                 candidate_count: 1,
+                phase_a: None,
             })
         }
     }
@@ -3150,6 +3241,7 @@ mod tests {
             cli_args: vec!["p2-arc3-live-eval".into()],
             evidence_class,
             recordings_dir: None,
+            contract: PolicyContract::greedy(),
         }
     }
 
@@ -3723,10 +3815,14 @@ mod tests {
         for (path, source) in &sources {
             if matches!(
                 path.as_str(),
+                // Live/eval-side modules only. `arc3_phase_a.rs` is the ADR
+                // 0004 controller: it is constructed from the live driver and
+                // the bridge, and no training-reachable source imports it.
                 "p2/agent_session.rs"
                     | "p2/arc3.rs"
                     | "p2/arc3_bridge.rs"
                     | "p2/arc3_live.rs"
+                    | "p2/arc3_phase_a.rs"
                     | "p2/cli.rs"
             ) {
                 continue;

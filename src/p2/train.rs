@@ -11202,9 +11202,12 @@ mod tests {
         fs::create_dir_all(&root)?;
         let mut cfg = TrainConfig::default();
         cfg.output_dir = root.clone();
+        // Gate policy v6 aborts only after three consecutive counting
+        // failures of the same gate.
         let foundation = checkpoint_foundation_state(vec![
             checkpoint_gate_evaluation(1_024, 0.1, false),
             checkpoint_gate_evaluation(2_048, 0.1, false),
+            checkpoint_gate_evaluation(3_072, 0.1, false),
         ]);
         assert!(ensure_foundation_v2_resume_not_aborted(&cfg, Some(&foundation)).is_err());
         cfg.resume_after_abort = true;

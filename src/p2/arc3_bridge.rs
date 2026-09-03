@@ -3,9 +3,9 @@
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::arc3_live::{
     decision_telemetry, live_evidence_class, live_run_provenance, run_public_suite, sha256_file,
-    write_json_atomic, AmbiguousMutation, ApiObservation, ArcApi, ArcObservation,
-    LiveDriverOptions, LivePolicy, LiveRecordingRun, LiveRunSettings, ModelPolicy, MutationError,
-    MutationResult, PublicGame, DEFAULT_TRIED_PENALTY, LIVE_POLICY,
+    write_json_atomic, ActionDecision, AmbiguousMutation, ApiObservation, ArcApi, ArcObservation,
+    LiveDriverOptions, LivePolicy, LivePolicyKind, LiveRecordingRun, LiveRunSettings, ModelPolicy,
+    MutationError, MutationResult, PolicyContract, PublicGame, DEFAULT_TRIED_PENALTY,
 };
 use crate::p2::data::ArcAction;
 use crate::p2::eval::load_model;
@@ -41,6 +41,8 @@ pub struct Arc3BridgeConfig {
     pub profile_eval: bool,
     pub seed: Option<u64>,
     pub max_actions_per_game: Option<u32>,
+    pub policy: LivePolicyKind,
+    pub phase_a_calibration: Option<PathBuf>,
 }
 
 impl Arc3BridgeConfig {
@@ -74,19 +76,35 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
     let (model, _varmap) = load_model(&train_config, &config.checkpoint, &device)?;
-    let mut policy = ModelPolicy::new(
-        &model,
-        &device,
-        PHYSICAL_BATCH,
-        ACTION6_MAX_CANDIDATES,
-        ACTION6_GRID_STRIDE,
-        DEFAULT_TRIED_PENALTY,
-    );
+    let mut policy = match config.policy {
+        LivePolicyKind::Greedy => BridgePolicy::Greedy(ModelPolicy::new(
+            &model,
+            &device,
+            PHYSICAL_BATCH,
+            ACTION6_MAX_CANDIDATES,
+            ACTION6_GRID_STRIDE,
+            DEFAULT_TRIED_PENALTY,
+        )),
+        LivePolicyKind::PhaseA => {
+            let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
+                config.phase_a_calibration.as_deref(),
+            )?;
+            BridgePolicy::PhaseA(crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
+                &model,
+                &device,
+                PHYSICAL_BATCH,
+                crate::p2::latent_planning::config::PhaseAConfig::default(),
+                calibration,
+                ACTION6_MAX_CANDIDATES,
+                ACTION6_GRID_STRIDE,
+            )?)
+        }
+    };
 
     match config.mode {
         Arc3BridgeMode::Drive => {
             let output = config.output.as_deref().expect("validated drive output");
-            if config.profile_eval {
+            if let (true, BridgePolicy::Greedy(policy)) = (config.profile_eval, &mut policy) {
                 policy.enable_eval_profile(
                     output_parent(output),
                     format!("tofy.p2.arc3.{checkpoint_sha256}"),
@@ -116,6 +134,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 cli_args: provenance.cli_args,
                 evidence_class: live_evidence_class(&driver).into(),
                 recordings_dir: config.recordings_dir.clone(),
+                contract: PolicyContract::for_kind(config.policy),
             };
             let mut api = StdioArcApi::new(reader, writer);
             let report = run_public_suite(&mut api, &mut policy, &settings);
@@ -132,7 +151,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
             Ok(())
         }
         Arc3BridgeMode::Serve => {
-            if config.profile_eval {
+            if let (true, BridgePolicy::Greedy(policy)) = (config.profile_eval, &mut policy) {
                 let anchor = config
                     .output
                     .as_deref()
@@ -405,6 +424,63 @@ struct ServeStream {
     policy_started: bool,
 }
 
+/// Either deployed controller behind one `LivePolicy` surface.
+enum BridgePolicy<'a> {
+    Greedy(ModelPolicy<'a>),
+    PhaseA(crate::p2::arc3_phase_a::PhaseAPolicy<crate::p2::arc3_phase_a::TensorPhaseAAdapter<'a>>),
+}
+
+impl LivePolicy for BridgePolicy<'_> {
+    fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+        match self {
+            Self::Greedy(p) => p.choose_action(observation),
+            Self::PhaseA(p) => p.choose_action(observation),
+        }
+    }
+    fn policy_name(&self) -> &'static str {
+        match self {
+            Self::Greedy(p) => p.policy_name(),
+            Self::PhaseA(p) => p.policy_name(),
+        }
+    }
+    fn on_suite_start(&mut self, games: &[PublicGame]) -> Result<()> {
+        match self {
+            Self::Greedy(p) => p.on_suite_start(games),
+            Self::PhaseA(p) => p.on_suite_start(games),
+        }
+    }
+    fn on_game_start(&mut self, game_id: &str) {
+        match self {
+            Self::Greedy(p) => p.on_game_start(game_id),
+            Self::PhaseA(p) => p.on_game_start(game_id),
+        }
+    }
+    fn on_level_transition(&mut self, levels_completed: u16) {
+        match self {
+            Self::Greedy(p) => p.on_level_transition(levels_completed),
+            Self::PhaseA(p) => p.on_level_transition(levels_completed),
+        }
+    }
+    fn on_reset_retry(&mut self, reason: &str) {
+        match self {
+            Self::Greedy(p) => p.on_reset_retry(reason),
+            Self::PhaseA(p) => p.on_reset_retry(reason),
+        }
+    }
+    fn on_game_end(&mut self, outcome: &str) {
+        match self {
+            Self::Greedy(p) => p.on_game_end(outcome),
+            Self::PhaseA(p) => p.on_game_end(outcome),
+        }
+    }
+    fn finish_session(&mut self) -> Result<()> {
+        match self {
+            Self::Greedy(p) => p.finish_session(),
+            Self::PhaseA(p) => p.finish_session(),
+        }
+    }
+}
+
 fn run_serve_loop<R: BufRead, W: Write, P: LivePolicy>(
     mut reader: R,
     mut writer: W,
@@ -537,7 +613,7 @@ fn serve_observation<P: LivePolicy>(
                 "x": null,
                 "y": null,
                 "telemetry": {
-                    "policy": LIVE_POLICY,
+                    "policy": policy.policy_name(),
                     "terminal_reset": true,
                 }
             }
@@ -793,6 +869,7 @@ mod tests {
                     predicted_effect: 1.0,
                 },
                 candidate_count: 1,
+                phase_a: None,
             })
         }
     }
