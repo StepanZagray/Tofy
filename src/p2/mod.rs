@@ -23,6 +23,7 @@ pub mod muon;
 pub mod optimizer;
 pub mod prefetch;
 pub mod representation;
+pub mod residual_probe;
 pub mod rhae;
 pub mod semantic_eval;
 pub mod sigreg;

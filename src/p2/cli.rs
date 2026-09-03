@@ -1089,3 +1089,6 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         phase_a_calibration: args.phase_a_calibration,
     })
 }
+
+/// `p2-residual-probe` — ADR 0005 §5.3 residual-vs-reliability probe (frozen checkpoint).
+pub use crate::p2::residual_probe::{run_p2_residual_probe, P2ResidualProbeArgs};
