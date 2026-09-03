@@ -467,9 +467,9 @@ fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [
     // so translated V5 content is classified as content, not padding.
     let origin_x = usize::from(sample.provenance.content_x);
     let origin_y = usize::from(sample.provenance.content_y);
-    let width = usize::from(sample.provenance.content_width).min(FRAME_SIDE.saturating_sub(origin_x));
-    let height =
-        usize::from(sample.provenance.content_height).min(rows.saturating_sub(origin_y));
+    let width =
+        usize::from(sample.provenance.content_width).min(FRAME_SIDE.saturating_sub(origin_x));
+    let height = usize::from(sample.provenance.content_height).min(rows.saturating_sub(origin_y));
     for y in origin_y..origin_y + height {
         for x in origin_x..origin_x + width {
             content[y * FRAME_SIDE + x] = true;
@@ -1229,8 +1229,8 @@ pub fn evaluate_semantics_with_control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2::data::palette;
     use crate::domain::Split;
+    use crate::p2::data::palette;
     use crate::p2::data::{
         compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcAction,
         ArcFrame, ContentRect, D4Transform, EpisodeOperator, GoalFeatures, MixedStreamConfig,
