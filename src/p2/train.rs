@@ -10,7 +10,7 @@ use crate::p2::cg_profile::{
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
-    generate_curriculum, ArcFrame,
+    gameplay_rows, generate_curriculum, ArcFrame,
     ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
     MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance,
     FRAME_SIDE, GOAL_FEATURES_DIM,
@@ -2976,6 +2976,8 @@ pub struct PreparedFoundationV2BatchHost {
     foreground_count: usize,
     background_count: usize,
     foreground_weight: f64,
+    /// Supervised board rows: 63 for legacy rows, 64 under ADR 0005 §1.1.
+    gameplay_rows: usize,
 }
 
 fn validate_frame_pixels(frame: &ArcFrame) -> Result<()> {
@@ -3002,7 +3004,10 @@ pub(crate) fn prepare_foundation_v2_batch_host(
     }
     let batch_size = samples.len();
     let frame_pixels = FRAME_SIDE * FRAME_SIDE;
-    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let whole_frame = mixed.contract_v6();
+    let rows = gameplay_rows(whole_frame);
+    let gameplay_pixels = rows * FRAME_SIDE;
+    let mut background_colors = Vec::with_capacity(batch_size);
     let mut frames = Vec::with_capacity(batch_size * frame_pixels);
     let mut next_frames = Vec::with_capacity(batch_size * frame_pixels);
     let mut actions = Vec::with_capacity(batch_size);
@@ -3029,6 +3034,7 @@ pub(crate) fn prepare_foundation_v2_batch_host(
         current_pixels.extend_from_slice(&transition.current.pixels[..gameplay_pixels]);
         target_pixels.extend_from_slice(&transition.next.pixels[..gameplay_pixels]);
         content_mask_u8.extend_from_slice(&sample.content_mask.values[..gameplay_pixels]);
+        background_colors.push(transition.provenance.background_color);
 
         let id = u32::from(transition.action.id);
         if id >= ACTION_VOCAB as u32 {
@@ -3123,10 +3129,18 @@ pub(crate) fn prepare_foundation_v2_batch_host(
         .zip(&content_mask_u8)
         .map(|(changed, content)| f32::from(*content != 0) - changed)
         .collect::<Vec<_>>();
+    // Foreground is every content pixel that is not the row's rendered EMPTY
+    // colour (ADR 0005 §1.2); legacy rows render EMPTY as index 0.
     let foreground_values = current_pixels
-        .iter()
-        .zip(&content_mask_u8)
-        .map(|(pixel, content)| f32::from(*content != 0 && *pixel != 0))
+        .chunks_exact(gameplay_pixels)
+        .zip(content_mask_u8.chunks_exact(gameplay_pixels))
+        .zip(&background_colors)
+        .flat_map(|((pixels, content), background)| {
+            pixels
+                .iter()
+                .zip(content)
+                .map(move |(pixel, content)| f32::from(*content != 0 && pixel != background))
+        })
         .collect::<Vec<_>>();
     let foreground_count = foreground_values
         .iter()
@@ -3142,7 +3156,7 @@ pub(crate) fn prepare_foundation_v2_batch_host(
     let mut model_next_frames = next_frames.clone();
     // Legacy rows carry a synthetic status strip on row 63 that the model must
     // not see; v6 rows have no status row (ADR 0005 §1.3), so row 63 stays.
-    if !mixed.contract_v6() {
+    if !whole_frame {
         for pixels in model_frames.chunks_exact_mut(frame_pixels) {
             pixels[gameplay_pixels..].fill(0);
         }
@@ -3171,6 +3185,7 @@ pub(crate) fn prepare_foundation_v2_batch_host(
         foreground_count,
         background_count,
         foreground_weight,
+        gameplay_rows: rows,
     })
 }
 
@@ -5436,16 +5451,16 @@ fn foundation_v2_graded_q_targets_from_parts(
     next_frames: &Tensor,
     content: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    let batch_size = predicted_logits.dim(0)?;
-    if content.dims() != [batch_size, FRAME_SIDE - 1, FRAME_SIDE] {
+    let (batch_size, rows, _, _) = predicted_logits.dims4()?;
+    if content.dims() != [batch_size, rows, FRAME_SIDE] {
         bail!("foundation-v2 Q content mask has the wrong shape");
     }
     let current_labels = current_frames
-        .narrow(2, 0, FRAME_SIDE - 1)?
+        .narrow(2, 0, rows)?
         .squeeze(1)?
         .to_dtype(DType::U32)?;
     let target_labels = next_frames
-        .narrow(2, 0, FRAME_SIDE - 1)?
+        .narrow(2, 0, rows)?
         .squeeze(1)?
         .to_dtype(DType::U32)?;
     let composed =
@@ -5575,31 +5590,40 @@ fn foundation_v2_training_loss_with_event_weights(
     let content_predicted_canonical =
         model.canonical_representation(&out.y.broadcast_mul(&latent_mask)?)?;
     let batch_size = host.batch_size;
+    let rows = host.gameplay_rows;
+    // ADR 0005 §1.1: a v6 batch supervises all 64 rows and therefore needs a
+    // decoder that emits them; a legacy batch needs the 63-row decoder.
+    if gameplay_rows(model.config().world_core_v6) != rows {
+        bail!(
+            "data contract supervises {rows} rows but the model decodes {}; set data_contract_v6 and world_core_v6 together",
+            gameplay_rows(model.config().world_core_v6)
+        );
+    }
     let changed_weights = host.changed_weights;
     let content = Tensor::from_vec(
         host.content_values.clone(),
-        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        (batch_size, rows, FRAME_SIDE),
         device,
     )?;
     let changed = Tensor::from_vec(
         host.changed_values.clone(),
-        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        (batch_size, rows, FRAME_SIDE),
         device,
     )?;
     let unchanged = Tensor::from_vec(
         host.unchanged_values.clone(),
-        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        (batch_size, rows, FRAME_SIDE),
         device,
     )?;
     let current_labels = batch
         .frames
-        .narrow(2, 0, FRAME_SIDE - 1)?
+        .narrow(2, 0, rows)?
         .squeeze(1)?
         .to_dtype(DType::U32)?
         .contiguous()?;
     let target_labels = batch
         .next_frames
-        .narrow(2, 0, FRAME_SIDE - 1)?
+        .narrow(2, 0, rows)?
         .squeeze(1)?
         .to_dtype(DType::U32)?
         .contiguous()?;
@@ -5627,7 +5651,7 @@ fn foundation_v2_training_loss_with_event_weights(
 
     let foreground = Tensor::from_vec(
         host.foreground_values.clone(),
-        (batch_size, FRAME_SIDE - 1, FRAME_SIDE),
+        (batch_size, rows, FRAME_SIDE),
         device,
     )?;
     let background = content.sub(&foreground)?;
@@ -11499,6 +11523,31 @@ mod tests {
                 .iter()
                 .all(|value| *value == 0.0));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn v6_batch_conditions_unknown_and_keeps_row_63_in_model_frames() -> Result<()> {
+        let mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 128,
+                seed: 0x7606,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            0.0,
+            0,
+            V5DataSplit::Train,
+        )?;
+        let host = prepare_foundation_v2_batch_host(&mixed)?;
+        for row in host.operator_conditioning.chunks_exact(OPERATOR_CONDITION_DIM) {
+            assert_eq!(row[OPERATOR_FAMILY_UNKNOWN], 1.0);
+            assert_eq!(row.iter().sum::<f32>(), 1.0, "v6 rows carry no colour triple");
+        }
+        assert_eq!(host.model_frames, host.frames);
+        assert_eq!(host.model_next_frames, host.next_frames);
+        assert!(host.latent_content_mask.iter().all(|&value| value == 1.0));
         Ok(())
     }
 

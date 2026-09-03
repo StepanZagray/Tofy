@@ -2954,6 +2954,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v6_tried_action_key_and_proposals_treat_row_63_as_board() -> Result<()> {
+        // Background colour 5 with a palette-0 pixel on row 63: the legacy key
+        // treats it as padding, the v6 key hashes every pixel.
+        let mut base = observation("game", "NOT_FINISHED", vec![1, 6]);
+        base.frame = frame(5);
+        let mut row63 = base.clone();
+        row63.frame.pixels[63 * FRAME_SIDE + 7] = 0;
+        assert_eq!(observation_hash(&base), observation_hash(&row63));
+        assert_ne!(
+            observation_hash_with(&base, true),
+            observation_hash_with(&row63, true)
+        );
+        let legacy = enumerate_actions(&row63, 8, 1)?;
+        assert!(legacy.iter().all(|action| action.y != Some(63)));
+        let whole_frame = enumerate_actions_with(&row63, 8, 1, true)?;
+        assert!(whole_frame
+            .iter()
+            .any(|action| action.id == 6 && action.y == Some(63)));
+        Ok(())
+    }
+
     fn scored_action(id: u8, score: f64) -> ActionScore {
         ActionScore {
             action: ArcAction::new(id, None, None).unwrap(),

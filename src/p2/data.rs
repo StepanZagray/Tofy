@@ -970,6 +970,21 @@ pub struct TransitionProvenance {
     /// Number of context transitions carried by the row (ADR 0005 §2.4).
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub context_len: u8,
+    /// Rendered colour of semantic EMPTY (ADR 0005 §1.2). Zero for legacy rows;
+    /// v6 rows carry the permuted EMPTY so no consumer treats index 0 as
+    /// background.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub background_color: u8,
+}
+
+/// Rows of a frame that are board content: 63 under the legacy status-row
+/// contract, all 64 under Whole-Frame Content (ADR 0005 §1.1).
+pub const fn gameplay_rows(whole_frame: bool) -> usize {
+    if whole_frame {
+        FRAME_SIDE
+    } else {
+        FRAME_SIDE - 1
+    }
 }
 
 /// All eight ARC-AGI-3 actions (RESET, ACTION1..7) available.
@@ -1036,6 +1051,7 @@ impl TransitionProvenance {
             level_index: 0,
             available_actions: 0,
             context_len: 0,
+            background_color: 0,
         }
     }
 
@@ -1052,6 +1068,7 @@ impl TransitionProvenance {
             level_index: 0,
             available_actions: 0,
             context_len: 0,
+            background_color: 0,
         }
     }
 }
@@ -2397,6 +2414,7 @@ fn augment_v5_transition(
         // below keeps the permuted operator for counterfactual replay.
         transition.provenance.operator = None;
         transition.provenance.available_actions = ALL_ACTIONS_AVAILABLE;
+        transition.provenance.background_color = operator.empty_color;
         transition.provenance.context_len = u8::try_from(transition.context.len())
             .map_err(|_| anyhow!("context window exceeds u8"))?;
         if transition.provenance.rule_id == 0 {
@@ -5873,5 +5891,333 @@ mod tests {
     fn pad_rejects_oversize_without_interpolation() {
         let big = ArcFrame::new(65, 1, vec![0; 65]).unwrap();
         assert!(big.to_fixed_64().is_err());
+    }
+
+    // ---- ADR 0005 v6 data contract -------------------------------------
+
+    fn v6_config(batch_size: usize, seed: u64) -> MixedStreamConfig {
+        MixedStreamConfig {
+            batch_size,
+            seed,
+            schedule: adaptation_v6_stream_schedule,
+            data_contract_v6: true,
+            ..MixedStreamConfig::default()
+        }
+    }
+
+    fn padding_is(frame: &ArcFrame, rect: ContentRect, color: u8) -> bool {
+        frame.pixels.iter().enumerate().all(|(index, &pixel)| {
+            let x = (index % FRAME_SIDE) as u8;
+            let y = (index / FRAME_SIDE) as u8;
+            rect.contains(x, y) || pixel == color
+        })
+    }
+
+    fn approx(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn adaptation_v6_schedule_sums_to_one_and_ramps_learning_histories() {
+        for (progress, expected) in [(0.0, 0.25), (0.5, 0.375), (1.0, 0.5)] {
+            let schedule = adaptation_v6_stream_schedule(progress);
+            approx(schedule.total(), 1.0);
+            approx(schedule.learning_histories, expected);
+            // Legacy streams keep their ADR 0003 ratios.
+            let legacy = foundation_v2_stream_schedule(progress);
+            approx(
+                schedule.random_one_step / schedule.factual_branches,
+                legacy.random_one_step / legacy.factual_branches,
+            );
+            approx(
+                schedule.hazard_one_step / schedule.exploration,
+                legacy.hazard_one_step / legacy.exploration,
+            );
+        }
+        assert_eq!(foundation_v2_stream_schedule(0.5).learning_histories, 0.0);
+    }
+
+    #[test]
+    fn legacy_config_rejects_the_learning_history_schedule() {
+        let config = MixedStreamConfig {
+            schedule: adaptation_v6_stream_schedule,
+            ..MixedStreamConfig::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(v6_config(512, 1).validate().is_ok());
+    }
+
+    #[test]
+    fn v6_rows_are_whole_frame_free_background_and_status_free() -> Result<()> {
+        let config = v6_config(192, 0x6006);
+        let mut saw_permuted_empty = false;
+        let mut saw_row_63 = false;
+        let mut saw_operator_row = false;
+        for batch_index in 0..4 {
+            let batch = compose_mixed_stream_batch(&config, 0.5, batch_index, V5DataSplit::Train)?;
+            assert!(batch.contract_v6());
+            assert!(batch.stream_counts()[&MixedStreamKind::LearningHistories] > 0);
+            for sample in batch.samples() {
+                sample.validate()?;
+                let provenance = &sample.provenance;
+                let rect = provenance.content_rect;
+                let permutation = provenance.augmentation.color_permutation;
+                let empty = permutation[usize::from(palette::EMPTY)];
+                assert!(provenance.contract_v6);
+                assert!(sample.content_mask.is_all_ones());
+                assert_eq!(sample.transition.provenance.operator, None);
+                assert_eq!(provenance.conditioning_operator(), None);
+                assert_eq!(
+                    sample.transition.provenance.available_actions,
+                    ALL_ACTIONS_AVAILABLE
+                );
+                assert_ne!(sample.transition.provenance.rule_id, 0);
+                assert_eq!(
+                    usize::from(sample.transition.provenance.context_len),
+                    sample.transition.context.len()
+                );
+                assert!(padding_is(&sample.transition.current, rect, empty));
+                assert!(padding_is(&sample.transition.next, rect, empty));
+                assert_eq!(provenance.operator.empty_color, empty);
+                assert_eq!(sample.transition.provenance.background_color, empty);
+                saw_permuted_empty |= empty != palette::EMPTY;
+                saw_row_63 |= usize::from(rect.y) + usize::from(rect.height) == FRAME_SIDE;
+                if matches!(sample.transition.action.id, 5 | 6) {
+                    saw_operator_row = true;
+                    let replayed = apply_episode_operator(
+                        &sample.transition.current,
+                        &sample.transition.action,
+                        rect,
+                        provenance.operator,
+                    )?;
+                    assert_eq!(
+                        replayed, sample.transition.next,
+                        "permuted operator must replay on the augmented whole frame"
+                    );
+                }
+            }
+        }
+        assert!(saw_permuted_empty, "v6 permutation must move index 0");
+        assert!(saw_row_63, "v6 content must be able to reach row 63");
+        assert!(saw_operator_row);
+        Ok(())
+    }
+
+    #[test]
+    fn v6_factual_effect_labels_cover_row_63() -> Result<()> {
+        let mut transition = generate_curriculum("factual_branches", 3, 0, Split::Train)?
+            .into_iter()
+            .next()
+            .expect("factual row");
+        transition.next = transition.current.clone();
+        transition.next.pixels[FRAME_SIDE * (FRAME_SIDE - 1) + 5] ^= 1;
+        let legacy = FactualActionBranch::try_from_transition(transition.clone())?;
+        assert!(!legacy.board_effect.changed);
+        let whole = FactualActionBranch::try_from_transition_whole_frame(transition)?;
+        assert!(whole.board_effect.changed);
+        assert!(whole.status_changed_cells.is_empty());
+        Ok(())
+    }
+
+    fn history_time(history: &LearningHistory, index: usize) -> usize {
+        let earlier = history
+            .chronological
+            .iter()
+            .filter(|&&position| position < index)
+            .count();
+        if history.chronological.contains(&index) {
+            earlier
+        } else {
+            earlier - 1
+        }
+    }
+
+    #[test]
+    fn learning_history_context_is_chronological_and_bounded() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        for meta_episode_id in 0..12u64 {
+            let (primary, twin) =
+                generate_learning_history_pair(0x4C48, meta_episode_id, V5DataSplit::Train, &families)?;
+            for history in [&primary, &twin] {
+                assert!(LEARNING_HISTORY_LEVELS.contains(&history.levels));
+                assert_eq!(
+                    history.rows.len(),
+                    history.levels
+                        * (LEARNING_HISTORY_STEPS_PER_LEVEL + LEARNING_HISTORY_OPERATOR_ACTIONS)
+                );
+                assert_eq!(
+                    history.chronological.len(),
+                    history.levels * (LEARNING_HISTORY_STEPS_PER_LEVEL + 1)
+                );
+                let timeline = history
+                    .chronological
+                    .iter()
+                    .map(|&index| {
+                        let row = &history.rows[index];
+                        ContextTransition {
+                            current: row.current.clone(),
+                            action: row.action.clone(),
+                            next: row.next.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for (index, row) in history.rows.iter().enumerate() {
+                    row.provenance.validate()?;
+                    let t = history_time(history, index);
+                    let k = row.context.len();
+                    assert!(k <= CONTEXT_WINDOW_MAX && k <= t);
+                    assert_eq!(usize::from(row.provenance.context_len), k);
+                    assert_eq!(row.context, timeline[t - k..t]);
+                    assert_eq!(row.provenance.rule_id, history.rule_id);
+                    assert_eq!(row.provenance.operator, Some(history.operator));
+                    assert!(usize::from(row.provenance.level_index) < history.levels);
+                    assert_eq!(row.family, "learning_history");
+                    assert_eq!(row.provenance.available_actions, ALL_ACTIONS_AVAILABLE);
+                }
+                // Each level ends with exactly one realized operator row.
+                let operator_rows = history
+                    .chronological
+                    .iter()
+                    .filter(|&&index| matches!(history.rows[index].action.id, 5 | 6))
+                    .count();
+                assert_eq!(operator_rows, history.levels);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn learning_history_context_length_distribution_keeps_the_no_context_prior() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        let mut unclipped = 0usize;
+        let mut zero = 0usize;
+        let mut max_k = 0usize;
+        for meta_episode_id in 0..120u64 {
+            let (primary, _) =
+                generate_learning_history_pair(0x4B4B, meta_episode_id, V5DataSplit::Train, &families)?;
+            for (index, row) in primary.rows.iter().enumerate() {
+                if history_time(&primary, index) < CONTEXT_WINDOW_MAX {
+                    continue;
+                }
+                unclipped += 1;
+                zero += usize::from(row.context.is_empty());
+                max_k = max_k.max(row.context.len());
+            }
+        }
+        assert!(unclipped > 500, "population too small: {unclipped}");
+        let zero_fraction = zero as f32 / unclipped as f32;
+        assert!(
+            (0.10..=0.25).contains(&zero_fraction),
+            "P(K=0) = {zero_fraction}"
+        );
+        assert_eq!(max_k, CONTEXT_WINDOW_MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn twin_census_finds_no_single_frame_identifiable_rule() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        let pairs = (0..64u64)
+            .map(|meta_episode_id| {
+                generate_learning_history_pair(0x5457_494E, meta_episode_id, V5DataSplit::Train, &families)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let census = census_twin_exclusivity(&pairs);
+        assert_eq!(census.pairs, 64);
+        assert_eq!(census.single_frame_rule_identifiable, 0);
+        assert_eq!(census.divergent_pairs, 64);
+        for (primary, twin) in &pairs {
+            assert_eq!(primary.rows[0].current, twin.rows[0].current);
+            assert_ne!(primary.operator.family, twin.operator.family);
+            assert_eq!(primary.goal_family, twin.goal_family);
+            assert_ne!(primary.rule_id, twin.rule_id);
+            let index = twin_first_divergence(primary, twin)?.expect("twins diverge");
+            let (left, right) = (&primary.rows[index], &twin.rows[index]);
+            assert_eq!(left.current, right.current);
+            assert_eq!(left.action, right.action);
+            assert!(matches!(left.action.id, 5 | 6));
+            assert_ne!(left.next, right.next);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v6_learning_history_rows_keep_context_under_the_row_augmentation() -> Result<()> {
+        let batch = compose_mixed_stream_batch(&v6_config(128, 0x4348), 1.0, 2, V5DataSplit::Train)?;
+        let mut chained = 0usize;
+        let mut with_context = 0usize;
+        for sample in batch
+            .samples()
+            .iter()
+            .filter(|sample| sample.provenance.stream == MixedStreamKind::LearningHistories)
+        {
+            let rect = sample.provenance.content_rect;
+            let empty = sample.provenance.augmentation.color_permutation[0];
+            for context in &sample.transition.context {
+                assert!(padding_is(&context.current, rect, empty));
+                assert!(padding_is(&context.next, rect, empty));
+                if context.action.id == 6 {
+                    assert!(rect.contains(context.action.x.unwrap(), context.action.y.unwrap()));
+                }
+            }
+            if let Some(last) = sample.transition.context.last() {
+                with_context += 1;
+                // A level boundary follows every realized operator row; every
+                // other row chains onto the latest context transition.
+                if matches!(last.action.id, 5 | 6) {
+                    continue;
+                }
+                assert_eq!(last.next, sample.transition.current);
+                chained += 1;
+            }
+        }
+        assert!(with_context > 0 && chained > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_v6_fields_round_trip_and_legacy_json_is_unchanged() -> Result<()> {
+        let legacy = TransitionProvenance::full_frame(1, 2, Split::Train, "legacy");
+        let json = serde_json::to_string(&legacy)?;
+        for key in [
+            "rule_id",
+            "level_index",
+            "available_actions",
+            "context_len",
+            "background_color",
+            "empty_color",
+        ] {
+            assert!(!json.contains(key), "{key} leaked into legacy JSON");
+        }
+        assert_eq!(serde_json::from_str::<TransitionProvenance>(&json)?, legacy);
+        let mut v6 = legacy.clone();
+        v6.rule_id = 0xABCD;
+        v6.level_index = 3;
+        v6.available_actions = ALL_ACTIONS_AVAILABLE;
+        v6.context_len = 9;
+        v6.background_color = 13;
+        let round_trip: TransitionProvenance = serde_json::from_str(&serde_json::to_string(&v6)?)?;
+        assert_eq!(round_trip, v6);
+        let operator = EpisodeOperator {
+            family: OperatorFamily::Paint,
+            agent_color: 2,
+            primary_color: 7,
+            secondary_color: 8,
+            empty_color: 11,
+        };
+        let round_trip: EpisodeOperator = serde_json::from_str(&serde_json::to_string(&operator)?)?;
+        assert_eq!(round_trip, operator);
+        assert_ne!(
+            hidden_rule_id(operator, Some(0)),
+            hidden_rule_id(
+                EpisodeOperator {
+                    family: OperatorFamily::Toggle,
+                    ..operator
+                },
+                Some(0)
+            )
+        );
+        assert_ne!(hidden_rule_id(operator, Some(0)), hidden_rule_id(operator, Some(1)));
+        Ok(())
     }
 }

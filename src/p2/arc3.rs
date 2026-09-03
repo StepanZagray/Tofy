@@ -330,6 +330,7 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
                 level_index: 0,
                 available_actions: 0,
                 context_len: 0,
+                background_color: 0,
             },
             oracle_latent: None,
             context: Vec::new(),

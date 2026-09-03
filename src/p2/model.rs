@@ -964,6 +964,7 @@ impl WorldModel {
             patch_histogram_grounding: PatchHistogramGrounding::new(
                 cfg.hidden_dim,
                 cfg.patch_size,
+                cfg.world_core_v6,
                 vb.pp("grounding_head"),
             )?,
             exact_patch_grounding: cfg
@@ -974,6 +975,7 @@ impl WorldModel {
                         cfg.patch_size,
                         cfg.copy_gate_bias_prior,
                         cfg.decode_composition,
+                        cfg.world_core_v6,
                         vb.pp("exact_grounding_head"),
                     )
                 })

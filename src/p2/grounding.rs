@@ -3,7 +3,7 @@
 //! The head is instantiated in every model so objective on/off comparisons keep
 //! an identical parameter topology and name-seeded initialization.
 
-use crate::p2::data::TransitionSample;
+use crate::p2::data::{gameplay_rows, TransitionSample};
 use crate::p2::model::{FRAME_SIDE, PALETTE_SIZE};
 use anyhow::{ensure, Result};
 use candle_core::{DType, Tensor, D};
@@ -56,6 +56,8 @@ pub struct PatchHistogramGrounding {
     decoder: Linear,
     patch_side: usize,
     latent_grid: usize,
+    /// ADR 0005 §1.1: `world_core_v6` histograms include row 63.
+    whole_frame: bool,
 }
 
 /// Composition rule used by the deployed gameplay decode.
@@ -84,6 +86,8 @@ pub struct ExactPatchGrounding {
     patch_side: usize,
     latent_grid: usize,
     composition: DecodeComposition,
+    /// ADR 0005 §1.1: `world_core_v6` decodes and supervises all 64 rows.
+    whole_frame: bool,
 }
 
 impl ExactPatchGrounding {
@@ -92,6 +96,7 @@ impl ExactPatchGrounding {
         patch_side: usize,
         copy_gate_bias_prior: Option<f64>,
         composition: DecodeComposition,
+        whole_frame: bool,
         vb: VarBuilder<'_>,
     ) -> Result<Self> {
         ensure!(
@@ -139,11 +144,17 @@ impl ExactPatchGrounding {
             patch_side,
             latent_grid: FRAME_SIDE / patch_side,
             composition,
+            whole_frame,
         })
     }
 
-    /// `B×63×64×16` logits in gameplay-pixel order. The full per-token
-    /// projection is immediately rearranged and the status row is discarded.
+    /// Board rows decoded by this head: 63 (legacy status row dropped) or 64.
+    pub fn rows(&self) -> usize {
+        gameplay_rows(self.whole_frame)
+    }
+
+    /// `B×rows×64×16` logits in gameplay-pixel order. The full per-token
+    /// projection is immediately rearranged; legacy heads discard the status row.
     pub fn gameplay_logits(&self, latents: &Tensor) -> Result<Tensor> {
         let (batch, hidden, height, width) = latents.dims4()?;
         ensure!(
@@ -166,7 +177,7 @@ impl ExactPatchGrounding {
             PALETTE_SIZE,
         ))?;
         patch_tokens_to_pixels(&patch_logits)?
-            .narrow(1, 0, FRAME_SIDE - 1)
+            .narrow(1, 0, self.rows())
             .map_err(Into::into)
     }
 
@@ -190,7 +201,7 @@ impl ExactPatchGrounding {
         ))?;
         patch_tokens_to_pixels(&patch_logits)?
             .squeeze(3)?
-            .narrow(1, 0, FRAME_SIDE - 1)
+            .narrow(1, 0, self.rows())
             .map_err(Into::into)
     }
 
@@ -207,9 +218,9 @@ impl ExactPatchGrounding {
         );
         let logits = self
             .gameplay_logits(latents)?
-            .reshape((batch * (FRAME_SIDE - 1) * FRAME_SIDE, PALETTE_SIZE))?;
+            .reshape((batch * self.rows() * FRAME_SIDE, PALETTE_SIZE))?;
         let labels = frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .contiguous()?
             .flatten_all()?
@@ -231,11 +242,11 @@ impl ExactPatchGrounding {
             .detach()
             .argmax(D::Minus1)?;
         let current = current_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         let target = next_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         transition_correctness_from_gameplay(&predicted, &current, &target)
@@ -254,7 +265,7 @@ impl ExactPatchGrounding {
             "current frames must be Bx1x{FRAME_SIDE}x{FRAME_SIDE}"
         );
         let current = current_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         let logits = self.gameplay_logits(predicted)?;
@@ -272,20 +283,18 @@ impl ExactPatchGrounding {
         current_pixels: &Tensor,
     ) -> Result<Tensor> {
         let (batch, height, width, palette) = logits.dims4()?;
+        let rows = self.rows();
         ensure!(
-            (height, width, palette) == (FRAME_SIDE - 1, FRAME_SIDE, PALETTE_SIZE),
-            "gameplay logits must be Bx{}x{FRAME_SIDE}x{PALETTE_SIZE}",
-            FRAME_SIDE - 1
+            (height, width, palette) == (rows, FRAME_SIDE, PALETTE_SIZE),
+            "gameplay logits must be Bx{rows}x{FRAME_SIDE}x{PALETTE_SIZE}"
         );
         ensure!(
-            gate.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
-            "copy gate must be Bx{}x{FRAME_SIDE}",
-            FRAME_SIDE - 1
+            gate.dims3()? == (batch, rows, FRAME_SIDE),
+            "copy gate must be Bx{rows}x{FRAME_SIDE}"
         );
         ensure!(
-            current_pixels.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
-            "current pixels must be Bx{}x{FRAME_SIDE}",
-            FRAME_SIDE - 1
+            current_pixels.dims3()? == (batch, rows, FRAME_SIDE),
+            "current pixels must be Bx{rows}x{FRAME_SIDE}"
         );
         let logits = logits.detach();
         let gate = gate.detach();
@@ -328,11 +337,11 @@ impl ExactPatchGrounding {
         next_frames: &Tensor,
     ) -> Result<Tensor> {
         let current = current_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         let target = next_frames
-            .narrow(2, 0, FRAME_SIDE - 1)?
+            .narrow(2, 0, self.rows())?
             .squeeze(1)?
             .to_dtype(DType::U32)?;
         let composed = self.compose_gameplay_pixels(predicted, current_frames)?;
@@ -356,20 +365,19 @@ fn transition_correctness_from_gameplay(
     current: &Tensor,
     target: &Tensor,
 ) -> Result<Tensor> {
-    let batch = predicted.dim(0)?;
+    let (batch, rows, width) = predicted.dims3()?;
     ensure!(
-        current.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE)
-            && target.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
-        "exact correctness inputs must share a Bx63x64 gameplay grid"
+        width == FRAME_SIDE && (rows == FRAME_SIDE - 1 || rows == FRAME_SIDE),
+        "exact decoder produced an invalid gameplay grid"
     );
     ensure!(
-        predicted.dims3()? == (batch, FRAME_SIDE - 1, FRAME_SIDE),
-        "exact decoder produced an invalid gameplay grid"
+        current.dims3()? == (batch, rows, FRAME_SIDE) && target.dims3()? == (batch, rows, FRAME_SIDE),
+        "exact correctness inputs must share a Bx{rows}x64 gameplay grid"
     );
     let correct = predicted.eq(target)?.to_dtype(DType::F32)?;
     let changed = current.ne(target)?.to_dtype(DType::F32)?;
-    let correct_flat = correct.reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?;
-    let changed_flat = changed.reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?;
+    let correct_flat = correct.reshape((batch, rows * FRAME_SIDE))?;
+    let changed_flat = changed.reshape((batch, rows * FRAME_SIDE))?;
     let overall_ok = correct_flat
         .mean_keepdim(D::Minus1)?
         .ge(0.99)?
@@ -389,7 +397,12 @@ fn transition_correctness_from_gameplay(
 }
 
 impl PatchHistogramGrounding {
-    pub fn new(hidden_dim: usize, patch_side: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(
+        hidden_dim: usize,
+        patch_side: usize,
+        whole_frame: bool,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         ensure!(
             patch_side > 0 && FRAME_SIDE.is_multiple_of(patch_side),
             "patch grounding patch side must divide {FRAME_SIDE}"
@@ -398,6 +411,7 @@ impl PatchHistogramGrounding {
             decoder: linear(hidden_dim, PALETTE_SIZE, vb.pp("decoder"))?,
             patch_side,
             latent_grid: FRAME_SIDE / patch_side,
+            whole_frame,
         })
     }
 
@@ -428,7 +442,7 @@ impl PatchHistogramGrounding {
         );
 
         let (histograms, changed, changed_count) =
-            patch_targets(samples, self.latent_grid, self.patch_side)?;
+            patch_targets(samples, self.latent_grid, self.patch_side, self.whole_frame)?;
         let patch_count = batch * self.latent_grid * self.latent_grid;
         let unchanged_count = patch_count - changed_count;
         let weights = balanced_patch_weights(&changed, changed_count, unchanged_count);
@@ -476,6 +490,7 @@ fn patch_targets(
     samples: &[TransitionSample],
     latent_grid: usize,
     patch_side: usize,
+    whole_frame: bool,
 ) -> Result<(Vec<f32>, Vec<bool>, usize)> {
     let patch_count = samples.len() * latent_grid * latent_grid;
     let mut histograms = vec![0.0f32; patch_count * PALETTE_SIZE];
@@ -506,8 +521,9 @@ fn patch_targets(
                 let mut gameplay_pixels = 0usize;
                 for dy in 0..patch_side {
                     let y = patch_y * patch_side + dy;
-                    // The final row is a synthetic budget/status display, not board state.
-                    if y == FRAME_SIDE - 1 {
+                    // Legacy: the final row is a synthetic budget/status display,
+                    // not board state. v6 frames are whole-frame content.
+                    if y >= gameplay_rows(whole_frame) {
                         continue;
                     }
                     for dx in 0..patch_side {
@@ -651,6 +667,7 @@ mod tests {
                 4,
                 None,
                 composition,
+                false,
                 VarBuilder::from_varmap(&vars, DType::F32, &device),
             )?;
             let current = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
@@ -694,6 +711,7 @@ mod tests {
             4,
             None,
             DecodeComposition::default(),
+            false,
             VarBuilder::from_varmap(&vars, DType::F32, &device),
         )?;
         let latents = Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?;
@@ -768,12 +786,12 @@ mod tests {
         let current = vec![0; FRAME_SIDE * FRAME_SIDE];
         let mut next = current.clone();
         next[(FRAME_SIDE - 1) * FRAME_SIDE] = 2;
-        let (_, _, changed_count) = patch_targets(&[sample(current.clone(), next)], 8, 8).unwrap();
+        let (_, _, changed_count) = patch_targets(&[sample(current.clone(), next)], 8, 8, false).unwrap();
         assert_eq!(changed_count, 0, "status-only change must be ignored");
 
         let mut next = current.clone();
         next[(FRAME_SIDE - 2) * FRAME_SIDE] = 1;
-        let (histograms, _, changed_count) = patch_targets(&[sample(current, next)], 8, 8).unwrap();
+        let (histograms, _, changed_count) = patch_targets(&[sample(current, next)], 8, 8, false).unwrap();
         assert_eq!(changed_count, 1);
         let bottom_left = (7 * 8) * PALETTE_SIZE;
         assert!((histograms[bottom_left] - 55.0 / 56.0).abs() < 1e-6);

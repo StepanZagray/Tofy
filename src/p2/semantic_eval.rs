@@ -1261,6 +1261,7 @@ mod tests {
                 level_index: 0,
                 available_actions: 0,
                 context_len: 0,
+                background_color: 0,
             },
             oracle_latent: None,
             context: Vec::new(),
@@ -1292,6 +1293,7 @@ mod tests {
             level_index: 0,
             available_actions: 0,
             context_len: 0,
+            background_color: 0,
         };
         let noop = current.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE]
             == next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE];
