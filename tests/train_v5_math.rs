@@ -221,7 +221,10 @@ fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
     assert_eq!(pass.diagnostics[0].name, "positive_improvement");
     assert_eq!(pass.diagnostics[0].measured, Some(-25.0));
 
-    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.97), Some(0.6), Some(0.45));
+    // Gate policy v6 (ADR 0003, 2026-08-31): a failure counts toward abort only
+    // when it exceeds the one-sided binomial noise margin of the fixed
+    // population, so the fixture uses violations well beyond that margin.
+    let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.99), Some(0.6), Some(0.45));
     assert!(!gate(&first_fail, "shuffled_action_ratio"));
     assert!(!foundation_v2_gate_history_aborts(&[first_fail.clone()]));
 
@@ -231,13 +234,13 @@ fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
         recovery.clone()
     ]));
 
-    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(0.98), Some(0.6), Some(0.45));
+    let second_fail = foundation_v2_gate_evaluation(7_168, metrics(0.995), Some(0.6), Some(0.45));
     assert!(!foundation_v2_gate_history_aborts(&[
         first_fail.clone(),
         recovery,
         second_fail.clone()
     ]));
-    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(0.99), Some(0.6), Some(0.45));
+    let consecutive = foundation_v2_gate_evaluation(8_192, metrics(1.0), Some(0.6), Some(0.45));
     assert!(foundation_v2_gate_history_aborts(&[
         first_fail,
         second_fail,

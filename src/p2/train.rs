@@ -14745,16 +14745,7 @@ mod tests {
             Ok(breakdown.total.to_dtype(DType::F32)?.to_scalar::<f32>()?)
         };
         let (v5, _) = fresh_model(tiny_v5_model_cfg(), 23, &device)?;
-        let (v6, _) = fresh_model(
-            ModelConfig {
-                world_core_v6: true,
-                ..tiny_v5_model_cfg()
-            },
-            23,
-            &device,
-        )?;
         let v5_plain = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
-        let v6_plain = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
 
         let injected = inject_synthetic_context(&mut mixed, 4);
         assert!(injected > 0);
@@ -14765,11 +14756,39 @@ mod tests {
         // rows 0,4,...,28 carry windows of length 1,2,3,1,2,3,1,2.
         assert_eq!(context.valid.iter().filter(|v| **v != 0.0).count(), 15);
 
-        // v5 ignores context; v6 at zero context FiLM is bit-identical to no context.
+        // v5 ignores context rows entirely.
         let v5_ctx = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
-        let v6_ctx = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
-        assert!(v5_plain.is_finite() && v6_plain.is_finite());
+        assert!(v5_plain.is_finite());
         assert_eq!(v5_plain, v5_ctx, "legacy model must ignore context rows");
+
+        // A v6 model decodes all 64 rows, so it is paired with the v6 data
+        // contract (ADR 0005 §1.1); the legacy 63-row batch fails closed.
+        let (v6, _) = fresh_model(
+            ModelConfig {
+                world_core_v6: true,
+                ..tiny_v5_model_cfg()
+            },
+            23,
+            &device,
+        )?;
+        assert!(foundation_v2_training_loss(&v6, &mixed, &device, objective).is_err());
+        let mut mixed_v6 = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 32,
+                seed: 61,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            0.5,
+            0,
+            V5DataSplit::Train,
+        )?;
+        let v6_plain = scalar(foundation_v2_training_loss(&v6, &mixed_v6, &device, objective)?)?;
+        assert!(inject_synthetic_context(&mut mixed_v6, 4) > 0);
+        // v6 at zero context FiLM is bit-identical with and without context.
+        let v6_ctx = scalar(foundation_v2_training_loss(&v6, &mixed_v6, &device, objective)?)?;
+        assert!(v6_plain.is_finite());
         assert_eq!(v6_plain, v6_ctx, "zero context FiLM must not change the v6 loss");
         Ok(())
     }

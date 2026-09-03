@@ -4090,7 +4090,6 @@ mod tests {
                     // from the CLI dispatcher, never from training code.
                     | "p2/residual_probe.rs"
                     | "p2/cli.rs"
-                    | "p2/residual_probe.rs"
             ) {
                 continue;
             }
