@@ -253,3 +253,36 @@ shard stream weight > 0; ADR 0004 Phase B heads; anything that changes the
 - Old checkpoints load under their own flags; v6 metrics are not comparable
   to v5 metrics because the content population changes (whole frame).
 - The `RuleIdentifiabilityCensus` becomes a hard data gate, not a report.
+
+## Implementation record (2026-09-03, branch `feat/adaptation-v6`)
+
+Implemented across five reviewed branches and merged; full library test suite green at
+each merge. Deviations from the text above, recorded so nobody rediscovers them:
+
+- §3.3 fast-weight subset: the first encoder conv is `encoder.patch`, not `encoder.c1`.
+  `FAST_WEIGHT_PREFIXES = ["action_film_", "context_film_", "pixel_emb", "encoder.patch",
+  "exact_grounding_head"]`. Parameter count: v5 467,665 → v6 571,217 (≤ 650k).
+- §3.1 `ContextBatch` frames are U8 (widened at the gather) and only valid slots are encoded
+  (packed), for device memory; `encode_state` is not context-conditioned (context acts only
+  through dynamics FiLM). Warm start (§3.4) zeroes only `context_film_*`; the context MLP keeps
+  its seeded init because zeroing it would make the channel untrainable.
+- §2.2 Learning Histories: operators act on frames, not simulator state, so each level is 6
+  epsilon-greedy movement rows followed by one realized ACTION5/ACTION6 row (+4 same-state
+  counterfactual sidecar rows sharing its Context Window); rule evidence in a context comes from
+  earlier levels' operator rows. `LEARNING_HISTORY_STEPS_PER_LEVEL = 6` is a constant.
+- §2.3 Twins differ by operator family only (colour binding and goal family shared) so the
+  realized operator row diverges; the census records non-divergent pairs (0 of 64 in tests).
+- §1.6 `available_actions = 0xFF` only on v6 rows; legacy rows keep 0 for byte-identity.
+- §1.1 A v6 model with a legacy 63-row data contract fails closed at loss time; model-free
+  eval helpers (`semantic_eval` censuses, shuffled-control outcome compare) keep 63-row
+  semantics because no model config is in scope there.
+- §6 Channel A and Channel B keep separate `FactualBuffer`s (Arc-shared frames). The context
+  batch is rebuilt per physical chunk at inference (no per-decision summary cache yet). Goal
+  and terminal heads are frozen under adaptation, but they read latents produced by the
+  adapted dynamics; only heads and calibration are guaranteed pristine.
+- §5.3 ran on the 2026-08-27 foundation-v2 checkpoint (the s8 model was unreachable):
+  residual AUROC 0.905 vs reliability 0.634; the preregistered switch rule was narrowly missed
+  on the reliability side (see `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`).
+- §2.6 the ARCEngine shard generator exists (`python/tofy_arc3/synth`, 24 tests) and its
+  seed-1 census passes the twin and random-play gates; the Rust `SyntheticShards` loader is
+  not yet written (stream weight remains 0).
