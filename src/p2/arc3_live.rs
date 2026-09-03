@@ -92,7 +92,7 @@ impl PolicyContract {
 }
 const POLICY_LIMITATION: &str = "The checkpoint predicts composed next-frame accuracy, latent self-confidence, no-op probability, and latent action effect; it has no trained reward/value head. Real games provide no synthetic episode operator, so inference uses the UNKNOWN rule token with neutral colors. This exploratory policy is not a hidden-goal solver.";
 const GOAL_FEATURE_CONTRACT: &str = "Live policy supplies the all-zero goal vector. Foundation-v2 trains with 30% goal dropout, so this goal-free query is in-distribution; it does not provide hidden-goal evidence.";
-const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content";
+const TRIED_ACTION_KEY_CONTRACT: &str = "game id + session guid + levels completed + frame dimensions + visible pixels; row 63 participates only when it contains non-background gameplay content (legacy checkpoints) or unconditionally (world_core_v6 checkpoints)";
 const MAX_HTTP_ATTEMPTS: usize = 5;
 /// Default cap on guid-scoped RESET retries per level after a recoverable
 /// non-WIN terminal such as GAME_OVER.
@@ -1539,10 +1539,14 @@ impl<'a> ModelPolicy<'a> {
 
 impl LivePolicy for ModelPolicy<'_> {
     fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
-        let candidates = enumerate_actions(
+        // ADR 0005 §1.3: v6 frames are whole-frame content, so row 63 is
+        // ordinary board for both the tried-action key and ACTION6 proposals.
+        let whole_frame = self.model.config().world_core_v6;
+        let candidates = enumerate_actions_with(
             observation,
             self.action6_max_candidates,
             self.action6_grid_stride,
+            whole_frame,
         )?;
         let mut profile = self.begin_decision_profile(&observation.game_id, candidates.len())?;
         let measurement = profile
@@ -1551,7 +1555,7 @@ impl LivePolicy for ModelPolicy<'_> {
         let window = self.context.window(observation.levels_completed);
         let mut scores =
             self.score_candidates(&observation.frame, &candidates, &window, profile.as_ref())?;
-        let hash = observation_hash(observation);
+        let hash = observation_hash_with(observation, whole_frame);
         let tried = self.tried.entry(hash).or_default();
         apply_tried_penalty(&mut scores, tried, self.tried_penalty);
         scores.sort_by(|a, b| {
@@ -1724,6 +1728,12 @@ fn apply_tried_penalty(scores: &mut [ActionScore], tried: &mut BTreeSet<String>,
 }
 
 pub fn observation_hash(observation: &ArcObservation) -> u64 {
+    observation_hash_with(observation, false)
+}
+
+/// Tried-action key. `whole_frame` (world_core_v6) hashes all 64 rows; the
+/// legacy key drops row 63 unless it carries non-background content.
+pub fn observation_hash_with(observation: &ArcObservation, whole_frame: bool) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     observation.game_id.hash(&mut hasher);
     observation.guid.hash(&mut hasher);
@@ -1731,7 +1741,7 @@ pub fn observation_hash(observation: &ArcObservation) -> u64 {
     let frame = &observation.frame;
     frame.width.hash(&mut hasher);
     frame.height.hash(&mut hasher);
-    let visible_rows = usize::from(frame.height).min(if row63_has_content(frame) {
+    let visible_rows = usize::from(frame.height).min(if whole_frame || row63_has_content(frame) {
         FRAME_SIDE
     } else {
         FRAME_SIDE - 1
@@ -1757,6 +1767,17 @@ pub fn enumerate_actions(
     action6_max_candidates: usize,
     grid_stride: usize,
 ) -> Result<Vec<ArcAction>> {
+    enumerate_actions_with(observation, action6_max_candidates, grid_stride, false)
+}
+
+/// Candidate actions. `whole_frame` (world_core_v6) lets ACTION6 proposals
+/// target row 63 unconditionally (ADR 0005 §1.3).
+pub fn enumerate_actions_with(
+    observation: &ArcObservation,
+    action6_max_candidates: usize,
+    grid_stride: usize,
+    whole_frame: bool,
+) -> Result<Vec<ArcAction>> {
     observation.validate()?;
     ensure!(
         action6_max_candidates > 0,
@@ -1773,7 +1794,7 @@ pub fn enumerate_actions(
         }
     }
     if observation.available_actions.contains(&6) {
-        let allow_row63 = row63_has_content(&observation.frame);
+        let allow_row63 = whole_frame || row63_has_content(&observation.frame);
         for (x, y) in action6_coordinates(
             &observation.frame,
             action6_max_candidates,
@@ -3146,6 +3167,28 @@ mod tests {
             observation_hash(&first),
             observation_hash(&gameplay_changed)
         );
+    }
+
+    #[test]
+    fn v6_tried_action_key_and_proposals_treat_row_63_as_board() -> Result<()> {
+        // Background colour 5 with a palette-0 pixel on row 63: the legacy key
+        // treats it as padding, the v6 key hashes every pixel.
+        let mut base = observation("game", "NOT_FINISHED", vec![1, 6]);
+        base.frame = frame(5);
+        let mut row63 = base.clone();
+        row63.frame.pixels[63 * FRAME_SIDE + 7] = 0;
+        assert_eq!(observation_hash(&base), observation_hash(&row63));
+        assert_ne!(
+            observation_hash_with(&base, true),
+            observation_hash_with(&row63, true)
+        );
+        let legacy = enumerate_actions(&row63, 8, 1)?;
+        assert!(legacy.iter().all(|action| action.y != Some(63)));
+        let whole_frame = enumerate_actions_with(&row63, 8, 1, true)?;
+        assert!(whole_frame
+            .iter()
+            .any(|action| action.id == 6 && action.y == Some(63)));
+        Ok(())
     }
 
     fn scored_action(id: u8, score: f64) -> ActionScore {

@@ -287,6 +287,10 @@ pub struct P2TrainArgs {
     /// their zero/fresh init. Without it a v6 config never loads v5 weights.
     #[arg(long, requires = "world_core_v6")]
     pub init_context_from_v5: Option<PathBuf>,
+    /// Render training rows under the ADR 0005 v6 data contract (whole-frame
+    /// content, free background, no status row, learning-history stream).
+    #[arg(long, default_value_t = false)]
+    pub data_contract_v6: bool,
 
     /// Planning-head readout from the final BxCx8x8 prediction.
     #[arg(long, value_enum, default_value_t = ConsumerReadoutTopology::GlobalMean)]
@@ -498,6 +502,7 @@ impl P2TrainArgs {
             world_core_v4: false,
             world_core_v6: self.world_core_v6,
             init_context_from_v5: self.init_context_from_v5.clone(),
+            data_contract_v6: self.data_contract_v6,
             consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,

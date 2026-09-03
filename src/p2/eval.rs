@@ -12,8 +12,8 @@ use crate::p2::cg_profile::{
     EVAL_PROFILE_ENTRYPOINT,
 };
 use crate::p2::data::{
-    compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum,
-    generate_factual_branch_group, generate_hazard_one_step, palette, ArcAction, BranchGroup,
+    compose_mixed_stream_batch, foundation_v2_stream_schedule, gameplay_rows, generate_curriculum,
+    generate_factual_branch_group, generate_hazard_one_step, ArcAction, BranchGroup,
     ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
     TransitionSample, V5DataSplit, V5SampleProvenance, FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE,
     ORACLE_LATENT_DIM,
@@ -2362,8 +2362,9 @@ pub fn improvement_fraction(learned: &[f32], copy_forward: &[f32]) -> Option<f64
         .and_then(|(learned, copy)| (copy > 0.0).then_some(1.0 - learned / copy))
 }
 
-fn gameplay_pixels(sample: &TransitionSample) -> (&[u8], &[u8]) {
-    let gameplay_len = (FRAME_SIDE - 1) * FRAME_SIDE;
+/// Board pixels of a row. `gameplay_len` is the decoder's output width:
+/// `63*64` for legacy heads, `64*64` under ADR 0005 §1.1.
+fn gameplay_pixels(sample: &TransitionSample, gameplay_len: usize) -> (&[u8], &[u8]) {
     let current_end = gameplay_len.min(sample.current.pixels.len());
     let next_end = gameplay_len.min(sample.next.pixels.len());
     (
@@ -2418,7 +2419,7 @@ pub fn shuffled_action_changed_pixel_ratio(
         {
             continue;
         }
-        let (current, target) = gameplay_pixels(sample);
+        let (current, target) = gameplay_pixels(sample, true_prediction.len());
         if current.len() != target.len()
             || true_prediction.len() != target.len()
             || shuffled_prediction.len() != target.len()
@@ -2457,12 +2458,15 @@ pub fn foreground_reconstruction_accuracy(
     let mut foreground = 0usize;
     let mut correct = 0usize;
     for (sample, prediction) in samples.iter().zip(target_reconstructions) {
-        let (_, target) = gameplay_pixels(sample);
+        let (_, target) = gameplay_pixels(sample, prediction.len());
         if prediction.len() != target.len() {
             bail!("gate foreground prediction width does not match gameplay target");
         }
+        // Background is the row's rendered EMPTY colour (ADR 0005 §1.2), index 0
+        // for legacy rows.
+        let background = sample.provenance.background_color;
         for (predicted, target) in prediction.iter().zip(target) {
-            if *target == palette::EMPTY {
+            if *target == background {
                 continue;
             }
             foreground += 1;
@@ -2485,7 +2489,7 @@ pub fn one_step_changed_exact(
         if !is_board_changed_transition(sample) {
             continue;
         }
-        let (current, target) = gameplay_pixels(sample);
+        let (current, target) = gameplay_pixels(sample, prediction.len());
         if prediction.len() != target.len() || current.len() != target.len() {
             bail!("gate one-step prediction width does not match gameplay target");
         }
@@ -2619,7 +2623,7 @@ pub fn one_step_full_exact(
         if !is_board_changed_transition(sample) {
             continue;
         }
-        let (current, target) = gameplay_pixels(sample);
+        let (current, target) = gameplay_pixels(sample, prediction.len());
         if prediction.len() != target.len() || current.len() != target.len() {
             bail!("gate one-step prediction width does not match gameplay target");
         }
@@ -2647,7 +2651,7 @@ pub fn one_step_all_rows_exact(
     }
     let mut exact = 0usize;
     for (sample, prediction) in samples.iter().zip(one_step_predictions) {
-        let (current, target) = gameplay_pixels(sample);
+        let (current, target) = gameplay_pixels(sample, prediction.len());
         if prediction.len() != target.len() || current.len() != target.len() {
             bail!("gate one-step prediction width does not match gameplay target");
         }
@@ -2688,14 +2692,15 @@ pub fn one_step_false_edit_rate_with_content_masks(
     let mut unchanged = 0usize;
     let mut edited = 0usize;
     for (row, (sample, prediction)) in samples.iter().zip(one_step_predictions).enumerate() {
-        let (current, target) = gameplay_pixels(sample);
+        let (current, target) = gameplay_pixels(sample, prediction.len());
         if prediction.len() != target.len() || current.len() != target.len() {
             bail!("gate one-step prediction width does not match gameplay target");
         }
         let content_x = usize::from(sample.provenance.content_x);
         let content_y = usize::from(sample.provenance.content_y);
         let content_width = usize::from(sample.provenance.content_width).min(FRAME_SIDE);
-        let content_height = usize::from(sample.provenance.content_height).min(FRAME_SIDE - 1);
+        let content_height =
+            usize::from(sample.provenance.content_height).min(target.len() / FRAME_SIDE);
         for (index, ((before, after), predicted)) in
             current.iter().zip(target).zip(prediction).enumerate()
         {
@@ -2726,7 +2731,7 @@ fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<
     model
         .exact_gameplay_logits(latent)?
         .argmax(D::Minus1)?
-        .reshape((batch, (FRAME_SIDE - 1) * FRAME_SIDE))?
+        .reshape((batch, ()))?
         .to_dtype(DType::U8)?
         .to_vec2::<u8>()
         .map_err(Into::into)
@@ -3005,7 +3010,7 @@ fn evaluate_gate_support_impl(
         let true_predictions = exact_palette_predictions(model, &prediction)?;
         let composed_predictions = model
             .composed_gameplay_decode(&prediction, &encoded.batch.frames)?
-            .reshape((samples.len(), (FRAME_SIDE - 1) * FRAME_SIDE))?
+            .reshape((samples.len(), ()))?
             .to_dtype(DType::U8)?
             .to_vec2::<u8>()?;
         let shuffled_predictions = exact_palette_predictions(model, &shuffled_prediction)?;
@@ -3034,21 +3039,22 @@ fn evaluate_gate_support_impl(
         .iter()
         .map(|index| copy_errors[*index])
         .collect::<Vec<_>>();
+    let gameplay_len = gameplay_rows(model.config().world_core_v6) * FRAME_SIDE;
     let changed_pixels = samples
         .iter()
         .filter(|sample| is_board_changed_transition(sample))
         .map(|sample| {
-            let (current, target) = gameplay_pixels(sample);
+            let (current, target) = gameplay_pixels(sample, gameplay_len);
             current.iter().zip(target).filter(|(a, b)| a != b).count()
         })
         .sum();
     let foreground_pixels = samples
         .iter()
         .map(|sample| {
-            gameplay_pixels(sample)
+            gameplay_pixels(sample, gameplay_len)
                 .1
                 .iter()
-                .filter(|pixel| **pixel != palette::EMPTY)
+                .filter(|pixel| **pixel != sample.provenance.background_color)
                 .count()
         })
         .sum();
@@ -3599,18 +3605,27 @@ fn provenance_content_mask(sample: &TransitionSample) -> Result<ContentMask> {
     ContentMask::from_rect(rect)
 }
 
-fn origin_content_tensor(samples: &[TransitionSample], device: &Device) -> Result<Tensor> {
-    let mut values = Vec::with_capacity(samples.len() * (FRAME_SIDE - 1) * FRAME_SIDE);
+fn origin_content_tensor(
+    samples: &[TransitionSample],
+    whole_frame: bool,
+    device: &Device,
+) -> Result<Tensor> {
+    let rows = gameplay_rows(whole_frame);
+    let mut values = Vec::with_capacity(samples.len() * rows * FRAME_SIDE);
     for sample in samples {
-        let mask = provenance_content_mask(sample)?;
+        // ADR 0005 §1.1: every pixel of a v6 frame is content.
+        let mask = if whole_frame {
+            ContentMask::all_ones()
+        } else {
+            provenance_content_mask(sample)?
+        };
         values.extend(
-            mask.values[..(FRAME_SIDE - 1) * FRAME_SIDE]
+            mask.values[..rows * FRAME_SIDE]
                 .iter()
                 .map(|&value| f32::from(value)),
         );
     }
-    Tensor::from_vec(values, (samples.len(), FRAME_SIDE - 1, FRAME_SIDE), device)
-        .map_err(Into::into)
+    Tensor::from_vec(values, (samples.len(), rows, FRAME_SIDE), device).map_err(Into::into)
 }
 
 fn ptrm_metrics_for_k(
@@ -3953,7 +3968,7 @@ fn eval_one_batch(
                     &out.y,
                     &batch.frames,
                     &batch.next_frames,
-                    &origin_content_tensor(chunk, device)?,
+                    &origin_content_tensor(chunk, model.config().world_core_v6, device)?,
                 )?
                 .flatten_all()?
                 .to_vec1::<f32>()?,
@@ -6196,12 +6211,7 @@ fn evaluate_factual_branches(
         if model.config().world_core_v4 {
             predicted_gameplay_log_probs.extend(
                 ops::log_softmax(&model.exact_gameplay_logits(&output.y)?, D::Minus1)?
-                    .reshape((
-                        end - start,
-                        (crate::p2::data::FRAME_SIDE - 1)
-                            * crate::p2::data::FRAME_SIDE
-                            * crate::p2::model::PALETTE_SIZE,
-                    ))?
+                    .reshape((end - start, ()))?
                     .to_vec2::<f32>()?,
             );
         }
@@ -6398,8 +6408,9 @@ fn evaluate_factual_branches(
                 let log_probs = &predicted_gameplay_log_probs[global];
                 let width = usize::from(branch.transition.provenance.content_width)
                     .min(crate::p2::data::FRAME_SIDE);
-                let height = usize::from(branch.transition.provenance.content_height)
-                    .min(crate::p2::data::FRAME_SIDE - 1);
+                let height = usize::from(branch.transition.provenance.content_height).min(
+                    log_probs.len() / (crate::p2::data::FRAME_SIDE * crate::p2::model::PALETTE_SIZE),
+                );
                 let mut class_nll = Vec::with_capacity(outcome_representatives.len());
                 for representative in &outcome_representatives {
                     let target = &branches[*representative].transition.next.pixels;
@@ -7636,6 +7647,11 @@ mod tests {
                 source_kind: "action_diagnostic".into(),
                 trajectory_id: format!("test/action_diagnostic/{episode_id}"),
                 operator: None,
+                rule_id: 0,
+                level_index: 0,
+                available_actions: 0,
+                context_len: 0,
+                background_color: 0,
             },
             oracle_latent: None,
             context: Vec::new(),

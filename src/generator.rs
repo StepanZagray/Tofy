@@ -616,6 +616,31 @@ fn has_all_six_families(goals: &[Goal]) -> bool {
     seen.iter().all(|&x| x)
 }
 
+/// ADR 0005 §2.3: rebind the hidden goal to a seeded goal-family draw that is
+/// independent of `episode_id` (the legacy `episode_id % 6` round-robin stays
+/// in place for every legacy population). Prefers a move-reachable goal of the
+/// family; every generated scenario covers all six families.
+pub fn rebind_hidden_goal_family(scenario: &mut Scenario, family: u8, rng: &mut ChaCha8Rng) {
+    let of_family = |reachable_only: bool| -> Vec<usize> {
+        (0..scenario.candidate_goals.len())
+            .filter(|&index| {
+                let goal = &scenario.candidate_goals[index];
+                family_id(goal) == family
+                    && (!reachable_only || reachable_within(scenario, goal, scenario.action_budget))
+            })
+            .collect()
+    };
+    let mut preferred = of_family(true);
+    if preferred.is_empty() {
+        preferred = of_family(false);
+    }
+    assert!(
+        !preferred.is_empty(),
+        "every generated scenario covers all six goal families"
+    );
+    scenario.hidden_goal_index = preferred[rng.random_range(0..preferred.len())];
+}
+
 fn pick_hidden_for_family(
     candidates: &[Goal],
     solvable: &[usize],

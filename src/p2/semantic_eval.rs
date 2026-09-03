@@ -1,8 +1,8 @@
 //! Foundation-v2 semantic evaluation at the exact-decoder seam.
 
 use crate::p2::data::{
-    apply_episode_operator, palette, ArcAction, ArcFrame, TransitionSample, V5SampleProvenance,
-    FRAME_SIDE,
+    apply_episode_operator, gameplay_rows, ArcAction, ArcFrame, TransitionSample,
+    V5SampleProvenance, FRAME_SIDE,
 };
 use crate::p2::model::{WorldModel, PALETTE_SIZE};
 use crate::p2::train::{action_tensors_from_samples, batch_from_samples};
@@ -459,25 +459,27 @@ impl SourceAccum {
 }
 
 fn semantic_masks(current: &[u8], target: &[u8], sample: &TransitionSample) -> [Vec<bool>; 9] {
-    let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    // 63 rows for legacy rows, 64 under ADR 0005 §1.1 (whole-frame decoders).
+    let gameplay_pixels = target.len();
+    let rows = gameplay_pixels / FRAME_SIDE;
     let mut content = vec![false; gameplay_pixels];
     // Provenance carries the exact placement origin (zero for legacy rows),
     // so translated V5 content is classified as content, not padding.
     let origin_x = usize::from(sample.provenance.content_x);
     let origin_y = usize::from(sample.provenance.content_y);
-    let width = usize::from(sample.provenance.content_width).min(FRAME_SIDE.saturating_sub(origin_x));
-    let height = usize::from(sample.provenance.content_height)
-        .min((FRAME_SIDE - 1).saturating_sub(origin_y));
+    let width =
+        usize::from(sample.provenance.content_width).min(FRAME_SIDE.saturating_sub(origin_x));
+    let height = usize::from(sample.provenance.content_height).min(rows.saturating_sub(origin_y));
     for y in origin_y..origin_y + height {
         for x in origin_x..origin_x + width {
             content[y * FRAME_SIDE + x] = true;
         }
     }
     let padding: Vec<bool> = content.iter().map(|selected| !selected).collect();
-    let foreground: Vec<bool> = target
-        .iter()
-        .map(|pixel| *pixel != palette::EMPTY)
-        .collect();
+    // Background is the row's rendered EMPTY colour (ADR 0005 §1.2); legacy
+    // rows render it as index 0.
+    let background = sample.provenance.background_color;
+    let foreground: Vec<bool> = target.iter().map(|pixel| *pixel != background).collect();
     let changed: Vec<_> = current
         .iter()
         .zip(target)
@@ -524,8 +526,8 @@ struct DecodedRows {
 }
 
 fn decoded_rows(logits: &Tensor) -> Result<DecodedRows> {
-    let batch = logits.dim(0)?;
-    let pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+    let (batch, rows, width, _) = logits.dims4()?;
+    let pixels = rows * width;
     let predictions = logits
         .argmax(D::Minus1)?
         .reshape((batch, pixels))?
@@ -550,8 +552,9 @@ pub fn latent_semantic_metrics(
         decoded.predictions.len() == 1,
         "rollout semantic latent must have batch size one"
     );
-    let current = gameplay(&sample.current);
-    let target = gameplay(&sample.next);
+    let gameplay_len = gameplay_rows(model.config().world_core_v6) * FRAME_SIDE;
+    let current = gameplay_prefix(&sample.current, gameplay_len);
+    let target = gameplay_prefix(&sample.next, gameplay_len);
     let mut accum = SourceAccum::default();
     accum.add_variant(
         "rollout",
@@ -571,9 +574,15 @@ pub fn latent_semantic_metrics(
     Ok(metrics)
 }
 
+/// Legacy 63-row board slice used by model-free collision censuses.
 fn gameplay(frame: &crate::p2::data::ArcFrame) -> &[u8] {
-    let end = ((FRAME_SIDE - 1) * FRAME_SIDE).min(frame.pixels.len());
-    &frame.pixels[..end]
+    gameplay_prefix(frame, (FRAME_SIDE - 1) * FRAME_SIDE)
+}
+
+/// Board slice matching the evaluated decoder's rows (63 legacy, 64 for
+/// `world_core_v6`).
+fn gameplay_prefix(frame: &crate::p2::data::ArcFrame, gameplay_len: usize) -> &[u8] {
+    &frame.pixels[..gameplay_len.min(frame.pixels.len())]
 }
 
 fn append_action_key(key: &mut Vec<u8>, action: &ArcAction) {
@@ -1053,7 +1062,7 @@ pub fn evaluate_semantics_with_control(
                 &batch.operator_conditioning,
             )?
             .y;
-        let gameplay_pixels = (FRAME_SIDE - 1) * FRAME_SIDE;
+        let gameplay_pixels = gameplay_rows(model.config().world_core_v6) * FRAME_SIDE;
         let composed_predictions = model
             .composed_gameplay_decode(&prediction, &batch.frames)?
             .reshape((rows.len(), gameplay_pixels))?
@@ -1117,18 +1126,18 @@ pub fn evaluate_semantics_with_control(
             .map(|(name, logits)| Ok((name, decoded_rows(&logits)?)))
             .collect::<Result<Vec<_>>>()?;
         for (local, sample) in rows.iter().enumerate() {
-            let current = gameplay(&sample.current);
-            let target = gameplay(&sample.next);
+            let current = gameplay_prefix(&sample.current, gameplay_pixels);
+            let target = gameplay_prefix(&sample.next, gameplay_pixels);
             ensure!(
-                current.len() == (FRAME_SIDE - 1) * FRAME_SIDE
-                    && target.len() == (FRAME_SIDE - 1) * FRAME_SIDE,
+                current.len() == gameplay_pixels && target.len() == gameplay_pixels,
                 "semantic evaluation requires fixed 64x64 frames"
             );
+            let status_pixels = FRAME_SIDE * FRAME_SIDE - gameplay_pixels;
             overall.transitions += 1;
-            overall.status_pixels += FRAME_SIDE;
+            overall.status_pixels += status_pixels;
             let source = by_source.entry(labels[start + local].clone()).or_default();
             source.transitions += 1;
-            source.status_pixels += FRAME_SIDE;
+            source.status_pixels += status_pixels;
             for (name, decoded) in &decoded {
                 let decoder_target = if *name == "current_reconstruction" {
                     current
@@ -1166,7 +1175,8 @@ pub fn evaluate_semantics_with_control(
                 target,
             );
             let copy = current;
-            let zero = vec![palette::EMPTY; target.len()];
+            // Background control: the row's rendered EMPTY colour everywhere.
+            let zero = vec![sample.provenance.background_color; target.len()];
             for (name, prediction) in [
                 ("hard_copy_control", copy),
                 ("zero_control", zero.as_slice()),
@@ -1220,6 +1230,7 @@ pub fn evaluate_semantics_with_control(
 mod tests {
     use super::*;
     use crate::domain::Split;
+    use crate::p2::data::palette;
     use crate::p2::data::{
         compose_mixed_stream_batch, foundation_v2_stream_schedule, generate_curriculum, ArcAction,
         ArcFrame, ContentRect, D4Transform, EpisodeOperator, GoalFeatures, MixedStreamConfig,
@@ -1257,6 +1268,11 @@ mod tests {
                 source_kind: "movement".into(),
                 trajectory_id: "sim/Train/9/4".into(),
                 operator: None,
+                rule_id: 0,
+                level_index: 0,
+                available_actions: 0,
+                context_len: 0,
+                background_color: 0,
             },
             oracle_latent: None,
             context: Vec::new(),
@@ -1284,6 +1300,11 @@ mod tests {
             source_kind: "operator_control".into(),
             trajectory_id: format!("test/operator_control/{episode_id}"),
             operator: Some(operator),
+            rule_id: 0,
+            level_index: 0,
+            available_actions: 0,
+            context_len: 0,
+            background_color: 0,
         };
         let noop = current.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE]
             == next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE];
@@ -1317,6 +1338,7 @@ mod tests {
             },
             goal_dropped: false,
             branch_group_id: None,
+            contract_v6: false,
         };
         Ok((sample, provenance))
     }
@@ -1429,6 +1451,7 @@ mod tests {
             agent_color: palette::AGENT,
             primary_color: palette::EMPTY,
             secondary_color: palette::EMPTY,
+            empty_color: palette::EMPTY,
         };
         let (first, first_provenance) = operator_row(
             current.clone(),
@@ -1466,6 +1489,7 @@ mod tests {
             agent_color: palette::AGENT,
             primary_color: palette::SWITCH_BASE,
             secondary_color: palette::SWITCH_BASE + 1,
+            empty_color: palette::EMPTY,
         };
         let (first, first_provenance) = operator_row(
             current.clone(),
