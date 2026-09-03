@@ -98,3 +98,13 @@ real frames" observation from the s8 run is NOT reproduced on foundation-v2
 untested. Residual is a distribution-shift detector, not a per-transition
 correctness signal (chance within synthetic). Only 1.2% of real changed
 transitions were predicted exactly (28/2,410); 0/3,750 full-frame exact.
+
+## Amendment (2026-09-03): recursion depth 3x3
+
+E2 and E3 now run the v6 recipe at recursion depth 3x3 (ADR 0005 §3.5), not
+2x2. The 4096-step budget and thresholds are unchanged, but the per-step cost
+rises ~2.25x on the dynamics block, so the measured wall clock supersedes the
+earlier 2.1 h estimate; the first attempt at 2x2 (physical 128 x accum 2)
+measured 1.60 s/step. Any 2x2-vs-3x3 comparison is a separate preregistered
+ablation, not part of E2: E2 is a data-contract screen and both arms of its
+own comparison (K=0 vs K=16) share one checkpoint and therefore one depth.

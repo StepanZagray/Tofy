@@ -166,6 +166,18 @@ computation is recovered exactly at init) applied next to action FiLM.
 
 3.2 Parameter budget: <= 650k parameters total (v5 is ~467k).
 
+3.5 **Recursion depth 3x3** (owner decision, 2026-09-03). v6 applies the
+dynamics block `inner_steps = outer_steps = 3` (nine applications) instead of
+v5's 2x2 (four). The block contains two 3x3 convolutions, so 2x2 propagates
+information eight cells: a 17-cell receptive field on the 16x16 latent grid,
+exactly the grid width and therefore the bare minimum for a board-wide effect
+(a switch opening a distant door) to be predictable in one step, with no
+margin. 3x3 reaches 25 cells. Cost is 2.25x the dynamics compute and no extra
+parameters (the block is weight-shared across applications). This is a
+reasoned static bound on the receptive field, not a measured quality result;
+the depth ablation (ADR 0003 T0.2) remains the falsifier. v5 keeps 2x2 so
+legacy checkpoints and their evaluations stay reproducible.
+
 3.3 **Fast-weight subset** (the only parameters gradient adaptation may
 touch), by name prefix, exported as `FAST_WEIGHT_PREFIXES`:
 `action_film_`, `context_film_`, `pixel_emb`, `encoder.c1` (first conv of

@@ -111,6 +111,8 @@ const FOUNDATION_V2_GATE_EVERY: u64 = 1_024;
 const FOUNDATION_V2_GATE_WARMUP_STEPS: u64 = 4_096;
 const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
+/// ADR 0005 §3.5 recursion depth (inner and outer) for world-core v6.
+pub const V6_RECURSION_STEPS: usize = 3;
 const FOUNDATION_V2_ABORT_MARKER: &str = "foundation_v2_abort.json";
 const LEGACY_CHECKPOINT_ARTIFACTS: &[&str] = &[
     "model.safetensors",
@@ -1614,8 +1616,19 @@ impl TrainConfig {
         self.warm_start_y = true;
         self.hidden_dim = 128;
         self.action_dim = 32;
-        self.inner_steps = 2;
-        self.outer_steps = 2;
+        // ADR 0005 §3.5: v6 recurses 3x3 (nine block applications). The block
+        // holds two 3x3 convolutions, so 2x2 propagates information eight
+        // cells -- a 17-cell receptive field on the 16x16 latent grid, exactly
+        // the grid width with no margin for board-wide effects such as a
+        // switch opening a distant door. 3x3 reaches 25 cells at 2.25x
+        // dynamics compute. v5 keeps 2x2 so legacy runs stay reproducible.
+        let depth = if self.world_core_v6 {
+            V6_RECURSION_STEPS
+        } else {
+            2
+        };
+        self.inner_steps = depth;
+        self.outer_steps = depth;
         self.lr = 1e-3;
         self.weight_decay = 0.01;
         self.muon_momentum = 0.95;
@@ -14804,6 +14817,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn v6_recipe_recurses_three_by_three_and_v5_stays_two_by_two() {
+        let mut v6 = TrainConfig {
+            world_core_v6: true,
+            ..TrainConfig::default()
+        };
+        v6.apply_foundation_v2_recipe();
+        assert_eq!(v6.inner_steps, V6_RECURSION_STEPS);
+        assert_eq!(v6.outer_steps, V6_RECURSION_STEPS);
+        assert_eq!(v6.model_config().inner_steps, 3);
+        assert_eq!(v6.model_config().outer_steps, 3);
+        let mut v5 = TrainConfig::default();
+        v5.apply_foundation_v2_recipe();
+        assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
+    }
+
     fn v6_config_requires_foundation_v2_and_flags_compose() {
         let plain = TrainConfig {
             world_core_v6: true,
