@@ -59,3 +59,27 @@ _Avoid_: Replay buffer, imagined memory
 **Ambiguous Action Attempt**:
 An at-most-once action submission whose application status cannot be confirmed from the transport result.
 _Avoid_: Failed action, confirmed transition
+
+**Hidden Rule**:
+The episode-stable operator family, colour bindings, and goal family that determine transitions and never appear in any observation or conditioning input.
+_Avoid_: Operator token, revealed rule
+
+**Learning History**:
+A chronological sequence of factual transitions from one hidden-rule episode produced by an exploratory policy whose competence improves along the sequence.
+_Avoid_: Expert trajectory, demonstration
+
+**Context Window**:
+The bounded set of most recent factual transitions from the same episode that is supplied to the model as evidence about the hidden rule.
+_Avoid_: History buffer, memory tokens
+
+**Twin Episode**:
+A generated episode that shares a byte-identical initial frame with another episode but is bound to a different hidden rule.
+_Avoid_: Augmented copy, shuffled control
+
+**Fast Weights**:
+The named parameter subset that test-time adaptation may update; every other parameter is frozen at inference.
+_Avoid_: Adapter, LoRA
+
+**Whole-Frame Content**:
+The v6 convention that all 4096 pixels of a frame are board content with no reserved status row or unsupervised padding.
+_Avoid_: Content rectangle, playfield

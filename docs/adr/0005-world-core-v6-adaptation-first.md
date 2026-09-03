@@ -1,0 +1,255 @@
+# ADR 0005: World-core v6 — adaptation-first training and test-time adaptation contract
+
+- Status: proposed
+- Date: 2026-09-03
+- Amends: [ADR 0003](0003-world-core-v5-foundation-v2.md) §1 data contract, §2 model,
+  §3 objective, §6 evaluation, §7 deferred list; makes [ADR 0004](0004-latent-planning-contract.md)
+  Phase C ("prequential fast adapters") concrete.
+- Basis: research run `~/Research/Knowledge/_runs/2026-09-03T033950Z-tofy-zero-shot-transfer-training-design`
+  (synthesis.md and seven verified findings), plus the local audit
+  `findings/local-generator-vs-interface-audit.md` against worktree `7eddfd21`.
+
+## Decision
+
+Tofy stops treating an unseen ARC-AGI-3 game as an in-distribution query and
+starts treating it as a task to be adapted to. Version 6 of the world core:
+
+1. **Fixes the interface** so that the tuple the live policy actually sends
+   is a tuple the model was trained on (whole-frame content, free background
+   colour, no reserved status row, unknown operator with an all-zero goal).
+2. **Trains for adaptation**: every training row may carry a context window of
+   the most recent factual transitions from the same hidden-rule episode, the
+   generator is made *mutually exclusive* (identical frames, different rules),
+   and histories are exploratory learning histories spanning level boundaries.
+3. **Adds a context channel to the model** (CaDM-style in-context adaptation,
+   no gradients) and names a **fast-weight subset** for gradient adaptation.
+4. **Adds a bounded per-level test-time adaptation loop** at inference, with
+   snapshot/revert safeguards, that never touches the pretrained checkpoint.
+5. **Preregisters cheap falsifiers** that must pass before GPU-hours are spent.
+
+## Bounded claim and honest expectation
+
+The evidence supports each mechanism separately in other domains; no primary
+source shows a ~0.5M-parameter neural world model adapting profitably within
+the 5x-human action budget on unseen ARC-AGI-3 games. The Twin and Tycho
+results say goal inference, not dynamics accuracy, is the score bottleneck.
+This ADR therefore claims only: (a) the live query becomes in-distribution,
+(b) the model gains a measurable ability to use in-episode evidence, (c) the
+adaptation loop is safe (cannot make the frozen model worse than the prior).
+It does not claim a hidden-set score. The defensible target remains the
+Kaggle milestone regime; the grand prize is not a projected outcome.
+
+## Non-negotiable invariants (retained from ADR 0003)
+
+- Training data is synthetic only. Public ARC-AGI-3 levels are evaluation
+  only, enforced by `training_source_cannot_depend_on_live_or_recording_modules`.
+  Test-time adaptation at evaluation time uses only the current game's own
+  factual transitions, and its adapted weights are discarded at the end of
+  the game; the pretrained checkpoint is never updated from public games.
+- Deterministic seeds; manifested, hashed checkpoints; fail-closed loaders.
+- Predictions never enter Factual Memory; adaptation trains on factual
+  transitions only, never on imagined rollouts.
+
+## 1. Interface contract v6
+
+All items apply to `world_core_v6` models and the `v6` generator; legacy
+model flags are unchanged so old checkpoints remain loadable.
+
+1.1 **Whole-frame content.** Every pixel of the 64x64 frame is board content.
+The content mask of a v6 row is all ones; `ContentRect` survives only as
+augmentation geometry (D4 conjugation of coordinates) and as a per-source
+metric stratum. Losses, exactness metrics, no-op labels, board effects and
+outcome equivalence are computed over all 4096 pixels.
+
+1.2 **Free background colour.** The exact simulator keeps semantic index 0 for
+EMPTY; rendering maps it through the colour permutation like every other
+index. The v6 colour permutation is a uniformly random permutation of all
+16 colours. Padding outside the native board is rendered with the
+permuted EMPTY colour, so live frames with arbitrary backgrounds and
+synthetic frames are the same distribution. No model path may treat
+rendered index 0 specially (`embed_frames` status shortcut, decoder priors,
+`dominant_color` background inference in the live driver).
+
+1.3 **No reserved status row.** The v6 generator paints no synthetic budget
+bar; `V5_PLAYFIELD_HEIGHT` is not used by v6 layouts (content may occupy row
+63). `embed_frames` does not replace row 63 for `world_core_v6`. The live
+tried-action key hashes all 64 rows; ACTION6 proposals may target row 63.
+
+1.4 **Live query tuple has training support.** v6 rows always use the
+UNKNOWN operator-conditioning token with neutral colours. Rule identity is
+conveyed only by the context window (1.5) and never by conditioning.
+The 30% goal dropout is retained, so (all-zero goal, UNKNOWN) is a
+first-class training tuple. The `operator_conditioning_proj` parameters are
+retained for checkpoint compatibility and receive only UNKNOWN in v6.
+
+1.5 **Context window.** A v6 row carries `context: Vec<ContextTransition>`,
+`0 <= len <= CONTEXT_WINDOW_MAX = 16`, each `(current, action, next)` frame
+triple drawn from the same `(seed, meta_episode_id)` episode, strictly
+earlier in chronological order than the row, under the same D4/colour
+augmentation as the row. Context may cross level boundaries within the
+episode. The live policy fills the context with the most recent factual
+transitions of the current level from Factual Memory (across levels when
+the carry arm is on).
+
+1.6 **Available actions.** Rows record an 8-bit `available_actions` mask
+(RESET, ACTION1..7). The Rust generator emits all-available; ARCEngine shards
+emit the game's mask; the live driver masks proposals by it.
+
+## 2. Data contract v6
+
+2.1 **Streams.** ADR 0003 §1.1 streams are retained, rendered under §1
+rules, as the "legacy" mixture. A new stream `LearningHistories` is added.
+Schedule (fraction of physical rows): `LearningHistories` ramps linearly
+from 0.25 at progress 0 to 0.50 at progress 1; legacy streams share the
+remainder in their ADR 0003 ratios.
+
+2.2 **Learning histories.** A `LearningHistories` unit is one `MetaEpisode`
+with `levels in {2,3,4}` and a stable hidden rule (operator family + colour
+bindings + goal family). Its transitions come from an epsilon-decaying
+policy over the existing scripted solvers: `epsilon = 1.0` at the first
+transition of the episode decaying linearly to `0.2` at the last, so early
+context is exploratory and late context is competent (Algorithm
+Distillation shape: histories that improve, not expert data). Each emitted
+row is the transition at index `t` with `context = transitions[t-K..t]`,
+`K ~ Uniform{0..16}` with `P(K=0) >= 0.10` so the no-context prior keeps
+training. Goal-satisfaction, failure and exhausted labels follow ADR 0003.
+
+2.3 **Mutual exclusivity (the non-negotiable data property).** The hidden
+rule must not be inferable from a single frame. The generator enforces this
+by construction: every meta-episode is emitted together with a **twin** that
+shares the byte-identical level-0 initial frame and initial policy prefix
+but is bound to a different hidden rule (different operator family and/or
+different goal family and/or different colour binding), so identical frames
+map to different next frames across the two episodes. The goal family is a
+seeded draw independent of `episode_id` (the `episode_id % 6` shortcut is
+removed). The `census_rule_identifiability` machinery is extended with a
+`single_frame_rule_identifiable` count that must be 0 on the twin pairs.
+
+2.4 **Provenance.** `TransitionProvenance` gains `rule_id: u64` (hash of the
+hidden rule), `level_index: u16`, `available_actions: u8`, and
+`context_len: u8`. `TransitionSample` gains `context: Vec<ContextTransition>`
+(serde default empty).
+
+2.5 **Counterfactual sidecars** for gate 2 are retained for every stream.
+
+2.6 **ARCEngine shard stream (weight 0 in this ADR).** A `SyntheticShards`
+stream may load safetensors shards produced by `python/tofy_arc3/synth`
+(games authored against `arcengine.ARCBaseGame`, the same engine Kaggle
+runs). Shard contract: tensors `frames u8[N,64,64]`, `next_frames u8[N,64,64]`,
+`actions u8[N,3]` (id, x, y; 255 = none), `available_actions u8[N]`,
+`episode u32[N]`, `level u16[N]`, `transition_index u32[N]`,
+`rule_id u64[N]` (as two u32 halves `rule_id_lo/hi`), `level_completed u8[N]`,
+`game_over u8[N]`; sidecar `manifest.json` with `source: "tofy_synth_arcengine"`,
+generator revision, seed, rule census, and a `public_game_ids_excluded`
+attestation. The loader rejects any manifest whose game ids intersect the
+public game list. The stream weight stays 0 until the shard generator passes
+the memorization diagnostic (§5.1) on its own held-out twins.
+
+## 3. Model contract v6 (`world_core_v6`)
+
+3.1 v6 is v5 plus a **context channel**. Each context transition is encoded
+by the shared frame encoder applied to `current` and `next`, the action
+embedding (with spatial coordinate field for ACTION6), and the pooled latent
+difference; a small MLP maps the concatenation to `hidden_dim`. The `K`
+embeddings are aggregated by mean pooling plus the last element
+(order-aware summary), giving `c in R^hidden`; `K = 0` gives `c = 0`.
+`c` enters the dynamics block through **context FiLM**
+(`context_film_gamma`, `context_film_beta`, zero-initialised so the v5
+computation is recovered exactly at init) applied next to action FiLM.
+
+3.2 Parameter budget: <= 650k parameters total (v5 is ~467k).
+
+3.3 **Fast-weight subset** (the only parameters gradient adaptation may
+touch), by name prefix, exported as `FAST_WEIGHT_PREFIXES`:
+`action_film_`, `context_film_`, `pixel_emb`, `encoder.c1` (first conv of
+the frame encoder; name to be confirmed against `model.rs`), and
+`exact_grounding_head`. Everything else is frozen at inference.
+
+3.4 Loading: a `world_core_v6` config on a v5 checkpoint fails closed unless
+`--init-context-from-v5` is passed, in which case the context parameters
+are zero-initialised and everything else is loaded by name (warm start).
+
+## 4. Objective v6
+
+ADR 0003 §3 is retained unchanged in form; every loss is evaluated over
+whole-frame content (§1.1). Context rows use the same losses with the
+context supplied. No inner-loop meta-objective is added (Miranda et al.:
+effect size < 0.2 over multi-task pretraining; deferred, §8).
+
+## 5. Preregistered gates and falsifiers (must run before pod GPU-hours)
+
+5.1 **Memorization diagnostic** (Yin et al. 2020). On 512 held-out twin-pair
+meta-episodes, measure changed-exact on the row after the context with
+`K = 0` versus `K = 16`. Promotion of the data contract requires
+`delta >= 0.05` absolute by the first evaluation after step 4096 on a local
+run; a smaller delta is a **data** failure (the generator is not mutually
+exclusive) and blocks any pod run.
+
+5.2 **Adaptation falsifier.** Channel A (context only) vs Channel A+B
+(context plus fast-weight updates) on held-out synthetic meta-episodes,
+prequential: adapt on transitions `1..t`, score `t+1..t+4`. Channel B is
+promoted only if it improves prequential changed-exact by >= 0.02 absolute
+AND the adapted-then-frozen model is not worse than the prior on the same
+rows (Tempora failure mode). Otherwise Channel B ships disabled.
+
+5.3 **Residual-vs-reliability AUROC** on the latest local v5 checkpoint:
+one-step residual on real ARC frames (toolkit local recordings, evaluation
+only) versus in-distribution synthetic frames. If residual separates and
+the reliability head does not, Phase A trust uses residual-derived
+calibration until a v6 checkpoint exists.
+
+5.4 Existing ADR 0003 §5 gates and the v6 gate-policy schema are retained.
+
+## 6. Test-time adaptation contract (`src/p2/adaptation.rs`)
+
+6.1 **Channel A is always on** for v6 policies: the live driver keeps the
+last `CONTEXT_WINDOW_MAX` factual transitions of the current level (carry
+arm: of the current game) and passes them as context to every model call,
+including Phase A screening and verification.
+
+6.2 **Channel B (`--adapt`)** runs after every observed factual transition
+once the current level has >= 8 transitions:
+- optimizer AdamW on `FAST_WEIGHT_PREFIXES` only, lr `1e-4`, weight decay 0,
+  global grad-norm clip 1.0, no warm-up;
+- at most 4 gradient steps per new transition; cumulative steps per level
+  <= 8 x (number of unique transitions in the level);
+- batch `min(32, buffer)` drawn by reservoir sampling from the level-tagged
+  factual buffer (the buffer persists across levels; fast weights reset to
+  theta_0 at every level boundary in the default arm; the preregistered
+  `carry` arm keeps them);
+- loss = the ADR 0003 exact-decoder next-frame loss on factual rows with
+  the row's own context, plus L2-SP `1e-3 * ||theta - theta_0||^2` on the
+  fast subset;
+- prequential guard: loss on the newest 4 transitions is measured before
+  and after each update; two consecutive worsenings revert to theta_best;
+- collapse guard: an update whose grad-norm exceeds 3x the running mean
+  is skipped (SAR precursor);
+- the adapted model is never used for goal/terminal inference; Phase A
+  trust gates and calibration are unchanged;
+- every update, skip and revert is recorded in `ActionDecision` telemetry.
+
+6.3 Adapted weights are discarded at the end of a game. Nothing here
+modifies a checkpoint on disk.
+
+## 7. Evaluation additions
+
+- `p2-eval` reports v6 metrics stratified by `context_len in {0, 1-4, 5-16}`.
+- `p2-arc3-live-eval` / bridge report per-level adaptation telemetry
+  (updates, skips, reverts, prequential loss before/after).
+- The memorization diagnostic and adaptation falsifier are `p2-eval`
+  modes with fixed seeds and are `selection_only` until a fresh population
+  confirms them.
+
+## 8. Explicitly deferred
+
+MAML/MAML++ inner loop and multi-step loss; attention (Transformer-XL)
+memory over the context; mixture-of-adapted-models (MOLe); ARCEngine
+shard stream weight > 0; ADR 0004 Phase B heads; anything that changes the
+19-dim goal vector or the six goal-family slots consumed by Phase A.
+
+## 9. Consequences
+
+- A v6 generator is trajectory-changing: no exact resume from any v5 run.
+- Old checkpoints load under their own flags; v6 metrics are not comparable
+  to v5 metrics because the content population changes (whole frame).
+- The `RuleIdentifiabilityCensus` becomes a hard data gate, not a report.
