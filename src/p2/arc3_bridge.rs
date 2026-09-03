@@ -977,6 +977,68 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Default)]
+    struct TransitionPolicy {
+        transitions: Vec<(u16, u8, u16, bool)>,
+    }
+
+    impl LivePolicy for TransitionPolicy {
+        fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+            let mut first = FirstPolicy;
+            first.choose_action(observation)
+        }
+
+        fn on_confirmed_transition(
+            &mut self,
+            current: &ArcObservation,
+            action: &crate::p2::data::ArcAction,
+            next: &ArcObservation,
+        ) {
+            self.transitions.push((
+                current.levels_completed,
+                action.id,
+                next.levels_completed,
+                current.frame != next.frame,
+            ));
+        }
+    }
+
+    #[test]
+    fn serve_loop_reports_confirmed_transitions_to_the_policy() -> Result<()> {
+        let mut changed = wire_observation("game", "guid", "NOT_FINISHED", &[1]);
+        changed["frame"][0][0][0] = json!(3);
+        let input = response_lines(&[
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({ "op": "observe", "observation": changed }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "GAME_OVER", &[])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "WIN", &[])
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = TransitionPolicy::default();
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        // Every ACTION response is a factual transition; the RESET after
+        // GAME_OVER is not (no action was chosen from the terminal frame).
+        assert_eq!(
+            policy.transitions,
+            vec![(0, 1, 0, true), (0, 1, 0, true), (0, 1, 1, false)]
+        );
+        Ok(())
+    }
+
     #[test]
     fn bridge_recording_round_trips_through_importer() -> Result<()> {
         let root = std::env::temp_dir().join(format!(

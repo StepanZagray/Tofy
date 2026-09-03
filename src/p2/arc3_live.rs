@@ -4000,4 +4000,103 @@ mod tests {
         let fixture = format!("{data}\nuse crate::p2::arc3::import_recordings_dir;");
         assert!(contains_forbidden_training_import(&fixture));
     }
+
+    fn varmap_bits(varmap: &candle_nn::VarMap) -> Result<Vec<(String, Vec<u32>)>> {
+        let data = varmap.data().lock().unwrap();
+        let mut out = Vec::new();
+        for (name, var) in data.iter() {
+            let bits = var
+                .as_tensor()
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            out.push((name.clone(), bits));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    #[test]
+    fn adapting_policy_observes_transitions_and_restores_prior_at_game_end() -> Result<()> {
+        use crate::p2::adaptation::AdaptationMode;
+        use crate::p2::experiment::ConsumerReadoutTopology;
+        use crate::p2::model::ModelConfig;
+        use candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            patch_size: 4,
+            hidden_dim: 8,
+            action_dim: 8,
+            goal_dim: 6,
+            inner_steps: 1,
+            outer_steps: 1,
+            spatial_action_field: true,
+            world_core_v4: true,
+            world_core_v5: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            config,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let theta0 = varmap_bits(&varmap)?;
+        let adapter = adaptation_for(&model, &varmap, &device, true, false)?;
+        assert!(adapter.is_some());
+        assert!(adaptation_for(&model, &varmap, &device, false, false)?.is_none());
+        let mut policy = AdaptingPolicy::new(RecordingPolicy::default(), adapter);
+
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mid = scripted_observation("NOT_FINISHED", 0);
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        let mut api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(mid), Ok(win)]);
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )?;
+        let game = &report.games[0];
+        assert_eq!(game.stop_reason, "completed");
+        assert_eq!(game.trace.len(), 2);
+        assert!(
+            game.trace[0].decision.adaptation.is_none(),
+            "no factual transition precedes the first decision"
+        );
+        let trace = game.trace[1]
+            .decision
+            .adaptation
+            .as_ref()
+            .expect("the confirmed transition arms maybe_update before the next decision");
+        assert_eq!(trace.mode, AdaptationMode::Reset);
+        assert_eq!(trace.note.as_deref(), Some("warmup"));
+        assert_eq!(trace.updates, 0);
+        let telemetry = decision_telemetry(&game.trace[1].decision);
+        assert_eq!(
+            telemetry["adaptation"]["mode"],
+            Value::String("reset".into())
+        );
+        let first = serde_json::to_value(&game.trace[0].decision)?;
+        assert!(
+            first.get("adaptation").is_none(),
+            "absent trace is not serialized"
+        );
+
+        // Game end: buffer discarded and every parameter is theta_0 bitwise.
+        let adapter = policy.adapter().expect("adapter retained");
+        assert!(adapter.buffer().is_empty());
+        assert!(adapter.fast_weights_equal_prior()?);
+        assert_eq!(varmap_bits(&varmap)?, theta0);
+        assert_eq!(
+            policy.inner.events,
+            vec!["start:game", "level:1", "end:completed"],
+            "inner controller lifecycle is forwarded unchanged"
+        );
+        Ok(())
+    }
 }

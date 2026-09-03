@@ -990,6 +990,32 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_update_touches_only_fast_weights_and_restores_prior() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("no CUDA device available; skipping");
+            return Ok(());
+        };
+        let (model, varmap) = tiny_model(&device)?;
+        let before = all_var_snapshots(&varmap)?;
+        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        observe_distinct(&mut adapter, ADAPT_MIN_LEVEL_TRANSITIONS as u8, 0);
+        let trace = adapter.maybe_update()?.expect("pending");
+        assert!(trace.updates > 0, "{trace:?}");
+        assert!(trace.grad_norm.is_some_and(f64::is_finite));
+        assert!(trace.preq_loss_after.is_some_and(f64::is_finite));
+        let after = all_var_snapshots(&varmap)?;
+        for ((name, was), (_, now)) in before.iter().zip(&after) {
+            if !is_fast_weight(name) {
+                assert!(bitwise_equal(was, now)?, "frozen {name} changed on CUDA");
+            }
+        }
+        adapter.restore_prior()?;
+        assert!(adapter.fast_weights_equal_prior()?);
+        Ok(())
+    }
+
     #[test]
     fn trace_serialization_skips_empty_fields() -> Result<()> {
         let trace = AdaptationTrace {
