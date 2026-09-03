@@ -20,8 +20,8 @@ use crate::p2::data::{
 };
 use crate::p2::grounding::DecodeComposition;
 use crate::p2::model::{
-    flatten_latent, latent_mse_per_sample, pool_latent, PtrmConfig, RecursionDepth, RecursionOpts,
-    RecursionStepProbe, WorldModel, EVENT_GOAL_FAILED,
+    flatten_latent, latent_mse_per_sample, pool_latent, ContextBatch, PtrmConfig, RecursionDepth,
+    RecursionOpts, RecursionStepProbe, WorldModel, EVENT_GOAL_FAILED,
 };
 use crate::p2::representation::{
     RepresentationRowCollector, RepresentationSeam, RepresentationSeamCollector,
@@ -1133,6 +1133,11 @@ pub struct EvalReport {
     /// contract's actual held-out distributions. Selection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v5_holdout_gates: Option<BTreeMap<String, GateSupportMetrics>>,
+    /// ADR 0005 §7: the same gate metrics per held-out split, stratified by
+    /// the row's context window length (`"0"`, `"1-4"`, `"5-16"`). Present
+    /// only for `world_core_v6` checkpoints; selection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_context_strata: Option<BTreeMap<String, BTreeMap<String, GateSupportMetrics>>>,
     /// Same-checkpoint, same-row mechanism ablations for bundled treatments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanism_ablations: Option<MechanismAblationReport>,
@@ -2515,6 +2520,7 @@ fn foundation_v2_v5_holdout_gates(
     profile: Option<&RepresentativeUpdateCapture>,
 ) -> Result<(
     BTreeMap<String, GateSupportMetrics>,
+    Option<BTreeMap<String, BTreeMap<String, GateSupportMetrics>>>,
     Vec<TransitionSample>,
     Vec<ContentMask>,
     Vec<V5SampleProvenance>,
@@ -2534,6 +2540,7 @@ fn foundation_v2_v5_holdout_gates(
         ));
     }
     let mut gates = BTreeMap::new();
+    let mut context_strata = model.config().world_core_v6.then(BTreeMap::new);
     let mut ablation_population = None;
     for (lane, (name, split)) in splits.into_iter().enumerate() {
         let seed = cfg
@@ -2583,11 +2590,17 @@ fn foundation_v2_v5_holdout_gates(
         if lane == 0 {
             ablation_population = Some((samples.clone(), masks.clone(), provenance.clone()));
         }
+        if let Some(strata) = context_strata.as_mut() {
+            strata.insert(
+                name.clone(),
+                foundation_v2_context_strata(model, &samples, &masks, &provenance, device)?,
+            );
+        }
         gates.insert(name, metrics);
     }
     let (samples, masks, provenance) =
         ablation_population.expect("unseen-seed V5 holdout population is always present");
-    Ok((gates, samples, masks, provenance))
+    Ok((gates, context_strata, samples, masks, provenance))
 }
 
 /// Full-transition exactness on the same changed-transition rows counted by
@@ -2737,6 +2750,8 @@ struct EncodedGateSupportPopulation {
     shuffled: ShuffledActionControlPopulation,
     shuffled_actions: Tensor,
     shuffled_coords: Tensor,
+    /// ADR 0005 context windows, consumed only by `world_core_v6` models.
+    context: Option<ContextBatch>,
 }
 
 fn encode_gate_support_population(
@@ -2750,6 +2765,12 @@ fn encode_gate_support_population(
     let shuffled = shuffled_action_control_population(samples, provenance)?;
     let (shuffled_actions, shuffled_coords) =
         action_tensors_from_samples(&shuffled.samples, device)?;
+    let context = model
+        .config()
+        .world_core_v6
+        .then(|| ContextBatch::from_samples(samples, device))
+        .transpose()?
+        .flatten();
     Ok(EncodedGateSupportPopulation {
         batch,
         current,
@@ -2757,7 +2778,65 @@ fn encode_gate_support_population(
         shuffled,
         shuffled_actions,
         shuffled_coords,
+        context,
     })
+}
+
+/// ADR 0005 §7 evaluation stratum of a row's context window length.
+pub fn context_len_stratum(context_len: usize) -> &'static str {
+    match context_len {
+        0 => "0",
+        1..=4 => "1-4",
+        _ => "5-16",
+    }
+}
+
+/// Gate metrics of one population split by `context_len` stratum, keyed by
+/// [`context_len_stratum`]. Reported only for `world_core_v6` checkpoints.
+fn foundation_v2_context_strata(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    masks: &[ContentMask],
+    provenance: &[V5SampleProvenance],
+    device: &Device,
+) -> Result<BTreeMap<String, GateSupportMetrics>> {
+    let mut strata = BTreeMap::<String, Vec<usize>>::new();
+    for (index, sample) in samples.iter().enumerate() {
+        strata
+            .entry(context_len_stratum(sample.context.len()).to_string())
+            .or_default()
+            .push(index);
+    }
+    strata
+        .into_iter()
+        .map(|(name, rows)| {
+            let pick = |index: &usize| rows.contains(index);
+            let samples = samples
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| pick(index))
+                .map(|(_, sample)| sample.clone())
+                .collect::<Vec<_>>();
+            let masks = rows
+                .iter()
+                .map(|row| masks[*row].clone())
+                .collect::<Vec<_>>();
+            let provenance = rows
+                .iter()
+                .map(|row| provenance[*row].clone())
+                .collect::<Vec<_>>();
+            let metrics = evaluate_gate_support_impl(
+                model,
+                &samples,
+                Some(&masks),
+                Some(&provenance),
+                device,
+                None,
+                None,
+            )?;
+            Ok((name, metrics))
+        })
+        .collect()
 }
 
 fn eval_profile_phase<T>(
@@ -2885,22 +2964,29 @@ fn evaluate_gate_support_impl(
         SpanKind::Module,
         Some(ExecutionStep::Forward),
         || {
+            // ADR 0005 §6.1: v6 rows are scored with their context window
+            // (None for legacy rows, so v5 scoring is unchanged).
+            let depth = RecursionDepth::from_config(model.config());
             let prediction = model
-                .forward_from_latent_with_operator_conditioning(
+                .forward_from_latent_with_depth_and_operator_conditioning_with_context(
                     &encoded.current,
                     &encoded.batch.actions,
                     &encoded.batch.action_coords,
                     &encoded.batch.goals,
                     &encoded.batch.operator_conditioning,
+                    encoded.context.as_ref(),
+                    depth,
                 )?
                 .y;
             let shuffled_prediction = model
-                .forward_from_latent_with_operator_conditioning(
+                .forward_from_latent_with_depth_and_operator_conditioning_with_context(
                     &encoded.current,
                     &encoded.shuffled_actions,
                     &encoded.shuffled_coords,
                     &encoded.batch.goals,
                     &encoded.batch.operator_conditioning,
+                    encoded.context.as_ref(),
+                    depth,
                 )?
                 .y;
             Ok((prediction, shuffled_prediction))
@@ -7039,8 +7125,9 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
     if let Some(profile) = eval_profile.take() {
         profile.finish()?;
     }
-    let (v5_holdout_gates, mechanism_ablations) = if let Some((
+    let (v5_holdout_gates, v6_context_strata, mechanism_ablations) = if let Some((
         gates,
+        context_strata,
         samples,
         masks,
         provenance,
@@ -7056,9 +7143,9 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
                 &device,
             )
         })?;
-        (Some(gates), Some(ablations))
+        (Some(gates), context_strata, Some(ablations))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let report_reduction_started = Instant::now();
@@ -7113,6 +7200,16 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
             );
         }
     }
+    if let Some(strata) = &v6_context_strata {
+        for (split, by_stratum) in strata {
+            for (stratum, metrics) in by_stratum {
+                population_sha256.insert(
+                    format!("v6_context_{split}_{stratum}"),
+                    metrics.population_fingerprint.clone(),
+                );
+            }
+        }
+    }
     let identity = evaluation_identity(cfg, population_sha256)?;
 
     let report = EvalReport {
@@ -7144,6 +7241,7 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
         outcome_counterfactuals,
         arc3_transfer,
         v5_holdout_gates,
+        v6_context_strata,
         mechanism_ablations,
         research_claim: false,
     };
@@ -8989,5 +9087,14 @@ mod tests {
             .and_then(|(w, hd, zd)| linear_r2_with_weights(&encoder, &oracle, &w, hd, zd))
             .expect("r2");
         assert!(r2 > 0.99, "expected near-perfect linear recovery, got {r2}");
+    }
+
+    #[test]
+    fn context_len_stratum_boundaries_follow_adr_0005() {
+        assert_eq!(context_len_stratum(0), "0");
+        assert_eq!(context_len_stratum(1), "1-4");
+        assert_eq!(context_len_stratum(4), "1-4");
+        assert_eq!(context_len_stratum(5), "5-16");
+        assert_eq!(context_len_stratum(16), "5-16");
     }
 }

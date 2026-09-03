@@ -25,10 +25,11 @@ use crate::p2::experiment::{
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::model::{
     flatten_latent, init_copy_bypass_gate, latent_mse_per_sample, restore_copy_gate_bias_prior,
-    zero_action_film_projections, zero_operator_conditioning_projection, ModelConfig, PtrmConfig,
+    zero_action_film_projections, zero_context_film_projections,
+    zero_operator_conditioning_projection, ContextBatch, ContextBatchHost, ModelConfig, PtrmConfig,
     RecursionDepth, RecursionOpts, TrainingEncodedPair, WorldModel, ACTION_VOCAB,
-    DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, OPERATOR_CONDITION_DIM, OPERATOR_FAMILY_UNKNOWN,
-    OPERATOR_FAMILY_VOCAB, PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
+    CONTEXT_PARAMETER_PREFIX, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, OPERATOR_CONDITION_DIM,
+    OPERATOR_FAMILY_UNKNOWN, OPERATOR_FAMILY_VOCAB, PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
@@ -1043,6 +1044,16 @@ pub struct TrainConfig {
     pub world_core_v3: bool,
     #[serde(default)]
     pub world_core_v4: bool,
+    /// ADR 0005 world-core v6: foundation-v2 topology plus the context
+    /// channel. Trajectory-changing; recorded in the training contract.
+    #[serde(default)]
+    pub world_core_v6: bool,
+    /// ADR 0005 §3.4 warm start: v5 checkpoint (bundle directory or
+    /// `model.safetensors`) whose tensors initialize every non-context
+    /// parameter of a fresh v6 run. Without it a v6 config on a v5 checkpoint
+    /// fails closed.
+    #[serde(default)]
+    pub init_context_from_v5: Option<PathBuf>,
     /// Planning-head aggregation at the final spatial prediction seam.
     #[serde(default)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -1270,6 +1281,8 @@ impl Default for TrainConfig {
             world_core_v2: false,
             world_core_v3: false,
             world_core_v4: false,
+            world_core_v6: false,
+            init_context_from_v5: None,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
             spatial_action_field: false,
             spatial_action_residual: false,
@@ -1419,6 +1432,14 @@ impl TrainConfig {
                  to intentionally give that up)"
             );
         }
+        if (self.world_core_v6 || self.init_context_from_v5.is_some())
+            && self.recipe != TrainingRecipe::FoundationV2
+        {
+            bail!("world_core_v6 / init_context_from_v5 require the foundation-v2 recipe");
+        }
+        if self.init_context_from_v5.is_some() && !self.world_core_v6 {
+            bail!("init_context_from_v5 is only meaningful for a world_core_v6 run");
+        }
         if self.recipe == TrainingRecipe::FullV4 {
             self.validate_full_v4()?;
         } else if self.recipe == TrainingRecipe::FoundationV2 {
@@ -1466,6 +1487,7 @@ impl TrainConfig {
             world_core_v3: self.world_core_v3,
             world_core_v4: self.world_core_v4,
             world_core_v5: self.recipe == TrainingRecipe::FoundationV2,
+            world_core_v6: self.world_core_v6,
             consumer_readout: self.consumer_readout,
             copy_bypass_gate: self.copy_bypass_gate,
             copy_gate_bias_prior: self.copy_gate_bias_prior,
@@ -1619,6 +1641,8 @@ impl TrainConfig {
         canonical.decode_composition = self.decode_composition;
         canonical.positional_value_readout = self.positional_value_readout;
         canonical.allow_multi_treatment_arm = self.allow_multi_treatment_arm;
+        canonical.world_core_v6 = self.world_core_v6;
+        canonical.init_context_from_v5 = self.init_context_from_v5.clone();
         if self != &canonical {
             bail!("foundation-v2 recipe contains a caller-overridden fixed model/loss switch");
         }
@@ -2057,6 +2081,10 @@ struct TrainingContract {
     #[serde(default)]
     steady_gpu: bool,
     #[serde(default)]
+    world_core_v6: bool,
+    #[serde(default)]
+    init_context_from_v5: Option<PathBuf>,
+    #[serde(default)]
     supervise_last_outer_only: bool,
     phased_training: bool,
     #[serde(default = "default_stop_grad_event_y")]
@@ -2177,6 +2205,8 @@ impl From<&TrainConfig> for TrainingContract {
             ptrm_rank_every: cfg.ptrm_rank_every,
             randomize_depth: cfg.randomize_depth,
             steady_gpu: cfg.steady_gpu,
+            world_core_v6: cfg.world_core_v6,
+            init_context_from_v5: cfg.init_context_from_v5.clone(),
             supervise_last_outer_only: cfg.supervise_last_outer_only,
             phased_training: cfg.phased_training,
             stop_grad_event_y: cfg.stop_grad_event_y,
@@ -2779,6 +2809,80 @@ pub fn load_varmap_exact(varmap: &VarMap, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// ADR 0005 §3.4: load a v5 checkpoint into a `world_core_v6` varmap. Every
+/// checkpoint tensor must match a model tensor by name/shape/dtype and the
+/// only tensors allowed to be absent from the checkpoint are the context
+/// channel's (`context_*`), which keep their fresh initialization; context
+/// FiLM is then zeroed so the loaded model computes exactly the v5 function.
+/// Accepts a bundle directory or a `model.safetensors` path.
+pub fn load_varmap_warm_start_context(varmap: &VarMap, source: &Path) -> Result<()> {
+    let path = if source.is_dir() {
+        source.join("model.safetensors")
+    } else {
+        source.to_path_buf()
+    };
+    let device = varmap
+        .all_vars()
+        .first()
+        .map(|v| v.device().clone())
+        .ok_or_else(|| anyhow::anyhow!("empty varmap"))?;
+    let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(&path)? };
+    let expected: BTreeMap<String, Var> = varmap
+        .data()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, var)| (name.clone(), var.clone()))
+        .collect();
+    let checkpoint_names = mmap
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    let extra: Vec<_> = checkpoint_names
+        .iter()
+        .filter(|name| !expected.contains_key(*name))
+        .cloned()
+        .collect();
+    let missing: Vec<_> = expected
+        .keys()
+        .filter(|name| !checkpoint_names.contains(*name))
+        .cloned()
+        .collect();
+    let non_context_missing: Vec<_> = missing
+        .iter()
+        .filter(|name| !name.starts_with(CONTEXT_PARAMETER_PREFIX))
+        .cloned()
+        .collect();
+    if !extra.is_empty() || !non_context_missing.is_empty() || missing.is_empty() {
+        bail!(
+            "v5 warm start requires a checkpoint missing exactly the context parameters: \
+             missing={missing:?} extra={extra:?}"
+        );
+    }
+    let mut loaded = Vec::with_capacity(checkpoint_names.len());
+    for name in &checkpoint_names {
+        let var = &expected[name];
+        let tensor = mmap
+            .load(name, &device)
+            .with_context(|| format!("load model tensor {name}"))?;
+        if tensor.dims() != var.shape().dims() || tensor.dtype() != var.dtype() {
+            bail!(
+                "model checkpoint shape/dtype mismatch for {name}: checkpoint={:?}/{:?} model={:?}/{:?}",
+                tensor.dims(),
+                tensor.dtype(),
+                var.shape().dims(),
+                var.dtype()
+            );
+        }
+        loaded.push((var.clone(), tensor));
+    }
+    for (var, tensor) in loaded {
+        var.set(&tensor)?;
+    }
+    zero_context_film_projections(varmap)
+}
+
 pub fn parameter_count(varmap: &VarMap) -> usize {
     varmap.all_vars().iter().map(|v| v.elem_count()).sum()
 }
@@ -2938,6 +3042,8 @@ pub struct BatchTensors {
     pub event_targets: Tensor,
     pub event_mask: Tensor,
     pub factual: Option<FactualBatch>,
+    /// ADR 0005 context windows; `None` when no row carries context.
+    pub context: Option<ContextBatch>,
 }
 
 /// All CPU-only work needed for one foundation-v2 batch.
@@ -2968,6 +3074,13 @@ pub struct PreparedFoundationV2BatchHost {
     foreground_count: usize,
     background_count: usize,
     foreground_weight: f64,
+    context: Option<ContextBatchHost>,
+}
+
+impl PreparedFoundationV2BatchHost {
+    pub fn context(&self) -> Option<&ContextBatchHost> {
+        self.context.as_ref()
+    }
 }
 
 fn validate_frame_pixels(frame: &ArcFrame) -> Result<()> {
@@ -3158,6 +3271,7 @@ pub(crate) fn prepare_foundation_v2_batch_host(
         foreground_count,
         background_count,
         foreground_weight,
+        context: ContextBatchHost::from_rows(mixed.transitions())?,
     })
 }
 
@@ -3166,7 +3280,13 @@ fn batch_from_foundation_v2_host(
     device: &Device,
 ) -> Result<BatchTensors> {
     let shape = (host.batch_size, 1, FRAME_SIDE, FRAME_SIDE);
+    let context = host
+        .context
+        .as_ref()
+        .map(|context| ContextBatch::from_host(context, device))
+        .transpose()?;
     Ok(BatchTensors {
+        context,
         frames: Tensor::from_vec(host.frames.clone(), shape, device)?,
         next_frames: Tensor::from_vec(host.next_frames.clone(), shape, device)?,
         model_frames: Tensor::from_vec(host.model_frames.clone(), shape, device)?,
@@ -3406,7 +3526,12 @@ fn batch_from_rows<T: TransitionSampleView>(
         .collect();
     let goals = Tensor::from_vec(goals, (samples.len(), GOAL_FEATURES_DIM), device)?;
     let (event_targets, event_mask) = event_targets_and_mask_from_rows(samples, device)?;
+    let context =
+        ContextBatchHost::from_rows(samples.iter().map(TransitionSampleView::transition_sample))?
+            .map(|host| ContextBatch::from_host(&host, device))
+            .transpose()?;
     Ok(BatchTensors {
+        context,
         frames,
         next_frames,
         model_frames,
@@ -5344,35 +5469,52 @@ fn foundation_v2_rollout_loss_inner(
     let second_operator_conditioning = batch
         .operator_conditioning
         .index_select(&second_indices, 0)?;
+    // ADR 0005 §4: each rollout transition receives its own row's context.
+    let context = batch
+        .context
+        .as_ref()
+        .filter(|_| model.config().world_core_v6);
+    let first_context = context
+        .map(|context| context.select_rows(&first_rows))
+        .transpose()?
+        .flatten();
+    let second_context = context
+        .map(|context| context.select_rows(&second_rows))
+        .transpose()?
+        .flatten();
     let current_canonical = model.canonical_representation(&current)?;
-    let first_out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
-        &current,
-        &current_canonical,
-        &first_actions,
-        &first_action_coords,
-        &first_operator_conditioning,
-        RecursionDepth::from_config(model.config()),
-        0.0,
-        None,
-        RecursionOpts::training(true),
-    )?;
+    let first_out = model
+        .full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+            &current,
+            &current_canonical,
+            &first_actions,
+            &first_action_coords,
+            &first_operator_conditioning,
+            first_context.as_ref(),
+            RecursionDepth::from_config(model.config()),
+            0.0,
+            None,
+            RecursionOpts::training(true),
+        )?;
     let open_loop_input = if detach_open_loop_input {
         first_out.y.detach()
     } else {
         first_out.y.clone()
     };
     let h1_canonical = model.canonical_representation(&open_loop_input)?;
-    let second_out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
-        &open_loop_input,
-        &h1_canonical,
-        &second_actions,
-        &second_action_coords,
-        &second_operator_conditioning,
-        RecursionDepth::from_config(model.config()),
-        0.0,
-        None,
-        RecursionOpts::training(true),
-    )?;
+    let second_out = model
+        .full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+            &open_loop_input,
+            &h1_canonical,
+            &second_actions,
+            &second_action_coords,
+            &second_operator_conditioning,
+            second_context.as_ref(),
+            RecursionDepth::from_config(model.config()),
+            0.0,
+            None,
+            RecursionOpts::training(true),
+        )?;
     let (_, _, height, width) = second_out.y.dims4()?;
     let content_mask = latent_content_mask(second_masks.iter().copied(), height, width, device)?;
     let spatial = masked_spatial_huber(&second_out.y, &target_h2, &content_mask)?;
@@ -5530,20 +5672,30 @@ fn foundation_v2_training_loss_with_event_weights(
         bail!("foundation-v2 loss requires the patch-4 exact-decoder topology");
     }
     let batch = batch_from_foundation_v2_host(host, device)?;
-    let encoded = model
-        .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?;
+    let v6 = model.config().world_core_v6;
+    // ADR 0005 §1.3: v6 encodes the whole frame (row 63 is content), so the
+    // host-staged EMPTY status rows are bypassed; legacy keeps the staged path.
+    let encoded = if v6 {
+        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?
+    } else {
+        model.encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?
+    };
+    // ADR 0005 §4: context rows use the same losses with the context supplied.
+    let context = if v6 { batch.context.as_ref() } else { None };
     let current_canonical = model.canonical_representation(&encoded.current)?;
-    let out = model.full_v4_training_latents_from_encoded_state_with_operator_conditioning(
-        &encoded.current,
-        &current_canonical,
-        &batch.actions,
-        &batch.action_coords,
-        &batch.operator_conditioning,
-        RecursionDepth::from_config(model.config()),
-        0.0,
-        None,
-        RecursionOpts::training(true),
-    )?;
+    let out = model
+        .full_v4_training_latents_from_encoded_state_with_operator_conditioning_with_context(
+            &encoded.current,
+            &current_canonical,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.operator_conditioning,
+            context,
+            RecursionDepth::from_config(model.config()),
+            0.0,
+            None,
+            RecursionOpts::training(true),
+        )?;
     let predicted_canonical = model.canonical_representation(&out.y)?;
     let (_, _, latent_height, latent_width) = out.y.dims4()?;
     let expected_latent_side = FRAME_SIDE / PATCH_SIZE;
@@ -8757,8 +8909,15 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         // the learned values.
         zero_action_film_projections(&varmap)?;
         zero_operator_conditioning_projection(&varmap)?;
+        zero_context_film_projections(&varmap)?;
         init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
+        if let Some(source) = &cfg.init_context_from_v5 {
+            // ADR 0005 §3.4 warm start: every v5 tensor by name; context
+            // parameters keep the fresh init above (FiLM zero => exact v5).
+            load_varmap_warm_start_context(&varmap, source)?;
+            tracing::info!("initialized v6 non-context parameters from {}", source.display());
+        }
     }
     let mut ema = ModelEma::with_default_decay(&varmap)?;
     let mut state = if let Some(bundle) = &resumed_from {
@@ -9462,6 +9621,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         // Treatment initializations survive the generic reinit on every
         // fresh-init path, not only foundation-v2.
         zero_operator_conditioning_projection(&varmap)?;
+        zero_context_film_projections(&varmap)?;
         init_copy_bypass_gate(&varmap)?;
         restore_copy_gate_bias_prior(&varmap, cfg.copy_gate_bias_prior)?;
         TrainerState {
@@ -14271,6 +14431,221 @@ mod tests {
         assert_eq!(legacy.profile_updates, None);
         legacy.profile_updates = requested.profile_updates.clone();
         assert_eq!(legacy, requested);
+        Ok(())
+    }
+
+    // ---- ADR 0005 world-core v6 -------------------------------------------
+
+    fn tiny_v5_model_cfg() -> ModelConfig {
+        ModelConfig {
+            hidden_dim: 8,
+            action_dim: 4,
+            inner_steps: 1,
+            outer_steps: 2,
+            world_core_v4: true,
+            world_core_v5: true,
+            spatial_action_field: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            residual_y_update: true,
+            warm_start_y: true,
+            ..ModelConfig::default()
+        }
+    }
+
+    fn fresh_model(cfg: ModelConfig, seed: u64, device: &Device) -> Result<(WorldModel, VarMap)> {
+        let varmap = VarMap::new();
+        let model = WorldModel::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, device))?;
+        reinit_varmap_deterministic(&varmap, seed)?;
+        zero_action_film_projections(&varmap)?;
+        zero_operator_conditioning_projection(&varmap)?;
+        zero_context_film_projections(&varmap)?;
+        init_copy_bypass_gate(&varmap)?;
+        Ok((model, varmap))
+    }
+
+    /// Give `every`-th row a context window built from other rows' frames.
+    fn inject_synthetic_context(mixed: &mut MixedStreamBatch, every: usize) -> usize {
+        let donors = mixed
+            .transitions()
+            .map(|row| (row.current.clone(), row.action.clone(), row.next.clone()))
+            .collect::<Vec<_>>();
+        let mut injected = 0;
+        for (index, row) in mixed.transitions_mut().enumerate() {
+            if index % every != 0 {
+                continue;
+            }
+            let len = 1 + (index / every) % 3;
+            row.context = (0..len)
+                .map(|offset| {
+                    let (current, action, next) = &donors[(index + offset + 1) % donors.len()];
+                    crate::p2::data::ContextTransition {
+                        current: current.clone(),
+                        action: action.clone(),
+                        next: next.clone(),
+                    }
+                })
+                .collect();
+            injected += 1;
+        }
+        injected
+    }
+
+    #[test]
+    fn v6_config_requires_foundation_v2_and_flags_compose() {
+        let plain = TrainConfig {
+            world_core_v6: true,
+            ..TrainConfig::default()
+        };
+        assert!(plain.validate().is_err());
+        let mut v6 = TrainConfig::default();
+        v6.apply_foundation_v2_recipe();
+        v6.physical_batch = 64;
+        v6.world_core_v6 = true;
+        v6.validate().expect("foundation-v2 + v6 is a valid arm");
+        assert!(v6.model_config().world_core_v6);
+        let mut orphan_init = v6.clone();
+        orphan_init.world_core_v6 = false;
+        orphan_init.init_context_from_v5 = Some(PathBuf::from("x"));
+        assert!(orphan_init.validate().is_err());
+        let contract = TrainingContract::from(&v6);
+        assert!(contract.world_core_v6);
+    }
+
+    #[test]
+    fn v5_checkpoint_into_v6_fails_closed_unless_warm_started() -> Result<()> {
+        let device = Device::Cpu;
+        let root = checkpoint_test_root("v6-warm-start");
+        fs::create_dir_all(&root)?;
+        let (v5, v5_vars) = fresh_model(tiny_v5_model_cfg(), 41, &device)?;
+        let checkpoint = root.join("model.safetensors");
+        v5_vars.save(&checkpoint)?;
+
+        let v6_cfg = ModelConfig {
+            world_core_v6: true,
+            ..tiny_v5_model_cfg()
+        };
+        let (v6, v6_vars) = fresh_model(v6_cfg, 99, &device)?;
+        let error = load_varmap_exact(&v6_vars, &checkpoint).expect_err("v5 into v6 must fail closed");
+        assert!(error.to_string().contains("missing"), "{error}");
+        // Warm start into a v5 target is meaningless (nothing missing) and must fail too.
+        assert!(load_varmap_warm_start_context(&v5_vars, &checkpoint).is_err());
+        load_varmap_warm_start_context(&v6_vars, &root)?;
+
+        let samples = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 16,
+                seed: 7,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::Train,
+        )?
+        .transitions()
+        .cloned()
+        .collect::<Vec<_>>();
+        let batch = batch_from_samples(&samples, &device)?;
+        let context = {
+            let mut with_context = samples.clone();
+            for (index, row) in with_context.iter_mut().enumerate() {
+                if index % 3 == 0 {
+                    row.context = vec![crate::p2::data::ContextTransition {
+                        current: samples[(index + 1) % samples.len()].current.clone(),
+                        action: samples[(index + 1) % samples.len()].action.clone(),
+                        next: samples[(index + 1) % samples.len()].next.clone(),
+                    }];
+                }
+            }
+            ContextBatch::from_samples(&with_context, &device)?.expect("context present")
+        };
+        // The loaded v6 model computes the v5 function, with or without
+        // context. Row 63 handling differs by design (§1.3), so compare on
+        // frames whose status row is already EMPTY: only weights are under test.
+        let empty_status = {
+            let mut pixels = batch.frames.flatten_all()?.to_vec1::<u8>()?;
+            for frame in pixels.chunks_exact_mut(FRAME_SIDE * FRAME_SIDE) {
+                frame[(FRAME_SIDE - 1) * FRAME_SIDE..].fill(0);
+            }
+            Tensor::from_vec(pixels, batch.frames.dims(), &device)?
+        };
+        let reference = v5.forward_with_operator_conditioning(
+            &empty_status,
+            &batch.actions,
+            &batch.action_coords,
+            &batch.goals,
+            &batch.operator_conditioning,
+        )?;
+        for context in [None, Some(&context)] {
+            let out = v6.forward_with_depth_and_operator_conditioning_with_context(
+                &empty_status,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                &batch.operator_conditioning,
+                context,
+                RecursionDepth::from_config(v6.config()),
+                0.0,
+                None,
+            )?;
+            assert_eq!(
+                reference.y.flatten_all()?.to_vec1::<f32>()?,
+                out.y.flatten_all()?.to_vec1::<f32>()?,
+                "warm-started v6 must reproduce v5 (context = {})",
+                context.is_some()
+            );
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_loss_is_unchanged_by_context_plumbing_at_init() -> Result<()> {
+        let device = Device::Cpu;
+        let mut mixed = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 32,
+                seed: 61,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            0.5,
+            0,
+            V5DataSplit::Train,
+        )?;
+        // Legacy rows: no context is ever materialized.
+        assert!(prepare_foundation_v2_batch_host(&mixed)?.context().is_none());
+        let objective = FoundationV2ObjectiveConfig::default();
+        let scalar = |breakdown: FoundationV2LossBreakdown| -> Result<f32> {
+            Ok(breakdown.total.to_dtype(DType::F32)?.to_scalar::<f32>()?)
+        };
+        let (v5, _) = fresh_model(tiny_v5_model_cfg(), 23, &device)?;
+        let (v6, _) = fresh_model(
+            ModelConfig {
+                world_core_v6: true,
+                ..tiny_v5_model_cfg()
+            },
+            23,
+            &device,
+        )?;
+        let v5_plain = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v6_plain = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
+
+        let injected = inject_synthetic_context(&mut mixed, 4);
+        assert!(injected > 0);
+        let host = prepare_foundation_v2_batch_host(&mixed)?;
+        let context = host.context().expect("context rows are materialized");
+        assert_eq!(context.batch, 32);
+        assert_eq!(context.k, 3);
+        // rows 0,4,...,28 carry windows of length 1,2,3,1,2,3,1,2.
+        assert_eq!(context.valid.iter().filter(|v| **v != 0.0).count(), 15);
+
+        // v5 ignores context; v6 at zero context FiLM is bit-identical to no context.
+        let v5_ctx = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v6_ctx = scalar(foundation_v2_training_loss(&v6, &mixed, &device, objective)?)?;
+        assert!(v5_plain.is_finite() && v6_plain.is_finite());
+        assert_eq!(v5_plain, v5_ctx, "legacy model must ignore context rows");
+        assert_eq!(v6_plain, v6_ctx, "zero context FiLM must not change the v6 loss");
         Ok(())
     }
 }

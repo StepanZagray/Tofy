@@ -278,6 +278,17 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub world_core_v3: bool,
 
+    /// ADR 0005 world-core v6: foundation-v2 plus the context channel
+    /// (whole-frame content, context FiLM). Requires `--recipe foundation-v2`.
+    #[arg(long, default_value_t = false)]
+    pub world_core_v6: bool,
+
+    /// ADR 0005 §3.4: warm-start a fresh v6 run from this v5 checkpoint
+    /// (bundle directory or model.safetensors); context parameters stay at
+    /// their zero/fresh init. Without it a v6 config never loads v5 weights.
+    #[arg(long, requires = "world_core_v6")]
+    pub init_context_from_v5: Option<PathBuf>,
+
     /// Planning-head readout from the final BxCx8x8 prediction.
     #[arg(long, value_enum, default_value_t = ConsumerReadoutTopology::GlobalMean)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -486,6 +497,8 @@ impl P2TrainArgs {
             world_core_v2: self.world_core_v2 || self.world_core_v3,
             world_core_v3: self.world_core_v3,
             world_core_v4: false,
+            world_core_v6: self.world_core_v6,
+            init_context_from_v5: self.init_context_from_v5.clone(),
             consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
@@ -1092,3 +1105,48 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
 
 /// `p2-residual-probe` — ADR 0005 §5.3 residual-vs-reliability probe (frozen checkpoint).
 pub use crate::p2::residual_probe::{run_p2_residual_probe, P2ResidualProbeArgs};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: P2TrainArgs,
+    }
+
+    #[test]
+    fn init_context_from_v5_requires_world_core_v6_and_reaches_config() {
+        let orphan = Wrapper::try_parse_from([
+            "p2-train",
+            "--recipe",
+            "foundation-v2",
+            "--init-context-from-v5",
+            "runs/v5/checkpoints/best",
+        ]);
+        assert!(orphan.is_err(), "warm start without --world-core-v6 must be rejected");
+        let parsed = Wrapper::try_parse_from([
+            "p2-train",
+            "--recipe",
+            "foundation-v2",
+            "--world-core-v6",
+            "--init-context-from-v5",
+            "runs/v5/checkpoints/best",
+        ])
+        .expect("v6 warm-start arguments parse");
+        let cfg = parsed.args.to_config();
+        assert!(cfg.world_core_v6);
+        assert_eq!(
+            cfg.init_context_from_v5.as_deref(),
+            Some(std::path::Path::new("runs/v5/checkpoints/best"))
+        );
+        assert!(cfg.model_config().world_core_v6);
+        let legacy = Wrapper::try_parse_from(["p2-train", "--recipe", "foundation-v2"])
+            .expect("legacy arguments parse")
+            .args
+            .to_config();
+        assert!(!legacy.world_core_v6 && legacy.init_context_from_v5.is_none());
+    }
+}
