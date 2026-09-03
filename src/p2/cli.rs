@@ -736,6 +736,11 @@ pub struct P2EvalArgs {
     /// Publish one representative candle-graph evaluation bundle.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub profile_eval: bool,
+
+    /// ADR 0005 §5.1 memorization diagnostic: score the v6 held-out rows with
+    /// their context windows and again masked to K=0 (world_core_v6 only).
+    #[arg(long, default_value_t = false)]
+    pub context_ablation: bool,
 }
 
 impl P2EvalArgs {
@@ -759,6 +764,7 @@ impl P2EvalArgs {
             mode: self.eval_mode,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
             profile_eval: self.profile_eval,
+            context_ablation: self.context_ablation,
         }
     }
 }
@@ -871,6 +877,7 @@ impl P2Arc3EvalArgs {
             mode: EvalMode::Full,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
             profile_eval: self.profile_eval,
+            context_ablation: false,
         }
     }
 }
@@ -1157,6 +1164,26 @@ mod tests {
     struct Wrapper {
         #[command(flatten)]
         args: P2TrainArgs,
+    }
+
+    #[derive(Parser)]
+    struct EvalWrapper {
+        #[command(flatten)]
+        args: P2EvalArgs,
+    }
+
+    #[test]
+    fn context_ablation_flag_is_off_by_default_and_reaches_eval_config() {
+        let legacy = EvalWrapper::try_parse_from(["p2-eval"])
+            .expect("default eval arguments parse")
+            .args
+            .to_config();
+        assert!(!legacy.context_ablation);
+        let ablation = EvalWrapper::try_parse_from(["p2-eval", "--context-ablation"])
+            .expect("ablation flag parses")
+            .args
+            .to_config();
+        assert!(ablation.context_ablation);
     }
 
     #[test]
