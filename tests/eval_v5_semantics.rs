@@ -54,6 +54,7 @@ fn sample(
             operator: None,
         },
         oracle_latent: None,
+        context: Vec::new(),
     })
 }
 

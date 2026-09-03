@@ -328,6 +328,7 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
                 operator: None,
             },
             oracle_latent: None,
+            context: Vec::new(),
         });
     }
     Ok(out)

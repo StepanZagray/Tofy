@@ -11416,6 +11416,7 @@ mod tests {
                 "test",
             ),
             oracle_latent: None,
+            context: Vec::new(),
         }
     }
 

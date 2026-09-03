@@ -7540,6 +7540,7 @@ mod tests {
                 operator: None,
             },
             oracle_latent: None,
+            context: Vec::new(),
         })
     }
 

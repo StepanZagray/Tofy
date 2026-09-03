@@ -1259,6 +1259,7 @@ mod tests {
                 operator: None,
             },
             oracle_latent: None,
+            context: Vec::new(),
         }
     }
 
@@ -1302,6 +1303,7 @@ mod tests {
             transition_index: 0,
             provenance: source.clone(),
             oracle_latent: None,
+            context: Vec::new(),
         };
         let provenance = V5SampleProvenance {
             source,

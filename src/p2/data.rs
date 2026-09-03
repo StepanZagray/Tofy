@@ -923,6 +923,19 @@ impl TransitionProvenance {
     }
 }
 
+/// Maximum number of earlier factual transitions supplied as evidence about the
+/// hidden rule (ADR 0005 §1.5).
+pub const CONTEXT_WINDOW_MAX: usize = 16;
+
+/// One earlier factual transition from the same episode, supplied to the model as
+/// evidence about the Hidden Rule (ADR 0005 §1.5). Never a prediction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextTransition {
+    pub current: ArcFrame,
+    pub action: ArcAction,
+    pub next: ArcFrame,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransitionSample {
     pub current: ArcFrame,
@@ -947,6 +960,10 @@ pub struct TransitionSample {
     /// Exact-simulator features for identifiability eval; absent for ARC recordings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_latent: Option<Vec<f32>>,
+    /// Context Window: earlier factual transitions of the same episode, chronological
+    /// order, at most [`CONTEXT_WINDOW_MAX`]. Empty for legacy rows (ADR 0005 §1.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextTransition>,
 }
 
 /// Exact board-only result of one factual action. The bottom status row is
@@ -1484,6 +1501,7 @@ fn sample_from_rendered_transition(
         transition_index,
         provenance: TransitionProvenance::simulator(scenario, goal_family(goal)),
         oracle_latent: Some(oracle_latent(scenario, before)),
+        context: Vec::new(),
     }
 }
 
@@ -1533,6 +1551,7 @@ fn sample_from_rendered_transition_goal_free(
         transition_index,
         provenance: TransitionProvenance::simulator(scenario, family),
         oracle_latent: Some(oracle_latent(scenario, before)),
+    context: Vec::new(),
     }
 }
 
@@ -2054,6 +2073,7 @@ fn operator_sample_from_rendered_current(
     let noop = current.pixels[..status_start] == next.pixels[..status_start];
     Ok(TransitionSample {
         oracle_latent: Some(oracle_latent(scenario, state)),
+        context: Vec::new(),
         current,
         next,
         action,
@@ -2080,6 +2100,7 @@ fn null_sample_from_state(
     let current = render_state_padded(scenario, state)?;
     Ok(TransitionSample {
         oracle_latent: Some(oracle_latent(scenario, state)),
+        context: Vec::new(),
         next: current.clone(),
         current,
         action: ArcAction::new(0, None, None)?,
@@ -2270,6 +2291,7 @@ pub fn generate_coordinate_one_step(
                 "coordinate_action",
             ),
             oracle_latent: Some(oracle_latent_from_frame(&current)),
+            context: Vec::new(),
             current,
         });
     }
@@ -2302,6 +2324,7 @@ pub fn generate_interact_one_step(
         paint_status_ui(&mut next, 64, step as u16 + 1);
         out.push(TransitionSample {
             oracle_latent: Some(oracle_latent_from_frame(&current)),
+            context: Vec::new(),
             current,
             next,
             action: ArcAction::new(5, None, None)?,
