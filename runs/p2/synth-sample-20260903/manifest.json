@@ -1,0 +1,739 @@
+{
+  "args": {
+    "episode_steps": 250,
+    "games": 20,
+    "levels": null,
+    "shard_rows": 50000
+  },
+  "episodes": [
+    {
+      "available_actions": 127,
+      "episode": 0,
+      "game_id": "tsyn-2a0c0255",
+      "game_over_events": 6,
+      "levels": 6,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 8492642940709225622,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 1,
+      "game_id": "tsyn-f73ca3b6",
+      "game_over_events": 1,
+      "levels": 6,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 15607783273785593139,
+      "twin_of": "tsyn-2a0c0255"
+    },
+    {
+      "available_actions": 127,
+      "episode": 2,
+      "game_id": "tsyn-da42456d",
+      "game_over_events": 5,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 17058402506573011640,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 3,
+      "game_id": "tsyn-147dec65",
+      "game_over_events": 10,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 10866795133448378201,
+      "twin_of": "tsyn-da42456d"
+    },
+    {
+      "available_actions": 127,
+      "episode": 4,
+      "game_id": "tsyn-67b8ef0c",
+      "game_over_events": 9,
+      "levels": 6,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 18439060174549838664,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 5,
+      "game_id": "tsyn-35139b43",
+      "game_over_events": 7,
+      "levels": 6,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 13325032486584229704,
+      "twin_of": "tsyn-67b8ef0c"
+    },
+    {
+      "available_actions": 95,
+      "episode": 6,
+      "game_id": "tsyn-324fbbde",
+      "game_over_events": 3,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 7809360389079381260,
+      "twin_of": null
+    },
+    {
+      "available_actions": 95,
+      "episode": 7,
+      "game_id": "tsyn-1b80f820",
+      "game_over_events": 1,
+      "levels": 5,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 2428730189346978254,
+      "twin_of": "tsyn-324fbbde"
+    },
+    {
+      "available_actions": 127,
+      "episode": 8,
+      "game_id": "tsyn-ed128b22",
+      "game_over_events": 3,
+      "levels": 6,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 13295755077789961990,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 9,
+      "game_id": "tsyn-a576f225",
+      "game_over_events": 4,
+      "levels": 6,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 4514927319801912085,
+      "twin_of": "tsyn-ed128b22"
+    },
+    {
+      "available_actions": 127,
+      "episode": 10,
+      "game_id": "tsyn-3dbe7d32",
+      "game_over_events": 9,
+      "levels": 4,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 11066706261692146503,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 11,
+      "game_id": "tsyn-061499e0",
+      "game_over_events": 19,
+      "levels": 4,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 13100604491570782650,
+      "twin_of": "tsyn-3dbe7d32"
+    },
+    {
+      "available_actions": 127,
+      "episode": 12,
+      "game_id": "tsyn-58120281",
+      "game_over_events": 3,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 3898563832005945849,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 13,
+      "game_id": "tsyn-c6a17881",
+      "game_over_events": 17,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 3303064916455156489,
+      "twin_of": "tsyn-58120281"
+    },
+    {
+      "available_actions": 127,
+      "episode": 14,
+      "game_id": "tsyn-b71b441b",
+      "game_over_events": 16,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 1858744934224239508,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 15,
+      "game_id": "tsyn-3f8ceb9c",
+      "game_over_events": 13,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 3117544100103882761,
+      "twin_of": "tsyn-b71b441b"
+    },
+    {
+      "available_actions": 127,
+      "episode": 16,
+      "game_id": "tsyn-596985df",
+      "game_over_events": 5,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 140446086841636657,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 17,
+      "game_id": "tsyn-6597e8eb",
+      "game_over_events": 4,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 15210660338106384207,
+      "twin_of": "tsyn-596985df"
+    },
+    {
+      "available_actions": 127,
+      "episode": 18,
+      "game_id": "tsyn-f292e6ed",
+      "game_over_events": 12,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 15486169505009591827,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 19,
+      "game_id": "tsyn-0dc86718",
+      "game_over_events": 7,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 2282957295656594250,
+      "twin_of": "tsyn-f292e6ed"
+    },
+    {
+      "available_actions": 127,
+      "episode": 20,
+      "game_id": "tsyn-15852830",
+      "game_over_events": 7,
+      "levels": 6,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 2378652959185444441,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 21,
+      "game_id": "tsyn-d88a3a14",
+      "game_over_events": 10,
+      "levels": 6,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 11743229231408609015,
+      "twin_of": "tsyn-15852830"
+    },
+    {
+      "available_actions": 63,
+      "episode": 22,
+      "game_id": "tsyn-32c2925f",
+      "game_over_events": 6,
+      "levels": 6,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 16980852302792707325,
+      "twin_of": null
+    },
+    {
+      "available_actions": 63,
+      "episode": 23,
+      "game_id": "tsyn-a78b2673",
+      "game_over_events": 2,
+      "levels": 6,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 6493521880462495121,
+      "twin_of": "tsyn-32c2925f"
+    },
+    {
+      "available_actions": 95,
+      "episode": 24,
+      "game_id": "tsyn-25dd938c",
+      "game_over_events": 2,
+      "levels": 4,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 12987727468125755696,
+      "twin_of": null
+    },
+    {
+      "available_actions": 95,
+      "episode": 25,
+      "game_id": "tsyn-c1f68482",
+      "game_over_events": 11,
+      "levels": 4,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 4027088314689854488,
+      "twin_of": "tsyn-25dd938c"
+    },
+    {
+      "available_actions": 127,
+      "episode": 26,
+      "game_id": "tsyn-39eed3ae",
+      "game_over_events": 4,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 13365012814474280109,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 27,
+      "game_id": "tsyn-4d0f2496",
+      "game_over_events": 8,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 9777207851714578338,
+      "twin_of": "tsyn-39eed3ae"
+    },
+    {
+      "available_actions": 127,
+      "episode": 28,
+      "game_id": "tsyn-668c0145",
+      "game_over_events": 7,
+      "levels": 4,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 7304545274863367994,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 29,
+      "game_id": "tsyn-4c606cde",
+      "game_over_events": 5,
+      "levels": 4,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 1409428619130158132,
+      "twin_of": "tsyn-668c0145"
+    },
+    {
+      "available_actions": 127,
+      "episode": 30,
+      "game_id": "tsyn-1055168d",
+      "game_over_events": 7,
+      "levels": 5,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 14274507268272376642,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 31,
+      "game_id": "tsyn-71d6bee0",
+      "game_over_events": 8,
+      "levels": 5,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 6508665437417538251,
+      "twin_of": "tsyn-1055168d"
+    },
+    {
+      "available_actions": 127,
+      "episode": 32,
+      "game_id": "tsyn-de313724",
+      "game_over_events": 9,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 6091631523721304068,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 33,
+      "game_id": "tsyn-7af144c7",
+      "game_over_events": 9,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 5462304482836439847,
+      "twin_of": "tsyn-de313724"
+    },
+    {
+      "available_actions": 95,
+      "episode": 34,
+      "game_id": "tsyn-b2b4b130",
+      "game_over_events": 4,
+      "levels": 5,
+      "levels_completed_events": 4,
+      "rows": 250,
+      "rule_id": 17098091623529641442,
+      "twin_of": null
+    },
+    {
+      "available_actions": 95,
+      "episode": 35,
+      "game_id": "tsyn-a2300747",
+      "game_over_events": 5,
+      "levels": 5,
+      "levels_completed_events": 2,
+      "rows": 250,
+      "rule_id": 2548081570047005192,
+      "twin_of": "tsyn-b2b4b130"
+    },
+    {
+      "available_actions": 127,
+      "episode": 36,
+      "game_id": "tsyn-151d570a",
+      "game_over_events": 6,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 15886851096419040736,
+      "twin_of": null
+    },
+    {
+      "available_actions": 127,
+      "episode": 37,
+      "game_id": "tsyn-00e05428",
+      "game_over_events": 9,
+      "levels": 5,
+      "levels_completed_events": 1,
+      "rows": 250,
+      "rule_id": 16619488633932608237,
+      "twin_of": "tsyn-151d570a"
+    },
+    {
+      "available_actions": 63,
+      "episode": 38,
+      "game_id": "tsyn-ea6d3834",
+      "game_over_events": 13,
+      "levels": 6,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 816475721890495773,
+      "twin_of": null
+    },
+    {
+      "available_actions": 63,
+      "episode": 39,
+      "game_id": "tsyn-b425dc23",
+      "game_over_events": 9,
+      "levels": 6,
+      "levels_completed_events": 3,
+      "rows": 250,
+      "rule_id": 1147908458327198232,
+      "twin_of": "tsyn-ea6d3834"
+    }
+  ],
+  "frame_semantics": {
+    "available_actions_mask": "bit0=RESET, bit i=ACTIONi",
+    "frame_source": "last frame of ARCEngine perform_action frame list",
+    "level_completed_next_frame": "initial frame of the next level (engine advances within the same action)",
+    "reset_rows": "action id 0 rows are emitted when the policy issues RESET (after GAME_OVER/WIN or unsolvable state)"
+  },
+  "game_id_prefix": "tsyn",
+  "game_ids": [
+    "tsyn-2a0c0255",
+    "tsyn-f73ca3b6",
+    "tsyn-da42456d",
+    "tsyn-147dec65",
+    "tsyn-67b8ef0c",
+    "tsyn-35139b43",
+    "tsyn-324fbbde",
+    "tsyn-1b80f820",
+    "tsyn-ed128b22",
+    "tsyn-a576f225",
+    "tsyn-3dbe7d32",
+    "tsyn-061499e0",
+    "tsyn-58120281",
+    "tsyn-c6a17881",
+    "tsyn-b71b441b",
+    "tsyn-3f8ceb9c",
+    "tsyn-596985df",
+    "tsyn-6597e8eb",
+    "tsyn-f292e6ed",
+    "tsyn-0dc86718",
+    "tsyn-15852830",
+    "tsyn-d88a3a14",
+    "tsyn-32c2925f",
+    "tsyn-a78b2673",
+    "tsyn-25dd938c",
+    "tsyn-c1f68482",
+    "tsyn-39eed3ae",
+    "tsyn-4d0f2496",
+    "tsyn-668c0145",
+    "tsyn-4c606cde",
+    "tsyn-1055168d",
+    "tsyn-71d6bee0",
+    "tsyn-de313724",
+    "tsyn-7af144c7",
+    "tsyn-b2b4b130",
+    "tsyn-a2300747",
+    "tsyn-151d570a",
+    "tsyn-00e05428",
+    "tsyn-ea6d3834",
+    "tsyn-b425dc23"
+  ],
+  "games_file": "games.json",
+  "generator": {
+    "engine": "arcengine",
+    "git_revision": "9179a89a16b6c1a326498633eedf0baab6f3e678",
+    "package": "tofy_arc3.synth"
+  },
+  "policy": {
+    "epsilon_end": 0.2,
+    "epsilon_start": 1.0,
+    "shared_random_prefix_len": 12,
+    "solver": "bfs"
+  },
+  "public_game_ids_excluded": [
+    "ar25-0c556536",
+    "bp35-0a0ad940",
+    "cd82-fb555c5d",
+    "cn04-2fe56bfb",
+    "dc22-fdcac232",
+    "ft09-0d8bbf25",
+    "g50t-5849a774",
+    "ka59-38d34dbb",
+    "lf52-271a04aa",
+    "lp85-305b61c3",
+    "ls20-9607627b",
+    "m0r0-492f87ba",
+    "r11l-495a7899",
+    "re86-8af5384d",
+    "s5i5-18d95033",
+    "sb26-7fbdac44",
+    "sc25-635fd71a",
+    "sk48-d8078629",
+    "sp80-589a99af",
+    "su15-1944f8ab",
+    "tn36-ef4dde99",
+    "tr87-cd924810",
+    "tu93-0768757b",
+    "vc33-5430563c",
+    "wa30-ee6fef47"
+  ],
+  "public_game_ids_intersection": [],
+  "rule_census": {
+    "by_action5": {
+      "noop": 13,
+      "portal": 11,
+      "toggle": 16
+    },
+    "by_action6": {
+      "noop": 13,
+      "teleport": 8,
+      "toggle_click": 19
+    },
+    "by_available_mask": {
+      "127": 30,
+      "63": 4,
+      "95": 6
+    },
+    "by_background": {
+      "0": 4,
+      "1": 2,
+      "11": 4,
+      "12": 6,
+      "13": 2,
+      "14": 6,
+      "15": 4,
+      "5": 6,
+      "7": 2,
+      "9": 4
+    },
+    "by_goal": {
+      "collect_all": 13,
+      "collect_then_exit": 10,
+      "reach_exit": 2,
+      "toggle_all": 7,
+      "toggle_then_exit": 8
+    },
+    "by_move_perm": {
+      "dlru": 1,
+      "dlur": 2,
+      "drlu": 2,
+      "drul": 1,
+      "dulr": 2,
+      "durl": 4,
+      "ldru": 1,
+      "ldur": 5,
+      "lrdu": 1,
+      "lurd": 2,
+      "rdlu": 4,
+      "rdul": 1,
+      "rldu": 2,
+      "rlud": 1,
+      "rudl": 1,
+      "udlr": 1,
+      "uldr": 3,
+      "ulrd": 3,
+      "urdl": 3
+    },
+    "distinct_rule_ids": 40,
+    "games": 40,
+    "levels_per_game": {
+      "4": 6,
+      "5": 22,
+      "6": 12
+    }
+  },
+  "schema": "adr-0005-2.6",
+  "seed": 1,
+  "shards": [
+    {
+      "episodes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "file": "shard-00000.safetensors",
+      "rows": 10000,
+      "sha256": "6b0405723f250fe56bee93d5f5efe40a7f8614895186d7f7adf806c1a7ffdca8"
+    }
+  ],
+  "source": "tofy_synth_arcengine",
+  "total_rows": 10000,
+  "twin_pair_count": 20,
+  "twin_pairs": [
+    [
+      0,
+      1
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      4,
+      5
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      8,
+      9
+    ],
+    [
+      10,
+      11
+    ],
+    [
+      12,
+      13
+    ],
+    [
+      14,
+      15
+    ],
+    [
+      16,
+      17
+    ],
+    [
+      18,
+      19
+    ],
+    [
+      20,
+      21
+    ],
+    [
+      22,
+      23
+    ],
+    [
+      24,
+      25
+    ],
+    [
+      26,
+      27
+    ],
+    [
+      28,
+      29
+    ],
+    [
+      30,
+      31
+    ],
+    [
+      32,
+      33
+    ],
+    [
+      34,
+      35
+    ],
+    [
+      36,
+      37
+    ],
+    [
+      38,
+      39
+    ]
+  ]
+}
