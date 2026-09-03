@@ -326,6 +326,10 @@ pub fn events_to_transitions(events: &[RecordingEvent]) -> Result<Vec<Transition
                     curr.source_path.display()
                 ),
                 operator: None,
+                rule_id: 0,
+                level_index: 0,
+                available_actions: 0,
+                context_len: 0,
             },
             oracle_latent: None,
             context: Vec::new(),

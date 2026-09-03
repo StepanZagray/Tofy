@@ -11458,12 +11458,14 @@ mod tests {
             agent_color: 7,
             primary_color: 11,
             secondary_color: 4,
+            empty_color: 0,
         });
         samples[1].provenance.operator = Some(EpisodeOperator {
             family: OperatorFamily::SwapRegion,
             agent_color: 7,
             primary_color: 11,
             secondary_color: 4,
+            empty_color: 0,
         });
         let rows = operator_conditioning_from_samples(&samples, &device)?.to_vec2::<f32>()?;
 

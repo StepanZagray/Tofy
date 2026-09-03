@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::generator::{
     generate, generate_p1c, generate_p1c_hard_candidate, generate_sized,
-    p1c_falsification_probe_width, rng_for, V5_CONTENT_SIZES,
+    p1c_falsification_probe_width, rebind_hidden_goal_family, rng_for, V5_CONTENT_SIZES,
 };
 use crate::search::shortest_path;
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -313,7 +313,8 @@ fn family_index(goal: &Goal) -> u8 {
     }
 }
 
-/// The five sources mixed concurrently by the foundation-v2 data schedule.
+/// The five ADR 0003 sources mixed concurrently by the foundation-v2 data
+/// schedule, plus the ADR 0005 §2.1 `LearningHistories` stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MixedStreamKind {
@@ -322,6 +323,27 @@ pub enum MixedStreamKind {
     Exploration,
     SequentialFragments,
     HazardOneStep,
+    LearningHistories,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
 }
 
 /// Raw schedule weights from ADR 0003 §1.1.
@@ -329,6 +351,8 @@ pub enum MixedStreamKind {
 /// The documented endpoint weights total 0.95. [`normalized`] preserves their
 /// ratios when a caller needs to fill a fixed physical row budget; the raw
 /// fields remain the exact percentages specified by the ADR.
+/// `learning_histories` is zero for every legacy schedule and is omitted from
+/// its serialization so legacy batch identities are unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MixedStreamProportions {
     pub random_one_step: f32,
@@ -336,6 +360,8 @@ pub struct MixedStreamProportions {
     pub exploration: f32,
     pub sequential_fragments: f32,
     pub hazard_one_step: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub learning_histories: f32,
 }
 
 impl MixedStreamProportions {
@@ -345,6 +371,7 @@ impl MixedStreamProportions {
             + self.exploration
             + self.sequential_fragments
             + self.hazard_one_step
+            + self.learning_histories
     }
 
     pub fn normalized(self) -> Self {
@@ -358,10 +385,11 @@ impl MixedStreamProportions {
             exploration: self.exploration / total,
             sequential_fragments: self.sequential_fragments / total,
             hazard_one_step: self.hazard_one_step / total,
+            learning_histories: self.learning_histories / total,
         }
     }
 
-    fn ordered(self) -> [(MixedStreamKind, f32); 5] {
+    fn ordered(self) -> [(MixedStreamKind, f32); 6] {
         [
             (MixedStreamKind::RandomOneStep, self.random_one_step),
             (MixedStreamKind::FactualBranches, self.factual_branches),
@@ -371,6 +399,7 @@ impl MixedStreamProportions {
                 self.sequential_fragments,
             ),
             (MixedStreamKind::HazardOneStep, self.hazard_one_step),
+            (MixedStreamKind::LearningHistories, self.learning_histories),
         ]
     }
 }
@@ -389,6 +418,29 @@ pub fn foundation_v2_stream_schedule(progress: f32) -> MixedStreamProportions {
         exploration: 0.20,
         sequential_fragments: 0.15,
         hazard_one_step: lerp(0.10, 0.05),
+        learning_histories: 0.0,
+    }
+}
+
+/// ADR 0005 §2.1 schedule: `LearningHistories` ramps linearly from 0.25 to
+/// 0.50 of the physical rows; the legacy streams share the remainder in their
+/// ADR 0003 ratios. Totals one at every progress.
+pub fn adaptation_v6_stream_schedule(progress: f32) -> MixedStreamProportions {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let learning_histories = 0.25 + 0.25 * progress;
+    let legacy = foundation_v2_stream_schedule(progress).normalized();
+    let share = 1.0 - learning_histories;
+    MixedStreamProportions {
+        random_one_step: legacy.random_one_step * share,
+        factual_branches: legacy.factual_branches * share,
+        exploration: legacy.exploration * share,
+        sequential_fragments: legacy.sequential_fragments * share,
+        hazard_one_step: legacy.hazard_one_step * share,
+        learning_histories,
     }
 }
 
@@ -527,9 +579,11 @@ impl ContentRect {
             usize::from(self.x) + usize::from(self.width) <= FRAME_SIDE,
             "content rect exceeds canvas width"
         );
+        // v6 layouts may occupy row 63 (ADR 0005 §1.3); legacy layouts never
+        // sample a rectangle reaching it.
         ensure!(
-            usize::from(self.y) + usize::from(self.height) <= V5_PLAYFIELD_HEIGHT,
-            "content rect overlaps the reserved status row"
+            usize::from(self.y) + usize::from(self.height) <= FRAME_SIDE,
+            "content rect exceeds canvas height"
         );
         Ok(())
     }
@@ -545,11 +599,23 @@ impl ContentRect {
 /// Explicit PAD-vs-EMPTY discriminator consumed by every v5 loss.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentMask {
-    /// Row-major 64x64 values in `{0,1}`. Row 63 is always zero.
+    /// Row-major 64x64 values in `{0,1}`. Row 63 is always zero for legacy
+    /// rows; v6 rows are all ones (Whole-Frame Content, ADR 0005 §1.1).
     pub values: SharedBytes,
 }
 
 impl ContentMask {
+    /// Whole-Frame Content mask: every pixel is board content.
+    pub fn all_ones() -> Self {
+        Self {
+            values: vec![1; FRAME_SIDE * FRAME_SIDE].into(),
+        }
+    }
+
+    fn is_all_ones(&self) -> bool {
+        self.values.len() == FRAME_SIDE * FRAME_SIDE && self.values.iter().all(|&value| value == 1)
+    }
+
     pub fn from_rect(rect: ContentRect) -> Result<Self> {
         rect.validate()?;
         let mut values = vec![0; FRAME_SIDE * FRAME_SIDE];
@@ -636,7 +702,8 @@ impl D4Transform {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymmetryAugmentation {
     pub d4: D4Transform,
-    /// A bijection of `0..=15`; entry zero is always zero.
+    /// A bijection of `0..=15`. Legacy rows fix entry zero; v6 rows permute
+    /// every index (free background colour, ADR 0005 §1.2).
     pub color_permutation: [u8; 16],
 }
 
@@ -647,6 +714,10 @@ pub struct EpisodeOperator {
     pub agent_color: u8,
     pub primary_color: u8,
     pub secondary_color: u8,
+    /// Rendered colour of semantic EMPTY. Zero for every legacy row; v6 rows
+    /// carry the permuted EMPTY so the operator replays on augmented frames.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub empty_color: u8,
 }
 
 /// V5-only provenance sidecar. It avoids changing the legacy provenance struct
@@ -662,6 +733,19 @@ pub struct V5SampleProvenance {
     pub goal_dropped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_group_id: Option<BranchGroupId>,
+    /// Row rendered under the ADR 0005 §1 interface contract: whole-frame
+    /// content, free background colour, no status row, UNKNOWN conditioning.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub contract_v6: bool,
+}
+
+impl V5SampleProvenance {
+    /// Operator the model may be conditioned on. v6 rows always condition as
+    /// UNKNOWN (ADR 0005 §1.4); the sidecar `operator` remains available for
+    /// counterfactual replay and censuses.
+    pub fn conditioning_operator(&self) -> Option<EpisodeOperator> {
+        (!self.contract_v6).then_some(self.operator)
+    }
 }
 
 /// One v5 transition plus its mandatory content mask and augmentation metadata.
@@ -699,7 +783,7 @@ impl V5Sample {
             "v5 sidecar/source provenance mismatch"
         );
         ensure!(
-            self.transition.provenance.operator == Some(self.provenance.operator),
+            self.transition.provenance.operator == self.provenance.conditioning_operator(),
             "v5 transition/operator provenance mismatch"
         );
         ensure!(
@@ -708,14 +792,26 @@ impl V5Sample {
                     == u16::from(self.provenance.content_rect.height),
             "v5 content rect size does not match source provenance"
         );
+        ensure!(
+            usize::from(self.provenance.source.context_len) == self.transition.context.len()
+                && self.transition.context.len() <= CONTEXT_WINDOW_MAX,
+            "context_len provenance does not match the context window"
+        );
         if validate_mask {
             ensure!(
-                self.content_mask.matches_rect(self.provenance.content_rect),
+                if self.provenance.contract_v6 {
+                    self.content_mask.is_all_ones()
+                } else {
+                    self.content_mask.matches_rect(self.provenance.content_rect)
+                },
                 "v5 content mask does not match provenance rect"
             );
         }
         if validate_permutation {
-            validate_color_permutation(&self.provenance.augmentation.color_permutation)?;
+            validate_color_permutation(
+                &self.provenance.augmentation.color_permutation,
+                !self.provenance.contract_v6,
+            )?;
         }
         for color in [
             self.provenance.operator.agent_color,
@@ -743,7 +839,7 @@ impl V5Sample {
     }
 }
 
-fn validate_color_permutation(permutation: &[u8; 16]) -> Result<()> {
+fn validate_color_permutation(permutation: &[u8; 16], fixed_empty: bool) -> Result<()> {
     let mut seen = [false; 16];
     for &color in permutation {
         let Some(slot) = seen.get_mut(usize::from(color)) else {
@@ -753,7 +849,7 @@ fn validate_color_permutation(permutation: &[u8; 16]) -> Result<()> {
         *slot = true;
     }
     ensure!(
-        permutation[0] == 0 && seen.into_iter().all(|value| value),
+        (permutation[0] == 0 || !fixed_empty) && seen.into_iter().all(|value| value),
         "v5 color permutation must be a bijection with color 0 fixed"
     );
     Ok(())
@@ -768,6 +864,10 @@ pub struct MixedStreamConfig {
     pub goal_dropout_probability: f32,
     pub operator_families: OperatorFamilySplit,
     pub symmetry_augmentation: bool,
+    /// Render every row under the ADR 0005 §1 interface contract and allow
+    /// the `LearningHistories` stream. Off keeps every legacy path
+    /// byte-identical.
+    pub data_contract_v6: bool,
 }
 
 impl Default for MixedStreamConfig {
@@ -779,6 +879,7 @@ impl Default for MixedStreamConfig {
             goal_dropout_probability: V5_GOAL_DROPOUT_PROBABILITY,
             operator_families: OperatorFamilySplit::default(),
             symmetry_augmentation: true,
+            data_contract_v6: false,
         }
     }
 }
@@ -808,6 +909,10 @@ impl MixedStreamConfig {
         // nonlinear, so a batch size can satisfy the tolerance at progress 0
         // yet violate it later and abort mid-run; validate across the range.
         for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            ensure!(
+                self.data_contract_v6 || (self.schedule)(progress).learning_histories == 0.0,
+                "the learning-histories stream requires data_contract_v6"
+            );
             self.realized_proportions(progress)?;
         }
         Ok(())
@@ -848,9 +953,27 @@ pub struct TransitionProvenance {
     pub trajectory_id: String,
     /// Episode operator after row-level color conjugation. Legacy and real
     /// rows omit it and are conditioned as an unknown rule with neutral colors.
+    /// v6 rows also omit it: rule identity reaches the model only through the
+    /// context window (ADR 0005 §1.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<EpisodeOperator>,
+    /// Hash of the Hidden Rule (ADR 0005 §2.4). Zero for legacy rows.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rule_id: u64,
+    /// Level of the meta-episode the row belongs to (ADR 0005 §2.4).
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub level_index: u16,
+    /// Bitmask of RESET, ACTION1..7 (ADR 0005 §1.6). v6 rows record all
+    /// eight; legacy rows leave it unrecorded (zero).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub available_actions: u8,
+    /// Number of context transitions carried by the row (ADR 0005 §2.4).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub context_len: u8,
 }
+
+/// All eight ARC-AGI-3 actions (RESET, ACTION1..7) available.
+pub const ALL_ACTIONS_AVAILABLE: u8 = 0xFF;
 
 impl TransitionProvenance {
     pub fn validate(&self) -> Result<()> {
@@ -859,9 +982,8 @@ impl TransitionProvenance {
             "content_width must be in 1..={FRAME_SIDE}"
         );
         ensure!(
-            (1..FRAME_SIDE as u16).contains(&self.content_height),
-            "content_height must be in 1..{}",
-            FRAME_SIDE - 1
+            (1..=FRAME_SIDE as u16).contains(&self.content_height),
+            "content_height must be in 1..={FRAME_SIDE}"
         );
         // u32 arithmetic: u16 addition would wrap in release for corrupt
         // deserialized values and let an out-of-frame rectangle validate.
@@ -870,9 +992,12 @@ impl TransitionProvenance {
             "content rectangle exceeds the canvas width"
         );
         ensure!(
-            u32::from(self.content_y) + u32::from(self.content_height)
-                <= (FRAME_SIDE - 1) as u32,
-            "content rectangle exceeds the gameplay height"
+            u32::from(self.content_y) + u32::from(self.content_height) <= FRAME_SIDE as u32,
+            "content rectangle exceeds the canvas height"
+        );
+        ensure!(
+            usize::from(self.context_len) <= CONTEXT_WINDOW_MAX,
+            "context_len exceeds CONTEXT_WINDOW_MAX"
         );
         ensure!(
             !self.source_kind.is_empty(),
@@ -907,6 +1032,10 @@ impl TransitionProvenance {
             ),
             source_kind,
             operator: None,
+            rule_id: 0,
+            level_index: 0,
+            available_actions: 0,
+            context_len: 0,
         }
     }
 
@@ -919,6 +1048,10 @@ impl TransitionProvenance {
             source_kind: source_kind.into(),
             trajectory_id: format!("synthetic/{source_kind}/{split:?}/{seed}/{episode_id}"),
             operator: None,
+            rule_id: 0,
+            level_index: 0,
+            available_actions: 0,
+            context_len: 0,
         }
     }
 }
@@ -1176,7 +1309,20 @@ impl FactualBatch {
 }
 
 impl FactualActionBranch {
+    /// Legacy rows: row 63 is the status strip and never enters the board effect.
     pub fn try_from_transition(transition: TransitionSample) -> Result<Self> {
+        Self::try_from_transition_with_board(transition, (FRAME_SIDE - 1) * FRAME_SIDE)
+    }
+
+    /// v6 rows: every one of the 4096 pixels is board content (ADR 0005 §1.1).
+    pub fn try_from_transition_whole_frame(transition: TransitionSample) -> Result<Self> {
+        Self::try_from_transition_with_board(transition, FRAME_SIDE * FRAME_SIDE)
+    }
+
+    fn try_from_transition_with_board(
+        transition: TransitionSample,
+        status_start: usize,
+    ) -> Result<Self> {
         ensure!(
             transition.current.width as usize == FRAME_SIDE
                 && transition.current.height as usize == FRAME_SIDE
@@ -1184,7 +1330,6 @@ impl FactualActionBranch {
                 && transition.next.height as usize == FRAME_SIDE,
             "factual branches require fixed {FRAME_SIDE}x{FRAME_SIDE} frames"
         );
-        let status_start = (FRAME_SIDE - 1) * FRAME_SIDE;
         let mut changed_cells = Vec::new();
         let mut status_changed_cells = Vec::new();
         for (index, (&before, &after)) in transition
@@ -1551,7 +1696,7 @@ fn sample_from_rendered_transition_goal_free(
         transition_index,
         provenance: TransitionProvenance::simulator(scenario, family),
         oracle_latent: Some(oracle_latent(scenario, before)),
-    context: Vec::new(),
+        context: Vec::new(),
     }
 }
 
@@ -1613,9 +1758,19 @@ fn sampled_content_size(split: V5DataSplit, rng: &mut ChaCha8Rng) -> u8 {
     }
 }
 
-fn sampled_content_rect(size: u8, split: V5DataSplit, rng: &mut ChaCha8Rng) -> ContentRect {
+fn sampled_content_rect(
+    size: u8,
+    split: V5DataSplit,
+    rng: &mut ChaCha8Rng,
+    whole_frame: bool,
+) -> ContentRect {
     let max_x = FRAME_SIDE as u8 - size;
-    let max_y = V5_PLAYFIELD_HEIGHT as u8 - size;
+    // v6 layouts have no reserved status row: content may reach row 63.
+    let max_y = if whole_frame {
+        FRAME_SIDE as u8 - size
+    } else {
+        V5_PLAYFIELD_HEIGHT as u8 - size
+    };
     let mut x = rng.random_range(0..=max_x);
     let mut y = rng.random_range(0..=max_y);
     if split == V5DataSplit::Translated7x7 && x == 0 && y == 0 {
@@ -1633,7 +1788,11 @@ fn sampled_content_rect(size: u8, split: V5DataSplit, rng: &mut ChaCha8Rng) -> C
     }
 }
 
-fn sampled_augmentation(rng: &mut ChaCha8Rng, enabled: bool) -> SymmetryAugmentation {
+fn sampled_augmentation(
+    rng: &mut ChaCha8Rng,
+    enabled: bool,
+    free_background: bool,
+) -> SymmetryAugmentation {
     let d4 = if enabled {
         D4Transform::ALL[rng.random_range(0..D4Transform::ALL.len())]
     } else {
@@ -1641,8 +1800,11 @@ fn sampled_augmentation(rng: &mut ChaCha8Rng, enabled: bool) -> SymmetryAugmenta
     };
     let mut color_permutation = std::array::from_fn(|index| index as u8);
     if enabled {
-        for index in (2..16).rev() {
-            let other = rng.random_range(1..=index);
+        // v6: uniform permutation of all sixteen colours (ADR 0005 §1.2).
+        // Legacy: colour 0 fixed.
+        let lowest = if free_background { 0 } else { 1 };
+        for index in (lowest + 1..16).rev() {
+            let other = rng.random_range(lowest..=index);
             color_permutation.swap(index, other);
         }
     }
@@ -1658,6 +1820,7 @@ fn permute_operator(operator: EpisodeOperator, color_permutation: &[u8; 16]) -> 
         agent_color: color_permutation[operator.agent_color as usize],
         primary_color: color_permutation[operator.primary_color as usize],
         secondary_color: color_permutation[operator.secondary_color as usize],
+        empty_color: color_permutation[operator.empty_color as usize],
     }
 }
 
@@ -1725,6 +1888,7 @@ fn frame_with_transformed_content(
     source_rect: ContentRect,
     target_rect: ContentRect,
     augmentation: &SymmetryAugmentation,
+    whole_frame: bool,
 ) -> Result<()> {
     ensure!(
         source.width as usize == FRAME_SIDE && source.height as usize == FRAME_SIDE,
@@ -1740,7 +1904,14 @@ fn frame_with_transformed_content(
     );
     FRAME_TRANSFORM_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        scratch.fill(palette::PAD);
+        // v6 padding is rendered as the permuted EMPTY colour so live frames
+        // with arbitrary backgrounds and synthetic frames share one
+        // distribution (ADR 0005 §1.2).
+        scratch.fill(if whole_frame {
+            augmentation.color_permutation[usize::from(palette::EMPTY)]
+        } else {
+            palette::PAD
+        });
         for y in 0..source_rect.height {
             for x in 0..source_rect.width {
                 let source_x = usize::from(source_rect.x + x);
@@ -1753,10 +1924,13 @@ fn frame_with_transformed_content(
                 scratch[target_y * FRAME_SIDE + target_x] = color;
             }
         }
-        // Status UI is copied only after spatial/color augmentation and is never
-        // part of the semantic content mask or branch-effect equivalence.
-        let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
-        scratch[status_start..].copy_from_slice(&source.pixels[status_start..]);
+        // Legacy: status UI is copied only after spatial/color augmentation and
+        // is never part of the semantic content mask or branch-effect
+        // equivalence. v6 paints no status row (ADR 0005 §1.3).
+        if !whole_frame {
+            let status_start = V5_PLAYFIELD_HEIGHT * FRAME_SIDE;
+            scratch[status_start..].copy_from_slice(&source.pixels[status_start..]);
+        }
         source.pixels.copy_from_slice(&scratch);
     });
     Ok(())
@@ -1767,6 +1941,7 @@ fn transform_frame_once(
     source_rect: ContentRect,
     target_rect: ContentRect,
     augmentation: &SymmetryAugmentation,
+    whole_frame: bool,
     cache: &mut BTreeMap<(usize, u16, u16), ArcFrame>,
 ) -> Result<()> {
     let key = (frame.pixels.allocation_id(), frame.width, frame.height);
@@ -1774,7 +1949,7 @@ fn transform_frame_once(
         *frame = transformed.clone();
         return Ok(());
     }
-    frame_with_transformed_content(frame, source_rect, target_rect, augmentation)?;
+    frame_with_transformed_content(frame, source_rect, target_rect, augmentation, whole_frame)?;
     cache.insert(key, frame.clone());
     Ok(())
 }
@@ -1872,7 +2047,7 @@ pub fn apply_episode_operator(
             let target =
                 coordinate.unwrap_or_else(|| symmetric_coordinate(content_rect, agent_x, agent_y));
             if target != (agent_x, agent_y) {
-                next.pixels[index(agent_x, agent_y)] = palette::EMPTY;
+                next.pixels[index(agent_x, agent_y)] = operator.empty_color;
                 next.pixels[index(target.0, target.1)] = operator.agent_color;
             }
         }
@@ -1908,7 +2083,8 @@ pub fn apply_episode_operator(
                     let y = i16::from(agent_y) + i16::from(dy);
                     if x >= 0 && y >= 0 {
                         let (x, y) = (x as u8, y as u8);
-                        if content_rect.contains(x, y) && next.pixels[index(x, y)] == palette::EMPTY
+                        if content_rect.contains(x, y)
+                            && next.pixels[index(x, y)] == operator.empty_color
                         {
                             next.pixels[index(x, y)] = operator.primary_color;
                         }
@@ -1931,7 +2107,7 @@ pub fn apply_episode_operator(
                     if content_rect.contains(destination.0, destination.1) {
                         next.pixels[index(destination.0, destination.1)] =
                             current.pixels[index(x, y)];
-                        next.pixels[index(x, y)] = palette::EMPTY;
+                        next.pixels[index(x, y)] = operator.empty_color;
                     }
                 }
             } else {
@@ -2019,6 +2195,7 @@ fn sampled_operator(
         agent_color: palette::AGENT,
         primary_color: palette::SWITCH_BASE,
         secondary_color: palette::SWITCH_BASE + 1,
+        empty_color: palette::EMPTY,
     })
 }
 
@@ -2127,6 +2304,7 @@ fn augment_v5_transition(
     augmentation: SymmetryAugmentation,
     content_mask: ContentMask,
     goal_dropout_probability: f32,
+    contract_v6: bool,
     dropout_rng: &mut ChaCha8Rng,
     frame_cache: &mut BTreeMap<(usize, u16, u16), ArcFrame>,
 ) -> Result<V5Sample> {
@@ -2142,11 +2320,15 @@ fn augment_v5_transition(
         source_rect.width == rect.width && source_rect.height == rect.height,
         "augmentation rectangle does not match transition provenance"
     );
+    // Learning-history units carry per-row hidden rules because twins share
+    // one augmentation unit; every legacy raw row leaves the operator unset.
+    let operator = transition.provenance.operator.unwrap_or(operator);
     transform_frame_once(
         &mut transition.current,
         source_rect,
         rect,
         &augmentation,
+        contract_v6,
         frame_cache,
     )?;
     transform_frame_once(
@@ -2154,9 +2336,31 @@ fn augment_v5_transition(
         source_rect,
         rect,
         &augmentation,
+        contract_v6,
         frame_cache,
     )?;
     transition.action = conjugate_action(&transition.action, augmentation.d4, source_rect, rect)?;
+    // The context window receives the same D4/colour augmentation as the row
+    // (ADR 0005 §1.5).
+    for context in &mut transition.context {
+        transform_frame_once(
+            &mut context.current,
+            source_rect,
+            rect,
+            &augmentation,
+            contract_v6,
+            frame_cache,
+        )?;
+        transform_frame_once(
+            &mut context.next,
+            source_rect,
+            rect,
+            &augmentation,
+            contract_v6,
+            frame_cache,
+        )?;
+        context.action = conjugate_action(&context.action, augmentation.d4, source_rect, rect)?;
+    }
     // The sampled placement origin becomes part of transition provenance so
     // standalone consumers can rebuild the exact content mask; before this,
     // translated rows silently reverted to top-left masks downstream.
@@ -2188,7 +2392,22 @@ fn augment_v5_transition(
     // conditioning is explicitly represented at this observer seam.
     transition.exhausted = None;
     let operator = permute_operator(operator, &augmentation.color_permutation);
-    transition.provenance.operator = Some(operator);
+    if contract_v6 {
+        // Rule identity never enters conditioning (ADR 0005 §1.4); the sidecar
+        // below keeps the permuted operator for counterfactual replay.
+        transition.provenance.operator = None;
+        transition.provenance.available_actions = ALL_ACTIONS_AVAILABLE;
+        transition.provenance.context_len = u8::try_from(transition.context.len())
+            .map_err(|_| anyhow!("context window exceeds u8"))?;
+        if transition.provenance.rule_id == 0 {
+            transition.provenance.rule_id = hidden_rule_id(
+                operator_before_permutation(operator, &augmentation.color_permutation),
+                None,
+            );
+        }
+    } else {
+        transition.provenance.operator = Some(operator);
+    }
     Ok(V5Sample {
         provenance: V5SampleProvenance {
             source: transition.provenance.clone(),
@@ -2199,11 +2418,41 @@ fn augment_v5_transition(
             augmentation,
             goal_dropped,
             branch_group_id: None,
+            contract_v6,
         },
         transition,
         content_mask,
         original_goal_nonzero,
     })
+}
+
+fn operator_before_permutation(
+    operator: EpisodeOperator,
+    color_permutation: &[u8; 16],
+) -> EpisodeOperator {
+    let mut inverse = [0u8; 16];
+    for (index, &color) in color_permutation.iter().enumerate() {
+        inverse[usize::from(color)] = index as u8;
+    }
+    permute_operator(operator, &inverse)
+}
+
+/// Stable hash of a Hidden Rule: operator family, raw colour binding, and the
+/// goal family when the unit has one (ADR 0005 §2.4). Never zero.
+pub fn hidden_rule_id(operator: EpisodeOperator, goal_family: Option<u8>) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for byte in [
+        operator.family.conditioning_token() as u8,
+        operator.agent_color,
+        operator.primary_color,
+        operator.secondary_color,
+        operator.empty_color,
+        goal_family.unwrap_or(u8::MAX),
+    ] {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash.max(1)
 }
 
 /// Random legal one-step transitions without candidate-goal conditioning (early ARC play).
@@ -3128,6 +3377,14 @@ impl MixedStreamBatch {
         self.factual.as_ref()
     }
 
+    /// Whether every row follows the ADR 0005 §1 interface contract. Batches
+    /// are homogeneous by construction.
+    pub fn contract_v6(&self) -> bool {
+        self.samples
+            .first()
+            .is_some_and(|sample| sample.provenance.contract_v6)
+    }
+
     /// Ranges in mixed-batch row order; every range is one complete group.
     pub fn factual_group_ranges(&self) -> &[std::ops::Range<usize>] {
         &self.factual_group_ranges
@@ -3173,6 +3430,11 @@ fn realized_stream_proportions(
     let mut remainders = Vec::new();
     let mut assigned = 0usize;
     for (kind, weight) in ordered {
+        // Legacy schedules never realize learning histories; leaving the kind
+        // out of `counts` keeps legacy batch identities byte-identical.
+        if kind == MixedStreamKind::LearningHistories && weight == 0.0 {
+            continue;
+        }
         let exact = weight as f64 * batch_size as f64;
         let floor = exact.floor() as usize;
         counts.insert(kind, floor);
@@ -3205,10 +3467,13 @@ fn realized_stream_proportions(
             MixedStreamKind::Exploration,
             MixedStreamKind::SequentialFragments,
             MixedStreamKind::HazardOneStep,
+            MixedStreamKind::LearningHistories,
         ] {
-            let available = counts[&kind];
-            let take = available.min(needed);
-            *counts.get_mut(&kind).expect("stream exists") -= take;
+            let Some(count) = counts.get_mut(&kind) else {
+                continue;
+            };
+            let take = (*count).min(needed);
+            *count -= take;
             needed -= take;
             if needed == 0 {
                 break;
@@ -3224,6 +3489,11 @@ fn realized_stream_proportions(
         sequential_fragments: counts[&MixedStreamKind::SequentialFragments] as f32
             / batch_size as f32,
         hazard_one_step: counts[&MixedStreamKind::HazardOneStep] as f32 / batch_size as f32,
+        learning_histories: counts
+            .get(&MixedStreamKind::LearningHistories)
+            .copied()
+            .unwrap_or(0) as f32
+            / batch_size as f32,
     };
     // The intact-branch-group constraint moves stream shares in steps of one
     // whole group, so small smoke batches cannot meet the 5pp tolerance at
@@ -3423,15 +3693,22 @@ fn augment_v5_unit(
     ensure!(!transitions.is_empty(), "cannot augment an empty v5 unit");
     let size = u8::try_from(transitions[0].provenance.content_width)
         .map_err(|_| anyhow!("content size does not fit u8"))?;
+    let v6 = config.data_contract_v6;
     let mut augmentation_rng = seeded_v5_rng(config.seed, episode_id, split, 0xA06D_4E05);
-    let rect = sampled_content_rect(size, split, &mut augmentation_rng);
-    let augmentation = sampled_augmentation(&mut augmentation_rng, config.symmetry_augmentation);
-    validate_color_permutation(&augmentation.color_permutation)?;
-    let content_mask = ContentMask::from_rect(rect)?;
-    ensure!(
-        content_mask.matches_rect(rect),
-        "shared v5 content mask does not match sampled unit rect"
-    );
+    let rect = sampled_content_rect(size, split, &mut augmentation_rng, v6);
+    let augmentation =
+        sampled_augmentation(&mut augmentation_rng, config.symmetry_augmentation, v6);
+    validate_color_permutation(&augmentation.color_permutation, !v6)?;
+    let content_mask = if v6 {
+        ContentMask::all_ones()
+    } else {
+        let content_mask = ContentMask::from_rect(rect)?;
+        ensure!(
+            content_mask.matches_rect(rect),
+            "shared v5 content mask does not match sampled unit rect"
+        );
+        content_mask
+    };
     let mut dropout_rng = seeded_v5_rng(config.seed, episode_id, split, 0xD20F_0005);
     let mut frame_cache = BTreeMap::new();
     transitions
@@ -3446,6 +3723,7 @@ fn augment_v5_unit(
                 augmentation.clone(),
                 content_mask.clone(),
                 config.goal_dropout_probability,
+                v6,
                 &mut dropout_rng,
                 &mut frame_cache,
             )
@@ -3537,6 +3815,9 @@ fn compose_nonfactual_unit(
         MixedStreamKind::FactualBranches => {
             bail!("factual stream must be composed as whole groups")
         }
+        MixedStreamKind::LearningHistories => {
+            bail!("learning histories must be composed as twin meta-episode units")
+        }
     };
     let mut unit = augment_v5_unit(raw, config, split, stream, operator, episode_id)?;
     unit.truncate(maximum_rows);
@@ -3554,7 +3835,9 @@ fn compose_fixed_nonfactual_stream(
     let rows_per_unit = match stream {
         MixedStreamKind::Exploration => MIXED_STREAM_FRAGMENT_ROWS,
         MixedStreamKind::RandomOneStep | MixedStreamKind::HazardOneStep => 1,
-        MixedStreamKind::SequentialFragments | MixedStreamKind::FactualBranches => {
+        MixedStreamKind::SequentialFragments
+        | MixedStreamKind::FactualBranches
+        | MixedStreamKind::LearningHistories => {
             bail!("stream does not have a fixed row count per unit")
         }
     };
@@ -3685,7 +3968,13 @@ fn compose_factual_group(
     let group = BranchGroup::try_new(
         samples
             .iter()
-            .map(|sample| FactualActionBranch::try_from_transition(sample.transition.clone()))
+            .map(|sample| {
+                if config.data_contract_v6 {
+                    FactualActionBranch::try_from_transition_whole_frame(sample.transition.clone())
+                } else {
+                    FactualActionBranch::try_from_transition(sample.transition.clone())
+                }
+            })
             .collect::<Result<Vec<_>>>()?,
     )?;
     let group_id = BranchGroupId::from_transition(&samples[0].transition);
@@ -3787,7 +4076,7 @@ pub fn compose_mixed_stream_batch(
     samples.append(&mut sequential_samples);
     unit_index = next_unit_index;
 
-    let (mut hazard_samples, _) = compose_fixed_nonfactual_stream(
+    let (mut hazard_samples, next_unit_index) = compose_fixed_nonfactual_stream(
         config,
         split,
         MixedStreamKind::HazardOneStep,
@@ -3796,6 +4085,26 @@ pub fn compose_mixed_stream_batch(
         unit_index,
     )?;
     samples.append(&mut hazard_samples);
+    unit_index = next_unit_index;
+
+    let learning_histories = stream_counts
+        .get(&MixedStreamKind::LearningHistories)
+        .copied()
+        .unwrap_or(0);
+    if learning_histories > 0 {
+        ensure!(
+            config.data_contract_v6,
+            "the learning-histories stream requires data_contract_v6"
+        );
+        let (mut history_samples, _) = compose_learning_histories_stream(
+            config,
+            split,
+            learning_histories,
+            batch_index,
+            unit_index,
+        )?;
+        samples.append(&mut history_samples);
+    }
     ensure!(
         samples.len() == config.batch_size,
         "mixed composer produced {} rows for requested batch {}",
@@ -3806,6 +4115,10 @@ pub fn compose_mixed_stream_batch(
         // Mask shape and color bijection were validated once when this row's
         // unit allocated its shared mask/augmentation.
         sample.validate_after_unit_fields()?;
+        ensure!(
+            sample.provenance.contract_v6 == config.data_contract_v6,
+            "mixed batch mixes v6 and legacy interface contracts"
+        );
     }
     let goal_dropout_census = GoalDropoutCensus {
         total: samples.len(),
@@ -4711,6 +5024,409 @@ pub fn census_rule_identifiability(
     })
 }
 
+/// Movement transitions per level of a Learning History (ADR 0005 §2.2).
+pub const LEARNING_HISTORY_STEPS_PER_LEVEL: usize = 6;
+/// Level counts a Learning History may have (ADR 0005 §2.2).
+pub const LEARNING_HISTORY_LEVELS: [usize; 3] = [2, 3, 4];
+/// Epsilon-greedy schedule endpoints over the chronological transitions:
+/// fully exploratory at the first transition, mostly competent at the last.
+const LEARNING_HISTORY_EPSILON: (f32, f32) = (1.0, 0.2);
+/// Rows forced to carry no context so the no-context prior keeps training
+/// (`P(K = 0) >= 0.10`, ADR 0005 §2.2).
+const LEARNING_HISTORY_NO_CONTEXT_PROBABILITY: f64 = 0.10;
+/// Realized operator row plus its same-state counterfactual alternatives:
+/// ACTION5 and four stratified ACTION6 coordinates.
+const LEARNING_HISTORY_OPERATOR_ACTIONS: usize = 5;
+
+/// One Learning History: a multi-level episode under one stable Hidden Rule
+/// (operator family, colour binding, goal family) whose rows carry Context
+/// Windows of strictly earlier transitions from the same episode.
+///
+/// Each level is a fresh layout: an epsilon-decaying policy over the exact
+/// shortest-path solver walks [`LEARNING_HISTORY_STEPS_PER_LEVEL`] movement
+/// transitions, then the level ends with one realized ACTION5/ACTION6 row whose
+/// next frame is the hidden operator's outcome. The operator alternatives from
+/// that same frame are emitted right after it as counterfactual sidecar rows
+/// (same Context Window, gate-2 support). Operators act on frames only, so an
+/// operator row can only end a level; the exact simulator has no state for a
+/// painted or teleported board.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LearningHistory {
+    pub seed: u64,
+    pub meta_episode_id: u64,
+    pub data_split: V5DataSplit,
+    pub content_size: u8,
+    pub levels: usize,
+    /// Raw (pre-augmentation) hidden operator.
+    pub operator: EpisodeOperator,
+    /// Hidden goal family (`0..6`), a seeded draw independent of episode ids.
+    pub goal_family: u8,
+    pub rule_id: u64,
+    /// Emission order: chronological rows, each realized operator row followed
+    /// by its counterfactual alternatives.
+    pub rows: Vec<TransitionSample>,
+    /// Indices into `rows` of the chronological transitions, in order.
+    pub chronological: Vec<usize>,
+}
+
+struct LearningHistoryDraw {
+    levels: usize,
+    content_size: u8,
+    goal_family: u8,
+    operator: EpisodeOperator,
+}
+
+fn learning_history_draw(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    families: &OperatorFamilySplit,
+) -> Result<LearningHistoryDraw> {
+    let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_5255_4C45);
+    let levels = LEARNING_HISTORY_LEVELS[rng.random_range(0..LEARNING_HISTORY_LEVELS.len())];
+    let content_size = sampled_content_size(split, &mut rng);
+    let goal_family = rng.random_range(0..6u8);
+    let operator = sampled_operator(families, split, &mut rng)?;
+    Ok(LearningHistoryDraw {
+        levels,
+        content_size,
+        goal_family,
+        operator,
+    })
+}
+
+fn sampled_context_len(rng: &mut ChaCha8Rng, available: usize) -> usize {
+    let k = if rng.random_bool(LEARNING_HISTORY_NO_CONTEXT_PROBABILITY) {
+        0
+    } else {
+        rng.random_range(0..=CONTEXT_WINDOW_MAX)
+    };
+    k.min(available)
+}
+
+fn generate_learning_history(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    draw: &LearningHistoryDraw,
+    operator: EpisodeOperator,
+    twin_index: u8,
+) -> Result<LearningHistory> {
+    let rule_id = hidden_rule_id(operator, Some(draw.goal_family));
+    // Movement, realized-operator choice and context lengths never depend on
+    // the operator, so twins share byte-identical frames until the rule acts.
+    let mut policy_rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_504F_4C49);
+    let mut context_rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_4354_5854);
+    let total = draw.levels * (LEARNING_HISTORY_STEPS_PER_LEVEL + 1);
+    let (epsilon_start, epsilon_end) = LEARNING_HISTORY_EPSILON;
+    let trajectory_id =
+        format!("learning-history/{split:?}/{seed}/{meta_episode_id}/twin{twin_index}");
+    let mut history: Vec<ContextTransition> = Vec::with_capacity(total);
+    let mut rows = Vec::new();
+    let mut chronological = Vec::with_capacity(total);
+    let mut finalize =
+        |mut row: TransitionSample, level_index: usize, history: &[ContextTransition]| {
+            let t = history.len();
+            let k = sampled_context_len(&mut context_rng, t);
+            row.context = history[t - k..t].to_vec();
+            row.family = "learning_history".into();
+            row.provenance.source_kind = "learning_history".into();
+            row.provenance.trajectory_id = trajectory_id.clone();
+            row.provenance.operator = Some(operator);
+            row.provenance.rule_id = rule_id;
+            row.provenance.level_index = u16::try_from(level_index).expect("levels fit u16");
+            row.provenance.available_actions = ALL_ACTIONS_AVAILABLE;
+            row.provenance.context_len = k as u8;
+            row
+        };
+    for level_index in 0..draw.levels {
+        let episode_id = meta_level_episode_id(meta_episode_id, level_index)?;
+        let mut scenario = scenario_for_v5(seed, episode_id, split, draw.content_size);
+        let mut goal_rng = seeded_v5_rng(seed, episode_id, split, 0x4C48_474F_414C);
+        rebind_hidden_goal_family(&mut scenario, draw.goal_family, &mut goal_rng);
+        let goal = scenario.hidden_goal().clone();
+        let scenario = Arc::new(scenario);
+        let sim = Simulator::new(Arc::clone(&scenario));
+        let mut state = State::initial(&scenario);
+        for _ in 0..LEARNING_HISTORY_STEPS_PER_LEVEL {
+            let t = history.len();
+            let epsilon =
+                epsilon_start + (epsilon_end - epsilon_start) * t as f32 / (total - 1) as f32;
+            let explore = policy_rng.random_bool(f64::from(epsilon));
+            let random_action = Action::moves()[policy_rng.random_range(0..4)];
+            let action = if explore {
+                random_action
+            } else {
+                shortest_path(&sim, &state, &goal, scenario.action_budget)
+                    .and_then(|plan| plan.actions.first().copied())
+                    .unwrap_or(random_action)
+            };
+            let next = apply_action(&sim, &state, action);
+            let row = finalize(
+                sample_from_transition(&scenario, &state, &next, action, &goal, t as u64)?,
+                level_index,
+                &history,
+            );
+            history.push(ContextTransition {
+                current: row.current.clone(),
+                action: row.action.clone(),
+                next: row.next.clone(),
+            });
+            chronological.push(rows.len());
+            rows.push(row);
+            state = next;
+        }
+        let current = render_state_padded(&scenario, &state)?;
+        let mut actions = vec![ArcAction::new(5, None, None)?];
+        for (x, y) in stratified_action6_coordinates(&current, draw.content_size)? {
+            actions.push(ArcAction::new(6, Some(x), Some(y))?);
+        }
+        debug_assert_eq!(actions.len(), LEARNING_HISTORY_OPERATOR_ACTIONS);
+        let realized = policy_rng.random_range(0..actions.len());
+        actions.swap(0, realized);
+        let t = history.len();
+        for (index, action) in actions.into_iter().enumerate() {
+            let mut row = operator_sample_from_rendered_current(
+                &scenario,
+                &state,
+                current.clone(),
+                action,
+                operator,
+                "learning_history",
+                t as u64,
+            )?;
+            row.goal_features = GoalFeatures::encode(&goal);
+            let row = finalize(row, level_index, &history);
+            if index == 0 {
+                history.push(ContextTransition {
+                    current: row.current.clone(),
+                    action: row.action.clone(),
+                    next: row.next.clone(),
+                });
+                chronological.push(rows.len());
+            }
+            rows.push(row);
+        }
+    }
+    Ok(LearningHistory {
+        seed,
+        meta_episode_id,
+        data_split: split,
+        content_size: draw.content_size,
+        levels: draw.levels,
+        operator,
+        goal_family: draw.goal_family,
+        rule_id,
+        rows,
+        chronological,
+    })
+}
+
+/// Generate a Learning History together with its Twin Episode (ADR 0005 §2.3).
+///
+/// The twin shares the seed, layouts, policy and every frame up to the first
+/// realized operator row, but is bound to a different operator family drawn
+/// from the same split marginal; the family is chosen so that at least one
+/// realized operator row maps the identical current frame to a different next
+/// frame (mutual exclusivity by construction). If no alternative family
+/// differs on this episode the first alternative is used and the twin census
+/// reports the pair as non-divergent.
+pub fn generate_learning_history_pair(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    families: &OperatorFamilySplit,
+) -> Result<(LearningHistory, LearningHistory)> {
+    families.validate()?;
+    let draw = learning_history_draw(seed, meta_episode_id, split, families)?;
+    let primary = generate_learning_history(seed, meta_episode_id, split, &draw, draw.operator, 0)?;
+    let same_split = match split {
+        V5DataSplit::HeldOutOperator(_) => &families.held_out,
+        _ => &families.train,
+    };
+    let mut alternatives = same_split
+        .iter()
+        .copied()
+        .filter(|family| *family != draw.operator.family)
+        .collect::<Vec<_>>();
+    ensure!(
+        !alternatives.is_empty(),
+        "twin episodes need at least two operator families in the split"
+    );
+    let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_5457_494E);
+    let rotation = rng.random_range(0..alternatives.len());
+    alternatives.rotate_left(rotation);
+    let rect = ContentRect {
+        x: 0,
+        y: 0,
+        width: draw.content_size,
+        height: draw.content_size,
+    };
+    let realized_operator_rows = primary
+        .chronological
+        .iter()
+        .map(|&index| &primary.rows[index])
+        .filter(|row| matches!(row.action.id, 5 | 6))
+        .collect::<Vec<_>>();
+    let diverges = |family: OperatorFamily| -> Result<bool> {
+        let alternative = EpisodeOperator {
+            family,
+            ..draw.operator
+        };
+        for row in &realized_operator_rows {
+            let outcome = apply_episode_operator(&row.current, &row.action, rect, alternative)?;
+            if outcome.pixels[..V5_PLAYFIELD_HEIGHT * FRAME_SIDE]
+                != row.next.pixels[..V5_PLAYFIELD_HEIGHT * FRAME_SIDE]
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut twin_family = alternatives[0];
+    for family in &alternatives {
+        if diverges(*family)? {
+            twin_family = *family;
+            break;
+        }
+    }
+    let twin = generate_learning_history(
+        seed,
+        meta_episode_id,
+        split,
+        &draw,
+        EpisodeOperator {
+            family: twin_family,
+            ..draw.operator
+        },
+        1,
+    )?;
+    Ok((primary, twin))
+}
+
+/// Model-free mutual-exclusivity census over Twin Episodes (ADR 0005 §2.3, §5.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinExclusivityCensus {
+    pub pairs: usize,
+    /// Pairs whose emitted frames or actions differ before any transition has
+    /// revealed the rule: the Hidden Rule would be readable from a single
+    /// frame. Must be zero.
+    pub single_frame_rule_identifiable: usize,
+    /// Pairs with a first differing transition that maps a byte-identical
+    /// current frame and action to different next frames.
+    pub divergent_pairs: usize,
+}
+
+/// Index of the first differing transition of a twin pair, or `Err` when the
+/// pair differs before any rule-revealing transition, or `Ok(None)` when the
+/// twins never diverge.
+pub fn twin_first_divergence(
+    primary: &LearningHistory,
+    twin: &LearningHistory,
+) -> Result<Option<usize>> {
+    ensure!(
+        primary.rows.len() == twin.rows.len(),
+        "twin episodes must emit the same number of rows"
+    );
+    for (index, (left, right)) in primary.rows.iter().zip(&twin.rows).enumerate() {
+        ensure!(
+            left.current == right.current && left.action == right.action,
+            "twin episodes differ before the first rule-revealing transition (row {index})"
+        );
+        if left.next != right.next {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+pub fn census_twin_exclusivity(
+    pairs: &[(LearningHistory, LearningHistory)],
+) -> TwinExclusivityCensus {
+    let mut census = TwinExclusivityCensus {
+        pairs: pairs.len(),
+        ..TwinExclusivityCensus::default()
+    };
+    for (primary, twin) in pairs {
+        match twin_first_divergence(primary, twin) {
+            Err(_) => census.single_frame_rule_identifiable += 1,
+            Ok(Some(_)) => census.divergent_pairs += 1,
+            Ok(None) => {}
+        }
+    }
+    census
+}
+
+fn compose_learning_history_unit(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    meta_episode_id: u64,
+) -> Result<Vec<V5Sample>> {
+    let (primary, twin) = generate_learning_history_pair(
+        config.seed,
+        meta_episode_id,
+        split,
+        &config.operator_families,
+    )?;
+    let operator = primary.operator;
+    // Twins share one augmentation unit so their emitted frames stay
+    // byte-identical until the rule acts; interleaving keeps a truncated
+    // unit balanced between the two rules.
+    augment_v5_unit(
+        interleave(primary.rows, twin.rows),
+        config,
+        split,
+        MixedStreamKind::LearningHistories,
+        operator,
+        meta_episode_id,
+    )
+}
+
+fn compose_learning_histories_stream(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    count: usize,
+    batch_index: u64,
+    first_unit_index: u64,
+) -> Result<(Vec<V5Sample>, u64)> {
+    let min_rows_per_unit = 2
+        * LEARNING_HISTORY_LEVELS[0]
+        * (LEARNING_HISTORY_STEPS_PER_LEVEL + LEARNING_HISTORY_OPERATOR_ACTIONS);
+    let mut samples = Vec::with_capacity(count);
+    let mut next_unit_index = first_unit_index;
+    while samples.len() < count {
+        let wave_units = (count - samples.len()).div_ceil(min_rows_per_unit);
+        let units = (0..wave_units)
+            .into_par_iter()
+            .map(|offset| {
+                compose_learning_history_unit(
+                    config,
+                    split,
+                    mixed_stream_episode_id(
+                        batch_index,
+                        next_unit_index
+                            .checked_add(offset as u64)
+                            .context("mixed stream unit index overflow")?,
+                    )?,
+                )
+            })
+            .collect::<Vec<_>>();
+        for unit in units {
+            if samples.len() == count {
+                break;
+            }
+            let mut unit = unit?;
+            ensure!(!unit.is_empty(), "learning-history unit produced no rows");
+            unit.truncate(count - samples.len());
+            samples.append(&mut unit);
+            next_unit_index = next_unit_index
+                .checked_add(1)
+                .context("mixed stream unit index overflow")?;
+        }
+    }
+    Ok((samples, next_unit_index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5060,6 +5776,7 @@ mod tests {
                     source_rect,
                     target_rect,
                     &augmentation,
+                    false,
                 )?;
                 let mut latent = Some(vec![
                     (f32::from(source_agent.0) + 0.5) / f32::from(size) * 2.0 - 1.0,

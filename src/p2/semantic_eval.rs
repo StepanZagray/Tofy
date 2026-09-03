@@ -1257,6 +1257,10 @@ mod tests {
                 source_kind: "movement".into(),
                 trajectory_id: "sim/Train/9/4".into(),
                 operator: None,
+                rule_id: 0,
+                level_index: 0,
+                available_actions: 0,
+                context_len: 0,
             },
             oracle_latent: None,
             context: Vec::new(),
@@ -1284,6 +1288,10 @@ mod tests {
             source_kind: "operator_control".into(),
             trajectory_id: format!("test/operator_control/{episode_id}"),
             operator: Some(operator),
+            rule_id: 0,
+            level_index: 0,
+            available_actions: 0,
+            context_len: 0,
         };
         let noop = current.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE]
             == next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE];
@@ -1317,6 +1325,7 @@ mod tests {
             },
             goal_dropped: false,
             branch_group_id: None,
+            contract_v6: false,
         };
         Ok((sample, provenance))
     }
@@ -1429,6 +1438,7 @@ mod tests {
             agent_color: palette::AGENT,
             primary_color: palette::EMPTY,
             secondary_color: palette::EMPTY,
+            empty_color: palette::EMPTY,
         };
         let (first, first_provenance) = operator_row(
             current.clone(),
@@ -1466,6 +1476,7 @@ mod tests {
             agent_color: palette::AGENT,
             primary_color: palette::SWITCH_BASE,
             secondary_color: palette::SWITCH_BASE + 1,
+            empty_color: palette::EMPTY,
         };
         let (first, first_provenance) = operator_row(
             current.clone(),
