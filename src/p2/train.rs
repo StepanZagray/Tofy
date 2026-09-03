@@ -10,10 +10,9 @@ use crate::p2::cg_profile::{
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
     adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
-    gameplay_rows, generate_curriculum, ArcFrame,
-    ContentMask, ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
-    MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance,
-    FRAME_SIDE, GOAL_FEATURES_DIM,
+    gameplay_rows, generate_curriculum, ArcFrame, ContentMask, ContentRect, EventLabelCensus,
+    FactualBatch, MixedStreamBatch, MixedStreamConfig, MixedStreamKind, OperatorFamily,
+    TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{
     evaluate_gate_support_with_v5_provenance, GateSupportMetrics,
@@ -35,8 +34,7 @@ use crate::p2::model::{
 use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::optimizer::{
     accumulate_parameter_gradients, clip_gradients_gpu_with_stats,
-    try_clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
-    ModelEma,
+    try_clip_gradients_gpu_with_stats, CheckpointHybridOptimizer, ModelEma,
 };
 use crate::p2::prefetch::{
     BatchPrefetcher, MixedStreamBatchPrefetcher, PrefetchRequest, PrefetchScope,
@@ -643,11 +641,15 @@ pub fn foundation_v2_gate_evaluation(
     let shuffled_margin =
         shuffled_floor.map(|floor| foundation_v2_noise_margin(floor, outcome_changing_rows));
     let foreground_floor = foreground_active.then_some(0.60);
-    let foreground_margin = foreground_floor
-        .map(|floor| foundation_v2_noise_margin(floor, metrics.foreground_pixels));
-    let one_step_margin = collapse_floor
-        .map(|floor| foundation_v2_noise_margin(floor, metrics.changed_transitions));
-    let composed_floor_field = if warmup_done { composed_collapse_floor } else { None };
+    let foreground_margin =
+        foreground_floor.map(|floor| foundation_v2_noise_margin(floor, metrics.foreground_pixels));
+    let one_step_margin =
+        collapse_floor.map(|floor| foundation_v2_noise_margin(floor, metrics.changed_transitions));
+    let composed_floor_field = if warmup_done {
+        composed_collapse_floor
+    } else {
+        None
+    };
     let composed_margin = composed_floor_field
         .map(|floor| foundation_v2_noise_margin(floor, metrics.changed_transitions));
     let diagnostics = vec![FoundationV2GateDiagnostic {
@@ -1447,6 +1449,20 @@ impl TrainConfig {
         if self.init_context_from_v5.is_some() && !self.world_core_v6 {
             bail!("init_context_from_v5 is only meaningful for a world_core_v6 run");
         }
+        if self.data_contract_v6 && !self.world_core_v6 {
+            bail!(
+                "data_contract_v6 requires world_core_v6: the v6 data contract supervises \
+                 all 64 rows and only a v6 model decodes them (ADR 0005 §1.1)"
+            );
+        }
+        if self.world_core_v6 && !self.data_contract_v6 && self.init_context_from_v5.is_none() {
+            bail!(
+                "world_core_v6 without data_contract_v6 is only allowed as an \
+                 init_context_from_v5 warm-start smoke; a v6 model trained on legacy \
+                 63-row data violates the whole-frame contract (ADR 0005 §1.1). Set \
+                 data_contract_v6 or supply init_context_from_v5"
+            );
+        }
         if self.recipe == TrainingRecipe::FullV4 {
             self.validate_full_v4()?;
         } else if self.recipe == TrainingRecipe::FoundationV2 {
@@ -2091,6 +2107,9 @@ struct TrainingContract {
     world_core_v6: bool,
     #[serde(default)]
     init_context_from_v5: Option<PathBuf>,
+    /// ADR 0005 §2: selects the stream schedule and whole-frame rendering.
+    #[serde(default)]
+    data_contract_v6: bool,
     #[serde(default)]
     supervise_last_outer_only: bool,
     phased_training: bool,
@@ -2214,6 +2233,7 @@ impl From<&TrainConfig> for TrainingContract {
             steady_gpu: cfg.steady_gpu,
             world_core_v6: cfg.world_core_v6,
             init_context_from_v5: cfg.init_context_from_v5.clone(),
+            data_contract_v6: cfg.data_contract_v6,
             supervise_last_outer_only: cfg.supervise_last_outer_only,
             phased_training: cfg.phased_training,
             stop_grad_event_y: cfg.stop_grad_event_y,
@@ -3168,15 +3188,18 @@ pub(crate) fn prepare_foundation_v2_batch_host(
 
         let base = row * OPERATOR_CONDITION_DIM;
         // v6 rows always condition as UNKNOWN (ADR 0005 §1.4).
-        let operator = sample.provenance.conditioning_operator().filter(|operator| {
-            matches!(
-                operator.family,
-                OperatorFamily::Teleport
-                    | OperatorFamily::Toggle
-                    | OperatorFamily::Paint
-                    | OperatorFamily::PushLine
-            )
-        });
+        let operator = sample
+            .provenance
+            .conditioning_operator()
+            .filter(|operator| {
+                matches!(
+                    operator.family,
+                    OperatorFamily::Teleport
+                        | OperatorFamily::Toggle
+                        | OperatorFamily::Paint
+                        | OperatorFamily::PushLine
+                )
+            });
         let family_token = operator
             .map(|operator| operator.family.conditioning_token())
             .unwrap_or(OPERATOR_FAMILY_UNKNOWN);
@@ -5705,7 +5728,8 @@ fn foundation_v2_training_loss_with_event_weights(
     let encoded = if v6 {
         model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?
     } else {
-        model.encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?
+        model
+            .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?
     };
     // ADR 0005 §4: context rows use the same losses with the context supplied.
     let context = if v6 { batch.context.as_ref() } else { None };
@@ -8358,9 +8382,7 @@ fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<Strin
         .take(MAX_CONSECUTIVE_SKIPS)
         .copied()
         .collect::<Vec<_>>();
-    if tail.len() == MAX_CONSECUTIVE_SKIPS
-        && tail.windows(2).all(|pair| pair[0] == pair[1] + 1)
-    {
+    if tail.len() == MAX_CONSECUTIVE_SKIPS && tail.windows(2).all(|pair| pair[0] == pair[1] + 1) {
         return Some(format!(
             "{MAX_CONSECUTIVE_SKIPS} consecutive updates ending at step {} produced \
              non-finite gradients; this is divergence, not an isolated bad batch",
@@ -8546,10 +8568,8 @@ impl FoundationV2LossLog {
                             }
                         }
                         FoundationV2LossLogCommand::Flush(reply) => {
-                            let result = sink
-                                .flush()
-                                .and_then(|_| sink.sync())
-                                .with_context(|| {
+                            let result =
+                                sink.flush().and_then(|_| sink.sync()).with_context(|| {
                                     format!("flush loss log {}", worker_path.display())
                                 });
                             let stop = result.is_err();
@@ -8559,10 +8579,8 @@ impl FoundationV2LossLog {
                             }
                         }
                         FoundationV2LossLogCommand::Shutdown(reply) => {
-                            let result = sink
-                                .flush()
-                                .and_then(|_| sink.sync())
-                                .with_context(|| {
+                            let result =
+                                sink.flush().and_then(|_| sink.sync()).with_context(|| {
                                     format!("flush loss log {}", worker_path.display())
                                 });
                             let _ = reply.send(result);
@@ -8952,7 +8970,10 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             // ADR 0005 §3.4 warm start: every v5 tensor by name; context
             // parameters keep the fresh init above (FiLM zero => exact v5).
             load_varmap_warm_start_context(&varmap, source)?;
-            tracing::info!("initialized v6 non-context parameters from {}", source.display());
+            tracing::info!(
+                "initialized v6 non-context parameters from {}",
+                source.display()
+            );
         }
     }
     let mut ema = ModelEma::with_default_decay(&varmap)?;
@@ -10868,29 +10889,183 @@ mod tests {
     fn foundation_v2_degenerate_copy_model_cannot_latch_best_selection() {
         let history: Vec<FoundationV2GateEvaluation> = [
             (1024, true, 0.0, 0.296875, 0.001153402537, 0.0),
-            (2048, true, 0.1242937853, 0.041015625, 0.2967128028, 0.0001878099109),
-            (3072, true, 0.1666666667, 0.048828125, 0.226314055, 0.0008257751695),
-            (4096, false, 0.1525423729, 0.072265625, 0.1644834404, 0.0007272117437),
-            (5120, false, 0.1581920904, 0.044921875, 0.1536496952, 0.0008748116997),
-            (6144, true, 0.2033898305, 0.052734375, 0.1384906904, 0.0008890322935),
-            (7168, true, 0.2966101695, 0.0625, 0.1362250783, 0.0007806615616),
-            (8192, false, 0.3276836158, 0.064453125, 0.1351952546, 0.0006404170851),
-            (9216, false, 0.3870056497, 0.052734375, 0.1328884495, 0.000646791834),
-            (10240, true, 0.3926553672, 0.05859375, 0.1393969352, 0.0007532011047),
-            (11264, true, 0.4491525424, 0.056640625, 0.1356071841, 0.0007522203741),
-            (12288, true, 0.4548022599, 0.05859375, 0.1279452958, 0.00075369147),
-            (13312, true, 0.4689265537, 0.0625, 0.1231257209, 0.0007728157168),
-            (14336, true, 0.4604519774, 0.06640625, 0.1211896523, 0.0007904688677),
-            (15360, true, 0.4576271186, 0.072265625, 0.1150107102, 0.0007791904657),
-            (16384, true, 0.4576271186, 0.05078125, 0.1139808865, 0.0007448648946),
-            (17408, true, 0.4661016949, 0.04296875, 0.1108914154, 0.0007953725207),
-            (18432, true, 0.4802259887, 0.052734375, 0.1073076289, 0.0007688927944),
-            (19456, true, 0.488700565, 0.04296875, 0.1037650354, 0.0008061605574),
-            (20480, true, 0.5197740113, 0.048828125, 0.1058658758, 0.000823323343),
-            (21504, true, 0.5141242938, 0.044921875, 0.1051655957, 0.0008247944389),
+            (
+                2048,
+                true,
+                0.1242937853,
+                0.041015625,
+                0.2967128028,
+                0.0001878099109,
+            ),
+            (
+                3072,
+                true,
+                0.1666666667,
+                0.048828125,
+                0.226314055,
+                0.0008257751695,
+            ),
+            (
+                4096,
+                false,
+                0.1525423729,
+                0.072265625,
+                0.1644834404,
+                0.0007272117437,
+            ),
+            (
+                5120,
+                false,
+                0.1581920904,
+                0.044921875,
+                0.1536496952,
+                0.0008748116997,
+            ),
+            (
+                6144,
+                true,
+                0.2033898305,
+                0.052734375,
+                0.1384906904,
+                0.0008890322935,
+            ),
+            (
+                7168,
+                true,
+                0.2966101695,
+                0.0625,
+                0.1362250783,
+                0.0007806615616,
+            ),
+            (
+                8192,
+                false,
+                0.3276836158,
+                0.064453125,
+                0.1351952546,
+                0.0006404170851,
+            ),
+            (
+                9216,
+                false,
+                0.3870056497,
+                0.052734375,
+                0.1328884495,
+                0.000646791834,
+            ),
+            (
+                10240,
+                true,
+                0.3926553672,
+                0.05859375,
+                0.1393969352,
+                0.0007532011047,
+            ),
+            (
+                11264,
+                true,
+                0.4491525424,
+                0.056640625,
+                0.1356071841,
+                0.0007522203741,
+            ),
+            (
+                12288,
+                true,
+                0.4548022599,
+                0.05859375,
+                0.1279452958,
+                0.00075369147,
+            ),
+            (
+                13312,
+                true,
+                0.4689265537,
+                0.0625,
+                0.1231257209,
+                0.0007728157168,
+            ),
+            (
+                14336,
+                true,
+                0.4604519774,
+                0.06640625,
+                0.1211896523,
+                0.0007904688677,
+            ),
+            (
+                15360,
+                true,
+                0.4576271186,
+                0.072265625,
+                0.1150107102,
+                0.0007791904657,
+            ),
+            (
+                16384,
+                true,
+                0.4576271186,
+                0.05078125,
+                0.1139808865,
+                0.0007448648946,
+            ),
+            (
+                17408,
+                true,
+                0.4661016949,
+                0.04296875,
+                0.1108914154,
+                0.0007953725207,
+            ),
+            (
+                18432,
+                true,
+                0.4802259887,
+                0.052734375,
+                0.1073076289,
+                0.0007688927944,
+            ),
+            (
+                19456,
+                true,
+                0.488700565,
+                0.04296875,
+                0.1037650354,
+                0.0008061605574,
+            ),
+            (
+                20480,
+                true,
+                0.5197740113,
+                0.048828125,
+                0.1058658758,
+                0.000823323343,
+            ),
+            (
+                21504,
+                true,
+                0.5141242938,
+                0.044921875,
+                0.1051655957,
+                0.0008247944389,
+            ),
             (22528, true, 0.5, 0.05078125, 0.09976931949, 0.0008110642104),
-            (23552, true, 0.5084745763, 0.05078125, 0.09729774263, 0.0008502934346),
-            (24576, true, 0.5141242938, 0.044921875, 0.09853353106, 0.0008826575446),
+            (
+                23552,
+                true,
+                0.5084745763,
+                0.05078125,
+                0.09729774263,
+                0.0008502934346,
+            ),
+            (
+                24576,
+                true,
+                0.5141242938,
+                0.044921875,
+                0.09853353106,
+                0.0008826575446,
+            ),
         ]
         .into_iter()
         .map(|(step, armed_ok, composed, all_rows, fe, pad_fe)| {
@@ -10964,9 +11139,9 @@ mod tests {
         // Regression for bundle-s8 through the failed broad-window repairs:
         // 30 lineage skips remain below the truly local burst budget.
         let bundle_s8 = [
-            10_613, 11_015, 11_599, 11_934, 12_040, 12_120, 12_501, 12_553, 12_581, 12_585,
-            12_838, 12_848, 12_895, 12_911, 13_055, 13_062, 13_073, 13_075, 13_077, 13_116,
-            13_133, 13_137, 13_155, 13_158, 13_166, 13_171, 13_181, 13_183, 13_190, 13_191,
+            10_613, 11_015, 11_599, 11_934, 12_040, 12_120, 12_501, 12_553, 12_581, 12_585, 12_838,
+            12_848, 12_895, 12_911, 13_055, 13_062, 13_073, 13_075, 13_077, 13_116, 13_133, 13_137,
+            13_155, 13_158, 13_166, 13_171, 13_181, 13_183, 13_190, 13_191,
         ];
         assert!(foundation_v2_nonfinite_skip_exhausted(&bundle_s8).is_none());
     }
@@ -11058,7 +11233,10 @@ mod tests {
             .iter()
             .find(|gate| gate.name == "shuffled_action_ratio")
             .expect("shuffled gate");
-        assert!(!shuffled.passed, "noise-level failure must still block promotion");
+        assert!(
+            !shuffled.passed,
+            "noise-level failure must still block promotion"
+        );
 
         let mut blind_history = Vec::new();
         for step in [4_096u64, 5_120, 6_144] {
@@ -11725,7 +11903,11 @@ mod tests {
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         let losses = foundation_v2_training_loss(&model, &mixed, &device, objective.clone())?;
-        assert!(losses.total.to_dtype(DType::F32)?.to_scalar::<f32>()?.is_finite());
+        assert!(losses
+            .total
+            .to_dtype(DType::F32)?
+            .to_scalar::<f32>()?
+            .is_finite());
 
         let legacy_varmap = VarMap::new();
         let legacy = WorldModel::new(
@@ -11755,9 +11937,16 @@ mod tests {
             V5DataSplit::Train,
         )?;
         let host = prepare_foundation_v2_batch_host(&mixed)?;
-        for row in host.operator_conditioning.chunks_exact(OPERATOR_CONDITION_DIM) {
+        for row in host
+            .operator_conditioning
+            .chunks_exact(OPERATOR_CONDITION_DIM)
+        {
             assert_eq!(row[OPERATOR_FAMILY_UNKNOWN], 1.0);
-            assert_eq!(row.iter().sum::<f32>(), 1.0, "v6 rows carry no colour triple");
+            assert_eq!(
+                row.iter().sum::<f32>(),
+                1.0,
+                "v6 rows carry no colour triple"
+            );
         }
         assert_eq!(host.model_frames, host.frames);
         assert_eq!(host.model_next_frames, host.next_frames);
@@ -13817,6 +14006,9 @@ mod tests {
         let mut cfg = base.clone();
         cfg.branch_learning.outcome_pull_weight += 0.01;
         changed.push(("branch_learning", cfg));
+        let mut cfg = base.clone();
+        cfg.data_contract_v6 = true;
+        changed.push(("data_contract_v6", cfg));
 
         for (name, cfg) in changed {
             assert_ne!(
@@ -14167,7 +14359,6 @@ mod tests {
         Ok(())
     }
 
-
     /// Sink that fails a configured number of write calls before succeeding,
     /// recording all bytes that were accepted. Models the transient I/O blips
     /// of a network-mounted /workspace.
@@ -14215,11 +14406,8 @@ mod tests {
             fail_forever: false,
         };
         let values = FoundationV2LossMeans::default();
-        let mut log = FoundationV2LossLog::with_sink(
-            sink,
-            PathBuf::from("test-loss-log.jsonl"),
-            false,
-        )?;
+        let mut log =
+            FoundationV2LossLog::with_sink(sink, PathBuf::from("test-loss-log.jsonl"), false)?;
         for step in 0..4u64 {
             log.append(step, &values, 1e-3)?;
         }
@@ -14248,11 +14436,8 @@ mod tests {
             fail_forever: true,
         };
         let values = FoundationV2LossMeans::default();
-        let mut log = FoundationV2LossLog::with_sink(
-            sink,
-            PathBuf::from("test-loss-log.jsonl"),
-            false,
-        )?;
+        let mut log =
+            FoundationV2LossLog::with_sink(sink, PathBuf::from("test-loss-log.jsonl"), false)?;
         // The worker gives up while draining the bounded queue; subsequent
         // appends or the flush must report the failure to the caller.
         let mut failed = false;
@@ -14263,7 +14448,10 @@ mod tests {
             }
         }
         failed = failed || log.flush().is_err();
-        assert!(failed, "persistent sink failure never surfaced to the caller");
+        assert!(
+            failed,
+            "persistent sink failure never surfaced to the caller"
+        );
         Ok(())
     }
 
@@ -14626,6 +14814,7 @@ mod tests {
         v6.apply_foundation_v2_recipe();
         v6.physical_batch = 64;
         v6.world_core_v6 = true;
+        v6.data_contract_v6 = true;
         v6.validate().expect("foundation-v2 + v6 is a valid arm");
         assert!(v6.model_config().world_core_v6);
         let mut orphan_init = v6.clone();
@@ -14634,6 +14823,52 @@ mod tests {
         assert!(orphan_init.validate().is_err());
         let contract = TrainingContract::from(&v6);
         assert!(contract.world_core_v6);
+        assert!(contract.data_contract_v6);
+    }
+
+    /// ADR 0005 §1.1: the data and model contracts are paired. The only
+    /// legal v6-model / legacy-data combination is the warm-start smoke.
+    #[test]
+    fn v6_data_and_model_contracts_must_be_paired() {
+        let mut base = TrainConfig::default();
+        base.apply_foundation_v2_recipe();
+        base.physical_batch = 64;
+
+        // data_contract_v6 without world_core_v6: rejected at config time.
+        let mut data_only = base.clone();
+        data_only.data_contract_v6 = true;
+        let err = data_only
+            .validate()
+            .expect_err("v6 data on a legacy model must fail closed");
+        assert!(
+            err.to_string()
+                .contains("data_contract_v6 requires world_core_v6"),
+            "{err:#}"
+        );
+
+        // world_core_v6 without data_contract_v6 and without warm start: rejected.
+        let mut model_only = base.clone();
+        model_only.world_core_v6 = true;
+        let err = model_only
+            .validate()
+            .expect_err("v6 model on legacy data without warm start must fail closed");
+        assert!(err.to_string().contains("ADR 0005 §1.1"), "{err:#}");
+
+        // world_core_v6 without data_contract_v6 but with init_context_from_v5:
+        // the warm-start smoke is allowed.
+        let mut warm_start = model_only.clone();
+        warm_start.init_context_from_v5 = Some(PathBuf::from("runs/v5/checkpoints/best"));
+        warm_start
+            .validate()
+            .expect("v5 warm-start smoke on legacy data is allowed");
+
+        // Both flags on: the §5.1 arm.
+        let mut paired = base.clone();
+        paired.world_core_v6 = true;
+        paired.data_contract_v6 = true;
+        paired.validate().expect("paired v6 contracts validate");
+        let contract = TrainingContract::from(&paired);
+        assert!(contract.world_core_v6 && contract.data_contract_v6);
     }
 
     #[test]
@@ -14650,7 +14885,8 @@ mod tests {
             ..tiny_v5_model_cfg()
         };
         let (v6, v6_vars) = fresh_model(v6_cfg, 99, &device)?;
-        let error = load_varmap_exact(&v6_vars, &checkpoint).expect_err("v5 into v6 must fail closed");
+        let error =
+            load_varmap_exact(&v6_vars, &checkpoint).expect_err("v5 into v6 must fail closed");
         assert!(error.to_string().contains("missing"), "{error}");
         // Warm start into a v5 target is meaningless (nothing missing) and must fail too.
         assert!(load_varmap_warm_start_context(&v5_vars, &checkpoint).is_err());
@@ -14739,13 +14975,17 @@ mod tests {
             V5DataSplit::Train,
         )?;
         // Legacy rows: no context is ever materialized.
-        assert!(prepare_foundation_v2_batch_host(&mixed)?.context().is_none());
+        assert!(prepare_foundation_v2_batch_host(&mixed)?
+            .context()
+            .is_none());
         let objective = FoundationV2ObjectiveConfig::default();
         let scalar = |breakdown: FoundationV2LossBreakdown| -> Result<f32> {
             Ok(breakdown.total.to_dtype(DType::F32)?.to_scalar::<f32>()?)
         };
         let (v5, _) = fresh_model(tiny_v5_model_cfg(), 23, &device)?;
-        let v5_plain = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v5_plain = scalar(foundation_v2_training_loss(
+            &v5, &mixed, &device, objective,
+        )?)?;
 
         let injected = inject_synthetic_context(&mut mixed, 4);
         assert!(injected > 0);
@@ -14757,7 +14997,9 @@ mod tests {
         assert_eq!(context.valid.iter().filter(|v| **v != 0.0).count(), 15);
 
         // v5 ignores context rows entirely.
-        let v5_ctx = scalar(foundation_v2_training_loss(&v5, &mixed, &device, objective)?)?;
+        let v5_ctx = scalar(foundation_v2_training_loss(
+            &v5, &mixed, &device, objective,
+        )?)?;
         assert!(v5_plain.is_finite());
         assert_eq!(v5_plain, v5_ctx, "legacy model must ignore context rows");
 
@@ -14784,12 +15026,19 @@ mod tests {
             0,
             V5DataSplit::Train,
         )?;
-        let v6_plain = scalar(foundation_v2_training_loss(&v6, &mixed_v6, &device, objective)?)?;
+        let v6_plain = scalar(foundation_v2_training_loss(
+            &v6, &mixed_v6, &device, objective,
+        )?)?;
         assert!(inject_synthetic_context(&mut mixed_v6, 4) > 0);
         // v6 at zero context FiLM is bit-identical with and without context.
-        let v6_ctx = scalar(foundation_v2_training_loss(&v6, &mixed_v6, &device, objective)?)?;
+        let v6_ctx = scalar(foundation_v2_training_loss(
+            &v6, &mixed_v6, &device, objective,
+        )?)?;
         assert!(v6_plain.is_finite());
-        assert_eq!(v6_plain, v6_ctx, "zero context FiLM must not change the v6 loss");
+        assert_eq!(
+            v6_plain, v6_ctx,
+            "zero context FiLM must not change the v6 loss"
+        );
         Ok(())
     }
 }
