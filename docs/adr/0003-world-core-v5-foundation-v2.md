@@ -145,7 +145,7 @@
   the latter remains `NEEDS-3-SEED` until fresh matched runs pass the existing
   quality gates.
 - This follows the "Next falsifier" protocol in
-  `/home/stepan/Research/Knowledge/ml/tofy/mixed-precision-bf16-speed.md`.
+  `/home/stepan/Research/ml/tofy/mixed-precision-bf16-speed.md`.
   The execution dtype changes, but the population, objective, reductions,
   optimizer, and schedule do not, so `FOUNDATION_OBJECTIVE_REVISION` is not
   bumped. The flag is nevertheless persisted in `config.json` and the resume

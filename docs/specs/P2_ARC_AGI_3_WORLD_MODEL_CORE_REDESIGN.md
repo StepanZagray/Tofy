@@ -5,7 +5,7 @@ Status: implementation specification
 Date: 2026-08-09
 
 Source revision: `17fbfdffba917bcef23f5bdea86aa83561524272`
-Research run: `~/Research/Knowledge/_runs/2026-08-09T172003Z-tofy-arc-agi-3-world-model-redesign/`
+Research run: `~/Research/_runs/2026-08-09T172003Z-tofy-arc-agi-3-world-model-redesign/`
 
 ## 1. Objective and decision
 

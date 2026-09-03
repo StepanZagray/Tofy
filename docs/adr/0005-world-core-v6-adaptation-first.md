@@ -5,7 +5,7 @@
 - Amends: [ADR 0003](0003-world-core-v5-foundation-v2.md) §1 data contract, §2 model,
   §3 objective, §6 evaluation, §7 deferred list; makes [ADR 0004](0004-latent-planning-contract.md)
   Phase C ("prequential fast adapters") concrete.
-- Basis: research run `~/Research/Knowledge/_runs/2026-09-03T033950Z-tofy-zero-shot-transfer-training-design`
+- Basis: research run `~/Research/_runs/2026-09-03T033950Z-tofy-zero-shot-transfer-training-design`
   (synthesis.md and seven verified findings), plus the local audit
   `findings/local-generator-vs-interface-audit.md` against worktree `7eddfd21`.
 

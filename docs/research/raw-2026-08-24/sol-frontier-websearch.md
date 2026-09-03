@@ -309,4 +309,4 @@ If one-frame collisions are common, no one-frame objective can reach high exact 
 
 A realistic success target for the first four interventions together is moving held-out changed-pixel exact prediction from 2–5% into roughly the **20–45%** range. That would be meaningful evidence of learned dynamics, but I would not expect a proportional ARC-AGI-3 score increase until goal/progress inference and information-efficient exploration are added. The public agents demonstrate that accurate transition modeling is necessary; they also demonstrate that verification, hypothesis management, and action choice are where game completion is won.
 
-The durable research synthesis was also saved in [arc-agi-3-frontier-interventions.md](</home/stepan/Research/Knowledge/ml/tofy/arc-agi-3-frontier-interventions.md>).
+The durable research synthesis was also saved in [arc-agi-3-frontier-interventions.md](</home/stepan/Research/ml/tofy/arc-agi-3-frontier-interventions.md>).
