@@ -10,10 +10,11 @@
 //! the controller reduces to the exact graph-frontier explorer and says so in
 //! every decision trace. Kernels stay tensor-free behind [`PhaseAModel`].
 
+use crate::p2::adaptation::{context_batch_for, LiveContext};
 use crate::p2::arc3_live::{
     enumerate_actions, ActionDecision, ActionScore, ArcObservation, LivePolicy,
 };
-use crate::p2::data::{ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
+use crate::p2::data::{ArcAction, ArcFrame, ContextTransition, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::latent_planning::adapter::{
     EvalBudget, GoalEventReadout, ModelCallError, PhaseAModel, StepPrediction,
 };
@@ -113,6 +114,8 @@ pub struct TensorPhaseAAdapter<'a> {
     physical_batch: usize,
     budget: EvalBudget,
     current_frames: Option<Tensor>,
+    /// ADR 0005 §6.1 Channel A window for the decision being scored.
+    context: Vec<ContextTransition>,
 }
 
 impl<'a> TensorPhaseAAdapter<'a> {
@@ -123,6 +126,7 @@ impl<'a> TensorPhaseAAdapter<'a> {
             physical_batch: physical_batch.max(1),
             budget: EvalBudget::default(),
             current_frames: None,
+            context: Vec::new(),
         }
     }
 
@@ -228,6 +232,8 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                 let zero_goals = Tensor::zeros((n, GOAL_FEATURES_DIM), DType::F32, self.device)?;
                 let operator = unknown_operator_conditioning(n, self.device)?;
                 let state = from.tensor.broadcast_as((n, channels, height, width))?;
+                // Channel A: screening and verification alike see the window.
+                let context = context_batch_for(&self.context, n, self.device)?;
                 if from.is_root {
                     let frames = self
                         .current_frames
@@ -235,13 +241,14 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                         .context("root latent has no encoded frame")?;
                     let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
                     self.model
-                        .forward_from_encoded_state_with_operator_conditioning(
+                        .forward_from_encoded_state_with_operator_conditioning_with_context(
                             &state,
                             &frame_batch,
                             &action_ids,
                             &coords,
                             &zero_goals,
                             &operator,
+                            context.as_ref(),
                             RecursionDepth::from_config(self.model.config()),
                             0.0,
                             None,
@@ -249,12 +256,13 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                         )
                 } else {
                     self.model
-                        .forward_from_latent_with_depth_and_operator_conditioning(
+                        .forward_from_latent_with_depth_and_operator_conditioning_with_context(
                             &state,
                             &action_ids,
                             &coords,
                             &zero_goals,
                             &operator,
+                            context.as_ref(),
                             RecursionDepth::from_config(self.model.config()),
                         )
                 }
@@ -348,6 +356,10 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
     fn reset_decision_budget(&mut self, cap: usize) {
         self.budget.reset(cap);
     }
+
+    fn set_context_window(&mut self, window: Vec<ContextTransition>) {
+        self.context = window;
+    }
 }
 
 struct PendingTransition {
@@ -382,6 +394,8 @@ pub struct PhaseAPolicy<M: PhaseAModel> {
     candidates: Option<CandidateSet>,
     pending: Option<PendingTransition>,
     prev_inventory: Option<FeatureInventory>,
+    /// ADR 0005 §6.1 Channel A state; disabled unless [`Self::set_context`].
+    context: LiveContext,
 }
 
 impl<'a> PhaseAPolicy<TensorPhaseAAdapter<'a>> {
@@ -452,7 +466,13 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
             candidates: None,
             pending: None,
             prev_inventory: None,
+            context: LiveContext::disabled(),
         }
+    }
+
+    /// Channel A state (ADR 0005 §6.1); see `arc3_live::live_context_for`.
+    pub fn set_context(&mut self, context: LiveContext) {
+        self.context = context;
     }
 
     fn clear_episode_state(&mut self) {
@@ -686,6 +706,10 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
         let started = Instant::now();
         self.adapter
             .reset_decision_budget(self.config.max_model_evals);
+        // Channel A: only transitions confirmed before this decision.
+        let window = self.context.window(observation.levels_completed);
+        let context_len = window.len();
+        self.adapter.set_context_window(window);
         let pixels: Vec<u8> = observation.frame.pixels.to_vec();
         if pixels.len() != FRAME_PIXELS {
             bail!(
@@ -1083,6 +1107,7 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             candidate_count: actions.len(),
             phase_a: Some(trace),
             adaptation: None,
+            context_len,
         })
     }
 
@@ -1092,6 +1117,21 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
 
     fn on_game_start(&mut self, _game_id: &str) {
         self.clear_episode_state();
+        self.context.begin_game();
+    }
+
+    fn on_confirmed_transition(
+        &mut self,
+        current: &ArcObservation,
+        action: &ArcAction,
+        next: &ArcObservation,
+    ) {
+        self.context.observe(
+            &current.frame,
+            action,
+            &next.frame,
+            current.levels_completed,
+        );
     }
 
     fn on_level_transition(&mut self, _levels_completed: u16) {
@@ -1115,6 +1155,7 @@ mod tests {
         step_calls: usize,
         encode_calls: usize,
         satisfied_for_first_action: f32,
+        context_lens: Vec<usize>,
     }
 
     impl FakeModel {
@@ -1124,6 +1165,7 @@ mod tests {
                 step_calls: 0,
                 encode_calls: 0,
                 satisfied_for_first_action: satisfied,
+                context_lens: Vec::new(),
             }
         }
     }
@@ -1187,6 +1229,10 @@ mod tests {
         fn reset_decision_budget(&mut self, cap: usize) {
             self.budget.reset(cap);
         }
+
+        fn set_context_window(&mut self, window: Vec<ContextTransition>) {
+            self.context_lens.push(window.len());
+        }
     }
 
     fn observation(levels: u16, marker: bool) -> ArcObservation {
@@ -1231,6 +1277,120 @@ mod tests {
             ptrm: bin(),
             uncalibrated: false,
         }
+    }
+
+    #[test]
+    fn phase_a_policy_hands_the_preceding_window_to_the_adapter() -> Result<()> {
+        use crate::p2::adaptation::{AdaptationMode, LiveContext};
+        let mut policy = PhaseAPolicy::new(
+            FakeModel::new(0.9),
+            PhaseAConfig::default(),
+            permissive_calibration(),
+            8,
+            8,
+        );
+        policy.set_context(LiveContext::new(true, AdaptationMode::Reset));
+        policy.on_game_start("game");
+        let first = policy.choose_action(&observation(0, true))?;
+        assert_eq!(first.context_len, 0);
+        assert_eq!(policy.adapter.context_lens, vec![0]);
+        for id in 1..=3u8 {
+            let current = observation(0, true);
+            let next = observation(0, false);
+            let action = ArcAction::new(id, None, None)?;
+            policy.on_confirmed_transition(&current, &action, &next);
+        }
+        let decision = policy.choose_action(&observation(0, true))?;
+        assert_eq!(decision.context_len, 3);
+        assert_eq!(
+            policy.adapter.context_lens.last(),
+            Some(&3),
+            "the window is set before any model call of the decision"
+        );
+        // Level 1 (default arm) starts without level 0's transitions.
+        policy.on_level_transition(1);
+        assert_eq!(policy.choose_action(&observation(1, true))?.context_len, 0);
+        // Game start empties Factual Memory.
+        policy.on_game_start("next-game");
+        assert_eq!(policy.choose_action(&observation(0, true))?.context_len, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_adapter_conditions_screening_and_verification_on_context() -> Result<()> {
+        use crate::p2::experiment::ConsumerReadoutTopology;
+        use crate::p2::model::ModelConfig;
+        use candle_nn::{VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            patch_size: 4,
+            hidden_dim: 8,
+            action_dim: 8,
+            inner_steps: 1,
+            outer_steps: 1,
+            spatial_action_field: true,
+            world_core_v4: true,
+            world_core_v5: true,
+            world_core_v6: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            config,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        {
+            // Zero-initialised context FiLM would hide the window; perturb it.
+            let data = varmap.data().lock().unwrap();
+            let var = data.get("context_film_gamma.weight").expect("v6 parameter");
+            var.set(&var.as_tensor().ones_like()?.affine(0.5, 0.0)?)?;
+        }
+        let frame = |fill: u8| ArcFrame::new(64, 64, vec![fill; FRAME_PIXELS]).unwrap();
+        let window: Vec<ContextTransition> = (0..3u8)
+            .map(|i| ContextTransition {
+                current: frame(i),
+                action: ArcAction::new(1 + i, None, None).unwrap(),
+                next: frame(i + 1),
+            })
+            .collect();
+        let keys = vec![
+            phase_a_action_key(&ArcAction::new(1, None, None)?),
+            phase_a_action_key(&ArcAction::new(6, Some(3), Some(4))?),
+        ];
+        let goals = [[0.0f32; 19]];
+
+        let mut adapter = TensorPhaseAAdapter::new(&model, &device, 8);
+        adapter.reset_decision_budget(64);
+        let root = adapter.encode(&frame(7).pixels)?;
+        // Screening (root, frame-grounded path).
+        let plain = adapter.step_batch(&root, &keys, &goals)?;
+        adapter.set_context_window(window.clone());
+        let contextual = adapter.step_batch(&root, &keys, &goals)?;
+        assert!(
+            plain
+                .iter()
+                .zip(&contextual)
+                .any(|(a, b)| a.q_raw != b.q_raw || a.reliability_raw != b.reliability_raw),
+            "screening must be conditioned on the window"
+        );
+        // Verification (non-root latent path) with the same window.
+        let from = &contextual[0].latent;
+        let verified = adapter.step_batch(from, &keys, &goals)?;
+        adapter.set_context_window(Vec::new());
+        let verified_plain = adapter.step_batch(from, &keys, &goals)?;
+        assert!(
+            verified
+                .iter()
+                .zip(&verified_plain)
+                .any(|(a, b)| a.q_raw != b.q_raw || a.reliability_raw != b.reliability_raw),
+            "verification must be conditioned on the window"
+        );
+        for prediction in verified.iter().chain(&contextual) {
+            assert!(prediction.q_raw.is_finite() && prediction.reliability_raw.is_finite());
+        }
+        Ok(())
     }
 
     #[test]

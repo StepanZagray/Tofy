@@ -1,7 +1,7 @@
 //! Newline-delimited JSON bridge for the local ARC-AGI-3 toolkit.
 
 use crate::gpu_lock::GpuSessionGuard;
-use crate::p2::arc3_live::{adaptation_for, AdaptingPolicy};
+use crate::p2::arc3_live::{adaptation_for, live_context_for, AdaptingPolicy};
 use crate::p2::arc3_live::{
     decision_telemetry, live_evidence_class, live_run_provenance, run_public_suite, sha256_file,
     write_json_atomic, ActionDecision, AmbiguousMutation, ApiObservation, ArcApi, ArcObservation,
@@ -47,6 +47,8 @@ pub struct Arc3BridgeConfig {
     /// ADR 0005 §6.2 Channel B test-time adaptation.
     pub adapt: bool,
     pub adapt_carry: bool,
+    /// ADR 0005 §6.1 Channel A; `None` = on for `world_core_v6` checkpoints.
+    pub context_window: Option<bool>,
 }
 
 impl Arc3BridgeConfig {
@@ -85,20 +87,25 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
     let device = resolve_device(&config.device)?;
     let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
     let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
+    let context = live_context_for(&model, config.context_window, config.adapt_carry);
     let mut policy = match config.policy {
-        LivePolicyKind::Greedy => BridgePolicy::Greedy(ModelPolicy::new(
-            &model,
-            &device,
-            PHYSICAL_BATCH,
-            ACTION6_MAX_CANDIDATES,
-            ACTION6_GRID_STRIDE,
-            DEFAULT_TRIED_PENALTY,
-        )),
+        LivePolicyKind::Greedy => {
+            let mut policy = ModelPolicy::new(
+                &model,
+                &device,
+                PHYSICAL_BATCH,
+                ACTION6_MAX_CANDIDATES,
+                ACTION6_GRID_STRIDE,
+                DEFAULT_TRIED_PENALTY,
+            );
+            policy.set_context(context);
+            BridgePolicy::Greedy(policy)
+        }
         LivePolicyKind::PhaseA => {
             let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
                 config.phase_a_calibration.as_deref(),
             )?;
-            BridgePolicy::PhaseA(crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
+            let mut policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
                 &model,
                 &device,
                 PHYSICAL_BATCH,
@@ -106,7 +113,9 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 calibration,
                 ACTION6_MAX_CANDIDATES,
                 ACTION6_GRID_STRIDE,
-            )?)
+            )?;
+            policy.set_context(context);
+            BridgePolicy::PhaseA(policy)
         }
     };
 
@@ -905,6 +914,7 @@ mod tests {
                 candidate_count: 1,
                 phase_a: None,
                 adaptation: None,
+                context_len: 0,
             })
         }
     }

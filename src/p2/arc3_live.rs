@@ -5,13 +5,16 @@
 //! checkpoint selection, or curriculum hooks back to `p2::train`.
 
 use crate::gpu_lock::GpuSessionGuard;
-use crate::p2::adaptation::{AdaptationMode, AdaptationTrace, FastWeightAdapter};
+use crate::p2::adaptation::{
+    context_batch_for, AdaptationMode, AdaptationTrace, FastWeightAdapter, LiveContext,
+};
 use crate::p2::agent_session::AgentSession;
 use crate::p2::arc3::{first_recorded_decision_observations, ParsedActionInput, RecordingEvent};
 use crate::p2::cg_profile::{
     ensure_eval_profile_campaign, EvalCaptureSpec, RepresentativeUpdateCapture,
     ARC3_PROFILE_ENTRYPOINT,
 };
+use crate::p2::data::ContextTransition;
 use crate::p2::data::{palette, ArcAction, ArcFrame, FRAME_SIDE, GOAL_FEATURES_DIM};
 use crate::p2::eval::load_model;
 use crate::p2::model::{
@@ -127,6 +130,9 @@ pub struct LiveEvalConfig {
     pub adapt: bool,
     /// Preregistered carry arm: adapted fast weights persist across levels.
     pub adapt_carry: bool,
+    /// ADR 0005 §6.1 Channel A (`--context-window`): `None` = default (on for
+    /// `world_core_v6`); always off on checkpoints without a context channel.
+    pub context_window: Option<bool>,
 }
 
 impl LiveEvalConfig {
@@ -1048,6 +1054,11 @@ pub struct ActionDecision {
     /// loss); present only under `--adapt`, never serialized otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptation: Option<AdaptationTrace>,
+    /// ADR 0005 §6.1 Channel A: number of factual transitions in the Context
+    /// Window every model call of this decision was conditioned on (0 when the
+    /// window is off or empty).
+    #[serde(default)]
+    pub context_len: usize,
 }
 
 pub trait LivePolicy {
@@ -1113,6 +1124,22 @@ pub fn adaptation_for<'a>(
         AdaptationMode::Reset
     };
     FastWeightAdapter::new(model, varmap, device, mode).map(Some)
+}
+
+/// Resolve `--context-window` (ADR 0005 §6.1 Channel A) against the loaded
+/// checkpoint: on by default for `world_core_v6`; forced off (a no-op) for
+/// checkpoints without a context channel, which reject any context.
+pub fn live_context_for(model: &WorldModel, requested: Option<bool>, carry: bool) -> LiveContext {
+    let v6 = model.config().world_core_v6;
+    if !v6 && requested == Some(true) {
+        eprintln!("--context-window ignored: the checkpoint is not world_core_v6");
+    }
+    let mode = if carry {
+        AdaptationMode::Carry
+    } else {
+        AdaptationMode::Reset
+    };
+    LiveContext::new(v6 && requested.unwrap_or(true), mode)
 }
 
 /// Wraps any controller with Channel B adaptation (ADR 0005 §6.2). With no
@@ -1228,6 +1255,7 @@ pub struct ModelPolicy<'a> {
     tried_penalty: f64,
     tried: BTreeMap<u64, BTreeSet<String>>,
     profile: Option<Arc3ProfileCampaign>,
+    context: LiveContext,
 }
 
 struct Arc3ProfileCampaign {
@@ -1274,7 +1302,13 @@ impl<'a> ModelPolicy<'a> {
             tried_penalty,
             tried: BTreeMap::new(),
             profile: None,
+            context: LiveContext::disabled(),
         }
+    }
+
+    /// Channel A state (ADR 0005 §6.1); see [`live_context_for`].
+    pub fn set_context(&mut self, context: LiveContext) {
+        self.context = context;
     }
 
     pub fn enable_eval_profile(&mut self, output_dir: &Path, campaign_id: String, device: &str) {
@@ -1384,6 +1418,7 @@ impl<'a> ModelPolicy<'a> {
         &self,
         frame: &ArcFrame,
         candidates: &[ArcAction],
+        window: &[ContextTransition],
         profile: Option<&RepresentativeUpdateCapture>,
     ) -> Result<Vec<ActionScore>> {
         let (frames, encoded) = arc3_profile_phase(
@@ -1434,15 +1469,17 @@ impl<'a> ModelPolicy<'a> {
                     let operator_conditioning = unknown_operator_conditioning(n, self.device)?;
                     let state = encoded.broadcast_as((n, channels, height, width))?;
                     let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
+                    let context = context_batch_for(window, n, self.device)?;
                     let output = self
                         .model
-                        .forward_from_encoded_state_with_operator_conditioning(
+                        .forward_from_encoded_state_with_operator_conditioning_with_context(
                             &state,
                             &frame_batch,
                             &actions,
                             &coords,
                             &goals,
                             &operator_conditioning,
+                            context.as_ref(),
                             RecursionDepth::from_config(self.model.config()),
                             0.0,
                             None,
@@ -1511,8 +1548,9 @@ impl LivePolicy for ModelPolicy<'_> {
         let measurement = profile
             .as_ref()
             .and_then(RepresentativeUpdateCapture::measurement);
+        let window = self.context.window(observation.levels_completed);
         let mut scores =
-            self.score_candidates(&observation.frame, &candidates, profile.as_ref())?;
+            self.score_candidates(&observation.frame, &candidates, &window, profile.as_ref())?;
         let hash = observation_hash(observation);
         let tried = self.tried.entry(hash).or_default();
         apply_tried_penalty(&mut scores, tried, self.tried_penalty);
@@ -1533,6 +1571,7 @@ impl LivePolicy for ModelPolicy<'_> {
             candidate_count: candidates.len(),
             phase_a: None,
             adaptation: None,
+            context_len: window.len(),
         };
         if let Some(capture) = profile.as_ref() {
             let metrics = capture.phase("metrics", SpanKind::Function, None);
@@ -1580,6 +1619,21 @@ impl LivePolicy for ModelPolicy<'_> {
 
     fn on_game_start(&mut self, _game_id: &str) {
         self.tried.clear();
+        self.context.begin_game();
+    }
+
+    fn on_confirmed_transition(
+        &mut self,
+        current: &ArcObservation,
+        action: &ArcAction,
+        next: &ArcObservation,
+    ) {
+        self.context.observe(
+            &current.frame,
+            action,
+            &next.frame,
+            current.levels_completed,
+        );
     }
 
     fn on_level_transition(&mut self, _levels_completed: u16) {
@@ -1636,6 +1690,7 @@ pub(crate) fn decision_telemetry(decision: &ActionDecision) -> Value {
         "noop_probability": decision.chosen.noop_probability,
         "predicted_effect": decision.chosen.predicted_effect,
         "candidate_count": decision.candidate_count,
+        "context_len": decision.context_len,
     });
     if let Some(trace) = &decision.phase_a {
         if let Ok(value) = serde_json::to_value(trace) {
@@ -2469,6 +2524,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     let device = resolve_device(&config.device)?;
     let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
     let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
+    let context = live_context_for(&model, config.context_window, config.adapt_carry);
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -2515,6 +2571,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                     &config.device,
                 );
             }
+            policy.set_context(context);
             let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
@@ -2522,7 +2579,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
             let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
                 config.phase_a_calibration.as_deref(),
             )?;
-            let policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
+            let mut policy = crate::p2::arc3_phase_a::PhaseAPolicy::with_tensor_model(
                 &model,
                 &device,
                 config.physical_batch,
@@ -2531,6 +2588,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                 config.action6_max_candidates,
                 config.action6_grid_stride,
             )?;
+            policy.set_context(context);
             let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
@@ -3276,6 +3334,7 @@ mod tests {
                 candidate_count: 1,
                 phase_a: None,
                 adaptation: None,
+                context_len: 0,
             })
         }
     }
@@ -3976,12 +4035,15 @@ mod tests {
                 // Live/eval-side modules only. `arc3_phase_a.rs` is the ADR
                 // 0004 controller: it is constructed from the live driver and
                 // the bridge, and no training-reachable source imports it.
+                // `residual_probe.rs` is the ADR 0005 §5.3 frozen-checkpoint
+                // probe CLI over imported recordings; only `cli.rs` reaches it.
                 "p2/agent_session.rs"
                     | "p2/arc3.rs"
                     | "p2/arc3_bridge.rs"
                     | "p2/arc3_live.rs"
                     | "p2/arc3_phase_a.rs"
                     | "p2/cli.rs"
+                    | "p2/residual_probe.rs"
             ) {
                 continue;
             }
@@ -4017,6 +4079,143 @@ mod tests {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+
+    fn tiny_live_model(device: &Device, v6: bool) -> Result<(WorldModel, candle_nn::VarMap)> {
+        use crate::p2::experiment::ConsumerReadoutTopology;
+        use crate::p2::model::ModelConfig;
+        let config = ModelConfig {
+            patch_size: 4,
+            hidden_dim: 8,
+            action_dim: 8,
+            inner_steps: 1,
+            outer_steps: 1,
+            spatial_action_field: true,
+            world_core_v4: true,
+            world_core_v5: true,
+            world_core_v6: v6,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..ModelConfig::default()
+        };
+        let varmap = candle_nn::VarMap::new();
+        let model = WorldModel::new(
+            config,
+            candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        if v6 {
+            // Context FiLM is zero-initialised (exact v5 recovery), so make the
+            // channel observable before asserting a window reached the model.
+            let data = varmap.data().lock().unwrap();
+            let var = data.get("context_film_gamma.weight").expect("v6 parameter");
+            var.set(&var.as_tensor().ones_like()?.affine(0.5, 0.0)?)?;
+        }
+        Ok((model, varmap))
+    }
+
+    fn observe_transitions(policy: &mut ModelPolicy<'_>, count: u8, level: u16) {
+        for i in 0..count {
+            let mut current = observation("demo", "NOT_FINISHED", vec![1, 2, 6]);
+            current.frame = frame(10 + i);
+            current.levels_completed = level;
+            let mut next = current.clone();
+            next.frame = frame(11 + i);
+            let action = ArcAction::new(1 + i % 5, None, None).unwrap();
+            policy.on_confirmed_transition(&current, &action, &next);
+        }
+    }
+
+    #[test]
+    fn greedy_policy_scores_candidates_with_the_context_window() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = tiny_live_model(&device, true)?;
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+        let context = live_context_for(&model, None, false);
+        assert!(context.enabled(), "v6 defaults to Channel A on");
+        policy.set_context(context);
+        policy.on_game_start("demo");
+        let observation = observation("demo", "NOT_FINISHED", vec![1, 2, 6]);
+        let candidates = enumerate_actions(&observation, 4, 32)?;
+        let plain = policy.score_candidates(&observation.frame, &candidates, &[], None)?;
+
+        observe_transitions(&mut policy, 3, 0);
+        let window = policy.context.window(0);
+        assert_eq!(window.len(), 3);
+        let contextual = policy.score_candidates(&observation.frame, &candidates, &window, None)?;
+        assert_eq!(plain.len(), contextual.len());
+        assert!(
+            plain
+                .iter()
+                .zip(&contextual)
+                .any(|(a, b)| a.score != b.score),
+            "the ContextBatch must reach the forward pass"
+        );
+        for score in &contextual {
+            assert!(score.score.is_finite());
+        }
+        let decision = policy.choose_action(&observation)?;
+        assert_eq!(decision.context_len, 3);
+        assert_eq!(decision_telemetry(&decision)["context_len"], json!(3));
+        // Another level sees none of level 0's transitions (default arm).
+        let mut later = observation.clone();
+        later.levels_completed = 1;
+        assert_eq!(policy.choose_action(&later)?.context_len, 0);
+        // `--context-window=false` keeps a v6 policy on the legacy path.
+        policy.set_context(live_context_for(&model, Some(false), false));
+        observe_transitions(&mut policy, 3, 0);
+        assert_eq!(policy.choose_action(&observation)?.context_len, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v5_checkpoint_forces_the_context_window_off_without_error() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = tiny_live_model(&device, false)?;
+        let context = live_context_for(&model, Some(true), true);
+        assert!(!context.enabled(), "non-v6 checkpoints reject context");
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+        policy.set_context(context);
+        policy.on_game_start("demo");
+        observe_transitions(&mut policy, 4, 0);
+        let decision = policy.choose_action(&observation("demo", "NOT_FINISHED", vec![1, 2, 6]))?;
+        assert_eq!(decision.context_len, 0);
+        assert!(decision.chosen.score.is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_window_holds_only_transitions_confirmed_before_each_decision() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = tiny_live_model(&device, true)?;
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+        policy.set_context(live_context_for(&model, None, false));
+        let opening = scripted_observation("NOT_FINISHED", 0);
+        let mut mid = scripted_observation("NOT_FINISHED", 0);
+        mid.frame = frame(5);
+        let mut later = scripted_observation("NOT_FINISHED", 0);
+        later.frame = frame(6);
+        let mut win = scripted_observation("WIN", 1);
+        win.win_levels = 1;
+        let mut api = ScriptedApi::new(vec![Ok(opening)], vec![Ok(mid), Ok(later), Ok(win)]);
+        let report = run_public_suite(
+            &mut api,
+            &mut policy,
+            &scripted_settings(LiveDriverOptions::default()),
+        )?;
+        let game = &report.games[0];
+        assert_eq!(game.stop_reason, "completed");
+        let lens: Vec<usize> = game
+            .trace
+            .iter()
+            .map(|step| step.decision.context_len)
+            .collect();
+        assert_eq!(
+            lens,
+            vec![0, 1, 2],
+            "decision i sees exactly the i transitions confirmed before it"
+        );
+        let json = serde_json::to_value(&game.trace[2].decision)?;
+        assert_eq!(json["context_len"], json!(2));
+        Ok(())
     }
 
     #[test]
