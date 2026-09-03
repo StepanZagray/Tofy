@@ -1,0 +1,163 @@
+{
+  "dir": "runs/p2/synth-sample-20260903",
+  "source": "tofy_synth_arcengine",
+  "generator_revision": "9179a89a16b6c1a326498633eedf0baab6f3e678",
+  "seed": 1,
+  "public_game_ids_intersection": [],
+  "rule_census": {
+    "by_action5": {
+      "noop": 13,
+      "portal": 11,
+      "toggle": 16
+    },
+    "by_action6": {
+      "noop": 13,
+      "teleport": 8,
+      "toggle_click": 19
+    },
+    "by_available_mask": {
+      "127": 30,
+      "63": 4,
+      "95": 6
+    },
+    "by_background": {
+      "0": 4,
+      "1": 2,
+      "11": 4,
+      "12": 6,
+      "13": 2,
+      "14": 6,
+      "15": 4,
+      "5": 6,
+      "7": 2,
+      "9": 4
+    },
+    "by_goal": {
+      "collect_all": 13,
+      "collect_then_exit": 10,
+      "reach_exit": 2,
+      "toggle_all": 7,
+      "toggle_then_exit": 8
+    },
+    "by_move_perm": {
+      "dlru": 1,
+      "dlur": 2,
+      "drlu": 2,
+      "drul": 1,
+      "dulr": 2,
+      "durl": 4,
+      "ldru": 1,
+      "ldur": 5,
+      "lrdu": 1,
+      "lurd": 2,
+      "rdlu": 4,
+      "rdul": 1,
+      "rldu": 2,
+      "rlud": 1,
+      "rudl": 1,
+      "udlr": 1,
+      "uldr": 3,
+      "ulrd": 3,
+      "urdl": 3
+    },
+    "distinct_rule_ids": 40,
+    "games": 40,
+    "levels_per_game": {
+      "4": 6,
+      "5": 22,
+      "6": 12
+    }
+  },
+  "twins": {
+    "twin_pairs": 20,
+    "twin_pairs_frame0_mismatch": 0,
+    "single_frame_rule_identifiable": 0,
+    "first_divergence": {
+      "pass": 20,
+      "fail_frames_or_actions_differ": 0,
+      "no_divergence": 0
+    },
+    "joint_frame_action_conflicts": 613,
+    "distinct_rule_ids": 40,
+    "episodes": 40,
+    "rows": 10000,
+    "level_completed_rows": 69,
+    "game_over_rows": 295,
+    "reset_rows": 839,
+    "rows_per_level": {
+      "0": 4220,
+      "1": 4974,
+      "2": 602,
+      "3": 196,
+      "4": 8
+    }
+  },
+  "random_play": {
+    "steps_per_game_level": 20000,
+    "per_level": {
+      "0": {
+        "steps": 800000,
+        "episodes": 59140,
+        "completions": 433,
+        "games": 40,
+        "completions_per_episode": 0.007321609739600947,
+        "completions_per_step": 0.00054125,
+        "tutorial": true
+      },
+      "1": {
+        "steps": 800000,
+        "episodes": 65823,
+        "completions": 0,
+        "games": 40,
+        "completions_per_episode": 0.0,
+        "completions_per_step": 0.0,
+        "tutorial": false
+      },
+      "2": {
+        "steps": 800000,
+        "episodes": 62208,
+        "completions": 0,
+        "games": 40,
+        "completions_per_episode": 0.0,
+        "completions_per_step": 0.0,
+        "tutorial": false
+      },
+      "3": {
+        "steps": 800000,
+        "episodes": 64556,
+        "completions": 0,
+        "games": 40,
+        "completions_per_episode": 0.0,
+        "completions_per_step": 0.0,
+        "tutorial": false
+      },
+      "4": {
+        "steps": 680000,
+        "episodes": 67282,
+        "completions": 0,
+        "games": 34,
+        "completions_per_episode": 0.0,
+        "completions_per_step": 0.0,
+        "tutorial": false
+      },
+      "5": {
+        "steps": 240000,
+        "episodes": 21747,
+        "completions": 0,
+        "games": 12,
+        "completions_per_episode": 0.0,
+        "completions_per_step": 0.0,
+        "tutorial": false
+      }
+    },
+    "non_tutorial": {
+      "episodes": 281616,
+      "completions": 0,
+      "steps": 3320000,
+      "completions_per_episode": 0.0,
+      "completions_per_step": 0.0,
+      "meets_1_in_10000_per_episode": true
+    },
+    "non_tutorial_levels_with_completions": []
+  }
+}
