@@ -4680,6 +4680,17 @@ fn eval_identifiability(
     if labeled_h.is_empty() {
         return None;
     }
+    let full_gram_gib = (latent_dim as f64 * latent_dim as f64 * std::mem::size_of::<f32>() as f64)
+        / (1024.0 * 1024.0 * 1024.0);
+    let upper_triangle_gib =
+        (latent_dim as f64 * (latent_dim as f64 + 1.0) * 0.5 * std::mem::size_of::<f64>() as f64)
+            / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "[p2-eval identifiability] rows={} latent_dim={} rayon_threads={} full_gram_gib={full_gram_gib:.2} upper_triangle_gib={upper_triangle_gib:.2}",
+        labeled_h.len(),
+        latent_dim,
+        rayon::current_num_threads(),
+    );
     // Degenerate assignments (every group on one side) leave no honest
     // held-out population; fit on everything and report no validation R².
     let split_usable = labeled_val.iter().any(|&v| v) && labeled_val.iter().any(|&v| !v);
