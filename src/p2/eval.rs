@@ -2774,7 +2774,7 @@ pub fn evaluate_gate_support(
 /// the frame encoder over thousands of frames and exceeds the envelope of a
 /// training step. Chunking keeps the gate evaluation inside that envelope;
 /// every op on the path is per-row, so results are unchanged.
-pub const FOUNDATION_V2_GATE_PHYSICAL_BATCH: usize = 128;
+pub const FOUNDATION_V2_GATE_PHYSICAL_BATCH: usize = 32;
 
 #[allow(clippy::too_many_arguments)]
 fn forward_gate_rows_chunked(
