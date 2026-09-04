@@ -1330,6 +1330,7 @@ impl TrainConfig {
             world_core_v2: self.world_core_v2,
             world_core_v3: self.world_core_v3,
             world_core_v4: self.world_core_v4,
+            world_core_v6: self.world_core_v6,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
             spatial_action_residual_scale: self.spatial_action_residual_scale,
@@ -14942,6 +14943,46 @@ mod tests {
         let contract = TrainingContract::from(&v6);
         assert!(contract.world_core_v6);
         assert!(contract.data_contract_v6);
+    }
+
+    /// A v6 config must persist as v6 everywhere the resolved identity is
+    /// consumed (report schema, training contract, resume comparison), and a
+    /// v5 config must keep its historical identity byte-for-byte.
+    #[test]
+    fn v6_config_resolves_v6_identity_and_v5_keeps_v5() -> Result<()> {
+        use crate::p2::experiment::{WorldCoreFamily, WORLD_CORE_V5_SCHEMA, WORLD_CORE_V6_SCHEMA};
+        let mut v6 = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            ..TrainConfig::default()
+        };
+        v6.apply_foundation_v2_recipe();
+        v6.physical_batch = 64;
+        v6.validate()?;
+        let resolved_v6 = v6.resolved_experiment()?;
+        assert_eq!(resolved_v6.family, WorldCoreFamily::V6);
+        assert_eq!(resolved_v6.report_schema, WORLD_CORE_V6_SCHEMA);
+
+        let mut v5 = TrainConfig::default();
+        v5.apply_foundation_v2_recipe();
+        v5.physical_batch = 64;
+        v5.validate()?;
+        let resolved_v5 = v5.resolved_experiment()?;
+        assert_eq!(resolved_v5.family, WorldCoreFamily::V5);
+        assert_eq!(resolved_v5.report_schema, WORLD_CORE_V5_SCHEMA);
+        let v5_json = serde_json::to_value(&resolved_v5)?;
+        assert_eq!(v5_json["family"], "v5");
+        assert_eq!(v5_json["report_schema"], "world_core_v5");
+
+        // The persisted contracts differ, so a v5 bundle never resumes as v6.
+        let v6_contract = TrainingContract::from(&v6);
+        let v5_contract = TrainingContract::from(&v5);
+        assert_ne!(v6_contract.experiment, v5_contract.experiment);
+        assert_eq!(
+            v6_contract.experiment.as_ref().map(|e| e.family),
+            Some(WorldCoreFamily::V6)
+        );
+        Ok(())
     }
 
     /// ADR 0005 §1.1: the data and model contracts are paired. The only

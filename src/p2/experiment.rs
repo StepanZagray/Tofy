@@ -11,6 +11,10 @@ pub const WORLD_CORE_V2_SCHEMA: &str = "world_core_v2";
 pub const WORLD_CORE_V3_SCHEMA: &str = "world_core_v3";
 pub const WORLD_CORE_V4_SCHEMA: &str = "world_core_v4_full_training";
 pub const WORLD_CORE_V5_SCHEMA: &str = "world_core_v5";
+/// ADR 0005 world-core v6: the foundation-v2 (V5) recipe plus the context
+/// channel. Persisted separately from V5 so reports, checkpoints, and resume
+/// contracts never present a v6 run as v5.
+pub const WORLD_CORE_V6_SCHEMA: &str = "world_core_v6";
 
 /// A persisted training recipe, separate from historical research switches.
 /// `FullV4` is resolved before validation and cannot be composed with V2/V3.
@@ -59,6 +63,7 @@ pub enum WorldCoreFamily {
     V3,
     V4,
     V5,
+    V6,
 }
 
 impl WorldCoreFamily {
@@ -73,6 +78,7 @@ impl WorldCoreFamily {
             Self::V3 => WORLD_CORE_V3_SCHEMA,
             Self::V4 => WORLD_CORE_V4_SCHEMA,
             Self::V5 => WORLD_CORE_V5_SCHEMA,
+            Self::V6 => WORLD_CORE_V6_SCHEMA,
         }
     }
 }
@@ -168,6 +174,8 @@ pub struct ExperimentRequest<'a> {
     pub world_core_v2: bool,
     pub world_core_v3: bool,
     pub world_core_v4: bool,
+    /// ADR 0005 context channel; only the foundation-v2 recipe may carry it.
+    pub world_core_v6: bool,
     pub spatial_action_field: bool,
     pub spatial_action_residual: bool,
     pub spatial_action_residual_scale: f64,
@@ -217,7 +225,11 @@ impl ResolvedExperiment {
                     topology_family == WorldCoreFamily::V4,
                     "foundation-v2 recipe requires the exact-decoder topology"
                 );
-                WorldCoreFamily::V5
+                if request.world_core_v6 {
+                    WorldCoreFamily::V6
+                } else {
+                    WorldCoreFamily::V5
+                }
             }
             TrainingRecipe::LegacyExperimental => {
                 ensure!(
@@ -227,8 +239,13 @@ impl ResolvedExperiment {
                 topology_family
             }
         };
+        ensure!(
+            !request.world_core_v6 || family == WorldCoreFamily::V6,
+            "world_core_v6 requires the foundation-v2 recipe"
+        );
         let legacy_branch_learning = matches!(family, WorldCoreFamily::V2 | WorldCoreFamily::V3);
-        let factual_learning = legacy_branch_learning || family == WorldCoreFamily::V5;
+        let factual_learning = legacy_branch_learning
+            || matches!(family, WorldCoreFamily::V5 | WorldCoreFamily::V6);
         ensure!(
             request.branch_learning_enabled == legacy_branch_learning,
             "legacy branch_learning.enabled must match the V2/V3 family"
@@ -265,7 +282,7 @@ impl ResolvedExperiment {
             (true, false) => {
                 ensure!(
                     factual_learning || family == WorldCoreFamily::V4,
-                    "spatial action fields require V2/V3/V4/V5"
+                    "spatial action fields require V2/V3/V4/V5/V6"
                 );
                 ActionConditioning::SpatialField
             }
@@ -356,6 +373,7 @@ mod tests {
             world_core_v2: false,
             world_core_v3: false,
             world_core_v4: false,
+            world_core_v6: false,
             spatial_action_field: false,
             spatial_action_residual: false,
             spatial_action_residual_scale: 0.25,
@@ -418,6 +436,51 @@ mod tests {
         assert_eq!(resolved.report_schema, WORLD_CORE_V4_SCHEMA);
 
         request.world_core_v2 = true;
+        assert!(ResolvedExperiment::resolve(request).is_err());
+        Ok(())
+    }
+
+    /// A foundation-v2 run with the ADR 0005 context channel is its own
+    /// persisted family; the v5 identity stays exactly what it was.
+    #[test]
+    fn foundation_v2_with_context_channel_resolves_v6_and_v5_does_not() -> Result<()> {
+        let lessons = vec!["dynamics".into()];
+        let mut request = request(&lessons);
+        request.recipe = TrainingRecipe::FoundationV2;
+        request.world_core_v4 = true;
+        request.spatial_action_field = true;
+        request.consumer_readout = ConsumerReadoutTopology::SpatialQuery;
+        request.sigreg_weight = 0.01;
+
+        let v5 = ResolvedExperiment::resolve(request)?;
+        assert_eq!(v5.family, WorldCoreFamily::V5);
+        assert_eq!(v5.report_schema, WORLD_CORE_V5_SCHEMA);
+        assert!(v5.factual_learning);
+        assert_eq!(serde_json::to_value(v5.family)?, "v5");
+
+        request.world_core_v6 = true;
+        let v6 = ResolvedExperiment::resolve(request)?;
+        assert_eq!(v6.family, WorldCoreFamily::V6);
+        assert_eq!(v6.report_schema, WORLD_CORE_V6_SCHEMA);
+        assert!(v6.factual_learning);
+        assert!(v6.family.is_action_faithful());
+        assert_eq!(serde_json::to_value(v6.family)?, "v6");
+        assert_ne!(v5, v6, "v5 and v6 must never compare as the same treatment");
+        let json = serde_json::to_string(&v6)?;
+        assert_eq!(v6, serde_json::from_str(&json)?);
+
+        // The context channel never rides on a legacy or full-v4 recipe.
+        request.recipe = TrainingRecipe::FullV4;
+        request.sigreg_weight = 0.1;
+        request.exact_grounding_weight = 0.1;
+        assert!(ResolvedExperiment::resolve(request).is_err());
+        request.recipe = TrainingRecipe::LegacyExperimental;
+        request.world_core_v4 = false;
+        request.world_core_v2 = true;
+        request.branch_learning_enabled = true;
+        request.sigreg_weight = 0.0;
+        let lessons = vec!["factual_branches".into()];
+        request.lessons = &lessons;
         assert!(ResolvedExperiment::resolve(request).is_err());
         Ok(())
     }
