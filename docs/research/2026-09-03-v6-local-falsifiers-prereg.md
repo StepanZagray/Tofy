@@ -127,3 +127,22 @@ roughly 2x or more. Before any result is read, the rule is fixed as follows:
   will supersede this rule when it exists.
 - E2's checkpoint was trained at effective batch 256 and depth 3x3; the
   screen is a data-contract decision only.
+
+## E2 execution record (2026-09-03/04, local RTX 5060 8 GB)
+
+| attempt | launched | died at | cause (established) |
+|---|---|---|---|
+| 1 | 2026-09-03 ~14:40 | step 1024 | gate evaluation OOM; concurrent test suite on the GPU |
+| 2 | 2026-09-03 22:07 | step 1024 | gate evaluation OOM with 128-row chunking (no concurrent load) |
+| 3 | 2026-09-04 09:03 (resume 512) | step ~575 | concurrent CPU evaluation competing for system RAM |
+| 4 | 2026-09-04 09:16 (resume 512) | step 1024 | gate evaluation OOM with 32-row chunking |
+| repro | 2026-09-04 10:32 (resume 512→1032) | passed | outputs detached; GPU peak 5.7 GB at the gate |
+| 5 | 2026-09-04 10:58 (resume 1032→4096) | running | same binary as the reproduction |
+
+Root cause of 1/2/4: candle retains every op's inputs while its output lives;
+the evaluator held chunk outputs, so chunking bounded nothing until the
+outputs were detached. Attempt 5's checkpoints from step 1024 onward were
+written by a resume launched with an absolute `output_dir`; evaluations must
+use each checkpoint bundle's own `config.json`, which the evaluator enforces
+by hash. E2's loss log contains the appended rows of all attempts; the
+authoritative trajectory is the checkpoint chain, not the row count.
