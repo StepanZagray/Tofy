@@ -146,3 +146,27 @@ written by a resume launched with an absolute `output_dir`; evaluations must
 use each checkpoint bundle's own `config.json`, which the evaluator enforces
 by hash. E2's loss log contains the appended rows of all attempts; the
 authoritative trajectory is the checkpoint chain, not the row count.
+
+## Amendment (2026-09-04): E3 as implemented, before any result is read
+
+`p2-eval --adaptation-falsifier` (commit eaf4b619) implements §5.2. Two facts
+found during implementation bound what it can show:
+
+1. **The as-registered arm cannot update.** §6.2 starts Channel B only once a
+   level holds >= 8 unique transitions; a synthetic Learning History level has
+   exactly 7 (`LEARNING_HISTORY_STEPS_PER_LEVEL = 6` movement rows plus one
+   operator row). Under the registered rule the reset and carry arms therefore
+   reproduce the context-only arm bit for bit with zero updates, and the
+   verdict fails by construction. This is a generator/limits mismatch, not a
+   model result. The registered arm is still run and reported as such. A
+   **labelled deviation arm** with `--adaptation-falsifier-min-level-transitions 4`
+   is the first run that actually exercises Channel B; its result is
+   exploratory and cannot satisfy the §5.2 promotion rule on its own.
+2. **t = 32 is unreachable** (levels in {2,3,4} give <= 28 chronological
+   transitions); the rule is applied over t in {8, 16} only, and the report
+   lists the skipped prefix under `verdict.skipped_prefix_lengths`.
+
+Consequence for the generator (deferred, trajectory-changing): synthetic
+levels are far shorter than live levels (tens to hundreds of actions), so the
+live warm-up rule is untestable on them; a v6.1 generator should draw level
+lengths from a wider range.
