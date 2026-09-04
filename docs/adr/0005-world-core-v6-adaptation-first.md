@@ -303,8 +303,12 @@ each merge. Deviations from the text above, recorded so nobody rediscovers them:
   residual AUROC 0.905 vs reliability 0.634; the preregistered switch rule was narrowly missed
   on the reliability side (see `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`).
 - 2026-09-04 fixes from code review and the first local v6 run: the in-trainer
-  gate forward is chunked (32 rows; a 512-row v6 forward with context windows
-  exceeds the 8 GB laptop envelope on top of ~5.7 GB of training residue);
+  gate forward is chunked (32 rows) AND its outputs are detached. Chunking
+  alone did not help (measured: identical OOM at step 1024 with 128- and
+  32-row chunks) because candle keeps every op's inputs alive as autograd
+  history while the output lives, so concatenated chunk outputs pinned all
+  chunks' activations at once. With `detach`, a resume across step 1024 peaked
+  at 5.7 GB (no spike above training) on the 8 GB laptop GPU;
   twins on the singleton held-out split draw the alternative family from all
   families (the primary keeps the held-out rule); Phase A retrodiction and
   goal evaluation treat row 63 as board content for v6; the §5.1 threshold is
