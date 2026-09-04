@@ -497,10 +497,10 @@ pub fn foundation_v2_armed_gates_passed(evaluation: &FoundationV2GateEvaluation)
 
 /// The gate evaluation currently holding the promotion under `metric`,
 /// obtained by replaying the strict-improvement scan over the history.
-pub fn foundation_v2_best_evaluation<'a>(
+pub fn foundation_v2_best_evaluation(
     metric: PromotionMetric,
-    gate_history: &'a [FoundationV2GateEvaluation],
-) -> Option<&'a FoundationV2GateEvaluation> {
+    gate_history: &[FoundationV2GateEvaluation],
+) -> Option<&FoundationV2GateEvaluation> {
     let mut best: Option<&FoundationV2GateEvaluation> = None;
     for evaluation in gate_history {
         if foundation_v2_armed_gates_passed(evaluation)
@@ -2112,6 +2112,10 @@ fn default_completed_repair_state() -> RunAttemptRepairState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+// Journal events are serialized and immediately discarded; keeping the
+// schema-shaped record inline is clearer than adding allocation solely to
+// equalize transient enum variant sizes.
+#[allow(clippy::large_enum_variant)]
 enum RunAttemptJournalEvent {
     Started {
         record: RunAttempt,
@@ -11942,9 +11946,11 @@ mod tests {
     #[test]
     fn best_resume_reconciliation_repairs_missing_and_mismatched_rotation() -> Result<()> {
         let root = checkpoint_test_root("best-reconcile");
-        let mut cfg = TrainConfig::default();
-        cfg.recipe = TrainingRecipe::FoundationV2;
-        cfg.output_dir = root.clone();
+        let cfg = TrainConfig {
+            recipe: TrainingRecipe::FoundationV2,
+            output_dir: root.clone(),
+            ..TrainConfig::default()
+        };
         let selected = checkpoint_step_directory(&cfg, 1_024);
         write_fake_checkpoint_bundle(&selected, 1_024, true)?;
         let foundation =
@@ -11980,9 +11986,11 @@ mod tests {
     #[test]
     fn permanent_resume_reconciliation_recopies_missing_and_corrupt_bundle() -> Result<()> {
         let root = checkpoint_test_root("permanent-reconcile");
-        let mut cfg = TrainConfig::default();
-        cfg.recipe = TrainingRecipe::FoundationV2;
-        cfg.output_dir = root.clone();
+        let cfg = TrainConfig {
+            recipe: TrainingRecipe::FoundationV2,
+            output_dir: root.clone(),
+            ..TrainConfig::default()
+        };
         let source = checkpoint_step_directory(&cfg, 2_048);
         write_fake_checkpoint_bundle(&source, 2_048, true)?;
         let permanent = root.join("checkpoints/permanent/step-000000002048");
@@ -12009,8 +12017,10 @@ mod tests {
     fn aborted_resume_requires_explicit_override_for_history_or_marker() -> Result<()> {
         let root = checkpoint_test_root("abort-marker");
         fs::create_dir_all(&root)?;
-        let mut cfg = TrainConfig::default();
-        cfg.output_dir = root.clone();
+        let mut cfg = TrainConfig {
+            output_dir: root.clone(),
+            ..TrainConfig::default()
+        };
         // Gate policy v6 aborts only after three consecutive counting
         // failures of the same gate.
         let foundation = checkpoint_foundation_state(vec![
@@ -12330,7 +12340,7 @@ mod tests {
             model_cfg,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
-        let losses = foundation_v2_training_loss(&model, &mixed, &device, objective.clone())?;
+        let losses = foundation_v2_training_loss(&model, &mixed, &device, objective)?;
         assert!(losses
             .total
             .to_dtype(DType::F32)?
@@ -14808,7 +14818,7 @@ mod tests {
                 return Err(std::io::Error::other("transient write failure"));
             }
             // Partial writes are legal for Write; exercise offset tracking.
-            let take = buf.len().min(3).max(1).min(buf.len());
+            let take = buf.len().min(3);
             self.data.lock().unwrap().extend_from_slice(&buf[..take]);
             Ok(take)
         }

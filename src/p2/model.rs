@@ -1567,12 +1567,12 @@ impl WorldModel {
     /// groups before the canonical readout; patch-8 models pass through.
     fn read_consumer(&self, spatial: &Tensor) -> Result<Tensor> {
         if self.positional_value_readout {
-            return self.consumer_readout.forward(spatial).map_err(Into::into);
+            return self.consumer_readout.forward(spatial);
         }
         let (_, _, height, width) = spatial.dims4()?;
         let readout_grid = FRAME_SIDE / LEGACY_PATCH_SIZE;
         if height == readout_grid && width == readout_grid {
-            return self.consumer_readout.forward(spatial).map_err(Into::into);
+            return self.consumer_readout.forward(spatial);
         }
         if height != width || !height.is_multiple_of(readout_grid) {
             bail!(
@@ -1581,7 +1581,6 @@ impl WorldModel {
         }
         self.consumer_readout
             .forward(&spatial.avg_pool2d(height / readout_grid)?)
-            .map_err(Into::into)
     }
 
     /// Encode palette-index frames into the shared latent space.
@@ -3253,6 +3252,7 @@ impl WorldModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_ptrm_with_depth_and_operator_conditioning(
         &self,
         frames: &Tensor,
@@ -3302,6 +3302,7 @@ impl WorldModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_ptrm_from_latent_with_operator_conditioning(
         &self,
         state: &Tensor,

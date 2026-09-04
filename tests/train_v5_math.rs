@@ -194,14 +194,8 @@ fn foundation_v2_gate_evaluation(
     running_best: Option<f64>,
     composed_running_best: Option<f64>,
 ) -> FoundationV2GateEvaluation {
-    try_foundation_v2_gate_evaluation(
-        step,
-        metrics,
-        running_best,
-        composed_running_best,
-        &[],
-    )
-    .expect("test gate population is causally eligible")
+    try_foundation_v2_gate_evaluation(step, metrics, running_best, composed_running_best, &[])
+        .expect("test gate population is causally eligible")
 }
 
 fn gate(evaluation: &FoundationV2GateEvaluation, name: &str) -> bool {
@@ -226,7 +220,9 @@ fn gates_pass_fail_and_abort_only_on_consecutive_failure() {
     // population, so the fixture uses violations well beyond that margin.
     let first_fail = foundation_v2_gate_evaluation(5_120, metrics(0.99), Some(0.6), Some(0.45));
     assert!(!gate(&first_fail, "shuffled_action_ratio"));
-    assert!(!foundation_v2_gate_history_aborts(&[first_fail.clone()]));
+    assert!(!foundation_v2_gate_history_aborts(std::slice::from_ref(
+        &first_fail
+    )));
 
     let recovery = foundation_v2_gate_evaluation(6_144, metrics(0.9), Some(0.6), Some(0.45));
     assert!(!foundation_v2_gate_history_aborts(&[

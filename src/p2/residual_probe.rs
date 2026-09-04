@@ -27,8 +27,8 @@ use serde::Serialize;
 
 use crate::p2::arc3::import_recordings_dir;
 use crate::p2::data::{
-    compose_mixed_stream_batch, foundation_v2_stream_schedule, MixedStreamConfig,
-    TransitionSample, V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
+    compose_mixed_stream_batch, foundation_v2_stream_schedule, MixedStreamConfig, TransitionSample,
+    V5DataSplit, FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::model::{unknown_operator_conditioning, WorldModel, PALETTE_SIZE};
 use crate::p2::train::{
@@ -140,7 +140,10 @@ pub fn run_p2_residual_probe(args: P2ResidualProbeArgs) -> Result<()> {
     // (a) real frames: toolkit recordings -> TransitionSample (goal already zero).
     let real = import_recordings_dir(&args.arc_recordings_dir)?;
     if real.is_empty() {
-        bail!("no transitions imported from {}", args.arc_recordings_dir.display());
+        bail!(
+            "no transitions imported from {}",
+            args.arc_recordings_dir.display()
+        );
     }
 
     // (b) synthetic comparator: the evaluator's unseen-seed in-distribution population.
@@ -175,7 +178,7 @@ pub fn run_p2_residual_probe(args: P2ResidualProbeArgs) -> Result<()> {
     let goal_dropped_rows = synthetic.iter().filter(|s| s.3).count();
     // Deterministic shuffle so no physical chunk is an all-factual partial group
     // (batch_from_samples would otherwise try to rebuild complete branch groups).
-    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(population_seed ^ 0x5052_4f42_45);
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(population_seed ^ 0x0050_524f_4245);
     synthetic.shuffle(&mut rng);
 
     let mut out = fs::File::create(&args.output_jsonl)
@@ -183,10 +186,8 @@ pub fn run_p2_residual_probe(args: P2ResidualProbeArgs) -> Result<()> {
     let mut real_rows = Vec::new();
     let mut synth_rows = Vec::new();
 
-    let real_meta: Vec<(TransitionSample, Option<String>, Option<String>, bool)> = real
-        .into_iter()
-        .map(|s| (s, None, None, true))
-        .collect();
+    let real_meta: Vec<(TransitionSample, Option<String>, Option<String>, bool)> =
+        real.into_iter().map(|s| (s, None, None, true)).collect();
     for (source, rows, sink) in [
         ("real", &real_meta, &mut real_rows),
         ("synthetic", &synthetic, &mut synth_rows),
@@ -258,9 +259,11 @@ pub fn run_p2_residual_probe(args: P2ResidualProbeArgs) -> Result<()> {
         train_config: args.train_config.clone(),
         device: args.device.clone(),
         conditioning: if live_conditioning {
-            "live: goal=all-zero(19), operator=UNKNOWN token, no context, eval recursion depth".into()
+            "live: goal=all-zero(19), operator=UNKNOWN token, no context, eval recursion depth"
+                .into()
         } else {
-            "eval: row goal features + row operator conditioning, no context, eval recursion depth".into()
+            "eval: row goal features + row operator conditioning, no context, eval recursion depth"
+                .into()
         },
         legacy_operator_projection_zeroed,
         synthetic_population,
@@ -268,7 +271,10 @@ pub fn run_p2_residual_probe(args: P2ResidualProbeArgs) -> Result<()> {
         synthetic: summarize(&synth_rows),
         real_rows_per_game: per_game,
     };
-    fs::write(&args.output_summary, serde_json::to_string_pretty(&summary)?)?;
+    fs::write(
+        &args.output_summary,
+        serde_json::to_string_pretty(&summary)?,
+    )?;
     println!(
         "p2-residual-probe complete real={} synthetic={} real_rel_median={:.3e} synth_rel_median={:.3e}",
         summary.real.rows,
@@ -292,7 +298,7 @@ fn load_model_legacy_operator_compat(
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
     let model = WorldModel::new(train_cfg.model_config(), vb)?;
     match load_varmap_exact(&varmap, weights) {
-        Ok(()) => return Ok((model, varmap, false)),
+        Ok(()) => Ok((model, varmap, false)),
         Err(error) => {
             let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(weights)? };
             let checkpoint_names: std::collections::BTreeSet<String> =
@@ -303,8 +309,7 @@ fn load_model_legacy_operator_compat(
             };
             let expected_names: std::collections::BTreeSet<String> =
                 expected.iter().map(|(n, _)| n.clone()).collect();
-            let missing: Vec<&String> =
-                expected_names.difference(&checkpoint_names).collect();
+            let missing: Vec<&String> = expected_names.difference(&checkpoint_names).collect();
             let extra: Vec<&String> = checkpoint_names.difference(&expected_names).collect();
             let only_operator_proj = !missing.is_empty()
                 && extra.is_empty()
@@ -415,7 +420,10 @@ fn probe_batch(
         .reshape((n, GAMEPLAY_LEN))?
         .mean(D::Minus1)?
         .to_vec1::<f32>()?;
-    let gate_mean = gate.reshape((n, GAMEPLAY_LEN))?.mean(D::Minus1)?.to_vec1::<f32>()?;
+    let gate_mean = gate
+        .reshape((n, GAMEPLAY_LEN))?
+        .mean(D::Minus1)?
+        .to_vec1::<f32>()?;
     let reliability = ops::sigmoid(&output.reliability_logit.detach())?
         .flatten_all()?
         .to_vec1::<f32>()?;
@@ -423,7 +431,11 @@ fn probe_batch(
         .flatten_all()?
         .to_vec1::<f32>()?;
     if reliability.len() != n || q.len() != n {
-        bail!("head output rows {} / {} do not match batch {n}", reliability.len(), q.len());
+        bail!(
+            "head output rows {} / {} do not match batch {n}",
+            reliability.len(),
+            q.len()
+        );
     }
     debug_assert_eq!(PALETTE_SIZE, logits.dim(3)?);
 
@@ -433,7 +445,10 @@ fn probe_batch(
     for (sample, prediction) in samples.iter().zip(&composed) {
         let cur = &sample.current.pixels[..GAMEPLAY_LEN.min(sample.current.pixels.len())];
         let nxt = &sample.next.pixels[..GAMEPLAY_LEN.min(sample.next.pixels.len())];
-        if cur.len() != GAMEPLAY_LEN || nxt.len() != GAMEPLAY_LEN || prediction.len() != GAMEPLAY_LEN {
+        if cur.len() != GAMEPLAY_LEN
+            || nxt.len() != GAMEPLAY_LEN
+            || prediction.len() != GAMEPLAY_LEN
+        {
             bail!("gameplay pixel width mismatch");
         }
         let mut changed = 0usize;
@@ -478,7 +493,11 @@ fn summarize(rows: &[ProbeRow]) -> SourceSummary {
         reliability_mean: rel.iter().sum::<f64>() / n,
         reliability_median: rel[rel.len() / 2],
         residual_pixel_ce_mean: rows.iter().map(|r| r.residual_pixel_ce).sum::<f64>() / n,
-        residual_changed_pixels_mean: rows.iter().map(|r| r.residual_changed_pixels as f64).sum::<f64>() / n,
+        residual_changed_pixels_mean: rows
+            .iter()
+            .map(|r| r.residual_changed_pixels as f64)
+            .sum::<f64>()
+            / n,
     }
 }
 

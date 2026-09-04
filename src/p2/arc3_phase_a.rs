@@ -1015,15 +1015,10 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                     let min_claim = f64::from(self.config.epsilon);
                     let mut probes = Vec::new();
                     let mut decoded_by_prefix: BTreeMap<Vec<ActionKey>, Vec<u8>> = BTreeMap::new();
-                    let mut decodes = 0usize;
-                    for prefix in prefixes.iter().take(MAX_DECODED_PREFIXES) {
-                        if decodes >= DECODE_EVALS {
-                            break;
-                        }
+                    for prefix in prefixes.iter().take(MAX_DECODED_PREFIXES.min(DECODE_EVALS)) {
                         let Ok(decoded) = self.adapter.decode(&prefix.latent) else {
                             break;
                         };
-                        decodes += 1;
                         let mut end_pixels = decoded.clone();
                         end_pixels.resize(FRAME_PIXELS, 0);
                         let whole_frame = self.adapter.whole_frame();

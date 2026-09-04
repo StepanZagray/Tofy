@@ -2981,6 +2981,7 @@ pub fn one_step_changed_exact_counts(
 /// size, held-out operator families) instead of only the legacy
 /// origin-aligned curriculum rows. Selection-only; each population uses an
 /// eval-domain seed distinct from the reserved in-trainer gate seed.
+#[allow(clippy::type_complexity)]
 fn foundation_v2_v5_holdout_gates(
     model: &WorldModel,
     cfg: &EvalConfig,
@@ -5305,7 +5306,7 @@ fn eval_identifiability(
         }
         labeled_h.push(encoder.clone());
         labeled_z.push(oracle.clone());
-        labeled_val.push(identifiability_group_hash(sample) % 5 == 0);
+        labeled_val.push(identifiability_group_hash(sample).is_multiple_of(5));
     }
     if labeled_h.is_empty() {
         return None;
@@ -5360,7 +5361,7 @@ fn eval_identifiability(
     for (sample, encoder) in samples.iter().zip(encoders.iter()) {
         // Pair metrics score only validation groups: training-pair alignment
         // must not raise the reported held-out increment cosine.
-        if split_usable && identifiability_group_hash(sample) % 5 != 0 {
+        if split_usable && !identifiability_group_hash(sample).is_multiple_of(5) {
             prev = None;
             continue;
         }
@@ -5771,8 +5772,9 @@ fn eval_one_batch(
             )
         })
         .transpose()?;
+    type FoundationEpRows = (Vec<Vec<f32>>, Vec<Vec<f32>>);
     let foundation_ep = foundation_recipe
-        .then(|| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        .then(|| -> Result<FoundationEpRows> {
             let (_, _, latent_height, latent_width) = current_z.dims4()?;
             let masks = chunk
                 .iter()
@@ -8994,13 +8996,13 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
     };
     let (arc3_transfer, arc3_population_fingerprint) = if let Some((samples, _)) = &arc3_recordings
     {
-        let fingerprint = semantic_population_fingerprint(&samples);
+        let fingerprint = semantic_population_fingerprint(samples);
         (
             Some(eval_sample_set(
                 &train_cfg,
                 &cfg.checkpoint,
                 &model,
-                &samples,
+                samples,
                 "arc3_transfer",
                 None,
                 cfg,
@@ -12217,8 +12219,10 @@ mod tests {
     fn chunked_gate_forward_matches_the_unchunked_forward() -> Result<()> {
         let device = Device::Cpu;
         for v6 in [false, true] {
-            let mut train_cfg = TrainConfig::default();
-            train_cfg.world_core_v6 = v6;
+            let mut train_cfg = TrainConfig {
+                world_core_v6: v6,
+                ..TrainConfig::default()
+            };
             train_cfg.apply_foundation_v2_recipe();
             train_cfg.hidden_dim = 8;
             train_cfg.action_dim = 4;

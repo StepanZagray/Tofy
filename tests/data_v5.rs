@@ -324,7 +324,7 @@ fn factual_groups_stay_intact_and_effect_labels_ignore_status_row() -> Result<()
     let factual = FactualBatch::from_groups(vec![group])?;
     let label = factual
         .pairwise_board_effect_labels()
-        .into_iter()
+        .iter()
         .find(|label| label.left_row == 0 && label.right_row == 1)
         .expect("first branch pair");
     assert!(

@@ -1662,6 +1662,7 @@ pub fn sample_from_transition(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_from_rendered_transition(
     scenario: &Scenario,
     before: &State,
@@ -2345,6 +2346,7 @@ fn null_sample_from_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn augment_v5_transition(
     mut transition: TransitionSample,
     split: V5DataSplit,
@@ -6247,7 +6249,7 @@ mod tests {
             .expect("documented collision fits u64");
         assert_eq!(
             computed,
-            META_LEVEL_EPISODE_DOMAIN | 1268 * META_LEVEL_EPISODE_STRIDE + 50
+            META_LEVEL_EPISODE_DOMAIN | (1268 * META_LEVEL_EPISODE_STRIDE + 50)
         );
         let rejection = std::panic::catch_unwind(|| {
             generate_coordinate_one_step(7, colliding_episode, Split::Train, 1)

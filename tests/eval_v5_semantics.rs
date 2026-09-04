@@ -220,7 +220,10 @@ fn alpha_sweep_preserves_main_weights_and_starts_at_trained_baseline() -> Result
     let before = evaluate_gate_support(&model, &rows, &device)?;
     let report = evaluate_mechanism_ablations(&model, &varmap, &rows, None, None, &device)?;
     let after = evaluate_gate_support(&model, &rows, &device)?;
-    assert_eq!(before, after, "alpha sweep mutated the main evaluation model");
+    assert_eq!(
+        before, after,
+        "alpha sweep mutated the main evaluation model"
+    );
     assert_eq!(serde_json::to_vec(&before)?, serde_json::to_vec(&after)?);
     assert_eq!(model.copy_bypass_alpha()?, Some(0.375));
     let points = report
@@ -304,7 +307,7 @@ fn provenance_origin_classifies_translated_false_edits_without_a_mask_sidecar() 
     let mut row = sample("translated", "sim/translated/1", 0, 1, 1, 1, Some(true))?;
     row.provenance.content_x = 10;
     row.provenance.content_y = 10;
-    let inside = (10 + 10 * FRAME_SIDE) as usize;
+    let inside = 10 + 10 * FRAME_SIDE;
     let mut prediction = row.next.pixels[..(FRAME_SIDE - 1) * FRAME_SIDE].to_vec();
     prediction[inside] = 5;
 

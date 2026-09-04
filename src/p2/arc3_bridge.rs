@@ -113,7 +113,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
             );
             policy.set_context(context);
             policy.set_prior_weights(prior);
-            BridgePolicy::Greedy(policy)
+            BridgePolicy::Greedy(Box::new(policy))
         }
         LivePolicyKind::PhaseA => {
             let calibration = crate::p2::arc3_phase_a::load_phase_a_calibration(
@@ -130,7 +130,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
             )?;
             policy.set_context(context);
             policy.set_prior_weights(prior);
-            BridgePolicy::PhaseA(policy)
+            BridgePolicy::PhaseA(Box::new(policy))
         }
     };
 
@@ -463,8 +463,12 @@ struct ServeStream {
 
 /// Either deployed controller behind one `LivePolicy` surface.
 enum BridgePolicy<'a> {
-    Greedy(ModelPolicy<'a>),
-    PhaseA(crate::p2::arc3_phase_a::PhaseAPolicy<crate::p2::arc3_phase_a::TensorPhaseAAdapter<'a>>),
+    Greedy(Box<ModelPolicy<'a>>),
+    PhaseA(
+        Box<
+            crate::p2::arc3_phase_a::PhaseAPolicy<crate::p2::arc3_phase_a::TensorPhaseAAdapter<'a>>,
+        >,
+    ),
 }
 
 impl LivePolicy for BridgePolicy<'_> {

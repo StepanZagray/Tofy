@@ -4198,7 +4198,7 @@ mod tests {
         let varmap = candle_nn::VarMap::new();
         let model = WorldModel::new(
             config,
-            candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, device),
         )?;
         if v6 {
             // Context FiLM is zero-initialised (exact v5 recovery), so make the
