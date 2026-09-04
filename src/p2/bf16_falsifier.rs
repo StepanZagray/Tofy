@@ -153,6 +153,12 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(sha256_hex(digest))
 }
 
+fn raw_bytes_sha256(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    sha256_hex(digest)
+}
+
 fn bytes_sha256(domain: &str, bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest_framed(&mut digest, "domain", domain.as_bytes());
@@ -238,6 +244,11 @@ fn ensure_baseline_config(cfg: &TrainConfig) -> Result<()> {
     }
     if cfg.bf16_recurrent_core {
         bail!("BF16 falsifier requires an F32 baseline config with bf16_recurrent_core=false");
+    }
+    if cfg.world_core_v6 || cfg.data_contract_v6 {
+        bail!(
+            "BF16 falsifier is defined only for the Foundation-v2/V5 population; +             world_core_v6/data_contract_v6 configs require a separately registered v6 population"
+        );
     }
     Ok(())
 }
@@ -478,7 +489,7 @@ pub fn compare_bf16_recurrent_core(
     // digest is the digest of what both arms actually consumed.
     let train_config_bytes =
         fs::read(train_config).with_context(|| format!("read {}", train_config.display()))?;
-    let train_config_sha256 = bytes_sha256("", &train_config_bytes);
+    let train_config_sha256 = raw_bytes_sha256(&train_config_bytes);
     let baseline_cfg: TrainConfig =
         serde_json::from_slice(&train_config_bytes).context("parse TrainConfig")?;
     ensure_baseline_config(&baseline_cfg)?;
@@ -517,9 +528,11 @@ pub fn compare_bf16_recurrent_core(
         .context("serialize BF16 falsifier config")?,
     );
 
-    // The model loader reads the checkpoint by path, so hash it immediately
-    // before the first arm and verify after the last one; a checkpoint that
-    // changed in between cannot be attributed to either digest.
+    // Both executable and checkpoint are mutable paths. Hash both immediately
+    // before the first arm and verify them after the last one so the report
+    // never attributes a two-arm comparison to bytes that changed mid-run.
+    let evaluator_binary = std::env::current_exe().context("resolve falsifier binary")?;
+    let evaluator_binary_sha256 = file_sha256(&evaluator_binary)?;
     let checkpoint_sha256 = file_sha256(checkpoint)?;
     let f32 = arm_outputs(&baseline_cfg, checkpoint, &device, &mixed)
         .context("run frozen F32 falsifier arm")?;
@@ -535,6 +548,13 @@ pub fn compare_bf16_recurrent_core(
             checkpoint.display()
         );
     }
+    let evaluator_binary_after = file_sha256(&evaluator_binary)?;
+    if evaluator_binary_after != evaluator_binary_sha256 {
+        bail!(
+            "evaluator binary {} changed during the BF16 falsifier: {evaluator_binary_sha256} before, {evaluator_binary_after} after",
+            evaluator_binary.display()
+        );
+    }
     let flips = flip_metrics(
         &mixed,
         &f32.raw_predictions,
@@ -543,14 +563,10 @@ pub fn compare_bf16_recurrent_core(
         &bf16.composed_predictions,
     )?;
 
-    let evaluator_binary = std::env::current_exe().context("resolve falsifier binary")?;
-    let evaluator_binary_sha256 = file_sha256(&evaluator_binary)?;
     let evaluator_package_version = env!("CARGO_PKG_VERSION").to_string();
     let command = std::env::args().collect::<Vec<_>>();
-    let command_sha256 = bytes_sha256(
-        "",
-        &serde_json::to_vec(&command).context("serialize falsifier argv")?,
-    );
+    let command_sha256 =
+        raw_bytes_sha256(&serde_json::to_vec(&command).context("serialize falsifier argv")?);
     let identity_root = bf16_drift_identity_root(&Bf16DriftIdentityLeaves {
         checkpoint_sha256: &checkpoint_sha256,
         train_config_sha256: &train_config_sha256,
@@ -849,6 +865,28 @@ mod tests {
         assert_ne!(bytes_sha256("a", b"b"), bytes_sha256("", b"ab"));
         assert_ne!(bytes_sha256("ab", b""), bytes_sha256("a", b"b"));
         assert_eq!(bytes_sha256("x", b"y"), bytes_sha256("x", b"y"));
+        assert_eq!(
+            raw_bytes_sha256(b"config bytes"),
+            format!("sha256:{:x}", Sha256::digest(b"config bytes"))
+        );
+    }
+
+    #[test]
+    fn bf16_falsifier_rejects_v6_configs_until_a_v6_population_is_registered() {
+        let mut cfg = TrainConfig {
+            recipe: crate::p2::experiment::TrainingRecipe::FoundationV2,
+            ..TrainConfig::default()
+        };
+        assert!(ensure_baseline_config(&cfg).is_ok());
+
+        cfg.world_core_v6 = true;
+        let err = ensure_baseline_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("Foundation-v2/V5"), "{err:#}");
+
+        cfg.world_core_v6 = false;
+        cfg.data_contract_v6 = true;
+        let err = ensure_baseline_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("Foundation-v2/V5"), "{err:#}");
     }
 
     #[test]
