@@ -14817,7 +14817,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn v6_recipe_recurses_three_by_three_and_v5_stays_two_by_two() {
         let mut v6 = TrainConfig {
             world_core_v6: true,
@@ -14833,17 +14832,22 @@ mod tests {
         assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
     }
 
+    #[test]
     fn v6_config_requires_foundation_v2_and_flags_compose() {
         let plain = TrainConfig {
             world_core_v6: true,
             ..TrainConfig::default()
         };
         assert!(plain.validate().is_err());
-        let mut v6 = TrainConfig::default();
+        // Flags precede the recipe, as in `P2TrainArgs::to_config`: the recipe
+        // resolves the v6 recursion depth from `world_core_v6` (ADR 0005 §3.5).
+        let mut v6 = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            ..TrainConfig::default()
+        };
         v6.apply_foundation_v2_recipe();
         v6.physical_batch = 64;
-        v6.world_core_v6 = true;
-        v6.data_contract_v6 = true;
         v6.validate().expect("foundation-v2 + v6 is a valid arm");
         assert!(v6.model_config().world_core_v6);
         let mut orphan_init = v6.clone();
@@ -14859,13 +14863,21 @@ mod tests {
     /// legal v6-model / legacy-data combination is the warm-start smoke.
     #[test]
     fn v6_data_and_model_contracts_must_be_paired() {
-        let mut base = TrainConfig::default();
-        base.apply_foundation_v2_recipe();
-        base.physical_batch = 64;
+        // The recipe resolves recursion depth from `world_core_v6`, so each arm
+        // sets its flags first and applies the recipe afterwards (CLI order).
+        let arm = |world_core_v6: bool, data_contract_v6: bool| {
+            let mut cfg = TrainConfig {
+                world_core_v6,
+                data_contract_v6,
+                ..TrainConfig::default()
+            };
+            cfg.apply_foundation_v2_recipe();
+            cfg.physical_batch = 64;
+            cfg
+        };
 
         // data_contract_v6 without world_core_v6: rejected at config time.
-        let mut data_only = base.clone();
-        data_only.data_contract_v6 = true;
+        let data_only = arm(false, true);
         let err = data_only
             .validate()
             .expect_err("v6 data on a legacy model must fail closed");
@@ -14876,8 +14888,7 @@ mod tests {
         );
 
         // world_core_v6 without data_contract_v6 and without warm start: rejected.
-        let mut model_only = base.clone();
-        model_only.world_core_v6 = true;
+        let model_only = arm(true, false);
         let err = model_only
             .validate()
             .expect_err("v6 model on legacy data without warm start must fail closed");
@@ -14892,9 +14903,7 @@ mod tests {
             .expect("v5 warm-start smoke on legacy data is allowed");
 
         // Both flags on: the §5.1 arm.
-        let mut paired = base.clone();
-        paired.world_core_v6 = true;
-        paired.data_contract_v6 = true;
+        let paired = arm(true, true);
         paired.validate().expect("paired v6 contracts validate");
         let contract = TrainingContract::from(&paired);
         assert!(contract.world_core_v6 && contract.data_contract_v6);

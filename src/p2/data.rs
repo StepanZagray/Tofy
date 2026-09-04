@@ -5291,9 +5291,23 @@ pub fn generate_learning_history_pair(
         .copied()
         .filter(|family| *family != draw.operator.family)
         .collect::<Vec<_>>();
+    if alternatives.is_empty() {
+        // A singleton held-out split (the default holds out SwapRegion alone)
+        // cannot supply a differing twin rule from within itself. The twin only
+        // has to DIFFER from the primary for mutual exclusivity (ADR 0005
+        // §2.3); the primary keeps the held-out rule, so no held-out rule
+        // becomes trainable through this fallback.
+        alternatives = families
+            .train
+            .iter()
+            .chain(families.held_out.iter())
+            .copied()
+            .filter(|family| *family != draw.operator.family)
+            .collect::<Vec<_>>();
+    }
     ensure!(
         !alternatives.is_empty(),
-        "twin episodes need at least two operator families in the split"
+        "twin episodes need at least two operator families overall"
     );
     let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_5457_494E);
     let rotation = rng.random_range(0..alternatives.len());
@@ -6139,6 +6153,33 @@ mod tests {
             "P(K=0) = {zero_fraction}"
         );
         assert_eq!(max_k, CONTEXT_WINDOW_MAX);
+        Ok(())
+    }
+
+    /// The default split holds out one operator family, so a twin cannot draw a
+    /// differing rule from within it; the fallback must still produce a pair
+    /// rather than failing the whole held-out evaluation population.
+    #[test]
+    fn twins_compose_on_a_singleton_held_out_split() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        assert_eq!(families.held_out.len(), 1, "fixture assumes a singleton");
+        let split = V5DataSplit::HeldOutOperator(families.held_out[0]);
+        let (primary, twin) = generate_learning_history_pair(7, 3, split, &families)?;
+        assert_ne!(primary.operator.family, twin.operator.family);
+        assert_eq!(primary.rows[0].current, twin.rows[0].current);
+        let batch = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 16,
+                seed: 0x5A11_0000_7E51,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            split,
+        )?;
+        assert_eq!(batch.transitions().len(), 16);
         Ok(())
     }
 
