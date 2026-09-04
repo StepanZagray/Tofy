@@ -5852,6 +5852,16 @@ fn eval_sample_set(
 
     log_eval_phase("ptrm_forwards", source, merged.ptrm_forward_elapsed);
     let metric_reduction_started = Instant::now();
+    // Sub-phase timing inside the reduction window: `detail=<source>/<step>`.
+    let mut sub_phase_started = Instant::now();
+    let mut log_sub_phase = |step: &str| {
+        log_eval_phase(
+            "metric_reduction",
+            &format!("{source}/{step}"),
+            sub_phase_started.elapsed(),
+        );
+        sub_phase_started = Instant::now();
+    };
 
     if merged.foundation_ep_current.len() != merged.foundation_ep_next.len() {
         bail!("foundation-v2 EP population current/next row counts diverged");
@@ -5888,9 +5898,11 @@ fn eval_sample_set(
         merged.sigreg_bounded_weighted = bounded * rows as f64;
         merged.sigreg_n = rows;
     }
+    log_sub_phase("foundation_ep_sigreg");
 
     let representation_seams = seam_collector.summarize()?;
     let post_rms_pooled = top_level_collector.summarize()?;
+    log_sub_phase("representation_summaries");
     let representation = Some(summarize_representation_from_seam(
         &post_rms_pooled,
         merged.sigreg_raw_weighted,
@@ -5902,6 +5914,7 @@ fn eval_sample_set(
         &merged.changed_copy_forward_errors,
         cfg.seed.wrapping_add(0xC0F1),
     )?);
+    log_sub_phase("changed_transitions");
     let mse_all = merged.mse_all;
     let encoder_embeddings = merged.encoder_embeddings;
     let event_labeled = merged.event_labeled;
@@ -6027,7 +6040,9 @@ fn eval_sample_set(
             },
         }
     });
+    log_sub_phase("scalar_metrics");
     let contrastive = eval_contrastive_probes(model, samples, device).ok();
+    log_sub_phase("contrastive_probes[model]");
     let fallback_sources = [(source.to_string(), samples.len())];
     let action_diagnostics = Some(eval_action_diagnostics(
         train_cfg,
@@ -6040,6 +6055,7 @@ fn eval_sample_set(
         device,
         cfg.seed,
     )?);
+    log_sub_phase("action_diagnostics[model]");
 
     let rollout_rows = if with_rollout {
         Some(eval_episode_rollouts(
@@ -6054,7 +6070,11 @@ fn eval_sample_set(
     let closed_loop = rollout_rows
         .as_deref()
         .map(|rows| rollout_metrics_from_rows(rows, RolloutMetric::Closed, cfg.seed ^ 0xC1));
+    if with_rollout {
+        log_sub_phase("rollouts[model]");
+    }
     let identifiability = eval_identifiability(samples, &encoder_embeddings);
+    log_sub_phase("identifiability");
     let semantic = if train_cfg.world_core_v4 {
         Some(timed_eval_phase("semantic_decode", source, || {
             evaluate_semantics_with_control(
@@ -6073,8 +6093,12 @@ fn eval_sample_set(
     } else {
         None
     };
+    if semantic.is_some() {
+        log_sub_phase("semantic_decode[model]");
+    }
     let collision_census = collision_census(samples, action_sources.unwrap_or(&fallback_sources));
     let ambiguity_ceiling = ambiguity_ceiling(samples);
+    log_sub_phase("census");
 
     let split = SplitEval {
         source: source.into(),
