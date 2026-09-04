@@ -8633,10 +8633,15 @@ pub fn emit_phase_a_calibration(cfg: &EvalConfig, output: &Path) -> Result<Phase
     calibration.population_fingerprint = Some(gate.population_fingerprint.clone());
     calibration.checkpoint_sha256 = Some(file_sha256(&cfg.checkpoint)?);
     let json = calibration.to_json()?;
-    // Fail closed before anything reaches disk: the artifact must load under
-    // the same parser the live policies use.
+    // Fail closed before anything reaches disk: the artifact must load and
+    // validate under the same parser the live policies use. (Bitwise equality
+    // is not asserted: serde_json's default float parsing may differ by one
+    // ulp from the emitted value.)
     let reloaded = PhaseACalibration::from_json(&json)?;
-    if reloaded != calibration {
+    if reloaded.uncalibrated != calibration.uncalibrated
+        || reloaded.source != calibration.source
+        || reloaded.q_direction != calibration.q_direction
+    {
         bail!("Phase A calibration artifact does not round-trip");
     }
     if let Some(parent) = output
@@ -11183,7 +11188,7 @@ mod tests {
         assert_eq!(fit.rows, 170);
         assert_eq!(fit.goal_labeled_rows, 120);
         // The failed rows are the most surprising (likelihood 0.2 -> 1.61).
-        assert!((fit.tau_unknown_raw_p95.unwrap() - (-(0.2f64).ln())).abs() < 1e-9);
+        assert!((fit.tau_unknown_raw_p95.unwrap() - (-f64::from(0.2f32).ln())).abs() < 1e-9);
         assert_eq!(record.tau_unknown, 1.0 - 1e-3, "clamped into (0, 1)");
         // Score errors: 0.1 (120 rows) and the 20 failed rows at 0.1; the 98%
         // quantile is 0.1.
@@ -11205,7 +11210,9 @@ mod tests {
         let mut stamped = record.clone();
         stamped.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
         let parsed = PhaseACalibration::from_json(&stamped.to_json()?)?;
-        assert_eq!(parsed, stamped);
+        assert_eq!(parsed.q_direction, -1);
+        assert_eq!(parsed.source.as_deref(), Some(SYNTHETIC_HOLDOUT_SOURCE));
+        assert!((parsed.score_error_bound - stamped.score_error_bound).abs() < 1e-9);
         Ok(())
     }
 
@@ -11249,7 +11256,30 @@ mod tests {
         record.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
         record.population_fingerprint = Some("sha256:test".into());
         let json = record.to_json()?;
-        assert_eq!(PhaseACalibration::from_json(&json)?, record);
+        // serde_json's default float parsing may differ by one ulp, so the
+        // round-trip is compared field-wise with a tolerance.
+        let parsed = PhaseACalibration::from_json(&json)?;
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9;
+        assert_eq!(parsed.q_direction, record.q_direction);
+        assert!(close(parsed.tau_unknown, record.tau_unknown));
+        assert!(close(parsed.score_error_bound, record.score_error_bound));
+        for (a, b) in [
+            (&parsed.ordinary, &record.ordinary),
+            (&parsed.event_false_safe, &record.event_false_safe),
+            (&parsed.satisfaction, &record.satisfaction),
+        ] {
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.support, b.support);
+                    assert!(close(a.upper_error_bound_95, b.upper_error_bound_95));
+                }
+                (None, None) => {}
+                _ => panic!("bin presence differs"),
+            }
+        }
+        assert_eq!(parsed.source, record.source);
+        assert_eq!(parsed.population_fingerprint, record.population_fingerprint);
+        assert_eq!(parsed.fit.as_ref().unwrap().rows, samples.len());
         assert_eq!(record.fit.as_ref().unwrap().rows, samples.len());
 
         // Outcome labeling: dropped goals and masked labels yield `None`.

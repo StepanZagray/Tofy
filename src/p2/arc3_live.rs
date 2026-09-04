@@ -4333,9 +4333,9 @@ mod tests {
         let mut round = 0u8;
         loop {
             adapter.observe(
-                &frame(20 + round),
+                &frame(round % 16),
                 &ArcAction::new(1 + round % 4, None, None)?,
-                &frame(21 + round),
+                &frame((round + 1) % 16),
                 0,
             );
             round += 1;
