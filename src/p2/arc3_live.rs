@@ -7,7 +7,7 @@
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::adaptation::{
     context_batch_for, AdaptationMode, AdaptationTrace, ContextScopeKind, FastWeightAdapter,
-    LiveContext,
+    LiveContext, PriorWeights,
 };
 use crate::p2::agent_session::AgentSession;
 use crate::p2::arc3::{first_recorded_decision_observations, ParsedActionInput, RecordingEvent};
@@ -1267,6 +1267,9 @@ pub struct ModelPolicy<'a> {
     tried: BTreeMap<u64, BTreeSet<String>>,
     profile: Option<Arc3ProfileCampaign>,
     context: LiveContext,
+    /// ADR 0005 §6.2: under `--adapt`, q/reliability/event readouts come from
+    /// theta_0 through this handle; `None` without Channel B.
+    prior: Option<PriorWeights>,
 }
 
 struct Arc3ProfileCampaign {
@@ -1314,12 +1317,20 @@ impl<'a> ModelPolicy<'a> {
             tried: BTreeMap::new(),
             profile: None,
             context: LiveContext::disabled(),
+            prior: None,
         }
     }
 
     /// Channel A state (ADR 0005 §6.1); see [`live_context_for`].
     pub fn set_context(&mut self, context: LiveContext) {
         self.context = context;
+    }
+
+    /// ADR 0005 §6.2 prior-weight readouts: with a handle, the q, reliability
+    /// and no-op (event) scores are computed with the fast subset swapped to
+    /// theta_0; the predicted effect keeps the adapted dynamics.
+    pub fn set_prior_weights(&mut self, prior: Option<PriorWeights>) {
+        self.prior = prior;
     }
 
     pub fn enable_eval_profile(&mut self, output_dir: &Path, campaign_id: String, device: &str) {
@@ -1445,11 +1456,18 @@ impl<'a> ModelPolicy<'a> {
             },
         )?;
         let (_, channels, height, width) = encoded.dims4()?;
+        // §6.2: the readout heads see a theta_0 encoding and theta_0 dynamics
+        // whenever the fast subset has drifted (the encoder's first conv is a
+        // fast weight, so the frame is re-encoded under the prior as well).
+        let prior = self.prior.as_ref().filter(|prior| !prior.is_at_prior());
+        let prior_encoded = prior
+            .map(|prior| prior.with_prior_weights(|| self.model.encode_state(&frames)))
+            .transpose()?;
         let mut scores = Vec::with_capacity(candidates.len());
         for (chunk_index, chunk) in candidates.chunks(self.physical_batch).enumerate() {
             let n = chunk.len();
             let selected_profile = (chunk_index == 0).then_some(profile).flatten();
-            let (output, state) = arc3_profile_phase(
+            let (output, readout, state) = arc3_profile_phase(
                 selected_profile,
                 self.device,
                 "forward",
@@ -1481,22 +1499,32 @@ impl<'a> ModelPolicy<'a> {
                     let state = encoded.broadcast_as((n, channels, height, width))?;
                     let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
                     let context = context_batch_for(window, n, self.device)?;
-                    let output = self
-                        .model
-                        .forward_from_encoded_state_with_operator_conditioning_with_context(
-                            &state,
-                            &frame_batch,
-                            &actions,
-                            &coords,
-                            &goals,
-                            &operator_conditioning,
-                            context.as_ref(),
-                            RecursionDepth::from_config(self.model.config()),
-                            0.0,
-                            None,
-                            RecursionOpts::EVAL,
-                        )?;
-                    Ok((output, state))
+                    let forward = |state: &Tensor| {
+                        self.model
+                            .forward_from_encoded_state_with_operator_conditioning_with_context(
+                                state,
+                                &frame_batch,
+                                &actions,
+                                &coords,
+                                &goals,
+                                &operator_conditioning,
+                                context.as_ref(),
+                                RecursionDepth::from_config(self.model.config()),
+                                0.0,
+                                None,
+                                RecursionOpts::EVAL,
+                            )
+                    };
+                    let output = forward(&state)?;
+                    let readout = match (prior, prior_encoded.as_ref()) {
+                        (Some(prior), Some(prior_encoded)) => {
+                            let prior_state =
+                                prior_encoded.broadcast_as((n, channels, height, width))?;
+                            prior.with_prior_weights(|| forward(&prior_state))?
+                        }
+                        _ => output.clone(),
+                    };
+                    Ok((output, readout, state))
                 },
             )?;
             let (q, reliability, noop, effect) = arc3_profile_phase(
@@ -1507,13 +1535,13 @@ impl<'a> ModelPolicy<'a> {
                 None,
                 || {
                     Ok((
-                        ops::sigmoid(&output.q_logit)?
+                        ops::sigmoid(&readout.q_logit)?
                             .flatten_all()?
                             .to_vec1::<f32>()?,
-                        ops::sigmoid(&output.reliability_logit)?
+                        ops::sigmoid(&readout.reliability_logit)?
                             .flatten_all()?
                             .to_vec1::<f32>()?,
-                        ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
+                        ops::sigmoid(&readout.event_logits.narrow(1, EVENT_NOOP, 1)?)?
                             .flatten_all()?
                             .to_vec1::<f32>()?,
                         latent_mse_per_sample(&output.y, &state)?
@@ -2566,6 +2594,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
         config.context_scope,
     )?;
     let context = live_context_for(&model, config.context_window, config.context_scope);
+    let prior = adapter.as_ref().map(FastWeightAdapter::prior_weights);
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -2613,6 +2642,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                 );
             }
             policy.set_context(context);
+            policy.set_prior_weights(prior);
             let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
@@ -2630,6 +2660,7 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
                 config.action6_grid_stride,
             )?;
             policy.set_context(context);
+            policy.set_prior_weights(prior);
             let mut policy = AdaptingPolicy::new(policy, adapter);
             run_public_suite(&mut api, &mut policy, &settings)?
         }
@@ -4239,6 +4270,116 @@ mod tests {
         ));
         observe_transitions(&mut policy, 3, 0);
         assert_eq!(policy.choose_action(&observation)?.context_len, 0);
+        Ok(())
+    }
+
+    /// `--context-scope game` (the default) keeps the window across a level
+    /// boundary with Channel B off; `level` starts the next level empty; a
+    /// game boundary always clears Factual Memory.
+    #[test]
+    fn context_scope_game_keeps_the_window_across_levels_without_adapt() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = tiny_live_model(&device, true)?;
+        let observation = observation("demo", "NOT_FINISHED", vec![1, 2, 6]);
+        let mut later = observation.clone();
+        later.levels_completed = 1;
+        for (scope, expected_after_transition) in [
+            (ContextScopeKind::Game, 3usize),
+            (ContextScopeKind::Level, 0usize),
+        ] {
+            let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+            policy.set_context(live_context_for(&model, None, scope));
+            policy.on_game_start("demo");
+            observe_transitions(&mut policy, 3, 0);
+            assert_eq!(policy.choose_action(&observation)?.context_len, 3);
+            policy.on_level_transition(1);
+            let decision = policy.choose_action(&later)?;
+            assert_eq!(decision.context_len, expected_after_transition, "{scope:?}");
+            assert_eq!(decision.context_scope, scope);
+            let json = serde_json::to_value(&decision)?;
+            assert_eq!(json["context_scope"], serde_json::to_value(scope)?);
+            // Game boundary invariant: the next game starts with no context.
+            policy.on_game_start("next");
+            assert_eq!(
+                policy.choose_action(&observation)?.context_len,
+                0,
+                "{scope:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// ADR 0005 §6.2: with adapted fast weights, the greedy scorer's q,
+    /// reliability and no-op readouts equal those of the untouched model
+    /// (theta_0) bitwise; the adapted weights survive the readout untouched.
+    #[test]
+    fn adapted_greedy_policy_reads_q_reliability_and_noop_from_the_prior_weights() -> Result<()> {
+        use crate::p2::adaptation::AdaptationMode;
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_live_model(&device, true)?;
+        let observation = observation("demo", "NOT_FINISHED", vec![1, 2, 6]);
+        let candidates = enumerate_actions(&observation, 4, 32)?;
+        let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
+        let untouched = policy.score_candidates(&observation.frame, &candidates, &[], None)?;
+
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Game,
+        )?;
+        adapter.set_min_level_transitions(1);
+        let mut round = 0u8;
+        loop {
+            adapter.observe(
+                &frame(20 + round),
+                &ArcAction::new(1 + round % 4, None, None)?,
+                &frame(21 + round),
+                0,
+            );
+            round += 1;
+            adapter.maybe_update()?;
+            if adapter.fast_weights_equal_prior()? {
+                continue;
+            }
+            let adapted = policy.score_candidates(&observation.frame, &candidates, &[], None)?;
+            let moved = untouched.iter().zip(&adapted).any(|(a, b)| {
+                a.q_probability != b.q_probability
+                    || a.reliability_probability != b.reliability_probability
+                    || a.noop_probability != b.noop_probability
+            });
+            if moved || round >= 40 {
+                assert!(
+                    moved,
+                    "adaptation never reached the readouts; test is vacuous"
+                );
+                break;
+            }
+        }
+        let adapted_bits = varmap_bits(&varmap)?;
+
+        policy.set_prior_weights(Some(adapter.prior_weights()));
+        let prior = policy.score_candidates(&observation.frame, &candidates, &[], None)?;
+        assert_eq!(prior.len(), untouched.len());
+        for (a, b) in untouched.iter().zip(&prior) {
+            assert_eq!(a.action, b.action);
+            assert_eq!(a.q_probability.to_bits(), b.q_probability.to_bits());
+            assert_eq!(
+                a.reliability_probability.to_bits(),
+                b.reliability_probability.to_bits()
+            );
+            assert_eq!(a.noop_probability.to_bits(), b.noop_probability.to_bits());
+        }
+        assert_eq!(
+            varmap_bits(&varmap)?,
+            adapted_bits,
+            "the readout swap must leave the adapted weights in place"
+        );
+        assert!(!adapter.fast_weights_equal_prior()?);
+        // Restore at game end still returns the model to theta_0 bitwise.
+        adapter.restore_prior()?;
+        assert!(adapter.fast_weights_equal_prior()?);
         Ok(())
     }
 

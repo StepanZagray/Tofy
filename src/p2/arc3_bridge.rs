@@ -98,6 +98,9 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
         config.context_scope,
     )?;
     let context = live_context_for(&model, config.context_window, config.context_scope);
+    let prior = adapter
+        .as_ref()
+        .map(crate::p2::adaptation::FastWeightAdapter::prior_weights);
     let mut policy = match config.policy {
         LivePolicyKind::Greedy => {
             let mut policy = ModelPolicy::new(
@@ -109,6 +112,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 DEFAULT_TRIED_PENALTY,
             );
             policy.set_context(context);
+            policy.set_prior_weights(prior);
             BridgePolicy::Greedy(policy)
         }
         LivePolicyKind::PhaseA => {
@@ -125,6 +129,7 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
                 ACTION6_GRID_STRIDE,
             )?;
             policy.set_context(context);
+            policy.set_prior_weights(prior);
             BridgePolicy::PhaseA(policy)
         }
     };

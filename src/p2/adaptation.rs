@@ -24,6 +24,8 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use candle_core::backprop::GradStore;
@@ -374,11 +376,93 @@ struct FastVar {
     best: Tensor,
 }
 
+/// Shared handle to theta_0 of the fast subset (§6.2 prior-weight readouts).
+///
+/// Goal/terminal/reliability readouts consumed by Phase A trust and by the
+/// greedy scorer must come from the prior weights, not from latents produced
+/// by adapted dynamics. [`PriorWeights::with_prior_weights`] swaps the fast
+/// subset to theta_0 (bitwise) for the duration of one readout call and
+/// restores the adapted values afterwards, also on error. The handle is
+/// `Clone` (Arc-shared with the adapter): the `Var`s share storage with the
+/// model, theta_0 is cached on device at construction, and the adapter flags
+/// drift after any optimizer step so an un-drifted model skips the swap.
+#[derive(Clone)]
+pub struct PriorWeights {
+    inner: Arc<PriorWeightsInner>,
+}
+
+struct PriorWeightsInner {
+    /// `(name, live Var shared with the model, theta_0 on device)`.
+    fast: Vec<(String, Var, Tensor)>,
+    /// Set after any optimizer step; cleared by `reset_to_prior`.
+    drifted: AtomicBool,
+}
+
+impl PriorWeights {
+    fn new(fast: &[FastVar]) -> Self {
+        Self {
+            inner: Arc::new(PriorWeightsInner {
+                fast: fast
+                    .iter()
+                    .map(|entry| (entry.name.clone(), entry.var.clone(), entry.theta0.clone()))
+                    .collect(),
+                drifted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn set_drifted(&self, drifted: bool) {
+        self.inner.drifted.store(drifted, Ordering::Release);
+    }
+
+    /// `true` while no optimizer step has moved the fast subset since the
+    /// last reset, i.e. the live weights are theta_0 and no swap is needed.
+    pub fn is_at_prior(&self) -> bool {
+        !self.inner.drifted.load(Ordering::Acquire)
+    }
+
+    pub fn fast_weight_names(&self) -> Vec<&str> {
+        self.inner
+            .fast
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect()
+    }
+
+    /// Run `f` with the fast subset set to theta_0 bitwise, then restore the
+    /// adapted values (whether or not `f` failed). A model that has not
+    /// drifted runs `f` directly.
+    pub fn with_prior_weights<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.is_at_prior() {
+            return f();
+        }
+        let mut saved = Vec::with_capacity(self.inner.fast.len());
+        for (_, var, theta0) in &self.inner.fast {
+            saved.push(snapshot(var)?);
+            var.set(theta0)?;
+        }
+        let result = f();
+        let mut restore_error = None;
+        for ((_, var, _), adapted) in self.inner.fast.iter().zip(&saved) {
+            if let Err(err) = var.set(adapted) {
+                restore_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = restore_error {
+            return Err(anyhow::anyhow!(
+                "restoring adapted fast weights after a prior-weight readout failed: {err}"
+            ));
+        }
+        result
+    }
+}
+
 /// Channel B: gradient adaptation of the Fast Weights on factual transitions.
 pub struct FastWeightAdapter<'a> {
     model: &'a WorldModel,
     device: &'a Device,
     fast: Vec<FastVar>,
+    prior: PriorWeights,
     optimizer: AdamW,
     buffer: FactualBuffer,
     mode: AdaptationMode,
@@ -453,10 +537,12 @@ impl<'a> FastWeightAdapter<'a> {
             "no fast-weight parameters found in VarMap"
         );
         let optimizer = new_optimizer(&fast)?;
+        let prior = PriorWeights::new(&fast);
         Ok(Self {
             model,
             device,
             fast,
+            prior,
             optimizer,
             buffer: FactualBuffer::new(scope),
             mode,
@@ -482,6 +568,18 @@ impl<'a> FastWeightAdapter<'a> {
 
     pub fn fast_weight_names(&self) -> Vec<&str> {
         self.fast.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    /// Shared theta_0 handle for the policies' prior-weight readouts (§6.2).
+    pub fn prior_weights(&self) -> PriorWeights {
+        self.prior.clone()
+    }
+
+    /// Run `f(model)` with the fast subset at theta_0 bitwise; the adapted
+    /// values are restored afterwards. See [`PriorWeights::with_prior_weights`].
+    pub fn with_prior_weights<T>(&self, f: impl FnOnce(&WorldModel) -> Result<T>) -> Result<T> {
+        let model = self.model;
+        self.prior.with_prior_weights(|| f(model))
     }
 
     /// Falsifier knob for the L2-SP ablation arm; production keeps the default.
@@ -550,6 +648,7 @@ impl<'a> FastWeightAdapter<'a> {
             entry.best = entry.theta0.clone();
         }
         self.optimizer = new_optimizer(&self.fast)?;
+        self.prior.set_drifted(false);
         self.steps_this_level = 0;
         self.consecutive_worsenings = 0;
         self.grad_norm_sum = 0.0;
@@ -642,6 +741,7 @@ impl<'a> FastWeightAdapter<'a> {
                 self.scale_fast_grads(&mut grads, ADAPT_GRAD_CLIP / norm)?;
             }
             self.optimizer.step(&grads)?;
+            self.prior.set_drifted(true);
             self.grad_norm_sum += norm;
             self.grad_norm_count += 1;
             self.steps_this_level += 1;
@@ -1223,6 +1323,73 @@ mod tests {
         for ((name, was), (_, now)) in before.iter().zip(&restored) {
             assert!(bitwise_equal(was, now)?, "{name} differs from theta_0");
         }
+        Ok(())
+    }
+
+    /// §6.2 prior-weight readouts: inside `with_prior_weights` every fast
+    /// parameter is theta_0 bitwise, the adapted values come back afterwards
+    /// (also when the closure fails), and an un-drifted adapter skips the swap.
+    #[test]
+    fn prior_weight_swap_is_bitwise_and_restores_the_adapted_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_model(&device)?;
+        let theta0 = all_var_snapshots(&varmap)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Game,
+        )?;
+        let prior = adapter.prior_weights();
+        assert!(prior.is_at_prior());
+        assert_eq!(prior.fast_weight_names(), adapter.fast_weight_names());
+        adapter.set_min_level_transitions(1);
+        let mut updates = 0;
+        let mut round = 0u8;
+        while updates == 0 {
+            adapter.observe(&frame(round), &action(1), &frame(round + 1), 0);
+            round += 1;
+            updates += adapter.maybe_update()?.expect("pending").updates;
+        }
+        assert!(!prior.is_at_prior());
+        assert!(!adapter.fast_weights_equal_prior()?);
+        let adapted = all_var_snapshots(&varmap)?;
+
+        adapter.with_prior_weights(|_| {
+            let inside = all_var_snapshots(&varmap)?;
+            for ((name, was), (_, now)) in theta0.iter().zip(&inside) {
+                assert!(
+                    bitwise_equal(was, now)?,
+                    "{name} is not theta_0 inside the swap"
+                );
+            }
+            Ok(())
+        })?;
+        let after = all_var_snapshots(&varmap)?;
+        for ((name, was), (_, now)) in adapted.iter().zip(&after) {
+            assert!(
+                bitwise_equal(was, now)?,
+                "{name} not restored after the swap"
+            );
+        }
+        assert!(!prior.is_at_prior(), "the swap does not clear drift");
+
+        // A failing readout still restores the adapted weights.
+        let failed: Result<()> = prior.with_prior_weights(|| anyhow::bail!("readout failed"));
+        assert!(failed.is_err());
+        let after_error = all_var_snapshots(&varmap)?;
+        for ((name, was), (_, now)) in adapted.iter().zip(&after_error) {
+            assert!(
+                bitwise_equal(was, now)?,
+                "{name} not restored after an error"
+            );
+        }
+
+        // Reset clears drift; the handle then runs closures without swapping.
+        adapter.reset_to_prior()?;
+        assert!(prior.is_at_prior());
+        assert!(adapter.fast_weights_equal_prior()?);
         Ok(())
     }
 

@@ -10,7 +10,7 @@
 //! the controller reduces to the exact graph-frontier explorer and says so in
 //! every decision trace. Kernels stay tensor-free behind [`PhaseAModel`].
 
-use crate::p2::adaptation::{context_batch_for, LiveContext};
+use crate::p2::adaptation::{context_batch_for, LiveContext, PriorWeights};
 use crate::p2::arc3_live::{
     enumerate_actions_with, ActionDecision, ActionScore, ArcObservation, LivePolicy,
 };
@@ -106,6 +106,11 @@ pub struct PhaseADecisionTrace {
 pub struct PhaseALatent {
     tensor: Tensor,
     is_root: bool,
+    /// ADR 0005 §6.2: the same latent produced end-to-end by the prior
+    /// weights (theta_0), present only while the fast subset has drifted.
+    /// Trust readouts (q, reliability, no-op, per-goal events) chain on it,
+    /// so no adapted dynamics ever reach goal/terminal inference.
+    prior: Option<Tensor>,
 }
 
 pub struct TensorPhaseAAdapter<'a> {
@@ -116,6 +121,8 @@ pub struct TensorPhaseAAdapter<'a> {
     current_frames: Option<Tensor>,
     /// ADR 0005 §6.1 Channel A window for the decision being scored.
     context: Vec<ContextTransition>,
+    /// ADR 0005 §6.2 theta_0 handle under `--adapt`; `None` without Channel B.
+    prior: Option<PriorWeights>,
 }
 
 impl<'a> TensorPhaseAAdapter<'a> {
@@ -127,7 +134,18 @@ impl<'a> TensorPhaseAAdapter<'a> {
             budget: EvalBudget::default(),
             current_frames: None,
             context: Vec::new(),
+            prior: None,
         }
+    }
+
+    /// ADR 0005 §6.2 prior-weight readouts; see [`PhaseAPolicy::set_prior_weights`].
+    pub fn set_prior_weights(&mut self, prior: Option<PriorWeights>) {
+        self.prior = prior;
+    }
+
+    /// The theta_0 handle when the fast subset has drifted from the prior.
+    fn drifted_prior(&self) -> Option<&PriorWeights> {
+        self.prior.as_ref().filter(|prior| !prior.is_at_prior())
     }
 
     fn backend<T>(result: Result<T>) -> Result<T, ModelCallError> {
@@ -176,10 +194,19 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
         ))?;
         let frames = Self::backend(frames_to_indices(std::slice::from_ref(&frame), self.device))?;
         let encoded = Self::backend(self.model.encode_state(&frames))?;
+        // The encoder's first conv is a fast weight: the prior readout chain
+        // starts from a theta_0 encoding of the same frame.
+        let prior = match self.drifted_prior() {
+            Some(prior) => Some(Self::backend(
+                prior.with_prior_weights(|| self.model.encode_state(&frames)),
+            )?),
+            None => None,
+        };
         self.current_frames = Some(frames);
         Ok(PhaseALatent {
             tensor: encoded,
             is_root: true,
+            prior,
         })
     }
 
@@ -208,7 +235,7 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
             .zip(actions.chunks(self.physical_batch))
         {
             let n = chunk.len();
-            let output = Self::backend((|| -> Result<_> {
+            let (output, readout) = Self::backend((|| -> Result<_> {
                 let action_ids = Tensor::from_vec(
                     chunk.iter().map(|a| u32::from(a.id)).collect::<Vec<_>>(),
                     n,
@@ -231,60 +258,74 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                 // only enter the event head below (dynamics are goal-independent).
                 let zero_goals = Tensor::zeros((n, GOAL_FEATURES_DIM), DType::F32, self.device)?;
                 let operator = unknown_operator_conditioning(n, self.device)?;
-                let state = from.tensor.broadcast_as((n, channels, height, width))?;
                 // Channel A: screening and verification alike see the window.
                 let context = context_batch_for(&self.context, n, self.device)?;
-                if from.is_root {
-                    let frames = self
-                        .current_frames
-                        .as_ref()
-                        .context("root latent has no encoded frame")?;
-                    let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
-                    self.model
-                        .forward_from_encoded_state_with_operator_conditioning_with_context(
-                            &state,
-                            &frame_batch,
-                            &action_ids,
-                            &coords,
-                            &zero_goals,
-                            &operator,
-                            context.as_ref(),
-                            RecursionDepth::from_config(self.model.config()),
-                            0.0,
-                            None,
-                            RecursionOpts::EVAL,
-                        )
-                } else {
-                    self.model
-                        .forward_from_latent_with_depth_and_operator_conditioning_with_context(
-                            &state,
-                            &action_ids,
-                            &coords,
-                            &zero_goals,
-                            &operator,
-                            context.as_ref(),
-                            RecursionDepth::from_config(self.model.config()),
-                        )
-                }
+                let forward = |latent: &Tensor| -> Result<_> {
+                    let state = latent.broadcast_as((n, channels, height, width))?;
+                    if from.is_root {
+                        let frames = self
+                            .current_frames
+                            .as_ref()
+                            .context("root latent has no encoded frame")?;
+                        let frame_batch = frames.broadcast_as((n, 1, FRAME_SIDE, FRAME_SIDE))?;
+                        self.model
+                            .forward_from_encoded_state_with_operator_conditioning_with_context(
+                                &state,
+                                &frame_batch,
+                                &action_ids,
+                                &coords,
+                                &zero_goals,
+                                &operator,
+                                context.as_ref(),
+                                RecursionDepth::from_config(self.model.config()),
+                                0.0,
+                                None,
+                                RecursionOpts::EVAL,
+                            )
+                    } else {
+                        self.model
+                            .forward_from_latent_with_depth_and_operator_conditioning_with_context(
+                                &state,
+                                &action_ids,
+                                &coords,
+                                &zero_goals,
+                                &operator,
+                                context.as_ref(),
+                                RecursionDepth::from_config(self.model.config()),
+                            )
+                    }
+                };
+                let output = forward(&from.tensor)?;
+                // §6.2: trust readouts come from theta_0 end to end (prior
+                // latent chain, prior dynamics); the adapted `output` only
+                // feeds the next-frame prediction (decode) and the search.
+                let readout = match self.drifted_prior() {
+                    Some(prior) => Some(prior.with_prior_weights(|| {
+                        forward(from.prior.as_ref().unwrap_or(&from.tensor))
+                    })?),
+                    None => None,
+                };
+                Ok((output, readout))
             })())?;
+            let heads = readout.as_ref().unwrap_or(&output);
             let q = Self::backend((|| -> Result<Vec<f32>> {
-                Ok(ops::sigmoid(&output.q_logit)?
+                Ok(ops::sigmoid(&heads.q_logit)?
                     .flatten_all()?
                     .to_vec1::<f32>()?)
             })())?;
             let reliability = Self::backend((|| -> Result<Vec<f32>> {
-                Ok(ops::sigmoid(&output.reliability_logit)?
+                Ok(ops::sigmoid(&heads.reliability_logit)?
                     .flatten_all()?
                     .to_vec1::<f32>()?)
             })())?;
             let noop = Self::backend((|| -> Result<Vec<f32>> {
-                Ok(
-                    ops::sigmoid(&output.event_logits.narrow(1, EVENT_NOOP, 1)?)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
-                )
+                Ok(ops::sigmoid(&heads.event_logits.narrow(1, EVENT_NOOP, 1)?)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?)
             })())?;
             // Event-head fan-out across goal vectors: reported, not charged.
+            // The event head is frozen (not a fast weight); it reads the
+            // prior-chain latent so no adapted dynamics reach goal inference.
             let mut per_goal: Vec<Vec<GoalEventReadout>> = vec![Vec::new(); n];
             for goal in goal_vectors {
                 let events = Self::backend((|| -> Result<Vec<f32>> {
@@ -292,7 +333,7 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
                         Tensor::from_slice(goal, (1, GOAL_FEATURES_DIM), self.device)?
                             .broadcast_as((n, GOAL_FEATURES_DIM))?
                             .contiguous()?;
-                    let logits = self.model.event_logits_from(&output.y, &goal_tensor)?;
+                    let logits = self.model.event_logits_from(&heads.y, &goal_tensor)?;
                     Ok(ops::sigmoid(&logits)?.flatten_all()?.to_vec1::<f32>()?)
                 })())?;
                 let stride = events.len() / n;
@@ -310,11 +351,18 @@ impl PhaseAModel for TensorPhaseAAdapter<'_> {
             }
             for index in 0..n {
                 let latent = Self::backend(output.y.narrow(0, index, 1).map_err(Into::into))?;
+                let prior = match readout.as_ref() {
+                    Some(readout) => Some(Self::backend(
+                        readout.y.narrow(0, index, 1).map_err(Into::into),
+                    )?),
+                    None => None,
+                };
                 predictions.push(StepPrediction {
                     action: keys[index].clone(),
                     latent: PhaseALatent {
                         tensor: latent,
                         is_root: false,
+                        prior,
                     },
                     q_raw: q[index],
                     reliability_raw: reliability[index],
@@ -448,6 +496,16 @@ impl<'a> PhaseAPolicy<TensorPhaseAAdapter<'a>> {
             action6_max_candidates,
             action6_grid_stride,
         ))
+    }
+}
+
+impl PhaseAPolicy<TensorPhaseAAdapter<'_>> {
+    /// ADR 0005 §6.2 prior-weight readouts: with a handle, screening and
+    /// verification compute q, reliability, no-op and per-goal events with
+    /// the fast subset swapped to theta_0 (on a theta_0 latent chain); the
+    /// adapted dynamics only feed the decoded next frame and the search.
+    pub fn set_prior_weights(&mut self, prior: Option<PriorWeights>) {
+        self.adapter.set_prior_weights(prior);
     }
 }
 
@@ -1396,6 +1454,123 @@ mod tests {
         // Game start empties Factual Memory.
         policy.on_game_start("next-game");
         assert_eq!(policy.choose_action(&observation(0, true))?.context_len, 0);
+        Ok(())
+    }
+
+    /// ADR 0005 §6.2: with adapted fast weights and a theta_0 handle, the
+    /// screening and verification trust readouts (q, reliability, no-op,
+    /// per-goal events) equal those of the untouched model bitwise.
+    #[test]
+    fn tensor_adapter_reads_trust_scores_from_the_prior_weights_under_adaptation() -> Result<()> {
+        use crate::p2::adaptation::{AdaptationMode, ContextScopeKind, FastWeightAdapter};
+        use crate::p2::experiment::ConsumerReadoutTopology;
+        use crate::p2::model::ModelConfig;
+        use candle_nn::{VarBuilder, VarMap};
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            patch_size: 4,
+            hidden_dim: 8,
+            action_dim: 8,
+            inner_steps: 1,
+            outer_steps: 1,
+            spatial_action_field: true,
+            world_core_v4: true,
+            world_core_v5: true,
+            world_core_v6: true,
+            consumer_readout: ConsumerReadoutTopology::SpatialQuery,
+            ..ModelConfig::default()
+        };
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            config,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        let frame = |fill: u8| {
+            let pixels = (0..FRAME_PIXELS)
+                .map(|index| ((index * 7 + usize::from(fill) * 13) % 16) as u8)
+                .collect();
+            ArcFrame::new(64, 64, pixels).unwrap()
+        };
+        let keys = vec![
+            phase_a_action_key(&ArcAction::new(1, None, None)?),
+            phase_a_action_key(&ArcAction::new(6, Some(3), Some(4))?),
+        ];
+        let mut goal = [0.0f32; 19];
+        goal[0] = 1.0;
+        let goals = [[0.0f32; 19], goal];
+        let readouts = |adapter: &mut TensorPhaseAAdapter<'_>| -> Result<Vec<_>> {
+            adapter.reset_decision_budget(64);
+            let root = adapter.encode(&frame(7).pixels)?;
+            let screened = adapter.step_batch(&root, &keys, &goals)?;
+            let verified = adapter.step_batch(&screened[0].latent, &keys, &goals)?;
+            Ok(screened
+                .into_iter()
+                .chain(verified)
+                .map(|p| {
+                    (
+                        p.q_raw.to_bits(),
+                        p.reliability_raw.to_bits(),
+                        p.noop_raw.to_bits(),
+                        p.per_goal_events
+                            .iter()
+                            .map(|e| {
+                                (
+                                    e.ordinary.to_bits(),
+                                    e.satisfied.to_bits(),
+                                    e.failed.to_bits(),
+                                    e.exhausted.to_bits(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect())
+        };
+        let mut adapter = TensorPhaseAAdapter::new(&model, &device, 8);
+        let untouched = readouts(&mut adapter)?;
+
+        let mut fast = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Game,
+        )?;
+        fast.set_min_level_transitions(1);
+        let mut round = 0u8;
+        loop {
+            fast.observe(
+                &frame(20 + round),
+                &ArcAction::new(1 + round % 4, None, None)?,
+                &frame(21 + round),
+                0,
+            );
+            round += 1;
+            fast.maybe_update()?;
+            if fast.fast_weights_equal_prior()? {
+                continue;
+            }
+            let moved = readouts(&mut adapter)? != untouched;
+            if moved || round >= 40 {
+                assert!(
+                    moved,
+                    "adaptation never reached the readouts; test is vacuous"
+                );
+                break;
+            }
+        }
+        adapter.set_prior_weights(Some(fast.prior_weights()));
+        assert_eq!(
+            readouts(&mut adapter)?,
+            untouched,
+            "trust readouts must come from theta_0 end to end"
+        );
+        assert!(
+            !fast.fast_weights_equal_prior()?,
+            "adapted weights stay in place"
+        );
+        fast.restore_prior()?;
+        assert!(fast.fast_weights_equal_prior()?);
         Ok(())
     }
 

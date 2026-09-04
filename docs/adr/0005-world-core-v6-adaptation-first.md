@@ -246,11 +246,18 @@ once the current level has >= 8 transitions:
 - collapse guard: an update whose grad-norm exceeds 3x the running mean
   is skipped (SAR precursor);
 - goal/terminal/reliability readouts consumed by Phase A trust and by the
-  greedy scorer are computed from the prior weights (theta_0): the fast subset
-  is swapped back to theta_0 for those readouts (implementation in progress,
-  2026-09-04; until it lands, frozen heads read latents produced by adapted
-  dynamics, which is NOT the same guarantee); Phase A calibration is unchanged
-  and must be fitted from synthetic held-out data only;
+  greedy scorer are computed from the prior weights (theta_0) end to end: the
+  adapter exposes `with_prior_weights` (a shared `PriorWeights` handle with
+  theta_0 cached on device), and the policies swap the fast subset back to
+  theta_0 bitwise for a second encode + forward whose q, reliability, no-op
+  and per-goal event heads are the only ones read; Phase A chains these
+  readouts on a theta_0 latent (`PhaseALatent::prior`) so horizon-2
+  verification never reads adapted dynamics either. The adapted weights are
+  restored after every readout (also on error) and serve only the decoded
+  next frame, the predicted effect and the search. An un-drifted model skips
+  the swap. Phase A calibration is unchanged by adaptation and must be fitted
+  from synthetic held-out data only (`p2-eval --emit-phase-a-calibration`,
+  `source: synthetic_holdout`; any other declared source fails closed at load);
 - every update, skip and revert is recorded in `ActionDecision` telemetry.
 
 6.3 Adapted weights are discarded at the end of a game. Nothing here
