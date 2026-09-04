@@ -897,12 +897,16 @@ fn joint_copy_mixture_matches_two_candidate_rule_and_never_edits_below_half() ->
         .enumerate()
     {
         let row = &probs_v[pixel * 16..(pixel + 1) * 16];
-        let (argmax, p_max) = row
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| {
-                if v > bv { (i, v) } else { (bi, bv) }
-            });
+        let (argmax, p_max) = row.iter().enumerate().fold(
+            (0usize, f32::MIN),
+            |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            },
+        );
         let p_cur = row[cur as usize];
         let expected = if g * p_max > (1.0 - g) + g * p_cur {
             argmax as u32

@@ -720,7 +720,10 @@ mod tests {
             head.gameplay_logits(&latents)?.dims(),
             &[1, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE]
         );
-        assert_eq!(head.copy_gate(&latents)?.dims(), &[1, FRAME_SIDE, FRAME_SIDE]);
+        assert_eq!(
+            head.copy_gate(&latents)?.dims(),
+            &[1, FRAME_SIDE, FRAME_SIDE]
+        );
         let clean = Tensor::zeros((1, 1, FRAME_SIDE, FRAME_SIDE), DType::U32, &device)?;
         let row_63 = Tensor::ones((1, 1, 1, FRAME_SIDE), DType::U32, &device)?;
         let edited = Tensor::cat(&[&clean.narrow(2, 0, FRAME_SIDE - 1)?, &row_63], 2)?;

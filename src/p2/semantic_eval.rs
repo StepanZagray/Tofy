@@ -1237,9 +1237,7 @@ mod tests {
         MixedStreamKind, OperatorFamily, SymmetryAugmentation, TransitionProvenance, V5DataSplit,
         V5SampleProvenance, FRAME_SIDE,
     };
-    use crate::p2::train::{
-        reinit_varmap_deterministic, TrainConfig, FOUNDATION_V2_GATE_SEED,
-    };
+    use crate::p2::train::{reinit_varmap_deterministic, TrainConfig, FOUNDATION_V2_GATE_SEED};
     use candle_nn::{VarBuilder, VarMap};
 
     fn sample(next_pixel: u8) -> TransitionSample {
@@ -1459,12 +1457,8 @@ mod tests {
             operator,
             1,
         )?;
-        let (second, second_provenance) = operator_row(
-            current,
-            ArcAction::new(6, Some(5), Some(5))?,
-            operator,
-            2,
-        )?;
+        let (second, second_provenance) =
+            operator_row(current, ArcAction::new(6, Some(5), Some(5))?, operator, 2)?;
         let factual = vec![first, second];
         let control = shuffled_action_control_population(
             &factual,
@@ -1497,12 +1491,8 @@ mod tests {
             operator,
             1,
         )?;
-        let (second, second_provenance) = operator_row(
-            current,
-            ArcAction::new(6, Some(5), Some(5))?,
-            operator,
-            2,
-        )?;
+        let (second, second_provenance) =
+            operator_row(current, ArcAction::new(6, Some(5), Some(5))?, operator, 2)?;
         let factual = vec![first, second];
         let provenance = vec![first_provenance, second_provenance];
         let control = shuffled_action_control_population(&factual, Some(&provenance))?;
