@@ -62,6 +62,9 @@ struct ScorecardFile {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EnvironmentEntry {
+    /// Required by the official scorecard schema; forms the RHAE denominator
+    /// (`1..=level_count`) for every run of the environment. Missing or
+    /// nonpositive values are rejected rather than defaulted from a run.
     #[serde(default)]
     level_count: Option<i64>,
     #[serde(default)]
@@ -72,8 +75,10 @@ struct EnvironmentEntry {
 struct RunEntry {
     #[serde(default)]
     levels_completed: Option<i64>,
+    /// Optional per-run copy of the environment level count. When present it
+    /// must agree with `level_count`; it never supplies the denominator.
     #[serde(default)]
-    number_of_levels: i64,
+    number_of_levels: Option<i64>,
     #[serde(default)]
     level_scores: Vec<f64>,
     #[serde(default)]
@@ -91,6 +96,45 @@ pub struct ScorecardBenchmark {
     pub game_scores: Vec<f64>,
 }
 
+/// Resolve the RHAE denominator for one environment.
+///
+/// The official scorecard schema requires `level_count` on every environment,
+/// and the level-weighted game score divides by `1 + 2 + ... + level_count`.
+/// A missing, zero, or negative count therefore cannot form a denominator and
+/// is rejected instead of being defaulted from the first run (which would
+/// silently reuse one run's count for every run of the environment).
+fn environment_level_count(env_index: usize, level_count: Option<i64>) -> Result<usize> {
+    match level_count {
+        None => bail!("scorecard environment {env_index} is missing level_count"),
+        Some(count) if count <= 0 => {
+            bail!("scorecard environment {env_index} level_count {count} must be positive")
+        }
+        Some(count) => usize::try_from(count).with_context(|| {
+            format!("scorecard environment {env_index} level_count overflows usize")
+        }),
+    }
+}
+
+/// A run's optional `number_of_levels` describes the same environment and
+/// must agree with the environment `level_count` when present.
+fn validate_run_level_count(
+    env_index: usize,
+    run_index: usize,
+    number_of_levels: Option<i64>,
+    total_levels: usize,
+) -> Result<()> {
+    match number_of_levels {
+        None => Ok(()),
+        Some(count) if count <= 0 => bail!(
+            "scorecard environment {env_index} run {run_index} number_of_levels {count} must be positive"
+        ),
+        Some(count) if usize::try_from(count).ok() == Some(total_levels) => Ok(()),
+        Some(count) => bail!(
+            "scorecard environment {env_index} run {run_index} number_of_levels {count} does not match environment level_count {total_levels}"
+        ),
+    }
+}
+
 /// Parse official scorecard JSON and recompute RHAE from per-level baselines.
 pub fn benchmark_from_scorecard_json(path: &Path) -> Result<ScorecardBenchmark> {
     let text =
@@ -103,21 +147,12 @@ pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
     let mut game_scores = Vec::new();
     let mut n_runs = 0usize;
 
-    for env in &card.environments {
-        let total_levels = env
-            .level_count
-            .filter(|&n| n > 0)
-            .map(|n| usize::try_from(n).context("scorecard level_count overflows usize"))
-            .transpose()?
-            .or_else(|| {
-                env.runs
-                    .first()
-                    .and_then(|run| usize::try_from(run.number_of_levels).ok())
-            })
-            .unwrap_or(0);
+    for (env_index, env) in card.environments.iter().enumerate() {
+        let total_levels = environment_level_count(env_index, env.level_count)?;
 
-        for run in &env.runs {
+        for (run_index, run) in env.runs.iter().enumerate() {
             n_runs += 1;
+            validate_run_level_count(env_index, run_index, run.number_of_levels, total_levels)?;
             let completed = match run.levels_completed {
                 Some(count) if count < 0 => bail!("scorecard levels_completed is negative"),
                 Some(count) => {
@@ -174,19 +209,10 @@ pub fn benchmark_from_scorecard_str(json: &str) -> Result<ScorecardBenchmark> {
                 );
             };
             let truncated: Vec<f64> = per_level.into_iter().take(completed).collect();
-            let total = if total_levels > 0 {
-                total_levels
-            } else {
-                usize::try_from(run.number_of_levels)
-                    .unwrap_or(0)
-                    .max(truncated.len())
-            };
-            if completed > total {
-                bail!("scorecard completed levels {completed} exceeds total levels {total}");
+            if completed > total_levels {
+                bail!("scorecard completed levels {completed} exceeds total levels {total_levels}");
             }
-            if total > 0 {
-                game_scores.push(game_score(&truncated, total));
-            }
+            game_scores.push(game_score(&truncated, total_levels));
         }
     }
 
@@ -321,5 +347,103 @@ mod tests {
             }]
         }"#;
         assert!(benchmark_from_scorecard_str(json).is_err());
+    }
+
+    /// Wave 22 finding 20 witness: two runs of one environment with omitted
+    /// `level_count` used to inherit the first run's `number_of_levels` as the
+    /// denominator, so `[1/1, 1/2]` scored 100% in one order and 33.33% in the
+    /// other. Missing `level_count` is schema-invalid and must be rejected in
+    /// both orders instead of scoring anything.
+    #[test]
+    fn missing_level_count_is_rejected_in_both_run_orders() {
+        let run_one = r#"{"levels_completed":1,"number_of_levels":1,"level_actions":[10],"level_baseline_actions":[10]}"#;
+        let run_two = r#"{"levels_completed":1,"number_of_levels":2,"level_actions":[10],"level_baseline_actions":[10]}"#;
+        for (first, second) in [(run_one, run_two), (run_two, run_one)] {
+            let json = format!(r#"{{"environments":[{{"runs":[{first},{second}]}}]}}"#);
+            let err = benchmark_from_scorecard_str(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("missing level_count"),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonpositive_level_count_is_rejected() {
+        for count in ["0", "-1"] {
+            let json = format!(
+                r#"{{"environments":[{{"level_count":{count},"runs":[{{"levels_completed":0}}]}}]}}"#
+            );
+            let err = benchmark_from_scorecard_str(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("must be positive"),
+                "level_count {count}: unexpected error: {err:#}"
+            );
+        }
+        // Environments without any runs still need a schema-valid count.
+        let no_runs = r#"{"environments":[{"level_count":0,"runs":[]}]}"#;
+        assert!(benchmark_from_scorecard_str(no_runs).is_err());
+        let missing_no_runs = r#"{"environments":[{"runs":[]}]}"#;
+        assert!(benchmark_from_scorecard_str(missing_no_runs).is_err());
+    }
+
+    #[test]
+    fn run_level_count_must_match_environment_level_count() {
+        let mismatched = r#"{"environments":[{"level_count":2,"runs":[
+            {"levels_completed":1,"number_of_levels":2,"level_actions":[10],"level_baseline_actions":[10]},
+            {"levels_completed":1,"number_of_levels":3,"level_actions":[10],"level_baseline_actions":[10]}
+        ]}]}"#;
+        let err = benchmark_from_scorecard_str(mismatched).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("run 1 number_of_levels 3 does not match"),
+            "unexpected error: {err:#}"
+        );
+        for count in ["0", "-2"] {
+            let json = format!(
+                r#"{{"environments":[{{"level_count":2,"runs":[{{"levels_completed":0,"number_of_levels":{count}}}]}}]}}"#
+            );
+            let err = benchmark_from_scorecard_str(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("number_of_levels")
+                    && err.to_string().contains("must be positive"),
+                "number_of_levels {count}: unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_multi_run_environment_uses_environment_denominator_for_every_run() {
+        // Two runs of a two-level game: one completes both levels at baseline,
+        // the other completes only level 1. Expected game scores are
+        // [1.0, 1/3]; the order of the runs must not change the result.
+        let run_full = r#"{"levels_completed":2,"number_of_levels":2,"level_actions":[10,10],"level_baseline_actions":[10,10]}"#;
+        let run_partial =
+            r#"{"levels_completed":1,"level_actions":[10],"level_baseline_actions":[10]}"#;
+        let expected_mean = (1.0 + 1.0 / 3.0) / 2.0 * 100.0;
+        for (first, second) in [(run_full, run_partial), (run_partial, run_full)] {
+            let json = format!(
+                r#"{{"score":66.67,"environments":[{{"level_count":2,"runs":[{first},{second}]}}]}}"#
+            );
+            let bench = benchmark_from_scorecard_str(&json).unwrap();
+            assert_eq!(bench.n_environments, 1);
+            assert_eq!(bench.n_runs, 2);
+            let mut sorted = bench.game_scores.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert!((sorted[0] - 1.0 / 3.0).abs() < 1e-9, "{sorted:?}");
+            assert!((sorted[1] - 1.0).abs() < 1e-9, "{sorted:?}");
+            let rhae = bench.recomputed_rhae_percent.unwrap();
+            assert!((rhae - expected_mean).abs() < 1e-9, "rhae={rhae}");
+        }
+    }
+
+    #[test]
+    fn unplayed_environment_with_valid_level_count_contributes_no_game_score() {
+        let json = r#"{"environments":[{"level_count":3,"runs":[]}]}"#;
+        let bench = benchmark_from_scorecard_str(json).unwrap();
+        assert_eq!(bench.n_environments, 1);
+        assert_eq!(bench.n_runs, 0);
+        assert!(bench.game_scores.is_empty());
+        assert_eq!(bench.recomputed_rhae_percent, None);
     }
 }
