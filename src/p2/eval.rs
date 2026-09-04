@@ -9,7 +9,9 @@ use crate::p2::arc3::{import_and_summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::board_probe::{
     BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
 };
-use crate::p2::calibration::{binary_auroc, expected_calibration_error, risk_coverage_buckets};
+use crate::p2::calibration::{
+    binary_auroc, clopper_pearson_upper, expected_calibration_error, risk_coverage_buckets,
+};
 use crate::p2::cg_profile::{
     ensure_eval_profile_campaign, EvalCaptureSpec, RepresentativeUpdateCapture,
     EVAL_PROFILE_ENTRYPOINT,
@@ -20,12 +22,16 @@ use crate::p2::data::{
     generate_factual_branch_group, generate_hazard_one_step, ArcAction, AugmentedLearningHistory,
     BranchGroup, ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
     TransitionSample, V5DataSplit, V5SampleProvenance, CONTEXT_WINDOW_MAX,
-    FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
+    FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, GOAL_FEATURES_DIM, ORACLE_LATENT_DIM,
 };
 use crate::p2::grounding::DecodeComposition;
+use crate::p2::latent_planning::trust::{
+    CalibrationBin, PhaseACalibration, PhaseACalibrationFit, SYNTHETIC_HOLDOUT_SOURCE,
+};
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, ContextBatch, PtrmConfig, RecursionDepth,
-    RecursionOpts, RecursionStepProbe, WorldModel, EVENT_GOAL_FAILED,
+    RecursionOpts, RecursionStepProbe, WorldModel, EVENT_EXHAUSTED, EVENT_GOAL_FAILED,
+    EVENT_GOAL_SATISFIED, EVENT_NOOP,
 };
 use crate::p2::representation::{
     RepresentationRowCollector, RepresentationSeam, RepresentationSeamCollector,
@@ -8260,6 +8266,389 @@ pub fn evaluate_arc3(cfg: &EvalConfig) -> Result<EvalReport> {
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0004 A3 Phase A calibration, fitted from the synthetic held-out
+// population only (`p2-eval --emit-phase-a-calibration <path>`).
+// ---------------------------------------------------------------------------
+
+/// ADR 0004 `epsilon = 0.02`: the likelihood clip of the belief update and the
+/// quantile level (`1 - epsilon`) reported as `score_error_bound`.
+pub const PHASE_A_CALIBRATION_EPSILON: f64 = 0.02;
+/// The held-out population the artifact is fitted on (`v5_holdout_gates` key).
+pub const PHASE_A_CALIBRATION_POPULATION: &str = "unseen_seed_7x7";
+
+/// Exact terminal channel of a held-out row under its own (non-dropped) goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseAOutcome {
+    Satisfied,
+    Failed,
+    Exhausted,
+    Ordinary,
+}
+
+/// One held-out row's raw head readouts and exact outcomes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseACalibrationRow {
+    pub q_raw: f32,
+    pub reliability_raw: f32,
+    /// Exact composed-transition correctness of the decoded next frame.
+    pub exact: bool,
+    pub noop_raw: f32,
+    pub satisfied_raw: f32,
+    pub failed_raw: f32,
+    pub exhausted_raw: f32,
+    /// `None` when the row's goal was dropped or its labels are masked.
+    pub outcome: Option<PhaseAOutcome>,
+}
+
+fn phase_a_outcome(sample: &TransitionSample) -> Option<PhaseAOutcome> {
+    if sample.goal_features.values == [0.0; GOAL_FEATURES_DIM] {
+        return None;
+    }
+    match (sample.goal_satisfied, sample.goal_failed, sample.exhausted) {
+        (Some(true), _, _) => Some(PhaseAOutcome::Satisfied),
+        (_, Some(true), _) => Some(PhaseAOutcome::Failed),
+        (_, _, Some(true)) => Some(PhaseAOutcome::Exhausted),
+        (Some(false), Some(false), _) => Some(PhaseAOutcome::Ordinary),
+        _ => None,
+    }
+}
+
+/// Raw q / reliability / event readouts and exact outcomes of `samples`,
+/// scored exactly like the gate evaluator (frame-encoded current latent,
+/// the row's own context window, `FOUNDATION_V2_GATE_PHYSICAL_BATCH` chunks,
+/// outputs detached per chunk).
+pub fn phase_a_calibration_rows(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<Vec<PhaseACalibrationRow>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !model.config().world_core_v4 {
+        bail!("Phase A calibration requires the exact gameplay decoder (world_core_v4)");
+    }
+    let batch = batch_from_samples(samples, device)?;
+    let (current, _target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let current = current.detach();
+    let context = model
+        .config()
+        .world_core_v6
+        .then(|| ContextBatch::from_samples(samples, device))
+        .transpose()?
+        .flatten();
+    let depth = RecursionDepth::from_config(model.config());
+    let chunk = FOUNDATION_V2_GATE_PHYSICAL_BATCH.max(1);
+    let mut rows = Vec::with_capacity(samples.len());
+    let mut start = 0;
+    while start < samples.len() {
+        let len = chunk.min(samples.len() - start);
+        let indices = (start..start + len)
+            .map(|row| row as u32)
+            .collect::<Vec<_>>();
+        let chunk_context = match context.as_ref() {
+            Some(context) => context.select_rows(&indices)?,
+            None => None,
+        };
+        let out = model.forward_from_latent_with_depth_and_operator_conditioning_with_context(
+            &current.narrow(0, start, len)?.contiguous()?,
+            &batch.actions.narrow(0, start, len)?.contiguous()?,
+            &batch.action_coords.narrow(0, start, len)?.contiguous()?,
+            &batch.goals.narrow(0, start, len)?.contiguous()?,
+            &batch
+                .operator_conditioning
+                .narrow(0, start, len)?
+                .contiguous()?,
+            chunk_context.as_ref(),
+            depth,
+        )?;
+        let q = ops::sigmoid(&out.q_logit.detach().to_dtype(DType::F32)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let reliability = ops::sigmoid(&out.reliability_logit.detach().to_dtype(DType::F32)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let events = ops::sigmoid(&out.event_logits.detach().to_dtype(DType::F32)?)?
+            .reshape((len, ()))?
+            .to_vec2::<f32>()?;
+        let exact = model
+            .exact_transition_correctness(
+                &out.y.detach(),
+                &batch.frames.narrow(0, start, len)?.contiguous()?,
+                &batch.next_frames.narrow(0, start, len)?.contiguous()?,
+            )?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        if q.len() != len || reliability.len() != len || events.len() != len || exact.len() != len {
+            bail!("Phase A calibration readout rows do not match the chunk");
+        }
+        for index in 0..len {
+            let read = |event: usize| events[index].get(event).copied().unwrap_or(0.0);
+            rows.push(PhaseACalibrationRow {
+                q_raw: q[index],
+                reliability_raw: reliability[index],
+                exact: exact[index] >= 0.5,
+                noop_raw: read(EVENT_NOOP),
+                satisfied_raw: read(EVENT_GOAL_SATISFIED),
+                failed_raw: read(EVENT_GOAL_FAILED),
+                exhausted_raw: read(EVENT_EXHAUSTED),
+                outcome: phase_a_outcome(&samples[start + index]),
+            });
+        }
+        start += len;
+    }
+    Ok(rows)
+}
+
+/// 95% Clopper-Pearson upper endpoint (the existing risk-coverage bound) on
+/// `failures / total`; `None` with no support.
+fn phase_a_error_bin(failures: u64, total: u64) -> Option<CalibrationBin> {
+    let upper_error_bound_95 = clopper_pearson_upper(failures, total)?;
+    Some(CalibrationBin {
+        upper_error_bound_95,
+        support: total,
+    })
+}
+
+/// Empirical upper `p`-quantile (smallest value with at least a `p` fraction
+/// of the sample at or below it).
+fn phase_a_upper_quantile(values: &[f64], p: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let index = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1;
+    Some(sorted[index])
+}
+
+/// Fit the ADR 0004 A3 record from held-out rows. Every bin is the observed
+/// error rate of the region the corresponding gate trusts, with the 95%
+/// Clopper-Pearson upper endpoint and the region's row count as support:
+///
+/// - `q_direction`: `-1` when AUROC(q, exact) < 0.5, else `1`;
+/// - `ordinary`: rows with direction-adjusted `q >= 0.5` and
+///   `reliability >= 0.5` (the `edge_trust` region); error = not exact;
+/// - `event_false_safe`: labeled rows the event head calls safe
+///   (`failed + exhausted < 0.5`); error = observed failed/exhausted;
+/// - `satisfaction`: labeled rows with `satisfied >= 0.5`; error = not
+///   satisfied;
+/// - `tau_unknown`: 95th percentile of `-ln(clip(L, eps, 1 - eps))` of the
+///   observed channel's raw likelihood, clamped into the `(0, 1)` domain the
+///   record requires (the raw quantile is kept in `fit`);
+/// - `score_error_bound`: the `1 - eps` quantile of
+///   `|satisfied_raw - 1[satisfied]|` on labeled rows (ADR 0004 Amendment 1
+///   charges `2 x` this bound);
+/// - `ptrm`: not fitted (`None`; no gate consumes it yet).
+///
+/// The generator masks the `exhausted` label (see `data.rs`), so the
+/// false-safe bin covers failure. No row is empty-population tolerant: with
+/// no rows the record is `uncalibrated`.
+pub fn fit_phase_a_calibration(rows: &[PhaseACalibrationRow]) -> PhaseACalibration {
+    let eps = PHASE_A_CALIBRATION_EPSILON;
+    let mut calibration = PhaseACalibration::fail_closed();
+    let mut fit = PhaseACalibrationFit {
+        rows: rows.len(),
+        score_error_quantile: 1.0 - eps,
+        bound_method: "clopper_pearson_upper (95%)".into(),
+        unfitted: vec![
+            "ptrm: PTRM disagreement calibration is not emitted; no gate consumes it".into(),
+        ],
+        ..PhaseACalibrationFit::default()
+    };
+    if rows.is_empty() {
+        calibration.fit = Some(fit);
+        return calibration;
+    }
+    let q_scores = rows.iter().map(|row| row.q_raw).collect::<Vec<_>>();
+    let exact = rows.iter().map(|row| row.exact).collect::<Vec<_>>();
+    fit.q_auroc = binary_auroc(&q_scores, &exact);
+    fit.exact_rate = Some(exact.iter().filter(|e| **e).count() as f64 / rows.len() as f64);
+    let q_direction: i8 = if fit.q_auroc.is_some_and(|auroc| auroc < 0.5) {
+        -1
+    } else {
+        1
+    };
+    let adjusted_q = |row: &PhaseACalibrationRow| {
+        if q_direction < 0 {
+            1.0 - f64::from(row.q_raw)
+        } else {
+            f64::from(row.q_raw)
+        }
+    };
+    let trusted = rows
+        .iter()
+        .filter(|row| adjusted_q(row) >= 0.5 && f64::from(row.reliability_raw) >= 0.5)
+        .collect::<Vec<_>>();
+    let ordinary = phase_a_error_bin(
+        trusted.iter().filter(|row| !row.exact).count() as u64,
+        trusted.len() as u64,
+    );
+
+    let labeled = rows
+        .iter()
+        .filter_map(|row| row.outcome.map(|outcome| (row, outcome)))
+        .collect::<Vec<_>>();
+    fit.goal_labeled_rows = labeled.len();
+    let called_safe = labeled
+        .iter()
+        .filter(|(row, _)| f64::from(row.failed_raw) + f64::from(row.exhausted_raw) < 0.5)
+        .collect::<Vec<_>>();
+    let event_false_safe = phase_a_error_bin(
+        called_safe
+            .iter()
+            .filter(|(_, outcome)| {
+                matches!(outcome, PhaseAOutcome::Failed | PhaseAOutcome::Exhausted)
+            })
+            .count() as u64,
+        called_safe.len() as u64,
+    );
+    let claimed = labeled
+        .iter()
+        .filter(|(row, _)| f64::from(row.satisfied_raw) >= 0.5)
+        .collect::<Vec<_>>();
+    let satisfaction = phase_a_error_bin(
+        claimed
+            .iter()
+            .filter(|(_, outcome)| *outcome != PhaseAOutcome::Satisfied)
+            .count() as u64,
+        claimed.len() as u64,
+    );
+
+    let surprises = labeled
+        .iter()
+        .map(|(row, outcome)| {
+            let likelihood = match outcome {
+                PhaseAOutcome::Satisfied => f64::from(row.satisfied_raw),
+                PhaseAOutcome::Failed => f64::from(row.failed_raw),
+                PhaseAOutcome::Exhausted => f64::from(row.exhausted_raw),
+                PhaseAOutcome::Ordinary => 1.0 - f64::from(row.satisfied_raw.max(row.failed_raw)),
+            };
+            -likelihood.clamp(eps, 1.0 - eps).ln()
+        })
+        .collect::<Vec<_>>();
+    fit.tau_unknown_raw_p95 = phase_a_upper_quantile(&surprises, 0.95);
+    let tau_unknown = fit
+        .tau_unknown_raw_p95
+        .map_or(0.5, |raw| raw.clamp(1e-3, 1.0 - 1e-3));
+    let score_errors = labeled
+        .iter()
+        .map(|(row, outcome)| {
+            let target = f64::from(*outcome == PhaseAOutcome::Satisfied);
+            (f64::from(row.satisfied_raw) - target).abs()
+        })
+        .collect::<Vec<_>>();
+    // No labeled row: the selection charge 2.0 rejects every finalist.
+    let score_error_bound = phase_a_upper_quantile(&score_errors, 1.0 - eps).unwrap_or(1.0);
+
+    calibration.q_direction = q_direction;
+    calibration.tau_unknown = tau_unknown;
+    calibration.score_error_bound = score_error_bound;
+    calibration.ordinary = ordinary;
+    calibration.event_false_safe = event_false_safe;
+    calibration.satisfaction = satisfaction;
+    calibration.ptrm = None;
+    calibration.uncalibrated = false;
+    calibration.fit = Some(fit);
+    calibration
+}
+
+/// The bundle check `evaluate` applies before loading a checkpoint.
+fn verify_phase_a_calibration_checkpoint(cfg: &EvalConfig, train_cfg: &TrainConfig) -> Result<()> {
+    let Some(bundle) = cfg.checkpoint.parent() else {
+        return Ok(());
+    };
+    let manifest = bundle.join("bundle-manifest.json");
+    if manifest.is_file() {
+        verify_checkpoint_bundle(bundle)?;
+        let bundled_config = bundle.join("config.json");
+        if file_sha256(&bundled_config)? != file_sha256(&cfg.train_config)? {
+            bail!(
+                "evaluation train config {} does not match checkpoint bundle {}",
+                cfg.train_config.display(),
+                bundled_config.display()
+            );
+        }
+    } else if train_cfg.world_core_v4 {
+        bail!(
+            "Phase A calibration requires a verified checkpoint bundle manifest beside {}",
+            cfg.checkpoint.display()
+        );
+    }
+    Ok(())
+}
+
+/// `p2-eval --emit-phase-a-calibration <path>`: fit the ADR 0004 A3 record on
+/// the synthetic `unseen_seed_7x7` held-out gate population (the same rows,
+/// seed derivation and fingerprint as `v5_holdout_gates`), stamp it
+/// `source = synthetic_holdout` with the emitter revision, the population
+/// fingerprint and the checkpoint hash, validate it under
+/// `PhaseACalibration::from_json`, and write it to `output`. No public or
+/// recorded game is read.
+pub fn emit_phase_a_calibration(cfg: &EvalConfig, output: &Path) -> Result<PhaseACalibration> {
+    cfg.validate()?;
+    let train_cfg = load_train_config(&cfg.train_config)?;
+    verify_phase_a_calibration_checkpoint(cfg, &train_cfg)?;
+    if train_cfg.recipe != crate::p2::experiment::TrainingRecipe::FoundationV2 {
+        bail!(
+            "Phase A calibration is defined for foundation-v2 checkpoints (frozen heads, exact \
+             decoder); got {:?}",
+            train_cfg.recipe
+        );
+    }
+    let _gpu_guard = if cfg.device == "cuda" || cfg.device.starts_with("cuda:") {
+        Some(GpuSessionGuard::acquire(&train_cfg.output_dir)?)
+    } else {
+        None
+    };
+    let device = resolve_device(&cfg.device)?;
+    let (model, _varmap) = timed_eval_phase("model_load", "checkpoint", || {
+        load_model(&train_cfg, &cfg.checkpoint, &device)
+    })?;
+    let (gates, _strata, samples, _masks, _provenance) =
+        timed_eval_phase("population_generation", "v5_holdout_gates", || {
+            foundation_v2_v5_holdout_gates(&model, cfg, &train_cfg, &device, None)
+        })?;
+    let gate = gates
+        .get(PHASE_A_CALIBRATION_POPULATION)
+        .with_context(|| format!("held-out gate population {PHASE_A_CALIBRATION_POPULATION}"))?;
+    let rows = timed_eval_phase("phase_a_calibration", "readouts", || {
+        phase_a_calibration_rows(&model, &samples, &device)
+    })?;
+    let mut calibration = fit_phase_a_calibration(&rows);
+    calibration.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
+    calibration.revision = crate::p2::arc3_live::live_run_provenance()
+        .ok()
+        .map(|provenance| {
+            if provenance.git_dirty {
+                format!("{}-dirty", provenance.git_revision)
+            } else {
+                provenance.git_revision
+            }
+        });
+    calibration.population = Some(format!("v5_holdout_gates/{PHASE_A_CALIBRATION_POPULATION}"));
+    calibration.population_fingerprint = Some(gate.population_fingerprint.clone());
+    calibration.checkpoint_sha256 = Some(file_sha256(&cfg.checkpoint)?);
+    let json = calibration.to_json()?;
+    // Fail closed before anything reaches disk: the artifact must load under
+    // the same parser the live policies use.
+    let reloaded = PhaseACalibration::from_json(&json)?;
+    if reloaded != calibration {
+        bail!("Phase A calibration artifact does not round-trip");
+    }
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, json).with_context(|| format!("write {}", output.display()))?;
+    Ok(calibration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10703,5 +11092,189 @@ mod tests {
         assert!(!verdict.promote_channel_b);
         assert!(!verdict.arms[1].deltas[1].improvement);
         assert!(verdict.arms[1].deltas[1].changed_exact_delta.is_none());
+    }
+
+    fn calibration_row(
+        q: f32,
+        reliability: f32,
+        exact: bool,
+        satisfied: f32,
+        failed: f32,
+        outcome: Option<PhaseAOutcome>,
+    ) -> PhaseACalibrationRow {
+        PhaseACalibrationRow {
+            q_raw: q,
+            reliability_raw: reliability,
+            exact,
+            noop_raw: 0.1,
+            satisfied_raw: satisfied,
+            failed_raw: failed,
+            exhausted_raw: 0.0,
+            outcome,
+        }
+    }
+
+    /// The fitted record's bins are the observed error rates of the regions
+    /// the gates trust, with Clopper-Pearson upper endpoints and honest
+    /// support; direction, tau and the score bound follow the documented rules.
+    #[test]
+    fn fit_phase_a_calibration_bins_direction_tau_and_score_bound() -> Result<()> {
+        let empty = fit_phase_a_calibration(&[]);
+        assert!(empty.uncalibrated);
+        assert!(empty.ordinary.is_none());
+        assert!(PhaseACalibration::from_json(&empty.to_json()?).is_ok());
+
+        let mut rows = Vec::new();
+        // 100 trusted rows (q, reliability >= 0.5), 10 of them not exact.
+        for i in 0..100 {
+            rows.push(calibration_row(
+                0.9,
+                0.8,
+                i >= 10,
+                if i % 2 == 0 { 0.9 } else { 0.1 },
+                0.05,
+                Some(if i % 2 == 0 {
+                    PhaseAOutcome::Satisfied
+                } else {
+                    PhaseAOutcome::Ordinary
+                }),
+            ));
+        }
+        // 50 untrusted rows (low reliability) that are exact: excluded from
+        // the ordinary bin, unlabeled (dropped goal).
+        for _ in 0..50 {
+            rows.push(calibration_row(0.9, 0.2, true, 0.5, 0.5, None));
+        }
+        // 20 rows the event head calls safe but which failed.
+        for _ in 0..20 {
+            rows.push(calibration_row(
+                0.1,
+                0.9,
+                false,
+                0.1,
+                0.2,
+                Some(PhaseAOutcome::Failed),
+            ));
+        }
+        let record = fit_phase_a_calibration(&rows);
+        assert_eq!(record.q_direction, 1);
+        let ordinary = record.ordinary.as_ref().expect("ordinary bin");
+        assert_eq!(ordinary.support, 100);
+        assert_eq!(
+            ordinary.upper_error_bound_95,
+            clopper_pearson_upper(10, 100).unwrap()
+        );
+        let false_safe = record.event_false_safe.as_ref().expect("false-safe bin");
+        assert_eq!(false_safe.support, 120, "labeled rows called safe");
+        assert_eq!(
+            false_safe.upper_error_bound_95,
+            clopper_pearson_upper(20, 120).unwrap()
+        );
+        let satisfaction = record.satisfaction.as_ref().expect("satisfaction bin");
+        assert_eq!(satisfaction.support, 50);
+        assert_eq!(
+            satisfaction.upper_error_bound_95,
+            clopper_pearson_upper(0, 50).unwrap()
+        );
+        assert!(record.ptrm.is_none());
+        assert!(!record.uncalibrated);
+        assert!(record.tau_unknown > 0.0 && record.tau_unknown < 1.0);
+        let fit = record.fit.as_ref().expect("fit metadata");
+        assert_eq!(fit.rows, 170);
+        assert_eq!(fit.goal_labeled_rows, 120);
+        // The failed rows are the most surprising (likelihood 0.2 -> 1.61).
+        assert!((fit.tau_unknown_raw_p95.unwrap() - (-(0.2f64).ln())).abs() < 1e-9);
+        assert_eq!(record.tau_unknown, 1.0 - 1e-3, "clamped into (0, 1)");
+        // Score errors: 0.1 (120 rows) and the 20 failed rows at 0.1; the 98%
+        // quantile is 0.1.
+        assert!((record.score_error_bound - 0.1).abs() < 1e-6);
+        assert!(!fit.unfitted.is_empty());
+
+        // Anti-correlated q flips the direction and the trusted region.
+        let flipped = rows
+            .iter()
+            .map(|row| PhaseACalibrationRow {
+                q_raw: 1.0 - row.q_raw,
+                ..row.clone()
+            })
+            .collect::<Vec<_>>();
+        let record = fit_phase_a_calibration(&flipped);
+        assert_eq!(record.q_direction, -1);
+        assert_eq!(record.ordinary.as_ref().unwrap().support, 100);
+        // The record validates under the live parser after stamping.
+        let mut stamped = record.clone();
+        stamped.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
+        let parsed = PhaseACalibration::from_json(&stamped.to_json()?)?;
+        assert_eq!(parsed, stamped);
+        Ok(())
+    }
+
+    /// The readout pass scores every held-out row of a v6 population with
+    /// probabilities in range, exact outcomes and goal labels, and the fitted
+    /// record validates under the live parser.
+    #[test]
+    fn phase_a_calibration_rows_score_the_held_out_population() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _varmap) = tiny_v6_model(&device)?;
+        let batch = compose_mixed_stream_batch(
+            &MixedStreamConfig {
+                batch_size: 12,
+                seed: 0x5645_4C35_1D00_0007,
+                schedule: adaptation_v6_stream_schedule,
+                data_contract_v6: true,
+                ..MixedStreamConfig::default()
+            },
+            1.0,
+            0,
+            V5DataSplit::UnseenSeed7x7,
+        )?;
+        let samples = batch.transitions().cloned().collect::<Vec<_>>();
+        let rows = phase_a_calibration_rows(&model, &samples, &device)?;
+        assert_eq!(rows.len(), samples.len());
+        for (row, sample) in rows.iter().zip(&samples) {
+            for value in [
+                row.q_raw,
+                row.reliability_raw,
+                row.noop_raw,
+                row.satisfied_raw,
+                row.failed_raw,
+                row.exhausted_raw,
+            ] {
+                assert!((0.0..=1.0).contains(&value), "{value}");
+            }
+            assert_eq!(row.outcome, phase_a_outcome(sample));
+        }
+        assert!(phase_a_calibration_rows(&model, &[], &device)?.is_empty());
+        let mut record = fit_phase_a_calibration(&rows);
+        record.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
+        record.population_fingerprint = Some("sha256:test".into());
+        let json = record.to_json()?;
+        assert_eq!(PhaseACalibration::from_json(&json)?, record);
+        assert_eq!(record.fit.as_ref().unwrap().rows, samples.len());
+
+        // Outcome labeling: dropped goals and masked labels yield `None`.
+        let mut sample = samples[0].clone();
+        sample.goal_features.values = [0.0; GOAL_FEATURES_DIM];
+        sample.goal_features.values[0] = 1.0;
+        sample.goal_satisfied = Some(false);
+        sample.goal_failed = Some(false);
+        assert_eq!(phase_a_outcome(&sample), Some(PhaseAOutcome::Ordinary));
+        sample.goal_failed = Some(true);
+        assert_eq!(phase_a_outcome(&sample), Some(PhaseAOutcome::Failed));
+        sample.goal_satisfied = Some(true);
+        assert_eq!(phase_a_outcome(&sample), Some(PhaseAOutcome::Satisfied));
+        sample.goal_satisfied = None;
+        sample.goal_failed = None;
+        sample.exhausted = Some(true);
+        assert_eq!(phase_a_outcome(&sample), Some(PhaseAOutcome::Exhausted));
+        sample.exhausted = None;
+        assert_eq!(phase_a_outcome(&sample), None);
+        sample.goal_satisfied = Some(true);
+        sample.goal_features.values = [0.0; GOAL_FEATURES_DIM];
+        assert_eq!(phase_a_outcome(&sample), None, "dropped goal");
+        assert_eq!(phase_a_upper_quantile(&[], 0.95), None);
+        assert_eq!(phase_a_upper_quantile(&[3.0, 1.0, 2.0], 0.5), Some(2.0));
+        assert_eq!(phase_a_upper_quantile(&[3.0, 1.0, 2.0], 0.95), Some(3.0));
+        Ok(())
     }
 }

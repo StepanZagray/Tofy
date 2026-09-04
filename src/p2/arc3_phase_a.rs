@@ -162,14 +162,32 @@ fn parse_action_key(key: &ActionKey) -> Option<ArcAction> {
 }
 
 /// Load the Phase A calibration artifact, or fail closed when absent.
+///
+/// An artifact whose `source` is anything but the synthetic held-out
+/// population (public games, recordings, ...) is rejected: public games may
+/// not tune thresholds (`docs/specs/P2_ARC_AGI_3_WORLD_MODEL_CORE_REDESIGN.md`
+/// §3.3). `PhaseACalibration::from_json` enforces this; the explicit check
+/// here keeps the loader fail-closed even if the parser contract changes.
 pub fn load_phase_a_calibration(path: Option<&std::path::Path>) -> Result<PhaseACalibration> {
     match path {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("read Phase A calibration {}", path.display()))?;
-            PhaseACalibration::from_json(&text).map_err(|error| {
+            let calibration = PhaseACalibration::from_json(&text).map_err(|error| {
                 anyhow::anyhow!("invalid Phase A calibration {}: {error}", path.display())
-            })
+            })?;
+            if let Some(source) = calibration.source.as_deref() {
+                anyhow::ensure!(
+                    source.trim().eq_ignore_ascii_case(
+                        crate::p2::latent_planning::trust::SYNTHETIC_HOLDOUT_SOURCE
+                    ),
+                    "Phase A calibration {} declares source {source:?}; only {:?} artifacts \
+                     may drive live trust gates (public/recorded games are rejected)",
+                    path.display(),
+                    crate::p2::latent_planning::trust::SYNTHETIC_HOLDOUT_SOURCE
+                );
+            }
+            Ok(calibration)
         }
         None => Ok(PhaseACalibration::fail_closed()),
     }
@@ -1361,7 +1379,41 @@ mod tests {
             satisfaction: bin(),
             ptrm: bin(),
             uncalibrated: false,
+            ..PhaseACalibration::fail_closed()
         }
+    }
+
+    #[test]
+    fn calibration_loader_rejects_public_or_recorded_sources() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tofy-phase-a-calibration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let mut record = permissive_calibration();
+        record.source = Some("public_games_2026".into());
+        let public = dir.join("public.json");
+        std::fs::write(&public, record.to_json()?)?;
+        let error = load_phase_a_calibration(Some(&public)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("public"),
+            "unexpected error: {error:#}"
+        );
+        record.source = Some("recorded".into());
+        std::fs::write(&public, record.to_json()?)?;
+        assert!(load_phase_a_calibration(Some(&public)).is_err());
+
+        record.source = Some(crate::p2::latent_planning::trust::SYNTHETIC_HOLDOUT_SOURCE.into());
+        let synthetic = dir.join("synthetic.json");
+        std::fs::write(&synthetic, record.to_json()?)?;
+        let loaded = load_phase_a_calibration(Some(&synthetic))?;
+        assert_eq!(loaded, record);
+        assert!(load_phase_a_calibration(None)?.uncalibrated);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// ADR 0005 §1.3: a v6 Phase A policy enumerates ACTION6 coordinates on

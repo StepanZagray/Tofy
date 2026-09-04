@@ -309,9 +309,27 @@ each merge. Deviations from the text above, recorded so nobody rediscovers them:
   eval helpers (`semantic_eval` censuses, shuffled-control outcome compare) keep 63-row
   semantics because no model config is in scope there.
 - §6 Channel A and Channel B keep separate `FactualBuffer`s (Arc-shared frames). The context
-  batch is rebuilt per physical chunk at inference (no per-decision summary cache yet). Goal
-  and terminal heads are frozen under adaptation, but they read latents produced by the
-  adapted dynamics; only heads and calibration are guaranteed pristine.
+  batch is rebuilt per physical chunk at inference (no per-decision summary cache yet).
+  Until 2026-09-04 the frozen goal/terminal heads read latents produced by the adapted
+  dynamics (only heads and calibration were pristine); `feat/v6-context-scope` closed this:
+  under `--adapt` every trust/score readout runs a second encode + forward with the fast
+  subset swapped to theta_0 (`PriorWeights::with_prior_weights`, bitwise, restored
+  afterwards), at roughly 2x the per-decision forward cost once the weights have drifted.
+- §1.5/§6.1 the live window scope is `--context-scope {level,game}` (default `game`, the
+  training distribution), a Channel A knob decoupled from `--adapt-carry`, which now only
+  selects the fast-weight reset arm; the scope is recorded per decision (`context_scope`).
+  The E3 falsifier keeps its preregistered coupling (reset arm = level-scoped row contexts,
+  carry arm = game-scoped) and does not expose the knob.
+- ADR 0004 A3 calibration: `p2-eval --emit-phase-a-calibration <path>` fits the record from
+  the synthetic `v5_holdout_gates/unseen_seed_7x7` population only (raw q/reliability/event
+  readouts vs exact composed-transition correctness and the rows' own goal labels), with
+  95% Clopper-Pearson upper endpoints and honest support per bin, `q_direction` from the
+  q-vs-exact AUROC, `tau_unknown` the 95th percentile of the observed channel's surprise
+  (clamped into the record's `(0, 1)` domain; the raw quantile is kept under `fit`), and
+  `score_error_bound` the `1 - epsilon` quantile of the satisfaction score error. Not
+  fitted: `ptrm` (no gate consumes it) and the exhausted channel (the generator masks its
+  label). The artifact carries `source: synthetic_holdout`, the emitter revision, the
+  population fingerprint and the checkpoint hash; loaders reject any other declared source.
 - §5.3 ran on the 2026-08-27 foundation-v2 checkpoint (the s8 model was unreachable):
   residual AUROC 0.905 vs reliability 0.634; the preregistered switch rule was narrowly missed
   on the reliability side (see `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`).
