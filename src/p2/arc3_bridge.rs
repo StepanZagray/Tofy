@@ -1,6 +1,7 @@
 //! Newline-delimited JSON bridge for the local ARC-AGI-3 toolkit.
 
 use crate::gpu_lock::GpuSessionGuard;
+use crate::p2::adaptation::ContextScopeKind;
 use crate::p2::arc3_live::{adaptation_for, live_context_for, AdaptingPolicy};
 use crate::p2::arc3_live::{
     decision_telemetry, live_evidence_class, live_run_provenance, run_public_suite, sha256_file,
@@ -49,6 +50,8 @@ pub struct Arc3BridgeConfig {
     pub adapt_carry: bool,
     /// ADR 0005 §6.1 Channel A; `None` = on for `world_core_v6` checkpoints.
     pub context_window: Option<bool>,
+    /// ADR 0005 §1.5 `--context-scope`; independent of the Channel B arm.
+    pub context_scope: ContextScopeKind,
 }
 
 impl Arc3BridgeConfig {
@@ -86,8 +89,15 @@ fn run_arc3_bridge_with_io<R: BufRead, W: Write>(
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
     let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
-    let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
-    let context = live_context_for(&model, config.context_window, config.adapt_carry);
+    let adapter = adaptation_for(
+        &model,
+        &varmap,
+        &device,
+        config.adapt,
+        config.adapt_carry,
+        config.context_scope,
+    )?;
+    let context = live_context_for(&model, config.context_window, config.context_scope);
     let mut policy = match config.policy {
         LivePolicyKind::Greedy => {
             let mut policy = ModelPolicy::new(
@@ -915,6 +925,7 @@ mod tests {
                 phase_a: None,
                 adaptation: None,
                 context_len: 0,
+                context_scope: ContextScopeKind::default(),
             })
         }
     }

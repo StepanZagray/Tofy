@@ -95,8 +95,11 @@ triple drawn from the same `(seed, meta_episode_id)` episode, strictly
 earlier in chronological order than the row, under the same D4/colour
 augmentation as the row. Context may cross level boundaries within the
 episode. The live policy fills the context with the most recent factual
-transitions of the current level from Factual Memory (across levels when
-the carry arm is on).
+transitions from Factual Memory under `--context-scope {level,game}`
+(default `game`, so the live window crosses level boundaries exactly as the
+training rows' windows do; `level` restricts it to the current level). The
+scope is a Channel A knob, independent of `--adapt` / `--adapt-carry`; a
+game boundary always empties Factual Memory (§6.3).
 
 1.6 **Available actions.** Rows record an 8-bit `available_actions` mask
 (RESET, ACTION1..7). The Rust generator emits all-available; ARCEngine shards
@@ -218,9 +221,11 @@ calibration until a v6 checkpoint exists.
 ## 6. Test-time adaptation contract (`src/p2/adaptation.rs`)
 
 6.1 **Channel A is always on** for v6 policies: the live driver keeps the
-last `CONTEXT_WINDOW_MAX` factual transitions of the current level (carry
-arm: of the current game) and passes them as context to every model call,
-including Phase A screening and verification.
+last `CONTEXT_WINDOW_MAX` factual transitions of the `--context-scope`
+(§1.5; default the current game, `level` the current level) and passes them
+as context to every model call, including Phase A screening and
+verification. The scope is recorded per decision (`context_scope`) next to
+`context_len`.
 
 6.2 **Channel B (`--adapt`)** runs after every observed factual transition
 once the current level has >= 8 transitions:
@@ -231,7 +236,8 @@ once the current level has >= 8 transitions:
 - batch `min(32, buffer)` drawn by reservoir sampling from the level-tagged
   factual buffer (the buffer persists across levels; fast weights reset to
   theta_0 at every level boundary in the default arm; the preregistered
-  `carry` arm keeps them);
+  `carry` arm keeps them; each stored row's own context follows
+  `--context-scope`, not the arm);
 - loss = the ADR 0003 exact-decoder next-frame loss on factual rows with
   the row's own context, plus L2-SP `1e-3 * ||theta - theta_0||^2` on the
   fast subset;

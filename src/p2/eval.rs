@@ -2,7 +2,9 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
-use crate::p2::adaptation::{AdaptationMode, FastWeightAdapter, ADAPT_MIN_LEVEL_TRANSITIONS};
+use crate::p2::adaptation::{
+    AdaptationMode, ContextScopeKind, FastWeightAdapter, ADAPT_MIN_LEVEL_TRANSITIONS,
+};
 use crate::p2::arc3::{import_and_summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::board_probe::{
     BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
@@ -3721,11 +3723,22 @@ fn evaluate_adaptation_falsifier_on(
         ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY,
         &context_only,
     );
-    for (name, mode) in [
-        (ADAPTATION_FALSIFIER_ARM_RESET, AdaptationMode::Reset),
-        (ADAPTATION_FALSIFIER_ARM_CARRY, AdaptationMode::Carry),
+    // Preregistered E3 arms: the row-context scope follows the arm (reset =
+    // level, carry = game), as the falsifier was registered; the live
+    // `--context-scope` knob is deliberately not exposed here.
+    for (name, mode, scope) in [
+        (
+            ADAPTATION_FALSIFIER_ARM_RESET,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        ),
+        (
+            ADAPTATION_FALSIFIER_ARM_CARRY,
+            AdaptationMode::Carry,
+            ContextScopeKind::Game,
+        ),
     ] {
-        let mut adapter = FastWeightAdapter::new(model, varmap, device, mode)?;
+        let mut adapter = FastWeightAdapter::new(model, varmap, device, mode, scope)?;
         adapter.set_min_level_transitions(spec.min_level_transitions);
         let accums = timed_eval_phase("adaptation_falsifier", &format!("arm={name}"), || {
             adaptation_falsifier_arm(model, device, histories, spec, Some(&mut adapter))
@@ -10455,7 +10468,13 @@ mod tests {
         };
 
         // One carry episode by hand, inspected before the restore.
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Carry)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Carry,
+            ContextScopeKind::Game,
+        )?;
         adapter.set_min_level_transitions(spec.min_level_transitions);
         adapter.begin_game()?;
         adapter.reseed_reservoir(spec.adapter_seed);

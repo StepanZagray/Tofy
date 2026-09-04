@@ -1127,6 +1127,7 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
             candidate_count: actions.len(),
             phase_a: Some(trace),
             adaptation: None,
+            context_scope: self.context.scope(),
             context_len,
         })
     }
@@ -1361,7 +1362,7 @@ mod tests {
 
     #[test]
     fn phase_a_policy_hands_the_preceding_window_to_the_adapter() -> Result<()> {
-        use crate::p2::adaptation::{AdaptationMode, LiveContext};
+        use crate::p2::adaptation::{ContextScopeKind, LiveContext};
         let mut policy = PhaseAPolicy::new(
             FakeModel::new(0.9),
             PhaseAConfig::default(),
@@ -1369,7 +1370,7 @@ mod tests {
             8,
             8,
         );
-        policy.set_context(LiveContext::new(true, AdaptationMode::Reset));
+        policy.set_context(LiveContext::new(true, ContextScopeKind::Level));
         policy.on_game_start("game");
         let first = policy.choose_action(&observation(0, true))?;
         assert_eq!(first.context_len, 0);
@@ -1387,9 +1388,11 @@ mod tests {
             Some(&3),
             "the window is set before any model call of the decision"
         );
-        // Level 1 (default arm) starts without level 0's transitions.
+        // Level 1 (level scope) starts without level 0's transitions.
         policy.on_level_transition(1);
-        assert_eq!(policy.choose_action(&observation(1, true))?.context_len, 0);
+        let level_one = policy.choose_action(&observation(1, true))?;
+        assert_eq!(level_one.context_len, 0);
+        assert_eq!(level_one.context_scope, ContextScopeKind::Level);
         // Game start empties Factual Memory.
         policy.on_game_start("next-game");
         assert_eq!(policy.choose_action(&observation(0, true))?.context_len, 0);

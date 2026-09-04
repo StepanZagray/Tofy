@@ -6,7 +6,8 @@
 
 use crate::gpu_lock::GpuSessionGuard;
 use crate::p2::adaptation::{
-    context_batch_for, AdaptationMode, AdaptationTrace, FastWeightAdapter, LiveContext,
+    context_batch_for, AdaptationMode, AdaptationTrace, ContextScopeKind, FastWeightAdapter,
+    LiveContext,
 };
 use crate::p2::agent_session::AgentSession;
 use crate::p2::arc3::{first_recorded_decision_observations, ParsedActionInput, RecordingEvent};
@@ -133,6 +134,10 @@ pub struct LiveEvalConfig {
     /// ADR 0005 §6.1 Channel A (`--context-window`): `None` = default (on for
     /// `world_core_v6`); always off on checkpoints without a context channel.
     pub context_window: Option<bool>,
+    /// ADR 0005 §1.5 `--context-scope`: which factual transitions feed the
+    /// window (`game`, the training distribution, by default). Independent of
+    /// `--adapt` / `--adapt-carry`.
+    pub context_scope: ContextScopeKind,
 }
 
 impl LiveEvalConfig {
@@ -1059,6 +1064,9 @@ pub struct ActionDecision {
     /// window is off or empty).
     #[serde(default)]
     pub context_len: usize,
+    /// ADR 0005 §1.5 `--context-scope` the window was drawn from.
+    #[serde(default)]
+    pub context_scope: ContextScopeKind,
 }
 
 pub trait LivePolicy {
@@ -1107,13 +1115,16 @@ pub trait LivePolicy {
 }
 
 /// Build the ADR 0005 §6.2 adapter when `--adapt` is set. `varmap` must be the
-/// VarMap `model` was constructed from; the adapter never sees the checkpoint path.
+/// VarMap `model` was constructed from; the adapter never sees the checkpoint
+/// path. `carry` selects the fast-weight reset arm only; `scope` is the
+/// `--context-scope` of the rows' own contexts (shared with Channel A).
 pub fn adaptation_for<'a>(
     model: &'a WorldModel,
     varmap: &candle_nn::VarMap,
     device: &'a Device,
     adapt: bool,
     carry: bool,
+    scope: ContextScopeKind,
 ) -> Result<Option<FastWeightAdapter<'a>>> {
     if !adapt {
         return Ok(None);
@@ -1123,23 +1134,23 @@ pub fn adaptation_for<'a>(
     } else {
         AdaptationMode::Reset
     };
-    FastWeightAdapter::new(model, varmap, device, mode).map(Some)
+    FastWeightAdapter::new(model, varmap, device, mode, scope).map(Some)
 }
 
 /// Resolve `--context-window` (ADR 0005 §6.1 Channel A) against the loaded
 /// checkpoint: on by default for `world_core_v6`; forced off (a no-op) for
-/// checkpoints without a context channel, which reject any context.
-pub fn live_context_for(model: &WorldModel, requested: Option<bool>, carry: bool) -> LiveContext {
+/// checkpoints without a context channel, which reject any context. `scope`
+/// is `--context-scope` (§1.5), independent of the Channel B arm.
+pub fn live_context_for(
+    model: &WorldModel,
+    requested: Option<bool>,
+    scope: ContextScopeKind,
+) -> LiveContext {
     let v6 = model.config().world_core_v6;
     if !v6 && requested == Some(true) {
         eprintln!("--context-window ignored: the checkpoint is not world_core_v6");
     }
-    let mode = if carry {
-        AdaptationMode::Carry
-    } else {
-        AdaptationMode::Reset
-    };
-    LiveContext::new(v6 && requested.unwrap_or(true), mode)
+    LiveContext::new(v6 && requested.unwrap_or(true), scope)
 }
 
 /// Wraps any controller with Channel B adaptation (ADR 0005 §6.2). With no
@@ -1576,6 +1587,7 @@ impl LivePolicy for ModelPolicy<'_> {
             phase_a: None,
             adaptation: None,
             context_len: window.len(),
+            context_scope: self.context.scope(),
         };
         if let Some(capture) = profile.as_ref() {
             let metrics = capture.phase("metrics", SpanKind::Function, None);
@@ -1695,6 +1707,7 @@ pub(crate) fn decision_telemetry(decision: &ActionDecision) -> Value {
         "predicted_effect": decision.chosen.predicted_effect,
         "candidate_count": decision.candidate_count,
         "context_len": decision.context_len,
+        "context_scope": decision.context_scope,
     });
     if let Some(trace) = &decision.phase_a {
         if let Ok(value) = serde_json::to_value(trace) {
@@ -2544,8 +2557,15 @@ pub fn evaluate_live(config: &LiveEvalConfig) -> Result<LiveEvalReport> {
     let train_config_sha256 = sha256_file(&config.train_config)?;
     let device = resolve_device(&config.device)?;
     let (model, varmap) = load_model(&train_config, &config.checkpoint, &device)?;
-    let adapter = adaptation_for(&model, &varmap, &device, config.adapt, config.adapt_carry)?;
-    let context = live_context_for(&model, config.context_window, config.adapt_carry);
+    let adapter = adaptation_for(
+        &model,
+        &varmap,
+        &device,
+        config.adapt,
+        config.adapt_carry,
+        config.context_scope,
+    )?;
+    let context = live_context_for(&model, config.context_window, config.context_scope);
     let mut api = HttpArcApi::from_env(
         &config.base_url,
         &config.api_key_env,
@@ -3378,6 +3398,7 @@ mod tests {
                 phase_a: None,
                 adaptation: None,
                 context_len: 0,
+                context_scope: ContextScopeKind::default(),
             })
         }
     }
@@ -4175,7 +4196,7 @@ mod tests {
         let device = Device::Cpu;
         let (model, _varmap) = tiny_live_model(&device, true)?;
         let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
-        let context = live_context_for(&model, None, false);
+        let context = live_context_for(&model, None, ContextScopeKind::Level);
         assert!(context.enabled(), "v6 defaults to Channel A on");
         policy.set_context(context);
         policy.on_game_start("demo");
@@ -4200,13 +4221,22 @@ mod tests {
         }
         let decision = policy.choose_action(&observation)?;
         assert_eq!(decision.context_len, 3);
+        assert_eq!(decision.context_scope, ContextScopeKind::Level);
         assert_eq!(decision_telemetry(&decision)["context_len"], json!(3));
-        // Another level sees none of level 0's transitions (default arm).
+        assert_eq!(
+            decision_telemetry(&decision)["context_scope"],
+            json!("level")
+        );
+        // Another level sees none of level 0's transitions (level scope).
         let mut later = observation.clone();
         later.levels_completed = 1;
         assert_eq!(policy.choose_action(&later)?.context_len, 0);
         // `--context-window=false` keeps a v6 policy on the legacy path.
-        policy.set_context(live_context_for(&model, Some(false), false));
+        policy.set_context(live_context_for(
+            &model,
+            Some(false),
+            ContextScopeKind::Level,
+        ));
         observe_transitions(&mut policy, 3, 0);
         assert_eq!(policy.choose_action(&observation)?.context_len, 0);
         Ok(())
@@ -4216,7 +4246,7 @@ mod tests {
     fn v5_checkpoint_forces_the_context_window_off_without_error() -> Result<()> {
         let device = Device::Cpu;
         let (model, _varmap) = tiny_live_model(&device, false)?;
-        let context = live_context_for(&model, Some(true), true);
+        let context = live_context_for(&model, Some(true), ContextScopeKind::Game);
         assert!(!context.enabled(), "non-v6 checkpoints reject context");
         let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
         policy.set_context(context);
@@ -4233,7 +4263,7 @@ mod tests {
         let device = Device::Cpu;
         let (model, _varmap) = tiny_live_model(&device, true)?;
         let mut policy = ModelPolicy::new(&model, &device, 4, 4, 32, DEFAULT_TRIED_PENALTY);
-        policy.set_context(live_context_for(&model, None, false));
+        policy.set_context(live_context_for(&model, None, ContextScopeKind::Game));
         let opening = scripted_observation("NOT_FINISHED", 0);
         let mut mid = scripted_observation("NOT_FINISHED", 0);
         mid.frame = frame(5);
@@ -4291,9 +4321,24 @@ mod tests {
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
         )?;
         let theta0 = varmap_bits(&varmap)?;
-        let adapter = adaptation_for(&model, &varmap, &device, true, false)?;
+        let adapter = adaptation_for(
+            &model,
+            &varmap,
+            &device,
+            true,
+            false,
+            ContextScopeKind::Game,
+        )?;
         assert!(adapter.is_some());
-        assert!(adaptation_for(&model, &varmap, &device, false, false)?.is_none());
+        assert!(adaptation_for(
+            &model,
+            &varmap,
+            &device,
+            false,
+            false,
+            ContextScopeKind::Game
+        )?
+        .is_none());
         let mut policy = AdaptingPolicy::new(RecordingPolicy::default(), adapter);
 
         let opening = scripted_observation("NOT_FINISHED", 0);
