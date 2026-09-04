@@ -2790,6 +2790,10 @@ fn forward_gate_rows_chunked(
 ) -> Result<Tensor> {
     let rows = current.dim(0)?;
     let chunk = chunk.max(1);
+    // Evaluation never back-propagates, but every candle op output keeps its
+    // inputs alive as autograd history. Without `detach`, concatenating the
+    // chunk outputs would pin every chunk's activations (context encoder,
+    // all recursion steps) at once, and chunking would bound nothing.
     if rows <= chunk {
         return Ok(model
             .forward_from_latent_with_depth_and_operator_conditioning_with_context(
@@ -2801,7 +2805,8 @@ fn forward_gate_rows_chunked(
                 context,
                 depth,
             )?
-            .y);
+            .y
+            .detach());
     }
     let mut parts = Vec::with_capacity(rows.div_ceil(chunk));
     let mut start = 0;
@@ -2825,7 +2830,8 @@ fn forward_gate_rows_chunked(
                     chunk_context.as_ref(),
                     depth,
                 )?
-                .y,
+                .y
+                .detach(),
         );
         start += len;
     }
@@ -2850,7 +2856,9 @@ fn encode_gate_support_population(
     device: &Device,
 ) -> Result<EncodedGateSupportPopulation> {
     let batch = batch_from_samples(samples, device)?;
+    // Detached: the encoder graph over the whole population is never needed.
     let (current, target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let (current, target) = (current.detach(), target.detach());
     let shuffled = shuffled_action_control_population(samples, provenance)?;
     let (shuffled_actions, shuffled_coords) =
         action_tensors_from_samples(&shuffled.samples, device)?;
