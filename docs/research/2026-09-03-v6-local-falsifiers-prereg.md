@@ -108,3 +108,22 @@ earlier 2.1 h estimate; the first attempt at 2x2 (physical 128 x accum 2)
 measured 1.60 s/step. Any 2x2-vs-3x3 comparison is a separate preregistered
 ablation, not part of E2: E2 is a data-contract screen and both arms of its
 own comparison (K=0 vs K=16) share one checkpoint and therefore one depth.
+
+## Amendment (2026-09-04): which statistic the §5.1 threshold applies to
+
+Code review (2026-09-04) found that `p2-eval --context-ablation` scores the
+generic held-out mixed population (legacy streams plus LearningHistories rows
+with K ~ Uniform{0..16}) with and without context, not the preregistered
+"512 twin-pair meta-episodes, K = 0 vs K = 16" population. Legacy rows and
+K = 0 rows contribute exactly zero delta, so `overall.delta` is diluted by
+roughly 2x or more. Before any result is read, the rule is fixed as follows:
+
+- The `>= 0.05` threshold applies to the **`5-16` context-length stratum**
+  delta (rows whose generated window has K >= 5, scored with their window vs
+  with K = 0), which is the closest implemented proxy for the preregistered
+  statistic. `overall.delta` is reported but is not the gate.
+- This is a weaker test than K = 16 exactly (windows of 5..16, mean ~10);
+  an exact K = 0 vs K = 16 twin-pair evaluation remains to be implemented and
+  will supersede this rule when it exists.
+- E2's checkpoint was trained at effective batch 256 and depth 3x3; the
+  screen is a data-contract decision only.

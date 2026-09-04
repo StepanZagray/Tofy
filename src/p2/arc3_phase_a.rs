@@ -505,9 +505,15 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         }
     }
 
-    fn gameplay_matches(decoded: &[u8], observed: &[u8]) -> bool {
-        // Composed decode covers rows 0..63; the status row is excluded.
-        let rows = decoded.len().min(63 * FRAME_SIDE);
+    fn gameplay_matches(decoded: &[u8], observed: &[u8], whole_frame: bool) -> bool {
+        // Legacy decoders cover rows 0..63 (the status row is excluded); v6
+        // decoders cover the whole frame (ADR 0005 §1.1).
+        let board = if whole_frame {
+            FRAME_PIXELS
+        } else {
+            63 * FRAME_SIDE
+        };
+        let rows = decoded.len().min(board);
         decoded[..rows] == observed[..rows]
     }
 
@@ -523,6 +529,7 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         };
         let channel = Self::observed_channel(observation, pending.prev_levels);
         let noop = pending.prev_pixels == pixels;
+        let whole_frame = self.adapter.whole_frame();
         let board_effect = pending
             .prev_pixels
             .iter()
@@ -532,7 +539,7 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         let exact_match = pending
             .decoded
             .as_deref()
-            .is_some_and(|decoded| Self::gameplay_matches(decoded, pixels));
+            .is_some_and(|decoded| Self::gameplay_matches(decoded, pixels, whole_frame));
         let edge = FactualEdge {
             action: pending.key.clone(),
             next_raw_id: Some(id),
@@ -943,7 +950,13 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
                         decodes += 1;
                         let mut end_pixels = decoded.clone();
                         end_pixels.resize(FRAME_PIXELS, 0);
-                        end_pixels[63 * FRAME_SIDE..].copy_from_slice(&pixels[63 * FRAME_SIDE..]);
+                        let whole_frame = self.adapter.whole_frame();
+                        if !whole_frame {
+                            // Legacy decoders never predict the status row;
+                            // carry the observed one. v6 predicts all 64 rows.
+                            end_pixels[63 * FRAME_SIDE..]
+                                .copy_from_slice(&pixels[63 * FRAME_SIDE..]);
+                        }
                         let Some(end_inventory) =
                             plain_frame(&end_pixels).map(|f| feature_inventory(&f))
                         else {
