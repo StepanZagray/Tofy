@@ -2,6 +2,7 @@
 name = "tofy"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 description = "Recursive world-model experiments for hidden-objective discovery and planning"
 
 [features]

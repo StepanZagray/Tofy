@@ -3,7 +3,8 @@
 use crate::p2::cg_profile::ProfileState;
 use crate::p2::experiment::{ResolvedExperiment, TrainingRecipe, WorldCoreFamily};
 use crate::p2::train::{
-    GradientPressureDiagnostics, RunAttempt, TrainConfig, TrainReport, TrainStatus,
+    read_run_attempts, GradientPressureDiagnostics, RunAttempt, RunAttemptRepairState, TrainConfig,
+    TrainReport, TrainStatus,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::{collections::BTreeSet, io::ErrorKind};
 
-pub const EVIDENCE_MANIFEST_SCHEMA: &str = "tofy/p2/evidence/1";
+pub const EVIDENCE_MANIFEST_SCHEMA: &str = "tofy/p2/evidence/2";
 pub const EVIDENCE_MANIFEST_FILE: &str = "evidence_manifest.json";
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -25,26 +27,63 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// visible as a claim rather than as an absent key.
 pub const UNKNOWN_PROVENANCE: &str = "unknown";
 
-/// Identity of the running trainer, captured once per process at launch:
-/// the source revision (git HEAD of the tree the binary was built from, or of
-/// the working directory as a fallback), whether that tree carried
-/// uncommitted changes, the executable's SHA-256, and the sibling
-/// `candle_graph` checkout the profile evidence depends on. Every value falls
-/// back to [`UNKNOWN_PROVENANCE`] rather than being dropped.
+fn unknown_string() -> String {
+    UNKNOWN_PROVENANCE.into()
+}
+
+/// Runtime checkout context. This is diagnostic context only and is never
+/// presented as the source identity of the already-built executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCheckoutProvenance {
+    pub path: PathBuf,
+    pub revision: String,
+    #[serde(default)]
+    pub dirty: Option<bool>,
+}
+
+impl Default for RuntimeCheckoutProvenance {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from(UNKNOWN_PROVENANCE),
+            revision: UNKNOWN_PROVENANCE.into(),
+            dirty: None,
+        }
+    }
+}
+
+/// Identity of the running trainer, captured once per process. Source,
+/// dependency, target, profile, and feature claims are embedded by `build.rs`;
+/// runtime git inspection is recorded separately and cannot redefine them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchProvenance {
     pub source_revision: String,
-    /// Where `source_revision` came from: `git:<tree>`,
-    /// `env:TOFY_SOURCE_REVISION`, or `unknown`.
+    /// `embedded-build:git`, an explicit build-time environment field, or
+    /// `unknown`. A runtime checkout is never a valid origin here.
     pub source_revision_origin: String,
-    /// `None` when the tree state could not be inspected (env override or no git).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Includes tracked and untracked source changes.
+    #[serde(default)]
     pub source_dirty: Option<bool>,
+    /// Whether the embedded source revision was reachable from its configured
+    /// upstream at build time. `None` means the fact was not knowable.
+    #[serde(default)]
+    pub source_pushed: Option<bool>,
+    #[serde(default = "unknown_string")]
+    pub build_command: String,
+    #[serde(default)]
+    pub cargo_features: Vec<String>,
+    #[serde(default = "unknown_string")]
+    pub cargo_profile: String,
+    #[serde(default = "unknown_string")]
+    pub cargo_target: String,
     pub binary_path: PathBuf,
     pub binary_sha256: String,
     pub candle_graph_revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub candle_graph_dirty: Option<bool>,
+    #[serde(default)]
+    pub candle_graph_pushed: Option<bool>,
+    #[serde(default)]
+    pub runtime_checkout: RuntimeCheckoutProvenance,
 }
 
 impl LaunchProvenance {
@@ -54,15 +93,24 @@ impl LaunchProvenance {
             source_revision: UNKNOWN_PROVENANCE.into(),
             source_revision_origin: UNKNOWN_PROVENANCE.into(),
             source_dirty: None,
+            source_pushed: None,
+            build_command: UNKNOWN_PROVENANCE.into(),
+            cargo_features: Vec::new(),
+            cargo_profile: UNKNOWN_PROVENANCE.into(),
+            cargo_target: UNKNOWN_PROVENANCE.into(),
             binary_path: binary.to_path_buf(),
             binary_sha256: UNKNOWN_PROVENANCE.into(),
             candle_graph_revision: UNKNOWN_PROVENANCE.into(),
             candle_graph_dirty: None,
+            candle_graph_pushed: None,
+            runtime_checkout: RuntimeCheckoutProvenance::default(),
         }
     }
 
     pub fn source_revision_known(&self) -> bool {
         self.source_revision != UNKNOWN_PROVENANCE
+            && (self.source_revision_origin.starts_with("embedded-build:")
+                || self.source_revision_origin.starts_with("build-env:"))
     }
 }
 
@@ -78,43 +126,46 @@ fn capture_launch_provenance() -> LaunchProvenance {
     let binary_sha256 = hash_file(&binary_path)
         .map(|(_, sha256)| sha256)
         .unwrap_or_else(|_| UNKNOWN_PROVENANCE.into());
-    // The tree this binary was compiled from is the most faithful source
-    // identity; the launch directory is the fallback for relocated binaries.
-    let build_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut candidates = vec![build_tree.clone()];
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd);
-    }
-    let mut source = None;
-    for tree in &candidates {
-        if let Some(revision) = git_head(tree) {
-            source = Some((revision, format!("git:{}", tree.display()), git_dirty(tree)));
-            break;
-        }
-    }
-    let (source_revision, source_revision_origin, source_dirty) = source
-        .or_else(|| {
-            std::env::var("TOFY_SOURCE_REVISION")
-                .ok()
-                .map(|revision| revision.trim().to_string())
-                .filter(|revision| !revision.is_empty())
-                .map(|revision| (revision, "env:TOFY_SOURCE_REVISION".to_string(), None))
+    let runtime_checkout = std::env::current_dir()
+        .ok()
+        .map(|path| RuntimeCheckoutProvenance {
+            revision: git_head(&path).unwrap_or_else(|| UNKNOWN_PROVENANCE.into()),
+            dirty: git_dirty(&path),
+            path,
         })
-        .unwrap_or_else(|| (UNKNOWN_PROVENANCE.into(), UNKNOWN_PROVENANCE.into(), None));
-    let candle_graph = build_tree.join("..").join("candle_graph");
-    let (candle_graph_revision, candle_graph_dirty) = match git_head(&candle_graph) {
-        Some(revision) => (revision, git_dirty(&candle_graph)),
-        None => (UNKNOWN_PROVENANCE.into(), None),
-    };
+        .unwrap_or_default();
     LaunchProvenance {
-        source_revision,
-        source_revision_origin,
-        source_dirty,
+        source_revision: env!("TOFY_EMBEDDED_SOURCE_REVISION").into(),
+        source_revision_origin: env!("TOFY_EMBEDDED_SOURCE_REVISION_ORIGIN").into(),
+        source_dirty: parse_embedded_bool(env!("TOFY_EMBEDDED_SOURCE_DIRTY")),
+        source_pushed: parse_embedded_bool(env!("TOFY_EMBEDDED_SOURCE_PUSHED")),
+        build_command: env!("TOFY_EMBEDDED_BUILD_COMMAND").into(),
+        cargo_features: parse_embedded_features(env!("TOFY_EMBEDDED_CARGO_FEATURES")),
+        cargo_profile: env!("TOFY_EMBEDDED_CARGO_PROFILE").into(),
+        cargo_target: env!("TOFY_EMBEDDED_CARGO_TARGET").into(),
         binary_path,
         binary_sha256,
-        candle_graph_revision,
-        candle_graph_dirty,
+        candle_graph_revision: env!("TOFY_EMBEDDED_CANDLE_GRAPH_REVISION").into(),
+        candle_graph_dirty: parse_embedded_bool(env!("TOFY_EMBEDDED_CANDLE_GRAPH_DIRTY")),
+        candle_graph_pushed: parse_embedded_bool(env!("TOFY_EMBEDDED_CANDLE_GRAPH_PUSHED")),
+        runtime_checkout,
     }
+}
+
+fn parse_embedded_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_embedded_features(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn git_head(tree: &Path) -> Option<String> {
@@ -138,7 +189,7 @@ fn git_dirty(tree: &Path) -> Option<bool> {
     let output = Command::new("git")
         .arg("-C")
         .arg(tree)
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        .args(["status", "--porcelain", "--untracked-files=normal"])
         .output()
         .ok()?;
     output
@@ -243,6 +294,7 @@ fn publish_training_evidence_with_provenance(
     launch: &LaunchProvenance,
 ) -> Result<PathBuf> {
     fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    preserve_prior_evidence(run_dir)?;
     let canonical_run_dir = run_dir
         .canonicalize()
         .with_context(|| format!("canonicalize {}", run_dir.display()))?;
@@ -255,6 +307,13 @@ fn publish_training_evidence_with_provenance(
         bail!(
             "published train report does not match the completed in-memory report: {}",
             report_path.display()
+        );
+    }
+    let journal_attempts = read_run_attempts(run_dir)?;
+    if journal_attempts != report.run_attempts {
+        bail!(
+            "run attempt journal does not match the published training report: {}",
+            run_dir.join("run_attempts.jsonl").display()
         );
     }
 
@@ -282,9 +341,27 @@ fn publish_training_evidence_with_provenance(
             report.latest_checkpoint.join("trainer_state.json"),
         ),
         ("checkpoint_latest", run_dir.join("checkpoints/latest.json")),
+        ("run_attempt_journal", run_dir.join("run_attempts.jsonl")),
     ] {
         push_artifact(&mut artifacts, &canonical_run_dir, role, &path, false)?;
     }
+    let loss_log = run_dir.join("loss_log.jsonl");
+    if loss_log.is_file() {
+        push_artifact(
+            &mut artifacts,
+            &canonical_run_dir,
+            "active_loss_log",
+            &loss_log,
+            false,
+        )?;
+    }
+    push_repair_sidecars(
+        &mut artifacts,
+        &canonical_run_dir,
+        run_dir,
+        &report.run_attempts,
+    )?;
+    push_prior_evidence(&mut artifacts, &canonical_run_dir, run_dir)?;
     if let Some(export) = report.export_checkpoint.as_deref() {
         push_artifact(
             &mut artifacts,
@@ -320,19 +397,8 @@ fn publish_training_evidence_with_provenance(
     let gradient_pressure = (!pressure_samples.is_empty())
         .then(|| bind_gradient_pressure(pressure_samples))
         .transpose()?;
-    let bundle_sha256 = bundle_sha256(&artifacts, gradient_pressure.as_ref());
     let mut gaps = Vec::new();
-    if !launch.source_revision_known() {
-        gaps.push(
-            "source revision unavailable (no git tree found); set TOFY_SOURCE_REVISION".into(),
-        );
-    }
-    if launch.source_dirty == Some(true) {
-        gaps.push("source tree had uncommitted changes at launch".into());
-    }
-    if launch.candle_graph_revision == UNKNOWN_PROVENANCE {
-        gaps.push("sibling candle_graph revision unavailable".into());
-    }
+    append_provenance_gaps(&mut gaps, "publishing binary", launch);
     if matches!(report.profile, ProfileState::Pending) {
         gaps.push("representative-update profile was not published".into());
     }
@@ -340,18 +406,51 @@ fn publish_training_evidence_with_provenance(
     let resume_count = report.resume_count;
     if report.run_attempts.is_empty() {
         gaps.push("run attempt history unavailable (report predates attempt records)".into());
-    } else if let Some(repaired) = report
-        .run_attempts
+    } else {
+        for attempt in &report.run_attempts {
+            append_provenance_gaps(
+                &mut gaps,
+                &format!("attempt {} binary", attempt.attempt),
+                &attempt.provenance,
+            );
+            match attempt.repair_state {
+                RunAttemptRepairState::Pending => gaps.push(format!(
+                    "attempt {} has no durable repair result (the process may have stopped mid-repair)",
+                    attempt.attempt
+                )),
+                RunAttemptRepairState::Failed => gaps.push(format!(
+                    "attempt {} loss-log repair failed: {}",
+                    attempt.attempt,
+                    attempt.repair_failure.as_deref().unwrap_or(UNKNOWN_PROVENANCE)
+                )),
+                RunAttemptRepairState::Completed => {}
+            }
+        }
+        if let Some(repaired) = report
+            .run_attempts
+            .iter()
+            .filter_map(|attempt| attempt.loss_log_repair.as_ref())
+            .filter(|repair| repair.rows_removed > 0)
+            .map(|repair| repair.rows_removed)
+            .reduce(|a, b| a + b)
+        {
+            gaps.push(format!(
+                "loss log was repaired on resume: {repaired} stale row(s) moved to attempt sidecars"
+            ));
+        }
+    }
+    let orphan_sidecars = artifacts
         .iter()
-        .filter_map(|attempt| attempt.loss_log_repair.as_ref())
-        .filter(|repair| repair.rows_removed > 0)
-        .map(|repair| repair.rows_removed)
-        .reduce(|a, b| a + b)
-    {
+        .filter(|artifact| artifact.role == "orphan_loss_log_repair_sidecar")
+        .count();
+    if orphan_sidecars > 0 {
         gaps.push(format!(
-            "loss log was repaired on resume: {repaired} stale row(s) moved to attempt sidecars"
+            "{orphan_sidecars} orphan loss-log repair sidecar(s) indicate an interrupted or legacy repair"
         ));
     }
+    gaps.sort();
+    gaps.dedup();
+    let bundle_sha256 = bundle_sha256(&artifacts, gradient_pressure.as_ref());
     let manifest = EvidenceManifest {
         schema: EVIDENCE_MANIFEST_SCHEMA.into(),
         identity,
@@ -384,6 +483,168 @@ fn publish_training_evidence_with_provenance(
     let path = run_dir.join(EVIDENCE_MANIFEST_FILE);
     write_json_atomic(&path, &manifest)?;
     Ok(path)
+}
+
+fn append_provenance_gaps(gaps: &mut Vec<String>, label: &str, provenance: &LaunchProvenance) {
+    if !provenance.source_revision_known() {
+        gaps.push(format!(
+            "{label}: build source revision is unknown or not build-bound"
+        ));
+    }
+    match provenance.source_dirty {
+        Some(true) => gaps.push(format!(
+            "{label}: build source included tracked or untracked changes"
+        )),
+        None => gaps.push(format!("{label}: build source dirty state is unknown")),
+        Some(false) => {}
+    }
+    match provenance.source_pushed {
+        Some(false) => gaps.push(format!(
+            "{label}: build source revision was not on its configured upstream"
+        )),
+        None => gaps.push(format!("{label}: build source pushed state is unknown")),
+        Some(true) => {}
+    }
+    if provenance.build_command == UNKNOWN_PROVENANCE {
+        gaps.push(format!("{label}: build command is unknown"));
+    }
+    if provenance.cargo_profile == UNKNOWN_PROVENANCE {
+        gaps.push(format!("{label}: Cargo profile is unknown"));
+    }
+    if provenance.cargo_target == UNKNOWN_PROVENANCE {
+        gaps.push(format!("{label}: Cargo target is unknown"));
+    }
+    if provenance.candle_graph_revision == UNKNOWN_PROVENANCE {
+        gaps.push(format!("{label}: candle_graph build revision is unknown"));
+    }
+    match provenance.candle_graph_dirty {
+        Some(true) => gaps.push(format!(
+            "{label}: candle_graph build source included tracked or untracked changes"
+        )),
+        None => gaps.push(format!("{label}: candle_graph dirty state is unknown")),
+        Some(false) => {}
+    }
+    match provenance.candle_graph_pushed {
+        Some(false) => gaps.push(format!(
+            "{label}: candle_graph revision was not on its configured upstream"
+        )),
+        None => gaps.push(format!("{label}: candle_graph pushed state is unknown")),
+        Some(true) => {}
+    }
+}
+
+/// Preserve an evidence/1 manifest before publishing evidence/2 at the
+/// canonical entry point. Re-publication of v2 is still atomic and stable.
+fn preserve_prior_evidence(run_dir: &Path) -> Result<()> {
+    let current = run_dir.join(EVIDENCE_MANIFEST_FILE);
+    if !current.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(&current).with_context(|| format!("read {}", current.display()))?;
+    let schema = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("schema")?.as_str().map(str::to_owned));
+    if schema.as_deref() == Some(EVIDENCE_MANIFEST_SCHEMA) {
+        return Ok(());
+    }
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let archive = run_dir.join(format!("evidence_manifest.prior-{}.json", &digest[..16]));
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&archive)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .with_context(|| format!("preserve {}", archive.display()))?;
+            File::open(run_dir)?.sync_all()?;
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if fs::read(&archive)? != bytes {
+                bail!("prior evidence archive collision at {}", archive.display());
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {}", archive.display()));
+        }
+    }
+    Ok(())
+}
+
+fn push_prior_evidence(
+    artifacts: &mut Vec<ArtifactDigest>,
+    canonical_run_dir: &Path,
+    run_dir: &Path,
+) -> Result<()> {
+    let mut paths = fs::read_dir(run_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("evidence_manifest.prior-")
+                })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        push_artifact(
+            artifacts,
+            canonical_run_dir,
+            "prior_evidence_manifest",
+            &path,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn push_repair_sidecars(
+    artifacts: &mut Vec<ArtifactDigest>,
+    canonical_run_dir: &Path,
+    run_dir: &Path,
+    attempts: &[RunAttempt],
+) -> Result<()> {
+    let mut referenced = BTreeSet::new();
+    for path in attempts
+        .iter()
+        .filter_map(|attempt| attempt.loss_log_repair.as_ref())
+        .filter_map(|repair| repair.removed_rows_path.as_ref())
+    {
+        referenced.insert(path.canonicalize().with_context(|| {
+            format!("canonicalize referenced repair sidecar {}", path.display())
+        })?);
+    }
+    let mut discovered = fs::read_dir(run_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("loss_log.jsonl.attempt-")
+                })
+        })
+        .collect::<Vec<_>>();
+    discovered.sort();
+    for path in discovered {
+        let canonical = path.canonicalize()?;
+        let role = if referenced.remove(&canonical) {
+            "loss_log_repair_sidecar"
+        } else {
+            "orphan_loss_log_repair_sidecar"
+        };
+        push_artifact(artifacts, canonical_run_dir, role, &path, false)?;
+    }
+    if let Some(missing) = referenced.into_iter().next() {
+        bail!(
+            "referenced loss-log repair sidecar is missing from run directory: {}",
+            missing.display()
+        );
+    }
+    Ok(())
 }
 
 /// Treatment flags come from the published `config.json` so the manifest
@@ -514,7 +775,7 @@ fn bundle_sha256(
     pressure: Option<&GradientPressureBinding>,
 ) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"tofy.p2.evidence.bundle.v1\0");
+    hash.update(b"tofy.p2.evidence.bundle.v2\0");
     for artifact in artifacts {
         for value in [
             artifact.role.as_bytes(),
@@ -594,6 +855,7 @@ mod tests {
     use crate::p2::data::EventLabelCensus;
     use crate::p2::train::{
         FoundationV2LossMeans, FoundationV2TrainingReport, PromotionMetric, RunAttemptKind,
+        RunAttemptRepairState,
     };
 
     fn write(path: &Path, contents: &[u8]) {
@@ -678,6 +940,22 @@ mod tests {
             displacement_health_weighted_l2: None,
             displacement_health_to_next_ratio: None,
         };
+        let launch = LaunchProvenance {
+            source_revision: "deadbeef".into(),
+            source_revision_origin: "embedded-build:test".into(),
+            source_dirty: Some(false),
+            source_pushed: Some(true),
+            build_command: "cargo test evidence".into(),
+            cargo_features: vec!["jemalloc".into()],
+            cargo_profile: "test".into(),
+            cargo_target: "test-target".into(),
+            binary_path: binary.clone(),
+            binary_sha256: hash_file(&binary)?.1,
+            candle_graph_revision: "cafef00d".into(),
+            candle_graph_dirty: Some(false),
+            candle_graph_pushed: Some(true),
+            runtime_checkout: RuntimeCheckoutProvenance::default(),
+        };
         let report = TrainReport {
             schema: "p2.train_report.v7".into(),
             world_core_schema: "legacy_p2_eval_compatible".into(),
@@ -740,8 +1018,10 @@ mod tests {
                     pid: 1,
                     resumed_from: None,
                     resumed_step: None,
-                    provenance: LaunchProvenance::unknown(&binary),
+                    provenance: launch.clone(),
+                    repair_state: RunAttemptRepairState::Completed,
                     loss_log_repair: None,
+                    repair_failure: None,
                 },
                 RunAttempt {
                     attempt: 2,
@@ -750,25 +1030,38 @@ mod tests {
                     pid: 2,
                     resumed_from: Some(checkpoint.clone()),
                     resumed_step: Some(7),
-                    provenance: LaunchProvenance::unknown(&binary),
+                    provenance: launch.clone(),
+                    repair_state: RunAttemptRepairState::Completed,
                     loss_log_repair: None,
+                    repair_failure: None,
                 },
             ],
         };
+        let attempt_journal = report
+            .run_attempts
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n")
+            + "\n";
+        write(&root.join("run_attempts.jsonl"), attempt_journal.as_bytes());
+        write(
+            &root.join("loss_log.jsonl"),
+            b"{\"global_step\":7,\"total\":1.0}\n",
+        );
+        write(
+            &root.join("loss_log.jsonl.attempt-99"),
+            b"{\"global_step\":8,\"orphan\":true}\n",
+        );
         write(
             &root.join("train_report.json"),
             &serde_json::to_vec_pretty(&report)?,
         );
+        write(
+            &root.join(EVIDENCE_MANIFEST_FILE),
+            b"{\"schema\":\"tofy/p2/evidence/1\",\"legacy\":true}\n",
+        );
 
-        let launch = LaunchProvenance {
-            source_revision: "deadbeef".into(),
-            source_revision_origin: "git:test".into(),
-            source_dirty: Some(false),
-            binary_path: binary.clone(),
-            binary_sha256: hash_file(&binary)?.1,
-            candle_graph_revision: "cafef00d".into(),
-            candle_graph_dirty: Some(false),
-        };
         let path = publish_training_evidence_with_provenance(&root, &report, &binary, &launch)?;
         let first_publication = fs::read(&path)?;
         publish_training_evidence_with_provenance(&root, &report, &binary, &launch)?;
@@ -789,7 +1082,7 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.contains("treatment flags unknown")));
-        assert_eq!(manifest.artifacts.len(), 15);
+        assert_eq!(manifest.artifacts.len(), 19);
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.role == "checkpoint_optimizer"
                 && artifact.path == "checkpoints/step-000000000007/optimizer.safetensors"
@@ -808,8 +1101,20 @@ mod tests {
             6
         );
         assert_eq!(manifest.gradient_pressure.unwrap().updates, vec![3]);
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.role == "prior_evidence_manifest"));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.role == "orphan_loss_log_repair_sidecar"));
         assert!(manifest.bundle_sha256.starts_with("sha256:"));
-        assert_eq!(manifest.gaps.len(), 1, "{:?}", manifest.gaps);
+        assert_eq!(manifest.gaps.len(), 2, "{:?}", manifest.gaps);
+        assert!(manifest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("orphan loss-log repair sidecar")));
         let mut mismatched_report = report.clone();
         mismatched_report.global_step += 1;
         assert!(publish_training_evidence_with_provenance(
@@ -844,8 +1149,8 @@ mod tests {
         assert!(!first.candle_graph_revision.is_empty());
         if first.source_revision_known() {
             assert!(
-                first.source_revision_origin.starts_with("git:")
-                    || first.source_revision_origin.starts_with("env:")
+                first.source_revision_origin.starts_with("embedded-build:")
+                    || first.source_revision_origin.starts_with("build-env:")
             );
         } else {
             assert_eq!(first.source_revision_origin, UNKNOWN_PROVENANCE);
@@ -853,5 +1158,54 @@ mod tests {
         let json = serde_json::to_value(first).unwrap();
         assert!(json["source_revision"].is_string());
         assert!(json["binary_sha256"].is_string());
+        assert!(json["source_dirty"].is_boolean() || json["source_dirty"].is_null());
+        assert!(json["source_pushed"].is_boolean() || json["source_pushed"].is_null());
+        assert!(json["build_command"].is_string());
+        assert!(json["cargo_features"].is_array());
+        assert!(json["cargo_profile"].is_string());
+        assert!(json["cargo_target"].is_string());
+        assert!(json["runtime_checkout"].is_object());
+    }
+
+    #[test]
+    fn embedded_build_metadata_parsing_is_deterministic() {
+        assert_eq!(parse_embedded_bool("true"), Some(true));
+        assert_eq!(parse_embedded_bool("false"), Some(false));
+        assert_eq!(parse_embedded_bool("unknown"), None);
+        assert_eq!(parse_embedded_bool("TRUE"), None);
+        assert_eq!(
+            parse_embedded_features("cuda,cudnn,jemalloc"),
+            ["cuda", "cudnn", "jemalloc"]
+        );
+        assert!(parse_embedded_features("").is_empty());
+    }
+
+    #[test]
+    fn unknown_dirty_and_unpushed_builds_are_explicit_evidence_gaps() {
+        let mut provenance = LaunchProvenance::unknown(Path::new("binary"));
+        provenance.source_revision = "deadbeef".into();
+        provenance.source_revision_origin = "embedded-build:test".into();
+        provenance.source_dirty = Some(true);
+        provenance.source_pushed = Some(false);
+        let mut gaps = Vec::new();
+        append_provenance_gaps(&mut gaps, "test", &provenance);
+        assert!(gaps.iter().any(|gap| gap.contains("tracked or untracked")));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.contains("not on its configured upstream")));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.contains("build command is unknown")));
+
+        provenance.source_dirty = None;
+        provenance.source_pushed = None;
+        gaps.clear();
+        append_provenance_gaps(&mut gaps, "test", &provenance);
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.contains("dirty state is unknown")));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap.contains("pushed state is unknown")));
     }
 }
