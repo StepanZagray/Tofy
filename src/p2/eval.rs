@@ -12706,7 +12706,7 @@ mod tests {
         // chronological rows are not guaranteed to be eight unique factual
         // queries, so t = 8 can correctly remain in warm-up; by t = 16 this
         // registered population member has crossed the production warm-up.
-        let mut factual = FactualBuffer::new(AdaptationMode::Reset);
+        let mut factual = FactualBuffer::new(ContextScopeKind::Game);
         for position in 0..16 {
             let row = &history.chronological_row(position).transition;
             factual.push(
@@ -13008,6 +13008,13 @@ mod tests {
         )?;
         let census = twin_memorization_census(&pairs, spec.context_len);
         validate_twin_memorization_census(&spec, &census)?;
+        let fingerprint = learning_history_population_fingerprint(
+            pairs.iter().flat_map(|pair| [&pair.primary, &pair.twin]),
+        );
+        assert_eq!(
+            fingerprint,
+            "sha256:484e8615e41102895997ddb9bec19665604fb7f62d21db9cc5ecea1470e58f42"
+        );
         assert_eq!(
             census,
             TwinMemorizationCensus {

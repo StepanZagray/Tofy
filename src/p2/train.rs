@@ -1638,12 +1638,12 @@ impl TrainConfig {
         self.warm_start_y = true;
         self.hidden_dim = 128;
         self.action_dim = 32;
-        // ADR 0005 §3.5: v6 recurses 3x3 (nine block applications). The block
-        // holds two 3x3 convolutions, so 2x2 propagates information eight
-        // cells -- a 17-cell receptive field on the 16x16 latent grid, exactly
-        // the grid width with no margin for board-wide effects such as a
-        // switch opening a distant door. 3x3 reaches 25 cells at 2.25x
-        // dynamics compute. v5 keeps 2x2 so legacy runs stay reproducible.
+        // ADR 0005 §3.5: each outer iteration executes `inner_steps + 1`
+        // applications of the two-convolution residual block. Thus 2x2 is 6
+        // blocks / 12 convolutions / receptive field 25, while 3x3 is 12 / 24
+        // / 49. Both already cover the 16x16 latent grid; 3x3 is the recorded
+        // v6 owner choice under a preregistered depth screen, not a proven
+        // receptive-field necessity. v5 stays 2x2 for reproducibility.
         let depth = if self.world_core_v6 {
             self.v6_recursion_steps
         } else {
