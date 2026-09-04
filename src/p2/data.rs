@@ -5131,10 +5131,94 @@ impl MixedStreamBatch {
     }
 }
 
-/// Movement transitions per level of a Learning History (ADR 0005 §2.2).
+/// Movement transitions per level of a TRAINING Learning History (ADR 0005
+/// §2.2); see [`LearningHistoryConfig::training`].
 pub const LEARNING_HISTORY_STEPS_PER_LEVEL: usize = 6;
-/// Level counts a Learning History may have (ADR 0005 §2.2).
+/// Level counts a TRAINING Learning History may have (ADR 0005 §2.2).
 pub const LEARNING_HISTORY_LEVELS: [usize; 3] = [2, 3, 4];
+/// Movement transitions per level of the EXTENDED evaluation histories
+/// ([`LearningHistoryConfig::extended_evaluation`]): long enough for the
+/// production Channel B warm-up (`ADAPT_MIN_LEVEL_TRANSITIONS = 8`) to be met
+/// inside one level.
+pub const LEARNING_HISTORY_EVAL_STEPS_PER_LEVEL: usize = 24;
+/// Level counts of the extended evaluation histories: the shortest history
+/// (`3 * 25 = 75` chronological transitions) covers the preregistered §5.2
+/// prefix `t = 32` plus its four scoring rows.
+pub const LEARNING_HISTORY_EVAL_LEVELS: [usize; 3] = [3, 4, 5];
+
+/// Level shape of a Learning History: movement rows per level and the level
+/// counts a meta-episode may draw from. [`Self::training`] (= `Default`) is
+/// the ADR 0005 §2.2 training shape and reproduces the stream byte for byte;
+/// the evaluators (`p2-eval --twin-memorization`, `--adaptation-falsifier`)
+/// may request longer levels through [`Self::extended_evaluation`] or an
+/// explicit shape. Every draw that does not depend on the shape (content
+/// size, goal family, operator, twin family, per-row context length) shares
+/// its seeded lane across shapes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningHistoryConfig {
+    /// Epsilon-greedy movement rows per level; one realized operator row
+    /// follows them, so a level has `steps_per_level + 1` chronological
+    /// transitions.
+    pub steps_per_level: usize,
+    /// Level counts drawn uniformly per meta-episode.
+    pub levels: Vec<usize>,
+}
+
+impl Default for LearningHistoryConfig {
+    fn default() -> Self {
+        Self::training()
+    }
+}
+
+impl LearningHistoryConfig {
+    /// The training shape (`6` movement rows, levels in `{2, 3, 4}`).
+    pub fn training() -> Self {
+        Self {
+            steps_per_level: LEARNING_HISTORY_STEPS_PER_LEVEL,
+            levels: LEARNING_HISTORY_LEVELS.to_vec(),
+        }
+    }
+
+    /// The extended evaluation shape (`24` movement rows, levels in
+    /// `{3, 4, 5}`; at least `75` chronological transitions).
+    pub fn extended_evaluation() -> Self {
+        Self {
+            steps_per_level: LEARNING_HISTORY_EVAL_STEPS_PER_LEVEL,
+            levels: LEARNING_HISTORY_EVAL_LEVELS.to_vec(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.steps_per_level >= 1,
+            "a learning history level needs at least one movement row"
+        );
+        ensure!(
+            !self.levels.is_empty() && self.levels.iter().all(|levels| *levels >= 1),
+            "learning history level counts must be non-empty and positive"
+        );
+        ensure!(
+            u16::try_from(self.levels.iter().copied().max().unwrap_or(0)).is_ok(),
+            "learning history level counts must fit u16"
+        );
+        Ok(())
+    }
+
+    pub fn is_training(&self) -> bool {
+        *self == Self::training()
+    }
+
+    /// Chronological transitions per level (movement rows plus the realized
+    /// operator row).
+    pub fn transitions_per_level(&self) -> usize {
+        self.steps_per_level + 1
+    }
+
+    /// Chronological transitions of the shortest history this shape can draw.
+    pub fn min_chronological_transitions(&self) -> usize {
+        self.levels.iter().copied().min().unwrap_or(0) * self.transitions_per_level()
+    }
+}
 /// Epsilon-greedy schedule endpoints over the chronological transitions:
 /// fully exploratory at the first transition, mostly competent at the last.
 const LEARNING_HISTORY_EPSILON: (f32, f32) = (1.0, 0.2);
@@ -5154,8 +5238,9 @@ const LEARNING_HISTORY_OPERATOR_ACTIONS: usize = 5;
 /// Windows of strictly earlier transitions from the same episode.
 ///
 /// Each level is a fresh layout: an epsilon-decaying policy over the exact
-/// shortest-path solver walks [`LEARNING_HISTORY_STEPS_PER_LEVEL`] movement
-/// transitions, then the level ends with one realized ACTION5/ACTION6 row whose
+/// shortest-path solver walks [`LearningHistoryConfig::steps_per_level`]
+/// movement transitions (training: [`LEARNING_HISTORY_STEPS_PER_LEVEL`]),
+/// then the level ends with one realized ACTION5/ACTION6 row whose
 /// next frame is the hidden operator's outcome. The operator alternatives from
 /// that same frame are emitted right after it as counterfactual sidecar rows
 /// (same Context Window, gate-2 support). Operators act on frames only, so an
@@ -5192,9 +5277,10 @@ fn learning_history_draw(
     meta_episode_id: u64,
     split: V5DataSplit,
     families: &OperatorFamilySplit,
+    shape: &LearningHistoryConfig,
 ) -> Result<LearningHistoryDraw> {
     let mut rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_5255_4C45);
-    let levels = LEARNING_HISTORY_LEVELS[rng.random_range(0..LEARNING_HISTORY_LEVELS.len())];
+    let levels = shape.levels[rng.random_range(0..shape.levels.len())];
     let content_size = sampled_content_size(split, &mut rng);
     let goal_family = rng.random_range(0..6u8);
     let operator = sampled_operator(families, split, &mut rng)?;
@@ -5225,13 +5311,14 @@ fn generate_learning_history(
     draw: &LearningHistoryDraw,
     operator: EpisodeOperator,
     twin_index: u8,
+    shape: &LearningHistoryConfig,
 ) -> Result<LearningHistory> {
     let rule_id = hidden_rule_id(operator, Some(draw.goal_family));
     // Movement, realized-operator choice and context lengths never depend on
     // the operator, so twins share byte-identical frames until the rule acts.
     let mut policy_rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_504F_4C49);
     let mut context_rng = seeded_v5_rng(seed, meta_episode_id, split, 0x4C48_4354_5854);
-    let total = draw.levels * (LEARNING_HISTORY_STEPS_PER_LEVEL + 1);
+    let total = draw.levels * shape.transitions_per_level();
     let (epsilon_start, epsilon_end) = LEARNING_HISTORY_EPSILON;
     let trajectory_id =
         format!("learning-history/{split:?}/{seed}/{meta_episode_id}/twin{twin_index}");
@@ -5262,7 +5349,7 @@ fn generate_learning_history(
         let scenario = Arc::new(scenario);
         let sim = Simulator::new(Arc::clone(&scenario));
         let mut state = State::initial(&scenario);
-        for _ in 0..LEARNING_HISTORY_STEPS_PER_LEVEL {
+        for _ in 0..shape.steps_per_level {
             let t = history.len();
             let epsilon =
                 epsilon_start + (epsilon_end - epsilon_start) * t as f32 / (total - 1) as f32;
@@ -5353,15 +5440,39 @@ fn generate_learning_history(
 /// frame (mutual exclusivity by construction). If no alternative family
 /// differs on this episode the first alternative is used and the twin census
 /// reports the pair as non-divergent.
+///
+/// Training shape ([`LearningHistoryConfig::training`]); see
+/// [`generate_learning_history_pair_with`] for an explicit shape.
 pub fn generate_learning_history_pair(
     seed: u64,
     meta_episode_id: u64,
     split: V5DataSplit,
     families: &OperatorFamilySplit,
 ) -> Result<(LearningHistory, LearningHistory)> {
+    generate_learning_history_pair_with(
+        seed,
+        meta_episode_id,
+        split,
+        families,
+        &LearningHistoryConfig::training(),
+    )
+}
+
+/// [`generate_learning_history_pair`] under an explicit level shape. The
+/// training composer always passes [`LearningHistoryConfig::training`]; the
+/// evaluators may request longer levels.
+pub fn generate_learning_history_pair_with(
+    seed: u64,
+    meta_episode_id: u64,
+    split: V5DataSplit,
+    families: &OperatorFamilySplit,
+    shape: &LearningHistoryConfig,
+) -> Result<(LearningHistory, LearningHistory)> {
     families.validate()?;
-    let draw = learning_history_draw(seed, meta_episode_id, split, families)?;
-    let primary = generate_learning_history(seed, meta_episode_id, split, &draw, draw.operator, 0)?;
+    shape.validate()?;
+    let draw = learning_history_draw(seed, meta_episode_id, split, families, shape)?;
+    let primary =
+        generate_learning_history(seed, meta_episode_id, split, &draw, draw.operator, 0, shape)?;
     let same_split = match split {
         V5DataSplit::HeldOutOperator(_) => &families.held_out,
         _ => &families.train,
@@ -5436,6 +5547,7 @@ pub fn generate_learning_history_pair(
             ..draw.operator
         },
         1,
+        shape,
     )?;
     Ok((primary, twin))
 }
@@ -5498,6 +5610,7 @@ fn compose_learning_history_unit(
     split: V5DataSplit,
     meta_episode_id: u64,
 ) -> Result<Vec<V5Sample>> {
+    // Training shape only: the stream never takes an evaluator's level shape.
     let (primary, twin) = generate_learning_history_pair(
         config.seed,
         meta_episode_id,
@@ -5561,40 +5674,145 @@ impl AugmentedLearningHistory {
 /// Generate the primary Learning History `meta_episode_id` of `config.seed`
 /// on `split` and augment it exactly like the stream unit would (the twin is
 /// generated for the family draw and discarded). Requires `data_contract_v6`.
+/// Training shape; see [`augmented_learning_history_with`].
 pub fn augmented_learning_history(
     config: &MixedStreamConfig,
     split: V5DataSplit,
     meta_episode_id: u64,
 ) -> Result<AugmentedLearningHistory> {
+    augmented_learning_history_with(
+        config,
+        split,
+        meta_episode_id,
+        &LearningHistoryConfig::training(),
+    )
+}
+
+/// [`augmented_learning_history`] under an explicit level shape.
+pub fn augmented_learning_history_with(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    meta_episode_id: u64,
+    shape: &LearningHistoryConfig,
+) -> Result<AugmentedLearningHistory> {
+    Ok(augmented_learning_history_pair_with(config, split, meta_episode_id, shape)?.primary)
+}
+
+/// Model-free divergence facts of one Twin Episode pair (ADR 0005 §2.3),
+/// computed on the raw (pre-augmentation) rows in chronological order. The
+/// augmentation is one bijection shared by both twins, so every equality
+/// below also holds on the augmented rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinPairDivergence {
+    /// The pair differs in a current frame or action before any next frame
+    /// differs: the Hidden Rule would be readable from a single frame. Must
+    /// be false (see [`TwinExclusivityCensus`]).
+    pub single_frame_rule_identifiable: bool,
+    /// Chronological index of the first transition whose next frame differs
+    /// between the twins; `None` when the twins never diverge.
+    pub first_divergence: Option<usize>,
+    /// Chronological indices whose next frame differs between the twins for
+    /// a byte-identical current frame and action ("outcome-changing" rows:
+    /// the realized operator rows on which the two rules disagree).
+    pub outcome_changing_positions: Vec<usize>,
+    /// Chronological indices whose current frame or action differs between
+    /// the twins (every level restarts from its own initial layout, so this
+    /// is zero by construction; reported so a generator regression cannot
+    /// hide inside the exclusivity claim).
+    pub state_differing_positions: usize,
+}
+
+impl TwinPairDivergence {
+    pub fn of(primary: &LearningHistory, twin: &LearningHistory) -> Result<Self> {
+        ensure!(
+            primary.chronological == twin.chronological,
+            "twin episodes must emit the same chronological layout"
+        );
+        let single_frame_rule_identifiable = twin_first_divergence(primary, twin).is_err();
+        let mut first_divergence = None;
+        let mut outcome_changing_positions = Vec::new();
+        let mut state_differing_positions = 0usize;
+        for (position, &index) in primary.chronological.iter().enumerate() {
+            let (left, right) = (&primary.rows[index], &twin.rows[index]);
+            let same_state = left.current == right.current && left.action == right.action;
+            state_differing_positions += usize::from(!same_state);
+            if left.next != right.next {
+                first_divergence.get_or_insert(position);
+                if same_state {
+                    outcome_changing_positions.push(position);
+                }
+            }
+        }
+        Ok(Self {
+            single_frame_rule_identifiable,
+            first_divergence,
+            outcome_changing_positions,
+            state_differing_positions,
+        })
+    }
+}
+
+/// A Twin Episode pair rendered under the v6 interface contract with ONE
+/// per-unit augmentation (the same content placement, D4 symmetry, colour
+/// permutation and per-row goal-dropout sequence for both twins), so the
+/// augmented twins stay byte-identical until the Hidden Rule acts, exactly
+/// as in the `LearningHistories` stream.
+#[derive(Clone, Debug)]
+pub struct AugmentedTwinPair {
+    pub primary: AugmentedLearningHistory,
+    pub twin: AugmentedLearningHistory,
+    pub divergence: TwinPairDivergence,
+}
+
+/// Generate the Twin Episode pair `meta_episode_id` of `config.seed` on
+/// `split` under `shape` and augment both twins like the stream unit would.
+/// Requires `data_contract_v6`.
+pub fn augmented_learning_history_pair_with(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    meta_episode_id: u64,
+    shape: &LearningHistoryConfig,
+) -> Result<AugmentedTwinPair> {
     ensure!(
         config.data_contract_v6,
         "an augmented learning history requires data_contract_v6"
     );
-    let (primary, _twin) = generate_learning_history_pair(
+    let (primary, twin) = generate_learning_history_pair_with(
         config.seed,
         meta_episode_id,
         split,
         &config.operator_families,
+        shape,
     )?;
-    let operator = primary.operator;
-    let expected = primary.rows.len();
-    let rows = augment_v5_unit(
-        primary.rows,
-        config,
-        split,
-        MixedStreamKind::LearningHistories,
-        operator,
-        meta_episode_id,
-    )?;
-    ensure!(
-        rows.len() == expected,
-        "unit augmentation must map learning-history rows one-to-one"
-    );
-    Ok(AugmentedLearningHistory {
-        meta_episode_id,
-        levels: primary.levels,
-        rows,
-        chronological: primary.chronological,
+    let divergence = TwinPairDivergence::of(&primary, &twin)?;
+    let augment = |history: LearningHistory| -> Result<AugmentedLearningHistory> {
+        let operator = history.operator;
+        let expected = history.rows.len();
+        // Seeded by (`config.seed`, `meta_episode_id`, `split`) only: the
+        // same unit augmentation and dropout sequence for either twin.
+        let rows = augment_v5_unit(
+            history.rows,
+            config,
+            split,
+            MixedStreamKind::LearningHistories,
+            operator,
+            meta_episode_id,
+        )?;
+        ensure!(
+            rows.len() == expected,
+            "unit augmentation must map learning-history rows one-to-one"
+        );
+        Ok(AugmentedLearningHistory {
+            meta_episode_id,
+            levels: history.levels,
+            rows,
+            chronological: history.chronological,
+        })
+    };
+    Ok(AugmentedTwinPair {
+        primary: augment(primary)?,
+        twin: augment(twin)?,
+        divergence,
     })
 }
 
@@ -6483,6 +6701,206 @@ mod tests {
             hidden_rule_id(operator, Some(0)),
             hidden_rule_id(operator, Some(1))
         );
+        Ok(())
+    }
+
+    /// Snapshot of the v6 training stream (`adaptation_v6_stream_schedule`,
+    /// `data_contract_v6`) taken before `LearningHistoryConfig` was introduced.
+    /// The training composer must keep rendering byte-identical rows under
+    /// the default (training) history configuration.
+    #[test]
+    fn v6_training_stream_content_digest_snapshot() -> Result<()> {
+        use crate::p2::train::{training_content_batch_digest, training_content_hash_append};
+        let config = v6_config(24, 0xDA7A_0106);
+        let total_steps = 3usize;
+        let chain = (0..total_steps as u64).try_fold([0; 32], |chain, batch_index| {
+            let batch = compose_mixed_stream_batch(
+                &config,
+                batch_index as f32 / total_steps as f32,
+                batch_index,
+                V5DataSplit::Train,
+            )?;
+            let digest = training_content_batch_digest(batch.transitions(), batch.content_masks())?;
+            Ok::<_, anyhow::Error>(training_content_hash_append(chain, digest))
+        })?;
+        assert_eq!(
+            chain,
+            [
+                141, 213, 94, 18, 49, 180, 221, 31, 182, 38, 138, 227, 117, 66, 81, 200, 178, 40,
+                97, 243, 1, 186, 143, 232, 64, 65, 16, 6, 65, 217, 251, 135,
+            ]
+        );
+        Ok(())
+    }
+
+    /// The explicit training shape is the default generator, row for row.
+    #[test]
+    fn learning_history_training_shape_reproduces_the_default_generator() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        let shape = LearningHistoryConfig::training();
+        assert!(shape.is_training());
+        assert_eq!(shape, LearningHistoryConfig::default());
+        assert_eq!(shape.transitions_per_level(), 7);
+        assert_eq!(shape.min_chronological_transitions(), 14);
+        for meta_episode_id in 0..6u64 {
+            let default_pair = generate_learning_history_pair(
+                0x5348_4150,
+                meta_episode_id,
+                V5DataSplit::UnseenSeed7x7,
+                &families,
+            )?;
+            let explicit = generate_learning_history_pair_with(
+                0x5348_4150,
+                meta_episode_id,
+                V5DataSplit::UnseenSeed7x7,
+                &families,
+                &shape,
+            )?;
+            assert_eq!(default_pair, explicit);
+        }
+        Ok(())
+    }
+
+    /// The extended evaluation shape yields >= 36 chronological transitions
+    /// (in fact >= 75) with the production level structure: 24 movement rows
+    /// then one realized operator row per level, and the twins still diverge
+    /// only on operator rows.
+    #[test]
+    fn extended_learning_history_shape_yields_long_levels() -> Result<()> {
+        let families = OperatorFamilySplit::default();
+        let shape = LearningHistoryConfig::extended_evaluation();
+        shape.validate()?;
+        assert!(!shape.is_training());
+        assert_eq!(shape.transitions_per_level(), 25);
+        assert_eq!(shape.min_chronological_transitions(), 75);
+        assert!(shape.min_chronological_transitions() >= 36);
+        let mut seen_levels = BTreeSet::new();
+        for meta_episode_id in 0..6u64 {
+            let (primary, twin) = generate_learning_history_pair_with(
+                0x4558_5445,
+                meta_episode_id,
+                V5DataSplit::UnseenSeed7x7,
+                &families,
+                &shape,
+            )?;
+            seen_levels.insert(primary.levels);
+            assert!(LEARNING_HISTORY_EVAL_LEVELS.contains(&primary.levels));
+            assert_eq!(
+                primary.chronological.len(),
+                primary.levels * shape.transitions_per_level()
+            );
+            assert!(primary.chronological.len() >= 36);
+            assert_eq!(
+                primary.rows.len(),
+                primary.levels * (shape.steps_per_level + LEARNING_HISTORY_OPERATOR_ACTIONS)
+            );
+            for (position, &index) in primary.chronological.iter().enumerate() {
+                let row = &primary.rows[index];
+                row.provenance.validate()?;
+                let is_operator = matches!(row.action.id, 5 | 6);
+                assert_eq!(
+                    is_operator,
+                    position % shape.transitions_per_level() == shape.steps_per_level,
+                    "position {position}"
+                );
+                assert_eq!(
+                    usize::from(row.provenance.level_index),
+                    position / shape.transitions_per_level()
+                );
+                assert!(row.context.len() <= CONTEXT_WINDOW_MAX.min(position));
+                // Movement never runs the level's action budget out.
+                assert_eq!(row.exhausted, Some(false), "position {position}");
+            }
+            let divergence = TwinPairDivergence::of(&primary, &twin)?;
+            assert!(!divergence.single_frame_rule_identifiable);
+            assert_eq!(divergence.state_differing_positions, 0);
+            assert_eq!(
+                twin_first_divergence(&primary, &twin)?.map(|index| primary
+                    .chronological
+                    .iter()
+                    .position(|&chronological| chronological == index)
+                    .expect("first divergence is a realized row")),
+                divergence.first_divergence
+            );
+            for position in &divergence.outcome_changing_positions {
+                assert_eq!(
+                    position % shape.transitions_per_level(),
+                    shape.steps_per_level,
+                    "twins may only diverge on operator rows"
+                );
+            }
+            assert!(
+                divergence.first_divergence.is_some(),
+                "twin family is chosen to diverge"
+            );
+        }
+        assert!(seen_levels.len() >= 2, "{seen_levels:?}");
+        // The shape is a real parameter: the same seed under the training
+        // shape is a different (shorter) history.
+        let (short, _) =
+            generate_learning_history_pair(0x4558_5445, 0, V5DataSplit::UnseenSeed7x7, &families)?;
+        assert!(short.chronological.len() < 36);
+        Ok(())
+    }
+
+    /// Augmented twins share one augmentation: byte-identical current frames
+    /// and actions at every chronological position, next frames identical
+    /// except on the outcome-changing rows.
+    #[test]
+    fn augmented_twin_pair_shares_one_augmentation() -> Result<()> {
+        let config = v6_config(24, 0x5457_494E);
+        for shape in [
+            LearningHistoryConfig::training(),
+            LearningHistoryConfig::extended_evaluation(),
+        ] {
+            let pair = augmented_learning_history_pair_with(
+                &config,
+                V5DataSplit::UnseenSeed7x7,
+                3,
+                &shape,
+            )?;
+            let single =
+                augmented_learning_history_with(&config, V5DataSplit::UnseenSeed7x7, 3, &shape)?;
+            assert_eq!(pair.primary.chronological, single.chronological);
+            assert_eq!(pair.primary.chronological, pair.twin.chronological);
+            assert_eq!(pair.primary.rows.len(), pair.twin.rows.len());
+            assert_eq!(pair.divergence.state_differing_positions, 0);
+            assert!(!pair.divergence.single_frame_rule_identifiable);
+            let outcome_changing = pair
+                .divergence
+                .outcome_changing_positions
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(!outcome_changing.is_empty());
+            for (position, (left, right)) in pair
+                .primary
+                .chronological
+                .iter()
+                .map(|&index| (&pair.primary.rows[index], &pair.twin.rows[index]))
+                .enumerate()
+            {
+                assert_eq!(left.provenance.augmentation, right.provenance.augmentation);
+                assert_eq!(left.provenance.content_rect, right.provenance.content_rect);
+                assert_eq!(
+                    left.transition.current, right.transition.current,
+                    "{position}"
+                );
+                assert_eq!(
+                    left.transition.action, right.transition.action,
+                    "{position}"
+                );
+                assert_eq!(
+                    left.transition.next != right.transition.next,
+                    outcome_changing.contains(&position),
+                    "{position}"
+                );
+                assert_eq!(
+                    single.rows[pair.primary.chronological[position]].transition,
+                    left.transition
+                );
+            }
+        }
         Ok(())
     }
 }
