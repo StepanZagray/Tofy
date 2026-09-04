@@ -170,3 +170,20 @@ Consequence for the generator (deferred, trajectory-changing): synthetic
 levels are far shorter than live levels (tens to hundreds of actions), so the
 live warm-up rule is untestable on them; a v6.1 generator should draw level
 lengths from a wider range.
+
+## Preregistered follow-up: depth ablation 2x2 vs 3x3 (2026-09-04)
+
+- Claim: on the v6 data contract, recursion depth 3x3 (ADR 0005 §3.5) yields
+  higher held-out changed-exact than 2x2 at equal data, seed, effective batch
+  and steps. Static argument only (receptive field 25 vs 17 cells on a 16-cell
+  grid); no measured evidence yet.
+- Arms: E2 (3x3, seed 2, physical 128 x accum 2, 4096 steps) versus one run
+  identical except `--v6-recursion-steps 2` (recorded in the contract through
+  `inner_steps`/`outer_steps`). Single seed: a screen, not a promotion result.
+- Metrics: the held-out gate metrics (`one_step_changed_exact`,
+  `one_step_composed_changed_exact`, `one_step_all_rows_exact`) per split and
+  the §5.1 ablation delta, both read from the same evaluator at each run's best
+  checkpoint. No threshold is preregistered; the result informs whether the
+  full run stays at 3x3 (owner decision) and is reported as an effect size.
+- Runs only if E2's §5.1 verdict is PASS; a failing data contract makes depth
+  uninterpretable. Cost ~2 h local.
