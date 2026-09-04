@@ -115,3 +115,18 @@ seal succeeds.
 - `available_actions` API masking (inference harness).
 - Animation-conditioned modeling (live observations preserve every layer, but
   the current model and training importer consume only the settled final frame).
+
+## Pod launch requirements (2026-09-03)
+
+- **CUDA 13.0** on the pod image (owner requirement). The local build machine
+  runs CUDA 13.3 / driver 610.57.04 with `cudarc 0.19.8`; a 12.x pod image is
+  not acceptable for this campaign.
+- Build with `cargo build --release --locked --features cudnn` and record the
+  binary SHA-256, the Tofy revision, and the pinned `candle_graph` revision in
+  the run root before launching (AGENTS.md launch safety).
+- Deploy by Git only: push the reviewed commit, then fetch/check out that exact
+  commit on the pod.
+- Credentials: no working RunPod API key is present on this machine
+  (`~/.runpod/config.toml` has an empty `apikey`, `Tofy/.env` has an empty
+  `RUNPOD_API_KEY`), so an agent cannot create or start a pod unattended; the
+  owner starts the pod and shares the SSH target.
