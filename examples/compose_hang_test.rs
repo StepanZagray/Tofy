@@ -42,6 +42,8 @@ fn main() -> Result<()> {
         goal_dropout_probability: 0.3,
         operator_families: OperatorFamilySplit::default(),
         symmetry_augmentation: true,
+        data_contract_v6: false,
+        synthetic_shards_dir: None,
     };
     println!(
         "compose benchmark: rows={} measured_batches={} rayon_threads={}",
