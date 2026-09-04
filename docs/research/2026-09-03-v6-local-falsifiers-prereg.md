@@ -35,10 +35,11 @@ or unblock the v6 pod run, it cannot satisfy a promotion gate.
   full context (K = 16) on 512 held-out twin-pair meta-episodes, fixed
   evaluation seed 1000002.
 - Budget: local run, 4096 optimizer steps, seed 2, evaluation at 1024/2048/3072/4096.
-  Batch pair measured before launch (AGENTS.md): physical 256 OOMs on the 8 GB GPU under
-  the v6 context channel; physical 128 × accumulation 2 (effective 256) peaks at 5.8 GB and
-  is the launched configuration. This is a smaller effective batch than the ADR 0003 recipe
-  (1024); the run is a data-contract screen, not a recipe comparison.
+  Intended batch pair measured before launch (AGENTS.md): physical 256 OOMs on the 8 GB GPU
+  under the v6 context channel; physical 128 × accumulation 2 (effective 256) peaks at 5.8 GB.
+  The later audit established that recipe/CLI precedence silently overwrote accumulation to 1,
+  so the completed implementation-smoke run actually used effective batch 128 and cannot satisfy
+  this registration.
 - Launch (2026-09-03, revision 975832f9, binary sha256 in the run root):
   `tofy p2-train --recipe foundation-v2 --world-core-v6 --data-contract-v6 --device cuda
   --seed 2 --init-seed 2 --physical-batch 128 --grad-accum 2 --steps 4096
@@ -125,8 +126,9 @@ roughly 2x or more. Before any result is read, the rule is fixed as follows:
 - This is a weaker test than K = 16 exactly (windows of 5..16, mean ~10);
   an exact K = 0 vs K = 16 twin-pair evaluation remains to be implemented and
   will supersede this rule when it exists.
-- E2's checkpoint was trained at effective batch 256 and depth 3x3; the
-  screen is a data-contract decision only.
+- E2 intended effective batch 256 and depth 3x3; the later audit found that
+  the checkpoint actually used effective batch 128, so it is not valid E2
+  evidence. The screen remains a data-contract decision only.
 
 ## E2 execution record (2026-09-03/04, local RTX 5060 8 GB)
 
@@ -137,7 +139,7 @@ roughly 2x or more. Before any result is read, the rule is fixed as follows:
 | 3 | 2026-09-04 09:03 (resume 512) | step ~575 | concurrent CPU evaluation competing for system RAM |
 | 4 | 2026-09-04 09:16 (resume 512) | step 1024 | gate evaluation OOM with 32-row chunking |
 | repro | 2026-09-04 10:32 (resume 512→1032) | passed | outputs detached; GPU peak 5.7 GB at the gate |
-| 5 | 2026-09-04 10:58 (resume 1032→4096) | running | same binary as the reproduction |
+| 5 | 2026-09-04 10:58 (resume 1032→4096) | completed 12:49 CDT | effective batch was 128, not the registered 256; provenance/root integrity also failed |
 
 Root cause of 1/2/4: candle retains every op's inputs while its output lives;
 the evaluator held chunk outputs, so chunking bounded nothing until the
@@ -145,7 +147,13 @@ outputs were detached. Attempt 5's checkpoints from step 1024 onward were
 written by a resume launched with an absolute `output_dir`; evaluations must
 use each checkpoint bundle's own `config.json`, which the evaluator enforces
 by hash. E2's loss log contains the appended rows of all attempts; the
-authoritative trajectory is the checkpoint chain, not the row count.
+authoritative trajectory is the checkpoint chain, not the row count. The
+completed root is **implementation smoke only**, not E2 evidence: five
+attempts reused one root, 512 step values are duplicated, build provenance is
+absent, the v6 run persisted v5 identity, and the implemented evaluator was
+the mixed K=5..16 proxy rather than the registered twin K=16 versus K=0
+statistic. Its inherited post-training evaluation was stopped on 2026-09-04
+because it could not answer the registered claim.
 
 ## Amendment (2026-09-04): E3 as implemented, before any result is read
 
@@ -171,15 +179,64 @@ levels are far shorter than live levels (tens to hundreds of actions), so the
 live warm-up rule is untestable on them; a v6.1 generator should draw level
 lengths from a wider range.
 
+## Amendment (2026-09-04): the registered E2 statistic and the redesigned E3 are implemented
+
+Independent audit of the two amendments above found (A) that the `5-16`
+stratum proxy is not the registered §5.1 statistic and (B) that the training
+histories (7 transitions per level, <= 28 per episode) make the registered E3
+arm vacuous by construction. Both are fixed in code before any E2 result is
+read; the rules below supersede the proxy rule of the first 2026-09-04
+amendment.
+
+- **E2, registered statistic: `p2-eval --twin-memorization`.** 256 held-out
+  Twin Episode pairs (= 512 twin-pair meta-episodes) on `UnseenSeed7x7`, seed
+  1000002, rendered with the stream's v6 unit augmentation (one augmentation
+  per pair, so the twins stay byte-identical until the rule acts), TRAINING
+  level shape (6 movement rows + 1 operator row per level, levels {2,3,4})
+  because E2 screens the data contract the checkpoint was trained on. Every
+  chronological row `i >= 16` of every episode is scored with exactly the 16
+  preceding transitions as context and again with `K = 0`; changed-exact and
+  composed changed-exact are reported for both arms with the delta over (1)
+  all scorable rows, (2) rows after the pair's first divergence and (3) rows
+  whose 16-window contains an outcome-changing row (the same current frame
+  and action mapping to different next frames across the twins). The
+  `>= 0.05` rule applies to (3), `verdict.delta_filtered`. A model-free
+  preflight census (pairs, single-frame-identifiable pairs, divergent pairs,
+  pairs diverging before index 16, outcome-changing rows, scorable rows with
+  evidence) fails closed before any forward. The fixed registered population
+  is pinned at 256 divergent pairs, 0 single-frame-identifiable pairs, 0
+  state-differing rows, 724 outcome-changing rows and 2,858 evidence-bearing
+  scorable rows. Forwards run in slices of <= 32 rows with every kept output
+  detached.
+- **E3, redesigned histories.** The falsifier now renders EXTENDED Learning
+  Histories by default: 24 movement rows + 1 operator row per level, levels
+  {3,4,5} (>= 75 chronological transitions), so the production warm-up
+  (8 unique transitions per level) can be met inside every level and all of
+  `t in {8, 16, 32}` are reachable; the registered arm is no longer vacuous
+  (`t = 16` is confirmed to update under the fixed seed). `t = 8` can still
+  be warm-up-only when its first eight rows contain fewer than eight unique
+  `(observation, action)` facts; that is reported telemetry, not hidden.
+  `--adaptation-falsifier-min-level-transitions` is not needed for a
+  non-vacuous run (it remains a labelled deviation knob). The shape is
+  recorded in the report (`history`) and can be overridden with
+  `--learning-history-steps-per-level` / `--learning-history-levels`. The
+  training stream is unchanged (pinned content digest).
+- The `--context-ablation` proxy is kept as a reported number only; it is not
+  the gate.
+
 ## Preregistered follow-up: depth ablation 2x2 vs 3x3 (2026-09-04)
 
 - Claim: on the v6 data contract, recursion depth 3x3 (ADR 0005 §3.5) yields
   higher held-out changed-exact than 2x2 at equal data, seed, effective batch
-  and steps. Static argument only (receptive field 25 vs 17 cells on a 16-cell
-  grid); no measured evidence yet.
-- Arms: E2 (3x3, seed 2, physical 128 x accum 2, 4096 steps) versus one run
-  identical except `--v6-recursion-steps 2` (recorded in the contract through
-  `inner_steps`/`outer_steps`). Single seed: a screen, not a promotion result.
+  and steps. Static argument only: the implementation executes 12 versus 6
+  two-convolution residual blocks, giving receptive fields 49 versus 25 cells
+  on a 16-cell grid; both already cover the board, while 3x3 costs about twice
+  the recurrent dynamics compute. There is no measured Tofy depth evidence.
+- Arms: two fresh matched runs, differing only in `--v6-recursion-steps 3`
+  versus `--v6-recursion-steps 2` (recorded through `inner_steps`/`outer_steps`).
+  The old E2 root cannot be reused as the 3x3 arm because it actually ran
+  physical 128 x accumulation 1 and lacks valid provenance. Single seed: a
+  screen, not a promotion result.
 - Metrics: the held-out gate metrics (`one_step_changed_exact`,
   `one_step_composed_changed_exact`, `one_step_all_rows_exact`) per split and
   the §5.1 ablation delta, both read from the same evaluator at each run's best

@@ -2,6 +2,8 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
+#[cfg(test)]
+use crate::p2::adaptation::FactualBuffer;
 use crate::p2::adaptation::{
     AdaptationMode, ContextScopeKind, FastWeightAdapter, ADAPT_MIN_LEVEL_TRANSITIONS,
 };
@@ -17,11 +19,12 @@ use crate::p2::cg_profile::{
     EVAL_PROFILE_ENTRYPOINT,
 };
 use crate::p2::data::{
-    adaptation_v6_stream_schedule, augmented_learning_history, compose_mixed_stream_batch,
-    foundation_v2_stream_schedule, gameplay_rows, generate_curriculum,
-    generate_factual_branch_group, generate_hazard_one_step, ArcAction, AugmentedLearningHistory,
-    BranchGroup, ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
-    TransitionSample, V5DataSplit, V5SampleProvenance, CONTEXT_WINDOW_MAX,
+    adaptation_v6_stream_schedule, augmented_learning_history_pair_with,
+    augmented_learning_history_with, compose_mixed_stream_batch, foundation_v2_stream_schedule,
+    gameplay_rows, generate_curriculum, generate_factual_branch_group, generate_hazard_one_step,
+    ArcAction, AugmentedLearningHistory, AugmentedTwinPair, BranchGroup, ContentMask, ContentRect,
+    FactualBatch, LearningHistoryConfig, MixedStreamConfig, OperatorFamilySplit, TransitionSample,
+    TwinPairDivergence, V5DataSplit, V5SampleProvenance, CONTEXT_WINDOW_MAX,
     FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, GOAL_FEATURES_DIM, ORACLE_LATENT_DIM,
 };
 use crate::p2::grounding::DecodeComposition;
@@ -179,13 +182,39 @@ pub struct EvalConfig {
     pub adaptation_falsifier: bool,
     /// Falsifier-only warm-up override for Channel B (§6.2 default 8 unique
     /// transitions per level). Recorded in the report; the live loop is
-    /// unaffected.
+    /// unaffected. With the extended evaluation histories the default is
+    /// reachable, so this knob is no longer needed for a non-vacuous run.
     #[serde(default = "default_adaptation_falsifier_min_level_transitions")]
     pub adaptation_falsifier_min_level_transitions: usize,
+    /// ADR 0005 §5.1 registered statistic (E2): `--twin-memorization`, the
+    /// held-out TWIN-PAIR meta-episodes scored with exactly `K = 16` versus
+    /// `K = 0`. `world_core_v6` checkpoints only; off keeps the report
+    /// byte-identical.
+    #[serde(default)]
+    pub twin_memorization: bool,
+    /// Twin pairs drawn for `--twin-memorization` (each pair is two
+    /// meta-episodes; the registered population is 256 pairs = 512
+    /// episodes). Independent of `synthetic_episodes`.
+    #[serde(default = "default_twin_memorization_pairs")]
+    pub twin_memorization_pairs: usize,
+    /// Optional level-shape override for the v6 evaluators' Learning
+    /// Histories (`--learning-history-steps-per-level`). Unset: each
+    /// evaluator's own default (twin diagnostic: the training shape; the
+    /// adaptation falsifier: the extended evaluation shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_history_steps_per_level: Option<usize>,
+    /// Optional level-count override (`--learning-history-levels`); see
+    /// [`Self::learning_history_steps_per_level`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_history_levels: Option<Vec<usize>>,
 }
 
 fn default_ensemble_members() -> usize {
     8
+}
+
+fn default_twin_memorization_pairs() -> usize {
+    TWIN_MEMORIZATION_DEFAULT_PAIRS
 }
 
 fn default_adaptation_falsifier_min_level_transitions() -> usize {
@@ -224,11 +253,29 @@ impl Default for EvalConfig {
             context_ablation: false,
             adaptation_falsifier: false,
             adaptation_falsifier_min_level_transitions: ADAPT_MIN_LEVEL_TRANSITIONS,
+            twin_memorization: false,
+            twin_memorization_pairs: TWIN_MEMORIZATION_DEFAULT_PAIRS,
+            learning_history_steps_per_level: None,
+            learning_history_levels: None,
         }
     }
 }
 
 impl EvalConfig {
+    /// Level shape the v6 evaluators render their Learning Histories under:
+    /// `default` with any `learning_history_*` override applied.
+    pub fn learning_history_shape(&self, default: LearningHistoryConfig) -> LearningHistoryConfig {
+        LearningHistoryConfig {
+            steps_per_level: self
+                .learning_history_steps_per_level
+                .unwrap_or(default.steps_per_level),
+            levels: self
+                .learning_history_levels
+                .clone()
+                .unwrap_or(default.levels),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.physical_batch == 0 {
             bail!("physical_batch must be > 0");
@@ -236,6 +283,11 @@ impl EvalConfig {
         if self.adaptation_falsifier_min_level_transitions == 0 {
             bail!("adaptation_falsifier_min_level_transitions must be > 0");
         }
+        if self.twin_memorization_pairs == 0 {
+            bail!("twin_memorization_pairs must be > 0");
+        }
+        self.learning_history_shape(LearningHistoryConfig::training())
+            .validate()?;
         if self.representation_row_cap == 0 {
             bail!("representation_row_cap must be > 0");
         }
@@ -1192,6 +1244,12 @@ pub struct EvalReport {
     /// selection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v6_adaptation_falsifier: Option<AdaptationFalsifierReport>,
+    /// ADR 0005 §5.1 registered statistic (`--twin-memorization`): held-out
+    /// twin-pair meta-episodes scored with exactly `K = 16` versus `K = 0`.
+    /// Present only when the flag is set on a `world_core_v6` checkpoint;
+    /// selection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_twin_memorization: Option<TwinMemorizationReport>,
     /// Same-checkpoint, same-row mechanism ablations for bundled treatments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanism_ablations: Option<MechanismAblationReport>,
@@ -3524,6 +3582,13 @@ pub struct AdaptationFalsifierSpec {
     pub score_window: usize,
     /// Channel B warm-up (§6.2 default [`ADAPT_MIN_LEVEL_TRANSITIONS`]).
     pub min_level_transitions: usize,
+    /// Level shape of the held-out Learning Histories. Default: the extended
+    /// evaluation shape (24 movement rows per level, levels in {3, 4, 5}),
+    /// under which the production warm-up and every preregistered prefix
+    /// length are reachable; the training shape (7 transitions per level,
+    /// <= 28 in total) makes the registered arm vacuous.
+    #[serde(default = "LearningHistoryConfig::extended_evaluation")]
+    pub history: LearningHistoryConfig,
 }
 
 impl AdaptationFalsifierSpec {
@@ -3535,6 +3600,7 @@ impl AdaptationFalsifierSpec {
             prefix_lengths: ADAPTATION_FALSIFIER_PREFIX_LENGTHS.to_vec(),
             score_window: ADAPTATION_FALSIFIER_SCORE_WINDOW,
             min_level_transitions,
+            history: LearningHistoryConfig::extended_evaluation(),
         }
     }
 }
@@ -3624,6 +3690,10 @@ pub struct AdaptationFalsifierReport {
     /// Channel B warm-up in force (§6.2 default 8; anything else is a
     /// recorded deviation).
     pub min_level_transitions: usize,
+    /// Level shape the population was rendered under (see
+    /// [`AdaptationFalsifierSpec::history`]).
+    #[serde(default = "LearningHistoryConfig::extended_evaluation")]
+    pub history: LearningHistoryConfig,
     /// Histogram of chronological episode lengths (`len` -> episodes).
     pub chronological_lengths: BTreeMap<String, usize>,
     /// Ordered arm-major, then by prefix length.
@@ -3648,35 +3718,47 @@ fn adaptation_falsifier_population(
 ) -> Result<Vec<AugmentedLearningHistory>> {
     let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
     stream_cfg.validate()?;
+    spec.history.validate()?;
     (0..spec.episodes)
         .into_par_iter()
         .map(|meta_episode_id| {
-            augmented_learning_history(
+            augmented_learning_history_with(
                 &stream_cfg,
                 V5DataSplit::UnseenSeed7x7,
                 meta_episode_id as u64,
+                &spec.history,
             )
         })
         .collect()
 }
 
-fn adaptation_falsifier_population_fingerprint(histories: &[AugmentedLearningHistory]) -> String {
+const LEARNING_HISTORY_EVAL_POPULATION_DOMAIN: &str =
+    "tofy.p2.learning_history_evaluation_population.v2";
+
+/// Versioned SHA-256 over every history's chronological transitions under the
+/// exact full-context view consumed by the v6 evaluators. This reuses the
+/// canonical full-row codec, including goal, labels, provenance and every
+/// factual transition in the reconstructed context window.
+fn learning_history_population_fingerprint<'a>(
+    histories: impl IntoIterator<Item = &'a AugmentedLearningHistory>,
+) -> String {
     let mut hash = Sha256::new();
-    for history in histories {
+    digest_framed_bytes(
+        &mut hash,
+        LEARNING_HISTORY_EVAL_POPULATION_DOMAIN.as_bytes(),
+    );
+    for (history_ordinal, history) in histories.into_iter().enumerate() {
+        hash.update((history_ordinal as u64).to_le_bytes());
         hash.update(history.meta_episode_id.to_le_bytes());
         hash.update((history.levels as u64).to_le_bytes());
         hash.update((history.chronological.len() as u64).to_le_bytes());
         for position in 0..history.chronological.len() {
-            let row = &history.chronological_row(position).transition;
-            hash.update(row.provenance.level_index.to_le_bytes());
-            hash.update(&row.current.pixels[..]);
-            hash.update([
-                row.action.id,
-                row.action.x.unwrap_or(0),
-                row.action.y.unwrap_or(0),
-                u8::from(is_board_changed_transition(row)),
-            ]);
-            hash.update(&row.next.pixels[..]);
+            hash.update((position as u64).to_le_bytes());
+            let mut row = history.chronological_row(position).transition.clone();
+            row.context = history.context_window_before(position);
+            row.provenance.context_len =
+                u8::try_from(row.context.len()).expect("context window fits u8");
+            update_canonical_transition_row(&mut hash, &row);
         }
     }
     format!("sha256:{:x}", hash.finalize())
@@ -4052,7 +4134,7 @@ fn evaluate_adaptation_falsifier_on(
     if histories.is_empty() {
         bail!("the adaptation falsifier needs at least one episode");
     }
-    let population_fingerprint = adaptation_falsifier_population_fingerprint(histories);
+    let population_fingerprint = learning_history_population_fingerprint(histories);
     let mut chronological_lengths = BTreeMap::<String, usize>::new();
     for history in histories {
         *chronological_lengths
@@ -4113,8 +4195,551 @@ fn evaluate_adaptation_falsifier_on(
         score_window: spec.score_window,
         context_window_max: CONTEXT_WINDOW_MAX,
         min_level_transitions: spec.min_level_transitions,
+        history: spec.history.clone(),
         chronological_lengths,
         arms,
+        verdict,
+    })
+}
+
+// ---- ADR 0005 §5.1 twin memorization diagnostic (E2, registered statistic) ----
+
+/// Preregistered population seed of the §5.1 twin-pair diagnostic (E2).
+pub const TWIN_MEMORIZATION_POPULATION_SEED: u64 = 1_000_002;
+/// Registered context length: every scored row carries exactly the `K = 16`
+/// preceding chronological transitions of its own episode (versus `K = 0`).
+pub const TWIN_MEMORIZATION_CONTEXT_LEN: usize = CONTEXT_WINDOW_MAX;
+/// Registered threshold on the changed-exact delta (absolute).
+pub const TWIN_MEMORIZATION_PROMOTION_DELTA: f64 = 0.05;
+/// Registered population: 256 twin pairs = 512 twin-pair meta-episodes.
+pub const TWIN_MEMORIZATION_DEFAULT_PAIRS: usize = 256;
+
+/// Knobs of one twin-memorization run. Production uses
+/// [`Self::preregistered`]; tests shrink the population.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinMemorizationSpec {
+    /// Twin pairs (two meta-episodes each).
+    pub pairs: usize,
+    pub population_seed: u64,
+    /// `K` of the full-context arm; the other arm is `K = 0`. Rows at
+    /// chronological index `i >= context_len` are scored.
+    pub context_len: usize,
+    /// Level shape of the generated histories (default: the TRAINING shape,
+    /// since E2 screens the data contract the checkpoint was trained on).
+    pub history: LearningHistoryConfig,
+}
+
+impl TwinMemorizationSpec {
+    pub fn preregistered(pairs: usize, history: LearningHistoryConfig) -> Self {
+        Self {
+            pairs,
+            population_seed: TWIN_MEMORIZATION_POPULATION_SEED,
+            context_len: TWIN_MEMORIZATION_CONTEXT_LEN,
+            history,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.pairs == 0 {
+            bail!("the twin memorization diagnostic needs at least one pair");
+        }
+        if self.context_len == 0 || self.context_len > CONTEXT_WINDOW_MAX {
+            bail!("twin memorization context_len must be in 1..={CONTEXT_WINDOW_MAX}");
+        }
+        self.history.validate()
+    }
+}
+
+/// Model-free preflight census of the twin population, computed before any
+/// forward so a vacuous population is visible on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinMemorizationCensus {
+    pub pairs: usize,
+    pub episodes: usize,
+    /// Pairs whose frames or actions differ before any next frame does (the
+    /// rule would be readable from a single frame). Must be 0.
+    pub single_frame_rule_identifiable: usize,
+    /// Pairs with at least one differing next frame.
+    pub divergent_pairs: usize,
+    /// Pairs whose first divergence lies at a chronological index
+    /// `< context_len`: the first scorable row's window already contains
+    /// rule evidence.
+    pub pairs_diverging_before_context_len: usize,
+    /// Histogram of the first divergence index (`index` -> pairs;
+    /// `"none"` for non-divergent pairs).
+    pub first_divergence_histogram: BTreeMap<String, usize>,
+    /// Chronological transitions over every episode.
+    pub chronological_transitions: usize,
+    /// Chronological rows (counted once per pair) whose next frame differs
+    /// between the twins for the same current frame and action.
+    pub outcome_changing_rows: usize,
+    /// Chronological rows whose current frame or action differs between the
+    /// twins (0 by construction; a regression would show here).
+    pub state_differing_rows: usize,
+    /// Rows at index `>= context_len` over every episode (both arms score
+    /// exactly these).
+    pub scorable_rows: usize,
+    /// Scorable rows after the pair's first divergence (`first < i`).
+    pub scorable_rows_after_first_divergence: usize,
+    /// Scorable rows whose `K` window `[i - K, i)` contains at least one
+    /// outcome-changing row; the registered rule is applied over these.
+    pub scorable_rows_with_evidence_in_window: usize,
+}
+
+/// One row set scored with exactly `K = context_len` and with `K = 0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinMemorizationMetrics {
+    pub rows: usize,
+    /// Rows entering the changed-exact denominator (board-changed rows with
+    /// at least one changed gameplay pixel), as in the gate metrics.
+    pub changed_transitions: usize,
+    pub changed_exact_full_context: Option<f64>,
+    pub changed_exact_no_context: Option<f64>,
+    /// `full_context - no_context`; `None` without a changed transition.
+    pub delta: Option<f64>,
+    pub composed_changed_exact_full_context: Option<f64>,
+    pub composed_changed_exact_no_context: Option<f64>,
+    pub composed_delta: Option<f64>,
+}
+
+/// The registered §5.1 rule applied to the evidence-filtered delta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinMemorizationVerdict {
+    pub promotion_delta: f64,
+    pub statistic: String,
+    /// Changed-exact delta over rows whose window contains rule evidence.
+    pub delta_filtered: Option<f64>,
+    /// Changed-exact delta over every scorable row.
+    pub delta_unfiltered: Option<f64>,
+    /// `delta_filtered >= promotion_delta` (tolerance 1e-9).
+    pub pass: bool,
+    pub note: String,
+}
+
+/// ADR 0005 §5.1 registered-statistic report (`--twin-memorization`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinMemorizationReport {
+    pub population: String,
+    pub population_seed: u64,
+    pub evidence_class: String,
+    pub pairs: usize,
+    pub episodes: usize,
+    pub context_len: usize,
+    pub history: LearningHistoryConfig,
+    /// SHA-256 over every episode's chronological transitions as scored
+    /// (primary then twin, pair by pair).
+    pub population_fingerprint: String,
+    pub census: TwinMemorizationCensus,
+    /// Every scorable row.
+    pub unfiltered: TwinMemorizationMetrics,
+    /// Scorable rows after the pair's first divergence.
+    pub after_first_divergence: TwinMemorizationMetrics,
+    /// Scorable rows whose window contains an outcome-changing row (the
+    /// registered rule's population).
+    pub evidence_in_window: TwinMemorizationMetrics,
+    pub verdict: TwinMemorizationVerdict,
+}
+
+fn twin_memorization_population(spec: &TwinMemorizationSpec) -> Result<Vec<AugmentedTwinPair>> {
+    spec.validate()?;
+    let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
+    stream_cfg.validate()?;
+    (0..spec.pairs)
+        .into_par_iter()
+        .map(|meta_episode_id| {
+            augmented_learning_history_pair_with(
+                &stream_cfg,
+                V5DataSplit::UnseenSeed7x7,
+                meta_episode_id as u64,
+                &spec.history,
+            )
+        })
+        .collect()
+}
+
+/// Whether the `K` window `[position - k, position)` holds an
+/// outcome-changing row of the pair.
+fn twin_window_has_evidence(divergence: &TwinPairDivergence, position: usize, k: usize) -> bool {
+    divergence
+        .outcome_changing_positions
+        .iter()
+        .any(|&changed| changed < position && changed + k >= position)
+}
+
+fn twin_after_first_divergence(divergence: &TwinPairDivergence, position: usize) -> bool {
+    divergence
+        .first_divergence
+        .is_some_and(|first| first < position)
+}
+
+/// Model-free census of `pairs` under `context_len` (see
+/// [`TwinMemorizationCensus`]).
+pub fn twin_memorization_census(
+    pairs: &[AugmentedTwinPair],
+    context_len: usize,
+) -> TwinMemorizationCensus {
+    let mut census = TwinMemorizationCensus {
+        pairs: pairs.len(),
+        episodes: pairs.len() * 2,
+        ..TwinMemorizationCensus::default()
+    };
+    for pair in pairs {
+        let divergence = &pair.divergence;
+        census.single_frame_rule_identifiable +=
+            usize::from(divergence.single_frame_rule_identifiable);
+        census.divergent_pairs += usize::from(divergence.first_divergence.is_some());
+        census.pairs_diverging_before_context_len += usize::from(
+            divergence
+                .first_divergence
+                .is_some_and(|first| first < context_len),
+        );
+        *census
+            .first_divergence_histogram
+            .entry(
+                divergence
+                    .first_divergence
+                    .map_or_else(|| "none".to_string(), |first| first.to_string()),
+            )
+            .or_default() += 1;
+        census.outcome_changing_rows += divergence.outcome_changing_positions.len();
+        census.state_differing_rows += divergence.state_differing_positions;
+        for history in [&pair.primary, &pair.twin] {
+            let len = history.chronological.len();
+            census.chronological_transitions += len;
+            for position in context_len..len {
+                census.scorable_rows += 1;
+                census.scorable_rows_after_first_divergence +=
+                    usize::from(twin_after_first_divergence(divergence, position));
+                census.scorable_rows_with_evidence_in_window +=
+                    usize::from(twin_window_has_evidence(divergence, position, context_len));
+            }
+        }
+    }
+    census
+}
+
+/// Fail-closed premise check for the registered twin statistic. The forward
+/// pass is meaningful only when the supplied population is complete, the two
+/// members of every pair remain observationally identical until the hidden
+/// rule changes an outcome, and the registered scoring/filtering sets are
+/// non-empty.
+fn validate_twin_memorization_census(
+    spec: &TwinMemorizationSpec,
+    census: &TwinMemorizationCensus,
+) -> Result<()> {
+    if census.pairs != spec.pairs || census.episodes != spec.pairs * 2 {
+        bail!(
+            "twin population is incomplete: expected {} pairs / {} episodes, got {} / {}",
+            spec.pairs,
+            spec.pairs * 2,
+            census.pairs,
+            census.episodes
+        );
+    }
+    if census.single_frame_rule_identifiable != 0 || census.state_differing_rows != 0 {
+        bail!(
+            "twin exclusivity failed: single_frame_rule_identifiable={} state_differing_rows={}",
+            census.single_frame_rule_identifiable,
+            census.state_differing_rows
+        );
+    }
+    if census.divergent_pairs != census.pairs {
+        bail!(
+            "twin population contains non-divergent pairs: divergent={} total={}",
+            census.divergent_pairs,
+            census.pairs
+        );
+    }
+    if census.outcome_changing_rows == 0
+        || census.scorable_rows == 0
+        || census.scorable_rows_with_evidence_in_window == 0
+    {
+        bail!(
+            "twin statistic is vacuous: outcome_changing_rows={} scorable_rows={} evidence_rows={}",
+            census.outcome_changing_rows,
+            census.scorable_rows,
+            census.scorable_rows_with_evidence_in_window
+        );
+    }
+    Ok(())
+}
+
+/// The chronological row `position` of `history` under the registered
+/// statistic: its own transition with exactly the `k` preceding chronological
+/// transitions as the Context Window (`position >= k`).
+fn twin_memorization_scoring_row(
+    history: &AugmentedLearningHistory,
+    position: usize,
+    k: usize,
+) -> Result<TransitionSample> {
+    let mut row = history.chronological_row(position).transition.clone();
+    let window = history.context_window_before(position);
+    if position < k || window.len() < k {
+        bail!("row {position} cannot carry a window of exactly {k} transitions");
+    }
+    row.context = window[window.len() - k..].to_vec();
+    row.provenance.context_len = u8::try_from(k).expect("context window fits u8");
+    Ok(row)
+}
+
+/// [`adaptation_falsifier_decode_rows`] over `rows` in slices of at most
+/// [`FOUNDATION_V2_GATE_PHYSICAL_BATCH`] rows: the frame encoder, the context
+/// encoder and the dynamics forward never see more rows than that, and only
+/// the decoded palettes (host `Vec<u8>`) survive each slice.
+fn decode_rows_bounded(
+    model: &WorldModel,
+    rows: &[TransitionSample],
+    device: &Device,
+) -> Result<AdaptationFalsifierDecodes> {
+    let mut decodes = AdaptationFalsifierDecodes {
+        true_predictions: Vec::with_capacity(rows.len()),
+        composed: Vec::with_capacity(rows.len()),
+    };
+    for slice in rows.chunks(FOUNDATION_V2_GATE_PHYSICAL_BATCH) {
+        let part = adaptation_falsifier_decode_rows(model, slice, device)?;
+        decodes.true_predictions.extend(part.true_predictions);
+        decodes.composed.extend(part.composed);
+    }
+    Ok(decodes)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TwinMemorizationAccum {
+    rows: usize,
+    changed: usize,
+    exact_full: usize,
+    exact_none: usize,
+    composed_full: usize,
+    composed_none: usize,
+}
+
+impl TwinMemorizationAccum {
+    fn metrics(&self) -> TwinMemorizationMetrics {
+        let fraction =
+            |exact: usize| (self.changed > 0).then(|| exact as f64 / self.changed as f64);
+        let delta = |full: Option<f64>, none: Option<f64>| Some(full? - none?);
+        let (full, none) = (fraction(self.exact_full), fraction(self.exact_none));
+        let (composed_full, composed_none) =
+            (fraction(self.composed_full), fraction(self.composed_none));
+        TwinMemorizationMetrics {
+            rows: self.rows,
+            changed_transitions: self.changed,
+            changed_exact_full_context: full,
+            changed_exact_no_context: none,
+            delta: delta(full, none),
+            composed_changed_exact_full_context: composed_full,
+            composed_changed_exact_no_context: composed_none,
+            composed_delta: delta(composed_full, composed_none),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TwinMemorizationAccums {
+    unfiltered: TwinMemorizationAccum,
+    after_first_divergence: TwinMemorizationAccum,
+    evidence_in_window: TwinMemorizationAccum,
+}
+
+/// Score every chronological row `i >= context_len` of `history` once with
+/// its exact `K = context_len` window and once with `K = 0`, and pool the
+/// per-row outcomes into the three row sets.
+fn twin_memorization_episode(
+    model: &WorldModel,
+    device: &Device,
+    history: &AugmentedLearningHistory,
+    divergence: &TwinPairDivergence,
+    spec: &TwinMemorizationSpec,
+    accums: &mut TwinMemorizationAccums,
+) -> Result<()> {
+    let k = spec.context_len;
+    let len = history.chronological.len();
+    if len <= k {
+        return Ok(());
+    }
+    let positions = (k..len).collect::<Vec<_>>();
+    let full = positions
+        .iter()
+        .map(|&position| twin_memorization_scoring_row(history, position, k))
+        .collect::<Result<Vec<_>>>()?;
+    let none = full
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.context.clear();
+            row.provenance.context_len = 0;
+            row
+        })
+        .collect::<Vec<_>>();
+    let full_decodes = decode_rows_bounded(model, &full, device)?;
+    let none_decodes = decode_rows_bounded(model, &none, device)?;
+    for (index, &position) in positions.iter().enumerate() {
+        let row = std::slice::from_ref(&full[index]);
+        let count = |prediction: &Vec<u8>| -> Result<(usize, usize)> {
+            one_step_changed_exact_counts(row, std::slice::from_ref(prediction))
+        };
+        let (changed, exact_full) = count(&full_decodes.true_predictions[index])?;
+        let (changed_none, exact_none) = count(&none_decodes.true_predictions[index])?;
+        let (changed_composed, composed_full) = count(&full_decodes.composed[index])?;
+        let (_, composed_none) = count(&none_decodes.composed[index])?;
+        if changed != changed_none || changed != changed_composed {
+            bail!("the two arms disagree on whether row {position} is a changed transition");
+        }
+        let outcome = TwinMemorizationAccum {
+            rows: 1,
+            changed,
+            exact_full,
+            exact_none,
+            composed_full,
+            composed_none,
+        };
+        let add = |accum: &mut TwinMemorizationAccum| {
+            accum.rows += outcome.rows;
+            accum.changed += outcome.changed;
+            accum.exact_full += outcome.exact_full;
+            accum.exact_none += outcome.exact_none;
+            accum.composed_full += outcome.composed_full;
+            accum.composed_none += outcome.composed_none;
+        };
+        add(&mut accums.unfiltered);
+        if twin_after_first_divergence(divergence, position) {
+            add(&mut accums.after_first_divergence);
+        }
+        if twin_window_has_evidence(divergence, position, k) {
+            add(&mut accums.evidence_in_window);
+        }
+    }
+    Ok(())
+}
+
+/// The registered §5.1 rule: pass iff the evidence-filtered changed-exact
+/// delta is at least `promotion_delta`.
+pub fn twin_memorization_verdict(
+    filtered: &TwinMemorizationMetrics,
+    unfiltered: &TwinMemorizationMetrics,
+    promotion_delta: f64,
+) -> TwinMemorizationVerdict {
+    let pass = filtered
+        .delta
+        .is_some_and(|delta| delta + ADAPTATION_FALSIFIER_DELTA_TOLERANCE >= promotion_delta);
+    let note = match filtered.delta {
+        None => format!(
+            "no changed transition among the {} rows whose window contains rule evidence; the \
+             rule cannot be evaluated and the data contract is NOT promoted",
+            filtered.rows
+        ),
+        Some(delta) => format!(
+            "changed-exact K=16 minus K=0 over {} evidence-bearing rows ({} changed) = {delta:.4}; \
+             unfiltered over {} rows = {}; threshold {promotion_delta}; pass = {pass}",
+            filtered.rows,
+            filtered.changed_transitions,
+            unfiltered.rows,
+            unfiltered
+                .delta
+                .map_or_else(|| "n/a".to_string(), |delta| format!("{delta:.4}")),
+        ),
+    };
+    TwinMemorizationVerdict {
+        promotion_delta,
+        statistic: "changed_exact(K=context_len) - changed_exact(K=0) on held-out twin-pair rows \
+                    at index >= context_len whose window contains an outcome-changing row"
+            .into(),
+        delta_filtered: filtered.delta,
+        delta_unfiltered: unfiltered.delta,
+        pass,
+        note,
+    }
+}
+
+/// ADR 0005 §5.1 registered statistic (E2): draw `spec.pairs` held-out Twin
+/// Episode pairs on `UnseenSeed7x7` under the stream's v6 augmentation and
+/// score every chronological row `i >= K` of every episode with exactly the
+/// `K` preceding transitions as context versus no context. Nothing here
+/// retains a model output beyond a bounded, detached slice.
+pub fn evaluate_twin_memorization(
+    model: &WorldModel,
+    device: &Device,
+    spec: &TwinMemorizationSpec,
+) -> Result<TwinMemorizationReport> {
+    if !model.config().world_core_v6 {
+        bail!("the twin memorization diagnostic requires a world_core_v6 checkpoint");
+    }
+    spec.validate()?;
+    let pairs = timed_eval_phase("twin_memorization", "population_generation", || {
+        twin_memorization_population(spec)
+    })?;
+    evaluate_twin_memorization_on(model, device, spec, &pairs)
+}
+
+/// [`evaluate_twin_memorization`] over a caller-supplied population.
+fn evaluate_twin_memorization_on(
+    model: &WorldModel,
+    device: &Device,
+    spec: &TwinMemorizationSpec,
+    pairs: &[AugmentedTwinPair],
+) -> Result<TwinMemorizationReport> {
+    if pairs.is_empty() {
+        bail!("the twin memorization diagnostic needs at least one pair");
+    }
+    let census = twin_memorization_census(pairs, spec.context_len);
+    validate_twin_memorization_census(spec, &census)?;
+    eprintln!(
+        "[p2-eval twin_memorization] preflight: pairs={} single_frame_rule_identifiable={} \
+         divergent_pairs={} pairs_diverging_before_context_len={} outcome_changing_rows={} \
+         scorable_rows={} with_evidence_in_window={}",
+        census.pairs,
+        census.single_frame_rule_identifiable,
+        census.divergent_pairs,
+        census.pairs_diverging_before_context_len,
+        census.outcome_changing_rows,
+        census.scorable_rows,
+        census.scorable_rows_with_evidence_in_window,
+    );
+    let population_fingerprint = learning_history_population_fingerprint(
+        pairs.iter().flat_map(|pair| [&pair.primary, &pair.twin]),
+    );
+    let mut accums = TwinMemorizationAccums::default();
+    timed_eval_phase("twin_memorization", "score_k_full_vs_k0", || {
+        for pair in pairs {
+            for history in [&pair.primary, &pair.twin] {
+                twin_memorization_episode(
+                    model,
+                    device,
+                    history,
+                    &pair.divergence,
+                    spec,
+                    &mut accums,
+                )?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    if accums.unfiltered.rows != census.scorable_rows
+        || accums.evidence_in_window.rows != census.scorable_rows_with_evidence_in_window
+    {
+        bail!("scored row counts do not match the preflight census");
+    }
+    let unfiltered = accums.unfiltered.metrics();
+    let after_first_divergence = accums.after_first_divergence.metrics();
+    let evidence_in_window = accums.evidence_in_window.metrics();
+    let verdict = twin_memorization_verdict(
+        &evidence_in_window,
+        &unfiltered,
+        TWIN_MEMORIZATION_PROMOTION_DELTA,
+    );
+    Ok(TwinMemorizationReport {
+        population: "twin_learning_histories/unseen_seed_7x7".into(),
+        population_seed: spec.population_seed,
+        evidence_class: "selection_only".into(),
+        pairs: pairs.len(),
+        episodes: pairs.len() * 2,
+        context_len: spec.context_len,
+        history: spec.history.clone(),
+        population_fingerprint,
+        census,
+        unfiltered,
+        after_first_divergence,
+        evidence_in_window,
         verdict,
     })
 }
@@ -8483,10 +9108,11 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
         );
     }
     let v6_adaptation_falsifier = if cfg.adaptation_falsifier && model.config().world_core_v6 {
-        let spec = AdaptationFalsifierSpec::preregistered(
+        let mut spec = AdaptationFalsifierSpec::preregistered(
             cfg.synthetic_episodes,
             cfg.adaptation_falsifier_min_level_transitions,
         );
+        spec.history = cfg.learning_history_shape(LearningHistoryConfig::extended_evaluation());
         if spec.population_seed == train_cfg.seed {
             bail!(
                 "adaptation falsifier population seed collides with the checkpoint's \
@@ -8503,6 +9129,31 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
             eprintln!(
                 "p2-eval: --adaptation-falsifier ignored; the checkpoint is not world_core_v6 \
                  (ADR 0005 §5.2 applies to v6 checkpoints only)"
+            );
+        }
+        None
+    };
+    let v6_twin_memorization = if cfg.twin_memorization && model.config().world_core_v6 {
+        let spec = TwinMemorizationSpec::preregistered(
+            cfg.twin_memorization_pairs,
+            cfg.learning_history_shape(LearningHistoryConfig::training()),
+        );
+        if spec.population_seed == train_cfg.seed {
+            bail!(
+                "twin memorization population seed collides with the checkpoint's training \
+                 seed; the held-out claim would be false"
+            );
+        }
+        Some(timed_eval_phase(
+            "twin_memorization",
+            "twin_learning_histories_unseen_seed_7x7",
+            || evaluate_twin_memorization(&model, &device, &spec),
+        )?)
+    } else {
+        if cfg.twin_memorization {
+            eprintln!(
+                "p2-eval: --twin-memorization ignored; the checkpoint is not world_core_v6 \
+                 (ADR 0005 §5.1 applies to v6 checkpoints only)"
             );
         }
         None
@@ -8604,6 +9255,7 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
         v6_context_strata,
         v6_context_ablation,
         v6_adaptation_falsifier,
+        v6_twin_memorization,
         mechanism_ablations,
         research_claim: false,
     };
@@ -9038,7 +9690,7 @@ pub fn emit_phase_a_calibration(cfg: &EvalConfig, output: &Path) -> Result<Phase
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2::data::{ArcAction, ArcFrame, GoalFeatures};
+    use crate::p2::data::{augmented_learning_history, ArcAction, ArcFrame, GoalFeatures};
     use crate::p2::train::{
         reinit_varmap_deterministic, save_checkpoint, TrainReport, TRAIN_REPORT_SCHEMA,
     };
@@ -10906,11 +11558,16 @@ mod tests {
             context_ablation: false,
             adaptation_falsifier: false,
             adaptation_falsifier_min_level_transitions: ADAPT_MIN_LEVEL_TRANSITIONS,
+            twin_memorization: false,
+            twin_memorization_pairs: TWIN_MEMORIZATION_DEFAULT_PAIRS,
+            learning_history_steps_per_level: None,
+            learning_history_levels: None,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);
         assert!(eval.v6_context_ablation.is_none());
         assert!(eval.v6_adaptation_falsifier.is_none());
+        assert!(eval.v6_twin_memorization.is_none());
         let eval_json = fs::read_to_string(dir.join("eval.json"))?;
         assert!(
             !eval_json.contains("v6_context_ablation"),
@@ -10919,6 +11576,14 @@ mod tests {
         assert!(
             !eval_json.contains("v6_adaptation_falsifier"),
             "legacy report must not gain the falsifier key"
+        );
+        assert!(
+            !eval_json.contains("v6_twin_memorization"),
+            "legacy report must not gain the twin memorization key"
+        );
+        assert!(
+            !eval_json.contains("learning_history"),
+            "legacy report must not gain the history-shape keys"
         );
         assert!(eval.official_rhae.is_none());
         assert!(!eval.public_data_used_for_fitting);
@@ -11994,12 +12659,82 @@ mod tests {
         Ok(())
     }
 
-    /// The default §6.2 warm-up (8 unique transitions per level) can never be
-    /// met on 7-transition synthetic levels: both adapted arms stay in warm-up
-    /// and reproduce the context-only arm exactly. The report makes that
-    /// visible through the telemetry rather than hiding it.
+    /// The registered arm on the extended evaluation histories: with the
+    /// production warm-up (8 unique transitions per level) Channel B leaves
+    /// warm-up inside level 0 and performs updates, and the report records
+    /// the history shape it ran under.
     #[test]
-    fn adaptation_falsifier_default_warmup_never_updates_on_synthetic_levels() -> Result<()> {
+    fn adaptation_falsifier_registered_arm_updates_on_extended_histories() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        let spec = AdaptationFalsifierSpec {
+            episodes: 1,
+            prefix_lengths: vec![16],
+            ..AdaptationFalsifierSpec::preregistered(1, ADAPT_MIN_LEVEL_TRANSITIONS)
+        };
+        assert_eq!(spec.min_level_transitions, ADAPT_MIN_LEVEL_TRANSITIONS);
+        assert_eq!(spec.history, LearningHistoryConfig::extended_evaluation());
+        let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
+        let mut history = augmented_learning_history_with(
+            &stream_cfg,
+            V5DataSplit::UnseenSeed7x7,
+            0,
+            &spec.history,
+        )?;
+        let full_len = history.chronological.len();
+        assert!(full_len >= 36, "{full_len}");
+        assert_eq!(full_len % spec.history.transitions_per_level(), 0);
+        // Every preregistered prefix is reachable on the untruncated history.
+        for t in ADAPTATION_FALSIFIER_PREFIX_LENGTHS {
+            assert!(t + ADAPTATION_FALSIFIER_SCORE_WINDOW <= full_len, "t={t}");
+        }
+        // Debug-mode adaptation is slow: keep only t = 16 and its four
+        // scoring rows, all inside level 0 (25 transitions). The first eight
+        // chronological rows are not guaranteed to be eight unique factual
+        // queries, so t = 8 can correctly remain in warm-up; by t = 16 this
+        // registered population member has crossed the production warm-up.
+        let mut factual = FactualBuffer::new(AdaptationMode::Reset);
+        for position in 0..16 {
+            let row = &history.chronological_row(position).transition;
+            factual.push(
+                row.current.clone(),
+                row.action.clone(),
+                row.next.clone(),
+                row.provenance.level_index,
+            );
+        }
+        assert!(
+            factual.unique_transitions_in_level(0) >= ADAPT_MIN_LEVEL_TRANSITIONS,
+            "{}",
+            factual.unique_transitions_in_level(0)
+        );
+        history
+            .chronological
+            .truncate(16 + ADAPTATION_FALSIFIER_SCORE_WINDOW);
+        let report = evaluate_adaptation_falsifier_on(&model, &varmap, &device, &spec, &[history])?;
+        assert_eq!(report.min_level_transitions, ADAPT_MIN_LEVEL_TRANSITIONS);
+        assert_eq!(report.history, LearningHistoryConfig::extended_evaluation());
+        assert_eq!(report.verdict.skipped_prefix_lengths, Vec::<usize>::new());
+        let context_only = &report.arms[0];
+        assert_eq!(context_only.arm, ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY);
+        assert_eq!(context_only.adaptation.updates, 0);
+        for metrics in &report.arms[1..] {
+            assert!(metrics.adaptation.updates > 0, "{metrics:?}");
+            assert!(metrics.adaptation.max_drift_from_prior > 0.0, "{metrics:?}");
+        }
+        let json = serde_json::to_string(&report)?;
+        assert!(json.contains("\"history\""));
+        let back: AdaptationFalsifierReport = serde_json::from_str(&json)?;
+        assert_eq!(back, report);
+        Ok(())
+    }
+
+    /// The default §6.2 warm-up (8 unique transitions per level) can never be
+    /// met on the TRAINING shape's 7-transition levels: both adapted arms stay
+    /// in warm-up and reproduce the context-only arm exactly. The report makes
+    /// that visible through the telemetry rather than hiding it.
+    #[test]
+    fn adaptation_falsifier_default_warmup_never_updates_on_training_shape_levels() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_v6_model(&device)?;
         let spec = AdaptationFalsifierSpec {
@@ -12010,7 +12745,12 @@ mod tests {
         let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
         let mut history = augmented_learning_history(&stream_cfg, V5DataSplit::UnseenSeed7x7, 1)?;
         history.chronological.truncate(12);
+        let spec = AdaptationFalsifierSpec {
+            history: LearningHistoryConfig::training(),
+            ..spec
+        };
         let report = evaluate_adaptation_falsifier_on(&model, &varmap, &device, &spec, &[history])?;
+        assert_eq!(report.history, LearningHistoryConfig::training());
         let context_only = &report.arms[0];
         assert_eq!(context_only.arm, ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY);
         for metrics in &report.arms[1..] {
@@ -12025,6 +12765,321 @@ mod tests {
         }
         assert!(!report.verdict.promote_channel_b);
         Ok(())
+    }
+
+    // ---- ADR 0005 §5.1 twin memorization diagnostic (registered statistic) --
+
+    fn twin_population(
+        pairs: usize,
+        history: LearningHistoryConfig,
+    ) -> Result<(TwinMemorizationSpec, Vec<AugmentedTwinPair>)> {
+        let spec = TwinMemorizationSpec::preregistered(pairs, history);
+        let population = twin_memorization_population(&spec)?;
+        Ok((spec, population))
+    }
+
+    /// The registered evaluator at the identity context FiLM: the K = 16
+    /// rows decode bit for bit like the plain context-free forward, so every
+    /// delta is exactly zero; counts reconcile with the census; the report
+    /// is deterministic and round-trips.
+    #[test]
+    fn twin_memorization_is_zero_at_identity_film_and_matches_plain_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        crate::p2::model::zero_context_film_projections(&varmap)?;
+        let (spec, pairs) = twin_population(3, LearningHistoryConfig::training())?;
+        assert_eq!(spec.context_len, CONTEXT_WINDOW_MAX);
+        assert_eq!(spec.population_seed, TWIN_MEMORIZATION_POPULATION_SEED);
+        let census = twin_memorization_census(&pairs, spec.context_len);
+        assert!(
+            census.scorable_rows > 0,
+            "fixture needs an episode longer than K: {census:?}"
+        );
+
+        // Bit-for-bit: K = 16 scoring rows through the bounded decode equal
+        // the plain forward without any context.
+        let episode = pairs
+            .iter()
+            .flat_map(|pair| [&pair.primary, &pair.twin])
+            .find(|history| history.chronological.len() > spec.context_len)
+            .expect("an episode with scorable rows");
+        let rows = (spec.context_len..episode.chronological.len())
+            .map(|position| twin_memorization_scoring_row(episode, position, spec.context_len))
+            .collect::<Result<Vec<_>>>()?;
+        for (offset, row) in rows.iter().enumerate() {
+            let position = spec.context_len + offset;
+            assert_eq!(row.context.len(), spec.context_len);
+            assert_eq!(usize::from(row.provenance.context_len), spec.context_len);
+            let previous = &episode.chronological_row(position - 1).transition;
+            let last = row.context.last().expect("window");
+            assert_eq!(last.current, previous.current);
+            assert_eq!(last.next, previous.next);
+            let first = &episode
+                .chronological_row(position - spec.context_len)
+                .transition;
+            assert_eq!(row.context[0].current, first.current);
+        }
+        let with_context = decode_rows_bounded(&model, &rows, &device)?;
+        let batch = batch_from_samples(&rows, &device)?;
+        assert!(batch.context.is_some());
+        let (current, _) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+        let plain = model
+            .forward_from_latent_with_depth_and_operator_conditioning_with_context(
+                &current,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                &batch.operator_conditioning,
+                None,
+                RecursionDepth::from_config(model.config()),
+            )?
+            .y;
+        assert_eq!(
+            with_context.true_predictions,
+            exact_palette_predictions(&model, &plain)?
+        );
+        assert_eq!(
+            with_context.composed,
+            model
+                .composed_gameplay_decode(&plain, &batch.frames)?
+                .reshape((rows.len(), ()))?
+                .to_dtype(DType::U8)?
+                .to_vec2::<u8>()?
+        );
+
+        let report = evaluate_twin_memorization_on(&model, &device, &spec, &pairs)?;
+        assert_eq!(report.pairs, 3);
+        assert_eq!(report.episodes, 6);
+        assert_eq!(report.context_len, CONTEXT_WINDOW_MAX);
+        assert_eq!(report.history, LearningHistoryConfig::training());
+        assert_eq!(report.evidence_class, "selection_only");
+        assert!(report.population_fingerprint.starts_with("sha256:"));
+        assert_eq!(report.census, census);
+        assert_eq!(report.unfiltered.rows, census.scorable_rows);
+        assert_eq!(
+            report.after_first_divergence.rows,
+            census.scorable_rows_after_first_divergence
+        );
+        assert_eq!(
+            report.evidence_in_window.rows,
+            census.scorable_rows_with_evidence_in_window
+        );
+        assert!(report.unfiltered.changed_transitions > 0, "{report:?}");
+        for metrics in [
+            &report.unfiltered,
+            &report.after_first_divergence,
+            &report.evidence_in_window,
+        ] {
+            if metrics.changed_transitions > 0 {
+                assert_eq!(metrics.delta, Some(0.0), "{metrics:?}");
+                assert_eq!(metrics.composed_delta, Some(0.0), "{metrics:?}");
+                assert_eq!(
+                    metrics.changed_exact_full_context,
+                    metrics.changed_exact_no_context
+                );
+            } else {
+                assert_eq!(metrics.delta, None);
+            }
+        }
+        assert_eq!(
+            report.verdict.promotion_delta,
+            TWIN_MEMORIZATION_PROMOTION_DELTA
+        );
+        assert_eq!(report.verdict.delta_unfiltered, report.unfiltered.delta);
+        assert_eq!(
+            report.verdict.delta_filtered,
+            report.evidence_in_window.delta
+        );
+        assert!(!report.verdict.pass, "{:?}", report.verdict);
+        let json = serde_json::to_string(&report)?;
+        let back: TwinMemorizationReport = serde_json::from_str(&json)?;
+        assert_eq!(back, report);
+        let again = evaluate_twin_memorization_on(&model, &device, &spec, &pairs)?;
+        assert_eq!(again, report);
+        Ok(())
+    }
+
+    /// The preflight census on a fixed seed: exclusivity holds, divergences
+    /// sit on operator rows, the evidence filter is consistent with a direct
+    /// recount, and the census is deterministic.
+    #[test]
+    fn twin_memorization_census_counts_on_a_fixed_seed() -> Result<()> {
+        let (spec, pairs) = twin_population(8, LearningHistoryConfig::training())?;
+        let k = spec.context_len;
+        let census = twin_memorization_census(&pairs, k);
+        assert_eq!(census.pairs, 8);
+        assert_eq!(census.episodes, 16);
+        assert_eq!(census.single_frame_rule_identifiable, 0);
+        assert_eq!(census.divergent_pairs, 8);
+        assert_eq!(census.state_differing_rows, 0);
+        assert!(census.outcome_changing_rows >= 8, "{census:?}");
+        assert!(census.pairs_diverging_before_context_len >= 1, "{census:?}");
+        assert!(census.scorable_rows > 0, "{census:?}");
+        assert!(
+            census.scorable_rows_with_evidence_in_window > 0,
+            "{census:?}"
+        );
+        assert!(
+            census.scorable_rows_with_evidence_in_window
+                <= census.scorable_rows_after_first_divergence
+        );
+        assert!(census.scorable_rows_after_first_divergence <= census.scorable_rows);
+        assert_eq!(census.first_divergence_histogram.values().sum::<usize>(), 8);
+        let per_level = spec.history.transitions_per_level();
+        // Direct recount from the augmented rows.
+        let mut chronological = 0usize;
+        let mut scorable = 0usize;
+        let mut evidence = 0usize;
+        let mut outcome_changing = 0usize;
+        for pair in &pairs {
+            let mut changed_positions = Vec::new();
+            for (position, &index) in pair.primary.chronological.iter().enumerate() {
+                let (left, right) = (
+                    &pair.primary.rows[index].transition,
+                    &pair.twin.rows[index].transition,
+                );
+                assert_eq!(left.current, right.current);
+                assert_eq!(left.action, right.action);
+                if left.next != right.next {
+                    assert_eq!(position % per_level, per_level - 1, "operator rows only");
+                    changed_positions.push(position);
+                }
+            }
+            assert_eq!(
+                pair.divergence.outcome_changing_positions,
+                changed_positions
+            );
+            assert_eq!(
+                pair.divergence.first_divergence,
+                changed_positions.first().copied()
+            );
+            let first = changed_positions[0].to_string();
+            assert!(census.first_divergence_histogram.contains_key(&first));
+            outcome_changing += changed_positions.len();
+            for history in [&pair.primary, &pair.twin] {
+                let len = history.chronological.len();
+                chronological += len;
+                for position in k..len {
+                    scorable += 1;
+                    evidence += usize::from(
+                        changed_positions
+                            .iter()
+                            .any(|&changed| changed < position && position - changed <= k),
+                    );
+                }
+            }
+        }
+        assert_eq!(census.chronological_transitions, chronological);
+        assert_eq!(census.scorable_rows, scorable);
+        assert_eq!(census.scorable_rows_with_evidence_in_window, evidence);
+        assert_eq!(census.outcome_changing_rows, outcome_changing);
+        assert_eq!(twin_memorization_census(&pairs, k), census);
+        let (_, again) = twin_population(8, LearningHistoryConfig::training())?;
+        assert_eq!(twin_memorization_census(&again, k), census);
+        // Under the extended shape the same seed draws longer histories and
+        // the census reports the shape's row counts.
+        let (extended_spec, extended) =
+            twin_population(2, LearningHistoryConfig::extended_evaluation())?;
+        let extended_census = twin_memorization_census(&extended, extended_spec.context_len);
+        assert_eq!(extended_census.pairs, 2);
+        assert!(extended_census.chronological_transitions >= 4 * 75);
+        assert_eq!(extended_census.state_differing_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn twin_memorization_registered_population_passes_preflight() -> Result<()> {
+        let (spec, pairs) = twin_population(
+            TWIN_MEMORIZATION_DEFAULT_PAIRS,
+            LearningHistoryConfig::training(),
+        )?;
+        let census = twin_memorization_census(&pairs, spec.context_len);
+        validate_twin_memorization_census(&spec, &census)?;
+        assert_eq!(
+            census,
+            TwinMemorizationCensus {
+                pairs: 256,
+                episodes: 512,
+                single_frame_rule_identifiable: 0,
+                divergent_pairs: 256,
+                pairs_diverging_before_context_len: 254,
+                first_divergence_histogram: BTreeMap::from([
+                    ("6".into(), 245),
+                    ("13".into(), 9),
+                    ("20".into(), 1),
+                    ("27".into(), 1),
+                ]),
+                chronological_transitions: 10_780,
+                outcome_changing_rows: 724,
+                state_differing_rows: 0,
+                scorable_rows: 2_912,
+                scorable_rows_after_first_divergence: 2_878,
+                scorable_rows_with_evidence_in_window: 2_858,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn twin_memorization_preflight_fails_closed_on_invalid_population() -> Result<()> {
+        let (spec, pairs) = twin_population(8, LearningHistoryConfig::training())?;
+        let valid = twin_memorization_census(&pairs, spec.context_len);
+        validate_twin_memorization_census(&spec, &valid)?;
+
+        let mut incomplete = valid.clone();
+        incomplete.pairs -= 1;
+        assert!(validate_twin_memorization_census(&spec, &incomplete)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete"));
+
+        let mut identifiable = valid.clone();
+        identifiable.single_frame_rule_identifiable = 1;
+        assert!(validate_twin_memorization_census(&spec, &identifiable)
+            .unwrap_err()
+            .to_string()
+            .contains("exclusivity failed"));
+
+        let mut non_divergent = valid.clone();
+        non_divergent.divergent_pairs -= 1;
+        assert!(validate_twin_memorization_census(&spec, &non_divergent)
+            .unwrap_err()
+            .to_string()
+            .contains("non-divergent"));
+
+        let mut vacuous = valid;
+        vacuous.scorable_rows_with_evidence_in_window = 0;
+        assert!(validate_twin_memorization_census(&spec, &vacuous)
+            .unwrap_err()
+            .to_string()
+            .contains("vacuous"));
+        Ok(())
+    }
+
+    #[test]
+    fn twin_memorization_verdict_includes_the_registered_threshold_boundary() {
+        let metrics = |delta: f64| TwinMemorizationMetrics {
+            rows: 100,
+            changed_transitions: 100,
+            changed_exact_full_context: Some(0.50 + delta),
+            changed_exact_no_context: Some(0.50),
+            delta: Some(delta),
+            composed_changed_exact_full_context: Some(0.50),
+            composed_changed_exact_no_context: Some(0.50),
+            composed_delta: Some(0.0),
+        };
+        let at_threshold = metrics(TWIN_MEMORIZATION_PROMOTION_DELTA);
+        assert!(
+            twin_memorization_verdict(
+                &at_threshold,
+                &at_threshold,
+                TWIN_MEMORIZATION_PROMOTION_DELTA
+            )
+            .pass
+        );
+
+        let below = metrics(TWIN_MEMORIZATION_PROMOTION_DELTA - 1e-6);
+        assert!(!twin_memorization_verdict(&below, &below, TWIN_MEMORIZATION_PROMOTION_DELTA).pass);
     }
 
     /// Test (3): the preregistered rule on hand-built metric tables.

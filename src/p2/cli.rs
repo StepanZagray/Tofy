@@ -756,9 +756,10 @@ pub struct P2EvalArgs {
     pub adaptation_falsifier: bool,
 
     /// Falsifier-only Channel B warm-up (unique transitions per level before
-    /// the first update; §6.2 default 8). Synthetic Learning Histories carry 7
-    /// transitions per level, so the default never leaves warm-up; any other
-    /// value is a recorded deviation from the preregistered §6.2 rule.
+    /// the first update; §6.2 default 8). The falsifier renders extended
+    /// Learning Histories (24 movement rows per level) by default, so the
+    /// production warm-up is reachable; any other value is a recorded
+    /// deviation from the preregistered §6.2 rule.
     #[arg(long, default_value_t = crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS, requires = "adaptation_falsifier")]
     pub adaptation_falsifier_min_level_transitions: usize,
 
@@ -771,6 +772,32 @@ pub struct P2EvalArgs {
     /// rejected by `--phase-a-calibration` at load time.
     #[arg(long)]
     pub emit_phase_a_calibration: Option<PathBuf>,
+
+    /// ADR 0005 §5.1 registered statistic (E2): `--twin-memorization-pairs`
+    /// held-out twin-pair meta-episodes (seed 1000002, unseen-seed 7x7, the
+    /// stream's v6 augmentation), every row at index >= 16 scored with
+    /// exactly K = 16 versus K = 0; pass iff the evidence-filtered
+    /// changed-exact delta >= 0.05 (world_core_v6 only).
+    #[arg(long, default_value_t = false)]
+    pub twin_memorization: bool,
+
+    /// Twin pairs for `--twin-memorization` (two meta-episodes each; the
+    /// registered population is 256 pairs = 512 episodes). Independent of
+    /// `--synthetic-episodes`.
+    #[arg(long, default_value_t = crate::p2::eval::TWIN_MEMORIZATION_DEFAULT_PAIRS, requires = "twin_memorization")]
+    pub twin_memorization_pairs: usize,
+
+    /// Level-shape override for the v6 evaluators' Learning Histories:
+    /// movement rows per level. Unset: the twin diagnostic uses the training
+    /// shape (6) and the adaptation falsifier the extended shape (24).
+    #[arg(long)]
+    pub learning_history_steps_per_level: Option<usize>,
+
+    /// Level-shape override: comma-separated level counts drawn per
+    /// meta-episode. Unset: training shape `2,3,4` (twin diagnostic) or
+    /// extended shape `3,4,5` (adaptation falsifier).
+    #[arg(long, value_delimiter = ',')]
+    pub learning_history_levels: Option<Vec<usize>>,
 }
 
 impl P2EvalArgs {
@@ -798,6 +825,10 @@ impl P2EvalArgs {
             adaptation_falsifier: self.adaptation_falsifier,
             adaptation_falsifier_min_level_transitions: self
                 .adaptation_falsifier_min_level_transitions,
+            twin_memorization: self.twin_memorization,
+            twin_memorization_pairs: self.twin_memorization_pairs,
+            learning_history_steps_per_level: self.learning_history_steps_per_level,
+            learning_history_levels: self.learning_history_levels.clone(),
         }
     }
 }
@@ -869,6 +900,33 @@ pub fn run_p2_eval(args: P2EvalArgs) -> Result<()> {
             .and_then(|m| m.latent_covariance_frobenius),
         report.arc3_recording_runs.as_ref().map(|b| b.n_runs),
     );
+    if let Some(twin) = &report.v6_twin_memorization {
+        println!(
+            "p2-eval twin-memorization (ADR 0005 §5.1 registered statistic): pairs={} \
+             episodes={} scored_rows={} evidence_rows={} delta_filtered={:?} \
+             delta_unfiltered={:?} pass={} history={:?}",
+            twin.pairs,
+            twin.episodes,
+            twin.unfiltered.rows,
+            twin.evidence_in_window.rows,
+            twin.verdict.delta_filtered,
+            twin.verdict.delta_unfiltered,
+            twin.verdict.pass,
+            twin.history,
+        );
+    }
+    if let Some(falsifier) = &report.v6_adaptation_falsifier {
+        println!(
+            "p2-eval adaptation-falsifier (ADR 0005 §5.2): episodes={} history={:?} \
+             min_level_transitions={} evaluated_t={:?} skipped_t={:?} promote_channel_b={}",
+            falsifier.episodes,
+            falsifier.history,
+            falsifier.min_level_transitions,
+            falsifier.verdict.evaluated_prefix_lengths,
+            falsifier.verdict.skipped_prefix_lengths,
+            falsifier.verdict.promote_channel_b,
+        );
+    }
     Ok(())
 }
 
@@ -938,6 +996,10 @@ impl P2Arc3EvalArgs {
             adaptation_falsifier: false,
             adaptation_falsifier_min_level_transitions:
                 crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS,
+            twin_memorization: false,
+            twin_memorization_pairs: crate::p2::eval::TWIN_MEMORIZATION_DEFAULT_PAIRS,
+            learning_history_steps_per_level: None,
+            learning_history_levels: None,
         }
     }
 }
@@ -1280,6 +1342,52 @@ mod tests {
     }
 
     #[test]
+    fn twin_memorization_and_history_shape_flags_reach_eval_config() {
+        use crate::p2::data::LearningHistoryConfig;
+        let legacy = EvalWrapper::try_parse_from(["p2-eval"])
+            .expect("default eval arguments parse")
+            .args
+            .to_config();
+        assert!(!legacy.twin_memorization);
+        assert_eq!(
+            legacy.twin_memorization_pairs,
+            crate::p2::eval::TWIN_MEMORIZATION_DEFAULT_PAIRS
+        );
+        assert_eq!(
+            legacy.learning_history_shape(LearningHistoryConfig::training()),
+            LearningHistoryConfig::training()
+        );
+        let twin = EvalWrapper::try_parse_from(["p2-eval", "--twin-memorization"])
+            .expect("twin flag parses")
+            .args
+            .to_config();
+        assert!(twin.twin_memorization);
+        assert_eq!(twin.twin_memorization_pairs, 256);
+        let shaped = EvalWrapper::try_parse_from([
+            "p2-eval",
+            "--twin-memorization",
+            "--twin-memorization-pairs",
+            "8",
+            "--learning-history-steps-per-level",
+            "24",
+            "--learning-history-levels",
+            "3,4,5",
+        ])
+        .expect("shape flags parse")
+        .args
+        .to_config();
+        assert_eq!(shaped.twin_memorization_pairs, 8);
+        assert_eq!(
+            shaped.learning_history_shape(LearningHistoryConfig::training()),
+            LearningHistoryConfig::extended_evaluation()
+        );
+        assert!(
+            EvalWrapper::try_parse_from(["p2-eval", "--twin-memorization-pairs", "8"]).is_err(),
+            "the pair count requires --twin-memorization"
+        );
+    }
+
+    #[test]
     fn adaptation_falsifier_flag_is_off_by_default_and_reaches_eval_config() {
         let legacy = EvalWrapper::try_parse_from(["p2-eval"])
             .expect("default eval arguments parse")
@@ -1310,6 +1418,9 @@ mod tests {
         assert!(lowered.adaptation_falsifier);
         assert_eq!(lowered.adaptation_falsifier_min_level_transitions, 4);
         assert_eq!(lowered.synthetic_episodes, 256);
+        assert!(!lowered.twin_memorization);
+        assert_eq!(lowered.learning_history_steps_per_level, None);
+        assert_eq!(lowered.learning_history_levels, None);
         assert!(
             EvalWrapper::try_parse_from([
                 "p2-eval",

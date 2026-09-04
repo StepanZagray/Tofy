@@ -349,3 +349,12 @@ each merge. Deviations from the text above, recorded so nobody rediscovers them:
 - §2.6 the ARCEngine shard generator exists (`python/tofy_arc3/synth`, 24 tests) and its
   seed-1 census passes the twin and random-play gates; the Rust `SyntheticShards` loader is
   not yet written (stream weight remains 0).
+- 2026-09-04 (audit fixes): the §5.1 statistic as registered is implemented as
+  `p2-eval --twin-memorization` (twin-pair meta-episodes, exactly `K = 16` vs `K = 0`,
+  rule over rows whose window contains an outcome-changing twin row; the `5-16` stratum
+  proxy is reported only). Learning Histories take a `LearningHistoryConfig` level shape:
+  training keeps `(6, {2,3,4})` byte for byte (pinned digest); the §5.2 falsifier renders
+  `(24, {3,4,5})` by default so the production warm-up and `t = 32` are reachable. A concrete
+  episode can still be warm-up-only at `t = 8` if its first eight rows are not eight unique
+  factual queries; telemetry exposes that case. See the 2026-09-04 amendment in
+  `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`.

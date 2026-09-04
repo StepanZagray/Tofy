@@ -588,10 +588,11 @@ impl<'a> FastWeightAdapter<'a> {
     }
 
     /// Falsifier knob: the per-level warm-up (§6.2 default
-    /// [`ADAPT_MIN_LEVEL_TRANSITIONS`]). Synthetic Learning Histories carry
-    /// only `LEARNING_HISTORY_STEPS_PER_LEVEL + 1 = 7` transitions per level,
-    /// so the §5.2 falsifier cannot leave warm-up at the default; a lowered
-    /// value is a recorded deviation, never the live default.
+    /// [`ADAPT_MIN_LEVEL_TRANSITIONS`]). Training-shape Learning Histories
+    /// carry only `LEARNING_HISTORY_STEPS_PER_LEVEL + 1 = 7` transitions per
+    /// level, so the §5.2 falsifier renders extended histories (24 movement
+    /// rows per level) to leave warm-up at the default; a lowered value is a
+    /// recorded deviation, never the live default.
     pub fn set_min_level_transitions(&mut self, transitions: usize) {
         self.min_level_transitions = transitions.max(1);
     }
