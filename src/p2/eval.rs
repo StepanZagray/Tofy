@@ -2,6 +2,7 @@
 
 use crate::domain::Split;
 use crate::gpu_lock::GpuSessionGuard;
+use crate::p2::adaptation::{AdaptationMode, FastWeightAdapter, ADAPT_MIN_LEVEL_TRANSITIONS};
 use crate::p2::arc3::{import_and_summarize_recordings_dir, RecordingRunSummary};
 use crate::p2::board_probe::{
     BoardProbeRows, BoardProbeTransitions, BoardTransitionMetrics, FixedBoardProbe, PATCH_COUNT,
@@ -12,10 +13,11 @@ use crate::p2::cg_profile::{
     EVAL_PROFILE_ENTRYPOINT,
 };
 use crate::p2::data::{
-    adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
-    gameplay_rows, generate_curriculum, generate_factual_branch_group, generate_hazard_one_step,
-    ArcAction, BranchGroup, ContentMask, ContentRect, FactualBatch, MixedStreamConfig,
-    OperatorFamilySplit, TransitionSample, V5DataSplit, V5SampleProvenance,
+    adaptation_v6_stream_schedule, augmented_learning_history, compose_mixed_stream_batch,
+    foundation_v2_stream_schedule, gameplay_rows, generate_curriculum,
+    generate_factual_branch_group, generate_hazard_one_step, ArcAction, AugmentedLearningHistory,
+    BranchGroup, ContentMask, ContentRect, FactualBatch, MixedStreamConfig, OperatorFamilySplit,
+    TransitionSample, V5DataSplit, V5SampleProvenance, CONTEXT_WINDOW_MAX,
     FACTUAL_BRANCHES_PER_GROUP, FRAME_SIDE, ORACLE_LATENT_DIM,
 };
 use crate::p2::grounding::DecodeComposition;
@@ -162,10 +164,24 @@ pub struct EvalConfig {
     /// `world_core_v6` checkpoints; off keeps the report byte-identical.
     #[serde(default)]
     pub context_ablation: bool,
+    /// ADR 0005 §5.2 adaptation falsifier (E3): prequential Channel A vs
+    /// Channel A+B (reset, carry) on held-out synthetic Learning Histories.
+    /// `world_core_v6` checkpoints only; off keeps the report byte-identical.
+    #[serde(default)]
+    pub adaptation_falsifier: bool,
+    /// Falsifier-only warm-up override for Channel B (§6.2 default 8 unique
+    /// transitions per level). Recorded in the report; the live loop is
+    /// unaffected.
+    #[serde(default = "default_adaptation_falsifier_min_level_transitions")]
+    pub adaptation_falsifier_min_level_transitions: usize,
 }
 
 fn default_ensemble_members() -> usize {
     8
+}
+
+fn default_adaptation_falsifier_min_level_transitions() -> usize {
+    ADAPT_MIN_LEVEL_TRANSITIONS
 }
 
 fn default_eval_mode() -> EvalMode {
@@ -198,6 +214,8 @@ impl Default for EvalConfig {
             representation_row_cap: default_representation_row_cap(),
             profile_eval: false,
             context_ablation: false,
+            adaptation_falsifier: false,
+            adaptation_falsifier_min_level_transitions: ADAPT_MIN_LEVEL_TRANSITIONS,
         }
     }
 }
@@ -206,6 +224,9 @@ impl EvalConfig {
     pub fn validate(&self) -> Result<()> {
         if self.physical_batch == 0 {
             bail!("physical_batch must be > 0");
+        }
+        if self.adaptation_falsifier_min_level_transitions == 0 {
+            bail!("adaptation_falsifier_min_level_transitions must be > 0");
         }
         if self.representation_row_cap == 0 {
             bail!("representation_row_cap must be > 0");
@@ -1151,6 +1172,12 @@ pub struct EvalReport {
     /// flag is set on a `world_core_v6` checkpoint; selection-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v6_context_ablation: Option<ContextAblationReport>,
+    /// ADR 0005 §5.2 adaptation falsifier (`--adaptation-falsifier`):
+    /// prequential Channel A vs A+B on held-out Learning Histories. Present
+    /// only when the flag is set on a `world_core_v6` checkpoint;
+    /// selection-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_adaptation_falsifier: Option<AdaptationFalsifierReport>,
     /// Same-checkpoint, same-row mechanism ablations for bundled treatments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanism_ablations: Option<MechanismAblationReport>,
@@ -2491,6 +2518,16 @@ pub fn one_step_changed_exact(
     samples: &[TransitionSample],
     one_step_predictions: &[Vec<u8>],
 ) -> Result<Option<f64>> {
+    let (transitions, exact) = one_step_changed_exact_counts(samples, one_step_predictions)?;
+    Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
+}
+
+/// `(changed transitions, exactly decoded changed transitions)` behind
+/// [`one_step_changed_exact`], so callers can pool rows across batches.
+pub fn one_step_changed_exact_counts(
+    samples: &[TransitionSample],
+    one_step_predictions: &[Vec<u8>],
+) -> Result<(usize, usize)> {
     if samples.len() != one_step_predictions.len() {
         bail!("gate one-step rows do not match the sample count");
     }
@@ -2518,7 +2555,7 @@ pub fn one_step_changed_exact(
             exact += usize::from(transition_exact);
         }
     }
-    Ok((transitions > 0).then_some(exact as f64 / transitions as f64))
+    Ok((transitions, exact))
 }
 
 /// ADR 0003 §6: evaluate the foundation-v2 gate metrics on each named V5
@@ -3097,6 +3134,623 @@ fn evaluate_context_ablation(
         evidence_class: "selection_only".into(),
         overall,
         per_stratum,
+    })
+}
+
+// ---- ADR 0005 §5.2 adaptation falsifier (E3) -------------------------------
+
+/// Preregistered held-out population seed of the §5.2 falsifier.
+pub const ADAPTATION_FALSIFIER_POPULATION_SEED: u64 = 1_000_002;
+/// Preregistered adapter seed: the reservoir sampler is reseeded with it at
+/// every episode start, so each episode's adaptation batches are a function
+/// of that episode's own observation sequence only.
+pub const ADAPTATION_FALSIFIER_ADAPTER_SEED: u64 = 7;
+/// Prefix lengths `t`: adapt on chronological transitions `1..t`, score
+/// `t+1..t+ADAPTATION_FALSIFIER_SCORE_WINDOW` (1-based, preregistered).
+pub const ADAPTATION_FALSIFIER_PREFIX_LENGTHS: [usize; 3] = [8, 16, 32];
+pub const ADAPTATION_FALSIFIER_SCORE_WINDOW: usize = 4;
+/// Promotion threshold on prequential changed-exact (absolute, preregistered).
+pub const ADAPTATION_FALSIFIER_PROMOTION_DELTA: f64 = 0.02;
+/// Absolute tolerance on the threshold comparison so a delta that is `0.02`
+/// up to floating-point rounding of the two fractions is not rejected.
+const ADAPTATION_FALSIFIER_DELTA_TOLERANCE: f64 = 1e-9;
+
+pub const ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY: &str = "context_only";
+pub const ADAPTATION_FALSIFIER_ARM_RESET: &str = "reset";
+pub const ADAPTATION_FALSIFIER_ARM_CARRY: &str = "carry";
+
+/// Knobs of one falsifier run. Production uses [`Self::preregistered`]; tests
+/// shrink the population and the prefix lengths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierSpec {
+    pub episodes: usize,
+    pub population_seed: u64,
+    pub adapter_seed: u64,
+    pub prefix_lengths: Vec<usize>,
+    pub score_window: usize,
+    /// Channel B warm-up (§6.2 default [`ADAPT_MIN_LEVEL_TRANSITIONS`]).
+    pub min_level_transitions: usize,
+}
+
+impl AdaptationFalsifierSpec {
+    pub fn preregistered(episodes: usize, min_level_transitions: usize) -> Self {
+        Self {
+            episodes,
+            population_seed: ADAPTATION_FALSIFIER_POPULATION_SEED,
+            adapter_seed: ADAPTATION_FALSIFIER_ADAPTER_SEED,
+            prefix_lengths: ADAPTATION_FALSIFIER_PREFIX_LENGTHS.to_vec(),
+            score_window: ADAPTATION_FALSIFIER_SCORE_WINDOW,
+            min_level_transitions,
+        }
+    }
+}
+
+/// Channel B telemetry pooled over episodes, cumulative through the prefix
+/// at which the rows were scored.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierTelemetry {
+    pub updates: usize,
+    pub skipped: usize,
+    pub reverted: usize,
+    /// `maybe_update` calls that ended in the §6.2 warm-up (`warmup` note).
+    pub warmup_calls: usize,
+    pub level_step_cap_calls: usize,
+    /// Largest `||theta - theta_0||^2` over the fast subset at scoring time.
+    pub max_drift_from_prior: f64,
+}
+
+/// One arm scored at one prefix length over every episode long enough.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierArmMetrics {
+    pub arm: String,
+    pub prefix_len: usize,
+    /// Episodes whose chronological length covers `prefix_len + score_window`.
+    pub episodes: usize,
+    pub rows: usize,
+    /// Rows entering the changed-exact denominator (board-changed rows with at
+    /// least one changed gameplay pixel), as in the gate metrics.
+    pub changed_transitions: usize,
+    pub changed_exact: Option<f64>,
+    pub composed_changed_exact: Option<f64>,
+    pub adaptation: AdaptationFalsifierTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierDelta {
+    pub prefix_len: usize,
+    /// `changed_exact(arm) - changed_exact(context_only)` on the same rows.
+    pub changed_exact_delta: Option<f64>,
+    pub composed_changed_exact_delta: Option<f64>,
+    /// `changed_exact_delta >= promotion_delta`.
+    pub improvement: bool,
+    /// Frozen-after-adaptation check: neither changed-exact nor composed
+    /// changed-exact of the adapted-then-frozen weights is below the prior.
+    pub not_worse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierArmVerdict {
+    pub arm: String,
+    pub deltas: Vec<AdaptationFalsifierDelta>,
+    pub improvement_at_every_t: bool,
+    pub not_worse_at_every_t: bool,
+    pub promote: bool,
+}
+
+/// The preregistered §5.2 rule applied to the pooled metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierVerdict {
+    pub promotion_delta: f64,
+    /// Prefix lengths with at least one changed transition in the
+    /// context-only arm; the rule is applied over exactly these.
+    pub evaluated_prefix_lengths: Vec<usize>,
+    /// Preregistered prefix lengths no episode was long enough for (or with
+    /// no changed transition). The rule cannot be evaluated there.
+    pub skipped_prefix_lengths: Vec<usize>,
+    pub arms: Vec<AdaptationFalsifierArmVerdict>,
+    pub promote_channel_b: bool,
+    pub satisfied_by: Vec<String>,
+    pub note: String,
+}
+
+/// ADR 0005 §5.2 adaptation falsifier report (`--adaptation-falsifier`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptationFalsifierReport {
+    pub population: String,
+    pub population_seed: u64,
+    pub adapter_seed: u64,
+    pub episodes: usize,
+    /// SHA-256 over every episode's chronological transitions as scored
+    /// (augmented frames, actions, level indices, changed flags).
+    pub population_fingerprint: String,
+    pub evidence_class: String,
+    pub prefix_lengths: Vec<usize>,
+    pub score_window: usize,
+    pub context_window_max: usize,
+    /// Channel B warm-up in force (§6.2 default 8; anything else is a
+    /// recorded deviation).
+    pub min_level_transitions: usize,
+    /// Histogram of chronological episode lengths (`len` -> episodes).
+    pub chronological_lengths: BTreeMap<String, usize>,
+    /// Ordered arm-major, then by prefix length.
+    pub arms: Vec<AdaptationFalsifierArmMetrics>,
+    pub verdict: AdaptationFalsifierVerdict,
+}
+
+/// Stream configuration under which the falsifier population is rendered: the
+/// v6 unit augmentation of the `LearningHistories` stream with the default
+/// operator-family split, seeded by the preregistered population seed.
+fn adaptation_falsifier_stream_config(population_seed: u64) -> MixedStreamConfig {
+    MixedStreamConfig {
+        seed: population_seed,
+        schedule: adaptation_v6_stream_schedule,
+        data_contract_v6: true,
+        ..MixedStreamConfig::default()
+    }
+}
+
+fn adaptation_falsifier_population(
+    spec: &AdaptationFalsifierSpec,
+) -> Result<Vec<AugmentedLearningHistory>> {
+    let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
+    stream_cfg.validate()?;
+    (0..spec.episodes)
+        .into_par_iter()
+        .map(|meta_episode_id| {
+            augmented_learning_history(
+                &stream_cfg,
+                V5DataSplit::UnseenSeed7x7,
+                meta_episode_id as u64,
+            )
+        })
+        .collect()
+}
+
+fn adaptation_falsifier_population_fingerprint(histories: &[AugmentedLearningHistory]) -> String {
+    let mut hash = Sha256::new();
+    for history in histories {
+        hash.update(history.meta_episode_id.to_le_bytes());
+        hash.update((history.levels as u64).to_le_bytes());
+        hash.update((history.chronological.len() as u64).to_le_bytes());
+        for position in 0..history.chronological.len() {
+            let row = &history.chronological_row(position).transition;
+            hash.update(row.provenance.level_index.to_le_bytes());
+            hash.update(&row.current.pixels[..]);
+            hash.update([
+                row.action.id,
+                row.action.x.unwrap_or(0),
+                row.action.y.unwrap_or(0),
+                u8::from(is_board_changed_transition(row)),
+            ]);
+            hash.update(&row.next.pixels[..]);
+        }
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+/// Scoring rows for prefix `t`: chronological positions `t..t+window`
+/// (0-based), each carrying Channel A's window, the last
+/// `<= CONTEXT_WINDOW_MAX` chronological transitions before it (episode
+/// scope, identical for every arm; the arms differ only in the weights).
+fn adaptation_falsifier_scoring_rows(
+    history: &AugmentedLearningHistory,
+    t: usize,
+    window: usize,
+) -> Vec<TransitionSample> {
+    (t..t + window)
+        .map(|position| {
+            let mut row = history.chronological_row(position).transition.clone();
+            row.context = history.context_window_before(position);
+            row.provenance.context_len =
+                u8::try_from(row.context.len()).expect("context window fits u8");
+            row
+        })
+        .collect()
+}
+
+struct AdaptationFalsifierDecodes {
+    true_predictions: Vec<Vec<u8>>,
+    composed: Vec<Vec<u8>>,
+}
+
+/// One-step exact decodes of `rows` under the model's current weights on the
+/// gate path: `encode_state_pair` -> [`forward_gate_rows_chunked`] (detached,
+/// `<= FOUNDATION_V2_GATE_PHYSICAL_BATCH` rows per forward) -> raw palette
+/// argmax and [`WorldModel::composed_gameplay_decode`]. Nothing here retains a
+/// tensor beyond the call.
+fn adaptation_falsifier_decode_rows(
+    model: &WorldModel,
+    rows: &[TransitionSample],
+    device: &Device,
+) -> Result<AdaptationFalsifierDecodes> {
+    let batch = batch_from_samples(rows, device)?;
+    let (current, _target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let current = current.detach();
+    let prediction = forward_gate_rows_chunked(
+        model,
+        &current,
+        &batch.actions,
+        &batch.action_coords,
+        &batch.goals,
+        &batch.operator_conditioning,
+        batch.context.as_ref(),
+        RecursionDepth::from_config(model.config()),
+        FOUNDATION_V2_GATE_PHYSICAL_BATCH,
+    )?;
+    let true_predictions = exact_palette_predictions(model, &prediction)?;
+    let composed = model
+        .composed_gameplay_decode(&prediction, &batch.frames)?
+        .reshape((rows.len(), ()))?
+        .to_dtype(DType::U8)?
+        .to_vec2::<u8>()?;
+    Ok(AdaptationFalsifierDecodes {
+        true_predictions,
+        composed,
+    })
+}
+
+#[derive(Debug, Default)]
+struct AdaptationFalsifierAccum {
+    episodes: usize,
+    rows: usize,
+    changed: usize,
+    exact: usize,
+    composed_exact: usize,
+    telemetry: AdaptationFalsifierTelemetry,
+}
+
+impl AdaptationFalsifierAccum {
+    fn add(
+        &mut self,
+        rows: &[TransitionSample],
+        decodes: &AdaptationFalsifierDecodes,
+        telemetry: &AdaptationFalsifierTelemetry,
+    ) -> Result<()> {
+        let (changed, exact) = one_step_changed_exact_counts(rows, &decodes.true_predictions)?;
+        let (changed_composed, composed_exact) =
+            one_step_changed_exact_counts(rows, &decodes.composed)?;
+        if changed != changed_composed {
+            bail!("raw and composed decodes disagree on the changed-transition count");
+        }
+        self.episodes += 1;
+        self.rows += rows.len();
+        self.changed += changed;
+        self.exact += exact;
+        self.composed_exact += composed_exact;
+        self.telemetry.updates += telemetry.updates;
+        self.telemetry.skipped += telemetry.skipped;
+        self.telemetry.reverted += telemetry.reverted;
+        self.telemetry.warmup_calls += telemetry.warmup_calls;
+        self.telemetry.level_step_cap_calls += telemetry.level_step_cap_calls;
+        self.telemetry.max_drift_from_prior = self
+            .telemetry
+            .max_drift_from_prior
+            .max(telemetry.max_drift_from_prior);
+        Ok(())
+    }
+
+    fn metrics(&self, arm: &str, prefix_len: usize) -> AdaptationFalsifierArmMetrics {
+        let fraction =
+            |exact: usize| (self.changed > 0).then(|| exact as f64 / self.changed as f64);
+        AdaptationFalsifierArmMetrics {
+            arm: arm.into(),
+            prefix_len,
+            episodes: self.episodes,
+            rows: self.rows,
+            changed_transitions: self.changed,
+            changed_exact: fraction(self.exact),
+            composed_changed_exact: fraction(self.composed_exact),
+            adaptation: self.telemetry.clone(),
+        }
+    }
+}
+
+/// Prequential pass over one episode. With `adapter = None` this is Channel A
+/// (frozen prior weights). With an adapter it is the live loop of §6.2:
+/// observe each chronological transition in order, `maybe_update` after each,
+/// `on_level_transition` at every level boundary; at each prefix length the
+/// next `score_window` rows are scored with the weights as adapted so far and
+/// no further update (frozen-after-adaptation). The caller owns
+/// `begin_game` / `restore_prior` around this function.
+fn adaptation_falsifier_episode(
+    model: &WorldModel,
+    device: &Device,
+    history: &AugmentedLearningHistory,
+    spec: &AdaptationFalsifierSpec,
+    mut adapter: Option<&mut FastWeightAdapter<'_>>,
+    accums: &mut BTreeMap<usize, AdaptationFalsifierAccum>,
+) -> Result<()> {
+    let len = history.chronological.len();
+    let mut telemetry = AdaptationFalsifierTelemetry::default();
+    let mut level: Option<u16> = None;
+    for position in 0..len {
+        if spec.prefix_lengths.contains(&position) && position + spec.score_window <= len {
+            let rows = adaptation_falsifier_scoring_rows(history, position, spec.score_window);
+            let decodes = adaptation_falsifier_decode_rows(model, &rows, device)?;
+            telemetry.max_drift_from_prior = match adapter.as_deref() {
+                Some(adapter) => adapter.drift_from_prior()?,
+                None => 0.0,
+            };
+            accums
+                .get_mut(&position)
+                .ok_or_else(|| anyhow::anyhow!("no accumulator for prefix {position}"))?
+                .add(&rows, &decodes, &telemetry)?;
+        }
+        let Some(adapter) = adapter.as_deref_mut() else {
+            continue;
+        };
+        let row = &history.chronological_row(position).transition;
+        let row_level = row.provenance.level_index;
+        if level.is_some_and(|current| current != row_level) {
+            adapter.on_level_transition(row_level)?;
+        }
+        level = Some(row_level);
+        adapter.observe(&row.current, &row.action, &row.next, row_level);
+        if let Some(trace) = adapter.maybe_update()? {
+            telemetry.updates += trace.updates;
+            telemetry.skipped += trace.skipped;
+            telemetry.reverted += trace.reverted;
+            match trace.note.as_deref() {
+                Some("warmup") => telemetry.warmup_calls += 1,
+                Some("level_step_cap") => telemetry.level_step_cap_calls += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn adaptation_falsifier_arm(
+    model: &WorldModel,
+    device: &Device,
+    histories: &[AugmentedLearningHistory],
+    spec: &AdaptationFalsifierSpec,
+    mut adapter: Option<&mut FastWeightAdapter<'_>>,
+) -> Result<BTreeMap<usize, AdaptationFalsifierAccum>> {
+    let mut accums = spec
+        .prefix_lengths
+        .iter()
+        .map(|t| (*t, AdaptationFalsifierAccum::default()))
+        .collect::<BTreeMap<_, _>>();
+    for history in histories {
+        if let Some(adapter) = adapter.as_deref_mut() {
+            adapter.begin_game()?;
+            adapter.reseed_reservoir(spec.adapter_seed);
+        }
+        adaptation_falsifier_episode(
+            model,
+            device,
+            history,
+            spec,
+            adapter.as_deref_mut(),
+            &mut accums,
+        )?;
+        if let Some(adapter) = adapter.as_deref_mut() {
+            adapter.restore_prior()?;
+        }
+    }
+    Ok(accums)
+}
+
+/// The preregistered §5.2 rule over pooled arm metrics: promote Channel B only
+/// if some adapted arm improves changed-exact over `context_only` by at least
+/// `promotion_delta` at every evaluated prefix length AND is not worse than
+/// the prior (changed-exact and composed changed-exact) at every one. Prefix
+/// lengths without a changed transition in the context-only arm are skipped
+/// and listed; if none remains, nothing is promoted.
+pub fn adaptation_falsifier_verdict(
+    arms: &[AdaptationFalsifierArmMetrics],
+    promotion_delta: f64,
+) -> AdaptationFalsifierVerdict {
+    let baseline = arms
+        .iter()
+        .filter(|metrics| metrics.arm == ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY)
+        .map(|metrics| (metrics.prefix_len, metrics))
+        .collect::<BTreeMap<_, _>>();
+    let prefix_lengths = arms
+        .iter()
+        .map(|metrics| metrics.prefix_len)
+        .collect::<BTreeSet<_>>();
+    let evaluated = prefix_lengths
+        .iter()
+        .copied()
+        .filter(|t| baseline.get(t).is_some_and(|m| m.changed_transitions > 0))
+        .collect::<Vec<_>>();
+    let skipped = prefix_lengths
+        .iter()
+        .copied()
+        .filter(|t| !evaluated.contains(t))
+        .collect::<Vec<_>>();
+    let delta = |arm: Option<f64>, prior: Option<f64>| Some(arm? - prior?);
+    let not_worse = |arm: Option<f64>, prior: Option<f64>| match (arm, prior) {
+        (Some(arm), Some(prior)) => arm >= prior,
+        (None, None) => true,
+        _ => false,
+    };
+    let mut arm_names = Vec::new();
+    for metrics in arms {
+        if metrics.arm != ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY && !arm_names.contains(&metrics.arm)
+        {
+            arm_names.push(metrics.arm.clone());
+        }
+    }
+    let arm_verdicts = arm_names
+        .iter()
+        .map(|arm| {
+            let deltas = evaluated
+                .iter()
+                .map(|t| {
+                    let prior = baseline[t];
+                    let adapted = arms
+                        .iter()
+                        .find(|metrics| &metrics.arm == arm && metrics.prefix_len == *t);
+                    match adapted {
+                        Some(adapted) => {
+                            let changed_exact_delta =
+                                delta(adapted.changed_exact, prior.changed_exact);
+                            AdaptationFalsifierDelta {
+                                prefix_len: *t,
+                                changed_exact_delta,
+                                composed_changed_exact_delta: delta(
+                                    adapted.composed_changed_exact,
+                                    prior.composed_changed_exact,
+                                ),
+                                improvement: changed_exact_delta.is_some_and(|d| {
+                                    d + ADAPTATION_FALSIFIER_DELTA_TOLERANCE >= promotion_delta
+                                }),
+                                not_worse: not_worse(adapted.changed_exact, prior.changed_exact)
+                                    && not_worse(
+                                        adapted.composed_changed_exact,
+                                        prior.composed_changed_exact,
+                                    ),
+                            }
+                        }
+                        None => AdaptationFalsifierDelta {
+                            prefix_len: *t,
+                            changed_exact_delta: None,
+                            composed_changed_exact_delta: None,
+                            improvement: false,
+                            not_worse: false,
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let improvement_at_every_t = !deltas.is_empty() && deltas.iter().all(|d| d.improvement);
+            let not_worse_at_every_t = !deltas.is_empty() && deltas.iter().all(|d| d.not_worse);
+            AdaptationFalsifierArmVerdict {
+                arm: arm.clone(),
+                deltas,
+                improvement_at_every_t,
+                not_worse_at_every_t,
+                promote: improvement_at_every_t && not_worse_at_every_t,
+            }
+        })
+        .collect::<Vec<_>>();
+    let satisfied_by = arm_verdicts
+        .iter()
+        .filter(|verdict| verdict.promote)
+        .map(|verdict| verdict.arm.clone())
+        .collect::<Vec<_>>();
+    let promote_channel_b = !satisfied_by.is_empty();
+    let note = if evaluated.is_empty() {
+        "no prefix length had a changed transition in the context-only arm; the rule \
+         cannot be evaluated and Channel B stays disabled"
+            .to_string()
+    } else if skipped.is_empty() {
+        format!(
+            "rule applied at every preregistered prefix length {evaluated:?}; promote Channel B \
+             = {promote_channel_b} (satisfied by {satisfied_by:?})"
+        )
+    } else {
+        format!(
+            "rule applied at prefix lengths {evaluated:?} only; {skipped:?} had no scorable \
+             changed transition (no episode long enough or no changed row) and could not be \
+             evaluated; promote Channel B = {promote_channel_b} (satisfied by {satisfied_by:?})"
+        )
+    };
+    AdaptationFalsifierVerdict {
+        promotion_delta,
+        evaluated_prefix_lengths: evaluated,
+        skipped_prefix_lengths: skipped,
+        arms: arm_verdicts,
+        promote_channel_b,
+        satisfied_by,
+        note,
+    }
+}
+
+/// ADR 0005 §5.2 (E3): prequential Channel A vs Channel A+B on held-out
+/// synthetic Learning Histories. Arms: `context_only` (frozen prior weights),
+/// `reset` (Channel B, fast weights reset to theta_0 at each level boundary)
+/// and `carry` (fast weights persist across levels). Every arm scores the
+/// same rows with the same Context Window; only the weights differ. The
+/// model's fast weights are back at theta_0 bitwise when this returns.
+pub fn evaluate_adaptation_falsifier(
+    model: &WorldModel,
+    varmap: &VarMap,
+    device: &Device,
+    spec: &AdaptationFalsifierSpec,
+) -> Result<AdaptationFalsifierReport> {
+    if !model.config().world_core_v6 {
+        bail!("the adaptation falsifier requires a world_core_v6 checkpoint");
+    }
+    if spec.episodes == 0 {
+        bail!("the adaptation falsifier needs at least one episode");
+    }
+    if spec.score_window == 0 || spec.prefix_lengths.is_empty() {
+        bail!("the adaptation falsifier needs a score window and prefix lengths");
+    }
+    let histories = timed_eval_phase("adaptation_falsifier", "population_generation", || {
+        adaptation_falsifier_population(spec)
+    })?;
+    evaluate_adaptation_falsifier_on(model, varmap, device, spec, &histories)
+}
+
+/// [`evaluate_adaptation_falsifier`] over a caller-supplied population (the
+/// production path generates it from `spec`; tests shorten episodes).
+fn evaluate_adaptation_falsifier_on(
+    model: &WorldModel,
+    varmap: &VarMap,
+    device: &Device,
+    spec: &AdaptationFalsifierSpec,
+    histories: &[AugmentedLearningHistory],
+) -> Result<AdaptationFalsifierReport> {
+    if histories.is_empty() {
+        bail!("the adaptation falsifier needs at least one episode");
+    }
+    let population_fingerprint = adaptation_falsifier_population_fingerprint(histories);
+    let mut chronological_lengths = BTreeMap::<String, usize>::new();
+    for history in histories {
+        *chronological_lengths
+            .entry(history.chronological.len().to_string())
+            .or_default() += 1;
+    }
+    let push_arm = |arms: &mut Vec<AdaptationFalsifierArmMetrics>,
+                    name: &str,
+                    accums: &BTreeMap<usize, AdaptationFalsifierAccum>| {
+        for (t, accum) in accums {
+            arms.push(accum.metrics(name, *t));
+        }
+    };
+    let mut arms = Vec::new();
+    let context_only = timed_eval_phase("adaptation_falsifier", "arm=context_only", || {
+        adaptation_falsifier_arm(model, device, histories, spec, None)
+    })?;
+    push_arm(
+        &mut arms,
+        ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY,
+        &context_only,
+    );
+    for (name, mode) in [
+        (ADAPTATION_FALSIFIER_ARM_RESET, AdaptationMode::Reset),
+        (ADAPTATION_FALSIFIER_ARM_CARRY, AdaptationMode::Carry),
+    ] {
+        let mut adapter = FastWeightAdapter::new(model, varmap, device, mode)?;
+        adapter.set_min_level_transitions(spec.min_level_transitions);
+        let accums = timed_eval_phase("adaptation_falsifier", &format!("arm={name}"), || {
+            adaptation_falsifier_arm(model, device, histories, spec, Some(&mut adapter))
+        })?;
+        if !adapter.fast_weights_equal_prior()? {
+            bail!("fast weights differ from theta_0 after the {name} arm");
+        }
+        drop(adapter);
+        push_arm(&mut arms, name, &accums);
+    }
+    let verdict = adaptation_falsifier_verdict(&arms, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+    Ok(AdaptationFalsifierReport {
+        population: "learning_histories/unseen_seed_7x7".into(),
+        population_seed: spec.population_seed,
+        adapter_seed: spec.adapter_seed,
+        episodes: histories.len(),
+        population_fingerprint,
+        evidence_class: "selection_only".into(),
+        prefix_lengths: spec.prefix_lengths.clone(),
+        score_window: spec.score_window,
+        context_window_max: CONTEXT_WINDOW_MAX,
+        min_level_transitions: spec.min_level_transitions,
+        chronological_lengths,
+        arms,
+        verdict,
     })
 }
 
@@ -7428,6 +8082,31 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
              (ADR 0005 §5.1 applies to v6 checkpoints only)"
         );
     }
+    let v6_adaptation_falsifier = if cfg.adaptation_falsifier && model.config().world_core_v6 {
+        let spec = AdaptationFalsifierSpec::preregistered(
+            cfg.synthetic_episodes,
+            cfg.adaptation_falsifier_min_level_transitions,
+        );
+        if spec.population_seed == train_cfg.seed {
+            bail!(
+                "adaptation falsifier population seed collides with the checkpoint's \
+                 training seed; the held-out claim would be false"
+            );
+        }
+        Some(timed_eval_phase(
+            "adaptation_falsifier",
+            "learning_histories_unseen_seed_7x7",
+            || evaluate_adaptation_falsifier(&model, &varmap, &device, &spec),
+        )?)
+    } else {
+        if cfg.adaptation_falsifier {
+            eprintln!(
+                "p2-eval: --adaptation-falsifier ignored; the checkpoint is not world_core_v6 \
+                 (ADR 0005 §5.2 applies to v6 checkpoints only)"
+            );
+        }
+        None
+    };
 
     let report_reduction_started = Instant::now();
     let mut population_sha256 = BTreeMap::from([
@@ -7524,6 +8203,7 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
         v5_holdout_gates,
         v6_context_strata,
         v6_context_ablation,
+        v6_adaptation_falsifier,
         mechanism_ablations,
         research_claim: false,
     };
@@ -9032,13 +9712,21 @@ mod tests {
             representation_row_cap: 7,
             profile_eval: false,
             context_ablation: false,
+            adaptation_falsifier: false,
+            adaptation_falsifier_min_level_transitions: ADAPT_MIN_LEVEL_TRANSITIONS,
         };
         let eval = evaluate(&eval_cfg)?;
         assert_eq!(eval.schema, EVAL_REPORT_SCHEMA);
         assert!(eval.v6_context_ablation.is_none());
+        assert!(eval.v6_adaptation_falsifier.is_none());
+        let eval_json = fs::read_to_string(dir.join("eval.json"))?;
         assert!(
-            !fs::read_to_string(dir.join("eval.json"))?.contains("v6_context_ablation"),
+            !eval_json.contains("v6_context_ablation"),
             "legacy report must not gain the ablation key"
+        );
+        assert!(
+            !eval_json.contains("v6_adaptation_falsifier"),
+            "legacy report must not gain the falsifier key"
         );
         assert!(eval.official_rhae.is_none());
         assert!(!eval.public_data_used_for_fitting);
@@ -9600,5 +10288,401 @@ mod tests {
         let back: ContextAblationReport = serde_json::from_value(json)?;
         assert_eq!(back, report);
         Ok(())
+    }
+
+    // ---- ADR 0005 §5.2 adaptation falsifier ---------------------------------
+
+    fn tiny_v6_model(device: &Device) -> Result<(WorldModel, VarMap)> {
+        let mut train_cfg = TrainConfig::default();
+        train_cfg.apply_foundation_v2_recipe();
+        train_cfg.hidden_dim = 8;
+        train_cfg.action_dim = 4;
+        train_cfg.inner_steps = 1;
+        train_cfg.outer_steps = 1;
+        train_cfg.world_core_v6 = true;
+        train_cfg.data_contract_v6 = true;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            train_cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, device),
+        )?;
+        reinit_varmap_deterministic(&varmap, 0xE3)?;
+        Ok((model, varmap))
+    }
+
+    fn var_snapshots(varmap: &VarMap) -> Result<Vec<(String, Vec<u32>)>> {
+        let data = varmap.data().lock().unwrap();
+        let mut out = Vec::new();
+        for (name, var) in data.iter() {
+            let bits = var
+                .as_tensor()
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            out.push((name.clone(), bits));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    fn falsifier_metrics(
+        arm: &str,
+        prefix_len: usize,
+        changed: usize,
+        changed_exact: Option<f64>,
+        composed_changed_exact: Option<f64>,
+    ) -> AdaptationFalsifierArmMetrics {
+        AdaptationFalsifierArmMetrics {
+            arm: arm.into(),
+            prefix_len,
+            episodes: 1,
+            rows: changed,
+            changed_transitions: changed,
+            changed_exact,
+            composed_changed_exact,
+            adaptation: AdaptationFalsifierTelemetry::default(),
+        }
+    }
+
+    /// Test (1): at the identity context FiLM, Channel A's scoring path (the
+    /// gate forward with the episode window) equals the plain context-free
+    /// forward bit-for-bit, and its pooled metric equals the gate metric.
+    #[test]
+    fn adaptation_falsifier_context_only_arm_matches_plain_forward_at_identity_film() -> Result<()>
+    {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        crate::p2::model::zero_context_film_projections(&varmap)?;
+        let stream_cfg = adaptation_falsifier_stream_config(ADAPTATION_FALSIFIER_POPULATION_SEED);
+        let history = augmented_learning_history(&stream_cfg, V5DataSplit::UnseenSeed7x7, 0)?;
+        let len = history.chronological.len();
+        assert!(len >= 14 && len % 7 == 0, "{len}");
+        let t = 8;
+        let window = ADAPTATION_FALSIFIER_SCORE_WINDOW;
+        let rows = adaptation_falsifier_scoring_rows(&history, t, window);
+        assert_eq!(rows.len(), window);
+        for (offset, row) in rows.iter().enumerate() {
+            let position = t + offset;
+            assert_eq!(row.context.len(), position.min(CONTEXT_WINDOW_MAX));
+            assert_eq!(usize::from(row.provenance.context_len), row.context.len());
+            let previous = &history.chronological_row(position - 1).transition;
+            let last = row.context.last().expect("window");
+            assert_eq!(last.current, previous.current);
+            assert_eq!(last.next, previous.next);
+            assert_eq!(
+                row.provenance.available_actions,
+                crate::p2::data::ALL_ACTIONS_AVAILABLE,
+                "v6 contract row"
+            );
+            assert!(
+                row.provenance.operator.is_none(),
+                "v6 rows condition as UNKNOWN"
+            );
+        }
+
+        let with_context = adaptation_falsifier_decode_rows(&model, &rows, &device)?;
+        // Plain forward: the same rows through the model without any context.
+        let batch = batch_from_samples(&rows, &device)?;
+        let (current, _) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+        let plain = model
+            .forward_from_latent_with_depth_and_operator_conditioning_with_context(
+                &current,
+                &batch.actions,
+                &batch.action_coords,
+                &batch.goals,
+                &batch.operator_conditioning,
+                None,
+                RecursionDepth::from_config(model.config()),
+            )?
+            .y;
+        let plain_true = exact_palette_predictions(&model, &plain)?;
+        let plain_composed = model
+            .composed_gameplay_decode(&plain, &batch.frames)?
+            .reshape((rows.len(), ()))?
+            .to_dtype(DType::U8)?
+            .to_vec2::<u8>()?;
+        assert!(batch.context.is_some(), "the scoring rows carry a window");
+        assert_eq!(with_context.true_predictions, plain_true);
+        assert_eq!(with_context.composed, plain_composed);
+        assert!(with_context
+            .true_predictions
+            .iter()
+            .all(|row| row.len() == FRAME_SIDE * FRAME_SIDE));
+
+        // Pooled metric == the gate metric on the same rows.
+        let gates = evaluate_gate_support_impl(&model, &rows, None, None, &device, None, None)?;
+        let spec = AdaptationFalsifierSpec {
+            episodes: 1,
+            prefix_lengths: vec![t],
+            ..AdaptationFalsifierSpec::preregistered(1, ADAPT_MIN_LEVEL_TRANSITIONS)
+        };
+        let accums = adaptation_falsifier_arm(&model, &device, &[history], &spec, None)?;
+        let metrics = accums[&t].metrics(ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY, t);
+        assert_eq!(metrics.rows, window);
+        assert_eq!(metrics.episodes, 1);
+        assert_eq!(metrics.changed_exact, gates.one_step_changed_exact);
+        assert_eq!(
+            metrics.composed_changed_exact,
+            gates.one_step_composed_changed_exact
+        );
+        assert_eq!(metrics.adaptation, AdaptationFalsifierTelemetry::default());
+        Ok(())
+    }
+
+    /// Test (2): Channel B moves only the fast subset during an episode,
+    /// `restore_prior` returns every parameter to theta_0 bitwise, and the
+    /// full falsifier leaves the VarMap untouched.
+    #[test]
+    fn adaptation_falsifier_adapts_fast_weights_and_restores_the_prior_bitwise() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        let before = var_snapshots(&varmap)?;
+        let stream_cfg = adaptation_falsifier_stream_config(ADAPTATION_FALSIFIER_POPULATION_SEED);
+        let mut history = augmented_learning_history(&stream_cfg, V5DataSplit::UnseenSeed7x7, 0)?;
+        // Debug-mode adaptation is slow; eight chronological transitions
+        // (level 0 complete plus the first of level 1) cover t = 4 and its
+        // window, with the warm-up lowered to two transitions.
+        history.chronological.truncate(8);
+        let t = 4;
+        let spec = AdaptationFalsifierSpec {
+            episodes: 1,
+            prefix_lengths: vec![t],
+            min_level_transitions: 2,
+            ..AdaptationFalsifierSpec::preregistered(1, 2)
+        };
+
+        // One carry episode by hand, inspected before the restore.
+        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Carry)?;
+        adapter.set_min_level_transitions(spec.min_level_transitions);
+        adapter.begin_game()?;
+        adapter.reseed_reservoir(spec.adapter_seed);
+        let mut accums = BTreeMap::from([(t, AdaptationFalsifierAccum::default())]);
+        adaptation_falsifier_episode(
+            &model,
+            &device,
+            &history,
+            &spec,
+            Some(&mut adapter),
+            &mut accums,
+        )?;
+        assert!(accums[&t].telemetry.updates > 0, "{:?}", accums[&t]);
+        assert!(accums[&t].telemetry.max_drift_from_prior > 0.0);
+        assert!(!adapter.fast_weights_equal_prior()?);
+        let during = var_snapshots(&varmap)?;
+        let mut fast_changed = 0usize;
+        for ((name, was), (_, now)) in before.iter().zip(&during) {
+            if crate::p2::model::is_fast_weight(name) {
+                fast_changed += usize::from(was != now);
+            } else {
+                assert_eq!(was, now, "frozen parameter {name} changed under adaptation");
+            }
+        }
+        assert!(fast_changed > 0, "adaptation moved no fast weight");
+        adapter.restore_prior()?;
+        assert!(adapter.fast_weights_equal_prior()?);
+        drop(adapter);
+        assert_eq!(var_snapshots(&varmap)?, before, "restore_prior is bitwise");
+
+        // The whole falsifier: three arms, prior restored, report round-trips.
+        let histories = [history];
+        let report = evaluate_adaptation_falsifier_on(&model, &varmap, &device, &spec, &histories)?;
+        assert_eq!(
+            var_snapshots(&varmap)?,
+            before,
+            "falsifier left the VarMap changed"
+        );
+        assert_eq!(report.episodes, 1);
+        assert_eq!(report.min_level_transitions, 2);
+        assert_eq!(report.population_seed, ADAPTATION_FALSIFIER_POPULATION_SEED);
+        assert_eq!(report.adapter_seed, ADAPTATION_FALSIFIER_ADAPTER_SEED);
+        assert_eq!(report.evidence_class, "selection_only");
+        assert!(report.population_fingerprint.starts_with("sha256:"));
+        assert_eq!(report.chronological_lengths.values().sum::<usize>(), 1);
+        let arm = |name: &str| {
+            report
+                .arms
+                .iter()
+                .find(|metrics| metrics.arm == name && metrics.prefix_len == t)
+                .unwrap_or_else(|| panic!("{name} arm at t={t}"))
+        };
+        let context_only = arm(ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY);
+        let reset = arm(ADAPTATION_FALSIFIER_ARM_RESET);
+        let carry = arm(ADAPTATION_FALSIFIER_ARM_CARRY);
+        assert_eq!(context_only.rows, ADAPTATION_FALSIFIER_SCORE_WINDOW);
+        assert_eq!(reset.rows, context_only.rows);
+        assert_eq!(carry.rows, context_only.rows);
+        assert_eq!(context_only.adaptation.updates, 0);
+        assert!(carry.adaptation.updates > 0, "{carry:?}");
+        assert!(carry.adaptation.max_drift_from_prior > 0.0);
+        // Position 4 is inside level 0: no level boundary has passed, so the
+        // reset and carry arms saw the same observations, the same reservoir
+        // seed and the same updates, and must coincide exactly.
+        assert_eq!(reset.adaptation, carry.adaptation, "{reset:?}");
+        assert_eq!(reset.changed_exact, carry.changed_exact);
+        assert_eq!(reset.composed_changed_exact, carry.composed_changed_exact);
+        assert_eq!(
+            report.verdict.arms.len(),
+            2,
+            "one verdict per adapted arm: {:?}",
+            report.verdict
+        );
+        let json = serde_json::to_string(&report)?;
+        let back: AdaptationFalsifierReport = serde_json::from_str(&json)?;
+        assert_eq!(back, report);
+
+        // Determinism: the same spec reproduces the same report bit for bit.
+        let again = evaluate_adaptation_falsifier_on(&model, &varmap, &device, &spec, &histories)?;
+        assert_eq!(again, report);
+        assert_eq!(var_snapshots(&varmap)?, before);
+        Ok(())
+    }
+
+    /// The default §6.2 warm-up (8 unique transitions per level) can never be
+    /// met on 7-transition synthetic levels: both adapted arms stay in warm-up
+    /// and reproduce the context-only arm exactly. The report makes that
+    /// visible through the telemetry rather than hiding it.
+    #[test]
+    fn adaptation_falsifier_default_warmup_never_updates_on_synthetic_levels() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        let spec = AdaptationFalsifierSpec {
+            episodes: 1,
+            prefix_lengths: vec![8],
+            ..AdaptationFalsifierSpec::preregistered(1, ADAPT_MIN_LEVEL_TRANSITIONS)
+        };
+        let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
+        let mut history = augmented_learning_history(&stream_cfg, V5DataSplit::UnseenSeed7x7, 1)?;
+        history.chronological.truncate(12);
+        let report = evaluate_adaptation_falsifier_on(&model, &varmap, &device, &spec, &[history])?;
+        let context_only = &report.arms[0];
+        assert_eq!(context_only.arm, ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY);
+        for metrics in &report.arms[1..] {
+            assert_eq!(metrics.adaptation.updates, 0, "{metrics:?}");
+            assert!(metrics.adaptation.warmup_calls > 0, "{metrics:?}");
+            assert_eq!(metrics.adaptation.max_drift_from_prior, 0.0);
+            assert_eq!(metrics.changed_exact, context_only.changed_exact);
+            assert_eq!(
+                metrics.composed_changed_exact,
+                context_only.composed_changed_exact
+            );
+        }
+        assert!(!report.verdict.promote_channel_b);
+        Ok(())
+    }
+
+    /// Test (3): the preregistered rule on hand-built metric tables.
+    #[test]
+    fn adaptation_falsifier_verdict_applies_the_preregistered_rule() {
+        let a = ADAPTATION_FALSIFIER_ARM_CONTEXT_ONLY;
+        let reset = ADAPTATION_FALSIFIER_ARM_RESET;
+        let carry = ADAPTATION_FALSIFIER_ARM_CARRY;
+        let prior = |t: usize, ce: f64, cce: f64| falsifier_metrics(a, t, 100, Some(ce), Some(cce));
+        let baseline = vec![
+            prior(8, 0.50, 0.55),
+            prior(16, 0.40, 0.45),
+            prior(32, 0.70, 0.75),
+        ];
+
+        // Pass: carry improves by >= 0.02 at every t (0.02 exactly at t=32
+        // up to rounding) and is never worse; reset equals the prior.
+        let mut pass = baseline.clone();
+        pass.extend([
+            falsifier_metrics(reset, 8, 100, Some(0.50), Some(0.55)),
+            falsifier_metrics(reset, 16, 100, Some(0.40), Some(0.45)),
+            falsifier_metrics(reset, 32, 100, Some(0.70), Some(0.75)),
+            falsifier_metrics(carry, 8, 100, Some(0.53), Some(0.56)),
+            falsifier_metrics(carry, 16, 100, Some(0.43), Some(0.46)),
+            falsifier_metrics(carry, 32, 100, Some(0.72), Some(0.75)),
+        ]);
+        let verdict = adaptation_falsifier_verdict(&pass, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+        assert!(verdict.promote_channel_b, "{verdict:?}");
+        assert_eq!(verdict.satisfied_by, vec![carry.to_string()]);
+        assert_eq!(verdict.evaluated_prefix_lengths, vec![8, 16, 32]);
+        assert!(verdict.skipped_prefix_lengths.is_empty());
+        let reset_verdict = &verdict.arms[0];
+        assert_eq!(reset_verdict.arm, reset);
+        assert!(!reset_verdict.promote && reset_verdict.not_worse_at_every_t);
+        assert!(!reset_verdict.improvement_at_every_t);
+        let carry_verdict = &verdict.arms[1];
+        assert!(carry_verdict.promote);
+        assert_eq!(carry_verdict.deltas.len(), 3);
+        assert!(carry_verdict
+            .deltas
+            .iter()
+            .all(|d| d.improvement && d.not_worse));
+
+        // Fail on one t: carry improves by only 0.01 at t=16.
+        let mut one_t = pass.clone();
+        one_t
+            .iter_mut()
+            .find(|m| m.arm == carry && m.prefix_len == 16)
+            .unwrap()
+            .changed_exact = Some(0.41);
+        let verdict = adaptation_falsifier_verdict(&one_t, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+        assert!(!verdict.promote_channel_b, "{verdict:?}");
+        assert!(verdict.satisfied_by.is_empty());
+        let carry_verdict = &verdict.arms[1];
+        assert!(!carry_verdict.improvement_at_every_t && carry_verdict.not_worse_at_every_t);
+        assert!(!carry_verdict.deltas[1].improvement);
+        assert!(carry_verdict.deltas[0].improvement && carry_verdict.deltas[2].improvement);
+
+        // Fail on frozen-worse: changed-exact improves everywhere, but the
+        // adapted-then-frozen composed decode is worse than the prior at t=8.
+        let mut frozen_worse = pass.clone();
+        frozen_worse
+            .iter_mut()
+            .find(|m| m.arm == carry && m.prefix_len == 8)
+            .unwrap()
+            .composed_changed_exact = Some(0.54);
+        let verdict =
+            adaptation_falsifier_verdict(&frozen_worse, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+        assert!(!verdict.promote_channel_b, "{verdict:?}");
+        let carry_verdict = &verdict.arms[1];
+        assert!(carry_verdict.improvement_at_every_t);
+        assert!(!carry_verdict.not_worse_at_every_t);
+        assert!(!carry_verdict.deltas[0].not_worse);
+        assert_eq!(
+            carry_verdict.deltas[0].composed_changed_exact_delta,
+            Some(0.54 - 0.55)
+        );
+
+        // A prefix length with no changed transition in the prior arm is
+        // skipped (t=32 is structurally empty on 2-4 level histories), and the
+        // rule is applied over the remaining ones only.
+        let mut skipped = pass.clone();
+        for metrics in skipped.iter_mut().filter(|m| m.prefix_len == 32) {
+            metrics.changed_transitions = 0;
+            metrics.rows = 0;
+            metrics.changed_exact = None;
+            metrics.composed_changed_exact = None;
+        }
+        let verdict = adaptation_falsifier_verdict(&skipped, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+        assert_eq!(verdict.evaluated_prefix_lengths, vec![8, 16]);
+        assert_eq!(verdict.skipped_prefix_lengths, vec![32]);
+        assert!(verdict.promote_channel_b);
+        assert!(verdict.note.contains("[32]"));
+
+        // Nothing evaluable: no promotion.
+        let verdict = adaptation_falsifier_verdict(
+            &[
+                falsifier_metrics(a, 8, 0, None, None),
+                falsifier_metrics(carry, 8, 0, None, None),
+            ],
+            ADAPTATION_FALSIFIER_PROMOTION_DELTA,
+        );
+        assert!(!verdict.promote_channel_b);
+        assert!(verdict.evaluated_prefix_lengths.is_empty());
+        assert!(!verdict.arms[0].promote);
+
+        // A missing adapted-arm entry at an evaluated t fails that arm.
+        let mut missing = pass.clone();
+        missing.retain(|m| !(m.arm == carry && m.prefix_len == 16));
+        let verdict = adaptation_falsifier_verdict(&missing, ADAPTATION_FALSIFIER_PROMOTION_DELTA);
+        assert!(!verdict.promote_channel_b);
+        assert!(!verdict.arms[1].deltas[1].improvement);
+        assert!(verdict.arms[1].deltas[1].changed_exact_delta.is_none());
     }
 }

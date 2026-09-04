@@ -741,6 +741,19 @@ pub struct P2EvalArgs {
     /// their context windows and again masked to K=0 (world_core_v6 only).
     #[arg(long, default_value_t = false)]
     pub context_ablation: bool,
+
+    /// ADR 0005 §5.2 adaptation falsifier (E3): prequential Channel A vs
+    /// Channel A+B (reset, carry) on `--synthetic-episodes` held-out Learning
+    /// Histories, seeds fixed by the preregistration (world_core_v6 only).
+    #[arg(long, default_value_t = false)]
+    pub adaptation_falsifier: bool,
+
+    /// Falsifier-only Channel B warm-up (unique transitions per level before
+    /// the first update; §6.2 default 8). Synthetic Learning Histories carry 7
+    /// transitions per level, so the default never leaves warm-up; any other
+    /// value is a recorded deviation from the preregistered §6.2 rule.
+    #[arg(long, default_value_t = crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS, requires = "adaptation_falsifier")]
+    pub adaptation_falsifier_min_level_transitions: usize,
 }
 
 impl P2EvalArgs {
@@ -765,6 +778,9 @@ impl P2EvalArgs {
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
             profile_eval: self.profile_eval,
             context_ablation: self.context_ablation,
+            adaptation_falsifier: self.adaptation_falsifier,
+            adaptation_falsifier_min_level_transitions: self
+                .adaptation_falsifier_min_level_transitions,
         }
     }
 }
@@ -878,6 +894,9 @@ impl P2Arc3EvalArgs {
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
             profile_eval: self.profile_eval,
             context_ablation: false,
+            adaptation_falsifier: false,
+            adaptation_falsifier_min_level_transitions:
+                crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS,
         }
     }
 }
@@ -1184,6 +1203,48 @@ mod tests {
             .args
             .to_config();
         assert!(ablation.context_ablation);
+    }
+
+    #[test]
+    fn adaptation_falsifier_flag_is_off_by_default_and_reaches_eval_config() {
+        let legacy = EvalWrapper::try_parse_from(["p2-eval"])
+            .expect("default eval arguments parse")
+            .args
+            .to_config();
+        assert!(!legacy.adaptation_falsifier);
+        assert_eq!(
+            legacy.adaptation_falsifier_min_level_transitions,
+            crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS
+        );
+        let falsifier = EvalWrapper::try_parse_from(["p2-eval", "--adaptation-falsifier"])
+            .expect("falsifier flag parses")
+            .args
+            .to_config();
+        assert!(falsifier.adaptation_falsifier);
+        assert_eq!(falsifier.adaptation_falsifier_min_level_transitions, 8);
+        let lowered = EvalWrapper::try_parse_from([
+            "p2-eval",
+            "--adaptation-falsifier",
+            "--adaptation-falsifier-min-level-transitions",
+            "4",
+            "--synthetic-episodes",
+            "256",
+        ])
+        .expect("falsifier knob parses")
+        .args
+        .to_config();
+        assert!(lowered.adaptation_falsifier);
+        assert_eq!(lowered.adaptation_falsifier_min_level_transitions, 4);
+        assert_eq!(lowered.synthetic_episodes, 256);
+        assert!(
+            EvalWrapper::try_parse_from([
+                "p2-eval",
+                "--adaptation-falsifier-min-level-transitions",
+                "4"
+            ])
+            .is_err(),
+            "the warm-up knob requires --adaptation-falsifier"
+        );
     }
 
     #[test]

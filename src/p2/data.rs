@@ -5438,6 +5438,86 @@ fn compose_learning_history_unit(
     )
 }
 
+/// One held-out Learning History rendered under the v6 interface contract
+/// (ADR 0005 §5.2 adaptation-falsifier population): the primary rows of
+/// [`generate_learning_history_pair`] after the same per-unit augmentation the
+/// `LearningHistories` stream applies (content placement, D4 symmetry, colour
+/// permutation, goal dropout), with the emission order preserved so
+/// `chronological` still indexes `rows`.
+#[derive(Clone, Debug)]
+pub struct AugmentedLearningHistory {
+    pub meta_episode_id: u64,
+    pub levels: usize,
+    /// Emission order of [`LearningHistory::rows`], augmented one-to-one.
+    pub rows: Vec<V5Sample>,
+    /// Indices into `rows` of the chronological transitions, in order.
+    pub chronological: Vec<usize>,
+}
+
+impl AugmentedLearningHistory {
+    /// The `index`-th chronological transition (0-based).
+    pub fn chronological_row(&self, index: usize) -> &V5Sample {
+        &self.rows[self.chronological[index]]
+    }
+
+    /// Channel A window for a decision at chronological position `index`: the
+    /// last `<= CONTEXT_WINDOW_MAX` chronological transitions strictly before
+    /// it, in order (episode scope).
+    pub fn context_window_before(&self, index: usize) -> Vec<ContextTransition> {
+        let start = index.saturating_sub(CONTEXT_WINDOW_MAX);
+        (start..index)
+            .map(|position| {
+                let row = &self.chronological_row(position).transition;
+                ContextTransition {
+                    current: row.current.clone(),
+                    action: row.action.clone(),
+                    next: row.next.clone(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Generate the primary Learning History `meta_episode_id` of `config.seed`
+/// on `split` and augment it exactly like the stream unit would (the twin is
+/// generated for the family draw and discarded). Requires `data_contract_v6`.
+pub fn augmented_learning_history(
+    config: &MixedStreamConfig,
+    split: V5DataSplit,
+    meta_episode_id: u64,
+) -> Result<AugmentedLearningHistory> {
+    ensure!(
+        config.data_contract_v6,
+        "an augmented learning history requires data_contract_v6"
+    );
+    let (primary, _twin) = generate_learning_history_pair(
+        config.seed,
+        meta_episode_id,
+        split,
+        &config.operator_families,
+    )?;
+    let operator = primary.operator;
+    let expected = primary.rows.len();
+    let rows = augment_v5_unit(
+        primary.rows,
+        config,
+        split,
+        MixedStreamKind::LearningHistories,
+        operator,
+        meta_episode_id,
+    )?;
+    ensure!(
+        rows.len() == expected,
+        "unit augmentation must map learning-history rows one-to-one"
+    );
+    Ok(AugmentedLearningHistory {
+        meta_episode_id,
+        levels: primary.levels,
+        rows,
+        chronological: primary.chronological,
+    })
+}
+
 fn compose_learning_histories_stream(
     config: &MixedStreamConfig,
     split: V5DataSplit,

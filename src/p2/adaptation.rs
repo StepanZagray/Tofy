@@ -353,6 +353,7 @@ pub struct FastWeightAdapter<'a> {
     grad_norm_sum: f64,
     grad_norm_count: usize,
     l2sp_weight: f64,
+    min_level_transitions: usize,
     rng: StdRng,
 }
 
@@ -427,6 +428,7 @@ impl<'a> FastWeightAdapter<'a> {
             grad_norm_sum: 0.0,
             grad_norm_count: 0,
             l2sp_weight: ADAPT_L2SP_WEIGHT,
+            min_level_transitions: ADAPT_MIN_LEVEL_TRANSITIONS,
             rng: StdRng::seed_from_u64(RESERVOIR_SEED),
         })
     }
@@ -446,6 +448,25 @@ impl<'a> FastWeightAdapter<'a> {
     /// Falsifier knob for the L2-SP ablation arm; production keeps the default.
     pub fn set_l2sp_weight(&mut self, weight: f64) {
         self.l2sp_weight = weight;
+    }
+
+    /// Falsifier knob: the per-level warm-up (§6.2 default
+    /// [`ADAPT_MIN_LEVEL_TRANSITIONS`]). Synthetic Learning Histories carry
+    /// only `LEARNING_HISTORY_STEPS_PER_LEVEL + 1 = 7` transitions per level,
+    /// so the §5.2 falsifier cannot leave warm-up at the default; a lowered
+    /// value is a recorded deviation, never the live default.
+    pub fn set_min_level_transitions(&mut self, transitions: usize) {
+        self.min_level_transitions = transitions.max(1);
+    }
+
+    pub fn min_level_transitions(&self) -> usize {
+        self.min_level_transitions
+    }
+
+    /// Reseed the reservoir sampler (deterministic per-episode batches for the
+    /// falsifier; the live loop keeps the fixed `RESERVOIR_SEED`).
+    pub fn reseed_reservoir(&mut self, seed: u64) {
+        self.rng = StdRng::seed_from_u64(seed);
     }
 
     /// Record one confirmed factual transition of `level_index`. Every observed
@@ -550,7 +571,7 @@ impl<'a> FastWeightAdapter<'a> {
             ..AdaptationTrace::default()
         };
         let unique = self.buffer.unique_transitions_in_level(self.level);
-        if unique < ADAPT_MIN_LEVEL_TRANSITIONS {
+        if unique < self.min_level_transitions {
             trace.note = Some("warmup".into());
             return Ok(Some(trace));
         }
