@@ -166,27 +166,23 @@ computation is recovered exactly at init) applied next to action FiLM.
 
 3.2 Parameter budget: <= 650k parameters total (v5 is ~467k).
 
-3.5 **Recursion depth 3x3** (owner decision, 2026-09-03). v6 applies the
-dynamics block `inner_steps = outer_steps = 3` (nine applications) instead of
-v5's 2x2 (four). The block contains two 3x3 convolutions, so 2x2 propagates
-information eight cells: a 17-cell receptive field on the 16x16 latent grid,
-exactly the grid width and therefore the bare minimum for a board-wide effect
-(a switch opening a distant door) to be predictable in one step, with no
-margin. 3x3 reaches 25 cells. Cost is 2.25x the dynamics compute and no extra
-parameters (the block is weight-shared across applications). This is a
-reasoned static bound on the receptive field, not a measured quality result;
-the depth ablation (ADR 0003 T0.2) remains the falsifier. v5 keeps 2x2 so
-legacy checkpoints and their evaluations stay reproducible.
+3.5 **Recursion depth 3x3** (owner decision, 2026-09-03; arithmetic corrected
+2026-09-04 after audit). v6 applies `inner_steps = outer_steps = 3` instead of
+v5's 2x2. Each outer step runs `inner_steps + 1` applications of the residual
+block (`deep_step`), and each block holds two 3x3 convolutions, so:
 
-3.3 **Fast-weight subset** (the only parameters gradient adaptation may
-touch), by name prefix, exported as `FAST_WEIGHT_PREFIXES`:
-`action_film_`, `context_film_`, `pixel_emb`, `encoder.c1` (first conv of
-the frame encoder; name to be confirmed against `model.rs`), and
-`exact_grounding_head`. Everything else is frozen at inference.
+| depth | blocks | 3x3 convs | receptive field on the 16x16 latent grid |
+|---|---|---|---|
+| 2x2 (v5) | 6 | 12 | 25 cells |
+| 3x3 (v6) | 12 | 24 | 49 cells |
 
-3.4 Loading: a `world_core_v6` config on a v5 checkpoint fails closed unless
-`--init-context-from-v5` is passed, in which case the context parameters
-are zero-initialised and everything else is loaded by name (warm start).
+The earlier text (4 vs 9 blocks, 17 vs 25 cells) was wrong: 2x2 already
+covers the grid; 3x3 doubles the dynamics compute (measured +10% wall clock on
+the host-bound local step) for margin that is not evidenced. RecurTrace
+(2026, in the 2026-09-04 literature map) reports that extra recurrent loops
+can hurt. The depth is therefore an owner choice under test, not a
+receptive-field necessity; the preregistered 2x2-vs-3x3 ablation is the
+arbiter. v5 keeps 2x2 so legacy checkpoints stay reproducible.
 
 ## 4. Objective v6
 
@@ -243,8 +239,12 @@ once the current level has >= 8 transitions:
   and after each update; two consecutive worsenings revert to theta_best;
 - collapse guard: an update whose grad-norm exceeds 3x the running mean
   is skipped (SAR precursor);
-- the adapted model is never used for goal/terminal inference; Phase A
-  trust gates and calibration are unchanged;
+- goal/terminal/reliability readouts consumed by Phase A trust and by the
+  greedy scorer are computed from the prior weights (theta_0): the fast subset
+  is swapped back to theta_0 for those readouts (implementation in progress,
+  2026-09-04; until it lands, frozen heads read latents produced by adapted
+  dynamics, which is NOT the same guarantee); Phase A calibration is unchanged
+  and must be fitted from synthetic held-out data only;
 - every update, skip and revert is recorded in `ActionDecision` telemetry.
 
 6.3 Adapted weights are discarded at the end of a game. Nothing here

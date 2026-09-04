@@ -249,3 +249,12 @@ Committed (small): `REPORT.md`, `recordings_summary.json`, `probe_summary_ema.js
 `probe_summary.json`, `probe_summary_evalcond.json`, `analysis_ema.json`, `analysis.json`.
 Local only (gitignored `runs/`): `recordings/` (toolkit JSONL, 130 MB),
 `environment_files/`, `probe_rows*.jsonl` (7,500 rows each), `record.*.log`.
+
+## Correction (2026-09-04)
+
+The decision wording above overstates the outcome. Against the preregistered rule
+(residual AUROC >= 0.80 AND reliability AUROC <= 0.60) the reliability condition
+was missed (0.634, CI excludes 0.60), so the switch was NOT triggered. Independent
+audit further noted that using the 25 public games to decide Phase A trust would
+violate the project's held-out policy; this report is evaluation-only evidence
+and no policy or threshold is selected from it.

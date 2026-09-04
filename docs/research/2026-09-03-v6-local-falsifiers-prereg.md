@@ -187,3 +187,28 @@ lengths from a wider range.
   full run stays at 3x3 (owner decision) and is reported as an effect size.
 - Runs only if E2's §5.1 verdict is PASS; a failing data contract makes depth
   uninterpretable. Cost ~2 h local.
+
+## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
+
+1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`
+   overwrote `--grad-accum 2` with 1 (fixed in the source after the run; the
+   run's `config.json` records `grad_accum: 1`). Every "128 x 2" timing in this
+   file was really 128 x 1. E2 (all attempts) is reclassified as
+   **implementation smoke / exploratory**; it cannot satisfy §5.1 as registered.
+   A registered E2 must be rerun in a never-reused root from a reviewed commit
+   with the exact twin-pair K = 0 vs K = 16 evaluator (in progress).
+2. **Depth arithmetic was wrong** (see ADR 0005 §3.5 corrected table):
+   2x2 = 6 blocks / receptive field 25; 3x3 = 12 blocks / 49; compute roughly
+   doubles. The depth-ablation registration below is re-stated with these
+   numbers and with matched, actually-applied accumulation.
+3. **E1's decision rule violated the project's held-out policy**: public games
+   may not tune thresholds or select policy
+   (`docs/specs/P2_ARC_AGI_3_WORLD_MODEL_CORE_REDESIGN.md`). The E1 rule
+   "switch Phase A trust on residual AUROC" is withdrawn; E1 stands as an
+   evaluation-only observation. Phase A calibration is to be fitted from
+   synthetic held-out data (`p2-eval --emit-phase-a-calibration`, in progress).
+4. The post-E2 chain launched E3 unconditionally; replaced by a gated chain
+   that runs E3 only on a PASS verdict, and E3 is deferred until its redesign
+   (longer evaluation histories so the production warm-up is reachable) lands.
+5. E3 t = 32 and the warm-up vacuity are being fixed by giving evaluation
+   populations longer levels (training rows unchanged).
