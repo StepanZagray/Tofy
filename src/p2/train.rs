@@ -1547,7 +1547,8 @@ impl TrainConfig {
     pub fn apply_full_v4_recipe(&mut self) {
         self.recipe = TrainingRecipe::FullV4;
         self.lessons = DEFAULT_LESSONS.iter().map(|s| (*s).to_string()).collect();
-        self.grad_accum = 1;
+        // `grad_accum` is a runtime batch-schedule field (caller-owned, recorded
+        // in the contract); recipes must not overwrite it (2026-09-04 audit).
         self.sigreg_projections = 1024;
         self.sigreg_knots = 17;
         self.sigreg_weight = 0.1;
@@ -1603,7 +1604,8 @@ impl TrainConfig {
     pub fn apply_foundation_v2_recipe(&mut self) {
         self.recipe = TrainingRecipe::FoundationV2;
         self.lessons.clear();
-        self.grad_accum = 1;
+        // `grad_accum` is a runtime batch-schedule field (caller-owned, recorded
+        // in the contract); recipes must not overwrite it (2026-09-04 audit).
         self.sigreg_projections = 1024;
         self.sigreg_knots = 17;
         self.sigreg_weight = 0.01;
@@ -1673,6 +1675,7 @@ impl TrainConfig {
         canonical.seed = self.seed;
         canonical.steps_per_lesson = self.steps_per_lesson;
         canonical.physical_batch = self.physical_batch;
+        canonical.grad_accum = self.grad_accum;
         canonical.device = self.device.clone();
         canonical.output_dir = self.output_dir.clone();
         canonical.resume = self.resume.clone();
@@ -14849,6 +14852,31 @@ mod tests {
         let mut v5 = TrainConfig::default();
         v5.apply_foundation_v2_recipe();
         assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
+    }
+
+    /// 2026-09-04 audit: `--grad-accum` must survive the recipe. E2 was
+    /// launched with `--grad-accum 2` and silently ran at 1.
+    #[test]
+    fn recipes_preserve_caller_owned_grad_accum() {
+        for recipe in [TrainingRecipe::FoundationV2, TrainingRecipe::FullV4] {
+            let mut cfg = TrainConfig {
+                world_core_v6: recipe == TrainingRecipe::FoundationV2,
+                data_contract_v6: recipe == TrainingRecipe::FoundationV2,
+                grad_accum: 8,
+                ..TrainConfig::default()
+            };
+            match recipe {
+                TrainingRecipe::FoundationV2 => cfg.apply_foundation_v2_recipe(),
+                _ => cfg.apply_full_v4_recipe(),
+            }
+            cfg.physical_batch = 128;
+            assert_eq!(cfg.grad_accum, 8, "{recipe:?} recipe overwrote grad_accum");
+            if recipe == TrainingRecipe::FoundationV2 {
+                cfg.validate()
+                    .expect("accumulation is caller-owned under foundation-v2");
+                assert_eq!(TrainingContract::from(&cfg).grad_accum, 8);
+            }
+        }
     }
 
     /// The preregistered depth ablation runs a v6 arm at 2x2 through the
