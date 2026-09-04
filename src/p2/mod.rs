@@ -28,5 +28,6 @@ pub mod residual_probe;
 pub mod rhae;
 pub mod semantic_eval;
 pub mod sigreg;
+pub mod synthetic_shards;
 pub mod train;
 pub mod view;

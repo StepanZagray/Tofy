@@ -20,6 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Official ARC-AGI-3 frame side length.
@@ -314,7 +315,8 @@ fn family_index(goal: &Goal) -> u8 {
 }
 
 /// The five ADR 0003 sources mixed concurrently by the foundation-v2 data
-/// schedule, plus the ADR 0005 §2.1 `LearningHistories` stream.
+/// schedule, plus the ADR 0005 §2.1 `LearningHistories` stream and the §2.6
+/// `SyntheticShards` stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MixedStreamKind {
@@ -324,6 +326,9 @@ pub enum MixedStreamKind {
     SequentialFragments,
     HazardOneStep,
     LearningHistories,
+    /// ARCEngine shard rows loaded by [`crate::p2::synthetic_shards`]
+    /// (ADR 0005 §2.6). Weight 0 in every shipped schedule.
+    SyntheticShards,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -351,8 +356,9 @@ fn is_zero_f32(value: &f32) -> bool {
 /// The documented endpoint weights total 0.95. [`normalized`] preserves their
 /// ratios when a caller needs to fill a fixed physical row budget; the raw
 /// fields remain the exact percentages specified by the ADR.
-/// `learning_histories` is zero for every legacy schedule and is omitted from
-/// its serialization so legacy batch identities are unchanged.
+/// `learning_histories` and `synthetic_shards` are zero for every legacy
+/// schedule and are omitted from its serialization so legacy batch identities
+/// are unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MixedStreamProportions {
     pub random_one_step: f32,
@@ -362,6 +368,10 @@ pub struct MixedStreamProportions {
     pub hazard_one_step: f32,
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub learning_histories: f32,
+    /// ADR 0005 §2.6 shard stream. Zero in every shipped schedule until the
+    /// shard generator passes the §5.1 memorization diagnostic on its twins.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub synthetic_shards: f32,
 }
 
 impl MixedStreamProportions {
@@ -372,6 +382,7 @@ impl MixedStreamProportions {
             + self.sequential_fragments
             + self.hazard_one_step
             + self.learning_histories
+            + self.synthetic_shards
     }
 
     pub fn normalized(self) -> Self {
@@ -386,10 +397,11 @@ impl MixedStreamProportions {
             sequential_fragments: self.sequential_fragments / total,
             hazard_one_step: self.hazard_one_step / total,
             learning_histories: self.learning_histories / total,
+            synthetic_shards: self.synthetic_shards / total,
         }
     }
 
-    fn ordered(self) -> [(MixedStreamKind, f32); 6] {
+    fn ordered(self) -> [(MixedStreamKind, f32); 7] {
         [
             (MixedStreamKind::RandomOneStep, self.random_one_step),
             (MixedStreamKind::FactualBranches, self.factual_branches),
@@ -400,6 +412,7 @@ impl MixedStreamProportions {
             ),
             (MixedStreamKind::HazardOneStep, self.hazard_one_step),
             (MixedStreamKind::LearningHistories, self.learning_histories),
+            (MixedStreamKind::SyntheticShards, self.synthetic_shards),
         ]
     }
 }
@@ -419,12 +432,15 @@ pub fn foundation_v2_stream_schedule(progress: f32) -> MixedStreamProportions {
         sequential_fragments: 0.15,
         hazard_one_step: lerp(0.10, 0.05),
         learning_histories: 0.0,
+        synthetic_shards: 0.0,
     }
 }
 
 /// ADR 0005 §2.1 schedule: `LearningHistories` ramps linearly from 0.25 to
 /// 0.50 of the physical rows; the legacy streams share the remainder in their
-/// ADR 0003 ratios. Totals one at every progress.
+/// ADR 0003 ratios. Totals one at every progress. `SyntheticShards` stays at
+/// weight 0 (ADR 0005 §2.6) until the shard generator passes the §5.1
+/// memorization diagnostic on its own held-out twins.
 pub fn adaptation_v6_stream_schedule(progress: f32) -> MixedStreamProportions {
     let progress = if progress.is_finite() {
         progress.clamp(0.0, 1.0)
@@ -441,6 +457,7 @@ pub fn adaptation_v6_stream_schedule(progress: f32) -> MixedStreamProportions {
         sequential_fragments: legacy.sequential_fragments * share,
         hazard_one_step: legacy.hazard_one_step * share,
         learning_histories,
+        synthetic_shards: 0.0,
     }
 }
 
@@ -868,6 +885,11 @@ pub struct MixedStreamConfig {
     /// the `LearningHistories` stream. Off keeps every legacy path
     /// byte-identical.
     pub data_contract_v6: bool,
+    /// Directory of ADR 0005 §2.6 ARCEngine shards (`manifest.json` plus
+    /// `*.safetensors`). Required, together with `data_contract_v6`, by any
+    /// schedule that gives `SyntheticShards` non-zero weight; `None` for every
+    /// shipped recipe.
+    pub synthetic_shards_dir: Option<PathBuf>,
 }
 
 impl Default for MixedStreamConfig {
@@ -880,6 +902,7 @@ impl Default for MixedStreamConfig {
             operator_families: OperatorFamilySplit::default(),
             symmetry_augmentation: true,
             data_contract_v6: false,
+            synthetic_shards_dir: None,
         }
     }
 }
@@ -912,6 +935,11 @@ impl MixedStreamConfig {
             ensure!(
                 self.data_contract_v6 || (self.schedule)(progress).learning_histories == 0.0,
                 "the learning-histories stream requires data_contract_v6"
+            );
+            ensure!(
+                (self.schedule)(progress).synthetic_shards == 0.0
+                    || (self.data_contract_v6 && self.synthetic_shards_dir.is_some()),
+                "the synthetic-shards stream requires data_contract_v6 and synthetic_shards_dir"
             );
             self.realized_proportions(progress)?;
         }
@@ -1743,7 +1771,12 @@ fn split_tag(split: V5DataSplit) -> u64 {
     }
 }
 
-fn seeded_v5_rng(seed: u64, episode_id: u64, split: V5DataSplit, lane: u64) -> ChaCha8Rng {
+pub(crate) fn seeded_v5_rng(
+    seed: u64,
+    episode_id: u64,
+    split: V5DataSplit,
+    lane: u64,
+) -> ChaCha8Rng {
     ChaCha8Rng::seed_from_u64(
         seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ episode_id.wrapping_mul(0xD1B5_4A32_D192_ED03)
@@ -2413,7 +2446,11 @@ fn augment_v5_transition(
         // Rule identity never enters conditioning (ADR 0005 §1.4); the sidecar
         // below keeps the permuted operator for counterfactual replay.
         transition.provenance.operator = None;
-        transition.provenance.available_actions = ALL_ACTIONS_AVAILABLE;
+        // Generated rows record all eight actions; shard rows keep the game's
+        // own mask (ADR 0005 §1.6).
+        if transition.provenance.available_actions == 0 {
+            transition.provenance.available_actions = ALL_ACTIONS_AVAILABLE;
+        }
         transition.provenance.background_color = operator.empty_color;
         transition.provenance.context_len = u8::try_from(transition.context.len())
             .map_err(|_| anyhow!("context window exceeds u8"))?;
@@ -3448,9 +3485,14 @@ fn realized_stream_proportions(
     let mut remainders = Vec::new();
     let mut assigned = 0usize;
     for (kind, weight) in ordered {
-        // Legacy schedules never realize learning histories; leaving the kind
-        // out of `counts` keeps legacy batch identities byte-identical.
-        if kind == MixedStreamKind::LearningHistories && weight == 0.0 {
+        // Legacy schedules never realize learning histories or shards;
+        // leaving the kind out of `counts` keeps legacy batch identities
+        // byte-identical.
+        if matches!(
+            kind,
+            MixedStreamKind::LearningHistories | MixedStreamKind::SyntheticShards
+        ) && weight == 0.0
+        {
             continue;
         }
         let exact = weight as f64 * batch_size as f64;
@@ -3486,6 +3528,7 @@ fn realized_stream_proportions(
             MixedStreamKind::SequentialFragments,
             MixedStreamKind::HazardOneStep,
             MixedStreamKind::LearningHistories,
+            MixedStreamKind::SyntheticShards,
         ] {
             let Some(count) = counts.get_mut(&kind) else {
                 continue;
@@ -3509,6 +3552,11 @@ fn realized_stream_proportions(
         hazard_one_step: counts[&MixedStreamKind::HazardOneStep] as f32 / batch_size as f32,
         learning_histories: counts
             .get(&MixedStreamKind::LearningHistories)
+            .copied()
+            .unwrap_or(0) as f32
+            / batch_size as f32,
+        synthetic_shards: counts
+            .get(&MixedStreamKind::SyntheticShards)
             .copied()
             .unwrap_or(0) as f32
             / batch_size as f32,
@@ -3700,7 +3748,7 @@ fn raw_hazard_v5_sample(
     Ok(sample)
 }
 
-fn augment_v5_unit(
+pub(crate) fn augment_v5_unit(
     transitions: Vec<TransitionSample>,
     config: &MixedStreamConfig,
     split: V5DataSplit,
@@ -3773,7 +3821,7 @@ fn non_meta_episode_id(batch_or_episode: u64, offset: u64) -> Result<u64> {
     checked_non_meta_episode_id(episode_id)
 }
 
-fn mixed_stream_episode_id(batch_index: u64, unit_index: u64) -> Result<u64> {
+pub(crate) fn mixed_stream_episode_id(batch_index: u64, unit_index: u64) -> Result<u64> {
     non_meta_episode_id(batch_index, unit_index)
 }
 
@@ -3836,6 +3884,9 @@ fn compose_nonfactual_unit(
         MixedStreamKind::LearningHistories => {
             bail!("learning histories must be composed as twin meta-episode units")
         }
+        MixedStreamKind::SyntheticShards => {
+            bail!("synthetic shards must be composed from a loaded shard pool")
+        }
     };
     let mut unit = augment_v5_unit(raw, config, split, stream, operator, episode_id)?;
     unit.truncate(maximum_rows);
@@ -3855,7 +3906,8 @@ fn compose_fixed_nonfactual_stream(
         MixedStreamKind::RandomOneStep | MixedStreamKind::HazardOneStep => 1,
         MixedStreamKind::SequentialFragments
         | MixedStreamKind::FactualBranches
-        | MixedStreamKind::LearningHistories => {
+        | MixedStreamKind::LearningHistories
+        | MixedStreamKind::SyntheticShards => {
             bail!("stream does not have a fixed row count per unit")
         }
     };
@@ -4114,7 +4166,7 @@ pub fn compose_mixed_stream_batch(
             config.data_contract_v6,
             "the learning-histories stream requires data_contract_v6"
         );
-        let (mut history_samples, _) = compose_learning_histories_stream(
+        let (mut history_samples, next_unit_index) = compose_learning_histories_stream(
             config,
             split,
             learning_histories,
@@ -4122,6 +4174,31 @@ pub fn compose_mixed_stream_batch(
             unit_index,
         )?;
         samples.append(&mut history_samples);
+        unit_index = next_unit_index;
+    }
+    let synthetic_shards = stream_counts
+        .get(&MixedStreamKind::SyntheticShards)
+        .copied()
+        .unwrap_or(0);
+    if synthetic_shards > 0 {
+        let shards_dir = config
+            .synthetic_shards_dir
+            .as_deref()
+            .ok_or_else(|| anyhow!("the synthetic-shards stream requires synthetic_shards_dir"))?;
+        ensure!(
+            config.data_contract_v6,
+            "the synthetic-shards stream requires data_contract_v6"
+        );
+        let pool = crate::p2::synthetic_shards::cached_pool(shards_dir)?;
+        let (mut shard_samples, _) = crate::p2::synthetic_shards::compose_synthetic_shards_stream(
+            &pool,
+            config,
+            split,
+            synthetic_shards,
+            batch_index,
+            unit_index,
+        )?;
+        samples.append(&mut shard_samples);
     }
     ensure!(
         samples.len() == config.batch_size,
@@ -5129,7 +5206,10 @@ fn learning_history_draw(
     })
 }
 
-fn sampled_context_len(rng: &mut ChaCha8Rng, available: usize) -> usize {
+/// Context-window length draw shared by Learning Histories and the shard
+/// stream (ADR 0005 §2.2): `K ~ Uniform{0..16}` with `P(K=0) >= 0.10`, clipped
+/// to the rows available before the row.
+pub(crate) fn sampled_context_len(rng: &mut ChaCha8Rng, available: usize) -> usize {
     let k = if rng.random_bool(LEARNING_HISTORY_NO_CONTEXT_PROBABILITY) {
         0
     } else {
@@ -6327,6 +6407,33 @@ mod tests {
             }
         }
         assert!(with_context > 0 && chained > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v6_mixed_stream_content_digest_snapshot() -> Result<()> {
+        use crate::p2::train::{training_content_batch_digest, training_content_hash_append};
+        let config = v6_config(32, 0xDA7A_0006);
+        let total_steps = 3usize;
+        let chain = (0..total_steps as u64).try_fold([0; 32], |chain, batch_index| {
+            let batch = compose_mixed_stream_batch(
+                &config,
+                batch_index as f32 / total_steps as f32,
+                batch_index,
+                V5DataSplit::Train,
+            )?;
+            let digest = training_content_batch_digest(batch.transitions(), batch.content_masks())?;
+            Ok::<_, anyhow::Error>(training_content_hash_append(chain, digest))
+        })?;
+        // Snapshot taken at 0a12f79a (before the `SyntheticShards` stream): a
+        // zero-weight shard stream must leave every v6 batch byte-identical.
+        assert_eq!(
+            chain,
+            [
+                142, 133, 119, 153, 224, 225, 166, 65, 172, 117, 91, 59, 138, 253, 119, 73, 152,
+                22, 85, 227, 234, 181, 135, 93, 85, 156, 221, 168, 232, 214, 19, 93,
+            ]
+        );
         Ok(())
     }
 
