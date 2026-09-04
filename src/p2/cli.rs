@@ -3,6 +3,7 @@
 //! Defaults are tiny smoke settings and must not be treated as a research result.
 //! Wiring into the top-level CLI is owned by the primary agent.
 
+use crate::p2::adaptation::ContextScopeKind;
 use crate::p2::arc3_bridge::{run_arc3_bridge, Arc3BridgeConfig, Arc3BridgeMode};
 use crate::p2::arc3_live::{
     evaluate_live, list_public_games, LiveDriverOptions, LiveEvalConfig, LivePolicyKind,
@@ -12,7 +13,7 @@ use crate::p2::bf16_falsifier::{
     compare_bf16_recurrent_core, run_bf16_benchmark, write_json_report,
 };
 use crate::p2::branch_learning::BranchLearningConfig;
-use crate::p2::eval::{evaluate, evaluate_arc3, EvalConfig, EvalMode};
+use crate::p2::eval::{emit_phase_a_calibration, evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::muon::MUON_RMS_SCALE;
@@ -760,6 +761,16 @@ pub struct P2EvalArgs {
     /// value is a recorded deviation from the preregistered §6.2 rule.
     #[arg(long, default_value_t = crate::p2::adaptation::ADAPT_MIN_LEVEL_TRANSITIONS, requires = "adaptation_falsifier")]
     pub adaptation_falsifier_min_level_transitions: usize,
+
+    /// ADR 0004 A3: fit the Phase A calibration artifact from the SYNTHETIC
+    /// `unseen_seed_7x7` held-out gate population only (raw q / reliability /
+    /// event readouts vs exact outcomes) and write it to this path, labelled
+    /// `source: synthetic_holdout` with revision, population fingerprint and
+    /// checkpoint hash. Runs instead of the evaluation report. Public games
+    /// never enter this fit; artifacts declaring any other source are
+    /// rejected by `--phase-a-calibration` at load time.
+    #[arg(long)]
+    pub emit_phase_a_calibration: Option<PathBuf>,
 }
 
 impl P2EvalArgs {
@@ -792,6 +803,30 @@ impl P2EvalArgs {
 }
 
 pub fn run_p2_eval(args: P2EvalArgs) -> Result<()> {
+    if let Some(output) = &args.emit_phase_a_calibration {
+        let calibration = emit_phase_a_calibration(&args.to_config(), output)?;
+        let bin = |bin: &Option<crate::p2::latent_planning::trust::CalibrationBin>| {
+            bin.as_ref()
+                .map(|bin| format!("{:.4}@{}", bin.upper_error_bound_95, bin.support))
+        };
+        println!(
+            "p2-eval phase-a calibration written path={} source={:?} population={:?} \
+             fingerprint={:?} q_direction={} tau_unknown={:.4} score_error_bound={:.4} \
+             ordinary={:?} event_false_safe={:?} satisfaction={:?} rows={:?}",
+            output.display(),
+            calibration.source,
+            calibration.population,
+            calibration.population_fingerprint,
+            calibration.q_direction,
+            calibration.tau_unknown,
+            calibration.score_error_bound,
+            bin(&calibration.ordinary),
+            bin(&calibration.event_false_safe),
+            bin(&calibration.satisfaction),
+            calibration.fit.as_ref().map(|fit| fit.rows),
+        );
+        return Ok(());
+    }
     let report = evaluate(&args.to_config())?;
     println!(
         "p2-eval smoke complete research_claim={} official_rhae={:?} public_fit={} \
@@ -978,6 +1013,14 @@ pub struct P2Arc3LiveEvalArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub context_window: Option<bool>,
 
+    /// ADR 0005 §1.5 Channel A scope: `game` (default; training Learning
+    /// Histories carry context across level boundaries, so the live window
+    /// matches that distribution) or `level` (only the current level's
+    /// transitions). Independent of `--adapt` / `--adapt-carry`, which only
+    /// control the fast-weight reset arm. A game boundary always clears it.
+    #[arg(long, value_enum, default_value_t = ContextScopeKind::Game)]
+    pub context_scope: ContextScopeKind,
+
     /// Use official competition semantics, where RESET retries the current
     /// level and cannot wipe progress in the game.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1066,6 +1109,7 @@ impl P2Arc3LiveEvalArgs {
             adapt: self.adapt,
             adapt_carry: self.adapt_carry,
             context_window: self.context_window,
+            context_scope: self.context_scope,
         }
     }
 }
@@ -1156,6 +1200,11 @@ pub struct P2Arc3BridgeArgs {
     /// checkpoints; forced off (no-op) on checkpoints without a context channel.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub context_window: Option<bool>,
+
+    /// ADR 0005 §1.5 Channel A scope: `game` (default, the training
+    /// distribution) or `level`. Independent of `--adapt` / `--adapt-carry`.
+    #[arg(long, value_enum, default_value_t = ContextScopeKind::Game)]
+    pub context_scope: ContextScopeKind,
 }
 
 pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
@@ -1174,6 +1223,7 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
         adapt: args.adapt,
         adapt_carry: args.adapt_carry,
         context_window: args.context_window,
+        context_scope: args.context_scope,
     })
 }
 
@@ -1209,6 +1259,24 @@ mod tests {
             .args
             .to_config();
         assert!(ablation.context_ablation);
+    }
+
+    #[test]
+    fn emit_phase_a_calibration_flag_parses_to_a_path() {
+        let default = EvalWrapper::try_parse_from(["p2-eval"]).unwrap().args;
+        assert!(default.emit_phase_a_calibration.is_none());
+        let emit = EvalWrapper::try_parse_from([
+            "p2-eval",
+            "--emit-phase-a-calibration",
+            "runs/p2/e2/phase_a_calibration.json",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(
+            emit.emit_phase_a_calibration.as_deref(),
+            Some(std::path::Path::new("runs/p2/e2/phase_a_calibration.json"))
+        );
+        assert!(EvalWrapper::try_parse_from(["p2-eval", "--emit-phase-a-calibration"]).is_err());
     }
 
     #[test]
@@ -1371,6 +1439,55 @@ mod adapt_flag_tests {
         assert_eq!(
             BridgeWrap::try_parse_from(off).unwrap().args.context_window,
             Some(false)
+        );
+    }
+
+    /// `--context-scope` is a Channel A knob: it parses on both arc3 commands,
+    /// defaults to `game`, and never requires `--adapt`.
+    #[test]
+    fn context_scope_flag_parses_on_both_arc3_commands_without_adapt() {
+        let default = LiveWrap::try_parse_from(["x"]).unwrap().args.to_config();
+        assert_eq!(default.context_scope, ContextScopeKind::Game);
+        assert!(!default.adapt);
+        let level = LiveWrap::try_parse_from(["x", "--context-scope", "level"])
+            .unwrap()
+            .args
+            .to_config();
+        assert_eq!(level.context_scope, ContextScopeKind::Level);
+        assert!(!level.adapt && !level.adapt_carry);
+        assert!(level.validate().is_ok());
+        let game = LiveWrap::try_parse_from(["x", "--context-scope=game", "--adapt"])
+            .unwrap()
+            .args
+            .to_config();
+        assert_eq!(game.context_scope, ContextScopeKind::Game);
+        assert!(game.adapt && !game.adapt_carry);
+        assert!(
+            LiveWrap::try_parse_from(["x", "--context-scope", "episode"]).is_err(),
+            "only level|game are accepted"
+        );
+
+        let base = [
+            "x",
+            "--mode",
+            "serve",
+            "--checkpoint",
+            "m.safetensors",
+            "--train-config",
+            "c.json",
+        ];
+        assert_eq!(
+            BridgeWrap::try_parse_from(base).unwrap().args.context_scope,
+            ContextScopeKind::Game
+        );
+        let mut level = base.to_vec();
+        level.extend(["--context-scope", "level"]);
+        assert_eq!(
+            BridgeWrap::try_parse_from(level)
+                .unwrap()
+                .args
+                .context_scope,
+            ContextScopeKind::Level
         );
     }
 }

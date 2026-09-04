@@ -5,18 +5,54 @@
 //! thinly supported, or looser than the configured bound.
 
 use super::config::PhaseAConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Minimum calibration support before a bin may certify anything.
 pub const MIN_SUPPORT: u64 = 64;
 
+/// The only `source` a calibration artifact may declare: fitted by
+/// `p2-eval --emit-phase-a-calibration` from the synthetic held-out
+/// population. Public ARC-AGI-3 games may not tune thresholds
+/// (`docs/specs/P2_ARC_AGI_3_WORLD_MODEL_CORE_REDESIGN.md` §3.3), so any
+/// other declared source (public games, recordings, ...) is rejected.
+pub const SYNTHETIC_HOLDOUT_SOURCE: &str = "synthetic_holdout";
+
 /// One calibrated error bin: a 95% upper bound on the error rate plus the
 /// number of samples that produced it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationBin {
     pub upper_error_bound_95: f64,
     pub support: u64,
+}
+
+/// How the emitter derived each field of a fitted artifact (informational;
+/// never consulted by a gate).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PhaseACalibrationFit {
+    /// Held-out rows scored (every bin's support is a subset of these).
+    pub rows: usize,
+    /// Rows with a terminal-channel label and a non-dropped goal.
+    pub goal_labeled_rows: usize,
+    /// AUROC of the raw q score against exact composed-transition correctness
+    /// (`q_direction` is `-1` when it is below 0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_auroc: Option<f64>,
+    /// Exact-transition rate over all rows (the population's base rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_rate: Option<f64>,
+    /// 95th percentile of `-ln(clip(L, 0.02, 0.98))` of the observed channel's
+    /// raw likelihood, before clamping into the `(0, 1)` `tau_unknown` domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tau_unknown_raw_p95: Option<f64>,
+    /// Quantile level of `|satisfied_raw - 1[satisfied]|` reported as
+    /// `score_error_bound` (`1 - epsilon`, ADR 0004 `epsilon = 0.02`).
+    pub score_error_quantile: f64,
+    /// Bound method for every bin.
+    pub bound_method: String,
+    /// Bins the emitter cannot fit (with the reason), e.g. `ptrm`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfitted: Vec<String>,
 }
 
 /// Phase A calibration record produced offline.
@@ -25,7 +61,7 @@ pub struct CalibrationBin {
 /// (`-1`) with reliability; `tau_unknown` is the surprise threshold fed to the
 /// belief update; `score_error_bound` bounds the finalist score error and
 /// drives [`selection_charge`].
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PhaseACalibration {
     pub q_direction: i8,
     pub tau_unknown: f64,
@@ -40,6 +76,25 @@ pub struct PhaseACalibration {
     pub ptrm: Option<CalibrationBin>,
     #[serde(default)]
     pub uncalibrated: bool,
+    /// Data the artifact was fitted from. Only [`SYNTHETIC_HOLDOUT_SOURCE`]
+    /// is accepted; anything else (public/recorded games) fails validation.
+    /// Absent on hand-written legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Git revision of the emitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Fingerprint of the held-out population the bins were fitted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population_fingerprint: Option<String>,
+    /// Named held-out population (e.g. `v5_holdout_gates/unseen_seed_7x7`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population: Option<String>,
+    /// SHA-256 of the checkpoint whose heads were calibrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<PhaseACalibrationFit>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +103,16 @@ pub enum TrustError {
     InvalidTauUnknown(f64),
     InvalidScoreErrorBound(f64),
     InvalidDirection(i8),
-    InvalidBinBound { bin: &'static str, value: f64 },
-    ZeroSupport { bin: &'static str },
+    InvalidBinBound {
+        bin: &'static str,
+        value: f64,
+    },
+    ZeroSupport {
+        bin: &'static str,
+    },
+    /// The artifact declares a data source other than the synthetic held-out
+    /// population (public or recorded games may not tune trust thresholds).
+    ForbiddenSource(String),
 }
 
 impl fmt::Display for TrustError {
@@ -72,6 +135,11 @@ impl fmt::Display for TrustError {
                 )
             }
             Self::ZeroSupport { bin } => write!(f, "{bin} calibration bin has zero support"),
+            Self::ForbiddenSource(source) => write!(
+                f,
+                "calibration source {source:?} is not {SYNTHETIC_HOLDOUT_SOURCE:?}; public or \
+                 recorded games may not fit Phase A trust (fail closed)"
+            ),
         }
     }
 }
@@ -97,7 +165,19 @@ impl PhaseACalibration {
             satisfaction: None,
             ptrm: None,
             uncalibrated: true,
+            source: None,
+            revision: None,
+            population_fingerprint: None,
+            population: None,
+            checkpoint_sha256: None,
+            fit: None,
         }
+    }
+
+    /// Serialize a record for the on-disk artifact.
+    pub fn to_json(&self) -> Result<String, TrustError> {
+        serde_json::to_string_pretty(self)
+            .map_err(|error| TrustError::InvalidJson(error.to_string()))
     }
 
     /// Parse and validate a calibration record.
@@ -108,7 +188,12 @@ impl PhaseACalibration {
         Ok(record)
     }
 
-    fn validate(&self) -> Result<(), TrustError> {
+    pub fn validate(&self) -> Result<(), TrustError> {
+        if let Some(source) = &self.source {
+            if source.trim().to_ascii_lowercase() != SYNTHETIC_HOLDOUT_SOURCE {
+                return Err(TrustError::ForbiddenSource(source.clone()));
+            }
+        }
         if !(self.tau_unknown.is_finite() && self.tau_unknown > 0.0 && self.tau_unknown < 1.0) {
             return Err(TrustError::InvalidTauUnknown(self.tau_unknown));
         }
@@ -241,7 +326,57 @@ mod tests {
             satisfaction: bin(0.1, 1_000),
             ptrm: bin(0.05, 1_000),
             uncalibrated: false,
+            ..PhaseACalibration::fail_closed()
         }
+    }
+
+    #[test]
+    fn artifact_round_trips_with_provenance_and_rejects_public_sources() {
+        let mut record = calibrated();
+        record.source = Some(SYNTHETIC_HOLDOUT_SOURCE.into());
+        record.revision = Some("deadbeef".into());
+        record.population_fingerprint = Some("sha256:00".into());
+        record.population = Some("v5_holdout_gates/unseen_seed_7x7".into());
+        record.checkpoint_sha256 = Some("ab".into());
+        record.fit = Some(PhaseACalibrationFit {
+            rows: 512,
+            goal_labeled_rows: 300,
+            q_auroc: Some(0.7),
+            exact_rate: Some(0.4),
+            tau_unknown_raw_p95: Some(2.0),
+            score_error_quantile: 0.98,
+            bound_method: "clopper_pearson_upper".into(),
+            unfitted: vec!["ptrm: not implemented".into()],
+        });
+        let json = record.to_json().unwrap();
+        let parsed = PhaseACalibration::from_json(&json).unwrap();
+        assert_eq!(parsed, record);
+        assert!(json.contains("\"source\": \"synthetic_holdout\""));
+
+        for source in [
+            "public_games",
+            "recorded games 2026-09",
+            "arc3_live recordings",
+            "PUBLIC",
+        ] {
+            let mut public = record.clone();
+            public.source = Some(source.into());
+            let json = public.to_json().unwrap();
+            assert!(
+                matches!(
+                    PhaseACalibration::from_json(&json),
+                    Err(TrustError::ForbiddenSource(_))
+                ),
+                "{source} must be rejected"
+            );
+        }
+        // Legacy records without a source still parse; a fail-closed record
+        // round-trips without emitting provenance keys.
+        let legacy = calibrated().to_json().unwrap();
+        assert!(!legacy.contains("source"));
+        assert!(PhaseACalibration::from_json(&legacy).is_ok());
+        let closed = PhaseACalibration::fail_closed().to_json().unwrap();
+        assert!(PhaseACalibration::from_json(&closed).unwrap().uncalibrated);
     }
 
     #[test]

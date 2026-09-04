@@ -95,8 +95,11 @@ triple drawn from the same `(seed, meta_episode_id)` episode, strictly
 earlier in chronological order than the row, under the same D4/colour
 augmentation as the row. Context may cross level boundaries within the
 episode. The live policy fills the context with the most recent factual
-transitions of the current level from Factual Memory (across levels when
-the carry arm is on).
+transitions from Factual Memory under `--context-scope {level,game}`
+(default `game`, so the live window crosses level boundaries exactly as the
+training rows' windows do; `level` restricts it to the current level). The
+scope is a Channel A knob, independent of `--adapt` / `--adapt-carry`; a
+game boundary always empties Factual Memory (§6.3).
 
 1.6 **Available actions.** Rows record an 8-bit `available_actions` mask
 (RESET, ACTION1..7). The Rust generator emits all-available; ARCEngine shards
@@ -218,9 +221,11 @@ calibration until a v6 checkpoint exists.
 ## 6. Test-time adaptation contract (`src/p2/adaptation.rs`)
 
 6.1 **Channel A is always on** for v6 policies: the live driver keeps the
-last `CONTEXT_WINDOW_MAX` factual transitions of the current level (carry
-arm: of the current game) and passes them as context to every model call,
-including Phase A screening and verification.
+last `CONTEXT_WINDOW_MAX` factual transitions of the `--context-scope`
+(§1.5; default the current game, `level` the current level) and passes them
+as context to every model call, including Phase A screening and
+verification. The scope is recorded per decision (`context_scope`) next to
+`context_len`.
 
 6.2 **Channel B (`--adapt`)** runs after every observed factual transition
 once the current level has >= 8 transitions:
@@ -231,7 +236,8 @@ once the current level has >= 8 transitions:
 - batch `min(32, buffer)` drawn by reservoir sampling from the level-tagged
   factual buffer (the buffer persists across levels; fast weights reset to
   theta_0 at every level boundary in the default arm; the preregistered
-  `carry` arm keeps them);
+  `carry` arm keeps them; each stored row's own context follows
+  `--context-scope`, not the arm);
 - loss = the ADR 0003 exact-decoder next-frame loss on factual rows with
   the row's own context, plus L2-SP `1e-3 * ||theta - theta_0||^2` on the
   fast subset;
@@ -240,11 +246,18 @@ once the current level has >= 8 transitions:
 - collapse guard: an update whose grad-norm exceeds 3x the running mean
   is skipped (SAR precursor);
 - goal/terminal/reliability readouts consumed by Phase A trust and by the
-  greedy scorer are computed from the prior weights (theta_0): the fast subset
-  is swapped back to theta_0 for those readouts (implementation in progress,
-  2026-09-04; until it lands, frozen heads read latents produced by adapted
-  dynamics, which is NOT the same guarantee); Phase A calibration is unchanged
-  and must be fitted from synthetic held-out data only;
+  greedy scorer are computed from the prior weights (theta_0) end to end: the
+  adapter exposes `with_prior_weights` (a shared `PriorWeights` handle with
+  theta_0 cached on device), and the policies swap the fast subset back to
+  theta_0 bitwise for a second encode + forward whose q, reliability, no-op
+  and per-goal event heads are the only ones read; Phase A chains these
+  readouts on a theta_0 latent (`PhaseALatent::prior`) so horizon-2
+  verification never reads adapted dynamics either. The adapted weights are
+  restored after every readout (also on error) and serve only the decoded
+  next frame, the predicted effect and the search. An un-drifted model skips
+  the swap. Phase A calibration is unchanged by adaptation and must be fitted
+  from synthetic held-out data only (`p2-eval --emit-phase-a-calibration`,
+  `source: synthetic_holdout`; any other declared source fails closed at load);
 - every update, skip and revert is recorded in `ActionDecision` telemetry.
 
 6.3 Adapted weights are discarded at the end of a game. Nothing here
@@ -296,9 +309,27 @@ each merge. Deviations from the text above, recorded so nobody rediscovers them:
   eval helpers (`semantic_eval` censuses, shuffled-control outcome compare) keep 63-row
   semantics because no model config is in scope there.
 - §6 Channel A and Channel B keep separate `FactualBuffer`s (Arc-shared frames). The context
-  batch is rebuilt per physical chunk at inference (no per-decision summary cache yet). Goal
-  and terminal heads are frozen under adaptation, but they read latents produced by the
-  adapted dynamics; only heads and calibration are guaranteed pristine.
+  batch is rebuilt per physical chunk at inference (no per-decision summary cache yet).
+  Until 2026-09-04 the frozen goal/terminal heads read latents produced by the adapted
+  dynamics (only heads and calibration were pristine); `feat/v6-context-scope` closed this:
+  under `--adapt` every trust/score readout runs a second encode + forward with the fast
+  subset swapped to theta_0 (`PriorWeights::with_prior_weights`, bitwise, restored
+  afterwards), at roughly 2x the per-decision forward cost once the weights have drifted.
+- §1.5/§6.1 the live window scope is `--context-scope {level,game}` (default `game`, the
+  training distribution), a Channel A knob decoupled from `--adapt-carry`, which now only
+  selects the fast-weight reset arm; the scope is recorded per decision (`context_scope`).
+  The E3 falsifier keeps its preregistered coupling (reset arm = level-scoped row contexts,
+  carry arm = game-scoped) and does not expose the knob.
+- ADR 0004 A3 calibration: `p2-eval --emit-phase-a-calibration <path>` fits the record from
+  the synthetic `v5_holdout_gates/unseen_seed_7x7` population only (raw q/reliability/event
+  readouts vs exact composed-transition correctness and the rows' own goal labels), with
+  95% Clopper-Pearson upper endpoints and honest support per bin, `q_direction` from the
+  q-vs-exact AUROC, `tau_unknown` the 95th percentile of the observed channel's surprise
+  (clamped into the record's `(0, 1)` domain; the raw quantile is kept under `fit`), and
+  `score_error_bound` the `1 - epsilon` quantile of the satisfaction score error. Not
+  fitted: `ptrm` (no gate consumes it) and the exhausted channel (the generator masks its
+  label). The artifact carries `source: synthetic_holdout`, the emitter revision, the
+  population fingerprint and the checkpoint hash; loaders reject any other declared source.
 - §5.3 ran on the 2026-08-27 foundation-v2 checkpoint (the s8 model was unreachable):
   residual AUROC 0.905 vs reliability 0.634; the preregistered switch rule was narrowly missed
   on the reliability side (see `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`).

@@ -24,11 +24,14 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use clap::ValueEnum;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -84,20 +87,48 @@ pub enum ContextScope {
     Game,
 }
 
+/// Live `--context-scope` (Channel A, §1.5/§6.1): the scope every decision's
+/// window and every stored row context are drawn from. Independent of the
+/// Channel B arm (`--adapt-carry` only decides whether fast weights reset at a
+/// level boundary). The default is `game` because the training rows' windows
+/// (Learning Histories, §1.5) cross level boundaries within an episode; a
+/// level-scoped live window would be a distribution the model never saw at
+/// exactly the moment it needs the rule evidence most (the first decisions of
+/// a new level). Game boundaries always clear Factual Memory (§6.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextScopeKind {
+    /// Only the current level's factual transitions.
+    Level,
+    /// Every factual transition of the current game (training distribution).
+    #[default]
+    Game,
+}
+
+impl ContextScopeKind {
+    /// The concrete scope for a decision or row at `level_index`.
+    pub fn resolve(self, level_index: u16) -> ContextScope {
+        match self {
+            Self::Level => ContextScope::Level(level_index),
+            Self::Game => ContextScope::Game,
+        }
+    }
+}
+
 /// Channel A source: supplies the last `<= CONTEXT_WINDOW_MAX` factual
-/// transitions of the current level (carry arm: game) for every model call.
+/// transitions of the configured [`ContextScopeKind`] for every model call.
 pub trait ContextProvider {
     fn context_window(&self) -> Vec<ContextTransition>;
 }
 
 /// Level-tagged, append-only store of factual transitions for one game.
-/// Its arm decides the scope of every stored per-row context: the row's own
-/// level (`Reset`, default) or the whole game (`Carry`).
+/// Its [`ContextScopeKind`] decides the scope of every stored per-row context
+/// and of every decision window: the row's own level or the whole game.
 #[derive(Debug, Default)]
 pub struct FactualBuffer {
     entries: Vec<FactualTransition>,
     seen: HashSet<(u16, u64, String)>,
-    mode: AdaptationMode,
+    scope: ContextScopeKind,
 }
 
 fn raw_observation_identity(frame: &ArcFrame) -> u64 {
@@ -116,19 +147,21 @@ fn action_key(action: &ArcAction) -> String {
 }
 
 impl FactualBuffer {
-    pub fn new(mode: AdaptationMode) -> Self {
+    pub fn new(scope: ContextScopeKind) -> Self {
         Self {
-            mode,
+            scope,
             ..Self::default()
         }
     }
 
-    /// Context scope of the arm for a decision or row at `level_index`.
+    /// The configured `--context-scope`.
+    pub fn scope(&self) -> ContextScopeKind {
+        self.scope
+    }
+
+    /// Context scope for a decision or row at `level_index`.
     pub fn scope_for(&self, level_index: u16) -> ContextScope {
-        match self.mode {
-            AdaptationMode::Reset => ContextScope::Level(level_index),
-            AdaptationMode::Carry => ContextScope::Game,
-        }
+        self.scope.resolve(level_index)
     }
 
     /// Append a confirmed transition. Returns `false` (and stores nothing) when
@@ -243,9 +276,9 @@ pub struct LiveContext {
 }
 
 impl LiveContext {
-    pub fn new(enabled: bool, mode: AdaptationMode) -> Self {
+    pub fn new(enabled: bool, scope: ContextScopeKind) -> Self {
         Self {
-            buffer: FactualBuffer::new(mode),
+            buffer: FactualBuffer::new(scope),
             enabled,
         }
     }
@@ -256,6 +289,11 @@ impl LiveContext {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// The configured `--context-scope` (reported even when the window is off).
+    pub fn scope(&self) -> ContextScopeKind {
+        self.buffer.scope()
     }
 
     /// New game: Factual Memory starts empty (§6.3).
@@ -279,8 +317,8 @@ impl LiveContext {
     }
 
     /// The window for a decision taken at `level_index`: the most recent
-    /// `<= CONTEXT_WINDOW_MAX` factual transitions of the arm's scope, all
-    /// observed strictly before this decision.
+    /// `<= CONTEXT_WINDOW_MAX` factual transitions of the configured scope,
+    /// all observed strictly before this decision.
     pub fn window(&self, level_index: u16) -> Vec<ContextTransition> {
         if !self.enabled {
             return Vec::new();
@@ -338,11 +376,93 @@ struct FastVar {
     best: Tensor,
 }
 
+/// Shared handle to theta_0 of the fast subset (§6.2 prior-weight readouts).
+///
+/// Goal/terminal/reliability readouts consumed by Phase A trust and by the
+/// greedy scorer must come from the prior weights, not from latents produced
+/// by adapted dynamics. [`PriorWeights::with_prior_weights`] swaps the fast
+/// subset to theta_0 (bitwise) for the duration of one readout call and
+/// restores the adapted values afterwards, also on error. The handle is
+/// `Clone` (Arc-shared with the adapter): the `Var`s share storage with the
+/// model, theta_0 is cached on device at construction, and the adapter flags
+/// drift after any optimizer step so an un-drifted model skips the swap.
+#[derive(Clone)]
+pub struct PriorWeights {
+    inner: Arc<PriorWeightsInner>,
+}
+
+struct PriorWeightsInner {
+    /// `(name, live Var shared with the model, theta_0 on device)`.
+    fast: Vec<(String, Var, Tensor)>,
+    /// Set after any optimizer step; cleared by `reset_to_prior`.
+    drifted: AtomicBool,
+}
+
+impl PriorWeights {
+    fn new(fast: &[FastVar]) -> Self {
+        Self {
+            inner: Arc::new(PriorWeightsInner {
+                fast: fast
+                    .iter()
+                    .map(|entry| (entry.name.clone(), entry.var.clone(), entry.theta0.clone()))
+                    .collect(),
+                drifted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn set_drifted(&self, drifted: bool) {
+        self.inner.drifted.store(drifted, Ordering::Release);
+    }
+
+    /// `true` while no optimizer step has moved the fast subset since the
+    /// last reset, i.e. the live weights are theta_0 and no swap is needed.
+    pub fn is_at_prior(&self) -> bool {
+        !self.inner.drifted.load(Ordering::Acquire)
+    }
+
+    pub fn fast_weight_names(&self) -> Vec<&str> {
+        self.inner
+            .fast
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect()
+    }
+
+    /// Run `f` with the fast subset set to theta_0 bitwise, then restore the
+    /// adapted values (whether or not `f` failed). A model that has not
+    /// drifted runs `f` directly.
+    pub fn with_prior_weights<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.is_at_prior() {
+            return f();
+        }
+        let mut saved = Vec::with_capacity(self.inner.fast.len());
+        for (_, var, theta0) in &self.inner.fast {
+            saved.push(snapshot(var)?);
+            var.set(theta0)?;
+        }
+        let result = f();
+        let mut restore_error = None;
+        for ((_, var, _), adapted) in self.inner.fast.iter().zip(&saved) {
+            if let Err(err) = var.set(adapted) {
+                restore_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = restore_error {
+            return Err(anyhow::anyhow!(
+                "restoring adapted fast weights after a prior-weight readout failed: {err}"
+            ));
+        }
+        result
+    }
+}
+
 /// Channel B: gradient adaptation of the Fast Weights on factual transitions.
 pub struct FastWeightAdapter<'a> {
     model: &'a WorldModel,
     device: &'a Device,
     fast: Vec<FastVar>,
+    prior: PriorWeights,
     optimizer: AdamW,
     buffer: FactualBuffer,
     mode: AdaptationMode,
@@ -384,12 +504,15 @@ fn new_optimizer(fast: &[FastVar]) -> Result<AdamW> {
 
 impl<'a> FastWeightAdapter<'a> {
     /// Snapshot theta_0 of the fast subset from `varmap` (the VarMap `model`
-    /// was built from) and build the fast-only AdamW.
+    /// was built from) and build the fast-only AdamW. `scope` is the
+    /// `--context-scope` every stored row's own context is drawn from (§6.2
+    /// "the row's own context"); `mode` only decides the level-boundary reset.
     pub fn new(
         model: &'a WorldModel,
         varmap: &VarMap,
         device: &'a Device,
         mode: AdaptationMode,
+        scope: ContextScopeKind,
     ) -> Result<Self> {
         ensure!(
             model.config().world_core_v4,
@@ -414,12 +537,14 @@ impl<'a> FastWeightAdapter<'a> {
             "no fast-weight parameters found in VarMap"
         );
         let optimizer = new_optimizer(&fast)?;
+        let prior = PriorWeights::new(&fast);
         Ok(Self {
             model,
             device,
             fast,
+            prior,
             optimizer,
-            buffer: FactualBuffer::new(mode),
+            buffer: FactualBuffer::new(scope),
             mode,
             level: 0,
             steps_this_level: 0,
@@ -443,6 +568,18 @@ impl<'a> FastWeightAdapter<'a> {
 
     pub fn fast_weight_names(&self) -> Vec<&str> {
         self.fast.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    /// Shared theta_0 handle for the policies' prior-weight readouts (§6.2).
+    pub fn prior_weights(&self) -> PriorWeights {
+        self.prior.clone()
+    }
+
+    /// Run `f(model)` with the fast subset at theta_0 bitwise; the adapted
+    /// values are restored afterwards. See [`PriorWeights::with_prior_weights`].
+    pub fn with_prior_weights<T>(&self, f: impl FnOnce(&WorldModel) -> Result<T>) -> Result<T> {
+        let model = self.model;
+        self.prior.with_prior_weights(|| f(model))
     }
 
     /// Falsifier knob for the L2-SP ablation arm; production keeps the default.
@@ -511,6 +648,7 @@ impl<'a> FastWeightAdapter<'a> {
             entry.best = entry.theta0.clone();
         }
         self.optimizer = new_optimizer(&self.fast)?;
+        self.prior.set_drifted(false);
         self.steps_this_level = 0;
         self.consecutive_worsenings = 0;
         self.grad_norm_sum = 0.0;
@@ -603,6 +741,7 @@ impl<'a> FastWeightAdapter<'a> {
                 self.scale_fast_grads(&mut grads, ADAPT_GRAD_CLIP / norm)?;
             }
             self.optimizer.step(&grads)?;
+            self.prior.set_drifted(true);
             self.grad_norm_sum += norm;
             self.grad_norm_count += 1;
             self.steps_this_level += 1;
@@ -928,8 +1067,8 @@ mod tests {
 
     #[test]
     fn buffer_entries_carry_their_preceding_window() {
-        // Default arm: each row's context is the earlier rows of its own level.
-        let mut buffer = FactualBuffer::default();
+        // Level scope: each row's context is the earlier rows of its own level.
+        let mut buffer = FactualBuffer::new(ContextScopeKind::Level);
         for i in 0..20u8 {
             assert!(buffer.push(frame(i), action(1), frame(i + 1), i as u16 / 10));
         }
@@ -953,8 +1092,9 @@ mod tests {
                 "a row never carries itself"
             );
         }
-        // Carry arm: game scope, bounded by CONTEXT_WINDOW_MAX.
-        let mut carry = FactualBuffer::new(AdaptationMode::Carry);
+        // Game scope (the default): bounded by CONTEXT_WINDOW_MAX.
+        let mut carry = FactualBuffer::new(ContextScopeKind::Game);
+        assert_eq!(FactualBuffer::default().scope(), ContextScopeKind::Game);
         for i in 0..20u8 {
             assert!(carry.push(frame(i), action(1), frame(i + 1), i as u16 / 10));
         }
@@ -971,7 +1111,7 @@ mod tests {
         assert!(!off.enabled());
         assert!(off.window(0).is_empty());
 
-        let mut live = LiveContext::new(true, AdaptationMode::Reset);
+        let mut live = LiveContext::new(true, ContextScopeKind::Level);
         assert!(live.enabled());
         for i in 0..20u8 {
             // The window handed to decision `i` never contains transition `i`.
@@ -985,12 +1125,57 @@ mod tests {
         live.begin_game();
         assert!(live.window(1).is_empty());
 
-        let mut carry = LiveContext::new(true, AdaptationMode::Carry);
+        let mut carry = LiveContext::new(true, ContextScopeKind::Game);
         for i in 0..20u8 {
             carry.observe(&frame(i), &action(1), &frame(i + 1), i as u16 / 10);
         }
         assert_eq!(carry.window(2).len(), CONTEXT_WINDOW_MAX);
         assert_eq!(carry.window(2)[15].current, frame(19));
+        // Game boundary invariant: Factual Memory is emptied whatever the scope.
+        carry.begin_game();
+        assert!(carry.window(2).is_empty());
+        assert!(carry.window(0).is_empty());
+        assert_eq!(carry.scope(), ContextScopeKind::Game);
+    }
+
+    #[test]
+    fn context_scope_kind_is_independent_of_the_adaptation_arm() -> Result<()> {
+        // Channel A scope is a first-class knob: a reset-arm adapter may draw
+        // game-scoped row contexts and a carry-arm adapter level-scoped ones.
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_model(&device)?;
+        let mut reset_game = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Game,
+        )?;
+        observe_distinct(&mut reset_game, 5, 0);
+        reset_game.on_level_transition(1)?;
+        assert_eq!(reset_game.mode(), AdaptationMode::Reset);
+        assert_eq!(reset_game.buffer().scope(), ContextScopeKind::Game);
+        assert_eq!(reset_game.context_window().len(), 5);
+        assert_eq!(reset_game.buffer().scope_for(1), ContextScope::Game);
+
+        let mut carry_level = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Carry,
+            ContextScopeKind::Level,
+        )?;
+        observe_distinct(&mut carry_level, 5, 0);
+        carry_level.on_level_transition(1)?;
+        assert_eq!(carry_level.mode(), AdaptationMode::Carry);
+        assert!(carry_level.context_window().is_empty());
+        assert_eq!(carry_level.buffer().scope_for(1), ContextScope::Level(1));
+        assert_eq!(ContextScopeKind::default(), ContextScopeKind::Game);
+        assert_eq!(
+            serde_json::to_value(ContextScopeKind::Level)?,
+            serde_json::Value::String("level".into())
+        );
+        Ok(())
     }
 
     #[test]
@@ -998,7 +1183,13 @@ mod tests {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model_with(&device, true)?;
         perturb_context_film(&varmap)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         assert!(adapter
             .fast_weight_names()
             .contains(&"context_film_gamma.weight"));
@@ -1027,7 +1218,13 @@ mod tests {
         // Legacy (v5) checkpoints: rows still carry a window, none is passed.
         let (v5, v5_map) = tiny_model(&device)?;
         assert!(!v5.config().world_core_v6);
-        let mut legacy = FastWeightAdapter::new(&v5, &v5_map, &device, AdaptationMode::Reset)?;
+        let mut legacy = FastWeightAdapter::new(
+            &v5,
+            &v5_map,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         observe_distinct(&mut legacy, 4, 0);
         let rows = legacy.buffer.newest(4);
         assert_eq!(rows[3].context.len(), 3);
@@ -1042,7 +1239,13 @@ mod tests {
     fn fast_subset_matches_real_parameter_names_and_excludes_goal_heads() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
-        let adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         let names = adapter.fast_weight_names();
         assert!(names.contains(&"pixel_emb.weight"), "{names:?}");
         assert!(names.contains(&"encoder.patch.weight"), "{names:?}");
@@ -1071,7 +1274,13 @@ mod tests {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
         let before = all_var_snapshots(&varmap)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         observe_distinct(&mut adapter, 7, 0);
         let trace = adapter.maybe_update()?.expect("pending");
         assert_eq!(trace.updates, 0);
@@ -1117,11 +1326,84 @@ mod tests {
         Ok(())
     }
 
+    /// §6.2 prior-weight readouts: inside `with_prior_weights` every fast
+    /// parameter is theta_0 bitwise, the adapted values come back afterwards
+    /// (also when the closure fails), and an un-drifted adapter skips the swap.
+    #[test]
+    fn prior_weight_swap_is_bitwise_and_restores_the_adapted_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_model(&device)?;
+        let theta0 = all_var_snapshots(&varmap)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Game,
+        )?;
+        let prior = adapter.prior_weights();
+        assert!(prior.is_at_prior());
+        assert_eq!(prior.fast_weight_names(), adapter.fast_weight_names());
+        adapter.set_min_level_transitions(1);
+        let mut updates = 0;
+        let mut round = 0u8;
+        while updates == 0 {
+            adapter.observe(&frame(round), &action(1), &frame(round + 1), 0);
+            round += 1;
+            updates += adapter.maybe_update()?.expect("pending").updates;
+        }
+        assert!(!prior.is_at_prior());
+        assert!(!adapter.fast_weights_equal_prior()?);
+        let adapted = all_var_snapshots(&varmap)?;
+
+        adapter.with_prior_weights(|_| {
+            let inside = all_var_snapshots(&varmap)?;
+            for ((name, was), (_, now)) in theta0.iter().zip(&inside) {
+                assert!(
+                    bitwise_equal(was, now)?,
+                    "{name} is not theta_0 inside the swap"
+                );
+            }
+            Ok(())
+        })?;
+        let after = all_var_snapshots(&varmap)?;
+        for ((name, was), (_, now)) in adapted.iter().zip(&after) {
+            assert!(
+                bitwise_equal(was, now)?,
+                "{name} not restored after the swap"
+            );
+        }
+        assert!(!prior.is_at_prior(), "the swap does not clear drift");
+
+        // A failing readout still restores the adapted weights.
+        let failed: Result<()> = prior.with_prior_weights(|| anyhow::bail!("readout failed"));
+        assert!(failed.is_err());
+        let after_error = all_var_snapshots(&varmap)?;
+        for ((name, was), (_, now)) in adapted.iter().zip(&after_error) {
+            assert!(
+                bitwise_equal(was, now)?,
+                "{name} not restored after an error"
+            );
+        }
+
+        // Reset clears drift; the handle then runs closures without swapping.
+        adapter.reset_to_prior()?;
+        assert!(prior.is_at_prior());
+        assert!(adapter.fast_weights_equal_prior()?);
+        Ok(())
+    }
+
     #[test]
     fn prequential_guard_reverts_to_best_after_two_worsenings() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         let mut trace = AdaptationTrace::default();
         // Improvement promotes the current weights to theta_best.
         adapter.prequential_guard(1.0, 0.5, &mut trace)?;
@@ -1148,7 +1430,13 @@ mod tests {
     fn step_caps_are_enforced_per_level() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         observe_distinct(&mut adapter, ADAPT_MIN_LEVEL_TRANSITIONS as u8, 0);
         let trace = adapter.maybe_update()?.expect("pending");
         // Eight pending transitions arm at most 4 * 8 = 32 attempted steps.
@@ -1188,7 +1476,13 @@ mod tests {
     fn carry_arm_keeps_weights_across_levels() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Carry)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Carry,
+            ContextScopeKind::Game,
+        )?;
         observe_distinct(&mut adapter, ADAPT_MIN_LEVEL_TRANSITIONS as u8, 0);
         let trace = adapter.maybe_update()?.expect("pending");
         assert!(trace.updates > 0);
@@ -1205,7 +1499,13 @@ mod tests {
     fn l2sp_reduces_drift_versus_no_penalty_arm() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = tiny_model(&device)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         let run = |adapter: &mut FastWeightAdapter<'_>, weight: f64| -> Result<f64> {
             adapter.restore_prior()?;
             adapter.rng = StdRng::seed_from_u64(RESERVOIR_SEED);
@@ -1236,7 +1536,13 @@ mod tests {
         };
         let (model, varmap) = tiny_model(&device)?;
         let before = all_var_snapshots(&varmap)?;
-        let mut adapter = FastWeightAdapter::new(&model, &varmap, &device, AdaptationMode::Reset)?;
+        let mut adapter = FastWeightAdapter::new(
+            &model,
+            &varmap,
+            &device,
+            AdaptationMode::Reset,
+            ContextScopeKind::Level,
+        )?;
         observe_distinct(&mut adapter, ADAPT_MIN_LEVEL_TRANSITIONS as u8, 0);
         let trace = adapter.maybe_update()?.expect("pending");
         assert!(trace.updates > 0, "{trace:?}");
