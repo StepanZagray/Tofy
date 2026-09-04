@@ -982,6 +982,12 @@ pub struct FactualBranchMetrics {
 /// synthetic transition population.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardProbeEvaluation {
+    /// Versioned, domain-separated SHA-256 over the exact ordered full-row
+    /// population the probe consumed (see [`BOARD_PROBE_POPULATION_DOMAIN`]).
+    /// Reports written before Wave 22 carried a `fnv1a64:` projection over
+    /// `(seed, episode_id, transition_index, family, action)` only, which
+    /// could not distinguish populations that differed in frames, operator
+    /// conditioning, content origin, or labels.
     pub population_fingerprint: String,
     pub fit_frames: usize,
     pub held_out_frames: usize,
@@ -1410,28 +1416,129 @@ fn semantic_population_fingerprint(samples: &[TransitionSample]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn sample_population_fingerprint(samples: &[TransitionSample]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for sample in samples {
-        for byte in sample
-            .seed
-            .to_le_bytes()
-            .into_iter()
-            .chain(sample.episode_id.to_le_bytes())
-            .chain(sample.transition_index.to_le_bytes())
-            .chain(sample.family.bytes())
-            .chain([
-                0xff,
-                sample.action.id,
-                sample.action.x.unwrap_or(u8::MAX),
-                sample.action.y.unwrap_or(u8::MAX),
-            ])
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Domain tag for the board-probe population identity. Bump the version
+/// whenever [`update_canonical_transition_row`] changes.
+pub(crate) const BOARD_PROBE_POPULATION_DOMAIN: &str = "tofy.p2.board_probe_population.v2";
+
+fn digest_framed_bytes(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+fn digest_option_bool(digest: &mut Sha256, value: Option<bool>) {
+    digest.update([match value {
+        None => 0u8,
+        Some(false) => 1,
+        Some(true) => 2,
+    }]);
+}
+
+fn digest_frame(digest: &mut Sha256, frame: &crate::p2::data::ArcFrame) {
+    digest.update(frame.width.to_le_bytes());
+    digest.update(frame.height.to_le_bytes());
+    digest_framed_bytes(digest, &frame.pixels);
+}
+
+fn digest_action(digest: &mut Sha256, action: &ArcAction) {
+    digest.update([action.id]);
+    for coordinate in [action.x, action.y] {
+        match coordinate {
+            None => digest.update([0u8, 0]),
+            Some(value) => digest.update([1u8, value]),
         }
     }
-    format!("fnv1a64:{hash:016x}")
+}
+
+/// Canonical full-row codec for one [`TransitionSample`]: fixed field order,
+/// little-endian fixed-width scalars, length-prefixed variable fields, and
+/// explicit option/enum tags. Every field of the row is folded, including the
+/// ones a given consumer does not read, so two populations that differ in any
+/// serialized field get different identities.
+pub(crate) fn update_canonical_transition_row(digest: &mut Sha256, sample: &TransitionSample) {
+    digest.update(sample.seed.to_le_bytes());
+    digest.update(sample.episode_id.to_le_bytes());
+    digest.update(sample.transition_index.to_le_bytes());
+    digest_framed_bytes(digest, sample.family.as_bytes());
+    digest.update([match sample.split {
+        Split::Train => 0u8,
+        Split::HeldOutComposition => 1,
+    }]);
+    digest_frame(digest, &sample.current);
+    digest_frame(digest, &sample.next);
+    digest_action(digest, &sample.action);
+    digest.update((sample.goal_features.values.len() as u64).to_le_bytes());
+    for goal in sample.goal_features.values {
+        digest.update(goal.to_bits().to_le_bytes());
+    }
+    digest_option_bool(digest, sample.noop);
+    digest_option_bool(digest, sample.goal_satisfied);
+    digest_option_bool(digest, sample.goal_failed);
+    digest_option_bool(digest, sample.exhausted);
+
+    let provenance = &sample.provenance;
+    digest.update(provenance.content_width.to_le_bytes());
+    digest.update(provenance.content_height.to_le_bytes());
+    digest.update(provenance.content_x.to_le_bytes());
+    digest.update(provenance.content_y.to_le_bytes());
+    digest_framed_bytes(digest, provenance.source_kind.as_bytes());
+    digest_framed_bytes(digest, provenance.trajectory_id.as_bytes());
+    match provenance.operator {
+        None => digest.update([0u8; 6]),
+        Some(operator) => digest.update([
+            1u8,
+            operator.family.conditioning_token() as u8,
+            operator.agent_color,
+            operator.primary_color,
+            operator.secondary_color,
+            operator.empty_color,
+        ]),
+    }
+    digest.update(provenance.rule_id.to_le_bytes());
+    digest.update(provenance.level_index.to_le_bytes());
+    digest.update([
+        provenance.available_actions,
+        provenance.context_len,
+        provenance.background_color,
+    ]);
+
+    match &sample.oracle_latent {
+        None => digest.update([0u8]),
+        Some(latent) => {
+            digest.update([1u8]);
+            digest.update((latent.len() as u64).to_le_bytes());
+            for value in latent {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    digest.update((sample.context.len() as u64).to_le_bytes());
+    for context in &sample.context {
+        digest_frame(digest, &context.current);
+        digest_action(digest, &context.action);
+        digest_frame(digest, &context.next);
+    }
+}
+
+/// Versioned, domain-separated SHA-256 identity of an ordered transition
+/// population: `domain || row_count || (ordinal || canonical_row)*`.
+pub(crate) fn canonical_transition_population_sha256(
+    domain: &str,
+    samples: &[TransitionSample],
+) -> String {
+    let mut digest = Sha256::new();
+    digest_framed_bytes(&mut digest, domain.as_bytes());
+    digest.update((samples.len() as u64).to_le_bytes());
+    for (ordinal, sample) in samples.iter().enumerate() {
+        digest.update((ordinal as u64).to_le_bytes());
+        update_canonical_transition_row(&mut digest, sample);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+/// Board-probe population identity over the full ordered population handed to
+/// [`evaluate_board_probe`] (fit and held-out partitions included).
+fn sample_population_fingerprint(samples: &[TransitionSample]) -> String {
+    canonical_transition_population_sha256(BOARD_PROBE_POPULATION_DOMAIN, samples)
 }
 
 fn board_probe_rows_for_samples(
@@ -9014,6 +9121,325 @@ mod tests {
             oracle_latent: None,
             context: Vec::new(),
         })
+    }
+
+    /// Pre-Wave-22 board-probe projection, kept here only to prove the
+    /// witness: it is blind to every field outside `(seed, episode_id,
+    /// transition_index, family, action)`.
+    fn legacy_board_probe_fnv_projection(samples: &[TransitionSample]) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for sample in samples {
+            for byte in sample
+                .seed
+                .to_le_bytes()
+                .into_iter()
+                .chain(sample.episode_id.to_le_bytes())
+                .chain(sample.transition_index.to_le_bytes())
+                .chain(sample.family.bytes())
+                .chain([
+                    0xff,
+                    sample.action.id,
+                    sample.action.x.unwrap_or(u8::MAX),
+                    sample.action.y.unwrap_or(u8::MAX),
+                ])
+            {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        format!("fnv1a64:{hash:016x}")
+    }
+
+    #[test]
+    fn board_probe_population_identity_binds_every_row_field() -> Result<()> {
+        use crate::p2::data::{ContextTransition, EpisodeOperator, OperatorFamily};
+
+        let base = vec![
+            action_diagnostic_sample(ArcAction::new(5, None, None)?, 0)?,
+            action_diagnostic_sample(ArcAction::new(6, Some(0), Some(0))?, 1)?,
+        ];
+        let baseline = sample_population_fingerprint(&base);
+        assert!(baseline.starts_with("sha256:"), "{baseline}");
+        assert_eq!(sample_population_fingerprint(&base.clone()), baseline);
+        assert_ne!(
+            sample_population_fingerprint(&base),
+            canonical_transition_population_sha256("other.domain", &base),
+            "identity must be domain separated"
+        );
+
+        // Fields the legacy projection ignored but the probe (or the report's
+        // meaning) depends on. Each mutation must change the new identity and
+        // is shown to have left the legacy FNV projection unchanged.
+        type SampleMutation = (
+            &'static str,
+            Box<dyn Fn(&mut TransitionSample) -> Result<()>>,
+        );
+        let omitted_mutations: Vec<SampleMutation> = vec![
+            (
+                "current frame",
+                Box::new(|s| {
+                    s.current = ArcFrame::new(1, 1, vec![9])?;
+                    Ok(())
+                }),
+            ),
+            (
+                "next frame",
+                Box::new(|s| {
+                    s.next = ArcFrame::new(1, 1, vec![9])?;
+                    Ok(())
+                }),
+            ),
+            (
+                "noop",
+                Box::new(|s| {
+                    s.noop = Some(true);
+                    Ok(())
+                }),
+            ),
+            (
+                "noop unknown",
+                Box::new(|s| {
+                    s.noop = None;
+                    Ok(())
+                }),
+            ),
+            (
+                "goal_satisfied",
+                Box::new(|s| {
+                    s.goal_satisfied = Some(true);
+                    Ok(())
+                }),
+            ),
+            (
+                "goal_failed",
+                Box::new(|s| {
+                    s.goal_failed = Some(false);
+                    Ok(())
+                }),
+            ),
+            (
+                "exhausted",
+                Box::new(|s| {
+                    s.exhausted = Some(true);
+                    Ok(())
+                }),
+            ),
+            (
+                "split",
+                Box::new(|s| {
+                    s.split = Split::Train;
+                    Ok(())
+                }),
+            ),
+            (
+                "goal_features",
+                Box::new(|s| {
+                    s.goal_features.values[0] = 1.0;
+                    Ok(())
+                }),
+            ),
+            (
+                "content_width",
+                Box::new(|s| {
+                    s.provenance.content_width = 2;
+                    Ok(())
+                }),
+            ),
+            (
+                "content_height",
+                Box::new(|s| {
+                    s.provenance.content_height = 2;
+                    Ok(())
+                }),
+            ),
+            (
+                "content_x",
+                Box::new(|s| {
+                    s.provenance.content_x = 3;
+                    Ok(())
+                }),
+            ),
+            (
+                "content_y",
+                Box::new(|s| {
+                    s.provenance.content_y = 3;
+                    Ok(())
+                }),
+            ),
+            (
+                "source_kind",
+                Box::new(|s| {
+                    s.provenance.source_kind = "other".into();
+                    Ok(())
+                }),
+            ),
+            (
+                "trajectory_id",
+                Box::new(|s| {
+                    s.provenance.trajectory_id = "other".into();
+                    Ok(())
+                }),
+            ),
+            (
+                "operator",
+                Box::new(|s| {
+                    s.provenance.operator = Some(EpisodeOperator {
+                        family: OperatorFamily::Paint,
+                        agent_color: 1,
+                        primary_color: 2,
+                        secondary_color: 3,
+                        empty_color: 0,
+                    });
+                    Ok(())
+                }),
+            ),
+            (
+                "rule_id",
+                Box::new(|s| {
+                    s.provenance.rule_id = 42;
+                    Ok(())
+                }),
+            ),
+            (
+                "level_index",
+                Box::new(|s| {
+                    s.provenance.level_index = 1;
+                    Ok(())
+                }),
+            ),
+            (
+                "available_actions",
+                Box::new(|s| {
+                    s.provenance.available_actions = 0b1111_1111;
+                    Ok(())
+                }),
+            ),
+            (
+                "context_len",
+                Box::new(|s| {
+                    s.provenance.context_len = 1;
+                    Ok(())
+                }),
+            ),
+            (
+                "background_color",
+                Box::new(|s| {
+                    s.provenance.background_color = 4;
+                    Ok(())
+                }),
+            ),
+            (
+                "oracle_latent",
+                Box::new(|s| {
+                    s.oracle_latent = Some(vec![0.5]);
+                    Ok(())
+                }),
+            ),
+            (
+                "context window",
+                Box::new(|s| {
+                    s.context.push(ContextTransition {
+                        current: ArcFrame::new(1, 1, vec![1])?,
+                        action: ArcAction::new(1, None, None)?,
+                        next: ArcFrame::new(1, 1, vec![2])?,
+                    });
+                    Ok(())
+                }),
+            ),
+        ];
+        let legacy_baseline = legacy_board_probe_fnv_projection(&base);
+        for (name, mutate) in &omitted_mutations {
+            let mut mutated = base.clone();
+            mutate(&mut mutated[1])?;
+            assert_ne!(mutated, base, "{name}: mutation must change the row");
+            assert_eq!(
+                legacy_board_probe_fnv_projection(&mutated),
+                legacy_baseline,
+                "{name}: witness expects the legacy projection to be blind"
+            );
+            assert_ne!(
+                sample_population_fingerprint(&mutated),
+                baseline,
+                "{name}: new identity must distinguish the populations"
+            );
+        }
+
+        // Operator sub-fields must each matter, including `empty_color`.
+        let mut with_operator = base.clone();
+        omitted_mutations[15].1(&mut with_operator[1])?;
+        let operator_baseline = sample_population_fingerprint(&with_operator);
+        let mut empty_color = with_operator.clone();
+        empty_color[1]
+            .provenance
+            .operator
+            .as_mut()
+            .unwrap()
+            .empty_color = 7;
+        assert_ne!(
+            sample_population_fingerprint(&empty_color),
+            operator_baseline
+        );
+        let mut family = with_operator.clone();
+        family[1].provenance.operator.as_mut().unwrap().family = OperatorFamily::Toggle;
+        assert_ne!(sample_population_fingerprint(&family), operator_baseline);
+
+        // Keyed-field controls the legacy projection also caught.
+        let keyed_mutations: Vec<SampleMutation> = vec![
+            (
+                "seed",
+                Box::new(|s| {
+                    s.seed += 1;
+                    Ok(())
+                }),
+            ),
+            (
+                "episode_id",
+                Box::new(|s| {
+                    s.episode_id += 100;
+                    Ok(())
+                }),
+            ),
+            (
+                "transition_index",
+                Box::new(|s| {
+                    s.transition_index += 1;
+                    Ok(())
+                }),
+            ),
+            (
+                "family",
+                Box::new(|s| {
+                    s.family = "other".into();
+                    Ok(())
+                }),
+            ),
+            (
+                "action id",
+                Box::new(|s| {
+                    s.action = ArcAction::new(2, None, None)?;
+                    Ok(())
+                }),
+            ),
+            (
+                "action coords",
+                Box::new(|s| {
+                    s.action = ArcAction::new(6, Some(1), Some(0))?;
+                    Ok(())
+                }),
+            ),
+        ];
+        for (name, mutate) in &keyed_mutations {
+            let mut mutated = base.clone();
+            mutate(&mut mutated[1])?;
+            assert_ne!(sample_population_fingerprint(&mutated), baseline, "{name}");
+        }
+
+        // Row order and row count are part of the identity.
+        let reversed = vec![base[1].clone(), base[0].clone()];
+        assert_ne!(sample_population_fingerprint(&reversed), baseline);
+        assert_ne!(sample_population_fingerprint(&base[..1]), baseline);
+        assert_ne!(sample_population_fingerprint(&[]), baseline);
+        Ok(())
     }
 
     #[test]
