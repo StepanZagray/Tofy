@@ -302,6 +302,15 @@ each merge. Deviations from the text above, recorded so nobody rediscovers them:
 - §5.3 ran on the 2026-08-27 foundation-v2 checkpoint (the s8 model was unreachable):
   residual AUROC 0.905 vs reliability 0.634; the preregistered switch rule was narrowly missed
   on the reliability side (see `docs/research/2026-09-03-v6-local-falsifiers-prereg.md`).
+- 2026-09-04 fixes from code review and the first local v6 run: the in-trainer
+  gate forward is chunked (32 rows; a 512-row v6 forward with context windows
+  exceeds the 8 GB laptop envelope on top of ~5.7 GB of training residue);
+  twins on the singleton held-out split draw the alternative family from all
+  families (the primary keeps the held-out rule); Phase A retrodiction and
+  goal evaluation treat row 63 as board content for v6; the §5.1 threshold is
+  applied to the `5-16` context-length stratum (prereg amendment) because the
+  implemented ablation scores the mixed held-out population, not K=0 vs K=16
+  twin pairs.
 - §2.6 the ARCEngine shard generator exists (`python/tofy_arc3/synth`, 24 tests) and its
   seed-1 census passes the twin and random-play gates; the Rust `SyntheticShards` loader is
   not yet written (stream weight remains 0).
