@@ -118,9 +118,10 @@ seal succeeds.
 
 ## Pod launch requirements (2026-09-03)
 
-- **CUDA 13.0** on the pod image (owner requirement). The local build machine
-  runs CUDA 13.3 / driver 610.57.04 with `cudarc 0.19.8`; a 12.x pod image is
-  not acceptable for this campaign.
+- **CUDA 13.0 or newer** (owner clarification, 2026-09-03): any 13.x toolkit
+  builds Tofy; the constraint is a floor, not an exact version. The local build
+  machine runs CUDA 13.3 / driver 610.57.04 with `cudarc 0.19.8`. A 12.x image
+  is not acceptable for this campaign.
 - Build with `cargo build --release --locked --features cudnn` and record the
   binary SHA-256, the Tofy revision, and the pinned `candle_graph` revision in
   the run root before launching (AGENTS.md launch safety).
