@@ -2769,6 +2769,69 @@ pub fn evaluate_gate_support(
     evaluate_gate_support_with_content_masks(model, samples, None, device)
 }
 
+/// Peak-memory bound for held-out gate forwards (ADR 0005). A v6 row carries
+/// up to `CONTEXT_WINDOW_MAX` context frame pairs, so one 512-row forward runs
+/// the frame encoder over thousands of frames and exceeds the envelope of a
+/// training step. Chunking keeps the gate evaluation inside that envelope;
+/// every op on the path is per-row, so results are unchanged.
+pub const FOUNDATION_V2_GATE_PHYSICAL_BATCH: usize = 128;
+
+#[allow(clippy::too_many_arguments)]
+fn forward_gate_rows_chunked(
+    model: &WorldModel,
+    current: &Tensor,
+    actions: &Tensor,
+    action_coords: &Tensor,
+    goals: &Tensor,
+    operator_conditioning: &Tensor,
+    context: Option<&ContextBatch>,
+    depth: RecursionDepth,
+    chunk: usize,
+) -> Result<Tensor> {
+    let rows = current.dim(0)?;
+    let chunk = chunk.max(1);
+    if rows <= chunk {
+        return Ok(model
+            .forward_from_latent_with_depth_and_operator_conditioning_with_context(
+                current,
+                actions,
+                action_coords,
+                goals,
+                operator_conditioning,
+                context,
+                depth,
+            )?
+            .y);
+    }
+    let mut parts = Vec::with_capacity(rows.div_ceil(chunk));
+    let mut start = 0;
+    while start < rows {
+        let len = chunk.min(rows - start);
+        let indices = (start..start + len)
+            .map(|row| row as u32)
+            .collect::<Vec<_>>();
+        let chunk_context = match context {
+            Some(context) => context.select_rows(&indices)?,
+            None => None,
+        };
+        parts.push(
+            model
+                .forward_from_latent_with_depth_and_operator_conditioning_with_context(
+                    &current.narrow(0, start, len)?.contiguous()?,
+                    &actions.narrow(0, start, len)?.contiguous()?,
+                    &action_coords.narrow(0, start, len)?.contiguous()?,
+                    &goals.narrow(0, start, len)?.contiguous()?,
+                    &operator_conditioning.narrow(0, start, len)?.contiguous()?,
+                    chunk_context.as_ref(),
+                    depth,
+                )?
+                .y,
+        );
+        start += len;
+    }
+    Tensor::cat(&parts, 0).map_err(Into::into)
+}
+
 struct EncodedGateSupportPopulation {
     batch: BatchTensors,
     current: Tensor,
@@ -3157,28 +3220,29 @@ fn evaluate_gate_support_impl(
             // ADR 0005 §6.1: v6 rows are scored with their context window
             // (None for legacy rows, so v5 scoring is unchanged).
             let depth = RecursionDepth::from_config(model.config());
-            let prediction = model
-                .forward_from_latent_with_depth_and_operator_conditioning_with_context(
-                    &encoded.current,
-                    &encoded.batch.actions,
-                    &encoded.batch.action_coords,
-                    &encoded.batch.goals,
-                    &encoded.batch.operator_conditioning,
-                    encoded.context.as_ref(),
-                    depth,
-                )?
-                .y;
-            let shuffled_prediction = model
-                .forward_from_latent_with_depth_and_operator_conditioning_with_context(
-                    &encoded.current,
-                    &encoded.shuffled_actions,
-                    &encoded.shuffled_coords,
-                    &encoded.batch.goals,
-                    &encoded.batch.operator_conditioning,
-                    encoded.context.as_ref(),
-                    depth,
-                )?
-                .y;
+            let chunk = FOUNDATION_V2_GATE_PHYSICAL_BATCH;
+            let prediction = forward_gate_rows_chunked(
+                model,
+                &encoded.current,
+                &encoded.batch.actions,
+                &encoded.batch.action_coords,
+                &encoded.batch.goals,
+                &encoded.batch.operator_conditioning,
+                encoded.context.as_ref(),
+                depth,
+                chunk,
+            )?;
+            let shuffled_prediction = forward_gate_rows_chunked(
+                model,
+                &encoded.current,
+                &encoded.shuffled_actions,
+                &encoded.shuffled_coords,
+                &encoded.batch.goals,
+                &encoded.batch.operator_conditioning,
+                encoded.context.as_ref(),
+                depth,
+                chunk,
+            )?;
             Ok((prediction, shuffled_prediction))
         },
     )?;
@@ -9317,6 +9381,89 @@ mod tests {
         assert_eq!(context_len_stratum(4), "1-4");
         assert_eq!(context_len_stratum(5), "5-16");
         assert_eq!(context_len_stratum(16), "5-16");
+    }
+
+    /// Chunking the held-out gate forward bounds peak memory (a v6 row carries
+    /// up to 16 context frame pairs, so a 512-row forward exceeds a training
+    /// step's envelope). Every op on the path is per-row, so chunking is
+    /// mathematically transparent; it is not bit-identical, because conv
+    /// kernels sum in a different order at a different batch size. The
+    /// observed drift is ~1e-6 on latents of order 1, the same class of
+    /// nondeterminism the repository already tolerates across rayon thread
+    /// counts, and it can in principle flip an exact-decode argmax tie.
+    #[test]
+    fn chunked_gate_forward_matches_the_unchunked_forward() -> Result<()> {
+        let device = Device::Cpu;
+        for v6 in [false, true] {
+            let mut train_cfg = TrainConfig::default();
+            train_cfg.world_core_v6 = v6;
+            train_cfg.apply_foundation_v2_recipe();
+            train_cfg.hidden_dim = 8;
+            train_cfg.action_dim = 4;
+            train_cfg.inner_steps = 1;
+            train_cfg.outer_steps = 1;
+            train_cfg.data_contract_v6 = v6;
+            let varmap = VarMap::new();
+            let model = WorldModel::new(
+                train_cfg.model_config(),
+                VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            )?;
+            let mixed = compose_mixed_stream_batch(
+                &MixedStreamConfig {
+                    batch_size: 32,
+                    seed: 0xC4_0000_5A1E,
+                    schedule: if v6 {
+                        adaptation_v6_stream_schedule
+                    } else {
+                        foundation_v2_stream_schedule
+                    },
+                    data_contract_v6: v6,
+                    ..MixedStreamConfig::default()
+                },
+                1.0,
+                0,
+                V5DataSplit::UnseenSeed7x7,
+            )?;
+            let samples = mixed.transitions().cloned().collect::<Vec<_>>();
+            let provenance = mixed
+                .samples()
+                .iter()
+                .map(|sample| sample.provenance.clone())
+                .collect::<Vec<_>>();
+            let encoded =
+                encode_gate_support_population(&model, &samples, Some(&provenance), &device)?;
+            assert_eq!(encoded.context.is_some(), v6, "v6 rows carry context");
+            let depth = RecursionDepth::from_config(model.config());
+            let forward = |chunk: usize| -> Result<Vec<f32>> {
+                Ok(forward_gate_rows_chunked(
+                    &model,
+                    &encoded.current,
+                    &encoded.batch.actions,
+                    &encoded.batch.action_coords,
+                    &encoded.batch.goals,
+                    &encoded.batch.operator_conditioning,
+                    encoded.context.as_ref(),
+                    depth,
+                    chunk,
+                )?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+            };
+            let whole = forward(samples.len())?;
+            let chunked = forward(5)?;
+            assert_eq!(whole.len(), chunked.len());
+            let worst = whole
+                .iter()
+                .zip(&chunked)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            eprintln!("v6={v6} worst chunk delta {worst:e}");
+            assert!(
+                worst <= 1e-5,
+                "chunked gate forward changed the prediction by {worst:e}"
+            );
+        }
+        Ok(())
     }
 
     /// ADR 0005 §5.1: the ablation scores the same rows twice (full context,
