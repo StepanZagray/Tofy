@@ -2178,19 +2178,87 @@ fn flatten_matrix(matrix: &[Vec<f32>]) -> (Vec<f32>, usize, usize) {
     (flat, rows, cols)
 }
 
-fn mat_transpose_mul(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0f64; cols * cols];
+/// Below this dimension the linear-algebra kernels run sequentially: rayon
+/// dispatch would cost more than the work. Both paths are bit-identical.
+const PARALLEL_LINALG_MIN_DIM: usize = 64;
+/// Output rows per task in the `Aᵀ·A`-style kernels: each input row is
+/// streamed once per block instead of once per output row.
+const GRAM_BLOCK_ROWS: usize = 16;
+/// Columns per deferred-update block in `solve_linear`: one parallel
+/// dispatch (barrier) per block instead of one per column.
+const SOLVE_BLOCK_COLUMNS: usize = 32;
+
+/// Upper-triangle rows `c0..c1` of `Aᵀ·A` for a row-major `rows × cols`
+/// matrix: entry `(c, d)` for `d >= c` accumulates `a[i][c]·a[i][d]` in f64
+/// over `i = 0..rows` in order, exactly as the sequential full-matrix loop.
+fn gram_upper_rows(a: &[f32], rows: usize, cols: usize, c0: usize, c1: usize) -> Vec<Vec<f64>> {
+    let mut accs: Vec<Vec<f64>> = (c0..c1).map(|c| vec![0f64; cols - c]).collect();
     for i in 0..rows {
-        for c in 0..cols {
-            let av = a[i * cols + c] as f64;
-            for d in 0..cols {
-                out[c * cols + d] += av * a[i * cols + d] as f64;
+        let row = &a[i * cols..(i + 1) * cols];
+        for (acc, c) in accs.iter_mut().zip(c0..c1) {
+            let av = row[c] as f64;
+            for (slot, value) in acc.iter_mut().zip(&row[c..]) {
+                *slot += av * *value as f64;
             }
         }
     }
-    out.into_iter().map(|v| v as f32).collect()
+    accs
 }
 
+/// Full upper triangle of `Aᵀ·A` as f64 rows (row `c` holds entries
+/// `c..cols`), computed in parallel over blocks of output rows. The product
+/// is symmetric bit-for-bit (IEEE multiplication commutes and both triangles
+/// accumulate in the same order), so the lower triangle is implied.
+fn gram_upper_triangle(a: &[f32], rows: usize, cols: usize) -> Vec<Vec<f64>> {
+    let blocks: Vec<(usize, usize)> = (0..cols)
+        .step_by(GRAM_BLOCK_ROWS)
+        .map(|c0| (c0, (c0 + GRAM_BLOCK_ROWS).min(cols)))
+        .collect();
+    let per_block: Vec<Vec<Vec<f64>>> = if cols < PARALLEL_LINALG_MIN_DIM {
+        blocks
+            .iter()
+            .map(|&(c0, c1)| gram_upper_rows(a, rows, cols, c0, c1))
+            .collect()
+    } else {
+        blocks
+            .par_iter()
+            .map(|&(c0, c1)| gram_upper_rows(a, rows, cols, c0, c1))
+            .collect()
+    };
+    per_block.into_iter().flatten().collect()
+}
+
+/// `Aᵀ·A` for a row-major `rows × cols` matrix, f64-accumulated and cast to
+/// f32 once, bit-identical to the sequential loop (see `gram_upper_rows`).
+fn mat_transpose_mul(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let upper: Vec<Vec<f32>> = gram_upper_triangle(a, rows, cols)
+        .into_iter()
+        .map(|row| row.into_iter().map(|v| v as f32).collect())
+        .collect();
+    let mut out = vec![0f32; cols * cols];
+    let fill_row = |c: usize, out_row: &mut [f32]| {
+        for (d, slot) in out_row.iter_mut().enumerate() {
+            *slot = if d >= c {
+                upper[c][d - c]
+            } else {
+                upper[d][c - d]
+            };
+        }
+    };
+    if cols < PARALLEL_LINALG_MIN_DIM {
+        for (c, out_row) in out.chunks_mut(cols.max(1)).enumerate() {
+            fill_row(c, out_row);
+        }
+    } else {
+        out.par_chunks_mut(cols)
+            .enumerate()
+            .for_each(|(c, out_row)| fill_row(c, out_row));
+    }
+    out
+}
+
+/// `Aᵀ·B` for row-major `rows × cols` and `rows × b_cols`. Parallel over
+/// blocks of output rows; each entry's f64 accumulation order is unchanged.
 fn mat_transpose_mul_rhs(
     a: &[f32],
     rows: usize,
@@ -2198,33 +2266,72 @@ fn mat_transpose_mul_rhs(
     b: &[f32],
     b_cols: usize,
 ) -> Vec<f32> {
-    let mut out = vec![0f64; cols * b_cols];
-    for i in 0..rows {
-        for c in 0..cols {
-            let av = a[i * cols + c] as f64;
-            for d in 0..b_cols {
-                out[c * b_cols + d] += av * b[i * b_cols + d] as f64;
-            }
-        }
+    let mut out = vec![0f32; cols * b_cols];
+    if b_cols == 0 {
+        return out;
     }
-    out.into_iter().map(|v| v as f32).collect()
-}
-
-fn mat_mul(a: &[f32], a_rows: usize, a_cols: usize, b: &[f32], b_cols: usize) -> Vec<f32> {
-    let mut out = vec![0f32; a_rows * b_cols];
-    for i in 0..a_rows {
-        for k in 0..a_cols {
-            let av = a[i * a_cols + k];
-            for j in 0..b_cols {
-                out[i * b_cols + j] += av * b[k * b_cols + j];
+    let fill_block = |c0: usize, out_block: &mut [f32]| {
+        let block = out_block.len() / b_cols;
+        let mut acc = vec![0f64; block * b_cols];
+        for i in 0..rows {
+            let b_row = &b[i * b_cols..(i + 1) * b_cols];
+            for (k, acc_row) in acc.chunks_mut(b_cols).enumerate() {
+                let av = a[i * cols + c0 + k] as f64;
+                for (slot, value) in acc_row.iter_mut().zip(b_row) {
+                    *slot += av * *value as f64;
+                }
             }
         }
+        for (slot, value) in out_block.iter_mut().zip(acc) {
+            *slot = value as f32;
+        }
+    };
+    let block_len = GRAM_BLOCK_ROWS * b_cols;
+    if cols < PARALLEL_LINALG_MIN_DIM {
+        for (index, out_block) in out.chunks_mut(block_len).enumerate() {
+            fill_block(index * GRAM_BLOCK_ROWS, out_block);
+        }
+    } else {
+        out.par_chunks_mut(block_len)
+            .enumerate()
+            .for_each(|(index, out_block)| fill_block(index * GRAM_BLOCK_ROWS, out_block));
     }
     out
 }
 
-fn solve_linear(mut a: Vec<f32>, n: usize, b: &mut [f32], nrhs: usize) -> bool {
-    const EPS: f64 = 1e-12;
+/// Row-major `A(a_rows × a_cols) · B(a_cols × b_cols)`. Parallel over output
+/// rows; each entry's f32 accumulation order over `k` is unchanged.
+fn mat_mul(a: &[f32], a_rows: usize, a_cols: usize, b: &[f32], b_cols: usize) -> Vec<f32> {
+    let mut out = vec![0f32; a_rows * b_cols];
+    if b_cols == 0 {
+        return out;
+    }
+    let fill_row = |i: usize, out_row: &mut [f32]| {
+        for k in 0..a_cols {
+            let av = a[i * a_cols + k];
+            for (slot, value) in out_row.iter_mut().zip(&b[k * b_cols..(k + 1) * b_cols]) {
+                *slot += av * *value;
+            }
+        }
+    };
+    if a_rows < PARALLEL_LINALG_MIN_DIM {
+        for (i, out_row) in out.chunks_mut(b_cols).enumerate() {
+            fill_row(i, out_row);
+        }
+    } else {
+        out.par_chunks_mut(b_cols)
+            .enumerate()
+            .for_each(|(i, out_row)| fill_row(i, out_row));
+    }
+    out
+}
+
+const SOLVE_EPS: f64 = 1e-12;
+
+/// Gauss-Jordan elimination with partial pivoting, in place: the sequential
+/// algorithm, used directly for small systems and as the arithmetic contract
+/// the blocked parallel `solve_linear` reproduces bit-for-bit.
+fn solve_linear_sequential(mut a: Vec<f32>, n: usize, b: &mut [f32], nrhs: usize) -> bool {
     for col in 0..n {
         let mut pivot = col;
         let mut best = a[col * n + col].abs();
@@ -2235,7 +2342,7 @@ fn solve_linear(mut a: Vec<f32>, n: usize, b: &mut [f32], nrhs: usize) -> bool {
                 pivot = row;
             }
         }
-        if best < EPS as f32 {
+        if best < SOLVE_EPS as f32 {
             return false;
         }
         if pivot != col {
@@ -2268,6 +2375,136 @@ fn solve_linear(mut a: Vec<f32>, n: usize, b: &mut [f32], nrhs: usize) -> bool {
                 b[row * nrhs + rhs] -= factor * b[col * nrhs + rhs];
             }
         }
+    }
+    true
+}
+
+/// Gauss-Jordan elimination with partial pivoting, bit-identical to
+/// `solve_linear_sequential`, with the row eliminations deferred and applied
+/// in parallel once per `SOLVE_BLOCK_COLUMNS` columns.
+///
+/// Within a block, each row keeps the factors `f_c` of the columns whose
+/// update it has not yet received. Pivot search reads "effective" column
+/// values (stored value minus the pending `f_c · P_c[col]` terms in column
+/// order), the chosen pivot row is materialized (its pending updates applied
+/// in column order) before it is swapped, normalized and snapshotted, and at
+/// the end of the block every row applies its pending updates in column
+/// order. Every element therefore sees exactly the sequential sequence of
+/// operations, and the `f == 0` skip of the sequential loop is preserved.
+fn solve_linear(mut a: Vec<f32>, n: usize, b: &mut [f32], nrhs: usize) -> bool {
+    if n < PARALLEL_LINALG_MIN_DIM {
+        return solve_linear_sequential(a, n, b, nrhs);
+    }
+    let block = SOLVE_BLOCK_COLUMNS;
+    let mut factors = vec![0f32; n * block];
+    let mut pending_from = vec![0usize; n];
+    let mut pivot_rows = vec![0f32; block * n];
+    let mut pivot_rhs = vec![0f32; block * nrhs];
+    let mut column = vec![0f32; n];
+    let mut block_start = 0usize;
+    while block_start < n {
+        let block_len = block.min(n - block_start);
+        pending_from.iter_mut().for_each(|from| *from = 0);
+        for k in 0..block_len {
+            let col = block_start + k;
+            for r in 0..n {
+                let mut value = a[r * n + col];
+                for kk in pending_from[r]..k {
+                    let f = factors[r * block + kk];
+                    if f != 0.0 {
+                        value -= f * pivot_rows[kk * n + col];
+                    }
+                }
+                column[r] = value;
+            }
+            let mut pivot = col;
+            let mut best = column[col].abs();
+            for (row, value) in column.iter().enumerate().skip(col + 1) {
+                let value = value.abs();
+                if value > best {
+                    best = value;
+                    pivot = row;
+                }
+            }
+            if best < SOLVE_EPS as f32 {
+                return false;
+            }
+            for kk in pending_from[pivot]..k {
+                let f = factors[pivot * block + kk];
+                if f == 0.0 {
+                    continue;
+                }
+                let c = block_start + kk;
+                let (a_tail, pivot_tail) = (
+                    &mut a[pivot * n + c..(pivot + 1) * n],
+                    &pivot_rows[kk * n + c..(kk + 1) * n],
+                );
+                for (slot, value) in a_tail.iter_mut().zip(pivot_tail) {
+                    *slot -= f * *value;
+                }
+                let (b_row, pivot_b) = (
+                    &mut b[pivot * nrhs..(pivot + 1) * nrhs],
+                    &pivot_rhs[kk * nrhs..(kk + 1) * nrhs],
+                );
+                for (slot, value) in b_row.iter_mut().zip(pivot_b) {
+                    *slot -= f * *value;
+                }
+            }
+            pending_from[pivot] = k;
+            if pivot != col {
+                for j in 0..n {
+                    a.swap(col * n + j, pivot * n + j);
+                }
+                for rhs in 0..nrhs {
+                    b.swap(col * nrhs + rhs, pivot * nrhs + rhs);
+                }
+                for kk in 0..block {
+                    factors.swap(col * block + kk, pivot * block + kk);
+                }
+                pending_from.swap(col, pivot);
+                column.swap(col, pivot);
+            }
+            let pivot_val = a[col * n + col];
+            for j in col..n {
+                a[col * n + j] /= pivot_val;
+            }
+            for rhs in 0..nrhs {
+                b[col * nrhs + rhs] /= pivot_val;
+            }
+            pivot_rows[k * n + col..(k + 1) * n].copy_from_slice(&a[col * n + col..(col + 1) * n]);
+            pivot_rhs[k * nrhs..(k + 1) * nrhs].copy_from_slice(&b[col * nrhs..(col + 1) * nrhs]);
+            for r in 0..n {
+                factors[r * block + k] = if r == col { 0.0 } else { column[r] };
+            }
+        }
+        let apply = |r: usize, a_row: &mut [f32], b_row: &mut [f32]| {
+            for kk in pending_from[r]..block_len {
+                let f = factors[r * block + kk];
+                if f == 0.0 {
+                    continue;
+                }
+                let c = block_start + kk;
+                let pivot_tail = &pivot_rows[kk * n + c..(kk + 1) * n];
+                for (slot, value) in a_row[c..].iter_mut().zip(pivot_tail) {
+                    *slot -= f * *value;
+                }
+                let pivot_b = &pivot_rhs[kk * nrhs..(kk + 1) * nrhs];
+                for (slot, value) in b_row.iter_mut().zip(pivot_b) {
+                    *slot -= f * *value;
+                }
+            }
+        };
+        if nrhs == 0 {
+            a.par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(r, a_row)| apply(r, a_row, &mut []));
+        } else {
+            a.par_chunks_mut(n)
+                .zip(b.par_chunks_mut(nrhs))
+                .enumerate()
+                .for_each(|(r, (a_row, b_row))| apply(r, a_row, b_row));
+        }
+        block_start += block_len;
     }
     true
 }
@@ -2342,6 +2579,11 @@ fn project_encoder_delta(weights: &[f32], h_dim: usize, z_dim: usize, dh: &[f32]
     out
 }
 
+/// Frobenius distance of the sample covariance of `encoder` from identity.
+/// The covariance accumulates in f64 over rows in order, exactly as the
+/// sequential full-matrix loop did; it is symmetric bit-for-bit, so only the
+/// upper triangle is computed (in parallel) and the final error sum walks the
+/// full matrix in the original row-major order.
 fn latent_covariance_frobenius(encoder: &[Vec<f32>]) -> Option<f64> {
     if encoder.len() < 2 {
         return None;
@@ -2350,22 +2592,19 @@ fn latent_covariance_frobenius(encoder: &[Vec<f32>]) -> Option<f64> {
     if dim == 0 {
         return None;
     }
-    let centered = center_columns(encoder);
-    let n = centered.len() as f64;
-    let mut cov = vec![0f64; dim * dim];
-    for row in &centered {
-        for i in 0..dim {
-            let vi = row[i] as f64;
-            for j in 0..dim {
-                cov[i * dim + j] += vi * row[j] as f64;
-            }
-        }
-    }
+    let (centered, rows, _) = flatten_matrix(&center_columns(encoder));
+    let n = rows as f64;
+    let upper = gram_upper_triangle(&centered, rows, dim);
     let denom = (n - 1.0).max(1.0);
     let mut err = 0f64;
     for i in 0..dim {
         for j in 0..dim {
-            let value = cov[i * dim + j] / denom;
+            let raw = if j >= i {
+                upper[i][j - i]
+            } else {
+                upper[j][i - j]
+            };
+            let value = raw / denom;
             let target = if i == j { 1.0 } else { 0.0 };
             let delta = value - target;
             err += delta * delta;
@@ -8794,6 +9033,91 @@ mod tests {
     };
     use rayon::ThreadPoolBuilder;
 
+    // Sequential reference kernels: the exact pre-parallel bodies, kept so the
+    // identity test can prove the rayon versions are bit-identical.
+    fn mat_transpose_mul_reference(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0f64; cols * cols];
+        for i in 0..rows {
+            for c in 0..cols {
+                let av = a[i * cols + c] as f64;
+                for d in 0..cols {
+                    out[c * cols + d] += av * a[i * cols + d] as f64;
+                }
+            }
+        }
+        out.into_iter().map(|v| v as f32).collect()
+    }
+
+    fn mat_transpose_mul_rhs_reference(
+        a: &[f32],
+        rows: usize,
+        cols: usize,
+        b: &[f32],
+        b_cols: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f64; cols * b_cols];
+        for i in 0..rows {
+            for c in 0..cols {
+                let av = a[i * cols + c] as f64;
+                for d in 0..b_cols {
+                    out[c * b_cols + d] += av * b[i * b_cols + d] as f64;
+                }
+            }
+        }
+        out.into_iter().map(|v| v as f32).collect()
+    }
+
+    fn mat_mul_reference(
+        a: &[f32],
+        a_rows: usize,
+        a_cols: usize,
+        b: &[f32],
+        b_cols: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; a_rows * b_cols];
+        for i in 0..a_rows {
+            for k in 0..a_cols {
+                let av = a[i * a_cols + k];
+                for j in 0..b_cols {
+                    out[i * b_cols + j] += av * b[k * b_cols + j];
+                }
+            }
+        }
+        out
+    }
+
+    fn latent_covariance_frobenius_reference(encoder: &[Vec<f32>]) -> Option<f64> {
+        if encoder.len() < 2 {
+            return None;
+        }
+        let dim = encoder[0].len();
+        if dim == 0 {
+            return None;
+        }
+        let centered = center_columns(encoder);
+        let n = centered.len() as f64;
+        let mut cov = vec![0f64; dim * dim];
+        for row in &centered {
+            for i in 0..dim {
+                let vi = row[i] as f64;
+                for j in 0..dim {
+                    cov[i * dim + j] += vi * row[j] as f64;
+                }
+            }
+        }
+        let denom = (n - 1.0).max(1.0);
+        let mut err = 0f64;
+        for i in 0..dim {
+            for j in 0..dim {
+                let value = cov[i * dim + j] / denom;
+                let target = if i == j { 1.0 } else { 0.0 };
+                let delta = value - target;
+                err += delta * delta;
+            }
+        }
+        Some(err.sqrt())
+    }
+
     fn serialized_eval_population_fixture() -> Result<Vec<u8>> {
         let episodes = 1;
         let seed = 0xE7A1_0005u64;
@@ -10905,6 +11229,262 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    fn pseudo_random_matrix(seed: u64, rows: usize, cols: usize) -> Vec<Vec<f32>> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..rows)
+            .map(|_| (0..cols).map(|_| rng.random_range(-1.5f32..1.5)).collect())
+            .collect()
+    }
+
+    fn assert_bits_equal(label: &str, parallel: &[f32], reference: &[f32]) {
+        assert_eq!(parallel.len(), reference.len(), "{label}: length");
+        for (index, (a, b)) in parallel.iter().zip(reference).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: element {index} {a} != {b}"
+            );
+        }
+    }
+
+    /// The rayon kernels behind `eval_identifiability` must reproduce the
+    /// sequential reference bodies bit-for-bit, on both the parallel path
+    /// (`dim >= PARALLEL_LINALG_MIN_DIM`) and the small sequential path.
+    #[test]
+    fn parallel_linalg_kernels_are_bit_identical_to_sequential_reference() {
+        for (rows, cols, b_cols) in [(53usize, 97usize, 5usize), (9, 17, 3), (2, 64, 1)] {
+            let (a_flat, _, _) =
+                flatten_matrix(&pseudo_random_matrix(0x51A7 + cols as u64, rows, cols));
+            let (b_flat, _, _) =
+                flatten_matrix(&pseudo_random_matrix(0xB0B0 + cols as u64, rows, b_cols));
+            let label = format!("rows={rows} cols={cols} b_cols={b_cols}");
+
+            let gram = mat_transpose_mul(&a_flat, rows, cols);
+            let gram_reference = mat_transpose_mul_reference(&a_flat, rows, cols);
+            assert_bits_equal(&format!("{label} gram"), &gram, &gram_reference);
+
+            let rhs = mat_transpose_mul_rhs(&a_flat, rows, cols, &b_flat, b_cols);
+            let rhs_reference =
+                mat_transpose_mul_rhs_reference(&a_flat, rows, cols, &b_flat, b_cols);
+            assert_bits_equal(&format!("{label} rhs"), &rhs, &rhs_reference);
+
+            let product = mat_mul(&a_flat, rows, cols, &gram, cols);
+            let product_reference = mat_mul_reference(&a_flat, rows, cols, &gram, cols);
+            assert_bits_equal(&format!("{label} mat_mul"), &product, &product_reference);
+
+            let mut ridge = gram.clone();
+            for i in 0..cols {
+                ridge[i * cols + i] += 1e-2;
+            }
+            let mut solution = rhs.clone();
+            let mut solution_reference = rhs.clone();
+            let ok = solve_linear(ridge.clone(), cols, &mut solution, b_cols);
+            let ok_reference =
+                solve_linear_sequential(ridge, cols, &mut solution_reference, b_cols);
+            assert_eq!(ok, ok_reference, "{label} solve status");
+            assert!(ok, "{label} ridge system must be solvable");
+            assert_bits_equal(&format!("{label} solve"), &solution, &solution_reference);
+
+            // A row-permuted, badly scaled system forces pivot swaps in
+            // every block; the blocked solver must pick the same pivots.
+            let mut permuted = vec![0f32; cols * cols];
+            for i in 0..cols {
+                let source = (i * 7 + 3) % cols;
+                let scale = if source % 3 == 0 { 1e-3 } else { 1.0 };
+                for j in 0..cols {
+                    permuted[i * cols + j] = gram[source * cols + j] * scale;
+                }
+                permuted[i * cols + source] += 1e-2 * scale;
+            }
+            let mut permuted_solution = rhs.clone();
+            let mut permuted_reference = rhs.clone();
+            let ok = solve_linear(permuted.clone(), cols, &mut permuted_solution, b_cols);
+            let ok_reference =
+                solve_linear_sequential(permuted, cols, &mut permuted_reference, b_cols);
+            assert_eq!(ok, ok_reference, "{label} permuted solve status");
+            assert!(ok, "{label} permuted system must be solvable");
+            assert_bits_equal(
+                &format!("{label} permuted solve"),
+                &permuted_solution,
+                &permuted_reference,
+            );
+
+            // A singular system fails in both implementations.
+            let mut singular = vec![0f32; cols * cols];
+            for i in 0..cols {
+                for j in 0..cols {
+                    singular[i * cols + j] = (i + 1) as f32 * (j + 1) as f32;
+                }
+            }
+            let mut singular_solution = rhs.clone();
+            let mut singular_reference = rhs.clone();
+            assert!(!solve_linear(
+                singular.clone(),
+                cols,
+                &mut singular_solution,
+                b_cols
+            ));
+            assert!(!solve_linear_sequential(
+                singular,
+                cols,
+                &mut singular_reference,
+                b_cols
+            ));
+
+            let encoder = pseudo_random_matrix(0xC0F + cols as u64, rows.max(2), cols);
+            let frobenius = latent_covariance_frobenius(&encoder).expect("covariance");
+            let frobenius_reference =
+                latent_covariance_frobenius_reference(&encoder).expect("covariance");
+            assert_eq!(
+                frobenius.to_bits(),
+                frobenius_reference.to_bits(),
+                "{label} covariance frobenius {frobenius} != {frobenius_reference}"
+            );
+        }
+    }
+
+    /// End-to-end: the identifiability metrics of a real synthetic sample set
+    /// serialize to the same JSON under a one-thread rayon pool, an
+    /// eight-thread pool, and the sequential reference kernels.
+    #[test]
+    fn eval_identifiability_is_bit_identical_across_rayon_thread_counts() -> Result<()> {
+        let sources = collect_synthetic_sources(
+            0x1DE7,
+            2,
+            &["random_one_step", "exploration"],
+            Split::HeldOutComposition,
+        )?;
+        let samples = flatten_sources(&sources);
+        assert!(samples.len() >= 8, "fixture too small: {}", samples.len());
+        let dim = 2 * PARALLEL_LINALG_MIN_DIM + 5;
+        let encoders: Vec<Option<Vec<f32>>> = pseudo_random_matrix(0xE4C0, samples.len(), dim)
+            .into_iter()
+            .map(Some)
+            .collect();
+
+        let run = || -> Result<String> {
+            let metrics =
+                eval_identifiability(&samples, &encoders).context("identifiability metrics")?;
+            Ok(serde_json::to_string(&metrics)?)
+        };
+        let one_thread = ThreadPoolBuilder::new().num_threads(1).build()?;
+        let eight_threads = ThreadPoolBuilder::new().num_threads(8).build()?;
+        let serial_json = one_thread.install(run)?;
+        let parallel_json = eight_threads.install(run)?;
+        assert_eq!(serial_json, parallel_json);
+
+        // The metrics must also match a fully sequential recomputation of the
+        // ridge bridge and covariance from the reference kernels.
+        let metrics: IdentifiabilityMetrics = serde_json::from_str(&parallel_json)?;
+        assert!(metrics.r2_h_to_z_train.is_some(), "{parallel_json}");
+        let labeled: Vec<Vec<f32>> = encoders.iter().flatten().cloned().collect();
+        let reference_frobenius =
+            latent_covariance_frobenius_reference(&labeled).expect("reference covariance");
+        assert_eq!(
+            metrics
+                .latent_covariance_frobenius
+                .expect("covariance")
+                .to_bits(),
+            reference_frobenius.to_bits()
+        );
+        Ok(())
+    }
+
+    /// Manual benchmark for the identifiability kernels at a v6-like scale
+    /// (`cargo test --release ... -- --ignored --nocapture`): prints the
+    /// sequential-reference and parallel wall times and asserts identity.
+    #[test]
+    #[ignore = "timing benchmark; run manually with --ignored --nocapture"]
+    fn identifiability_kernel_timing_benchmark() {
+        let rows = std::env::var("TOFY_IDENT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400usize);
+        let dim = std::env::var("TOFY_IDENT_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096usize);
+        let encoder = pseudo_random_matrix(0xBE7C, rows, dim);
+        let oracle = pseudo_random_matrix(0x0AC1, rows, ORACLE_LATENT_DIM);
+        let threads = std::env::var("TOFY_IDENT_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(rayon::current_num_threads);
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("rayon pool");
+
+        let started = Instant::now();
+        let (h_flat, n, _) = flatten_matrix(&center_columns(&encoder));
+        let (z_flat, _, _) = flatten_matrix(&center_columns(&oracle));
+        let mut gram_reference = mat_transpose_mul_reference(&h_flat, n, dim);
+        let gram_s = started.elapsed().as_secs_f64();
+        for i in 0..dim {
+            gram_reference[i * dim + i] += 1e-2;
+        }
+        let mut weights_reference =
+            mat_transpose_mul_rhs_reference(&h_flat, n, dim, &z_flat, ORACLE_LATENT_DIM);
+        let solve_started = Instant::now();
+        assert!(solve_linear_sequential(
+            gram_reference.clone(),
+            dim,
+            &mut weights_reference,
+            ORACLE_LATENT_DIM
+        ));
+        let solve_s = solve_started.elapsed().as_secs_f64();
+        let cov_started = Instant::now();
+        let frobenius_reference = latent_covariance_frobenius_reference(&encoder);
+        let cov_s = cov_started.elapsed().as_secs_f64();
+        let reference_s = started.elapsed().as_secs_f64();
+        eprintln!(
+            "identifiability kernels rows={rows} dim={dim} sequential_reference: gram_s={gram_s:.3} solve_s={solve_s:.3} covariance_s={cov_s:.3} total_s={reference_s:.3}"
+        );
+
+        let started = Instant::now();
+        let gram_started = Instant::now();
+        let mut gram = pool.install(|| mat_transpose_mul(&h_flat, n, dim));
+        let gram_s = gram_started.elapsed().as_secs_f64();
+        for i in 0..dim {
+            gram[i * dim + i] += 1e-2;
+        }
+        let rhs_started = Instant::now();
+        let mut weights_kernel =
+            pool.install(|| mat_transpose_mul_rhs(&h_flat, n, dim, &z_flat, ORACLE_LATENT_DIM));
+        let rhs_s = rhs_started.elapsed().as_secs_f64();
+        let solve_started = Instant::now();
+        assert!(pool.install(|| solve_linear(gram, dim, &mut weights_kernel, ORACLE_LATENT_DIM)));
+        let solve_s = solve_started.elapsed().as_secs_f64();
+        let kernels_s = started.elapsed().as_secs_f64();
+        eprintln!(
+            "identifiability kernels rows={rows} dim={dim} parallel threads={threads}: gram_s={gram_s:.3} rhs_s={rhs_s:.3} solve_s={solve_s:.3} kernels_total_s={kernels_s:.3}"
+        );
+        assert_bits_equal(
+            "ridge weights (kernels)",
+            &weights_kernel,
+            &weights_reference,
+        );
+
+        let started = Instant::now();
+        let (w, h_dim, z_dim) =
+            pool.install(|| fit_ridge_h_to_z(&encoder, &oracle).expect("ridge fit"));
+        let fit_s = started.elapsed().as_secs_f64();
+        let cov_started = Instant::now();
+        let frobenius = pool.install(|| latent_covariance_frobenius(&encoder));
+        let cov_s = cov_started.elapsed().as_secs_f64();
+        let parallel_s = started.elapsed().as_secs_f64();
+        eprintln!(
+            "identifiability kernels rows={rows} dim={dim} parallel threads={threads}: fit_s={fit_s:.3} covariance_s={cov_s:.3} total_s={parallel_s:.3} speedup={:.2}x",
+            reference_s / parallel_s
+        );
+        assert_eq!((h_dim, z_dim), (dim, ORACLE_LATENT_DIM));
+        assert_bits_equal("ridge weights", &w, &weights_reference);
+        assert_eq!(
+            frobenius.map(f64::to_bits),
+            frobenius_reference.map(f64::to_bits)
+        );
     }
 
     #[test]
