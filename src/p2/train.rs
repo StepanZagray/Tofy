@@ -113,6 +113,9 @@ const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
 /// ADR 0005 §3.5 recursion depth (inner and outer) for world-core v6.
 pub const V6_RECURSION_STEPS: usize = 3;
+fn default_v6_recursion_steps() -> usize {
+    V6_RECURSION_STEPS
+}
 const FOUNDATION_V2_ABORT_MARKER: &str = "foundation_v2_abort.json";
 const LEGACY_CHECKPOINT_ARTIFACTS: &[&str] = &[
     "model.safetensors",
@@ -1058,6 +1061,12 @@ pub struct TrainConfig {
     /// channel. Trajectory-changing; recorded in the training contract.
     #[serde(default)]
     pub world_core_v6: bool,
+    /// ADR 0005 §3.5 recursion depth (inner and outer) applied by the
+    /// foundation-v2 recipe when `world_core_v6` is set. Default 3; the
+    /// preregistered depth ablation sets 2. Reaches the contract through
+    /// `inner_steps`/`outer_steps`.
+    #[serde(default = "default_v6_recursion_steps")]
+    pub v6_recursion_steps: usize,
     /// ADR 0005 §3.4 warm start: v5 checkpoint (bundle directory or
     /// `model.safetensors`) whose tensors initialize every non-context
     /// parameter of a fresh v6 run. Without it a v6 config on a v5 checkpoint
@@ -1293,6 +1302,7 @@ impl Default for TrainConfig {
             world_core_v3: false,
             world_core_v4: false,
             world_core_v6: false,
+            v6_recursion_steps: V6_RECURSION_STEPS,
             init_context_from_v5: None,
             consumer_readout: ConsumerReadoutTopology::GlobalMean,
             spatial_action_field: false,
@@ -1450,6 +1460,15 @@ impl TrainConfig {
         }
         if self.init_context_from_v5.is_some() && !self.world_core_v6 {
             bail!("init_context_from_v5 is only meaningful for a world_core_v6 run");
+        }
+        if !(1..=4).contains(&self.v6_recursion_steps) {
+            bail!(
+                "v6_recursion_steps must be in 1..=4, got {}",
+                self.v6_recursion_steps
+            );
+        }
+        if self.v6_recursion_steps != V6_RECURSION_STEPS && !self.world_core_v6 {
+            bail!("v6_recursion_steps applies only to world_core_v6 runs");
         }
         if self.data_contract_v6 && !self.world_core_v6 {
             bail!(
@@ -1623,7 +1642,7 @@ impl TrainConfig {
         // switch opening a distant door. 3x3 reaches 25 cells at 2.25x
         // dynamics compute. v5 keeps 2x2 so legacy runs stay reproducible.
         let depth = if self.world_core_v6 {
-            V6_RECURSION_STEPS
+            self.v6_recursion_steps
         } else {
             2
         };
@@ -14830,6 +14849,44 @@ mod tests {
         let mut v5 = TrainConfig::default();
         v5.apply_foundation_v2_recipe();
         assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
+    }
+
+    /// The preregistered depth ablation runs a v6 arm at 2x2 through the
+    /// recipe, so it validates like any other v6 config and is recorded in
+    /// the contract via `inner_steps`/`outer_steps`.
+    #[test]
+    fn v6_recursion_override_reaches_the_recipe_and_contract() {
+        let mut shallow = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            v6_recursion_steps: 2,
+            ..TrainConfig::default()
+        };
+        shallow.apply_foundation_v2_recipe();
+        shallow.physical_batch = 64;
+        shallow.validate().expect("2x2 v6 arm validates");
+        assert_eq!((shallow.inner_steps, shallow.outer_steps), (2, 2));
+        let deep = {
+            let mut c = shallow.clone();
+            c.v6_recursion_steps = 3;
+            c.apply_foundation_v2_recipe();
+            c
+        };
+        assert_ne!(
+            TrainingContract::from(&shallow),
+            TrainingContract::from(&deep),
+            "depth is trajectory-changing and must split the contract"
+        );
+        let mut legacy = TrainConfig {
+            v6_recursion_steps: 2,
+            ..TrainConfig::default()
+        };
+        legacy.apply_foundation_v2_recipe();
+        legacy.physical_batch = 64;
+        assert!(
+            legacy.validate().is_err(),
+            "override without world_core_v6 is rejected"
+        );
     }
 
     #[test]

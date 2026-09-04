@@ -292,6 +292,11 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub data_contract_v6: bool,
 
+    /// ADR 0005 §3.5 recursion depth for v6 runs (inner and outer); 3 is the
+    /// contract, 2 is the preregistered depth-ablation arm.
+    #[arg(long, default_value_t = 3, requires = "world_core_v6")]
+    pub v6_recursion_steps: usize,
+
     /// Planning-head readout from the final BxCx8x8 prediction.
     #[arg(long, value_enum, default_value_t = ConsumerReadoutTopology::GlobalMean)]
     pub consumer_readout: ConsumerReadoutTopology,
@@ -503,6 +508,7 @@ impl P2TrainArgs {
             world_core_v6: self.world_core_v6,
             init_context_from_v5: self.init_context_from_v5.clone(),
             data_contract_v6: self.data_contract_v6,
+            v6_recursion_steps: self.v6_recursion_steps,
             consumer_readout: self.consumer_readout,
             spatial_action_field: self.spatial_action_field,
             spatial_action_residual: self.spatial_action_residual,
