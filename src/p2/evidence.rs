@@ -1,24 +1,158 @@
 //! Relocatable, hash-bound evidence manifest for one P2 training run.
 
 use crate::p2::cg_profile::ProfileState;
-use crate::p2::experiment::ResolvedExperiment;
-use crate::p2::train::{GradientPressureDiagnostics, TrainReport, TrainStatus};
+use crate::p2::experiment::{ResolvedExperiment, TrainingRecipe, WorldCoreFamily};
+use crate::p2::train::{
+    GradientPressureDiagnostics, RunAttempt, TrainConfig, TrainReport, TrainStatus,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 pub const EVIDENCE_MANIFEST_SCHEMA: &str = "tofy/p2/evidence/1";
 pub const EVIDENCE_MANIFEST_FILE: &str = "evidence_manifest.json";
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Explicit marker for provenance the trainer could not determine at launch.
+/// Manifests record it instead of omitting the field, so a missing value is
+/// visible as a claim rather than as an absent key.
+pub const UNKNOWN_PROVENANCE: &str = "unknown";
+
+/// Identity of the running trainer, captured once per process at launch:
+/// the source revision (git HEAD of the tree the binary was built from, or of
+/// the working directory as a fallback), whether that tree carried
+/// uncommitted changes, the executable's SHA-256, and the sibling
+/// `candle_graph` checkout the profile evidence depends on. Every value falls
+/// back to [`UNKNOWN_PROVENANCE`] rather than being dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProvenance {
+    pub source_revision: String,
+    /// Where `source_revision` came from: `git:<tree>`,
+    /// `env:TOFY_SOURCE_REVISION`, or `unknown`.
+    pub source_revision_origin: String,
+    /// `None` when the tree state could not be inspected (env override or no git).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dirty: Option<bool>,
+    pub binary_path: PathBuf,
+    pub binary_sha256: String,
+    pub candle_graph_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candle_graph_dirty: Option<bool>,
+}
+
+impl LaunchProvenance {
+    /// Placeholder for callers that own no process identity (unit fixtures).
+    pub fn unknown(binary: &Path) -> Self {
+        Self {
+            source_revision: UNKNOWN_PROVENANCE.into(),
+            source_revision_origin: UNKNOWN_PROVENANCE.into(),
+            source_dirty: None,
+            binary_path: binary.to_path_buf(),
+            binary_sha256: UNKNOWN_PROVENANCE.into(),
+            candle_graph_revision: UNKNOWN_PROVENANCE.into(),
+            candle_graph_dirty: None,
+        }
+    }
+
+    pub fn source_revision_known(&self) -> bool {
+        self.source_revision != UNKNOWN_PROVENANCE
+    }
+}
+
+/// Capture the process's launch provenance once; later calls return the same
+/// snapshot so every attempt record and manifest in one process agree.
+pub fn launch_provenance() -> &'static LaunchProvenance {
+    static PROVENANCE: OnceLock<LaunchProvenance> = OnceLock::new();
+    PROVENANCE.get_or_init(capture_launch_provenance)
+}
+
+fn capture_launch_provenance() -> LaunchProvenance {
+    let binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(UNKNOWN_PROVENANCE));
+    let binary_sha256 = hash_file(&binary_path)
+        .map(|(_, sha256)| sha256)
+        .unwrap_or_else(|_| UNKNOWN_PROVENANCE.into());
+    // The tree this binary was compiled from is the most faithful source
+    // identity; the launch directory is the fallback for relocated binaries.
+    let build_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut candidates = vec![build_tree.clone()];
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    let mut source = None;
+    for tree in &candidates {
+        if let Some(revision) = git_head(tree) {
+            source = Some((revision, format!("git:{}", tree.display()), git_dirty(tree)));
+            break;
+        }
+    }
+    let (source_revision, source_revision_origin, source_dirty) = source
+        .or_else(|| {
+            std::env::var("TOFY_SOURCE_REVISION")
+                .ok()
+                .map(|revision| revision.trim().to_string())
+                .filter(|revision| !revision.is_empty())
+                .map(|revision| (revision, "env:TOFY_SOURCE_REVISION".to_string(), None))
+        })
+        .unwrap_or_else(|| (UNKNOWN_PROVENANCE.into(), UNKNOWN_PROVENANCE.into(), None));
+    let candle_graph = build_tree.join("..").join("candle_graph");
+    let (candle_graph_revision, candle_graph_dirty) = match git_head(&candle_graph) {
+        Some(revision) => (revision, git_dirty(&candle_graph)),
+        None => (UNKNOWN_PROVENANCE.into(), None),
+    };
+    LaunchProvenance {
+        source_revision,
+        source_revision_origin,
+        source_dirty,
+        binary_path,
+        binary_sha256,
+        candle_graph_revision,
+        candle_graph_dirty,
+    }
+}
+
+fn git_head(tree: &Path) -> Option<String> {
+    if !tree.is_dir() {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (revision.len() >= 7 && revision.chars().all(|c| c.is_ascii_hexdigit())).then_some(revision)
+}
+
+fn git_dirty(tree: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| !output.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EvidenceManifest {
     schema: String,
+    /// What was trained, stated once at the top level so a reader never has
+    /// to infer the world-core family from nested comparison context.
+    identity: RunIdentity,
     terminal: TerminalState,
     comparison: ComparisonContext,
     provenance: Provenance,
@@ -53,10 +187,32 @@ struct RunInvariants {
     training_population_rows: u64,
 }
 
+/// Treatment identity of the run. Flags are read from the published
+/// `config.json`; when that config cannot be parsed they are recorded as
+/// `None` (serialized `null`) and a gap names the cause.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunIdentity {
+    recipe: TrainingRecipe,
+    family: WorldCoreFamily,
+    world_core_schema: String,
+    world_core_v6: Option<bool>,
+    data_contract_v6: Option<bool>,
+    /// Recursion depth (inner = outer) of a v6 run; `None` for pre-v6 runs.
+    v6_recursion_steps: Option<usize>,
+    physical_batch: usize,
+    grad_accum: usize,
+    effective_batch: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Provenance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_revision: Option<String>,
+    /// Identity of the process that published this manifest.
+    #[serde(flatten)]
+    launch: LaunchProvenance,
+    /// Launches of this run root after the fresh start.
+    resume_count: u64,
+    /// Every launch of this run root, oldest first, with its own revision and binary.
+    attempts: Vec<RunAttempt>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,17 +233,14 @@ struct ArtifactDigest {
 /// Publish the canonical evidence entry point after the run's report and checkpoint exist.
 pub(crate) fn publish_training_evidence(run_dir: &Path, report: &TrainReport) -> Result<PathBuf> {
     let binary = std::env::current_exe().context("resolve current Tofy executable")?;
-    let source_revision = std::env::var("TOFY_SOURCE_REVISION")
-        .ok()
-        .filter(|revision| !revision.trim().is_empty());
-    publish_training_evidence_with_provenance(run_dir, report, &binary, source_revision)
+    publish_training_evidence_with_provenance(run_dir, report, &binary, launch_provenance())
 }
 
 fn publish_training_evidence_with_provenance(
     run_dir: &Path,
     report: &TrainReport,
     binary: &Path,
-    source_revision: Option<String>,
+    launch: &LaunchProvenance,
 ) -> Result<PathBuf> {
     fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
     let canonical_run_dir = run_dir
@@ -169,14 +322,39 @@ fn publish_training_evidence_with_provenance(
         .transpose()?;
     let bundle_sha256 = bundle_sha256(&artifacts, gradient_pressure.as_ref());
     let mut gaps = Vec::new();
-    if source_revision.is_none() {
-        gaps.push("source revision unavailable; set TOFY_SOURCE_REVISION".into());
+    if !launch.source_revision_known() {
+        gaps.push(
+            "source revision unavailable (no git tree found); set TOFY_SOURCE_REVISION".into(),
+        );
+    }
+    if launch.source_dirty == Some(true) {
+        gaps.push("source tree had uncommitted changes at launch".into());
+    }
+    if launch.candle_graph_revision == UNKNOWN_PROVENANCE {
+        gaps.push("sibling candle_graph revision unavailable".into());
     }
     if matches!(report.profile, ProfileState::Pending) {
         gaps.push("representative-update profile was not published".into());
     }
+    let identity = run_identity(run_dir, report, &mut gaps);
+    let resume_count = report.resume_count;
+    if report.run_attempts.is_empty() {
+        gaps.push("run attempt history unavailable (report predates attempt records)".into());
+    } else if let Some(repaired) = report
+        .run_attempts
+        .iter()
+        .filter_map(|attempt| attempt.loss_log_repair.as_ref())
+        .filter(|repair| repair.rows_removed > 0)
+        .map(|repair| repair.rows_removed)
+        .reduce(|a, b| a + b)
+    {
+        gaps.push(format!(
+            "loss log was repaired on resume: {repaired} stale row(s) moved to attempt sidecars"
+        ));
+    }
     let manifest = EvidenceManifest {
         schema: EVIDENCE_MANIFEST_SCHEMA.into(),
+        identity,
         terminal: TerminalState {
             status: report.status,
             global_step: report.global_step,
@@ -193,7 +371,11 @@ fn publish_training_evidence_with_provenance(
             },
             treatment: report.experiment.clone(),
         },
-        provenance: Provenance { source_revision },
+        provenance: Provenance {
+            launch: launch.clone(),
+            resume_count,
+            attempts: report.run_attempts.clone(),
+        },
         gradient_pressure,
         artifacts,
         bundle_sha256,
@@ -202,6 +384,43 @@ fn publish_training_evidence_with_provenance(
     let path = run_dir.join(EVIDENCE_MANIFEST_FILE);
     write_json_atomic(&path, &manifest)?;
     Ok(path)
+}
+
+/// Treatment flags come from the published `config.json` so the manifest
+/// states exactly what the binary was launched with. The config artifact is
+/// already required (its absence fails closed above); an unparsable one is
+/// recorded as unknown flags plus a gap rather than an empty object.
+fn run_identity(run_dir: &Path, report: &TrainReport, gaps: &mut Vec<String>) -> RunIdentity {
+    let experiment = &report.experiment;
+    let config = fs::read(run_dir.join("config.json"))
+        .context("read published train config")
+        .and_then(|bytes| {
+            serde_json::from_slice::<TrainConfig>(&bytes).context("parse published train config")
+        });
+    let (world_core_v6, data_contract_v6, v6_recursion_steps) = match config {
+        Ok(config) => (
+            Some(config.world_core_v6),
+            Some(config.data_contract_v6),
+            config.world_core_v6.then_some(config.inner_steps),
+        ),
+        Err(error) => {
+            gaps.push(format!(
+                "treatment flags unknown: published config.json is not a train config ({error:#})"
+            ));
+            (None, None, None)
+        }
+    };
+    RunIdentity {
+        recipe: experiment.recipe,
+        family: experiment.family,
+        world_core_schema: experiment.report_schema.clone(),
+        world_core_v6,
+        data_contract_v6,
+        v6_recursion_steps,
+        physical_batch: report.physical_batch,
+        grad_accum: report.grad_accum,
+        effective_batch: report.physical_batch.saturating_mul(report.grad_accum),
+    }
 }
 
 fn bind_gradient_pressure(
@@ -373,7 +592,9 @@ mod tests {
     use super::*;
     use crate::p2::cg_profile::ProfileArtifacts;
     use crate::p2::data::EventLabelCensus;
-    use crate::p2::train::{FoundationV2LossMeans, FoundationV2TrainingReport, PromotionMetric};
+    use crate::p2::train::{
+        FoundationV2LossMeans, FoundationV2TrainingReport, PromotionMetric, RunAttemptKind,
+    };
 
     fn write(path: &Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {
@@ -474,7 +695,7 @@ mod tests {
             lessons: vec![],
             status: TrainStatus::Completed,
             global_step: 7,
-            latest_checkpoint: checkpoint,
+            latest_checkpoint: checkpoint.clone(),
             resumed_from: None,
             batch_schedule_migrations: vec![],
             checkpoint: root.join("model.safetensors"),
@@ -510,29 +731,64 @@ mod tests {
                 clip_strategy: "test".into(),
             }),
             research_claim: false,
+            resume_count: 1,
+            run_attempts: vec![
+                RunAttempt {
+                    attempt: 1,
+                    kind: RunAttemptKind::Fresh,
+                    started_unix_secs: 10,
+                    pid: 1,
+                    resumed_from: None,
+                    resumed_step: None,
+                    provenance: LaunchProvenance::unknown(&binary),
+                    loss_log_repair: None,
+                },
+                RunAttempt {
+                    attempt: 2,
+                    kind: RunAttemptKind::Resume,
+                    started_unix_secs: 20,
+                    pid: 2,
+                    resumed_from: Some(checkpoint.clone()),
+                    resumed_step: Some(7),
+                    provenance: LaunchProvenance::unknown(&binary),
+                    loss_log_repair: None,
+                },
+            ],
         };
         write(
             &root.join("train_report.json"),
             &serde_json::to_vec_pretty(&report)?,
         );
 
-        let path = publish_training_evidence_with_provenance(
-            &root,
-            &report,
-            &binary,
-            Some("deadbeef".into()),
-        )?;
+        let launch = LaunchProvenance {
+            source_revision: "deadbeef".into(),
+            source_revision_origin: "git:test".into(),
+            source_dirty: Some(false),
+            binary_path: binary.clone(),
+            binary_sha256: hash_file(&binary)?.1,
+            candle_graph_revision: "cafef00d".into(),
+            candle_graph_dirty: Some(false),
+        };
+        let path = publish_training_evidence_with_provenance(&root, &report, &binary, &launch)?;
         let first_publication = fs::read(&path)?;
-        publish_training_evidence_with_provenance(
-            &root,
-            &report,
-            &binary,
-            Some("deadbeef".into()),
-        )?;
+        publish_training_evidence_with_provenance(&root, &report, &binary, &launch)?;
         assert_eq!(fs::read(&path)?, first_publication);
         let manifest: EvidenceManifest = serde_json::from_reader(File::open(&path)?)?;
 
         assert_eq!(manifest.schema, EVIDENCE_MANIFEST_SCHEMA);
+        assert_eq!(manifest.provenance.launch, launch);
+        assert_eq!(manifest.provenance.resume_count, 1);
+        assert_eq!(manifest.provenance.attempts.len(), 2);
+        assert_eq!(manifest.identity.family, WorldCoreFamily::Legacy);
+        assert_eq!(manifest.identity.effective_batch, 8);
+        // `{}` is not a train config: flags are recorded as unknown, not dropped.
+        let raw: serde_json::Value = serde_json::from_slice(&first_publication)?;
+        assert!(raw["identity"]["world_core_v6"].is_null());
+        assert!(raw["provenance"]["source_revision"] == "deadbeef");
+        assert!(manifest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("treatment flags unknown")));
         assert_eq!(manifest.artifacts.len(), 15);
         assert!(manifest.artifacts.iter().any(|artifact| {
             artifact.role == "checkpoint_optimizer"
@@ -553,14 +809,14 @@ mod tests {
         );
         assert_eq!(manifest.gradient_pressure.unwrap().updates, vec![3]);
         assert!(manifest.bundle_sha256.starts_with("sha256:"));
-        assert!(manifest.gaps.is_empty());
+        assert_eq!(manifest.gaps.len(), 1, "{:?}", manifest.gaps);
         let mut mismatched_report = report.clone();
         mismatched_report.global_step += 1;
         assert!(publish_training_evidence_with_provenance(
             &root,
             &mismatched_report,
             &binary,
-            Some("deadbeef".into()),
+            &launch
         )
         .is_err());
         assert!(fs::read_dir(&root)?.all(|entry| {
@@ -573,5 +829,29 @@ mod tests {
 
         fs::remove_dir_all(&root)?;
         Ok(())
+    }
+
+    /// The process provenance is captured once and never empty: every field
+    /// is either a real value or the explicit `unknown` marker.
+    #[test]
+    fn launch_provenance_is_explicit_and_stable() {
+        let first = launch_provenance();
+        let second = launch_provenance();
+        assert_eq!(first, second);
+        assert!(!first.source_revision.is_empty());
+        assert!(!first.source_revision_origin.is_empty());
+        assert!(!first.binary_sha256.is_empty());
+        assert!(!first.candle_graph_revision.is_empty());
+        if first.source_revision_known() {
+            assert!(
+                first.source_revision_origin.starts_with("git:")
+                    || first.source_revision_origin.starts_with("env:")
+            );
+        } else {
+            assert_eq!(first.source_revision_origin, UNKNOWN_PROVENANCE);
+        }
+        let json = serde_json::to_value(first).unwrap();
+        assert!(json["source_revision"].is_string());
+        assert!(json["binary_sha256"].is_string());
     }
 }

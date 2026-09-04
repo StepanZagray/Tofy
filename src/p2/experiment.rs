@@ -244,8 +244,8 @@ impl ResolvedExperiment {
             "world_core_v6 requires the foundation-v2 recipe"
         );
         let legacy_branch_learning = matches!(family, WorldCoreFamily::V2 | WorldCoreFamily::V3);
-        let factual_learning = legacy_branch_learning
-            || matches!(family, WorldCoreFamily::V5 | WorldCoreFamily::V6);
+        let factual_learning =
+            legacy_branch_learning || matches!(family, WorldCoreFamily::V5 | WorldCoreFamily::V6);
         ensure!(
             request.branch_learning_enabled == legacy_branch_learning,
             "legacy branch_learning.enabled must match the V2/V3 family"

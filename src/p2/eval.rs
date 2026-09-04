@@ -1179,6 +1179,11 @@ pub struct OutcomeCounterfactualMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub schema: String,
+    /// Resolved world-core report schema of the evaluated checkpoint
+    /// (`world_core_v6`). Recorded for ADR 0005 v6 checkpoints only, so every
+    /// pre-v6 family keeps its report bytes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_core_schema: Option<String>,
     pub mode: EvalMode,
     pub seed: u64,
     pub iid_seed: u64,
@@ -9223,8 +9228,14 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
     }
     let identity = evaluation_identity(cfg, population_sha256)?;
 
+    let world_core_schema = train_cfg
+        .resolved_experiment()
+        .ok()
+        .filter(|experiment| experiment.family == crate::p2::experiment::WorldCoreFamily::V6)
+        .map(|experiment| experiment.report_schema);
     let report = EvalReport {
         schema: EVAL_REPORT_SCHEMA.into(),
+        world_core_schema,
         mode: cfg.mode,
         seed: cfg.seed,
         iid_seed: cfg.iid_seed,
@@ -11533,6 +11544,8 @@ mod tests {
             gradient_pressure_samples: vec![],
             foundation_v2: None,
             research_claim: false,
+            resume_count: 0,
+            run_attempts: vec![],
         };
         save_checkpoint(&varmap, &train_cfg, &report)?;
 

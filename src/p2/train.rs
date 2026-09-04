@@ -2054,6 +2054,217 @@ pub struct TrainReport {
     pub foundation_v2: Option<FoundationV2TrainingReport>,
     /// Smoke / scaffolding only; not a research result.
     pub research_claim: bool,
+    /// Launches of this run root after the fresh start (each one is a resume).
+    #[serde(default)]
+    pub resume_count: u64,
+    /// Every launch of this run root, oldest first, with the source revision
+    /// and binary that produced it and any loss-log repair it performed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_attempts: Vec<RunAttempt>,
+}
+
+/// One launch of a run root. Persisted to `run_attempts.jsonl` before any
+/// training happens so attempts that die before their first checkpoint are
+/// still on record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAttempt {
+    /// One-based launch index within the run root.
+    pub attempt: u64,
+    pub kind: RunAttemptKind,
+    pub started_unix_secs: u64,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_step: Option<u64>,
+    #[serde(flatten)]
+    pub provenance: crate::p2::evidence::LaunchProvenance,
+    /// Loss-log reconciliation performed by this resume, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_log_repair: Option<LossLogRepair>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunAttemptKind {
+    Fresh,
+    Resume,
+}
+
+const RUN_ATTEMPTS_FILE: &str = "run_attempts.jsonl";
+
+fn read_run_attempts(output_dir: &Path) -> Result<Vec<RunAttempt>> {
+    let path = output_dir.join(RUN_ATTEMPTS_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).with_context(|| format!("parse {}", path.display())))
+        .collect()
+}
+
+/// Append this launch to the run root's attempt history and return the full
+/// history (oldest first). Called after the resume source is resolved and the
+/// loss log reconciled, before the first optimizer update.
+fn record_run_attempt(
+    output_dir: &Path,
+    resumed_from: Option<&Path>,
+    resumed_step: Option<u64>,
+    loss_log_repair: Option<LossLogRepair>,
+) -> Result<Vec<RunAttempt>> {
+    let mut attempts = read_run_attempts(output_dir)?;
+    let attempt = RunAttempt {
+        attempt: attempts.len() as u64 + 1,
+        kind: if resumed_from.is_some() {
+            RunAttemptKind::Resume
+        } else {
+            RunAttemptKind::Fresh
+        },
+        started_unix_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+        pid: std::process::id(),
+        resumed_from: resumed_from.map(Path::to_path_buf),
+        resumed_step,
+        provenance: crate::p2::evidence::launch_provenance().clone(),
+        loss_log_repair,
+    };
+    let path = output_dir.join(RUN_ATTEMPTS_FILE);
+    let mut line = serde_json::to_vec(&attempt).context("serialize run attempt")?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(&line)
+        .and_then(|_| file.sync_data())
+        .with_context(|| format!("append run attempt to {}", path.display()))?;
+    attempts.push(attempt);
+    Ok(attempts)
+}
+
+fn resume_count(attempts: &[RunAttempt]) -> u64 {
+    attempts
+        .iter()
+        .filter(|attempt| attempt.kind == RunAttemptKind::Resume)
+        .count() as u64
+}
+
+/// Outcome of reconciling `loss_log.jsonl` with the checkpoint a resume
+/// starts from. Rows the resumed trajectory does not own are moved, in their
+/// original order, to `loss_log.jsonl.attempt-N` (never deleted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossLogRepair {
+    pub resumed_step: u64,
+    pub rows_before: usize,
+    pub rows_kept: usize,
+    pub rows_removed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_rows_path: Option<PathBuf>,
+}
+
+/// Make `loss_log.jsonl` a single trajectory ending at `resumed_step`.
+///
+/// The log is append-only across launches, so a crashed attempt leaves rows
+/// past the checkpoint it resumed from, and the next resume appends the same
+/// global steps again. Replaying the file in order, a row whose step does not
+/// exceed the previous row's step marks a restart: the kept trajectory is cut
+/// back to the rows strictly before it (the later attempt owns those steps,
+/// because it is the lineage the surviving checkpoints descend from). Rows
+/// past `resumed_step` and unparsable rows (torn tails) are removed too.
+/// Removed rows go to a sidecar; a log that is already consistent is left
+/// byte-identical and no sidecar is created.
+fn repair_loss_log_for_resume(
+    output_dir: &Path,
+    resumed_step: u64,
+) -> Result<Option<LossLogRepair>> {
+    let path = output_dir.join("loss_log.jsonl");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    let rows_before = lines.len();
+    // Kept trajectory as (global_step, original index); removed as indices.
+    let mut kept: Vec<(u64, usize)> = Vec::with_capacity(lines.len());
+    let mut removed: Vec<usize> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let step = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|row| row.get("global_step")?.as_u64());
+        let Some(step) = step else {
+            removed.push(index);
+            continue;
+        };
+        while kept.last().is_some_and(|(last, _)| *last >= step) {
+            let (_, stale) = kept.pop().expect("non-empty");
+            removed.push(stale);
+        }
+        kept.push((step, index));
+    }
+    while kept.last().is_some_and(|(last, _)| *last > resumed_step) {
+        let (_, stale) = kept.pop().expect("non-empty");
+        removed.push(stale);
+    }
+    if removed.is_empty() {
+        return Ok(Some(LossLogRepair {
+            resumed_step,
+            rows_before,
+            rows_kept: kept.len(),
+            rows_removed: 0,
+            removed_rows_path: None,
+        }));
+    }
+    removed.sort_unstable();
+    let sidecar = (1u64..)
+        .map(|attempt| output_dir.join(format!("loss_log.jsonl.attempt-{attempt}")))
+        .find(|candidate| !candidate.exists())
+        .expect("u64 sidecar namespace exhausted");
+    let mut removed_text = String::new();
+    for index in &removed {
+        removed_text.push_str(lines[*index]);
+        removed_text.push('\n');
+    }
+    // Sidecar first (create_new: never clobber), then the repaired log
+    // atomically; a crash between the two leaves the original log intact.
+    let mut sidecar_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&sidecar)
+        .with_context(|| format!("create {}", sidecar.display()))?;
+    sidecar_file
+        .write_all(removed_text.as_bytes())
+        .and_then(|_| sidecar_file.sync_all())
+        .with_context(|| format!("write {}", sidecar.display()))?;
+    let mut kept_text = String::new();
+    for (_, index) in &kept {
+        kept_text.push_str(lines[*index]);
+        kept_text.push('\n');
+    }
+    let tmp = unused_checkpoint_sibling(output_dir, "loss_log.jsonl.repair");
+    fs::write(&tmp, kept_text.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("publish repaired loss log {}", path.display()))?;
+    File::open(output_dir)?.sync_all()?;
+    tracing::warn!(
+        "loss log {} reconciled with resume step {resumed_step}: kept {} rows, moved {} stale rows to {}",
+        path.display(),
+        kept.len(),
+        removed.len(),
+        sidecar.display()
+    );
+    Ok(Some(LossLogRepair {
+        resumed_step,
+        rows_before,
+        rows_kept: kept.len(),
+        rows_removed: removed.len(),
+        removed_rows_path: Some(sidecar),
+    }))
 }
 
 fn default_legacy_world_core_schema() -> String {
@@ -8313,6 +8524,7 @@ fn build_report(
     parameter_count: usize,
     latest_checkpoint: PathBuf,
     resumed_from: Option<PathBuf>,
+    run_attempts: &[RunAttempt],
 ) -> TrainReport {
     let foundation_v2 = state.foundation_v2.as_ref().map(|foundation| {
         let best_promotion_value =
@@ -8393,6 +8605,8 @@ fn build_report(
         gradient_pressure_samples: state.gradient_pressure_samples.clone(),
         foundation_v2,
         research_claim: false,
+        resume_count: resume_count(run_attempts),
+        run_attempts: run_attempts.to_vec(),
     }
 }
 
@@ -9057,6 +9271,18 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
     if resumed_from.is_some() {
         ensure_foundation_v2_resume_not_aborted(&cfg, state.foundation_v2.as_ref())?;
     }
+    // The log must be one trajectory before this launch appends to it.
+    let loss_log_repair = if resumed_from.is_some() {
+        repair_loss_log_for_resume(&cfg.output_dir, state.global_step)?
+    } else {
+        None
+    };
+    let run_attempts = record_run_attempt(
+        &cfg.output_dir,
+        resumed_from.as_deref(),
+        resumed_from.as_ref().map(|_| state.global_step),
+        loss_log_repair,
+    )?;
     let mut loss_log = FoundationV2LossLog::open(&cfg.output_dir)?;
     let mut latest_checkpoint = if resumed_from.is_none() {
         loss_log.flush()?;
@@ -9181,6 +9407,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 latest_checkpoint.expect("foundation-v2 writes a final checkpoint"),
                 resumed_from,
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, &cfg, &report)?;
             sync_cuda_device(&device)?;
@@ -9643,6 +9870,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 checkpoint.clone(),
                 resumed_from.clone(),
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, &cfg, &report)?;
             let diagnostic = seal_foundation_v2_abort(&cfg, &checkpoint, &report)?;
@@ -9659,6 +9887,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 latest_checkpoint.clone().expect("pause saves checkpoint"),
                 resumed_from.clone(),
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, &cfg, &report)?;
             sync_cuda_device(&device)?;
@@ -9746,6 +9975,12 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
         }
     };
     ensure_profile_campaign_manifest(cfg, &[cfg.profile_update])?;
+    let run_attempts = record_run_attempt(
+        &cfg.output_dir,
+        resumed_from.as_deref(),
+        resumed_from.as_ref().map(|_| state.global_step),
+        None,
+    )?;
     let mut latest_checkpoint = resumed_from.clone();
     let mut latest_checkpoint_step = resumed_from.as_ref().map(|_| state.global_step);
     if resumed_from.is_none() {
@@ -9802,6 +10037,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 latest_checkpoint.expect("completed training has a checkpoint"),
                 resumed_from,
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, cfg, &report)?;
             if let Some(p) = prefetcher.as_mut() {
@@ -9824,6 +10060,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 checkpoint,
                 resumed_from,
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, cfg, &report)?;
             if let Some(p) = prefetcher.as_mut() {
@@ -10496,6 +10733,7 @@ pub fn train(cfg: &TrainConfig) -> Result<TrainReport> {
                 parameter_count,
                 latest_checkpoint.expect("pause writes a checkpoint"),
                 resumed_from,
+                &run_attempts,
             );
             publish_run_artifacts(&varmap, cfg, &report)?;
             if let Some(p) = prefetcher.as_mut() {
@@ -13733,6 +13971,8 @@ mod tests {
             gradient_pressure_samples: vec![],
             foundation_v2: None,
             research_claim: false,
+            resume_count: 0,
+            run_attempts: vec![],
         };
         let s = serde_json::to_string(&report)?;
         let back: TrainReport = serde_json::from_str(&s)?;
@@ -14524,6 +14764,229 @@ mod tests {
         assert_eq!(active.gradient_clip_scale, 0.5);
         assert_eq!(active.next_latent, 0.0);
         fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// Regression for the E2 run root: three crashed resumes appended steps
+    /// 513..1024 three times, so the log held 512 duplicated global steps.
+    /// Replaying restarts must leave one trajectory that ends at the resumed
+    /// step, and must preserve every removed row in an attempt sidecar.
+    #[test]
+    fn loss_log_repair_replays_restarts_into_one_trajectory() -> Result<()> {
+        let root = checkpoint_test_root("loss-log-repair");
+        fs::create_dir_all(&root)?;
+        assert!(repair_loss_log_for_resume(&root, 7)?.is_none());
+        let row = |attempt: &str, step: u64| {
+            format!("{{\"global_step\":{step},\"total\":1.0,\"attempt\":\"{attempt}\"}}\n")
+        };
+        let mut log = String::new();
+        for step in 1..=6 {
+            log.push_str(&row("a", step));
+        }
+        for step in 3..=6 {
+            log.push_str(&row("b", step));
+        }
+        for step in 3..=8 {
+            log.push_str(&row("c", step));
+        }
+        log.push_str("{\"global_step\":9,\"tot");
+        let path = root.join("loss_log.jsonl");
+        fs::write(&path, &log)?;
+
+        let repair = repair_loss_log_for_resume(&root, 7)?.expect("log exists");
+        assert_eq!(repair.resumed_step, 7);
+        assert_eq!(repair.rows_before, 17);
+        assert_eq!(repair.rows_kept, 7);
+        assert_eq!(repair.rows_removed, 10);
+        let sidecar = root.join("loss_log.jsonl.attempt-1");
+        assert_eq!(repair.removed_rows_path.as_deref(), Some(sidecar.as_path()));
+        let kept = fs::read_to_string(&path)?
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).expect("kept row");
+                (
+                    value["attempt"].as_str().unwrap().to_string(),
+                    value["global_step"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            ("a", 1),
+            ("a", 2),
+            ("c", 3),
+            ("c", 4),
+            ("c", 5),
+            ("c", 6),
+            ("c", 7),
+        ]
+        .iter()
+        .map(|(attempt, step)| ((*attempt).to_string(), *step))
+        .collect::<Vec<_>>();
+        assert_eq!(kept, expected);
+        let removed = fs::read_to_string(&sidecar)?;
+        let removed_lines = removed.lines().collect::<Vec<_>>();
+        assert_eq!(removed_lines.len(), 10);
+        assert!(removed_lines[0].contains("\"a\"") && removed_lines[0].contains("3"));
+        assert!(removed_lines[4].contains("\"b\""));
+        assert!(removed_lines[8].contains("\"c\"") && removed_lines[8].contains("8"));
+        assert_eq!(removed_lines[9], "{\"global_step\":9,\"tot");
+        // Every original row survives in exactly one of the two files.
+        assert_eq!(
+            fs::read_to_string(&path)?.lines().count() + removed_lines.len(),
+            17
+        );
+
+        // A consistent log is left byte-identical and gets no sidecar.
+        let before = fs::read(&path)?;
+        let again = repair_loss_log_for_resume(&root, 7)?.expect("log exists");
+        assert_eq!(again.rows_removed, 0);
+        assert_eq!(again.removed_rows_path, None);
+        assert_eq!(fs::read(&path)?, before);
+        assert!(!root.join("loss_log.jsonl.attempt-2").exists());
+        assert!(fs::read_dir(&root)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("repair")
+        }));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// CPU end-to-end: a v6 foundation-v2 run persists as v6 in the report,
+    /// the checkpoint contract, and the evidence manifest; the manifest carries
+    /// explicit provenance and treatment flags; and a resume reconciles a
+    /// duplicated loss log into one trajectory while recording each attempt.
+    #[test]
+    fn v6_smoke_persists_identity_provenance_and_repairs_loss_log_on_resume() -> Result<()> {
+        use crate::p2::experiment::WorldCoreFamily;
+        let root = checkpoint_test_root("v6-identity-smoke");
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            v6_recursion_steps: 2,
+            ..TrainConfig::default()
+        };
+        cfg.apply_foundation_v2_recipe();
+        cfg.seed = 73;
+        cfg.steps_per_lesson = 2;
+        // Smallest batch the mixed stream accepts: one factual group plus a row.
+        cfg.physical_batch = crate::p2::data::FACTUAL_BRANCHES_PER_GROUP + 1;
+        cfg.output_dir = root.join("run");
+        cfg.checkpoint_every_steps = 0;
+        cfg.prefetch_batches = false;
+        cfg.max_steps_this_run = Some(1);
+        let paused = train(&cfg)?;
+        assert_eq!(paused.status, TrainStatus::Paused);
+        assert_eq!(paused.global_step, 1);
+        assert_eq!(paused.experiment.family, WorldCoreFamily::V6);
+        assert_eq!(paused.world_core_schema, "world_core_v6");
+        assert_eq!(paused.resume_count, 0);
+        assert_eq!(paused.run_attempts.len(), 1);
+        assert_eq!(paused.run_attempts[0].kind, RunAttemptKind::Fresh);
+        let state: TrainerState = read_json(&paused.latest_checkpoint.join("trainer_state.json"))?;
+        assert_eq!(
+            state.contract.experiment.as_ref().map(|e| e.family),
+            Some(WorldCoreFamily::V6)
+        );
+        let persisted: serde_json::Value = read_json(&cfg.output_dir.join("train_report.json"))?;
+        assert_eq!(persisted["experiment"]["family"], "v6");
+        assert_eq!(persisted["world_core_schema"], "world_core_v6");
+
+        let manifest: serde_json::Value = read_json(
+            &cfg.output_dir
+                .join(crate::p2::evidence::EVIDENCE_MANIFEST_FILE),
+        )?;
+        let identity = &manifest["identity"];
+        assert_eq!(identity["recipe"], "foundation_v2");
+        assert_eq!(identity["family"], "v6");
+        assert_eq!(identity["world_core_schema"], "world_core_v6");
+        assert_eq!(identity["world_core_v6"], true);
+        assert_eq!(identity["data_contract_v6"], true);
+        assert_eq!(identity["v6_recursion_steps"], 2);
+        assert_eq!(identity["physical_batch"], cfg.physical_batch as u64);
+        assert_eq!(identity["grad_accum"], 1);
+        assert_eq!(identity["effective_batch"], cfg.physical_batch as u64);
+        assert_eq!(manifest["comparison"]["treatment"]["family"], "v6");
+        let provenance = &manifest["provenance"];
+        for key in [
+            "source_revision",
+            "source_revision_origin",
+            "binary_sha256",
+            "candle_graph_revision",
+        ] {
+            let value = provenance[key].as_str().unwrap_or_default();
+            assert!(!value.is_empty(), "provenance.{key} must be explicit");
+        }
+        assert!(provenance["binary_sha256"]
+            .as_str()
+            .is_some_and(|sha| sha.starts_with("sha256:")));
+        assert_eq!(provenance["resume_count"], 0);
+        assert_eq!(provenance["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(provenance["attempts"][0]["kind"], "fresh");
+        assert!(provenance["attempts"][0]["binary_sha256"].is_string());
+
+        // A later launch that resumed from step 1, logged steps 2..=3, and
+        // died before checkpointing leaves stale rows past the checkpoint.
+        let log = cfg.output_dir.join("loss_log.jsonl");
+        let mut stale = fs::read_to_string(&log)?;
+        assert_eq!(stale.lines().count(), 1);
+        for step in 2..=3u64 {
+            stale.push_str(&format!(
+                "{{\"global_step\":{step},\"total\":0.0,\"stale\":true}}\n"
+            ));
+        }
+        fs::write(&log, stale)?;
+
+        cfg.max_steps_this_run = None;
+        let resumed = train(&cfg)?;
+        assert_eq!(resumed.status, TrainStatus::Completed);
+        assert_eq!(resumed.global_step, 2);
+        assert_eq!(resumed.experiment.family, WorldCoreFamily::V6);
+        assert_eq!(resumed.resume_count, 1);
+        assert_eq!(resumed.run_attempts.len(), 2);
+        let attempt = &resumed.run_attempts[1];
+        assert_eq!(attempt.attempt, 2);
+        assert_eq!(attempt.kind, RunAttemptKind::Resume);
+        assert_eq!(attempt.resumed_step, Some(1));
+        let repair = attempt
+            .loss_log_repair
+            .as_ref()
+            .expect("resume repairs the log");
+        assert_eq!(
+            (repair.rows_before, repair.rows_kept, repair.rows_removed),
+            (3, 1, 2)
+        );
+        let sidecar = cfg.output_dir.join("loss_log.jsonl.attempt-1");
+        assert_eq!(repair.removed_rows_path.as_deref(), Some(sidecar.as_path()));
+        assert_eq!(fs::read_to_string(&sidecar)?.lines().count(), 2);
+        let rows = fs::read_to_string(&log)?
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).expect("row");
+                assert!(value.get("stale").is_none(), "stale row survived: {line}");
+                value["global_step"].as_u64().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![1, 2]);
+        let manifest: serde_json::Value = read_json(
+            &cfg.output_dir
+                .join(crate::p2::evidence::EVIDENCE_MANIFEST_FILE),
+        )?;
+        assert_eq!(manifest["provenance"]["resume_count"], 1);
+        assert_eq!(
+            manifest["provenance"]["attempts"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(manifest["provenance"]["attempts"][1]["kind"], "resume");
+        assert!(manifest["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap.as_str().unwrap().contains("loss log was repaired")));
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
