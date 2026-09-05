@@ -246,6 +246,32 @@ the rest of the run.
   selection lands on step 20480, and that a real candidate with a doubled
   false-edit rate is still rejected by the guard.
 
+## Implementation correction (2026-09-05 — executable recipe contract)
+
+- Foundation-v2 now rejects `grad_accum != 1`. Its specialized loop executes
+  one physical batch per optimizer update, so accepting a larger value would
+  record a fictitious effective batch. Real accumulation remains deferred.
+- Rollout no longer depends on the main mixed batch accidentally containing
+  enough sequential rows. Every rollout-enabled update deterministically
+  constructs a separate population of exactly 16 distinct sequential units,
+  truncated to its first adjacent horizon-2 pair (exactly 32 source rows).
+  Its weighted parameter gradients are added to the main parameter gradients,
+  then the combined store receives one global clip and one optimizer step.
+- Main and rollout population fingerprints and row counts, plus the main
+  event-objective population's event census, are committed only after a
+  successful optimizer step. Dedicated rollout rows do not train the event
+  head. Non-finite skipped attempts are excluded from completed-update
+  provenance.
+- Preregistered `pressure_updates` must be reachable and publish route-aware
+  pre-clip norms and cosines for prediction, component objectives, action and
+  observer bundles, rollout, and the combined gradient. Norms cover each
+  route's complete parameter support; a disjoint nonzero support has cosine
+  zero rather than disappearing from the denominator.
+- This changes the training objective and evidence contract: objective
+  implementation revision 5, trainer state v11, and training report v14.
+  It is an engineering correction only until an exact-binary CUDA smoke and a
+  fresh registered experiment pass their gates.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every
@@ -309,8 +335,10 @@ Prerequisite control for every arm: the repaired H2 rollout path must
 demonstrably fire (>=16 fragments -> finite nonzero loss reaching the
 recurrent core; the sealed run trained with a rollout loss of exactly zero).
 `foundation_v2_rollout_floor_and_activation_premise` checks this at test
-time; it is not a runtime launch gate, so the launch preflight must verify
-a nonzero realized rollout loss on the actual batch size before a campaign.
+time. Objective revision 5 also constructs a dedicated sequential population
+at runtime, records the first weighted recurrent-core gradient, and refuses to
+complete without that durable activation premise. The exact launch binary must
+still demonstrate a nonzero realized rollout loss before a campaign.
 The one-treatment-per-arm rule is enforced at validation: enabling more
 than one treatment fails closed unless `allow_multi_treatment_arm`
 explicitly waives single-factor attribution.
@@ -409,9 +437,11 @@ Weights are initial; the gradient-budget controller (below) adapts EP only.
   tiny/degenerate matrices → Adam.
 - **WSD schedule**: 500-step warmup → stable 1e-3 → cosine decay to 1e-4 over
   the final 15%. EMA (decay 0.999) maintained; eval uses EMA weights.
-- Batch 2048 is the nominal target; launch preflight selects the largest stable
-  physical batch. The EP controller first limits its encoder pressure, then one
-  combined global L2 clip at 1.0 is applied to the complete objective.
+- Batch 2048 is the historical nominal target; launch preflight selects the
+  largest stable physical batch. Foundation-v2 currently requires
+  `grad_accum=1`, so physical and effective batch are identical. The EP
+  controller first limits its encoder pressure, then one combined global L2
+  clip at 1.0 is applied to the main and dedicated-rollout gradients.
 - 24,576 steps total. Checkpoint every 256; permanent eval bundle every 2048;
   **best-checkpoint tracking** by the configured held-out exactness metric
   (historical default: changed-exact); the exported evaluation model is the

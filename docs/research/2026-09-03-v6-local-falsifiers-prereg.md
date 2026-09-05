@@ -984,3 +984,18 @@ it is not a model promotion or an ARC evaluation.
    (longer evaluation histories so the production warm-up is reachable) lands.
 5. E3 t = 32 and the warm-up vacuity are being fixed by giving evaluation
    populations longer levels (training rows unchanged).
+
+## Correction from the 2026-09-05 recipe audit (thread 3407e91b)
+
+The later sealed E2 run at `dadc3e5f` did preserve the caller's recorded
+`grad_accum=2`, but the Foundation-v2 training loop still did not execute an
+accumulation loop. It consumed 524,288 rows (`4096 * 128`) and stepped once per
+128-row batch, so its effective-batch-256 registration and evidence identity
+are false. This supersedes every passage below that calls that run a valid E2
+FAIL: its frozen-checkpoint evaluator result is exploratory only.
+
+The same loop computed rollout only from the main mixed batch. Under the V6
+schedule, physical batch 128 cannot contain the required 16 adjacent
+fragments, so rollout loss was zero by construction. E2G is paused. The next
+action is the separately preregistered Foundation-v2 recipe-contract repair,
+not another context-routing or production-style training run.

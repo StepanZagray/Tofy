@@ -1001,6 +1001,8 @@ mod tests {
                 best_promotion_value: None,
                 best_checkpoint: None,
                 rollout_enabled: true,
+                rollout_population: None,
+                gradient_pressure: vec![],
                 permanent_checkpoints: vec![],
                 event_label_census: EventLabelCensus::default(),
                 event_label_census_complete: true,

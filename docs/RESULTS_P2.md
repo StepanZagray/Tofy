@@ -17,6 +17,30 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
+
+The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
+the registered effective-batch-256 experiment. Its Foundation-v2 config records
+physical batch 128 and `grad_accum=2`, but the specialized loop made one
+128-row batch, one backward, and one optimizer step per update; it never entered
+the generic accumulation loop. The report's 524,288 consumed rows are exactly
+`4096 * 128`, rather than `4096 * 128 * 2`. The artifact's effective-batch-256
+identity is therefore false even though its files and evaluator replay remain
+internally useful.
+
+The same source made rollout activation impossible: V6 allocated at most 15
+sequential rows in a physical-128 mixed batch, but the objective required 16
+distinct adjacent fragments. The observed mean rollout loss of `0.0` was inert
+by construction. Consequently E2's K16-K0 delta `0.0`, changed exactness, loss,
+and clipping telemetry are exploratory checkpoint diagnostics, not a valid
+registered E2 FAIL. E2G and any production-style retrain are paused pending the
+preregistered Foundation-v2 contract repair.
+
+This audit does not invalidate the later local LP85 replay as a statement about
+the frozen checkpoint's behavior: that checkpoint did complete level 1 again.
+It does invalidate any inference that the checkpoint was trained with effective
+batch 256 or with an active horizon-2 rollout objective.
+
 ## V6 2x2 E2F registered semantic confirmation (2026-09-05; PASS)
 
 E2F passed its frozen single-pair semantic confirmation. It reused the exact

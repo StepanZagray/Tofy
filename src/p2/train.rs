@@ -9,10 +9,11 @@ use crate::p2::cg_profile::{
 };
 use crate::p2::consumer_transition::ConsumerTransition;
 use crate::p2::data::{
-    adaptation_v6_stream_schedule, compose_mixed_stream_batch, foundation_v2_stream_schedule,
-    gameplay_rows, generate_curriculum, ArcFrame, ContentMask, ContentRect, EventLabelCensus,
-    FactualBatch, MixedStreamBatch, MixedStreamConfig, MixedStreamKind, OperatorFamily,
-    TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance, FRAME_SIDE, GOAL_FEATURES_DIM,
+    adaptation_v6_stream_schedule, compose_mixed_stream_batch, compose_rollout_fragment_batch,
+    foundation_v2_stream_schedule, gameplay_rows, generate_curriculum, ArcFrame, ContentMask,
+    ContentRect, EventLabelCensus, FactualBatch, MixedStreamBatch, MixedStreamConfig,
+    MixedStreamKind, OperatorFamily, TransitionSample, V5DataSplit, V5Sample, V5SampleProvenance,
+    FRAME_SIDE, GOAL_FEATURES_DIM,
 };
 use crate::p2::eval::{
     evaluate_gate_support_with_v5_provenance, GateSupportMetrics,
@@ -31,7 +32,7 @@ use crate::p2::model::{
     CONTEXT_PARAMETER_PREFIX, DEFAULT_NUM_EVENTS, LEGACY_PATCH_SIZE, OPERATOR_CONDITION_DIM,
     OPERATOR_FAMILY_UNKNOWN, OPERATOR_FAMILY_VOCAB, PALETTE_SIZE, PATCH_SIZE, PREFIX_HORIZONS,
 };
-use crate::p2::muon::MUON_RMS_SCALE;
+use crate::p2::muon::{uses_muon, MUON_RMS_SCALE};
 use crate::p2::optimizer::{
     accumulate_parameter_gradients, clip_gradients_gpu_with_stats,
     try_clip_gradients_gpu_with_stats, CheckpointHybridOptimizer, ModelEma,
@@ -133,6 +134,7 @@ const FOUNDATION_V2_CHECKPOINT_ARTIFACTS: &[&str] = &[
 ];
 pub(crate) const FOUNDATION_V2_GATE_SEED: u64 = 0xF0A2_DA7A_0000_0005;
 const FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS: usize = 16;
+const FOUNDATION_V2_ROLLOUT_SEED_DOMAIN: u64 = 0xA011_0A77_0000_0002;
 /// ADR 0003 §3.5 hinge margin on the L2 distance of normalized displacements.
 const FOUNDATION_V2_SEPARATION_MARGIN: f64 = 0.3;
 /// Per-event-slot multipliers: noop, satisfied, failed, exhausted. The
@@ -141,8 +143,8 @@ const FOUNDATION_V2_SEPARATION_MARGIN: f64 = 0.3;
 /// `augment_v5_transition` force-masks the label (ADR 0003 corrections);
 /// do not "fix" the weight instead of the premise.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v13";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v14";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v11";
 /// Revision of the foundation-v2 objective *implementation* (masks, loss
 /// construction, reductions, gates). Bump on any semantic change so a
 /// checkpoint trained under an older objective cannot silently resume under a
@@ -154,8 +156,11 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v10";
 /// plus unchanged-target copy-gate supervision on gameplay PAD pixels;
 /// 4 = episode-operator family and permuted-color conditioning at the action
 /// seam, and reliability observes thresholded factual latent prediction error
-/// while Q continues to observe graded composed-pixel accuracy.
-pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 4;
+/// while Q continues to observe graded composed-pixel accuracy;
+/// 5 = reject unimplemented Foundation-v2 accumulation, add a dedicated
+/// 16-fragment rollout population whose gradients join the main objective
+/// before clipping, and record route-aware per-objective gradient pressure.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 5;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -1399,8 +1404,13 @@ impl TrainConfig {
                 bail!("profile_updates must be unique, one-based update numbers");
             }
         }
-        if self.pressure_updates.contains(&0) {
-            bail!("pressure_updates are one-based and must be > 0");
+        if !self.pressure_updates.is_empty() {
+            let mut sorted = self.pressure_updates.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.first() == Some(&0) || sorted.len() != self.pressure_updates.len() {
+                bail!("pressure_updates must be unique, one-based update numbers");
+            }
         }
         if self.recipe != TrainingRecipe::FoundationV2 {
             for lesson in &self.lessons {
@@ -1670,6 +1680,23 @@ impl TrainConfig {
         if self.seed == FOUNDATION_V2_GATE_SEED {
             bail!("foundation-v2 training seed is reserved by the frozen gate population");
         }
+        if self.grad_accum != 1 {
+            bail!(
+                "foundation-v2 requires grad_accum=1: its specialized loop does not implement \
+                 gradient accumulation; refusing to record a fictitious effective batch"
+            );
+        }
+        if let Some(update) = self
+            .pressure_updates
+            .iter()
+            .copied()
+            .find(|update| *update > self.steps_per_lesson as u64)
+        {
+            bail!(
+                "foundation-v2 pressure update {update} exceeds the configured {} total updates",
+                self.steps_per_lesson
+            );
+        }
         let mut canonical = self.clone();
         canonical.apply_foundation_v2_recipe();
         // Preserve the runtime/provenance fields explicitly left caller-owned.
@@ -1919,6 +1946,46 @@ pub struct FoundationV2EpGradientSample {
     pub rail: Option<FoundationV2EpRail>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2RolloutActivation {
+    pub step: u64,
+    pub population_rows: usize,
+    pub eligible_fragments: usize,
+    pub loss: f64,
+    pub weighted_recurrent_core_gradient_l2: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GradientRouteStats {
+    pub global_l2: f64,
+    pub adamw_l2: f64,
+    pub muon_l2: f64,
+    #[serde(default)]
+    pub global_cosine_to_prediction: Option<f64>,
+    #[serde(default)]
+    pub adamw_cosine_to_prediction: Option<f64>,
+    #[serde(default)]
+    pub muon_cosine_to_prediction: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GradientComponentSample {
+    pub objective: String,
+    pub weight: f64,
+    pub routes: FoundationV2GradientRouteStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2GradientPressureSample {
+    pub step: u64,
+    pub main_population_rows: usize,
+    pub rollout_population_rows: usize,
+    pub rollout_fragments: usize,
+    pub components: Vec<FoundationV2GradientComponentSample>,
+    pub combined_pre_clip: FoundationV2GradientRouteStats,
+    pub clip_scale: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FoundationV2EpRail {
@@ -1977,9 +2044,12 @@ pub struct FoundationV2TrainingReport {
     pub best_promotion_value: Option<f64>,
     pub best_checkpoint: Option<PathBuf>,
     pub rollout_enabled: bool,
+    pub rollout_population: Option<FoundationV2RolloutActivation>,
+    pub gradient_pressure: Vec<FoundationV2GradientPressureSample>,
     pub permanent_checkpoints: Vec<PathBuf>,
-    /// Exact support observed in consumed generated rows, ordered as
-    /// noop/satisfied/failed/exhausted.
+    /// Exact event-head support observed in successfully consumed main-batch
+    /// rows, ordered as noop/satisfied/failed/exhausted. Dedicated rollout
+    /// rows do not train the event head and are intentionally excluded.
     #[serde(default)]
     pub event_label_census: EventLabelCensus,
     /// False for checkpoints created before event-census tracking began; in
@@ -2730,6 +2800,8 @@ struct FoundationV2TrainerState {
     gate_history: Vec<FoundationV2GateEvaluation>,
     best_changed_exact: Option<f64>,
     rollout_enabled: bool,
+    rollout_population: Option<FoundationV2RolloutActivation>,
+    gradient_pressure: Vec<FoundationV2GradientPressureSample>,
     loss_sums: FoundationV2LossMeans,
     loss_steps: u64,
     permanent_checkpoints: Vec<PathBuf>,
@@ -4882,6 +4954,158 @@ fn gradient_cosine_for_parameter_prefix(
     Ok((dot / (left_norm * right_norm)).clamp(-1.0, 1.0))
 }
 
+#[derive(Clone, Copy)]
+enum OptimizerRoute {
+    All,
+    AdamW,
+    Muon,
+}
+
+fn parameter_uses_route(name: &str, tensor: &Tensor, route: OptimizerRoute) -> bool {
+    match route {
+        OptimizerRoute::All => true,
+        OptimizerRoute::AdamW => !uses_muon(name, tensor.dims()),
+        OptimizerRoute::Muon => uses_muon(name, tensor.dims()),
+    }
+}
+
+fn gradient_l2_for_optimizer_route(
+    grads: &GradStore,
+    varmap: &VarMap,
+    route: OptimizerRoute,
+) -> Result<f64> {
+    let data = varmap.data().lock().unwrap();
+    let mut sum_sq: Option<Tensor> = None;
+    for (name, var) in data.iter() {
+        let tensor = var.as_tensor();
+        if !parameter_uses_route(name, tensor, route) {
+            continue;
+        }
+        if let Some(gradient) = grads.get(tensor) {
+            let squared = gradient.to_dtype(DType::F32)?.sqr()?.sum_all()?;
+            sum_sq = Some(match sum_sq {
+                None => squared,
+                Some(acc) => acc.add(&squared)?,
+            });
+        }
+    }
+    let Some(sum_sq) = sum_sq else {
+        return Ok(0.0);
+    };
+    let norm = sum_sq.sqrt()?.to_scalar::<f32>()? as f64;
+    if !norm.is_finite() {
+        bail!("optimizer-route gradient norm is not finite: {norm}");
+    }
+    Ok(norm)
+}
+
+fn gradient_cosine_for_optimizer_route(
+    left: &GradStore,
+    right: &GradStore,
+    varmap: &VarMap,
+    route: OptimizerRoute,
+) -> Result<Option<f64>> {
+    let data = varmap.data().lock().unwrap();
+    let mut dot: Option<Tensor> = None;
+    let mut left_sq: Option<Tensor> = None;
+    let mut right_sq: Option<Tensor> = None;
+    for (name, var) in data.iter() {
+        let tensor = var.as_tensor();
+        if !parameter_uses_route(name, tensor, route) {
+            continue;
+        }
+        let left = left
+            .get(tensor)
+            .map(|value| value.to_dtype(DType::F32))
+            .transpose()?;
+        let right = right
+            .get(tensor)
+            .map(|value| value.to_dtype(DType::F32))
+            .transpose()?;
+        if let Some(left) = &left {
+            let squared = left.sqr()?.sum_all()?;
+            left_sq = Some(match left_sq {
+                None => squared,
+                Some(acc) => acc.add(&squared)?,
+            });
+        }
+        if let Some(right) = &right {
+            let squared = right.sqr()?.sum_all()?;
+            right_sq = Some(match right_sq {
+                None => squared,
+                Some(acc) => acc.add(&squared)?,
+            });
+        }
+        if let (Some(left), Some(right)) = (left, right) {
+            let product = left.mul(&right)?.sum_all()?;
+            dot = Some(match dot {
+                None => product,
+                Some(acc) => acc.add(&product)?,
+            });
+        }
+    }
+    let (Some(left_sq), Some(right_sq)) = (left_sq, right_sq) else {
+        return Ok(None);
+    };
+    let left_norm = left_sq.sqrt()?.to_scalar::<f32>()? as f64;
+    let right_norm = right_sq.sqrt()?.to_scalar::<f32>()? as f64;
+    let dot = dot
+        .map(|value| value.to_scalar::<f32>())
+        .transpose()?
+        .unwrap_or(0.0) as f64;
+    if !(dot.is_finite() && left_norm.is_finite() && right_norm.is_finite()) {
+        bail!("optimizer-route gradient cosine is not finite");
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some((dot / (left_norm * right_norm)).clamp(-1.0, 1.0)))
+}
+
+fn foundation_v2_gradient_route_stats(
+    grads: &GradStore,
+    prediction_grads: Option<&GradStore>,
+    varmap: &VarMap,
+) -> Result<FoundationV2GradientRouteStats> {
+    let global_l2 = gradient_l2_for_optimizer_route(grads, varmap, OptimizerRoute::All)?;
+    let adamw_l2 = gradient_l2_for_optimizer_route(grads, varmap, OptimizerRoute::AdamW)?;
+    let muon_l2 = gradient_l2_for_optimizer_route(grads, varmap, OptimizerRoute::Muon)?;
+    let cosine = |route| {
+        prediction_grads
+            .map(|prediction| gradient_cosine_for_optimizer_route(grads, prediction, varmap, route))
+            .transpose()
+            .map(Option::flatten)
+    };
+    Ok(FoundationV2GradientRouteStats {
+        global_l2,
+        adamw_l2,
+        muon_l2,
+        global_cosine_to_prediction: cosine(OptimizerRoute::All)?,
+        adamw_cosine_to_prediction: cosine(OptimizerRoute::AdamW)?,
+        muon_cosine_to_prediction: cosine(OptimizerRoute::Muon)?,
+    })
+}
+
+fn foundation_v2_gradient_component_sample(
+    objective: &str,
+    weight: f64,
+    grads: &GradStore,
+    prediction_grads: &GradStore,
+    varmap: &VarMap,
+) -> Result<FoundationV2GradientComponentSample> {
+    Ok(FoundationV2GradientComponentSample {
+        objective: objective.into(),
+        weight,
+        routes: foundation_v2_gradient_route_stats(grads, Some(prediction_grads), varmap)?,
+    })
+}
+
+fn retain_parameter_gradients(grads: GradStore, varmap: &VarMap) -> Result<GradStore> {
+    let mut retained = None;
+    accumulate_parameter_gradients(&mut retained, grads, varmap)?;
+    Ok(retained.expect("parameter-gradient filtering always initializes the store"))
+}
+
 #[derive(Debug, Clone)]
 pub struct LossBreakdown {
     pub total: Tensor,
@@ -5414,7 +5638,7 @@ pub struct FoundationV2LossBreakdown {
     pub mechanism_seams: Option<FoundationV2MechanismSeams>,
 }
 
-pub const BF16_BENCHMARK_SCHEMA: &str = "p2.bf16_recurrent_core_benchmark.v1";
+pub const BF16_BENCHMARK_SCHEMA: &str = "p2.bf16_recurrent_core_benchmark.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bf16BenchmarkArm {
@@ -5462,12 +5686,13 @@ fn median_f64(values: &[f64]) -> Result<f64> {
 fn benchmark_bf16_arm(
     baseline_cfg: &TrainConfig,
     checkpoint: &Path,
-    mixed: &MixedStreamBatch,
+    training_batches: (&MixedStreamBatch, &MixedStreamBatch),
     device: &Device,
     bf16_recurrent_core: bool,
     warmup_updates: usize,
     measured_updates: usize,
 ) -> Result<Bf16BenchmarkArm> {
+    let (mixed, rollout_mixed) = training_batches;
     let mut cfg = baseline_cfg.clone();
     cfg.bf16_recurrent_core = bf16_recurrent_core;
     cfg.validate()?;
@@ -5495,6 +5720,15 @@ fn benchmark_bf16_arm(
     for update in 0..total_updates {
         sync_cuda_device(device)?;
         let started = std::time::Instant::now();
+        let (attached_rollout, fragments) =
+            foundation_v2_dedicated_rollout_loss(&model, rollout_mixed, device)?;
+        let rollout = attached_rollout.detach();
+        let weighted_rollout = attached_rollout.affine(cfg.rollout_weight, 0.0)?;
+        let raw_rollout_grads = weighted_rollout.backward()?;
+        let mut accumulated = None;
+        accumulate_parameter_gradients(&mut accumulated, raw_rollout_grads, &varmap)?;
+        drop(weighted_rollout);
+        drop(attached_rollout);
         let losses = foundation_v2_training_loss_with_event_weights(
             &model,
             mixed,
@@ -5506,15 +5740,19 @@ fn benchmark_bf16_arm(
                 sigreg_knots: cfg.sigreg_knots,
                 sigreg_seed: cfg.seed.wrapping_add(update as u64),
                 q_mse_threshold: cfg.q_mse_threshold,
-                rollout_enabled: true,
+                rollout_enabled: false,
                 split_ce_weighting: cfg.split_ce_weighting,
                 split_ce_changed_budget: cfg.split_ce_changed_budget,
                 capture_mechanism_seams: false,
             },
             &event_slot_weights,
         )?;
-        let total = losses.total.clone();
-        let mut grads = total.backward()?;
+        let total = losses
+            .total
+            .add(&rollout.affine(cfg.rollout_weight, 0.0)?)?;
+        let raw_main_grads = losses.total.backward()?;
+        accumulate_parameter_gradients(&mut accumulated, raw_main_grads, &varmap)?;
+        let mut grads = accumulated.expect("benchmark main gradient store exists");
         clip_gradients_gpu_with_stats(&mut grads, &varmap, MAX_GRAD_NORM)?;
         let learning_rate =
             foundation_v2_wsd_learning_rate(update + 1, cfg.steps_per_lesson.max(total_updates));
@@ -5531,7 +5769,7 @@ fn benchmark_bf16_arm(
                 update + 1
             );
         }
-        rollout_fragments = losses.rollout_fragments;
+        rollout_fragments = fragments;
         if update >= warmup_updates {
             step_ms.push(elapsed_ms);
         }
@@ -5583,10 +5821,22 @@ pub fn benchmark_bf16_recurrent_core(
         0,
         V5DataSplit::Train,
     )?;
+    let rollout_mixed = compose_rollout_fragment_batch(
+        &MixedStreamConfig {
+            batch_size: baseline_cfg.physical_batch,
+            seed: baseline_cfg.seed ^ FOUNDATION_V2_ROLLOUT_SEED_DOMAIN,
+            schedule: foundation_v2_stream_schedule,
+            data_contract_v6: baseline_cfg.data_contract_v6,
+            ..MixedStreamConfig::default()
+        },
+        FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
+        0,
+        V5DataSplit::Train,
+    )?;
     let f32 = benchmark_bf16_arm(
         baseline_cfg,
         checkpoint,
-        &mixed,
+        (&mixed, &rollout_mixed),
         &device,
         false,
         warmup_updates,
@@ -5595,7 +5845,7 @@ pub fn benchmark_bf16_recurrent_core(
     let bf16 = benchmark_bf16_arm(
         baseline_cfg,
         checkpoint,
-        &mixed,
+        (&mixed, &rollout_mixed),
         &device,
         true,
         warmup_updates,
@@ -5847,6 +6097,35 @@ pub fn foundation_v2_rollout_falsifier(
         bail!("BF16 falsifier H2 rollout loss is non-finite");
     }
     Ok((value, fragments))
+}
+
+/// Production rollout seam for the dedicated fragment-counted population.
+/// This fails closed instead of returning the legacy inert zero when the ADR
+/// trace floor is not met.
+fn foundation_v2_dedicated_rollout_loss(
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    device: &Device,
+) -> Result<(Tensor, usize)> {
+    let batch = batch_from_rows(mixed.samples(), device)?;
+    let encoded = if model.config().world_core_v6 {
+        model.encode_state_pair_for_training(&batch.frames, &batch.next_frames)?
+    } else {
+        model
+            .encode_state_pair_for_training_staged(&batch.model_frames, &batch.model_next_frames)?
+    };
+    let (loss, fragments) = foundation_v2_rollout_loss(model, mixed, &batch, &encoded, device)?;
+    if fragments < FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS {
+        bail!(
+            "dedicated Foundation-v2 rollout population produced {fragments} eligible fragments; \
+             at least {FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS} are required"
+        );
+    }
+    let value = f64::from(loss.detach().to_dtype(DType::F32)?.to_scalar::<f32>()?);
+    if !(value.is_finite() && value > 0.0) {
+        bail!("dedicated Foundation-v2 rollout loss must be finite and > 0, got {value}");
+    }
+    Ok((loss, fragments))
 }
 
 /// `detach_open_loop_input` exists only for the gradient-attribution premise
@@ -8700,6 +8979,8 @@ fn build_report(
             best_promotion_value,
             best_checkpoint,
             rollout_enabled: foundation.rollout_enabled,
+            rollout_population: foundation.rollout_population.clone(),
+            gradient_pressure: foundation.gradient_pressure.clone(),
             permanent_checkpoints: foundation.permanent_checkpoints.clone(),
             event_label_census: foundation.event_label_census,
             event_label_census_complete: foundation.event_label_census_complete,
@@ -8713,10 +8994,7 @@ fn build_report(
                         .join(format!("update-{update:012}"))
                 })
                 .collect(),
-            // Documented ADR 0003 approximation: EP is first constrained by
-            // its encoder-gradient controller, then the combined gradient is
-            // clipped at 1.0. We do not claim a separately clipped EP store.
-            clip_strategy: "adaptive EP budget, then combined global L2 clip at 1.0".into(),
+            clip_strategy: "adaptive EP budget; sum main and dedicated-rollout gradients; then one combined global L2 clip at 1.0".into(),
         }
     });
     TrainReport {
@@ -9138,6 +9416,60 @@ fn validate_foundation_v2_profile_resume(
     Ok(())
 }
 
+fn validate_foundation_v2_completion(cfg: &TrainConfig, state: &TrainerState) -> Result<()> {
+    let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
+    let missing_pressure = cfg
+        .pressure_updates
+        .iter()
+        .copied()
+        .filter(|update| {
+            !foundation
+                .gradient_pressure
+                .iter()
+                .any(|sample| sample.step == *update)
+        })
+        .collect::<Vec<_>>();
+    if !missing_pressure.is_empty() {
+        bail!(
+            "foundation-v2 completed without preregistered pressure evidence for updates \
+             {missing_pressure:?}"
+        );
+    }
+    if state.global_step > 0 && foundation.rollout_population.is_none() {
+        bail!("foundation-v2 completed updates without a durable rollout activation premise");
+    }
+    Ok(())
+}
+
+fn validate_foundation_v2_resume_evidence(cfg: &TrainConfig, state: &TrainerState) -> Result<()> {
+    let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
+    let missing_pressure = cfg
+        .pressure_updates
+        .iter()
+        .copied()
+        .filter(|update| *update <= state.global_step)
+        .filter(|update| {
+            !foundation
+                .gradient_pressure
+                .iter()
+                .any(|sample| sample.step == *update)
+        })
+        .collect::<Vec<_>>();
+    if !missing_pressure.is_empty() {
+        bail!(
+            "foundation-v2 resume passed pressure updates {missing_pressure:?} without \
+             durable route-aware attribution"
+        );
+    }
+    if state.global_step > 0 && foundation.rollout_population.is_none() {
+        bail!(
+            "foundation-v2 resume has completed updates without a durable rollout \
+             activation premise"
+        );
+    }
+    Ok(())
+}
+
 fn record_foundation_v2_profile_tensors(
     profile: &RepresentativeUpdateCapture,
     range: &ProfileRange<'_>,
@@ -9403,6 +9735,8 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 gate_history: Vec::new(),
                 best_changed_exact: None,
                 rollout_enabled: true,
+                rollout_population: None,
+                gradient_pressure: Vec::new(),
                 loss_sums: FoundationV2LossMeans::default(),
                 loss_steps: 0,
                 permanent_checkpoints: Vec::new(),
@@ -9507,9 +9841,19 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         &cfg.output_dir,
         &cfg.device,
     )?;
+    if resumed_from.is_some() {
+        validate_foundation_v2_resume_evidence(&cfg, &state)?;
+    }
     let stream_config = MixedStreamConfig {
         batch_size: cfg.physical_batch,
         seed: cfg.seed,
+        schedule: stream_schedule,
+        data_contract_v6: cfg.data_contract_v6,
+        ..MixedStreamConfig::default()
+    };
+    let rollout_stream_config = MixedStreamConfig {
+        batch_size: cfg.physical_batch,
+        seed: cfg.seed ^ FOUNDATION_V2_ROLLOUT_SEED_DOMAIN,
         schedule: stream_schedule,
         data_contract_v6: cfg.data_contract_v6,
         ..MixedStreamConfig::default()
@@ -9535,6 +9879,9 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
 
     loop {
         let complete = state.global_step >= total_steps as u64;
+        if complete {
+            validate_foundation_v2_completion(&cfg, &state)?;
+        }
         if complete || PAUSE_REQUESTED.load(Ordering::SeqCst) {
             if let Some(prefetcher) = data_prefetcher.as_mut() {
                 prefetcher.shutdown();
@@ -9664,27 +10011,123 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             }
         };
         let batch_event_census = mixed.event_label_census();
-        {
-            let total = &mut state
-                .foundation_v2
-                .as_mut()
-                .expect("foundation-v2 state")
-                .event_label_census;
-            total.rows += batch_event_census.rows;
-            for slot in 0..4 {
-                total.labeled[slot] += batch_event_census.labeled[slot];
-                total.positive[slot] += batch_event_census.positive[slot];
-            }
-        }
-        update_training_population(
-            &mut state,
-            mixed.transitions(),
-            mixed.content_masks(),
-            Some(content_batch_digest),
-        )?;
         let (ep_weight, rollout_enabled) = {
             let foundation = state.foundation_v2.as_ref().expect("foundation-v2 state");
             (foundation.ep_weight, foundation.rollout_enabled)
+        };
+        let pressure_scheduled = cfg.pressure_updates.contains(&next_step)
+            && !state
+                .foundation_v2
+                .as_ref()
+                .expect("foundation-v2 state")
+                .gradient_pressure
+                .iter()
+                .any(|sample| sample.step == next_step);
+        let (
+            rollout_loss,
+            rollout_fragments,
+            rollout_population_rows,
+            mut rollout_grads,
+            pending_rollout_activation,
+            rollout_population,
+        ) = if rollout_enabled {
+            let rollout_mixed = if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "rollout_generation",
+                    SpanKind::Module,
+                    None,
+                    || {
+                        compose_rollout_fragment_batch(
+                            &rollout_stream_config,
+                            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
+                            state.global_step,
+                            V5DataSplit::Train,
+                        )
+                    },
+                )?
+            } else {
+                compose_rollout_fragment_batch(
+                    &rollout_stream_config,
+                    FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
+                    state.global_step,
+                    V5DataSplit::Train,
+                )?
+            };
+            let rollout_digest = training_content_batch_digest(
+                rollout_mixed.transitions(),
+                rollout_mixed.content_masks(),
+            )?;
+            let rollout_population_rows = rollout_mixed.samples().len();
+            let (attached_loss, fragments) = if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "rollout_forward",
+                    SpanKind::Function,
+                    Some(ExecutionStep::Forward),
+                    || foundation_v2_dedicated_rollout_loss(&model, &rollout_mixed, &device),
+                )?
+            } else {
+                foundation_v2_dedicated_rollout_loss(&model, &rollout_mixed, &device)?
+            };
+            let loss = attached_loss.detach();
+            let weighted = attached_loss.affine(cfg.rollout_weight, 0.0)?;
+            let raw_grads = if let Some(profile) = &cg_profile {
+                profile.synchronized_phase(
+                    &device,
+                    "rollout_backward",
+                    SpanKind::Function,
+                    Some(ExecutionStep::Backward),
+                    || weighted.backward().map_err(Into::into),
+                )?
+            } else {
+                weighted.backward()?
+            };
+            let grads = retain_parameter_gradients(raw_grads, &varmap)?;
+            drop(weighted);
+            drop(attached_loss);
+            let activation = if state
+                .foundation_v2
+                .as_ref()
+                .expect("foundation-v2 state")
+                .rollout_population
+                .is_none()
+            {
+                let recurrent_core_l2 =
+                    gradient_l2_for_parameter_prefix(&grads, &varmap, "block.")?;
+                if !(recurrent_core_l2.is_finite() && recurrent_core_l2 > 0.0) {
+                    bail!(
+                        "weighted dedicated rollout gradient does not reach the recurrent core: \
+                         L2={recurrent_core_l2}"
+                    );
+                }
+                Some(FoundationV2RolloutActivation {
+                    step: next_step,
+                    population_rows: rollout_population_rows,
+                    eligible_fragments: fragments,
+                    loss: f64::from(loss.detach().to_dtype(DType::F32)?.to_scalar::<f32>()?),
+                    weighted_recurrent_core_gradient_l2: recurrent_core_l2,
+                })
+            } else {
+                None
+            };
+            (
+                loss,
+                fragments,
+                rollout_population_rows,
+                Some(grads),
+                activation,
+                Some((rollout_mixed, rollout_digest)),
+            )
+        } else {
+            (
+                Tensor::zeros((), DType::F32, &device)?,
+                0,
+                0,
+                None,
+                None,
+                None,
+            )
         };
         let objective = FoundationV2ObjectiveConfig {
             ep_weight,
@@ -9692,14 +10135,17 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             sigreg_knots: cfg.sigreg_knots,
             sigreg_seed: cfg.seed.wrapping_add(state.global_step),
             q_mse_threshold: cfg.q_mse_threshold,
-            rollout_enabled,
+            // Production owns rollout as a separately backpropagated,
+            // fragment-counted population below. Keeping it out of the main
+            // mixed loss avoids retaining both full graphs at once.
+            rollout_enabled: false,
             split_ce_weighting: cfg.split_ce_weighting,
             split_ce_changed_budget: cfg.split_ce_changed_budget,
             capture_mechanism_seams: cg_profile
                 .as_ref()
                 .is_some_and(RepresentativeUpdateCapture::active),
         };
-        let losses = if let Some(profile) = &cg_profile {
+        let mut losses = if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
                 &device,
                 "forward_loss",
@@ -9726,11 +10172,13 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 &event_slot_weights,
             )?
         };
+        losses.rollout = rollout_loss.clone();
+        losses.rollout_fragments = rollout_fragments;
         if next_step.is_multiple_of(128) {
-            // These two attribution stores are read-only. Their graphs are
-            // reused below for the actual combined backward pass.
-            let ep_grads = losses.ep.backward()?;
-            let pred_grads = losses.pred_ce.backward()?;
+            // Retain only parameter gradients so the diagnostic backward
+            // stores cannot hold intermediate activations through the update.
+            let ep_grads = retain_parameter_gradients(losses.ep.backward()?, &varmap)?;
+            let pred_grads = retain_parameter_gradients(losses.pred_ce.backward()?, &varmap)?;
             let ep_norm = gradient_l2_for_parameter_prefix(&ep_grads, &varmap, "encoder.")?;
             let pred_norm = gradient_l2_for_parameter_prefix(&pred_grads, &varmap, "encoder.")?;
             let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
@@ -9755,9 +10203,82 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             .as_ref()
             .expect("foundation-v2 state")
             .ep_weight;
-        let total = losses
+        let main_total = losses
             .non_ep_total
             .add(&losses.ep.affine(effective_ep_weight, 0.0)?)?;
+        let total = main_total.add(&rollout_loss.affine(cfg.rollout_weight, 0.0)?)?;
+        let pending_component_pressure = if pressure_scheduled {
+            let prediction_grads = retain_parameter_gradients(losses.pred_ce.backward()?, &varmap)?;
+            let mut components = vec![foundation_v2_gradient_component_sample(
+                "pred_ce",
+                1.0,
+                &prediction_grads,
+                &prediction_grads,
+                &varmap,
+            )?];
+            for (name, weight, weighted_loss) in [
+                ("gate", 0.5, losses.gate.affine(0.5, 0.0)?),
+                ("latent", 0.25, losses.latent.affine(0.25, 0.0)?),
+                ("enc_ce", 0.1, losses.enc_ce.affine(0.1, 0.0)?),
+                ("separation", 0.2, losses.separation.affine(0.2, 0.0)?),
+                ("pull", 0.1, losses.pull.affine(0.1, 0.0)?),
+                (
+                    "inverse_action",
+                    0.1,
+                    losses.inverse_action.affine(0.1, 0.0)?,
+                ),
+                (
+                    "ep",
+                    effective_ep_weight,
+                    losses.ep.affine(effective_ep_weight, 0.0)?,
+                ),
+                (
+                    "action_bundle",
+                    1.0,
+                    losses
+                        .separation
+                        .affine(0.2, 0.0)?
+                        .add(&losses.pull.affine(0.1, 0.0)?)?
+                        .add(&losses.inverse_action.affine(0.1, 0.0)?)?,
+                ),
+                (
+                    "detached_observer_bundle",
+                    1.0,
+                    losses
+                        .event
+                        .affine(0.1, 0.0)?
+                        .add(&losses.q.affine(0.1, 0.0)?)?
+                        .add(&losses.reliability.affine(0.1, 0.0)?)?,
+                ),
+            ] {
+                let component_grads =
+                    retain_parameter_gradients(weighted_loss.backward()?, &varmap)?;
+                components.push(foundation_v2_gradient_component_sample(
+                    name,
+                    weight,
+                    &component_grads,
+                    &prediction_grads,
+                    &varmap,
+                )?);
+            }
+            components.push(match rollout_grads.as_ref() {
+                Some(grads) => foundation_v2_gradient_component_sample(
+                    "rollout",
+                    cfg.rollout_weight,
+                    grads,
+                    &prediction_grads,
+                    &varmap,
+                )?,
+                None => FoundationV2GradientComponentSample {
+                    objective: "rollout".into(),
+                    weight: cfg.rollout_weight,
+                    routes: FoundationV2GradientRouteStats::default(),
+                },
+            });
+            Some((components, prediction_grads))
+        } else {
+            None
+        };
         if let Some(profile) = &cg_profile {
             profile.synchronized_phase_with_range(
                 &device,
@@ -9772,17 +10293,41 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 },
             )?;
         }
-        let mut grads = if let Some(profile) = &cg_profile {
+        let raw_main_grads = if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
                 &device,
                 "backward",
                 SpanKind::Function,
                 Some(ExecutionStep::Backward),
-                || total.backward().map_err(Into::into),
+                || main_total.backward().map_err(Into::into),
             )?
         } else {
-            total.backward()?
+            main_total.backward()?
         };
+        let mut accumulated_grads = None;
+        accumulate_parameter_gradients(&mut accumulated_grads, raw_main_grads, &varmap)?;
+        if let Some(rollout_grads) = rollout_grads.take() {
+            accumulate_parameter_gradients(&mut accumulated_grads, rollout_grads, &varmap)?;
+        }
+        let mut grads = accumulated_grads.expect("main Foundation-v2 gradient store exists");
+        let pending_gradient_pressure =
+            if let Some((components, prediction_grads)) = pending_component_pressure {
+                Some(FoundationV2GradientPressureSample {
+                    step: next_step,
+                    main_population_rows: mixed.samples().len(),
+                    rollout_population_rows,
+                    rollout_fragments,
+                    components,
+                    combined_pre_clip: foundation_v2_gradient_route_stats(
+                        &grads,
+                        Some(&prediction_grads),
+                        &varmap,
+                    )?,
+                    clip_scale: 0.0,
+                })
+            } else {
+                None
+            };
         if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
                 &device,
@@ -9820,6 +10365,32 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             } else {
                 optimizer.step(&grads)?;
             }
+            update_training_population(
+                &mut state,
+                mixed.transitions(),
+                mixed.content_masks(),
+                Some(content_batch_digest),
+            )?;
+            if let Some((rollout_mixed, rollout_digest)) = &rollout_population {
+                update_training_population(
+                    &mut state,
+                    rollout_mixed.transitions(),
+                    rollout_mixed.content_masks(),
+                    Some(*rollout_digest),
+                )?;
+            }
+            {
+                let total = &mut state
+                    .foundation_v2
+                    .as_mut()
+                    .expect("foundation-v2 state")
+                    .event_label_census;
+                total.rows += batch_event_census.rows;
+                for slot in 0..4 {
+                    total.labeled[slot] += batch_event_census.labeled[slot];
+                    total.positive[slot] += batch_event_census.positive[slot];
+                }
+            }
             let values =
                 foundation_v2_loss_values(&losses, &total, clip.pre_clip_norm, clip.scale)?;
             if let Some(profile) = &cg_profile {
@@ -9836,6 +10407,13 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             loss_log.append(next_step, &values, learning_rate)?;
             state.active_sums = {
                 let foundation = state.foundation_v2.as_mut().expect("foundation-v2 state");
+                if let Some(activation) = pending_rollout_activation {
+                    foundation.rollout_population = Some(activation);
+                }
+                if let Some(mut pressure) = pending_gradient_pressure {
+                    pressure.clip_scale = clip.scale;
+                    foundation.gradient_pressure.push(pressure);
+                }
                 add_foundation_v2_loss_sums(&mut foundation.loss_sums, &values);
                 foundation.loss_steps += 1;
                 update_foundation_v2_rollout_zero_streak(
@@ -9856,6 +10434,12 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 bail!(
                     "non-finite gradient on preregistered profile update {next_step}; \
                      rerun with a different profile step"
+                );
+            }
+            if pending_gradient_pressure.is_some() {
+                bail!(
+                    "non-finite gradient on preregistered pressure update {next_step}; \
+                     route-aware attribution cannot be silently skipped"
                 );
             }
             eprintln!(
@@ -9880,6 +10464,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
         drop(losses);
         drop(grads);
         drop(mixed);
+        drop(rollout_population);
         state.global_step = next_step;
         state.optimizer_step = optimizer.step_t();
         updates_this_run += 1;
@@ -10910,6 +11495,61 @@ mod tests {
     use crate::p2::data::{palette, ArcAction, EpisodeOperator, GoalFeatures, OperatorFamily};
 
     #[test]
+    fn gradient_cosine_counts_disjoint_parameter_support_in_both_norms() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        {
+            let mut data = varmap.data().lock().unwrap();
+            data.insert(
+                "left.bias".into(),
+                Var::from_tensor(&Tensor::zeros((2,), DType::F32, &device)?)?,
+            );
+            data.insert(
+                "right.bias".into(),
+                Var::from_tensor(&Tensor::zeros((3,), DType::F32, &device)?)?,
+            );
+        }
+        let (left_parameter, right_parameter) = {
+            let data = varmap.data().lock().unwrap();
+            (
+                data["left.bias"].as_tensor().clone(),
+                data["right.bias"].as_tensor().clone(),
+            )
+        };
+        let mut left = GradStore::default();
+        left.insert(&left_parameter, Tensor::ones_like(&left_parameter)?);
+        let mut right = GradStore::default();
+        right.insert(&right_parameter, Tensor::ones_like(&right_parameter)?);
+
+        assert_eq!(
+            gradient_cosine_for_optimizer_route(&left, &right, &varmap, OptimizerRoute::All)?,
+            Some(0.0)
+        );
+        assert_eq!(
+            gradient_cosine_for_optimizer_route(&left, &right, &varmap, OptimizerRoute::AdamW)?,
+            Some(0.0)
+        );
+        assert_eq!(
+            gradient_cosine_for_optimizer_route(&left, &right, &varmap, OptimizerRoute::Muon)?,
+            None
+        );
+        let serialized = serde_json::to_value(FoundationV2GradientRouteStats::default())?;
+        for field in [
+            "global_cosine_to_prediction",
+            "adamw_cosine_to_prediction",
+            "muon_cosine_to_prediction",
+        ] {
+            assert!(
+                serialized
+                    .get(field)
+                    .is_some_and(serde_json::Value::is_null),
+                "undefined cosine {field} must serialize explicitly as null"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn foundation_v2_unimix_ce_matches_materialized_reference() -> Result<()> {
         let device = Device::Cpu;
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xCE_F005);
@@ -11863,6 +12503,8 @@ mod tests {
             gate_history,
             best_changed_exact: None,
             rollout_enabled: true,
+            rollout_population: None,
+            gradient_pressure: vec![],
             loss_sums: FoundationV2LossMeans::default(),
             loss_steps: 0,
             permanent_checkpoints: vec![],
@@ -11872,6 +12514,73 @@ mod tests {
             profiles_published: vec![],
             rollout_zero_loss_consecutive_steps: 0,
             gate_population_identity: None,
+        }
+    }
+
+    #[test]
+    fn foundation_v2_pressure_and_rollout_evidence_fail_closed_at_resume_and_completion() {
+        let mut cfg = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            steps_per_lesson: 1,
+            pressure_updates: vec![1],
+            ..TrainConfig::default()
+        };
+        cfg.apply_foundation_v2_recipe();
+        cfg.pressure_updates = vec![1];
+        let mut foundation = checkpoint_foundation_state(vec![]);
+        foundation.total_steps = 1;
+        let mut state = TrainerState {
+            schema: TRAINER_STATE_SCHEMA.into(),
+            contract: TrainingContract::from(&cfg),
+            global_step: 1,
+            lesson_index: 0,
+            step_in_lesson: 0,
+            optimizer_step: 1,
+            completed_lessons: vec![],
+            active_sums: LessonLossMeans::default(),
+            parameter_names: vec![],
+            training_population_hash: default_training_population_hash(),
+            training_content_hash: [0; 32],
+            training_population_rows: 0,
+            batch_schedule_migrations: vec![],
+            nonfinite_skipped_updates: vec![],
+            profile: ProfileState::Pending,
+            gradient_pressure: None,
+            gradient_pressure_samples: vec![],
+            foundation_v2: Some(foundation),
+        };
+
+        for error in [
+            validate_foundation_v2_resume_evidence(&cfg, &state)
+                .expect_err("resume must reject missing pressure evidence"),
+            validate_foundation_v2_completion(&cfg, &state)
+                .expect_err("completion must reject missing pressure evidence"),
+        ] {
+            assert!(error.to_string().contains("pressure"), "{error:#}");
+        }
+
+        state
+            .foundation_v2
+            .as_mut()
+            .unwrap()
+            .gradient_pressure
+            .push(FoundationV2GradientPressureSample {
+                step: 1,
+                main_population_rows: 1,
+                rollout_population_rows: 2,
+                rollout_fragments: 1,
+                components: vec![],
+                combined_pre_clip: FoundationV2GradientRouteStats::default(),
+                clip_scale: 1.0,
+            });
+        for error in [
+            validate_foundation_v2_resume_evidence(&cfg, &state)
+                .expect_err("resume must reject missing rollout evidence"),
+            validate_foundation_v2_completion(&cfg, &state)
+                .expect_err("completion must reject missing rollout evidence"),
+        ] {
+            assert!(error.to_string().contains("rollout"), "{error:#}");
         }
     }
 
@@ -14594,9 +15303,9 @@ mod tests {
         // Papers-audit mandatory control: the imported run trained with
         // rollout "enabled" but a mean rollout loss of exactly zero, so no
         // architecture arm can be interpreted until this path demonstrably
-        // fires. Below the 16-fragment floor the loss must be exactly zero;
-        // at a full batch it must be finite, nonzero, and reach the
-        // recurrent core's parameters.
+        // fires. The ordinary physical-128 mix remains below the 16-fragment
+        // floor; the dedicated fragment-counted population must be finite,
+        // nonzero, and reach the recurrent core's parameters.
         let device = Device::Cpu;
         let mut cfg = TrainConfig::default();
         cfg.apply_foundation_v2_recipe();
@@ -14634,24 +15343,60 @@ mod tests {
         assert_eq!(small_fragments, 0, "inert rollout must report inactive");
         assert_eq!(small_loss.to_dtype(DType::F32)?.to_scalar::<f32>()?, 0.0);
 
-        let full = compose_mixed_stream_batch(
+        let dedicated = compose_rollout_fragment_batch(
             &MixedStreamConfig {
-                batch_size: 512,
+                batch_size: 128,
                 seed: 52,
                 schedule: foundation_v2_stream_schedule,
                 ..MixedStreamConfig::default()
             },
-            0.5,
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
             0,
             V5DataSplit::Train,
         )?;
-        let full_samples = full.transitions().cloned().collect::<Vec<_>>();
-        let full_batch = batch_from_samples(&full_samples, &device)?;
-        let full_encoded =
-            model.encode_state_pair_for_training(&full_batch.frames, &full_batch.next_frames)?;
-        let (loss, fragments) =
-            foundation_v2_rollout_loss(&model, &full, &full_batch, &full_encoded, &device)?;
-        assert!(fragments >= FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
+        assert_eq!(
+            dedicated.samples().len(),
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS * 2
+        );
+        let fragment_keys = dedicated
+            .transitions()
+            .map(|sample| (sample.seed, sample.episode_id, sample.family.clone()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fragment_keys.len(),
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
+            "dedicated rollout units must be distinct"
+        );
+        let replay = compose_rollout_fragment_batch(
+            &MixedStreamConfig {
+                batch_size: 128,
+                seed: 52,
+                schedule: foundation_v2_stream_schedule,
+                ..MixedStreamConfig::default()
+            },
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS,
+            0,
+            V5DataSplit::Train,
+        )?;
+        assert_eq!(
+            training_content_batch_digest(dedicated.transitions(), dedicated.content_masks())?,
+            training_content_batch_digest(replay.transitions(), replay.content_masks())?,
+            "dedicated rollout population must replay deterministically"
+        );
+        let dedicated_samples = dedicated.transitions().cloned().collect::<Vec<_>>();
+        let dedicated_batch = batch_from_samples(&dedicated_samples, &device)?;
+        let dedicated_encoded = model.encode_state_pair_for_training(
+            &dedicated_batch.frames,
+            &dedicated_batch.next_frames,
+        )?;
+        let (loss, fragments) = foundation_v2_rollout_loss(
+            &model,
+            &dedicated,
+            &dedicated_batch,
+            &dedicated_encoded,
+            &device,
+        )?;
+        assert_eq!(fragments, FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS);
         let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         assert!(value.is_finite() && value > 0.0, "rollout loss {value}");
         let core_grad_vec = |loss: &Tensor| -> Result<Vec<f32>> {
@@ -14674,9 +15419,9 @@ mod tests {
         // one; the attached/detached difference can.
         let (detached_loss, _) = foundation_v2_rollout_loss_inner(
             &model,
-            &full,
-            &full_batch,
-            &full_encoded,
+            &dedicated,
+            &dedicated_batch,
+            &dedicated_encoded,
             &device,
             true,
         )?;
@@ -14688,6 +15433,108 @@ mod tests {
                 .any(|(a, d)| (a - d).abs() > 0.0),
             "first open-loop transition contributes no core gradient"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn foundation_v2_one_update_records_rollout_and_pressure_contract() -> Result<()> {
+        let root = checkpoint_test_root("foundation-v2-recipe-contract");
+        let mut cfg = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            ..TrainConfig::default()
+        };
+        cfg.apply_foundation_v2_recipe();
+        cfg.seed = 0xA11D_0005;
+        cfg.steps_per_lesson = 1;
+        cfg.physical_batch = crate::p2::data::FACTUAL_BRANCHES_PER_GROUP + 1;
+        cfg.grad_accum = 1;
+        cfg.output_dir = root.join("run");
+        cfg.checkpoint_every_steps = 0;
+        cfg.prefetch_batches = false;
+        cfg.pressure_updates = vec![1];
+
+        let report = train(&cfg)?;
+        let foundation = report.foundation_v2.as_ref().expect("foundation report");
+        let activation = foundation
+            .rollout_population
+            .as_ref()
+            .expect("rollout activation premise");
+        assert_eq!(activation.step, 1);
+        assert_eq!(
+            activation.eligible_fragments,
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS
+        );
+        assert_eq!(
+            activation.population_rows,
+            FOUNDATION_V2_MIN_ROLLOUT_FRAGMENTS * 2
+        );
+        assert!(activation.loss.is_finite() && activation.loss > 0.0);
+        assert!(
+            activation.weighted_recurrent_core_gradient_l2.is_finite()
+                && activation.weighted_recurrent_core_gradient_l2 > 0.0
+        );
+        assert_eq!(foundation.gradient_pressure.len(), 1);
+        let pressure = &foundation.gradient_pressure[0];
+        assert_eq!(pressure.step, 1);
+        assert_eq!(pressure.main_population_rows, cfg.physical_batch);
+        assert_eq!(pressure.rollout_population_rows, activation.population_rows);
+        assert_eq!(pressure.rollout_fragments, activation.eligible_fragments);
+        assert!(pressure.combined_pre_clip.global_l2.is_finite());
+        assert!(pressure.combined_pre_clip.adamw_l2.is_finite());
+        assert!(pressure.combined_pre_clip.muon_l2.is_finite());
+        assert!(pressure.clip_scale.is_finite() && pressure.clip_scale > 0.0);
+        assert_eq!(
+            pressure
+                .components
+                .iter()
+                .map(|component| component.objective.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "pred_ce",
+                "gate",
+                "latent",
+                "enc_ce",
+                "separation",
+                "pull",
+                "inverse_action",
+                "ep",
+                "action_bundle",
+                "detached_observer_bundle",
+                "rollout",
+            ]
+        );
+        for component in &pressure.components {
+            assert!(component.routes.global_l2.is_finite());
+            assert!(component.routes.adamw_l2.is_finite());
+            assert!(component.routes.muon_l2.is_finite());
+            for cosine in [
+                component.routes.global_cosine_to_prediction,
+                component.routes.adamw_cosine_to_prediction,
+                component.routes.muon_cosine_to_prediction,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(cosine.is_finite());
+            }
+        }
+        for required in ["pred_ce", "action_bundle", "rollout"] {
+            let component = pressure
+                .components
+                .iter()
+                .find(|component| component.objective == required)
+                .unwrap_or_else(|| panic!("missing pressure component {required}"));
+            assert!(
+                component.routes.global_l2 > 0.0,
+                "zero pressure for {required}"
+            );
+        }
+        assert_eq!(
+            report.training_population_rows,
+            (cfg.physical_batch + activation.population_rows) as u64
+        );
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
@@ -15590,10 +16437,10 @@ mod tests {
         assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
     }
 
-    /// 2026-09-04 audit: `--grad-accum` must survive the recipe. E2 was
-    /// launched with `--grad-accum 2` and silently ran at 1.
+    /// Recipe application must not rewrite caller input, but specialized
+    /// loops must reject accumulation they do not execute.
     #[test]
-    fn recipes_preserve_caller_owned_grad_accum() {
+    fn recipes_preserve_but_reject_unsupported_grad_accum() {
         for recipe in [TrainingRecipe::FoundationV2, TrainingRecipe::FullV4] {
             let mut cfg = TrainConfig {
                 world_core_v6: recipe == TrainingRecipe::FoundationV2,
@@ -15607,12 +16454,28 @@ mod tests {
             }
             cfg.physical_batch = 128;
             assert_eq!(cfg.grad_accum, 8, "{recipe:?} recipe overwrote grad_accum");
-            if recipe == TrainingRecipe::FoundationV2 {
-                cfg.validate()
-                    .expect("accumulation is caller-owned under foundation-v2");
-                assert_eq!(TrainingContract::from(&cfg).grad_accum, 8);
-            }
+            let error = cfg
+                .validate()
+                .expect_err("specialized recipe must reject unsupported accumulation");
+            assert!(error.to_string().contains("grad_accum=1"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn foundation_v2_rejects_unreachable_pressure_updates() {
+        let mut cfg = TrainConfig {
+            world_core_v6: true,
+            data_contract_v6: true,
+            steps_per_lesson: 1,
+            pressure_updates: vec![2],
+            ..TrainConfig::default()
+        };
+        cfg.apply_foundation_v2_recipe();
+        cfg.pressure_updates = vec![2];
+        let error = cfg
+            .validate()
+            .expect_err("pressure targets beyond the run must fail closed");
+        assert!(error.to_string().contains("exceeds"), "{error:#}");
     }
 
     /// The deferred depth treatment runs a v6 arm at 3x3 through the recipe,

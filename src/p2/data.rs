@@ -3999,6 +3999,127 @@ fn compose_sequential_stream(
     Ok((samples, next_unit_index))
 }
 
+/// Build the dedicated Foundation-v2 horizon-2 population from distinct
+/// sequential units. Unlike [`compose_mixed_stream_batch`], this constructor
+/// is fragment-counted rather than row-counted: every retained unit has at
+/// least one adjacent transition pair, so the caller can enforce ADR 0003's
+/// 16-trace premise without increasing the main physical batch.
+pub fn compose_rollout_fragment_batch(
+    config: &MixedStreamConfig,
+    fragment_count: usize,
+    batch_index: u64,
+    split: V5DataSplit,
+) -> Result<MixedStreamBatch> {
+    ensure!(
+        fragment_count > 0,
+        "rollout fragment count must be positive"
+    );
+    config.validate()?;
+
+    let output_rows = fragment_count
+        .checked_mul(2)
+        .context("rollout population row count overflow")?;
+    let mut samples = Vec::with_capacity(output_rows);
+    let mut accepted = 0usize;
+    let mut attempted = 0usize;
+    let maximum_attempts = fragment_count
+        .checked_mul(32)
+        .context("rollout fragment attempt budget overflow")?;
+    while accepted < fragment_count {
+        let wave = (fragment_count - accepted).min(maximum_attempts - attempted);
+        ensure!(
+            wave > 0,
+            "could not generate {fragment_count} adjacent rollout fragments"
+        );
+        let units = (0..wave)
+            .into_par_iter()
+            .map(|offset| {
+                compose_nonfactual_unit(
+                    config,
+                    split,
+                    MixedStreamKind::SequentialFragments,
+                    mixed_stream_episode_id(
+                        batch_index,
+                        u64::try_from(attempted + offset)
+                            .context("rollout fragment unit index does not fit u64")?,
+                    )?,
+                    MIXED_STREAM_FRAGMENT_ROWS,
+                )
+            })
+            .collect::<Vec<_>>();
+        attempted += wave;
+        for unit in units {
+            let mut unit = unit?;
+            if unit.len() < 2 {
+                continue;
+            }
+            unit.truncate(2);
+            samples.extend(unit);
+            accepted += 1;
+        }
+    }
+
+    for sample in &samples {
+        sample.validate_after_unit_fields()?;
+        ensure!(
+            sample.provenance.contract_v6 == config.data_contract_v6,
+            "rollout batch mixes v6 and legacy interface contracts"
+        );
+    }
+    ensure!(
+        samples.len() == output_rows,
+        "rollout population produced {} rows for {fragment_count} fragments",
+        samples.len()
+    );
+    let proportions = MixedStreamProportions {
+        random_one_step: 0.0,
+        factual_branches: 0.0,
+        exploration: 0.0,
+        sequential_fragments: 1.0,
+        hazard_one_step: 0.0,
+        learning_histories: 0.0,
+        synthetic_shards: 0.0,
+    };
+    let stream_counts = proportions
+        .ordered()
+        .into_iter()
+        .map(|(kind, _)| {
+            (
+                kind,
+                usize::from(kind == MixedStreamKind::SequentialFragments) * samples.len(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let goal_dropout_census = GoalDropoutCensus {
+        total: samples.len(),
+        eligible: samples
+            .iter()
+            .filter(|sample| sample.original_goal_nonzero)
+            .count(),
+        changed: samples
+            .iter()
+            .filter(|sample| sample.original_goal_nonzero && sample.provenance.goal_dropped)
+            .count(),
+        final_zero_goal: samples
+            .iter()
+            .filter(|sample| sample.transition.goal_features.values == [0.0; GOAL_FEATURES_DIM])
+            .count(),
+    };
+    Ok(MixedStreamBatch {
+        samples,
+        factual: None,
+        factual_group_ranges: Vec::new(),
+        stream_counts: stream_counts.clone(),
+        scheduled_proportions: proportions,
+        realized_proportions: RealizedStreamProportions {
+            normalized_target: proportions,
+            counts: stream_counts,
+            fractions: proportions,
+        },
+        goal_dropout_census,
+    })
+}
+
 struct ComposedFactualGroup {
     samples: Vec<V5Sample>,
     group: BranchGroup,
