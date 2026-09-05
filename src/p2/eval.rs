@@ -165,6 +165,11 @@ pub struct EvalConfig {
     pub mode: EvalMode,
     #[serde(default = "default_representation_row_cap")]
     pub representation_row_cap: usize,
+    /// Compute the oracle-latent identifiability bridge and covariance
+    /// diagnostics. Enabled by default for report compatibility; narrow
+    /// falsifiers may disable it when the diagnostic is outside their claim.
+    #[serde(default = "default_identifiability")]
+    pub identifiability: bool,
     /// Publish representative candle-graph inference evidence. CLI defaults
     /// this on; the serde/default path stays off for legacy embedded configs.
     #[serde(default)]
@@ -229,6 +234,10 @@ fn default_representation_row_cap() -> usize {
     DEFAULT_REPRESENTATION_ROW_CAP
 }
 
+fn default_identifiability() -> bool {
+    true
+}
+
 impl Default for EvalConfig {
     fn default() -> Self {
         Self {
@@ -249,6 +258,7 @@ impl Default for EvalConfig {
             ensemble_members: 8,
             mode: default_eval_mode(),
             representation_row_cap: default_representation_row_cap(),
+            identifiability: default_identifiability(),
             profile_eval: false,
             context_ablation: false,
             adaptation_falsifier: false,
@@ -5422,6 +5432,16 @@ fn eval_identifiability(
     })
 }
 
+fn eval_identifiability_if_requested(
+    enabled: bool,
+    samples: &[TransitionSample],
+    encoders: &[Option<Vec<f32>>],
+) -> Option<IdentifiabilityMetrics> {
+    enabled
+        .then(|| eval_identifiability(samples, encoders))
+        .flatten()
+}
+
 fn eval_events(
     logits: &Tensor,
     targets: &Tensor,
@@ -6955,7 +6975,8 @@ fn eval_sample_set(
     if with_rollout {
         log_sub_phase("rollouts[model]");
     }
-    let identifiability = eval_identifiability(samples, &encoder_embeddings);
+    let identifiability =
+        eval_identifiability_if_requested(cfg.identifiability, samples, &encoder_embeddings);
     log_sub_phase("identifiability");
     let semantic = if train_cfg.world_core_v4 {
         Some(timed_eval_phase("semantic_decode", source, || {
@@ -11569,6 +11590,7 @@ mod tests {
             ensemble_members: 4,
             mode: EvalMode::Full,
             representation_row_cap: 7,
+            identifiability: true,
             profile_eval: false,
             context_ablation: false,
             adaptation_falsifier: false,
@@ -12080,6 +12102,22 @@ mod tests {
                 .to_bits(),
             reference_frobenius.to_bits()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn identifiability_can_be_disabled_before_kernel_dispatch() -> Result<()> {
+        let sources = collect_synthetic_sources(
+            0x1DE7,
+            1,
+            &["random_one_step", "exploration"],
+            Split::HeldOutComposition,
+        )?;
+        let samples = flatten_sources(&sources);
+        assert!(samples.iter().any(|sample| sample.oracle_latent.is_some()));
+        let encoders = vec![Some(vec![0.25, -0.5, 0.75, 1.0]); samples.len()];
+        assert!(eval_identifiability_if_requested(true, &samples, &encoders).is_some());
+        assert!(eval_identifiability_if_requested(false, &samples, &encoders).is_none());
         Ok(())
     }
 

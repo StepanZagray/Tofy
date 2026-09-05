@@ -744,6 +744,11 @@ pub struct P2EvalArgs {
     #[arg(long, value_enum, default_value_t = EvalMode::Full)]
     pub eval_mode: EvalMode,
 
+    /// Compute oracle-latent identifiability diagnostics. Disable for narrow
+    /// falsifiers whose registered statistic does not use this O(d^3) bridge.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub identifiability: bool,
+
     /// Publish one representative candle-graph evaluation bundle.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub profile_eval: bool,
@@ -824,6 +829,7 @@ impl P2EvalArgs {
             ensemble_members: self.ensemble_members,
             mode: self.eval_mode,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
+            identifiability: self.identifiability,
             profile_eval: self.profile_eval,
             context_ablation: self.context_ablation,
             adaptation_falsifier: self.adaptation_falsifier,
@@ -995,6 +1001,7 @@ impl P2Arc3EvalArgs {
             ensemble_members: 8,
             mode: EvalMode::Full,
             representation_row_cap: crate::p2::representation::DEFAULT_REPRESENTATION_ROW_CAP,
+            identifiability: true,
             profile_eval: self.profile_eval,
             context_ablation: false,
             adaptation_falsifier: false,
@@ -1353,6 +1360,7 @@ mod tests {
             .args
             .to_config();
         assert!(!legacy.twin_memorization);
+        assert!(legacy.identifiability);
         assert_eq!(
             legacy.twin_memorization_pairs,
             crate::p2::eval::TWIN_MEMORIZATION_DEFAULT_PAIRS
@@ -1366,7 +1374,18 @@ mod tests {
             .args
             .to_config();
         assert!(twin.twin_memorization);
+        assert!(twin.identifiability);
         assert_eq!(twin.twin_memorization_pairs, 256);
+        let focused = EvalWrapper::try_parse_from([
+            "p2-eval",
+            "--twin-memorization",
+            "--identifiability=false",
+        ])
+        .expect("focused twin diagnostic parses")
+        .args
+        .to_config();
+        assert!(focused.twin_memorization);
+        assert!(!focused.identifiability);
         let shaped = EvalWrapper::try_parse_from([
             "p2-eval",
             "--twin-memorization",

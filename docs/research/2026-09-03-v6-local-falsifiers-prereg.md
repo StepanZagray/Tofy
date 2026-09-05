@@ -227,6 +227,11 @@ amendment.
   training stream is unchanged (pinned content digest).
 - The `--context-ablation` proxy is kept as a reported number only; it is not
   the gate.
+- Exact E2 invocations set `--identifiability=false`. The oracle-latent ridge
+  bridge is outside the K=16 versus K=0 claim and, at v6's 32,768-dimensional
+  representation seam, its current primal implementation requires a 4 GiB
+  Gram matrix and O(d^3) solve. The flag is recorded in the evaluation command
+  identity and changes no twin population, model forward, reducer, or verdict.
 
 ## Amendment (2026-09-04): 2x2 is the v6 baseline
 
