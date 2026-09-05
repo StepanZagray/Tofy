@@ -847,6 +847,119 @@ experiment registration name, not a post-hoc relabeling of E2E or E2D.
   recursively verify the final root, and record the manifest digest outside
   it. Do not read public ARC data.
 
+## Post-E2 screen E2G: simultaneous-pair capacity and held-out routing (2026-09-05)
+
+This section was frozen after the sealed E2F PASS was analyzed and before E2G
+implementation or model output. E2F proves exact causal routing only on one
+directly trained pair. E2G is the authorized simultaneous multi-pair screen;
+it is not a model promotion or an ARC evaluation.
+
+- **Prior expectation and resource boundary.** A held-out routing PASS is
+  unlikely: the frozen checkpoint's E2R own-versus-paired NLL response was only
+  `-2.23e-7`, and registered E2's K=16-minus-K0 changed-exact delta was `0.0`.
+  The likely result is trained-capacity PASS plus held-out FAIL, which would
+  identify the direct supervised objective rather than the 2x2 wiring path as
+  the next constraint. The maximum registered cost is one local GPU-hour; an
+  exact 8-update preflight must measure and extrapolate runtime before that
+  spend. E2G remains useful because no existing result measures simultaneous
+  interference or whether direct training induces any unseen-pair routing.
+- **Exact claims.** Capacity claim T: starting from the sealed E2 step-4096 EMA,
+  the E2F objective can fit eight selected twin pairs simultaneously without
+  pair-level interference by fixed checkpoints 256 and 512. Routing claim R,
+  the only load-bearing science gate: training on those eight pairs changes
+  data-true own-versus-paired separation in the correct direction on 32 fixed
+  qualifying pairs that never contribute a gradient, and the swapped arm
+  changes it in the opposite direction. This remains a single initialization,
+  one synthetic generator, and one GPU.
+- **Model-free fixed selection.** From the registered 256-pair population
+  (`seed = 1_000_002`, fingerprint
+  `sha256:484e8615e41102895997ddb9bec19665604fb7f62d21db9cc5ecea1470e58f42`),
+  before loading a model, repeatedly apply E2F's exact eligibility rule and
+  earliest-position rule to obtain the first 40 qualifying pairs in ascending
+  meta-episode order starting at ID 2. The first eight are train pairs; the next
+  32 are held out. Thus the first train pair is exactly E2F's meta-episode 2.
+  Before any CUDA run, a CPU-only derivation must freeze every ordered
+  row/window/target/mask digest and a digest over the complete ordered 40-pair
+  list in the registered spec and append that list digest to this section.
+  Any drift is integrity failure. Held-out rows may be decoded but must never
+  enter a differentiable batch or loss.
+- **Arms and comparator class.** Retain `correct_a`, `correct_b`, and `swapped`
+  with bit-identical initialization, fresh zero-state AdamW, canonical
+  parameter order, and deterministic cuDNN backward algorithms. Correct A/B
+  are replicas for integrity only and provide no additional statistical sample.
+  The causal comparators are each held-out pair's checkpoint-0 response and the
+  swapped arm. Bind E2F report
+  `sha256:968d05d9dc15e85fb3179d26d9575b6f0dad6da9f22910e33eccd69432334a27`
+  under external manifest
+  `sha256:c82d2e7e1c7b0be0fc008ef53ef8a8375aef0e05d4e51da22283f1a58627be0a`
+  as the fixed N=1 capacity premise, not as a held-out comparator.
+- **Pair-balanced objective.** Use the unchanged direct raw exact-decoder
+  Unimix CE only on each train pair's target-disagreement pixels, but normalize
+  within each pair before averaging pairs:
+  `L = (1/8) sum_i [(1/(2m_i)) sum_rows,pixels CE_i]`. A pooled pixel mean is
+  forbidden because the known pair sizes include `m = 2` and `m = 28`, so the
+  larger pair could dominate by 14x. Use a per-row mask, physical batch 16
+  (two rows for each of eight pairs), accumulation 1, F32, zero noise, AdamW
+  learning rate `1e-3`, betas `(0.9, 0.999)`, epsilon `1e-8`, zero weight
+  decay, and global clip 1.0.
+- **Budget and observations.** Run exactly 512 updates unless an integrity or
+  deadline failure stops the run. Fixed checkpoint family is
+  `0, 8, 16, 32, 64, 128, 256, 512`; checkpoints before 256 are descriptive
+  only. Evaluate all train and held-out pairs with the canonical batch-1
+  singleton estimator. There is no early model stop and no saved weight.
+- **Generalized integrity gates.** Retain fixed parent/E2W parity, complete
+  checkpoint-0 evaluator replay, exact correct-replica update/parameter/
+  checkpoint identity, and exact preflight-versus-registered parity at update
+  8. For every pair and arm require finite decodes, per-pair batch-2 duplicate
+  K0 identity including context summary, batch-1 versus actual batch-16 raw and
+  composed argmax label identity over all 4,096 gameplay pixels for each train
+  row, retained singleton score reproduction, and per-pair K0 raw correctness
+  `<= m_i` of `2m_i`. Cross-shape NLL differences remain descriptive. Any
+  failure sets both evidence classes to `failed_infrastructure_or_integrity`
+  and yields no model verdict.
+- **Capacity gate T.** At both fixed checkpoints 256 and 512, a train pair
+  passes only if each correct replica has per-pair `D > 1e-4`, own raw argmax
+  `2m_i/2m_i`, and paired `0/2m_i`, while swapped has `D < -1e-4`, own
+  `0/2m_i`, and paired `2m_i/2m_i`; both correct-minus-swapped interactions
+  exceed `2e-4`, every arm is probability/argmax sensitive, and all per-pair K0
+  gates pass. `capacity_pass` requires 8/8 pairs at both checkpoints,
+  `capacity_partial` requires 6-7/8, and `capacity_fail` is at most 5/8. Never
+  replace per-pair gates with aggregate pixels or loss. The trained-set result
+  is optimization/interference evidence only: the direct objective and swapped
+  label permutation make routing on trained rows nearly tautological.
+- **Held-out routing gate R.** For held-out pair `j` and arm `x`, define
+  `Delta_j(x) = D_j(x, checkpoint) - D_j(x, checkpoint 0)` using canonical
+  singleton NLL. At both checkpoints 256 and 512, require correct A to have at
+  least 24/32 strictly positive deltas and median delta `> 1e-4`; require
+  swapped to have at most 8/32 strictly positive deltas and median delta
+  `< -1e-4`. Correct B must reproduce A bit-for-bit but is not counted as a
+  second sample. The symmetric sign thresholds each have one-sided binomial
+  null tail approximately 0.0035; these are descriptive conditional-on-model
+  calibrations in this exploratory screen, not population-level confidence.
+  Report held-out exact argmax totals but never gate on them. If T fails, R is
+  descriptive only. There is one fixed primary conjunction at checkpoints
+  256/512, so no checkpoint multiplicity or post-hoc selection is allowed.
+- **Verdict and next decision.** `multipair_routing_pass` requires capacity
+  PASS and held-out R at both fixed final checkpoints. It authorizes only a
+  freshly preregistered Foundation-V2 training run adding a context-contrastive
+  objective across the full synthetic population, still gated on held-out
+  K=16-versus-K0 changed exactness before E3. Capacity PASS plus R FAIL (the
+  prior expectation) authorizes a matched local objective comparison—direct CE
+  versus context-contrastive versus explicit rule prediction—at this same
+  8-train/32-held-out scale. Capacity partial/fail requires the fixed
+  `N = 1, 2, 4, 8` ladder before objective work. No E2G outcome by itself
+  authorizes 3x3, remote scaling, planning claims, or ARC play.
+- **Execution and stop contract.** Implement a new registered schema/command;
+  do not loosen E2F flags. Use reviewed, pushed, clean Tofy, candle_graph
+  `8e012f25e38f0c597c14268f0c705e504a5b5c28`, exact locked cuDNN release
+  build, one binary/GPU UUID, global GPU lock, never-reused roots, lifecycle,
+  and recursive external seals. Run an exact 256-population, 8-update preflight
+  first with a 10-minute internal/outer cap. It must pass every integrity gate,
+  bind the E2F evidence, and project the registered wall time below 60 minutes.
+  The registered run binds that preflight and has matching internal/outer
+  60-minute caps. Stop on any integrity, input, source, device, deadline, or
+  hash mismatch. Do not read public ARC data.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`
