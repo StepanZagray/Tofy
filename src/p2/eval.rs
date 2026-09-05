@@ -3757,7 +3757,7 @@ const LEARNING_HISTORY_EVAL_POPULATION_DOMAIN: &str =
 /// exact full-context view consumed by the v6 evaluators. This reuses the
 /// canonical full-row codec, including goal, labels, provenance and every
 /// factual transition in the reconstructed context window.
-fn learning_history_population_fingerprint<'a>(
+pub(crate) fn learning_history_population_fingerprint<'a>(
     histories: impl IntoIterator<Item = &'a AugmentedLearningHistory>,
 ) -> String {
     let mut hash = Sha256::new();
@@ -4408,7 +4408,9 @@ pub struct TwinMemorizationReport {
     pub verdict: TwinMemorizationVerdict,
 }
 
-fn twin_memorization_population(spec: &TwinMemorizationSpec) -> Result<Vec<AugmentedTwinPair>> {
+pub(crate) fn twin_memorization_population(
+    spec: &TwinMemorizationSpec,
+) -> Result<Vec<AugmentedTwinPair>> {
     spec.validate()?;
     let stream_cfg = adaptation_falsifier_stream_config(spec.population_seed);
     stream_cfg.validate()?;
@@ -4427,7 +4429,11 @@ fn twin_memorization_population(spec: &TwinMemorizationSpec) -> Result<Vec<Augme
 
 /// Whether the `K` window `[position - k, position)` holds an
 /// outcome-changing row of the pair.
-fn twin_window_has_evidence(divergence: &TwinPairDivergence, position: usize, k: usize) -> bool {
+pub(crate) fn twin_window_has_evidence(
+    divergence: &TwinPairDivergence,
+    position: usize,
+    k: usize,
+) -> bool {
     divergence
         .outcome_changing_positions
         .iter()
@@ -4491,7 +4497,7 @@ pub fn twin_memorization_census(
 /// members of every pair remain observationally identical until the hidden
 /// rule changes an outcome, and the registered scoring/filtering sets are
 /// non-empty.
-fn validate_twin_memorization_census(
+pub(crate) fn validate_twin_memorization_census(
     spec: &TwinMemorizationSpec,
     census: &TwinMemorizationCensus,
 ) -> Result<()> {
@@ -4535,7 +4541,7 @@ fn validate_twin_memorization_census(
 /// The chronological row `position` of `history` under the registered
 /// statistic: its own transition with exactly the `k` preceding chronological
 /// transitions as the Context Window (`position >= k`).
-fn twin_memorization_scoring_row(
+pub(crate) fn twin_memorization_scoring_row(
     history: &AugmentedLearningHistory,
     position: usize,
     k: usize,
@@ -4575,16 +4581,17 @@ fn decode_rows_bounded(
 /// Detached prediction details needed to localize an exact-metric tie. Kept
 /// separate from [`AdaptationFalsifierDecodes`] so E3 does not pay the memory
 /// or host-transfer cost of E2R's continuous diagnostic.
-struct TwinContinuousDecodes {
-    true_predictions: Vec<Vec<u8>>,
-    composed: Vec<Vec<u8>>,
-    latent: Vec<Vec<f32>>,
-    log_probs: Vec<Vec<f32>>,
-    copy_gate: Vec<Vec<f32>>,
-    context_summary: Vec<Vec<f32>>,
+pub(crate) struct TwinContinuousDecodes {
+    pub(crate) true_predictions: Vec<Vec<u8>>,
+    pub(crate) composed: Vec<Vec<u8>>,
+    pub(crate) latent: Vec<Vec<f32>>,
+    pub(crate) probabilities: Vec<Vec<f32>>,
+    pub(crate) log_probs: Vec<Vec<f32>>,
+    pub(crate) copy_gate: Vec<Vec<f32>>,
+    pub(crate) context_summary: Vec<Vec<f32>>,
 }
 
-fn twin_continuous_decode_rows(
+pub(crate) fn twin_continuous_decode_rows(
     model: &WorldModel,
     rows: &[TransitionSample],
     device: &Device,
@@ -4623,6 +4630,9 @@ fn twin_continuous_decode_rows(
     let latent = flatten_latent(&prediction)?
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()?;
+    let probabilities = ops::softmax(&logits, D::Minus1)?
+        .reshape((rows.len(), ()))?
+        .to_vec2::<f32>()?;
     let log_probs = ops::log_softmax(&logits, D::Minus1)?
         .reshape((rows.len(), ()))?
         .to_vec2::<f32>()?;
@@ -4641,6 +4651,7 @@ fn twin_continuous_decode_rows(
         true_predictions,
         composed,
         latent,
+        probabilities,
         log_probs,
         copy_gate,
         context_summary,
@@ -4656,6 +4667,7 @@ fn twin_continuous_decode_rows_bounded(
         true_predictions: Vec::with_capacity(rows.len()),
         composed: Vec::with_capacity(rows.len()),
         latent: Vec::with_capacity(rows.len()),
+        probabilities: Vec::with_capacity(rows.len()),
         log_probs: Vec::with_capacity(rows.len()),
         copy_gate: Vec::with_capacity(rows.len()),
         context_summary: Vec::with_capacity(rows.len()),
@@ -4665,6 +4677,7 @@ fn twin_continuous_decode_rows_bounded(
         decodes.true_predictions.extend(part.true_predictions);
         decodes.composed.extend(part.composed);
         decodes.latent.extend(part.latent);
+        decodes.probabilities.extend(part.probabilities);
         decodes.log_probs.extend(part.log_probs);
         decodes.copy_gate.extend(part.copy_gate);
         decodes.context_summary.extend(part.context_summary);

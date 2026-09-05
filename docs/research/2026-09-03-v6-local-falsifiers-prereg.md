@@ -396,10 +396,11 @@ or provide ARC-AGI-3 planning evidence.
   Record direct loss, update-1 context-parameter gradient norm, global
   pre-clip norm, and clip scale, and fail closed on zero/non-finite context
   gradient, any non-finite value, source/data/hash drift, CUDA failure, or a
-  mixed-batch K0 leak. Early success requires both the wiring and promotion
-  gates below at the earliest two consecutive evaluation checkpoints; a
-  continuous-only wiring pass continues through update 256 and returns
-  `wiring_only_no_promotion`. Otherwise run both arms through update 256. No
+  mixed-batch K0 leak. Early success occurs at the first two consecutive
+  evaluation checkpoints where both the wiring and promotion gates hold. An
+  earlier wiring-only pair does not suppress a later joint pass; a run with
+  wiring but no consecutive joint pair continues through update 256 and
+  returns `wiring_only_no_promotion`. Otherwise run both arms through update 256. No
   fine-tuned checkpoint may be reused as held-out, E2, E3, or ARC evidence.
 - **Frozen evaluation comparisons.** At every evaluation checkpoint, score
   both query directions with own K=16, paired K=16, and K0 context. Over only
@@ -429,16 +430,20 @@ or provide ARC-AGI-3 planning evidence.
 - **Uncertainty and multiplicity.** This is one deterministic selected pair,
   so no confidence interval or population-level inference is reported. The
   complete checkpoint family is fixed to `0, 8, 16, 32, 64, 128, 256`; only
-  the first two consecutive registered checkpoints satisfying the stated
-  gates may produce early success, and no post-hoc checkpoint, direction,
+  the first two consecutive registered checkpoints jointly satisfying both
+  stated gates may produce early success, and no earlier wiring-only pair
+  precludes that joint pair. No post-hoc checkpoint, direction,
   metric, seed, or threshold selection is allowed.
 - **Execution evidence.** Use a never-reused run root with lifecycle state,
   exact Tofy and sibling revisions, locked build command/features, binary and
   checkpoint SHA-256, device identity, selected physical batch/accumulation,
   row/population hashes, configuration, per-checkpoint metrics, command log,
-  and an external finalized-file manifest digest. A bounded CUDA launch
-  preflight on the exact binary must pass first; that preflight cannot satisfy
-  E2W. The registered E2W result itself remains `implementation_smoke`
+  and a recursively verified external finalized-file manifest digest. Bind
+  the checkpoint and config to the complete sealed E2 parent manifest. A
+  256-pair, 8-update CUDA launch preflight on the exact binary, source,
+  dependency, checkpoint, config, selected row, and GPU must complete and seal
+  successfully first; the registered report binds that preflight manifest and
+  report. The preflight cannot satisfy E2W. The registered E2W result itself remains `implementation_smoke`
   evidence and can authorize only the explicitly stated small multi-pair
   follow-up, never a model promotion or E3.
 

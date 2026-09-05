@@ -1213,7 +1213,7 @@ fn default_spatial_action_residual_scale() -> f64 {
     0.25
 }
 
-fn sync_cuda_device(device: &Device) -> Result<()> {
+pub(crate) fn sync_cuda_device(device: &Device) -> Result<()> {
     if device.is_cuda() {
         device.synchronize()?;
     }
@@ -5641,7 +5641,7 @@ fn mean_tensors_or_zero(values: Vec<Tensor>, zero: &Tensor) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
-fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+pub(crate) fn foundation_v2_unimix_ce(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
     let pixels = labels.elem_count();
     let selected = candle_nn::ops::softmax(logits, D::Minus1)?
         .reshape((pixels, PALETTE_SIZE))?

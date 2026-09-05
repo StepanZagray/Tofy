@@ -1,7 +1,8 @@
-//! Exclusive CUDA session lock per P2 output directory.
+//! Exclusive CUDA session locks for P2 GPU work.
 //!
-//! Prevents `p2-train` and `p2-eval` from sharing a GPU simultaneously — a common
-//! cause of immediate OOM on resume when a stuck eval holds ~500+ MiB.
+//! A user-scoped global lock prevents runs rooted in different directories from
+//! sharing the GPU, while the legacy per-output lock keeps local tooling and
+//! watchers compatible.
 
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File, OpenOptions};
@@ -16,6 +17,18 @@ const POLL: Duration = Duration::from_millis(500);
 
 fn lock_path(output_dir: &Path) -> PathBuf {
     output_dir.join(LOCK_NAME)
+}
+
+fn global_lock_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let user_id = unsafe { libc::geteuid() };
+        PathBuf::from("/tmp").join(format!("tofy-p2-gpu-{user_id}.lock"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("tofy-p2-gpu.lock")
+    }
 }
 
 fn train_pid_path(output_dir: &Path) -> PathBuf {
@@ -62,14 +75,15 @@ fn is_tofy_gpu_process(pid: u32) -> bool {
                 && (cmd.contains("p2-train")
                     || cmd.contains("p2-eval")
                     || cmd.contains("p2-arc3-live-eval")
-                    || cmd.contains("p2-arc3-bridge"))
+                    || cmd.contains("p2-arc3-bridge")
+                    || cmd.contains("p2-context-wiring"))
         })
         .unwrap_or(false)
 }
 
 fn stale_lock_pid(path: &Path) -> Option<u32> {
     let pid = read_pid_file(path)?;
-    if process_alive(pid) && is_tofy_gpu_process(pid) {
+    if process_alive(pid) && (pid == std::process::id() || is_tofy_gpu_process(pid)) {
         Some(pid)
     } else {
         let _ = fs::remove_file(path);
@@ -93,17 +107,24 @@ pub fn wait_for_gpu_idle(output_dir: &Path) -> Result<()> {
                 continue;
             }
         }
-        if let Some(pid) = stale_lock_pid(&lock_path(output_dir)) {
-            if pid != std::process::id() {
-                if Instant::now() >= deadline {
-                    bail!(
-                        "timed out waiting for gpu.lock holder pid={pid} in {}",
-                        output_dir.display()
-                    );
+        let mut blocked = false;
+        for path in [global_lock_path(), lock_path(output_dir)] {
+            if let Some(pid) = stale_lock_pid(&path) {
+                if pid != std::process::id() {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for GPU lock holder pid={pid} at {}",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(POLL);
+                    blocked = true;
+                    break;
                 }
-                std::thread::sleep(POLL);
-                continue;
             }
+        }
+        if blocked {
+            continue;
         }
         return Ok(());
     }
@@ -159,37 +180,58 @@ impl Drop for TrainPidGuard {
     }
 }
 
-/// RAII exclusive GPU session for one output directory.
+/// RAII exclusive GPU session across every Tofy output root for this user.
 pub struct GpuSessionGuard {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
+    pid: u32,
 }
 
 impl GpuSessionGuard {
     pub fn acquire(output_dir: &Path) -> Result<Self> {
         fs::create_dir_all(output_dir)
             .with_context(|| format!("create {}", output_dir.display()))?;
-        let path = lock_path(output_dir);
-        loop {
-            wait_for_gpu_idle(output_dir)?;
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())
-                        .with_context(|| format!("write gpu lock {}", path.display()))?;
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("acquire gpu lock {}", path.display()));
+        let pid = std::process::id();
+        let mut guard = Self {
+            paths: Vec::with_capacity(2),
+            pid,
+        };
+        for path in [global_lock_path(), lock_path(output_dir)] {
+            loop {
+                wait_for_gpu_idle(output_dir)?;
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(mut file) => {
+                        let written = writeln!(file, "{pid}")
+                            .with_context(|| format!("write gpu lock {}", path.display()))
+                            .and_then(|()| {
+                                file.sync_all()
+                                    .with_context(|| format!("sync gpu lock {}", path.display()))
+                            });
+                        if let Err(error) = written {
+                            let _ = fs::remove_file(&path);
+                            return Err(error);
+                        }
+                        guard.paths.push(path);
+                        break;
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("acquire gpu lock {}", path.display()));
+                    }
                 }
             }
         }
+        Ok(guard)
     }
 }
 
 impl Drop for GpuSessionGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        for path in self.paths.iter().rev() {
+            if read_pid_file(path) == Some(self.pid) {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -205,8 +247,10 @@ mod tests {
         {
             let _guard = GpuSessionGuard::acquire(&dir)?;
             assert!(lock_path(&dir).is_file());
+            assert!(global_lock_path().is_file());
         }
         assert!(!lock_path(&dir).exists());
+        assert!(!global_lock_path().exists());
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
