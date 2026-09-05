@@ -1396,15 +1396,22 @@ impl WorldModel {
             );
         }
         let c = self.context_summary(context)?;
+        // `ContextBatch` is batch-wide, but context validity is row-local. A
+        // zero summary alone is insufficient because learned Linear biases
+        // would otherwise perturb K=0 rows whenever another row has context.
+        // Mask the projected deltas so K=0 is exactly the no-context path.
+        let present = context.valid.sum_keepdim(1)?.gt(0.0)?.to_dtype(c.dtype())?;
         let hidden = self.config.hidden_dim;
         let gamma = channel
             .film_gamma
             .forward(&c)?
+            .broadcast_mul(&present)?
             .affine(1.0, 1.0)?
             .reshape((batch, hidden, 1, 1))?;
         let beta = channel
             .film_beta
             .forward(&c)?
+            .broadcast_mul(&present)?
             .reshape((batch, hidden, 1, 1))?;
         Ok(ActionFilm {
             gamma: film.gamma.mul(&gamma)?,
@@ -4682,11 +4689,16 @@ mod tests {
     fn v6_context_channel_is_wired_and_masks_rows_without_context() -> Result<()> {
         let device = Device::Cpu;
         let (model, varmap) = v6_model(&device, 11)?;
-        // Make context FiLM non-trivial without touching its (zero) biases so
-        // a row with K = 0 (c = 0) must stay bit-identical.
+        // Make every context FiLM parameter non-trivial. In particular, the
+        // learned biases must not leak into a K=0 row in a mixed batch.
         {
             let data = varmap.data().lock().unwrap();
-            for name in ["context_film_gamma.weight", "context_film_beta.weight"] {
+            for name in [
+                "context_film_gamma.weight",
+                "context_film_gamma.bias",
+                "context_film_beta.weight",
+                "context_film_beta.bias",
+            ] {
                 let var = data.get(name).expect("context FiLM weight exists");
                 var.set(&Tensor::full(0.05f32, var.shape().dims(), &device)?)?;
             }
