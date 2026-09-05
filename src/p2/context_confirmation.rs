@@ -186,7 +186,20 @@ fn disagreement_mask_sha256(disagreement: &[usize], gameplay_pixels: usize) -> R
 /// its singleton decode bit for bit, and aggregate K0 raw correctness is
 /// bounded by `m` of `2m` because the targets differ on every disagreement
 /// pixel. Any violation is an integrity failure, not a negative result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SingletonSharedNllComparison {
+    pub direction: String,
+    pub singleton_raw_nll: f64,
+    pub shared_raw_nll: f64,
+    pub raw_nll_abs_difference: f64,
+    pub raw_nll_ulp_distance: u64,
+    pub singleton_unimix_nll: f64,
+    pub shared_unimix_nll: f64,
+    pub unimix_nll_abs_difference: f64,
+    pub unimix_nll_ulp_distance: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedK0Invariant {
     pub pass: bool,
     pub latent_elements_differing: usize,
@@ -198,6 +211,8 @@ pub struct SharedK0Invariant {
     /// Per direction (`primary`, `twin`).
     pub singleton_raw_nll_bit_identical: Vec<bool>,
     pub singleton_unimix_nll_bit_identical: Vec<bool>,
+    /// Exact values and bit distances retained when batch-size parity fails.
+    pub singleton_shared_nll: Vec<SingletonSharedNllComparison>,
     pub disagreement_pixels_per_direction: usize,
     pub k0_raw_argmax_correct_total: usize,
     /// `k0_raw_argmax_correct_total <= m`.
@@ -230,12 +245,30 @@ pub(crate) fn shared_k0_invariant(
     };
     let mut singleton_raw_nll_bit_identical = Vec::with_capacity(2);
     let mut singleton_unimix_nll_bit_identical = Vec::with_capacity(2);
+    let mut singleton_shared_nll = Vec::with_capacity(2);
     for (row, (target, single)) in targets.iter().zip(singleton).enumerate() {
         let scores = arm_scores_row(shared, row, target, disagreement)?;
         singleton_raw_nll_bit_identical
             .push(scores.raw_softmax_nll.to_bits() == single.raw_softmax_nll.to_bits());
         singleton_unimix_nll_bit_identical
             .push(scores.unimix_nll.to_bits() == single.unimix_nll.to_bits());
+        singleton_shared_nll.push(SingletonSharedNllComparison {
+            direction: ["primary", "twin"][row].into(),
+            singleton_raw_nll: single.raw_softmax_nll,
+            shared_raw_nll: scores.raw_softmax_nll,
+            raw_nll_abs_difference: (single.raw_softmax_nll - scores.raw_softmax_nll).abs(),
+            raw_nll_ulp_distance: single
+                .raw_softmax_nll
+                .to_bits()
+                .abs_diff(scores.raw_softmax_nll.to_bits()),
+            singleton_unimix_nll: single.unimix_nll,
+            shared_unimix_nll: scores.unimix_nll,
+            unimix_nll_abs_difference: (single.unimix_nll - scores.unimix_nll).abs(),
+            unimix_nll_ulp_distance: single
+                .unimix_nll
+                .to_bits()
+                .abs_diff(scores.unimix_nll.to_bits()),
+        });
     }
     let m = disagreement.len();
     let k0_raw_argmax_correct_total =
@@ -262,6 +295,7 @@ pub(crate) fn shared_k0_invariant(
         ),
         singleton_raw_nll_bit_identical,
         singleton_unimix_nll_bit_identical,
+        singleton_shared_nll,
         disagreement_pixels_per_direction: m,
         k0_raw_argmax_correct_total,
         finite_bound_holds: k0_raw_argmax_correct_total <= m,
@@ -2069,6 +2103,20 @@ mod tests {
                 composed_argmax_pixels_differing: 0,
                 singleton_raw_nll_bit_identical: vec![true, true],
                 singleton_unimix_nll_bit_identical: vec![true, true],
+                singleton_shared_nll: ["primary", "twin"]
+                    .iter()
+                    .map(|direction| SingletonSharedNllComparison {
+                        direction: (*direction).into(),
+                        singleton_raw_nll: 1.0,
+                        shared_raw_nll: 1.0,
+                        raw_nll_abs_difference: 0.0,
+                        raw_nll_ulp_distance: 0,
+                        singleton_unimix_nll: 1.0,
+                        shared_unimix_nll: 1.0,
+                        unimix_nll_abs_difference: 0.0,
+                        unimix_nll_ulp_distance: 0,
+                    })
+                    .collect(),
                 disagreement_pixels_per_direction: m,
                 k0_raw_argmax_correct_total: k0_total,
                 finite_bound_holds: k0_total <= m,
@@ -2326,6 +2374,8 @@ mod tests {
             shared_k0_invariant(&shared, &[drifted, twin.clone()], &targets, &disagreement)?;
         assert!(!invariant.pass);
         assert_eq!(invariant.singleton_raw_nll_bit_identical, vec![false, true]);
+        assert!(invariant.singleton_shared_nll[0].raw_nll_abs_difference > 0.0);
+        assert!(invariant.singleton_shared_nll[0].raw_nll_ulp_distance > 0);
         // Aggregate K0 correctness above m is an integrity failure.
         let mut inflated = twin.clone();
         inflated.raw_argmax_correct = 1;
