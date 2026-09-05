@@ -143,8 +143,8 @@ const FOUNDATION_V2_SEPARATION_MARGIN: f64 = 0.3;
 /// `augment_v5_transition` force-masks the label (ADR 0003 corrections);
 /// do not "fix" the weight instead of the premise.
 const EVENT_SLOT_WEIGHTS: [f32; 4] = [1.0, 1.0, 4.0, 2.0];
-pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v14";
-pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v11";
+pub const TRAIN_REPORT_SCHEMA: &str = "p2.train_report.v15";
+pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v12";
 /// Revision of the foundation-v2 objective *implementation* (masks, loss
 /// construction, reductions, gates). Bump on any semantic change so a
 /// checkpoint trained under an older objective cannot silently resume under a
@@ -159,8 +159,10 @@ pub const TRAINER_STATE_SCHEMA: &str = "p2.trainer_state.v11";
 /// while Q continues to observe graded composed-pixel accuracy;
 /// 5 = reject unimplemented Foundation-v2 accumulation, add a dedicated
 /// 16-fragment rollout population whose gradients join the main objective
-/// before clipping, and record route-aware per-objective gradient pressure.
-pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 5;
+/// before clipping, and record route-aware per-objective gradient pressure;
+/// 6 = add unit-mass balanced transition CE and make split-CE geometry plus
+/// disabled grounding explicit in the pressure evidence contract.
+pub const FOUNDATION_OBJECTIVE_REVISION: u32 = 6;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -1976,11 +1978,25 @@ pub struct FoundationV2GradientComponentSample {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationV2SplitCeGeometry {
+    pub weighting: SplitCeWeighting,
+    pub changed_pixels: usize,
+    pub unchanged_pixels: usize,
+    pub changed_fraction: f64,
+    pub changed_weight: f64,
+    pub changed_coefficient: f64,
+    pub unchanged_coefficient: f64,
+    pub changed_coefficient_share: f64,
+    pub coefficient_mass: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FoundationV2GradientPressureSample {
     pub step: u64,
     pub main_population_rows: usize,
     pub rollout_population_rows: usize,
     pub rollout_fragments: usize,
+    pub split_ce: FoundationV2SplitCeGeometry,
     pub components: Vec<FoundationV2GradientComponentSample>,
     pub combined_pre_clip: FoundationV2GradientRouteStats,
     pub clip_scale: f64,
@@ -5950,17 +5966,104 @@ pub enum SplitCeWeighting {
     /// `w` on positive and 1.0 on negative pixels, so the per-pixel
     /// coefficient ratio is `(1-p)/p` once (copy-gate BCE construction).
     PooledPerPixel,
+    /// Equal aggregate shares for the two stratum means with unit total
+    /// coefficient mass. This isolates legacy mass from within-loss geometry.
+    UnitMassBalanced,
 }
 
 /// Mode dispatch for the split CE. `CurrentDouble` without a budget override
 /// calls [`split_weighted_ce`] with unchanged arguments, keeping the default
-/// path bit-for-bit identical. Every alternative redistributes the same total
-/// coefficient mass as that legacy loss (`positive_weight + 1` when both
-/// strata exist). This controls nominal loss coefficients; it does not
-/// preserve gradient direction, norm, or clipping pressure. `changed_budget`
-/// is an aggregate *coefficient* share, not a measured gradient share. If
-/// either stratum is empty, all modes fall back to the only observed stratum
-/// with the legacy coefficient mass.
+/// path bit-for-bit identical. `EqualMeans` and `PooledPerPixel` redistribute
+/// the same total coefficient mass as that legacy loss (`positive_weight + 1`
+/// when both strata exist); `UnitMassBalanced` fixes the mass at one. This
+/// controls nominal loss coefficients; it does not preserve gradient direction,
+/// norm, or clipping pressure. `changed_budget` is an aggregate *coefficient*
+/// share, not a measured gradient share. If either stratum is empty, the
+/// unit-mass mode uses the sole mean once while legacy-mass modes retain their
+/// existing fallback.
+fn split_ce_coefficients(
+    positive_count: usize,
+    negative_count: usize,
+    positive_weight: f64,
+    mode: SplitCeWeighting,
+    changed_budget: Option<f64>,
+) -> (f64, f64) {
+    if positive_count == 0 && negative_count == 0 {
+        return (0.0, 0.0);
+    }
+    if positive_count == 0 {
+        return (0.0, 1.0);
+    }
+    if negative_count == 0 {
+        return (
+            if mode == SplitCeWeighting::UnitMassBalanced {
+                1.0
+            } else {
+                positive_weight
+            },
+            0.0,
+        );
+    }
+    if mode == SplitCeWeighting::CurrentDouble && changed_budget.is_none() {
+        return (positive_weight, 1.0);
+    }
+
+    let coefficient_mass = if mode == SplitCeWeighting::UnitMassBalanced {
+        1.0
+    } else {
+        positive_weight + 1.0
+    };
+    let positive_share = match changed_budget {
+        Some(budget) => budget,
+        None if matches!(
+            mode,
+            SplitCeWeighting::EqualMeans | SplitCeWeighting::UnitMassBalanced
+        ) =>
+        {
+            0.5
+        }
+        None if mode == SplitCeWeighting::CurrentDouble => positive_weight / coefficient_mass,
+        None => {
+            let weighted_positive = positive_weight * positive_count as f64;
+            weighted_positive / (weighted_positive + negative_count as f64)
+        }
+    };
+    (
+        coefficient_mass * positive_share,
+        coefficient_mass * (1.0 - positive_share),
+    )
+}
+
+fn foundation_v2_split_ce_geometry(
+    weights: ChangedPixelWeights,
+    mode: SplitCeWeighting,
+    changed_budget: Option<f64>,
+) -> FoundationV2SplitCeGeometry {
+    let (changed_coefficient, unchanged_coefficient) = split_ce_coefficients(
+        weights.changed_pixels,
+        weights.unchanged_pixels,
+        weights.changed_weight,
+        mode,
+        changed_budget,
+    );
+    let coefficient_mass = changed_coefficient + unchanged_coefficient;
+    FoundationV2SplitCeGeometry {
+        weighting: mode,
+        changed_pixels: weights.changed_pixels,
+        unchanged_pixels: weights.unchanged_pixels,
+        changed_fraction: weights.changed_fraction,
+        changed_weight: weights.changed_weight,
+        changed_coefficient,
+        unchanged_coefficient,
+        changed_coefficient_share: if coefficient_mass > 0.0 {
+            changed_coefficient / coefficient_mass
+        } else {
+            0.0
+        },
+        coefficient_mass,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn split_ce_with_weighting(
     per_pixel: &Tensor,
@@ -5992,21 +6095,28 @@ pub fn split_ce_with_weighting(
         return Ok(negative);
     }
     if negative_count == 0 {
-        return positive.affine(positive_weight, 0.0).map_err(Into::into);
+        let (positive_coefficient, _) = split_ce_coefficients(
+            positive_count,
+            negative_count,
+            positive_weight,
+            mode,
+            changed_budget,
+        );
+        return positive
+            .affine(positive_coefficient, 0.0)
+            .map_err(Into::into);
     }
 
-    let coefficient_mass = positive_weight + 1.0;
-    let positive_share = match changed_budget {
-        Some(budget) => budget,
-        None if mode == SplitCeWeighting::EqualMeans => 0.5,
-        None => {
-            let weighted_positive = positive_weight * positive_count as f64;
-            weighted_positive / (weighted_positive + negative_count as f64)
-        }
-    };
+    let (positive_coefficient, negative_coefficient) = split_ce_coefficients(
+        positive_count,
+        negative_count,
+        positive_weight,
+        mode,
+        changed_budget,
+    );
     positive
-        .affine(coefficient_mass * positive_share, 0.0)?
-        .add(&negative.affine(coefficient_mass * (1.0 - positive_share), 0.0)?)
+        .affine(positive_coefficient, 0.0)?
+        .add(&negative.affine(negative_coefficient, 0.0)?)
         .map_err(Into::into)
 }
 
@@ -10216,6 +10326,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                 &prediction_grads,
                 &varmap,
             )?];
+            components.push(FoundationV2GradientComponentSample {
+                objective: "grounding".into(),
+                weight: 0.0,
+                routes: FoundationV2GradientRouteStats::default(),
+            });
             for (name, weight, weighted_loss) in [
                 ("gate", 0.5, losses.gate.affine(0.5, 0.0)?),
                 ("latent", 0.25, losses.latent.affine(0.25, 0.0)?),
@@ -10317,6 +10432,11 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
                     main_population_rows: mixed.samples().len(),
                     rollout_population_rows,
                     rollout_fragments,
+                    split_ce: foundation_v2_split_ce_geometry(
+                        losses.changed_weights,
+                        cfg.split_ce_weighting,
+                        cfg.split_ce_changed_budget,
+                    ),
                     components,
                     combined_pre_clip: foundation_v2_gradient_route_stats(
                         &grads,
@@ -11584,6 +11704,98 @@ mod tests {
     }
 
     #[test]
+    fn unit_mass_split_ce_is_balanced_and_current_double_is_bit_identical() -> Result<()> {
+        let device = Device::Cpu;
+        let per_pixel = Tensor::new(&[2.0f32, 4.0, 10.0], &device)?;
+        let positive = Tensor::new(&[1.0f32, 1.0, 0.0], &device)?;
+        let negative = Tensor::new(&[0.0f32, 0.0, 1.0], &device)?;
+        let legacy = split_weighted_ce(&per_pixel, &positive, &negative, 2, 1, 5.0)?;
+        let dispatched = split_ce_with_weighting(
+            &per_pixel,
+            &positive,
+            &negative,
+            2,
+            1,
+            5.0,
+            SplitCeWeighting::CurrentDouble,
+            None,
+        )?;
+        assert_eq!(
+            legacy.to_scalar::<f32>()?.to_bits(),
+            dispatched.to_scalar::<f32>()?.to_bits(),
+            "CurrentDouble dispatch must stay bit-identical"
+        );
+
+        let unit_mass = split_ce_with_weighting(
+            &per_pixel,
+            &positive,
+            &negative,
+            2,
+            1,
+            5.0,
+            SplitCeWeighting::UnitMassBalanced,
+            None,
+        )?
+        .to_scalar::<f32>()?;
+        assert_eq!(unit_mass, 6.5);
+        let budgeted = split_ce_with_weighting(
+            &per_pixel,
+            &positive,
+            &negative,
+            2,
+            1,
+            5.0,
+            SplitCeWeighting::UnitMassBalanced,
+            Some(0.25),
+        )?
+        .to_scalar::<f32>()?;
+        assert_eq!(budgeted, 8.25);
+
+        let positive_only = split_ce_with_weighting(
+            &per_pixel,
+            &positive,
+            &Tensor::zeros_like(&negative)?,
+            2,
+            0,
+            5.0,
+            SplitCeWeighting::UnitMassBalanced,
+            None,
+        )?
+        .to_scalar::<f32>()?;
+        assert_eq!(positive_only, 3.0);
+        let negative_only = split_ce_with_weighting(
+            &per_pixel,
+            &Tensor::zeros_like(&positive)?,
+            &negative,
+            0,
+            1,
+            5.0,
+            SplitCeWeighting::UnitMassBalanced,
+            None,
+        )?
+        .to_scalar::<f32>()?;
+        assert_eq!(negative_only, 10.0);
+
+        let geometry = foundation_v2_split_ce_geometry(
+            ChangedPixelWeights {
+                content_pixels: 3,
+                changed_pixels: 2,
+                unchanged_pixels: 1,
+                changed_fraction: 2.0 / 3.0,
+                changed_weight: 5.0,
+                unchanged_weight: 1.0,
+            },
+            SplitCeWeighting::UnitMassBalanced,
+            None,
+        );
+        assert_eq!(geometry.changed_coefficient, 0.5);
+        assert_eq!(geometry.unchanged_coefficient, 0.5);
+        assert_eq!(geometry.changed_coefficient_share, 0.5);
+        assert_eq!(geometry.coefficient_mass, 1.0);
+        Ok(())
+    }
+
+    #[test]
     fn foundation_v2_copy_gate_supervises_pad_as_unchanged() -> Result<()> {
         let device = Device::Cpu;
         // Pixel 0 stands for content and pixel 1 for PAD. Neither changed, so
@@ -12570,6 +12782,18 @@ mod tests {
                 main_population_rows: 1,
                 rollout_population_rows: 2,
                 rollout_fragments: 1,
+                split_ce: foundation_v2_split_ce_geometry(
+                    ChangedPixelWeights {
+                        content_pixels: 1,
+                        changed_pixels: 1,
+                        unchanged_pixels: 0,
+                        changed_fraction: 1.0,
+                        changed_weight: 1.0,
+                        unchanged_weight: 1.0,
+                    },
+                    SplitCeWeighting::CurrentDouble,
+                    None,
+                ),
                 components: vec![],
                 combined_pre_clip: FoundationV2GradientRouteStats::default(),
                 clip_scale: 1.0,
@@ -15480,6 +15704,15 @@ mod tests {
         assert_eq!(pressure.main_population_rows, cfg.physical_batch);
         assert_eq!(pressure.rollout_population_rows, activation.population_rows);
         assert_eq!(pressure.rollout_fragments, activation.eligible_fragments);
+        assert_eq!(pressure.split_ce.weighting, SplitCeWeighting::CurrentDouble);
+        assert_eq!(
+            pressure.split_ce.changed_pixels + pressure.split_ce.unchanged_pixels,
+            cfg.physical_batch * FRAME_SIDE * FRAME_SIDE
+        );
+        assert_eq!(
+            pressure.split_ce.coefficient_mass,
+            pressure.split_ce.changed_weight + 1.0
+        );
         assert!(pressure.combined_pre_clip.global_l2.is_finite());
         assert!(pressure.combined_pre_clip.adamw_l2.is_finite());
         assert!(pressure.combined_pre_clip.muon_l2.is_finite());
@@ -15492,6 +15725,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "pred_ce",
+                "grounding",
                 "gate",
                 "latent",
                 "enc_ce",
@@ -15504,6 +15738,13 @@ mod tests {
                 "rollout",
             ]
         );
+        let grounding = pressure
+            .components
+            .iter()
+            .find(|component| component.objective == "grounding")
+            .expect("explicit disabled-grounding row");
+        assert_eq!(grounding.weight, 0.0);
+        assert_eq!(grounding.routes, FoundationV2GradientRouteStats::default());
         for component in &pressure.components {
             assert!(component.routes.global_l2.is_finite());
             assert!(component.routes.adamw_l2.is_finite());

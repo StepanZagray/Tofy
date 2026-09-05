@@ -418,6 +418,36 @@ fn split_ce_empty_strata_fall_back_to_the_legacy_observed_mass() {
         assert!((positive_only - 4.5).abs() < 1e-6);
         assert!((negative_only - 3.0).abs() < 1e-6);
     }
+    for budget in [None, Some(0.75)] {
+        let positive_only = split_ce_with_weighting(
+            &values,
+            &all,
+            &none,
+            2,
+            0,
+            1.5,
+            SplitCeWeighting::UnitMassBalanced,
+            budget,
+        )
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+        let negative_only = split_ce_with_weighting(
+            &values,
+            &none,
+            &all,
+            0,
+            2,
+            1.5,
+            SplitCeWeighting::UnitMassBalanced,
+            budget,
+        )
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+        assert!((positive_only - 3.0).abs() < 1e-6);
+        assert!((negative_only - 3.0).abs() < 1e-6);
+    }
 }
 
 #[test]

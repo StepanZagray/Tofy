@@ -272,6 +272,22 @@ the rest of the run.
   It is an engineering correction only until an exact-binary CUDA smoke and a
   fresh registered experiment pass their gates.
 
+## Implementation correction (2026-09-05 — split-CE mass evidence)
+
+- The revision-5 CUDA smoke passed the rollout and pressure premise but showed
+  prediction supplied 99.1% of the combined gradient norm and direction at
+  seed 2 initialization.
+- `UnitMassBalanced` adds a registered objective-isolation arm whose changed
+  and unchanged mean coefficients sum to one. `CurrentDouble` remains
+  bit-identical; `EqualMeans` and `PooledPerPixel` continue to preserve legacy
+  coefficient mass.
+- Every pressure packet records the exact split-CE pixel census, resolved
+  coefficients, and coefficient mass. Disabled Foundation grounding now gets
+  an explicit zero-norm/null-cosine row instead of being omitted.
+- This selectable objective and evidence-contract change increments objective
+  implementation revision 6, trainer state v12, and training report v15. It
+  authorizes only the preregistered one-update coefficient-mass screen.
+
 ## Preregistered model-treatment flags (2026-08-27, amended 2026-08-29; all default off)
 
 Six config-gated model treatments exist for the next matched runs. Every
