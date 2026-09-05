@@ -83,6 +83,46 @@ mass cuts the changed-pixel coefficient from 50 to 0.5. Fable 5.1 High judged
 the evidence integrity-clean and authorized only a relative-gate A/B/C
 confirmation at seeds 3 and 4 before any multi-step comparison.
 
+## V6 split-CE mass multiseed confirmation (2026-09-05; CONFIRMED)
+
+The preregistered six-arm confirmation at pushed revision
+`02fc64a639997b0727680885bc52ccca8271bb18` used a fresh locked cuDNN binary
+`sha256:ac2beae20f5f5a20e1046310c6ea820e7797d2326b06e8b9e8ebde0dd425e2e4`
+whose source/Cargo inputs are byte-identical to implementation revision
+`96f0c449`. The successful never-reused root is
+`split-ce-mass-confirmation-20260905T112618-CDT`; its 150-file parent seal
+manifest has digest
+`sha256:d07efd41a3af4293e07900e0ac12f89bd20824551e551401ac20b2ce17273435`.
+
+| Seed/arm | Prediction global L2 | Pred/combined share | Global cosine to prediction | Muon cosine to prediction | Result |
+|---|---:|---:|---:|---:|---|
+| 3A CurrentDouble | `325.6452` | `0.98008` | `0.99727` | `0.99881` | premise pass |
+| 3B EqualMeans | `280.0593` | — | `0.99688` | `0.99854` | mass-control pass |
+| 3C UnitMassBalanced | `5.49141` | — | `0.39275` | `0.51337` | support pass |
+| 4A CurrentDouble | `411.8410` | `0.99223` | `0.99882` | `0.99923` | premise pass |
+| 4B EqualMeans | `304.7730` | — | `0.99860` | `0.99888` | mass-control pass |
+| 4C UnitMassBalanced | `5.97601` | — | `0.33649` | `0.46628` | support pass |
+
+C reduced prediction L2 `59.30x / 68.92x` versus A. B/C prediction ratios
+`50.99952 / 50.99937` matched coefficient mass ratio 51 within relative
+`1.23e-5`; invariant route norms matched within `1.3e-7`, and rollout-core
+norms matched exactly per seed. Every provenance, population, census, pressure,
+hash, process, lock, and GPU-cleanup gate passed. Fable 5.1 High independently
+recomputed the raw reports and returned CONFIRMED.
+
+This confirms only that legacy shared split-CE mass is sufficient for initial
+prediction-direction dominance at seeds 3 and 4. The treatment also changes
+encoder next-frame CE; all arms were fully clipped; and no learned-quality,
+planning, rollout-fidelity, or ARC metric was measured. An earlier root stopped
+after 3A for an unknown embedded build command and is separately sealed as
+failed infrastructure; no metric from it entered the confirmation.
+
+The next prerequisite is not a two-arm treatment run. First establish an
+informative CurrentDouble update budget with nonzero held-out changed exactness.
+The eventual quality screen must then include a unit-mass changed-share
+`50/51` control so total mass is separated from the candidate's 100x reduction
+in changed-pixel coefficient.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
