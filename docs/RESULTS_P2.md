@@ -17,6 +17,46 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2F registered semantic confirmation (2026-09-05; PASS)
+
+E2F passed its frozen single-pair semantic confirmation. It reused the exact
+deterministic-backward E2E binary from pushed Tofy
+`e2fb4b66c270f154d8f2c2ed81b561b5ca5974e8`, binary
+`sha256:4bda8befc5e492031833c779a3fbc1f65a4652b16875ca24e88c3e3e3ae9114f`,
+and bound the sealed E2E preflight under manifest
+`sha256:e9bc531a58bab2908b4cad6150652b48a15de10314d9d7cf971a68c587a4bf5d`.
+The registered root `v6-e2f-registered-20260905T071154-CDT` completed all 256
+updates per arm in 72.02 s on NVIDIA GeForce RTX 5060 Laptop GPU
+`GPU-216be468-8184-1801-0563-7c67555dbc45`. Its report is
+`sha256:968d05d9dc15e85fb3179d26d9575b6f0dad6da9f22910e33eccd69432334a27`
+and its recursively verified external manifest is
+`sha256:c82d2e7e1c7b0be0fc008ef53ef8a8375aef0e05d4e51da22283f1a58627be0a`.
+No public ARC data was read and no arm weights were saved.
+
+| Checkpoint | D correct A/B | D swapped | Interaction A/B | L1 correct A/B | L1 swapped | Exact correct own/paired/K0 | Exact swapped own/paired/K0 | Gate |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 64 | +0.000329548 | -0.000068247 | 0.000397795 | 0.000444106 | 0.000145469 | 28/28/28 | 28/28/28 | fail |
+| 128 | +13.5590 | -10.9841 | 24.5431 | 1.999877 | 1.999046 | 56/0/28 | 0/56/28 | pass |
+| 256 | +15.2549 | -15.8516 | 31.1066 | 1.999990 | 1.999986 | 56/0/28 | 0/56/28 | pass |
+
+The complete conjunction held at consecutive fixed checkpoints 128 and 256:
+both independently trained correct replicas predicted all 56 disagreement
+pixels with their own histories and none with the paired histories, while the
+swapped arm exactly reversed that behavior. All same-shape and cross-shape
+semantic K0 invariants passed at every checkpoint. Correct A/B update records,
+parameter digests, and complete checkpoints remained bit-identical through
+update 256; checkpoint-0 evaluator replay and exact preflight-versus-registered
+evaluator/optimizer parity also passed.
+
+This is the first integrity-clean evidence that the repaired 2x2 path can learn
+and causally route a second, harder synthetic twin pair, rather than merely
+reacting to a context-shaped bias. Its scope is deliberately narrow: one fixed
+pair, one initialization, one GPU, and a direct pair-specific overfit objective.
+It is not held-out population generalization, a promoted world model, planning,
+or ARC-AGI level completion, and it does not update “Best So Far.” PASS
+authorizes only the separately preregistered simultaneous multi-pair synthetic
+screen.
+
 ## V6 2x2 E2E deterministic-backward premise (2026-09-05; implementation smoke)
 
 E2E changed only vendored Candle's cuDNN convolution backward-filter and
