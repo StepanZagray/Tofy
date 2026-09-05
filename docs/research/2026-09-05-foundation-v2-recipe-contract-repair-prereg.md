@@ -108,3 +108,16 @@ hashes, physical batch/accumulation, and pressure update. Use a never-reused
 root and seal it recursively. No public ARC data is read. Any subsequent
 comparison needs a fresh preregistration with seeds, checkpoint selection,
 uncertainty, multiplicity, and promotion/rejection rules.
+
+## Post-run qualification (recorded 2026-09-05 after the smoke)
+
+The smoke passed its active implementation gates, but the component list did
+not contain the `grounding` item named in claim 3 because both Foundation
+grounding weights are fixed to zero. The config and evidence manifest make that
+disabled state explicit, so no active loss was hidden, but the prose and packet
+were not exact. This mismatch is declared rather than edited away. The next
+pressure contract must report a zero/null grounding row explicitly.
+
+The one-step WSD schedule also selected final LR `0.0001`, not the stable
+production LR `0.001`. That does not affect the pre-optimizer attribution used
+by this smoke, but it prevents treating the optimizer update as representative.

@@ -17,6 +17,39 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## Foundation-v2 recipe repair smoke (2026-09-05; bounded PASS)
+
+The exact pushed revision
+`42bfe5b5c7d613f397b9e8345c659712d6eb11e2` repaired the executable
+Foundation-v2 contract and passed a single-update CUDA implementation smoke on
+the RTX 5060 Laptop GPU. The locked cuDNN release binary was
+`sha256:5ac69bf19952de0d63b0764287b8b6a68ad31ffa973b10f275a41d8e07435b9b`.
+The never-reused root
+`foundation-v2-recipe-smoke-20260905T101459-CDT` completed at physical batch
+128, accumulation 1, and truthful effective batch 128. It consumed 128 main
+rows plus 32 dedicated rollout rows from exactly 16 adjacent fragments.
+Rollout loss was `1.3553996` and its weighted recurrent-core gradient L2 was
+`0.0526454`.
+
+The route-pressure result is negative for objective balance: prediction global
+L2 was `408.2888` against combined `411.9768` (ratio `0.9910`), and the combined
+global/AdamW/Muon cosines to prediction were
+`0.99709 / 0.99642 / 0.99836`. The complete action bundle was `19.3412` L2
+(4.74% of prediction), while rollout was `0.16214` (0.040%). Clip scale was
+`0.0024273`; this is a conditioning signal, not an effective-learning-rate
+multiplier under AdamW/Muon. Fable 5.1 High independently judged the bounded
+repair GO and selected a unit-mass split-CE falsifier.
+
+Every evidence-manifest artifact and the final 26-file recursive seal verified;
+the external seal-manifest digest is
+`sha256:0d93e448d83cf246314fc852a7d4c8a48dbeb1a7770bc10cf48d36c158737752`.
+The expected evidence gap is that no representative-update profile was
+published. Also, the one-step WSD schedule used final LR `0.0001`, and the
+pressure list omitted the named grounding row because both grounding weights
+are zero. This remains an implementation smoke with `research_claim=false`,
+not model evidence or an ARC result. It authorizes only the separately
+preregistered split-CE pressure screen.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
