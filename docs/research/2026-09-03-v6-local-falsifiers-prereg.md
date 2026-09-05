@@ -702,6 +702,73 @@ bit-identity gate is neither relaxed nor assigned a post-hoc tolerance.
   between updates and with outer process timeouts. Do not read public ARC data
   or save arm weights.
 
+## Post-E2 premise E2E: deterministic cuDNN backward trajectory (2026-09-05)
+
+This section was frozen after reading the sealed E2D preflight and before
+editing the CUDA backend or observing any result from a deterministic-backward
+build. E2D remains failed infrastructure/integrity evidence: it produced no
+model verdict and cannot be reclassified by E2E.
+
+- **Exact bounded claim.** On the same RTX 5060 Laptop GPU, fixed 256-pair
+  population, selected second twin pair, checkpoint, hyperparameters, ordered
+  parameters, and 8-update three-arm operation sequence as E2D, replacing only
+  cuDNN's heuristic backward-filter and backward-data convolution choices with
+  their documented deterministic algorithm-1 variants makes the identical
+  `correct_a` and `correct_b` replicas bit-identical in every update record,
+  parameter state, and complete checkpoint through update 8. This is an
+  implementation/infrastructure premise smoke, not a context-wiring, model,
+  planning, scaling, or ARC-AGI result.
+- **Baseline and one causal factor.** The comparator is E2D root
+  `v6-e2d-preflight-20260905T063615-CDT`, report
+  `sha256:83a6de7b3dc8e76f32632c2d18133e69097f81130271fad30ac9dd4d390db318`,
+  under external manifest
+  `sha256:cc8d40651aec5f2b3254961c41fe6ed3feb9821cf775d7bc55f4bafef1f4c660`.
+  Its pushed Tofy revision was
+  `559edf9997949b9eeb5dcac947e7cd057ac45eba` and its exact cuDNN release
+  binary was
+  `sha256:c5c46a5bcce87f02434224de103a8512036bf0beaab8ba6ef185611c01041b31`.
+  The earlier detached-build root under manifest
+  `sha256:35702c3f83668443db015bd7ea31b2dff137517ff49b50b60e5d70f0e3a0c1b0`
+  is provenance-failure evidence only and is excluded from the comparison.
+- **Intervention.** In vendored Candle, pin convolution backward-filter to
+  `CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1` and backward-data to
+  `CUDNN_CONVOLUTION_BWD_DATA_ALGO_1`; do not alter forward convolution,
+  tensor shapes, precision, loss, optimizer, clipping, evaluator, seed, row
+  order, or model code. Bind the intervention through reviewed and pushed
+  source, the exact build command and binary digest, and record the installed
+  cuDNN version. The source must state both selected algorithms explicitly.
+- **Why this is not a proof.** NVIDIA's installed cuDNN 9.25 headers document
+  both algorithm-1 variants as deterministic and document backward-filter
+  algorithms 0/3 and backward-data algorithm 0 as nondeterministic. That proves
+  only the vendor classification of those individual algorithms. Other CUDA
+  reductions, cuBLAS kernels, or asynchronous effects are counterexamples to
+  inferring whole-trajectory determinism from the algorithm names; the exact
+  8-update replica test remains necessary.
+- **Invariant test and metrics.** Reuse the full E2D v2 preflight so checkpoint
+  0 must again pass fixed-selection, sealed E2W legacy parity, identical arm
+  initialization and ordered names, complete in-process evaluator replay,
+  same-shape bit identity, cross-shape 4,096-pixel raw/composed argmax identity,
+  and the finite K0 bound. Require `correct_a` versus `correct_b` to match
+  exactly at checkpoint 0 and 8; at updates 1 through 8 require exact loss,
+  pre-clip norm, clip scale, context-gradient norm, parameter digest, and every
+  complete checkpoint field. NLL cross-shape deltas remain descriptive. No
+  numeric tolerance, post-hoc field removal, or alternate arm is permitted.
+- **Execution and provenance.** Build once from a reviewed, pushed, clean
+  commit with `cargo build --release --locked --features cudnn`; use the same
+  clean candle_graph revision
+  `8e012f25e38f0c597c14268f0c705e504a5b5c28`, parent and E2W seals, GPU UUID,
+  physical batch 2, accumulation 1, zero noise, and maximum 8 updates. Run in a
+  never-reused root under the global GPU lock with both an internal and outer
+  2-minute cap. Seal and recursively verify the completed or failed root. Do
+  not read public ARC data or save weights.
+- **Decision.** PASS requires every preceding integrity gate and exact replica
+  equality through update 8. PASS authorizes only a freshly preregistered E2F
+  registered semantic confirmation from the deterministic backend; the E2E
+  report itself never satisfies E2D, even if model metrics look favorable.
+  FAIL stops without a model verdict and localizes the next cheapest falsifier
+  to the first mismatching operation, considering filter-only, data-only, or
+  non-convolution CUDA sources without weakening bit identity.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`

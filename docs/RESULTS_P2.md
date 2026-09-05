@@ -17,6 +17,61 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2D GPU replica-integrity failure (2026-09-05; failed preflight)
+
+E2D produced no model verdict and no registered run was launched. A first
+provenance-only attempt, `v6-e2d-preflight-20260905T063254-CDT`, failed before
+opening CUDA because its detached build recorded `source_pushed: null`. It used
+Tofy `559edf9997949b9eeb5dcac947e7cd057ac45eba`, binary
+`sha256:d9fd55904c6183becf4b9255c5a37a7db7d3907bd287d2f1fefbc595d3af25cf`,
+report
+`sha256:66ac470e40e7a6fdc2d15e3824f3b89d17abd9855abebdd6d7b34fde96fae42e`,
+and external manifest
+`sha256:35702c3f83668443db015bd7ea31b2dff137517ff49b50b60e5d70f0e3a0c1b0`.
+This root is failed infrastructure evidence only.
+
+The valid exact-binary CUDA preflight,
+`v6-e2d-preflight-20260905T063615-CDT`, used the same pushed, clean Tofy
+revision, candle_graph `8e012f25e38f0c597c14268f0c705e504a5b5c28`, binary
+`sha256:c5c46a5bcce87f02434224de103a8512036bf0beaab8ba6ef185611c01041b31`,
+and NVIDIA GeForce RTX 5060 Laptop GPU
+`GPU-216be468-8184-1801-0563-7c67555dbc45`. It stopped after 8 updates in
+5.27 s and is sealed by external manifest
+`sha256:cc8d40651aec5f2b3254961c41fe6ed3feb9821cf775d7bc55f4bafef1f4c660`;
+the report digest is
+`sha256:83a6de7b3dc8e76f32632c2d18133e69097f81130271fad30ac9dd4d390db318`.
+Both recursive manifests and report sidecars verified. No public ARC data was
+read and no arm weights were saved.
+
+Checkpoint 0 passed every repaired evaluator premise: the fixed second twin
+pair matched, sealed E2W legacy fields were bit-identical, all three arms had
+identical initialization and canonical parameter order, and the repeated
+complete evaluator digest was exactly
+`24ba590629f904fd0c40a01a10e414fcc668124f2eb70a4e18c526588862d804`.
+The batch-2 duplicate rows were bit-identical in latent, probability, log,
+gate, context-summary, raw-argmax, and composed-argmax fields. Each retained
+batch-1 K0 decode also matched its batch-2 row on all 4,096 raw and composed
+argmax labels, and the finite control passed (`K0 = 16/56 <= 28`). The observed
+batch-shape NLL deltas (`2.152e-6` primary, `4.621e-6` twin raw) remained
+descriptive and were not used as a gate.
+
+The identical `correct_a` and `correct_b` replicas then diverged in the first
+backward update despite equal loss (`2.607574462890625`): pre-clip gradient
+norms were `1.6910316944` versus `1.6910375357`. By update 8 their losses were
+`1.9128700495` versus `1.9128057957` and parameter digests differed. The
+preregistered exact update/state/checkpoint gate therefore failed and the root
+closed as `failed_infrastructure_or_integrity`; update-8 model fields are not
+admissible evidence.
+
+Source inspection identifies a candidate cause, not a confirmed attribution:
+vendored Candle asks cuDNN heuristics to choose both backward-filter and
+backward-data convolution algorithms. The installed NVIDIA cuDNN 9.25 headers
+classify backward-filter algorithms 0 and 3 and backward-data algorithm 0 as
+nondeterministic, while both algorithm-1 variants are deterministic. Inference
+replay was exact, so forward convolution remains unchanged. A one-factor,
+8-update implementation smoke must pin only both backward algorithm-1 variants
+and reproduce all E2D gates before any fresh registered semantic confirmation.
+
 ## V6 2x2 E2C batch-shape integrity failure (2026-09-05; failed preflight)
 
 E2C produced no wiring result and no registered run was launched. Its exact
