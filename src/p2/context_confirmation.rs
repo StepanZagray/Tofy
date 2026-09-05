@@ -157,8 +157,12 @@ impl ContextConfirmationSpec {
 
 /// Hash the semantic one-bit disagreement mask over the decoded gameplay
 /// region. The digest is invariant to the input index order and binds both the
-/// region size and every selected pixel.
-fn disagreement_mask_sha256(disagreement: &[usize], gameplay_pixels: usize) -> Result<String> {
+/// region size and every selected pixel. E2D reuses this exact digest so its
+/// fixed mask hash is comparable with the failed E2C preflights.
+pub(crate) fn disagreement_mask_sha256(
+    disagreement: &[usize],
+    gameplay_pixels: usize,
+) -> Result<String> {
     if disagreement.is_empty() {
         bail!("E2C disagreement mask is empty");
     }
@@ -359,6 +363,38 @@ pub struct ConfirmationCheckpoint {
     pub exact: ExactArgmaxTotals,
 }
 
+/// Per-arm checkpoint record of a three-arm confirmation protocol (E2C's
+/// [`ConfirmationCheckpoint`], E2D's semantic checkpoint). The shared gate,
+/// verdict, replica and launch-parity logic only needs these accessors.
+pub trait ArmCheckpoint:
+    Clone + PartialEq + std::fmt::Debug + Serialize + serde::de::DeserializeOwned
+{
+    fn update(&self) -> usize;
+    fn parameter_sha256(&self) -> &str;
+    fn evaluation(&self) -> &CheckpointEvaluation;
+    fn exact(&self) -> &ExactArgmaxTotals;
+    /// Mixed-batch and protocol-specific cross-direction K0 invariants.
+    fn k0_invariants_pass(&self) -> bool;
+}
+
+impl ArmCheckpoint for ConfirmationCheckpoint {
+    fn update(&self) -> usize {
+        self.update
+    }
+    fn parameter_sha256(&self) -> &str {
+        &self.parameter_sha256
+    }
+    fn evaluation(&self) -> &CheckpointEvaluation {
+        &self.evaluation
+    }
+    fn exact(&self) -> &ExactArgmaxTotals {
+        &self.exact
+    }
+    fn k0_invariants_pass(&self) -> bool {
+        self.evaluation.mixed_k0_invariant_pass && self.shared_k0_invariant.pass
+    }
+}
+
 fn evaluate_arm_checkpoint(
     arm: &Arm,
     directions: &[DirectionRows; 2],
@@ -426,60 +462,68 @@ pub struct ConfirmationGate {
     pub correct_own_exceeds_k0_derived: bool,
 }
 
-pub fn confirmation_gate(
-    correct_a: &ConfirmationCheckpoint,
-    correct_b: &ConfirmationCheckpoint,
-    swapped: &ConfirmationCheckpoint,
+/// E2C's continuous and exact gates at one checkpoint. E2D reuses the same
+/// definition and thresholds unchanged; only the per-checkpoint K0 record
+/// behind [`ArmCheckpoint::k0_invariants_pass`] differs between protocols.
+pub fn confirmation_gate<C: ArmCheckpoint>(
+    correct_a: &C,
+    correct_b: &C,
+    swapped: &C,
     spec: &ContextWiringSpec,
 ) -> Result<ConfirmationGate> {
-    if correct_a.update != correct_b.update || correct_a.update != swapped.update {
+    if correct_a.update() != correct_b.update() || correct_a.update() != swapped.update() {
         bail!(
             "arms evaluated different updates: correct_a={} correct_b={} swapped={}",
-            correct_a.update,
-            correct_b.update,
-            swapped.update
+            correct_a.update(),
+            correct_b.update(),
+            swapped.update()
         );
     }
-    let sensitive = |checkpoint: &ConfirmationCheckpoint| {
-        checkpoint.evaluation.probability_l1 > spec.probability_l1_threshold
-            || checkpoint.evaluation.raw_argmax_disagreement_pixels >= 1
+    let sensitive = |checkpoint: &C| {
+        checkpoint.evaluation().probability_l1 > spec.probability_l1_threshold
+            || checkpoint.evaluation().raw_argmax_disagreement_pixels >= 1
     };
-    let k0_invariants_pass = [correct_a, correct_b, swapped].iter().all(|checkpoint| {
-        checkpoint.evaluation.mixed_k0_invariant_pass && checkpoint.shared_k0_invariant.pass
-    });
-    let interaction_a = correct_a.evaluation.d - swapped.evaluation.d;
-    let interaction_b = correct_b.evaluation.d - swapped.evaluation.d;
-    let continuous_gate = correct_a.evaluation.d > spec.d_threshold
-        && correct_b.evaluation.d > spec.d_threshold
-        && swapped.evaluation.d < -spec.d_threshold
+    let k0_invariants_pass = [correct_a, correct_b, swapped]
+        .iter()
+        .all(|checkpoint| checkpoint.k0_invariants_pass());
+    let (eval_a, eval_b, eval_s) = (
+        correct_a.evaluation(),
+        correct_b.evaluation(),
+        swapped.evaluation(),
+    );
+    let interaction_a = eval_a.d - eval_s.d;
+    let interaction_b = eval_b.d - eval_s.d;
+    let continuous_gate = eval_a.d > spec.d_threshold
+        && eval_b.d > spec.d_threshold
+        && eval_s.d < -spec.d_threshold
         && interaction_a > spec.interaction_threshold
         && interaction_b > spec.interaction_threshold
         && sensitive(correct_a)
         && sensitive(correct_b)
         && sensitive(swapped)
         && k0_invariants_pass;
-    let exact_correct = |checkpoint: &ConfirmationCheckpoint| {
-        checkpoint.exact.own_raw_argmax_correct == checkpoint.exact.total_pixels
-            && checkpoint.exact.paired_raw_argmax_correct == 0
+    let exact_correct = |checkpoint: &C| {
+        checkpoint.exact().own_raw_argmax_correct == checkpoint.exact().total_pixels
+            && checkpoint.exact().paired_raw_argmax_correct == 0
     };
     let exact_correct_a = exact_correct(correct_a);
     let exact_correct_b = exact_correct(correct_b);
-    let exact_swapped = swapped.exact.own_raw_argmax_correct == 0
-        && swapped.exact.paired_raw_argmax_correct == swapped.exact.total_pixels;
+    let exact_swapped = swapped.exact().own_raw_argmax_correct == 0
+        && swapped.exact().paired_raw_argmax_correct == swapped.exact().total_pixels;
     let exact_gate = exact_correct_a && exact_correct_b && exact_swapped;
     Ok(ConfirmationGate {
-        update: correct_a.update,
-        d_correct_a: correct_a.evaluation.d,
-        d_correct_b: correct_b.evaluation.d,
-        d_swapped: swapped.evaluation.d,
+        update: correct_a.update(),
+        d_correct_a: eval_a.d,
+        d_correct_b: eval_b.d,
+        d_swapped: eval_s.d,
         interaction_a,
         interaction_b,
-        probability_l1_correct_a: correct_a.evaluation.probability_l1,
-        probability_l1_correct_b: correct_b.evaluation.probability_l1,
-        probability_l1_swapped: swapped.evaluation.probability_l1,
-        raw_argmax_disagreement_correct_a: correct_a.evaluation.raw_argmax_disagreement_pixels,
-        raw_argmax_disagreement_correct_b: correct_b.evaluation.raw_argmax_disagreement_pixels,
-        raw_argmax_disagreement_swapped: swapped.evaluation.raw_argmax_disagreement_pixels,
+        probability_l1_correct_a: eval_a.probability_l1,
+        probability_l1_correct_b: eval_b.probability_l1,
+        probability_l1_swapped: eval_s.probability_l1,
+        raw_argmax_disagreement_correct_a: eval_a.raw_argmax_disagreement_pixels,
+        raw_argmax_disagreement_correct_b: eval_b.raw_argmax_disagreement_pixels,
+        raw_argmax_disagreement_swapped: eval_s.raw_argmax_disagreement_pixels,
         k0_invariants_pass,
         continuous_gate,
         exact_correct_a,
@@ -489,8 +533,8 @@ pub fn confirmation_gate(
         confirmation_gate: continuous_gate && exact_gate,
         correct_own_exceeds_k0_derived: exact_correct_a
             && exact_correct_b
-            && correct_a.exact.own_raw_argmax_correct > correct_a.exact.k0_raw_argmax_correct
-            && correct_b.exact.own_raw_argmax_correct > correct_b.exact.k0_raw_argmax_correct,
+            && correct_a.exact().own_raw_argmax_correct > correct_a.exact().k0_raw_argmax_correct
+            && correct_b.exact().own_raw_argmax_correct > correct_b.exact().k0_raw_argmax_correct,
     })
 }
 
@@ -544,10 +588,50 @@ pub struct ConfirmationVerdict {
     pub note: String,
 }
 
+/// Outcome labels and rule text of one confirmation protocol. The decision
+/// logic (two consecutive family checkpoints, early stop, preflight can never
+/// pass) is shared and fixed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerdictLabels {
+    /// Protocol name used in notes (`E2C`, `E2D`).
+    pub(crate) protocol: &'static str,
+    pub(crate) pass: &'static str,
+    pub(crate) reject: &'static str,
+    pub(crate) preflight: &'static str,
+    pub(crate) statistic: &'static str,
+    pub(crate) rule: &'static str,
+}
+
+pub(crate) const E2C_VERDICT_LABELS: VerdictLabels = VerdictLabels {
+    protocol: "E2C",
+    pass: OUTCOME_CONFIRMATION_PASS,
+    reject: OUTCOME_REJECT,
+    preflight: OUTCOME_PREFLIGHT,
+    statistic: "D = raw_softmax_NLL(paired K=16) - raw_softmax_NLL(own K=16) over \
+                target-disagreement pixels, averaged within each query direction then \
+                equally across both directions; exact gate on raw-argmax totals over 2m pixels",
+    rule: "confirmation_pass: at the same two consecutive family checkpoints D_correct_a > 1e-4, \
+           D_correct_b > 1e-4, D_swapped < -1e-4, each correct-minus-swapped interaction > 2e-4, \
+           every arm pooled own-vs-paired probability L1 > 1e-6 or >= 1 raw argmax \
+           disagreement, all mixed-K0 and cross-direction K0 invariants hold, each correct \
+           arm scores own 2m/2m and paired 0/2m raw-argmax pixels, and swapped scores own \
+           0/2m and paired 2m/2m. Stop at the second checkpoint of the first such pair; \
+           otherwise run through update 256 and reject the bounded single-pair claim.",
+};
+
 pub fn confirmation_verdict(
     gates: Vec<ConfirmationGate>,
     spec: &ContextConfirmationSpec,
     updates_run: usize,
+) -> Result<ConfirmationVerdict> {
+    confirmation_verdict_labeled(gates, spec, updates_run, &E2C_VERDICT_LABELS)
+}
+
+pub(crate) fn confirmation_verdict_labeled(
+    gates: Vec<ConfirmationGate>,
+    spec: &ContextConfirmationSpec,
+    updates_run: usize,
+    labels: &VerdictLabels,
 ) -> Result<ConfirmationVerdict> {
     let wiring = &spec.wiring;
     let decision = confirmation_decision(&gates, &wiring.checkpoint_family)?;
@@ -557,13 +641,13 @@ pub fn confirmation_verdict(
         .map(|(_, second)| second)
         .filter(|update| spec.is_registered_contract() && *update < wiring.max_updates);
     let outcome = if !spec.is_registered_contract() {
-        OUTCOME_PREFLIGHT
+        labels.preflight
     } else if registered_confirmation_pass {
-        OUTCOME_CONFIRMATION_PASS
+        labels.pass
     } else if updates_run >= CONTEXT_WIRING_MAX_UPDATES {
-        OUTCOME_REJECT
+        labels.reject
     } else {
-        OUTCOME_PREFLIGHT
+        labels.preflight
     };
     let note = match (
         spec.is_registered_contract(),
@@ -571,7 +655,8 @@ pub fn confirmation_verdict(
     ) {
         (false, observed) => format!(
             "unregistered run observed confirmation checkpoints {observed:?}, but cannot satisfy \
-             E2C; outcome {outcome} after {updates_run} updates per arm"
+             {}; outcome {outcome} after {updates_run} updates per arm",
+            labels.protocol
         ),
         (true, Some((first, second))) => format!(
             "continuous and exact gates held in correct_a, correct_b and swapped at consecutive \
@@ -587,18 +672,8 @@ pub fn confirmation_verdict(
         ),
     };
     Ok(ConfirmationVerdict {
-        statistic: "D = raw_softmax_NLL(paired K=16) - raw_softmax_NLL(own K=16) over \
-                    target-disagreement pixels, averaged within each query direction then \
-                    equally across both directions; exact gate on raw-argmax totals over 2m pixels"
-            .into(),
-        rule: "confirmation_pass: at the same two consecutive family checkpoints D_correct_a > 1e-4, \
-               D_correct_b > 1e-4, D_swapped < -1e-4, each correct-minus-swapped interaction > 2e-4, \
-               every arm pooled own-vs-paired probability L1 > 1e-6 or >= 1 raw argmax \
-               disagreement, all mixed-K0 and cross-direction K0 invariants hold, each correct \
-               arm scores own 2m/2m and paired 0/2m raw-argmax pixels, and swapped scores own \
-               0/2m and paired 2m/2m. Stop at the second checkpoint of the first such pair; \
-               otherwise run through update 256 and reject the bounded single-pair claim."
-            .into(),
+        statistic: labels.statistic.into(),
+        rule: labels.rule.into(),
         d_threshold: wiring.d_threshold,
         interaction_threshold: wiring.interaction_threshold,
         probability_l1_threshold: wiring.probability_l1_threshold,
@@ -619,7 +694,7 @@ pub fn confirmation_verdict(
 /// Serialized-JSON identity: `serde_json` round-trips every finite float
 /// exactly, so equal bytes mean equal bits (non-finite values are rejected
 /// earlier by the finiteness guards).
-fn json_bit_identical<T: Serialize>(left: &T, right: &T) -> Result<bool> {
+pub(crate) fn json_bit_identical<T: Serialize>(left: &T, right: &T) -> Result<bool> {
     Ok(serde_json::to_vec(left)? == serde_json::to_vec(right)?)
 }
 
@@ -650,7 +725,11 @@ fn json_leaf_mismatches(left: &Value, right: &Value, path: &str, out: &mut Vec<S
 }
 
 /// Human-readable leaf paths where two serializable values differ.
-fn describe_mismatches<T: Serialize>(label: &str, left: &T, right: &T) -> Result<Vec<String>> {
+pub(crate) fn describe_mismatches<T: Serialize>(
+    label: &str,
+    left: &T,
+    right: &T,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     json_leaf_mismatches(
         &serde_json::to_value(left)?,
@@ -670,22 +749,31 @@ pub struct LaunchParity {
     pub mismatches: Vec<String>,
 }
 
-/// Bit parity between the exact preflight and the current run: arm
-/// initialization hashes, ordered parameter names, parameter hashes after
-/// update 8, update records `1..=8` and every checkpoint-0/8 field per arm.
-pub fn launch_parity(
-    preflight: &ConfirmationArms,
-    current: &ConfirmationArms,
-) -> Result<LaunchParity> {
-    let mut mismatches = Vec::new();
+/// E2C's registered parity set split into the two components E2D reports
+/// separately: `evaluator` (arm initialization hashes, ordered parameter
+/// names, row contexts, every checkpoint-0 field) and `optimizer` (update
+/// records `1..=8`, update-8 parameter hashes, every checkpoint-8 field).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct LaunchParityMismatches {
+    pub(crate) evaluator: Vec<String>,
+    pub(crate) optimizer: Vec<String>,
+}
+
+pub(crate) fn launch_parity_mismatches<C: ArmCheckpoint>(
+    preflight: &ConfirmationArms<C>,
+    current: &ConfirmationArms<C>,
+) -> Result<LaunchParityMismatches> {
+    let mut mismatches = LaunchParityMismatches::default();
     if preflight.parameter_count != current.parameter_count {
-        mismatches.push(format!(
+        mismatches.evaluator.push(format!(
             "parameter_count: preflight {} != current {}",
             preflight.parameter_count, current.parameter_count
         ));
     }
     if preflight.ordered_parameter_names_sha256 != current.ordered_parameter_names_sha256 {
-        mismatches.push("ordered_parameter_names_sha256 differs".into());
+        mismatches
+            .evaluator
+            .push("ordered_parameter_names_sha256 differs".into());
     }
     for (before, after) in [
         (&preflight.correct_a, &current.correct_a),
@@ -694,17 +782,23 @@ pub fn launch_parity(
     ] {
         let name = &after.name;
         if before.name != after.name {
-            mismatches.push(format!("arm name {} != {name}", before.name));
+            mismatches
+                .evaluator
+                .push(format!("arm name {} != {name}", before.name));
         }
         if before.row_contexts != after.row_contexts {
-            mismatches.push(format!("{name}: row_contexts differs"));
+            mismatches
+                .evaluator
+                .push(format!("{name}: row_contexts differs"));
         }
         if before.initial_parameter_sha256 != after.initial_parameter_sha256 {
-            mismatches.push(format!("{name}: initial_parameter_sha256 differs"));
+            mismatches
+                .evaluator
+                .push(format!("{name}: initial_parameter_sha256 differs"));
         }
         if before.updates.len() < LAUNCH_PARITY_UPDATE || after.updates.len() < LAUNCH_PARITY_UPDATE
         {
-            mismatches.push(format!(
+            mismatches.optimizer.push(format!(
                 "{name}: fewer than {LAUNCH_PARITY_UPDATE} update records (preflight {}, current {})",
                 before.updates.len(),
                 after.updates.len()
@@ -717,7 +811,7 @@ pub fn launch_parity(
             .take(LAUNCH_PARITY_UPDATE)
         {
             if !json_bit_identical(record_before, record_after)? {
-                mismatches.extend(describe_mismatches(
+                mismatches.optimizer.extend(describe_mismatches(
                     &format!("{name}.update[{}]", record_after.update),
                     record_before,
                     record_after,
@@ -725,31 +819,51 @@ pub fn launch_parity(
             }
         }
         for update in [0, LAUNCH_PARITY_UPDATE] {
-            let find = |arm: &ConfirmationArmReport| {
+            let component = if update == 0 {
+                &mut mismatches.evaluator
+            } else {
+                &mut mismatches.optimizer
+            };
+            let find = |arm: &ConfirmationArmReport<C>| {
                 arm.checkpoints
                     .iter()
-                    .find(|checkpoint| checkpoint.update == update)
+                    .find(|checkpoint| checkpoint.update() == update)
                     .cloned()
             };
             match (find(before), find(after)) {
                 (Some(checkpoint_before), Some(checkpoint_after)) => {
-                    if checkpoint_before.parameter_sha256 != checkpoint_after.parameter_sha256 {
-                        mismatches.push(format!(
+                    if checkpoint_before.parameter_sha256() != checkpoint_after.parameter_sha256() {
+                        component.push(format!(
                             "{name}: parameter_sha256 after update {update} differs"
                         ));
                     }
                     if !json_bit_identical(&checkpoint_before, &checkpoint_after)? {
-                        mismatches.extend(describe_mismatches(
+                        component.extend(describe_mismatches(
                             &format!("{name}.checkpoint[{update}]"),
                             &checkpoint_before,
                             &checkpoint_after,
                         )?);
                     }
                 }
-                _ => mismatches.push(format!("{name}: checkpoint {update} missing on one side")),
+                _ => component.push(format!("{name}: checkpoint {update} missing on one side")),
             }
         }
     }
+    Ok(mismatches)
+}
+
+/// Bit parity between the exact preflight and the current run: arm
+/// initialization hashes, ordered parameter names, parameter hashes after
+/// update 8, update records `1..=8` and every checkpoint-0/8 field per arm.
+pub fn launch_parity(
+    preflight: &ConfirmationArms,
+    current: &ConfirmationArms,
+) -> Result<LaunchParity> {
+    let LaunchParityMismatches {
+        evaluator,
+        optimizer,
+    } = launch_parity_mismatches(preflight, current)?;
+    let mismatches = [evaluator, optimizer].concat();
     Ok(LaunchParity {
         compared_update: LAUNCH_PARITY_UPDATE,
         pass: mismatches.is_empty(),
@@ -845,7 +959,7 @@ fn legacy_checkpoint0(report: &ContextWiringReport, arm: &str) -> Result<Checkpo
 
 /// Verify the sealed registered E2W report (fixed report and root-manifest
 /// digests) and extract its frozen selection.
-fn bind_e2w_evidence(path: &Path) -> Result<(E2wEvidenceBinding, ContextWiringReport)> {
+pub(crate) fn bind_e2w_evidence(path: &Path) -> Result<(E2wEvidenceBinding, ContextWiringReport)> {
     let report_path = fs::canonicalize(path)
         .with_context(|| format!("canonicalize E2W report {}", path.display()))?;
     let bytes = fs::read(&report_path)
@@ -922,15 +1036,17 @@ fn bind_e2w_evidence(path: &Path) -> Result<(E2wEvidenceBinding, ContextWiringRe
 
 // ---- three-arm execution ----------------------------------------------------
 
+/// One arm's evidence; `C` is the protocol's per-checkpoint record
+/// (E2C: [`ConfirmationCheckpoint`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConfirmationArmReport {
+pub struct ConfirmationArmReport<C = ConfirmationCheckpoint> {
     pub name: String,
     /// Row order of the physical batch: `[primary, twin]` with this arm's
     /// context assignment.
     pub row_contexts: Vec<String>,
     pub initial_parameter_sha256: String,
     pub updates: Vec<UpdateRecord>,
-    pub checkpoints: Vec<ConfirmationCheckpoint>,
+    pub checkpoints: Vec<C>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -972,20 +1088,24 @@ pub struct ReplicaComparison {
     pub directions: Vec<ReplicaDirectionComparison>,
 }
 
-pub fn replica_comparison(
-    correct_a: &ConfirmationCheckpoint,
-    correct_b: &ConfirmationCheckpoint,
+pub fn replica_comparison<C: ArmCheckpoint>(
+    correct_a: &C,
+    correct_b: &C,
 ) -> Result<ReplicaComparison> {
-    if correct_a.update != correct_b.update
-        || correct_a.evaluation.directions.len() != correct_b.evaluation.directions.len()
+    let (update, evaluation_a, evaluation_b) = (
+        correct_a.update(),
+        correct_a.evaluation(),
+        correct_b.evaluation(),
+    );
+    if update != correct_b.update()
+        || evaluation_a.directions.len() != evaluation_b.directions.len()
     {
         bail!("replica checkpoints are not comparable");
     }
-    if correct_a
-        .evaluation
+    if evaluation_a
         .directions
         .iter()
-        .zip(&correct_b.evaluation.directions)
+        .zip(&evaluation_b.directions)
         .any(|(a, b)| a.direction != b.direction)
     {
         bail!("replica checkpoint directions differ");
@@ -1019,11 +1139,10 @@ pub fn replica_comparison(
                 ),
             }
         };
-    let directions = correct_a
-        .evaluation
+    let directions = evaluation_a
         .directions
         .iter()
-        .zip(&correct_b.evaluation.directions)
+        .zip(&evaluation_b.directions)
         .map(|(a, b)| ReplicaDirectionComparison {
             direction: a.direction.clone(),
             own: score_difference(&a.own, &b.own),
@@ -1034,18 +1153,19 @@ pub fn replica_comparison(
         })
         .collect();
     Ok(ReplicaComparison {
-        update: correct_a.update,
-        parameter_sha256_identical: correct_a.parameter_sha256 == correct_b.parameter_sha256,
-        evaluation_bit_identical: json_bit_identical(&correct_a.evaluation, &correct_b.evaluation)?,
+        update,
+        parameter_sha256_identical: correct_a.parameter_sha256() == correct_b.parameter_sha256(),
+        evaluation_bit_identical: json_bit_identical(evaluation_a, evaluation_b)?,
         directions,
     })
 }
 
+/// Three-arm evidence; `C` is the protocol's per-checkpoint record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConfirmationArms {
-    pub correct_a: ConfirmationArmReport,
-    pub correct_b: ConfirmationArmReport,
-    pub swapped: ConfirmationArmReport,
+pub struct ConfirmationArms<C = ConfirmationCheckpoint> {
+    pub correct_a: ConfirmationArmReport<C>,
+    pub correct_b: ConfirmationArmReport<C>,
+    pub swapped: ConfirmationArmReport<C>,
     pub parameter_ordering: ParameterOrdering,
     pub parameter_count: usize,
     /// SHA-256 over the canonically ordered parameter names/dtypes/shapes.
@@ -1067,11 +1187,108 @@ pub(crate) struct ConfirmationRun {
     pub(crate) failure: Option<String>,
 }
 
-struct RunState<'a> {
+/// Protocol-specific steps of the shared three-arm loop
+/// ([`run_protocol_arms`]): how one arm is evaluated at a checkpoint, what
+/// extra integrity controls run once all three arms are evaluated, and how
+/// preflight-versus-registered parity is judged at the parity update. The
+/// arm construction, ordered optimizer, deadline, family checkpoints, gates,
+/// decision and early stop are shared and fixed.
+pub(crate) trait ConfirmationProtocol {
+    type Checkpoint: ArmCheckpoint;
+
+    fn labels(&self) -> &VerdictLabels;
+
+    fn evaluate_arm(
+        &self,
+        arm: &Arm,
+        directions: &[DirectionRows; 2],
+        update: usize,
+        device: &Device,
+    ) -> Result<Self::Checkpoint>;
+
+    /// Runs after all three arms were evaluated at `update` and before the
+    /// records are stored. An error is an integrity failure that stops the
+    /// run (at checkpoint 0 this is before update 1).
+    fn after_checkpoint(
+        &mut self,
+        update: usize,
+        evaluated: &[Self::Checkpoint],
+        arms: &[Arm],
+        directions: &[DirectionRows; 2],
+        device: &Device,
+        on_progress: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()>;
+
+    /// Judge and record launch parity; returns every mismatch (empty = pass).
+    fn launch_parity(
+        &mut self,
+        preflight: &ConfirmationArms<Self::Checkpoint>,
+        current: &ConfirmationArms<Self::Checkpoint>,
+        on_progress: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Vec<String>>;
+}
+
+/// E2C as registered: the [`SharedK0Invariant`] checkpoint, no extra
+/// in-process control, and one undivided launch-parity mismatch list.
+pub(crate) struct E2cProtocol {
+    pub(crate) launch_parity: Option<LaunchParity>,
+}
+
+impl ConfirmationProtocol for E2cProtocol {
+    type Checkpoint = ConfirmationCheckpoint;
+
+    fn labels(&self) -> &VerdictLabels {
+        &E2C_VERDICT_LABELS
+    }
+
+    fn evaluate_arm(
+        &self,
+        arm: &Arm,
+        directions: &[DirectionRows; 2],
+        update: usize,
+        device: &Device,
+    ) -> Result<ConfirmationCheckpoint> {
+        evaluate_arm_checkpoint(arm, directions, update, device)
+    }
+
+    fn after_checkpoint(
+        &mut self,
+        _update: usize,
+        _evaluated: &[ConfirmationCheckpoint],
+        _arms: &[Arm],
+        _directions: &[DirectionRows; 2],
+        _device: &Device,
+        _on_progress: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn launch_parity(
+        &mut self,
+        preflight: &ConfirmationArms,
+        current: &ConfirmationArms,
+        _on_progress: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Vec<String>> {
+        let parity = launch_parity(preflight, current)?;
+        let mismatches = parity.mismatches.clone();
+        self.launch_parity = Some(parity);
+        Ok(mismatches)
+    }
+}
+
+/// Result of [`run_protocol_arms`]; see [`ConfirmationRun`].
+pub(crate) struct ProtocolRun<C> {
+    pub(crate) arms: ConfirmationArms<C>,
+    pub(crate) verdict: Option<ConfirmationVerdict>,
+    pub(crate) failure: Option<String>,
+}
+
+struct RunState<'a, P: ConfirmationProtocol> {
     spec: &'a ContextConfirmationSpec,
     device: &'a Device,
+    protocol: &'a mut P,
     arms: Vec<Arm>,
-    checkpoints: Vec<Vec<ConfirmationCheckpoint>>,
+    checkpoints: Vec<Vec<P::Checkpoint>>,
     initial_parameter_sha256: Vec<String>,
     parameter_count: usize,
     ordered_parameter_names_sha256: String,
@@ -1081,9 +1298,8 @@ struct RunState<'a> {
     gates: Vec<ConfirmationGate>,
     updates_run: usize,
     early_stopped: bool,
-    launch_parity: Option<LaunchParity>,
     deadline: Instant,
-    preflight_arms: Option<&'a ConfirmationArms>,
+    preflight_arms: Option<&'a ConfirmationArms<P::Checkpoint>>,
 }
 
 const ROW_CONTEXTS: [[&str; 2]; 3] = [
@@ -1092,7 +1308,7 @@ const ROW_CONTEXTS: [[&str; 2]; 3] = [
     ["primary<-twin_window", "twin<-primary_window"],
 ];
 
-impl RunState<'_> {
+impl<P: ConfirmationProtocol> RunState<'_, P> {
     fn check_deadline(&self, stage: &str) -> Result<()> {
         if Instant::now() >= self.deadline {
             bail!(
@@ -1103,7 +1319,7 @@ impl RunState<'_> {
         Ok(())
     }
 
-    fn arm_report(&self, index: usize) -> ConfirmationArmReport {
+    fn arm_report(&self, index: usize) -> ConfirmationArmReport<P::Checkpoint> {
         ConfirmationArmReport {
             name: self.arms[index].name.into(),
             row_contexts: ROW_CONTEXTS[index]
@@ -1116,7 +1332,7 @@ impl RunState<'_> {
         }
     }
 
-    fn arms_report(&self) -> Result<ConfirmationArms> {
+    fn arms_report(&self) -> Result<ConfirmationArms<P::Checkpoint>> {
         let replica_comparisons = self.checkpoints[0]
             .iter()
             .zip(&self.checkpoints[1])
@@ -1153,7 +1369,7 @@ impl RunState<'_> {
     ) -> Result<ConfirmationDecision> {
         let mut evaluated = Vec::with_capacity(3);
         for arm in &self.arms {
-            evaluated.push(evaluate_arm_checkpoint(
+            evaluated.push(self.protocol.evaluate_arm(
                 arm,
                 &self.directions,
                 update,
@@ -1166,6 +1382,7 @@ impl RunState<'_> {
             &evaluated[2],
             &self.spec.wiring,
         )?;
+        let exact = |index: usize| evaluated[index].exact();
         on_progress(&format!(
             "checkpoint {update}: D_a={:.6e} D_b={:.6e} D_swapped={:.6e} l1_a={:.3e} l1_b={:.3e} \
              l1_swapped={:.3e} own/paired/k0 a={}/{}/{} b={}/{}/{} swapped={}/{}/{} of {} \
@@ -1176,21 +1393,29 @@ impl RunState<'_> {
             gate.probability_l1_correct_a,
             gate.probability_l1_correct_b,
             gate.probability_l1_swapped,
-            evaluated[0].exact.own_raw_argmax_correct,
-            evaluated[0].exact.paired_raw_argmax_correct,
-            evaluated[0].exact.k0_raw_argmax_correct,
-            evaluated[1].exact.own_raw_argmax_correct,
-            evaluated[1].exact.paired_raw_argmax_correct,
-            evaluated[1].exact.k0_raw_argmax_correct,
-            evaluated[2].exact.own_raw_argmax_correct,
-            evaluated[2].exact.paired_raw_argmax_correct,
-            evaluated[2].exact.k0_raw_argmax_correct,
-            evaluated[0].exact.total_pixels,
+            exact(0).own_raw_argmax_correct,
+            exact(0).paired_raw_argmax_correct,
+            exact(0).k0_raw_argmax_correct,
+            exact(1).own_raw_argmax_correct,
+            exact(1).paired_raw_argmax_correct,
+            exact(1).k0_raw_argmax_correct,
+            exact(2).own_raw_argmax_correct,
+            exact(2).paired_raw_argmax_correct,
+            exact(2).k0_raw_argmax_correct,
+            exact(0).total_pixels,
             gate.continuous_gate,
             gate.exact_gate,
             gate.confirmation_gate,
-            evaluated[0].parameter_sha256 == evaluated[1].parameter_sha256
+            evaluated[0].parameter_sha256() == evaluated[1].parameter_sha256()
         ))?;
+        self.protocol.after_checkpoint(
+            update,
+            &evaluated,
+            &self.arms,
+            &self.directions,
+            self.device,
+            on_progress,
+        )?;
         for (index, checkpoint) in evaluated.into_iter().enumerate() {
             self.checkpoints[index].push(checkpoint);
         }
@@ -1243,19 +1468,21 @@ impl RunState<'_> {
             let decision = self.evaluate_all(update, on_progress)?;
             if update == self.spec.launch_parity_update {
                 if let Some(preflight) = self.preflight_arms {
-                    let parity = launch_parity(preflight, &self.arms_report()?)?;
+                    let current = self.arms_report()?;
+                    let mismatches =
+                        self.protocol
+                            .launch_parity(preflight, &current, on_progress)?;
                     on_progress(&format!(
                         "launch parity at update {update}: pass={} mismatches={}",
-                        parity.pass,
-                        parity.mismatches.len()
+                        mismatches.is_empty(),
+                        mismatches.len()
                     ))?;
-                    self.launch_parity = Some(parity.clone());
-                    if !parity.pass {
+                    if !mismatches.is_empty() {
                         bail!(
                             "preflight-versus-registered bit parity failed at update {update} \
                              (integrity failure; registered run stopped, not a negative model \
                              result): {}",
-                            parity.mismatches.join("; ")
+                            mismatches.join("; ")
                         );
                     }
                 }
@@ -1273,10 +1500,7 @@ impl RunState<'_> {
     }
 }
 
-/// Run the three arms in lockstep on already generated rows. `load_arm` must
-/// return a freshly loaded model on every call (bit-identical initialization).
-/// Setup failures (before any arm evidence exists) are returned as `Err`;
-/// mid-run failures are recorded in [`ConfirmationRun::failure`].
+/// E2C's three-arm loop: [`run_protocol_arms`] under [`E2cProtocol`].
 pub(crate) fn run_confirmation_arms(
     spec: &ContextConfirmationSpec,
     rows: &ContextWiringRows,
@@ -1284,8 +1508,44 @@ pub(crate) fn run_confirmation_arms(
     load_arm: &dyn Fn() -> Result<(WorldModel, VarMap)>,
     deadline: Instant,
     preflight_arms: Option<&ConfirmationArms>,
-    mut on_progress: impl FnMut(&str) -> Result<()>,
+    on_progress: impl FnMut(&str) -> Result<()>,
 ) -> Result<ConfirmationRun> {
+    let mut protocol = E2cProtocol {
+        launch_parity: None,
+    };
+    let run = run_protocol_arms(
+        spec,
+        rows,
+        device,
+        load_arm,
+        deadline,
+        preflight_arms,
+        &mut protocol,
+        on_progress,
+    )?;
+    Ok(ConfirmationRun {
+        arms: run.arms,
+        launch_parity: protocol.launch_parity,
+        verdict: run.verdict,
+        failure: run.failure,
+    })
+}
+
+/// Run the three arms in lockstep on already generated rows. `load_arm` must
+/// return a freshly loaded model on every call (bit-identical initialization).
+/// Setup failures (before any arm evidence exists) are returned as `Err`;
+/// mid-run failures are recorded in [`ProtocolRun::failure`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_protocol_arms<P: ConfirmationProtocol>(
+    spec: &ContextConfirmationSpec,
+    rows: &ContextWiringRows,
+    device: &Device,
+    load_arm: &dyn Fn() -> Result<(WorldModel, VarMap)>,
+    deadline: Instant,
+    preflight_arms: Option<&ConfirmationArms<P::Checkpoint>>,
+    protocol: &mut P,
+    mut on_progress: impl FnMut(&str) -> Result<()>,
+) -> Result<ProtocolRun<P::Checkpoint>> {
     spec.validate()?;
     let wiring = &spec.wiring;
     let windows = [
@@ -1337,6 +1597,7 @@ pub(crate) fn run_confirmation_arms(
     let mut state = RunState {
         spec,
         device,
+        protocol,
         checkpoints: vec![Vec::new(), Vec::new(), Vec::new()],
         arms,
         initial_parameter_sha256,
@@ -1348,7 +1609,6 @@ pub(crate) fn run_confirmation_arms(
         gates: Vec::new(),
         updates_run: 0,
         early_stopped: false,
-        launch_parity: None,
         deadline,
         preflight_arms,
     };
@@ -1356,7 +1616,12 @@ pub(crate) fn run_confirmation_arms(
     let arms = state.arms_report()?;
     let (verdict, failure) = match outcome {
         Ok(()) => {
-            let verdict = confirmation_verdict(state.gates.clone(), spec, state.updates_run)?;
+            let verdict = confirmation_verdict_labeled(
+                state.gates.clone(),
+                spec,
+                state.updates_run,
+                state.protocol.labels(),
+            )?;
             if state.early_stopped != verdict.early_stop_update.is_some() {
                 bail!("early-stop bookkeeping disagrees with the verdict");
             }
@@ -1364,9 +1629,8 @@ pub(crate) fn run_confirmation_arms(
         }
         Err(error) => (None, Some(format!("{error:#}"))),
     };
-    Ok(ConfirmationRun {
+    Ok(ProtocolRun {
         arms,
-        launch_parity: state.launch_parity,
         verdict,
         failure,
     })
@@ -1483,7 +1747,8 @@ fn identity_root(report: &ContextConfirmationReport) -> Result<String> {
     ])
 }
 
-fn arm_complete(arm: &ConfirmationArmReport, name: &str) -> bool {
+/// Whether an arm record holds exactly the 8-update preflight evidence.
+pub(crate) fn arm_complete<C: ArmCheckpoint>(arm: &ConfirmationArmReport<C>, name: &str) -> bool {
     arm.name == name
         && arm
             .updates
@@ -1493,7 +1758,7 @@ fn arm_complete(arm: &ConfirmationArmReport, name: &str) -> bool {
         && arm
             .checkpoints
             .iter()
-            .map(|checkpoint| checkpoint.update)
+            .map(|checkpoint| checkpoint.update())
             .eq([0, LAUNCH_PARITY_UPDATE])
 }
 
@@ -1844,8 +2109,9 @@ fn run_inner(
 }
 
 /// Re-derive E2W's meta-episode-1 selection from the same population, load a
-/// fresh model and re-evaluate checkpoint 0 with this binary.
-fn legacy_parity(
+/// fresh model and re-evaluate checkpoint 0 with this binary (the unchanged
+/// batch-1 singleton evaluator shared by E2W, E2C and E2D).
+pub(crate) fn legacy_parity(
     pairs: &[AugmentedTwinPair],
     context_len: usize,
     gameplay_pixels: usize,

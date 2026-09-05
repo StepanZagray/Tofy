@@ -1301,6 +1301,9 @@ pub fn run_p2_arc3_bridge(args: P2Arc3BridgeArgs) -> Result<()> {
 }
 
 pub use crate::p2::context_confirmation::{run_p2_context_confirmation, P2ContextConfirmationArgs};
+pub use crate::p2::context_confirmation_v2::{
+    run_p2_context_confirmation_v2, P2ContextConfirmationV2Args,
+};
 pub use crate::p2::context_wiring::{run_p2_context_wiring, P2ContextWiringArgs};
 /// `p2-residual-probe` — ADR 0005 §5.3 residual-vs-reliability probe (frozen checkpoint).
 pub use crate::p2::residual_probe::{run_p2_residual_probe, P2ResidualProbeArgs};

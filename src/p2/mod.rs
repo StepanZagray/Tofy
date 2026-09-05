@@ -14,6 +14,7 @@ pub mod cli;
 pub mod consumer_readout;
 pub mod consumer_transition;
 pub mod context_confirmation;
+pub mod context_confirmation_v2;
 pub mod context_wiring;
 pub mod data;
 pub mod eval;

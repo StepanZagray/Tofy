@@ -1219,11 +1219,14 @@ fn mixed_k0_invariant(
     })
 }
 
+/// Evaluate one query direction and return the exact batch-1 singleton K0
+/// decode that produced its reported `k0` score (E2D retains it for the
+/// semantic batch-invariance comparison; E2W and E2C discard it).
 fn evaluate_direction(
     model: &WorldModel,
     rows: &DirectionRows,
     device: &Device,
-) -> Result<DirectionEvaluation> {
+) -> Result<(DirectionEvaluation, TwinContinuousDecodes)> {
     let own = decode_single(model, &rows.own, device)?;
     let paired = decode_single(model, &rows.paired, device)?;
     let k0 = decode_single(model, &rows.k0, device)?;
@@ -1241,7 +1244,7 @@ fn evaluate_direction(
         &rows.disagreement,
         device,
     )?;
-    Ok(DirectionEvaluation {
+    let evaluation = DirectionEvaluation {
         direction: rows.direction.into(),
         disagreement_pixels: rows.disagreement.len(),
         d: paired_scores.raw_softmax_nll - own_scores.raw_softmax_nll,
@@ -1251,7 +1254,8 @@ fn evaluate_direction(
         own_vs_paired: compare(&own, &paired, &rows.disagreement)?,
         own_vs_k0: compare(&own, &k0, &rows.disagreement)?,
         mixed_k0_invariant,
-    })
+    };
+    Ok((evaluation, k0))
 }
 
 pub(crate) fn evaluate_checkpoint(
@@ -1260,10 +1264,25 @@ pub(crate) fn evaluate_checkpoint(
     update: usize,
     device: &Device,
 ) -> Result<CheckpointEvaluation> {
-    let evaluated = directions
+    evaluate_checkpoint_retaining_k0(model, directions, update, device)
+        .map(|(evaluation, _)| evaluation)
+}
+
+/// [`evaluate_checkpoint`] plus, per direction, the retained canonical
+/// batch-1 singleton K0 decode behind the reported `k0` score. The operation
+/// order is identical to the plain evaluator.
+pub(crate) fn evaluate_checkpoint_retaining_k0(
+    model: &WorldModel,
+    directions: &[DirectionRows],
+    update: usize,
+    device: &Device,
+) -> Result<(CheckpointEvaluation, Vec<TwinContinuousDecodes>)> {
+    let (evaluated, retained_k0): (Vec<_>, Vec<_>) = directions
         .iter()
         .map(|rows| evaluate_direction(model, rows, device))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .unzip();
     let count = evaluated.len() as f64;
     let d = evaluated.iter().map(|direction| direction.d).sum::<f64>() / count;
     let probability_l1 = evaluated
@@ -1286,7 +1305,7 @@ pub(crate) fn evaluate_checkpoint(
                 .collect::<Vec<_>>()
         );
     }
-    Ok(CheckpointEvaluation {
+    let evaluation = CheckpointEvaluation {
         update,
         d,
         probability_l1,
@@ -1300,7 +1319,8 @@ pub(crate) fn evaluate_checkpoint(
                 && direction.own.raw_argmax_correct > direction.k0.raw_argmax_correct
         }),
         directions: evaluated,
-    })
+    };
+    Ok((evaluation, retained_k0))
 }
 
 // ---- verdict ---------------------------------------------------------------
