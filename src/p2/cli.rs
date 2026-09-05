@@ -20,7 +20,7 @@ use crate::p2::muon::MUON_RMS_SCALE;
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{
     default_data_workers, train, PromotionMetric, SigregTarget, SplitCeWeighting, TrainConfig,
-    DEFAULT_LESSONS,
+    DEFAULT_LESSONS, V6_RECURSION_STEPS,
 };
 use anyhow::Result;
 use clap::Args;
@@ -293,9 +293,13 @@ pub struct P2TrainArgs {
     #[arg(long, default_value_t = false)]
     pub data_contract_v6: bool,
 
-    /// ADR 0005 §3.5 recursion depth for v6 runs (inner and outer); 3 is the
-    /// contract, 2 is the preregistered depth-ablation arm.
-    #[arg(long, default_value_t = 3, requires = "world_core_v6")]
+    /// ADR 0005 §3.5 recursion depth for v6 runs (inner and outer); 2 is the
+    /// baseline contract and 3 is the deferred depth-treatment arm.
+    #[arg(
+        long,
+        default_value_t = V6_RECURSION_STEPS,
+        requires = "world_core_v6"
+    )]
     pub v6_recursion_steps: usize,
 
     /// Planning-head readout from the final BxCx8x8 prediction.
@@ -1456,11 +1460,27 @@ mod tests {
         .expect("v6 warm-start arguments parse");
         let cfg = parsed.args.to_config();
         assert!(cfg.world_core_v6);
+        assert_eq!(cfg.v6_recursion_steps, V6_RECURSION_STEPS);
+        assert_eq!((cfg.inner_steps, cfg.outer_steps), (2, 2));
         assert_eq!(
             cfg.init_context_from_v5.as_deref(),
             Some(std::path::Path::new("runs/v5/checkpoints/best"))
         );
         assert!(cfg.model_config().world_core_v6);
+        let treatment = Wrapper::try_parse_from([
+            "p2-train",
+            "--recipe",
+            "foundation-v2",
+            "--world-core-v6",
+            "--data-contract-v6",
+            "--v6-recursion-steps",
+            "3",
+        ])
+        .expect("explicit 3x3 v6 treatment parses")
+        .args
+        .to_config();
+        assert_eq!(treatment.v6_recursion_steps, 3);
+        assert_eq!((treatment.inner_steps, treatment.outer_steps), (3, 3));
         let legacy = Wrapper::try_parse_from(["p2-train", "--recipe", "foundation-v2"])
             .expect("legacy arguments parse")
             .args

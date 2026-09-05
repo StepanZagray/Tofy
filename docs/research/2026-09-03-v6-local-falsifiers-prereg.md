@@ -35,17 +35,21 @@ or unblock the v6 pod run, it cannot satisfy a promotion gate.
   full context (K = 16) on 512 held-out twin-pair meta-episodes, fixed
   evaluation seed 1000002.
 - Budget: local run, 4096 optimizer steps, seed 2, evaluation at 1024/2048/3072/4096.
-  Intended batch pair measured before launch (AGENTS.md): physical 256 OOMs on the 8 GB GPU
-  under the v6 context channel; physical 128 × accumulation 2 (effective 256) peaks at 5.8 GB.
-  The later audit established that recipe/CLI precedence silently overwrote accumulation to 1,
-  so the completed implementation-smoke run actually used effective batch 128 and cannot satisfy
-  this registration.
-- Launch (2026-09-03, revision 975832f9, binary sha256 in the run root):
+  The old qualification found physical 256 OOM and selected physical 128 ×
+  accumulation 2, but recipe/CLI precedence silently overwrote accumulation to
+  1. The completed implementation-smoke run therefore used effective batch 128
+  and cannot satisfy this registration. Before the fresh 2x2 launch, measure
+  physical 256 × accumulation 1 first and fall back to 128 × 2 only if needed,
+  preserving effective batch 256 and recording the selected pair.
+- Historical invalid launch (2026-09-03, revision 975832f9, binary sha256 in the run root):
   `tofy p2-train --recipe foundation-v2 --world-core-v6 --data-contract-v6 --device cuda
   --seed 2 --init-seed 2 --physical-batch 128 --grad-accum 2 --steps 4096
   --checkpoint-every-steps 512 --output-dir runs/p2/v6-memorization-e2-20260903`.
-- Threshold: Δ ≥ 0.05 absolute at step 4096. Below threshold ⇒ DATA failure:
-  the generator is not mutually exclusive; the pod run is blocked.
+- Fresh 2x2 threshold: Δ ≥ 0.05 absolute at step 4096. The preflight census separately
+  verifies that the population is mutually exclusive. Below threshold after a
+  valid preflight means this 2x2 v6 training system did not learn to use that
+  history within the budget; the pod run is blocked, but the result does not
+  by itself identify the generator as the failed component.
 - Also recorded (no threshold): the same delta on the legacy streams
   (expected ≈ 0, since legacy rows carry no context), and the model-free
   `single_frame_rule_identifiable` census (must be 0).
@@ -100,15 +104,14 @@ untested. Residual is a distribution-shift detector, not a per-transition
 correctness signal (chance within synthetic). Only 1.2% of real changed
 transitions were predicted exactly (28/2,410); 0/3,750 full-frame exact.
 
-## Amendment (2026-09-03): recursion depth 3x3
+## Superseded amendment (2026-09-03): recursion depth 3x3
 
-E2 and E3 now run the v6 recipe at recursion depth 3x3 (ADR 0005 §3.5), not
-2x2. The 4096-step budget and thresholds are unchanged, but the per-step cost
-rises ~2.25x on the dynamics block, so the measured wall clock supersedes the
-earlier 2.1 h estimate; the first attempt at 2x2 (physical 128 x accum 2)
-measured 1.60 s/step. Any 2x2-vs-3x3 comparison is a separate preregistered
-ablation, not part of E2: E2 is a data-contract screen and both arms of its
-own comparison (K=0 vs K=16) share one checkpoint and therefore one depth.
+The owner initially selected 3x3 for E2 and E3. The later audit established
+that the rationale miscounted execution: 3x3 runs 12 residual blocks versus 6
+at 2x2, while both receptive fields already cover the 16x16 latent grid. The
+old timing also came from the invalid accumulation/provenance sequence, so it
+cannot estimate the fresh run. The 2026-09-04 2x2 amendment below supersedes
+this choice while preserving 3x3 as a separate treatment.
 
 ## Amendment (2026-09-04): which statistic the §5.1 threshold applies to
 
@@ -126,9 +129,10 @@ roughly 2x or more. Before any result is read, the rule is fixed as follows:
 - This is a weaker test than K = 16 exactly (windows of 5..16, mean ~10);
   an exact K = 0 vs K = 16 twin-pair evaluation remains to be implemented and
   will supersede this rule when it exists.
-- E2 intended effective batch 256 and depth 3x3; the later audit found that
-  the checkpoint actually used effective batch 128, so it is not valid E2
-  evidence. The screen remains a data-contract decision only.
+- The invalid E2 attempt intended effective batch 256 and depth 3x3; the later
+  audit found that the checkpoint actually used effective batch 128, so it is
+  not valid E2 evidence. The fresh registered run uses the 2x2 baseline. The
+  screen remains a data-contract decision only.
 
 ## E2 execution record (2026-09-03/04, local RTX 5060 8 GB)
 
@@ -224,26 +228,42 @@ amendment.
 - The `--context-ablation` proxy is kept as a reported number only; it is not
   the gate.
 
-## Preregistered follow-up: depth ablation 2x2 vs 3x3 (2026-09-04)
+## Amendment (2026-09-04): 2x2 is the v6 baseline
 
-- Claim: on the v6 data contract, recursion depth 3x3 (ADR 0005 §3.5) yields
-  higher held-out changed-exact than 2x2 at equal data, seed, effective batch
-  and steps. Static argument only: the implementation executes 12 versus 6
-  two-convolution residual blocks, giving receptive fields 49 versus 25 cells
-  on a 16-cell grid; both already cover the board, while 3x3 costs about twice
-  the recurrent dynamics compute. There is no measured Tofy depth evidence.
+Before a fresh E2 result is observed, the owner selected
+`inner_steps = outer_steps = 2` as the canonical v6 baseline. It executes 6
+two-convolution residual blocks (receptive field 25) rather than 12 blocks at
+3x3 (receptive field 49); both receptive fields already cover the 16x16 latent
+grid. E2 changes no other causal factor and both K=16/K=0 evaluator arms share
+the same 2x2 checkpoint. An explicit `--v6-recursion-steps 3` remains a
+trajectory-distinct treatment that may be tested only after E2 validates the
+history premise. This is a compute- and evidence-conservative baseline choice,
+not a claim that 2x2 is globally optimal.
+
+## Deferred treatment: depth ablation 2x2 vs 3x3 (2026-09-04)
+
+- Claim: on the v6 data contract, the explicit 3x3 treatment yields higher
+  held-out changed-exact than the 2x2 baseline at equal data, seed, physical
+  and effective batch, and steps. Static argument only: the implementation
+  executes 12 versus 6 two-convolution residual blocks, giving receptive
+  fields 49 versus 25 cells on a 16-cell grid; both already cover the board,
+  while 3x3 costs about twice the recurrent dynamics compute. There is no
+  measured Tofy depth evidence.
 - Arms: two fresh matched runs, differing only in `--v6-recursion-steps 3`
   versus `--v6-recursion-steps 2` (recorded through `inner_steps`/`outer_steps`).
   The old E2 root cannot be reused as the 3x3 arm because it actually ran
-  physical 128 x accumulation 1 and lacks valid provenance. Single seed: a
-  screen, not a promotion result.
+  physical 128 x accumulation 1 and lacks valid provenance. One matched seed
+  may screen the effect size; any decision to replace the baseline requires a
+  fresh multi-seed confirmation.
 - Metrics: the held-out gate metrics (`one_step_changed_exact`,
   `one_step_composed_changed_exact`, `one_step_all_rows_exact`) per split and
   the §5.1 ablation delta, both read from the same evaluator at each run's best
-  checkpoint. No threshold is preregistered; the result informs whether the
-  full run stays at 3x3 (owner decision) and is reported as an effect size.
+  checkpoint. No threshold is preregistered; the result informs whether 3x3
+  deserves a fresh confirmation against the 2x2 baseline and is reported as
+  an effect size.
 - Runs only if E2's §5.1 verdict is PASS; a failing data contract makes depth
-  uninterpretable. Cost ~2 h local.
+  uninterpretable. Runtime must be registered from a fresh 2x2/3x3 batch and
+  timing smoke; the old estimate is not valid evidence.
 
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 

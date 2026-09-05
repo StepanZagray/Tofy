@@ -169,23 +169,25 @@ computation is recovered exactly at init) applied next to action FiLM.
 
 3.2 Parameter budget: <= 650k parameters total (v5 is ~467k).
 
-3.5 **Recursion depth 3x3** (owner decision, 2026-09-03; arithmetic corrected
-2026-09-04 after audit). v6 applies `inner_steps = outer_steps = 3` instead of
-v5's 2x2. Each outer step runs `inner_steps + 1` applications of the residual
-block (`deep_step`), and each block holds two 3x3 convolutions, so:
+3.5 **Recursion baseline 2x2** (owner decision, 2026-09-04; supersedes the
+2026-09-03 3x3 choice after its arithmetic was corrected). v6 and v5 default
+to `inner_steps = outer_steps = 2`. Each outer step runs `inner_steps + 1`
+applications of the residual block (`deep_step`), and each block holds two
+3x3 convolutions, so:
 
 | depth | blocks | 3x3 convs | receptive field on the 16x16 latent grid |
 |---|---|---|---|
-| 2x2 (v5) | 6 | 12 | 25 cells |
-| 3x3 (v6) | 12 | 24 | 49 cells |
+| 2x2 (v5 and v6 baseline) | 6 | 12 | 25 cells |
+| 3x3 (explicit v6 treatment) | 12 | 24 | 49 cells |
 
 The earlier text (4 vs 9 blocks, 17 vs 25 cells) was wrong: 2x2 already
-covers the grid; 3x3 doubles the dynamics compute (measured +10% wall clock on
-the host-bound local step) for margin that is not evidenced. RecurTrace
-(2026, in the 2026-09-04 literature map) reports that extra recurrent loops
-can hurt. The depth is therefore an owner choice under test, not a
-receptive-field necessity; the preregistered 2x2-vs-3x3 ablation is the
-arbiter. v5 keeps 2x2 so legacy checkpoints stay reproducible.
+covers the grid, while 3x3 doubles the recurrent dynamics blocks for margin
+that is not evidenced. The old local timings were not a matched, provenance-
+valid depth comparison. RecurTrace (2026, in the 2026-09-04 literature map)
+also reports that extra recurrent loops can hurt. Therefore 3x3 remains an
+explicit, trajectory-changing override for a later matched treatment, not a
+receptive-field necessity or prerequisite for E2. The baseline keeps v5
+reproducible and minimizes compute while testing the history premise.
 
 ## 4. Objective v6
 
@@ -200,8 +202,11 @@ effect size < 0.2 over multi-task pretraining; deferred, §8).
 meta-episodes, measure changed-exact on the row after the context with
 `K = 0` versus `K = 16`. Promotion of the data contract requires
 `delta >= 0.05` absolute by the first evaluation after step 4096 on a local
-run; a smaller delta is a **data** failure (the generator is not mutually
-exclusive) and blocks any pod run.
+run. The model-free preflight separately establishes whether the population
+is mutually exclusive. After that passes, a smaller model delta falsifies the
+bounded claim that this training system learns to use valid history within
+4096 updates; it blocks any pod run but is not, by itself, proof of a generator
+defect.
 
 5.2 **Adaptation falsifier.** Channel A (context only) vs Channel A+B
 (context plus fast-weight updates) on held-out synthetic meta-episodes,

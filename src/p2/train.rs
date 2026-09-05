@@ -112,7 +112,7 @@ const FOUNDATION_V2_GATE_WARMUP_STEPS: u64 = 4_096;
 const FOUNDATION_V2_PERMANENT_EVERY: u64 = 2_048;
 const FOUNDATION_V2_GATE_ROWS: usize = 512;
 /// ADR 0005 §3.5 recursion depth (inner and outer) for world-core v6.
-pub const V6_RECURSION_STEPS: usize = 3;
+pub const V6_RECURSION_STEPS: usize = 2;
 fn default_v6_recursion_steps() -> usize {
     V6_RECURSION_STEPS
 }
@@ -1062,8 +1062,8 @@ pub struct TrainConfig {
     #[serde(default)]
     pub world_core_v6: bool,
     /// ADR 0005 §3.5 recursion depth (inner and outer) applied by the
-    /// foundation-v2 recipe when `world_core_v6` is set. Default 3; the
-    /// preregistered depth ablation sets 2. Reaches the contract through
+    /// foundation-v2 recipe when `world_core_v6` is set. Default 2; the
+    /// deferred depth treatment sets 3. Reaches the contract through
     /// `inner_steps`/`outer_steps`.
     #[serde(default = "default_v6_recursion_steps")]
     pub v6_recursion_steps: usize,
@@ -1641,9 +1641,9 @@ impl TrainConfig {
         // ADR 0005 §3.5: each outer iteration executes `inner_steps + 1`
         // applications of the two-convolution residual block. Thus 2x2 is 6
         // blocks / 12 convolutions / receptive field 25, while 3x3 is 12 / 24
-        // / 49. Both already cover the 16x16 latent grid; 3x3 is the recorded
-        // v6 owner choice under a preregistered depth screen, not a proven
-        // receptive-field necessity. v5 stays 2x2 for reproducibility.
+        // / 49. Both already cover the 16x16 latent grid; 2x2 is the v6
+        // baseline contract and 3x3 remains an explicit treatment arm, not a
+        // proven receptive-field necessity. v5 stays 2x2 for reproducibility.
         let depth = if self.world_core_v6 {
             self.v6_recursion_steps
         } else {
@@ -15575,7 +15575,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_recipe_recurses_three_by_three_and_v5_stays_two_by_two() {
+    fn v6_recipe_defaults_to_two_by_two_and_v5_stays_two_by_two() {
         let mut v6 = TrainConfig {
             world_core_v6: true,
             ..TrainConfig::default()
@@ -15583,8 +15583,8 @@ mod tests {
         v6.apply_foundation_v2_recipe();
         assert_eq!(v6.inner_steps, V6_RECURSION_STEPS);
         assert_eq!(v6.outer_steps, V6_RECURSION_STEPS);
-        assert_eq!(v6.model_config().inner_steps, 3);
-        assert_eq!(v6.model_config().outer_steps, 3);
+        assert_eq!(v6.model_config().inner_steps, 2);
+        assert_eq!(v6.model_config().outer_steps, 2);
         let mut v5 = TrainConfig::default();
         v5.apply_foundation_v2_recipe();
         assert_eq!((v5.inner_steps, v5.outer_steps), (2, 2));
@@ -15615,9 +15615,9 @@ mod tests {
         }
     }
 
-    /// The preregistered depth ablation runs a v6 arm at 2x2 through the
-    /// recipe, so it validates like any other v6 config and is recorded in
-    /// the contract via `inner_steps`/`outer_steps`.
+    /// The deferred depth treatment runs a v6 arm at 3x3 through the recipe,
+    /// so it validates like the 2x2 baseline and is recorded in the contract
+    /// via `inner_steps`/`outer_steps`.
     #[test]
     fn v6_recursion_override_reaches_the_recipe_and_contract() {
         let mut shallow = TrainConfig {
@@ -15636,13 +15636,14 @@ mod tests {
             c.apply_foundation_v2_recipe();
             c
         };
+        deep.validate().expect("3x3 v6 treatment validates");
         assert_ne!(
             TrainingContract::from(&shallow),
             TrainingContract::from(&deep),
             "depth is trajectory-changing and must split the contract"
         );
         let mut legacy = TrainConfig {
-            v6_recursion_steps: 2,
+            v6_recursion_steps: 3,
             ..TrainConfig::default()
         };
         legacy.apply_foundation_v2_recipe();
