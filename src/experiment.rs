@@ -5,9 +5,10 @@
 
 use crate::p2::cli::{
     run_p2_arc3_bridge, run_p2_arc3_eval, run_p2_arc3_live_eval, run_p2_bf16_bench,
-    run_p2_bf16_drift, run_p2_context_wiring, run_p2_eval, run_p2_residual_probe, run_p2_train,
-    P2Arc3BridgeArgs, P2Arc3EvalArgs, P2Arc3LiveEvalArgs, P2Bf16BenchArgs, P2Bf16DriftArgs,
-    P2ContextWiringArgs, P2EvalArgs, P2ResidualProbeArgs, P2TrainArgs,
+    run_p2_bf16_drift, run_p2_context_confirmation, run_p2_context_wiring, run_p2_eval,
+    run_p2_residual_probe, run_p2_train, P2Arc3BridgeArgs, P2Arc3EvalArgs, P2Arc3LiveEvalArgs,
+    P2Bf16BenchArgs, P2Bf16DriftArgs, P2ContextConfirmationArgs, P2ContextWiringArgs, P2EvalArgs,
+    P2ResidualProbeArgs, P2TrainArgs,
 };
 use crate::p2::view::{run_p2_view, P2ViewArgs};
 use anyhow::Result;
@@ -52,6 +53,9 @@ enum Commands {
     /// P2: E2W two-row context-wiring overfit diagnostic (implementation smoke)
     #[command(name = "p2-context-wiring")]
     P2ContextWiring(Box<P2ContextWiringArgs>),
+    /// P2: E2C second-pair exact wiring and launch stability confirmation (implementation smoke)
+    #[command(name = "p2-context-confirmation")]
+    P2ContextConfirmation(Box<P2ContextConfirmationArgs>),
     /// P2: unified application and optional GPU evidence viewer
     #[command(name = "p2-view")]
     P2View(P2ViewArgs),
@@ -70,6 +74,7 @@ pub fn run_cli() -> Result<()> {
         Commands::P2Arc3Bridge(args) => run_p2_arc3_bridge(args)?,
         Commands::P2ResidualProbe(args) => run_p2_residual_probe(args)?,
         Commands::P2ContextWiring(args) => run_p2_context_wiring(*args)?,
+        Commands::P2ContextConfirmation(args) => run_p2_context_confirmation(*args)?,
         Commands::P2View(args) => run_p2_view(args)?,
     }
     Ok(())

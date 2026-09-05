@@ -33,13 +33,14 @@ use crate::p2::experiment::TrainingRecipe;
 use crate::p2::model::{
     RecursionDepth, RecursionOpts, WorldModel, CONTEXT_PARAMETER_PREFIX, PALETTE_SIZE, PATCH_SIZE,
 };
-use crate::p2::optimizer::try_clip_gradients_gpu_with_stats;
+use crate::p2::optimizer::{try_clip_gradients_gpu_with_stats, GradientClipStats};
 use crate::p2::train::{
     batch_from_samples, foundation_v2_unimix_ce, resolve_device, sync_cuda_device, BatchTensors,
     TrainConfig,
 };
 use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::backprop::GradStore;
+use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::optim::{AdamW, ParamsAdamW};
 use candle_nn::{Optimizer, VarMap};
 use clap::Args;
@@ -90,19 +91,23 @@ pub const REGISTERED_BUILD_COMMAND: &str = "cargo build --release --locked --fea
 const REGISTERED_PARENT_CHECKPOINT_RELATIVE: &str = "checkpoints/step-000000004096/ema.safetensors";
 const REGISTERED_PARENT_CONFIG_RELATIVE: &str = "config.json";
 
-const EVIDENCE_CLASS: &str = "implementation_smoke";
-const LIFECYCLE_RUNNING: &str = "running";
-const LIFECYCLE_COMPLETE: &str = "complete_pending_analysis";
-const LIFECYCLE_FAILED: &str = "failed_integrity_or_evaluation";
-const REPORT_FILE: &str = "report.json";
+pub(crate) const EVIDENCE_CLASS: &str = "implementation_smoke";
+pub(crate) const FAILED_EVIDENCE_CLASS: &str = "failed_infrastructure_or_integrity";
+pub(crate) const LIFECYCLE_RUNNING: &str = "running";
+pub(crate) const LIFECYCLE_COMPLETE: &str = "complete_pending_analysis";
+pub(crate) const LIFECYCLE_FAILED: &str = "failed_integrity_or_evaluation";
+pub(crate) const RUN_CLASS_REGISTERED: &str = "registered_diagnostic";
+pub(crate) const RUN_CLASS_PREFLIGHT: &str = "unregistered_preflight";
+pub(crate) const REPORT_FILE: &str = "report.json";
 const LIFECYCLE_FILE: &str = "lifecycle.json";
 const COMMAND_LOG_FILE: &str = "command.log";
 const TRAIN_CONFIG_COPY_FILE: &str = "train_config.json";
 const IDENTITY_DOMAIN: &str = "tofy.p2.context_wiring_diagnostic.identity.v1";
+const COMMAND_TAG: &str = "p2-context-wiring";
 
 /// Registered census scalars of the fixed 256-pair E2 population (E2R
 /// registration, 2026-09-05). The complete census and fingerprint are pinned.
-fn registered_census_matches(census: &TwinMemorizationCensus) -> Result<()> {
+pub(crate) fn registered_census_matches(census: &TwinMemorizationCensus) -> Result<()> {
     let expected: [(&str, usize, usize); 10] = [
         ("pairs", census.pairs, 256),
         ("episodes", census.episodes, 512),
@@ -476,6 +481,19 @@ pub fn select_context_wiring_rows(
     k: usize,
     gameplay_pixels: usize,
 ) -> Result<(ContextWiringSelection, ContextWiringRows)> {
+    select_context_wiring_rows_from(pairs, k, gameplay_pixels, 0)
+}
+
+/// [`select_context_wiring_rows`] restricted to meta-episode IDs
+/// `>= first_meta_episode_id` (E2C scans `2..`, excluding E2W's rejected
+/// meta-episode 0 and trained meta-episode 1). `pair_ordinal` remains the
+/// index into the complete population; `pairs_scanned` counts scanned pairs.
+pub fn select_context_wiring_rows_from(
+    pairs: &[AugmentedTwinPair],
+    k: usize,
+    gameplay_pixels: usize,
+    first_meta_episode_id: u64,
+) -> Result<(ContextWiringSelection, ContextWiringRows)> {
     if pairs.is_empty() {
         bail!("E2W selection needs at least one twin pair");
     }
@@ -485,7 +503,17 @@ pub fn select_context_wiring_rows(
     {
         bail!("E2W selection requires pairs in strictly ascending meta-episode order");
     }
-    for (ordinal, pair) in pairs.iter().enumerate() {
+    let skipped = pairs
+        .iter()
+        .take_while(|pair| pair.primary.meta_episode_id < first_meta_episode_id)
+        .count();
+    if skipped == pairs.len() {
+        bail!(
+            "no twin pair among {} has meta-episode ID >= {first_meta_episode_id}",
+            pairs.len()
+        );
+    }
+    for (ordinal, pair) in pairs.iter().enumerate().skip(skipped) {
         if pair.divergence.single_frame_rule_identifiable {
             continue;
         }
@@ -513,7 +541,7 @@ pub fn select_context_wiring_rows(
                 .copied()
                 .filter(|&changed| changed >= position - k && changed < position)
                 .collect(),
-            pairs_scanned: ordinal + 1,
+            pairs_scanned: ordinal + 1 - skipped,
             gameplay_pixels,
             target_disagreement_pixels: rows.disagreement.len(),
             primary_row_sha256: row_sha256(&rows.primary),
@@ -527,14 +555,17 @@ pub fn select_context_wiring_rows(
         return Ok((selection, rows));
     }
     bail!(
-        "no twin pair among {} qualifies for E2W (need a non-identifiable pair with a \
-         position p >= {k} whose targets differ, is outcome-changing and has an earlier \
-         outcome-changing row in its window)",
+        "no twin pair among {} (meta-episode IDs >= {first_meta_episode_id}) qualifies (need a \
+         non-identifiable pair with a position p >= {k} whose targets differ, is \
+         outcome-changing and has an earlier outcome-changing row in its window)",
         pairs.len()
     );
 }
 
-fn with_context(row: &TransitionSample, window: &[ContextTransition]) -> TransitionSample {
+pub(crate) fn with_context(
+    row: &TransitionSample,
+    window: &[ContextTransition],
+) -> TransitionSample {
     let mut row = row.clone();
     row.context = window.to_vec();
     row.provenance.context_len = u8::try_from(window.len()).expect("context window fits u8");
@@ -554,14 +585,187 @@ pub struct UpdateRecord {
     pub context_gradient_norm: f64,
 }
 
-struct Arm {
+/// How an arm orders its floating parameters when constructing AdamW,
+/// reducing the global gradient norm, applying the clip and measuring the
+/// context-parameter gradient norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParameterOrdering {
+    /// E2W as registered: `VarMap` hash-map iteration order (process-random
+    /// floating reduction order; kept verbatim so E2W stays reproducible).
+    VarMapIteration,
+    /// E2C: canonical ascending parameter-name order in every arm and process.
+    CanonicalNameSorted,
+}
+
+pub(crate) struct Arm {
+    pub(crate) name: &'static str,
+    pub(crate) model: WorldModel,
+    pub(crate) varmap: VarMap,
+    pub(crate) ordering: ParameterOrdering,
+    /// Floating parameters in canonical name order (used by
+    /// [`ParameterOrdering::CanonicalNameSorted`]).
+    pub(crate) parameters: Vec<(String, Var)>,
+    pub(crate) optimizer: AdamW,
+    pub(crate) batch: BatchTensors,
+    pub(crate) updates: Vec<UpdateRecord>,
+    pub(crate) checkpoints: Vec<CheckpointEvaluation>,
+}
+
+/// Every floating parameter of `varmap` sorted by canonical name.
+pub(crate) fn ordered_float_parameters(varmap: &VarMap) -> Vec<(String, Var)> {
+    let data = varmap.data().lock().unwrap();
+    let mut parameters = data
+        .iter()
+        .filter(|(_, var)| var.dtype().is_float())
+        .map(|(name, var)| (name.clone(), var.clone()))
+        .collect::<Vec<_>>();
+    parameters.sort_by(|left, right| left.0.cmp(&right.0));
+    parameters
+}
+
+/// SHA-256 over the ordered parameter names, dtypes and shapes.
+pub(crate) fn ordered_parameter_names_sha256(parameters: &[(String, Var)]) -> String {
+    let mut digest = Sha256::new();
+    digest.update((parameters.len() as u64).to_le_bytes());
+    for (name, var) in parameters {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update(format!("{:?}", var.dtype()).as_bytes());
+        digest.update((var.shape().rank() as u64).to_le_bytes());
+        for dim in var.shape().dims() {
+            digest.update((*dim as u64).to_le_bytes());
+        }
+    }
+    sha256_hex(digest)
+}
+
+/// SHA-256 over the F32 bits of the already canonically ordered floating
+/// parameter list. E2C uses the same list for AdamW, clipping and state hashes.
+pub(crate) fn ordered_parameter_sha256(parameters: &[(String, Var)]) -> Result<String> {
+    let mut digest = Sha256::new();
+    for (name, var) in parameters {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update(format!("{:?}", var.dtype()).as_bytes());
+        digest.update((var.shape().rank() as u64).to_le_bytes());
+        for dim in var.shape().dims() {
+            digest.update((*dim as u64).to_le_bytes());
+        }
+        let values = var
+            .as_tensor()
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        digest.update((values.len() as u64).to_le_bytes());
+        for value in values {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+    }
+    Ok(sha256_hex(digest))
+}
+
+/// Global-norm clip whose floating reduction runs in the given parameter
+/// order (E2C: canonical name order). Same contract as
+/// [`try_clip_gradients_gpu_with_stats`]: `Ok(None)` on a non-finite norm.
+pub(crate) fn clip_gradients_ordered(
+    grads: &mut GradStore,
+    parameters: &[(String, Var)],
+    max_norm: f64,
+) -> Result<Option<GradientClipStats>> {
+    let mut sum_sq: Option<Tensor> = None;
+    for (_, var) in parameters {
+        if let Some(grad) = grads.get(var.as_tensor()) {
+            let sq = grad.to_dtype(DType::F32)?.sqr()?.sum_all()?;
+            sum_sq = Some(match sum_sq {
+                None => sq,
+                Some(acc) => acc.add(&sq)?,
+            });
+        }
+    }
+    let Some(sum_sq) = sum_sq else {
+        return Ok(Some(GradientClipStats {
+            pre_clip_norm: 0.0,
+            scale: 1.0,
+        }));
+    };
+    let norm = f64::from(sum_sq.sqrt()?.to_scalar::<f32>()?);
+    if !norm.is_finite() {
+        return Ok(None);
+    }
+    if norm <= max_norm {
+        return Ok(Some(GradientClipStats {
+            pre_clip_norm: norm,
+            scale: 1.0,
+        }));
+    }
+    let scale = max_norm / norm;
+    for (_, var) in parameters {
+        let tensor = var.as_tensor();
+        if let Some(grad) = grads.get(tensor) {
+            grads.insert(tensor, grad.affine(scale, 0.0)?);
+        }
+    }
+    Ok(Some(GradientClipStats {
+        pre_clip_norm: norm,
+        scale,
+    }))
+}
+
+/// Load a fresh model, build the fixed-row physical batch of one arm and its
+/// zero-state AdamW in the requested parameter order.
+pub(crate) fn build_arm(
     name: &'static str,
-    model: WorldModel,
-    varmap: VarMap,
-    optimizer: AdamW,
-    batch: BatchTensors,
-    updates: Vec<UpdateRecord>,
-    checkpoints: Vec<CheckpointEvaluation>,
+    rows: &ContextWiringRows,
+    windows: (&[ContextTransition], &[ContextTransition]),
+    spec: &ContextWiringSpec,
+    ordering: ParameterOrdering,
+    device: &Device,
+    load_arm: &dyn Fn() -> Result<(WorldModel, VarMap)>,
+) -> Result<Arm> {
+    let (model, varmap) = load_arm()?;
+    if !model.config().world_core_v6 {
+        bail!("E2W requires a world_core_v6 model");
+    }
+    let params = ParamsAdamW {
+        lr: spec.learning_rate,
+        beta1: spec.beta1,
+        beta2: spec.beta2,
+        eps: spec.epsilon,
+        weight_decay: spec.weight_decay,
+    };
+    let parameters = ordered_float_parameters(&varmap);
+    let vars = match ordering {
+        ParameterOrdering::VarMapIteration => varmap
+            .all_vars()
+            .into_iter()
+            .filter(|var| var.dtype().is_float())
+            .collect::<Vec<_>>(),
+        ParameterOrdering::CanonicalNameSorted => {
+            parameters.iter().map(|(_, var)| var.clone()).collect()
+        }
+    };
+    let optimizer = AdamW::new(vars, params)?;
+    let batch = batch_from_samples(
+        &[
+            with_context(&rows.primary, windows.0),
+            with_context(&rows.twin, windows.1),
+        ],
+        device,
+    )?;
+    if batch.context.is_none() {
+        bail!("E2W training rows carry no context");
+    }
+    Ok(Arm {
+        name,
+        model,
+        varmap,
+        ordering,
+        parameters,
+        optimizer,
+        batch,
+        updates: Vec::new(),
+        checkpoints: Vec::new(),
+    })
 }
 
 /// Direct raw exact-decoder Unimix cross-entropy under the production 2x2
@@ -614,14 +818,20 @@ fn reduce_disagreement_loss(
         .map_err(Into::into)
 }
 
-fn context_gradient_norm(varmap: &VarMap, grads: &candle_core::backprop::GradStore) -> Result<f64> {
+fn context_gradient_norm(varmap: &VarMap, grads: &GradStore) -> Result<f64> {
     let data = varmap.data().lock().unwrap();
+    context_gradient_norm_of(data.iter(), grads)
+}
+
+/// L2 norm of the gradient over every `context_*` parameter, reduced in the
+/// iteration order of `parameters`.
+pub(crate) fn context_gradient_norm_of<'a>(
+    parameters: impl Iterator<Item = (&'a String, &'a Var)>,
+    grads: &GradStore,
+) -> Result<f64> {
     let mut matched = 0usize;
     let mut sum = 0f64;
-    for (_, var) in data
-        .iter()
-        .filter(|(name, _)| name.starts_with(CONTEXT_PARAMETER_PREFIX))
-    {
+    for (_, var) in parameters.filter(|(name, _)| name.starts_with(CONTEXT_PARAMETER_PREFIX)) {
         matched += 1;
         if let Some(grad) = grads.get(var.as_tensor()) {
             sum += f64::from(
@@ -638,7 +848,7 @@ fn context_gradient_norm(varmap: &VarMap, grads: &candle_core::backprop::GradSto
     Ok(sum.sqrt())
 }
 
-fn disagreement_mask(
+pub(crate) fn disagreement_mask(
     disagreement: &[usize],
     rows: usize,
     gameplay_rows: usize,
@@ -654,7 +864,7 @@ fn disagreement_mask(
     Tensor::from_vec(values, (rows, gameplay_rows, FRAME_SIDE), device).map_err(Into::into)
 }
 
-fn train_update(
+pub(crate) fn train_update(
     arm: &mut Arm,
     mask: &Tensor,
     mask_pixels: usize,
@@ -671,7 +881,12 @@ fn train_update(
         );
     }
     let mut grads = loss.backward()?;
-    let context_gradient_norm = context_gradient_norm(&arm.varmap, &grads)?;
+    let context_gradient_norm = match arm.ordering {
+        ParameterOrdering::VarMapIteration => context_gradient_norm(&arm.varmap, &grads)?,
+        ParameterOrdering::CanonicalNameSorted => {
+            context_gradient_norm_of(arm.parameters.iter().map(|(name, var)| (name, var)), &grads)?
+        }
+    };
     if !context_gradient_norm.is_finite() || (update == 1 && context_gradient_norm == 0.0) {
         bail!(
             "{} arm update {update}: context-parameter gradient norm {context_gradient_norm} \
@@ -679,9 +894,15 @@ fn train_update(
             arm.name
         );
     }
-    let Some(clip) =
-        try_clip_gradients_gpu_with_stats(&mut grads, &arm.varmap, spec.gradient_clip)?
-    else {
+    let clip = match arm.ordering {
+        ParameterOrdering::VarMapIteration => {
+            try_clip_gradients_gpu_with_stats(&mut grads, &arm.varmap, spec.gradient_clip)?
+        }
+        ParameterOrdering::CanonicalNameSorted => {
+            clip_gradients_ordered(&mut grads, &arm.parameters, spec.gradient_clip)?
+        }
+    };
+    let Some(clip) = clip else {
         bail!(
             "{} arm update {update}: non-finite global gradient norm",
             arm.name
@@ -768,13 +989,37 @@ pub struct CheckpointEvaluation {
     pub promotion_gate: bool,
 }
 
-struct DirectionRows {
-    direction: &'static str,
-    own: TransitionSample,
-    paired: TransitionSample,
-    k0: TransitionSample,
-    target: Vec<u8>,
-    disagreement: Vec<usize>,
+pub(crate) struct DirectionRows {
+    pub(crate) direction: &'static str,
+    pub(crate) own: TransitionSample,
+    pub(crate) paired: TransitionSample,
+    pub(crate) k0: TransitionSample,
+    pub(crate) target: Vec<u8>,
+    pub(crate) disagreement: Vec<usize>,
+}
+
+/// The two data-true query directions: each score row with its own window,
+/// the paired (exchanged) window and no context.
+pub(crate) fn direction_rows(rows: &ContextWiringRows) -> [DirectionRows; 2] {
+    let no_context = |row: &TransitionSample| with_context(row, &[]);
+    [
+        DirectionRows {
+            direction: "primary",
+            own: with_context(&rows.primary, &rows.primary_window),
+            paired: with_context(&rows.primary, &rows.twin_window),
+            k0: no_context(&rows.primary),
+            target: rows.primary.next.pixels.to_vec(),
+            disagreement: rows.disagreement.clone(),
+        },
+        DirectionRows {
+            direction: "twin",
+            own: with_context(&rows.twin, &rows.twin_window),
+            paired: with_context(&rows.twin, &rows.primary_window),
+            k0: no_context(&rows.twin),
+            target: rows.twin.next.pixels.to_vec(),
+            disagreement: rows.disagreement.clone(),
+        },
+    ]
 }
 
 fn decode_single(
@@ -785,7 +1030,7 @@ fn decode_single(
     twin_continuous_decode_rows(model, std::slice::from_ref(row), device)
 }
 
-fn ensure_finite(decodes: &TwinContinuousDecodes, label: &str) -> Result<()> {
+pub(crate) fn ensure_finite(decodes: &TwinContinuousDecodes, label: &str) -> Result<()> {
     let finite = decodes
         .latent
         .iter()
@@ -806,10 +1051,24 @@ fn arm_scores(
     target: &[u8],
     disagreement: &[usize],
 ) -> Result<ContextArmScores> {
-    let log_probs = &decodes.log_probs[0];
-    let probabilities = &decodes.probabilities[0];
-    let raw = &decodes.true_predictions[0];
-    let composed = &decodes.composed[0];
+    arm_scores_row(decodes, 0, target, disagreement)
+}
+
+/// [`arm_scores`] for row `row` of a multi-row decode.
+pub(crate) fn arm_scores_row(
+    decodes: &TwinContinuousDecodes,
+    row: usize,
+    target: &[u8],
+    disagreement: &[usize],
+) -> Result<ContextArmScores> {
+    let (Some(log_probs), Some(probabilities), Some(raw), Some(composed)) = (
+        decodes.log_probs.get(row),
+        decodes.probabilities.get(row),
+        decodes.true_predictions.get(row),
+        decodes.composed.get(row),
+    ) else {
+        bail!("E2W decode has no row {row}");
+    };
     if log_probs.len() != raw.len() * PALETTE_SIZE
         || probabilities.len() != log_probs.len()
         || raw.len() != composed.len()
@@ -893,7 +1152,7 @@ fn compare(
     })
 }
 
-fn bits_differing(left: &[f32], right: &[f32]) -> usize {
+pub(crate) fn bits_differing(left: &[f32], right: &[f32]) -> usize {
     if left.len() != right.len() {
         return left.len().max(right.len());
     }
@@ -995,7 +1254,7 @@ fn evaluate_direction(
     })
 }
 
-fn evaluate_checkpoint(
+pub(crate) fn evaluate_checkpoint(
     model: &WorldModel,
     directions: &[DirectionRows],
     update: usize,
@@ -1258,7 +1517,8 @@ pub struct ContextWiringArms {
     pub updates_run: usize,
 }
 
-fn parameter_sha256(varmap: &VarMap) -> Result<String> {
+/// SHA-256 over every parameter's F32 bits in canonical name order.
+pub(crate) fn parameter_sha256(varmap: &VarMap) -> Result<String> {
     let data = varmap.data().lock().unwrap();
     let mut names = data.keys().cloned().collect::<Vec<_>>();
     names.sort();
@@ -1277,6 +1537,24 @@ fn parameter_sha256(varmap: &VarMap) -> Result<String> {
     Ok(sha256_hex(digest))
 }
 
+/// The `[physical_batch, gameplay_rows, FRAME_SIDE]` disagreement mask after
+/// checking the mask lies inside the decoded gameplay region.
+pub(crate) fn training_disagreement_mask(
+    rows: &ContextWiringRows,
+    spec: &ContextWiringSpec,
+    device: &Device,
+) -> Result<Tensor> {
+    let gameplay = gameplay_rows(true);
+    if rows
+        .disagreement
+        .iter()
+        .any(|&pixel| pixel >= gameplay * FRAME_SIDE)
+    {
+        bail!("disagreement mask lies outside the decoded gameplay region");
+    }
+    disagreement_mask(&rows.disagreement, spec.physical_batch, gameplay, device)
+}
+
 /// Run both arms in lockstep on already generated rows. `load_arm` must
 /// return a freshly loaded model each time it is called (bit-identical
 /// initialization for both arms).
@@ -1292,42 +1570,15 @@ pub(crate) fn run_context_wiring_arms(
                      primary_window: &[ContextTransition],
                      twin_window: &[ContextTransition]|
      -> Result<Arm> {
-        let (model, varmap) = load_arm()?;
-        if !model.config().world_core_v6 {
-            bail!("E2W requires a world_core_v6 model");
-        }
-        let params = ParamsAdamW {
-            lr: spec.learning_rate,
-            beta1: spec.beta1,
-            beta2: spec.beta2,
-            eps: spec.epsilon,
-            weight_decay: spec.weight_decay,
-        };
-        let vars = varmap
-            .all_vars()
-            .into_iter()
-            .filter(|var| var.dtype().is_float())
-            .collect::<Vec<_>>();
-        let optimizer = AdamW::new(vars, params)?;
-        let batch = batch_from_samples(
-            &[
-                with_context(&rows.primary, primary_window),
-                with_context(&rows.twin, twin_window),
-            ],
-            device,
-        )?;
-        if batch.context.is_none() {
-            bail!("E2W training rows carry no context");
-        }
-        Ok(Arm {
+        build_arm(
             name,
-            model,
-            varmap,
-            optimizer,
-            batch,
-            updates: Vec::new(),
-            checkpoints: Vec::new(),
-        })
+            rows,
+            (primary_window, twin_window),
+            spec,
+            ParameterOrdering::VarMapIteration,
+            device,
+            load_arm,
+        )
     };
     let mut correct = build_arm("correct", &rows.primary_window, &rows.twin_window)?;
     let mut swapped = build_arm("swapped", &rows.twin_window, &rows.primary_window)?;
@@ -1337,35 +1588,9 @@ pub(crate) fn run_context_wiring_arms(
     if !arms_initialized_identically {
         bail!("the two arms did not initialize bit-identically");
     }
-    let gameplay = gameplay_rows(true);
-    if rows
-        .disagreement
-        .iter()
-        .any(|&pixel| pixel >= gameplay * FRAME_SIDE)
-    {
-        bail!("disagreement mask lies outside the decoded gameplay region");
-    }
-    let mask = disagreement_mask(&rows.disagreement, spec.physical_batch, gameplay, device)?;
+    let mask = training_disagreement_mask(rows, spec, device)?;
     let mask_pixels = rows.disagreement.len() * spec.physical_batch;
-    let no_context = |row: &TransitionSample| with_context(row, &[]);
-    let directions = [
-        DirectionRows {
-            direction: "primary",
-            own: with_context(&rows.primary, &rows.primary_window),
-            paired: with_context(&rows.primary, &rows.twin_window),
-            k0: no_context(&rows.primary),
-            target: rows.primary.next.pixels.to_vec(),
-            disagreement: rows.disagreement.clone(),
-        },
-        DirectionRows {
-            direction: "twin",
-            own: with_context(&rows.twin, &rows.twin_window),
-            paired: with_context(&rows.twin, &rows.primary_window),
-            k0: no_context(&rows.twin),
-            target: rows.twin.next.pixels.to_vec(),
-            disagreement: rows.disagreement.clone(),
-        },
-    ];
+    let directions = direction_rows(rows);
 
     let mut gates = Vec::new();
     let mut updates_run = 0usize;
@@ -1563,14 +1788,14 @@ pub struct ContextWiringReport {
     pub error: Option<String>,
 }
 
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
 
-fn file_sha256_hex(path: &Path) -> Result<String> {
+pub(crate) fn file_sha256_hex(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -1584,6 +1809,18 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Domain-separated SHA-256 over length-framed `(role, value)` pairs.
+pub(crate) fn identity_frame_sha256(frames: &[(&str, Vec<u8>)]) -> Result<String> {
+    let mut digest = Sha256::new();
+    for (role, value) in frames {
+        digest.update((role.len() as u64).to_le_bytes());
+        digest.update(role.as_bytes());
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    Ok(sha256_hex(digest))
 }
 
 fn identity_root(report: &ContextWiringReport) -> Result<String> {
@@ -1627,11 +1864,11 @@ fn identity_root(report: &ContextWiringReport) -> Result<String> {
     Ok(sha256_hex(digest))
 }
 
-fn write_lifecycle(root: &Path, lifecycle: &LifecycleRecord) -> Result<()> {
+pub(crate) fn write_lifecycle(root: &Path, lifecycle: &LifecycleRecord) -> Result<()> {
     write_json_report(&root.join(LIFECYCLE_FILE), lifecycle)
 }
 
-fn append_command_log(root: &Path, line: &str) -> Result<()> {
+pub(crate) fn append_command_log(root: &Path, tag: &str, line: &str) -> Result<()> {
     let path = root.join(COMMAND_LOG_FILE);
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -1640,7 +1877,7 @@ fn append_command_log(root: &Path, line: &str) -> Result<()> {
         .with_context(|| format!("open {}", path.display()))?;
     writeln!(file, "{} {line}", unix_seconds())
         .with_context(|| format!("write {}", path.display()))?;
-    eprintln!("[p2-context-wiring] {line}");
+    eprintln!("[{tag}] {line}");
     Ok(())
 }
 
@@ -1679,7 +1916,7 @@ fn collect_regular_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(files)
 }
 
-fn parse_manifest(manifest: &str) -> Result<BTreeMap<PathBuf, String>> {
+pub(crate) fn parse_manifest(manifest: &str) -> Result<BTreeMap<PathBuf, String>> {
     let mut entries = BTreeMap::new();
     for (index, line) in manifest.lines().enumerate() {
         let (digest, relative) = line
@@ -1708,7 +1945,7 @@ fn parse_manifest(manifest: &str) -> Result<BTreeMap<PathBuf, String>> {
     Ok(entries)
 }
 
-fn verify_manifest(root: &Path, manifest_path: &Path) -> Result<String> {
+pub(crate) fn verify_manifest(root: &Path, manifest_path: &Path) -> Result<String> {
     let manifest =
         fs::read(manifest_path).with_context(|| format!("read {}", manifest_path.display()))?;
     let digest = format!("{:x}", Sha256::digest(&manifest));
@@ -1742,7 +1979,7 @@ fn verify_manifest(root: &Path, manifest_path: &Path) -> Result<String> {
     Ok(digest)
 }
 
-fn verify_manifest_sidecar(manifest_path: &Path, expected_digest: &str) -> Result<()> {
+pub(crate) fn verify_manifest_sidecar(manifest_path: &Path, expected_digest: &str) -> Result<()> {
     let sidecar = PathBuf::from(format!("{}.sha256", manifest_path.display()));
     let text =
         fs::read_to_string(&sidecar).with_context(|| format!("read {}", sidecar.display()))?;
@@ -1762,7 +1999,7 @@ fn verify_manifest_sidecar(manifest_path: &Path, expected_digest: &str) -> Resul
     Ok(())
 }
 
-fn external_manifest_paths(root: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn external_manifest_paths(root: &Path) -> Result<(PathBuf, PathBuf)> {
     let root_name = root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1775,7 +2012,7 @@ fn external_manifest_paths(root: &Path) -> Result<(PathBuf, PathBuf)> {
 /// Write `<root>.files.sha256` next to (outside) the run root over every
 /// finalized regular file, fsync it and its sidecar, then re-read and verify
 /// the complete root before returning the manifest digest.
-fn finalize_root_manifest(root: &Path) -> Result<String> {
+pub(crate) fn finalize_root_manifest(root: &Path) -> Result<String> {
     let entries = collect_regular_files(root)?;
     let mut manifest = String::new();
     for (relative, path) in entries {
@@ -1829,7 +2066,7 @@ fn finalize_root_manifest(root: &Path) -> Result<String> {
     Ok(digest)
 }
 
-fn bind_parent_evidence(args: &P2ContextWiringArgs) -> Result<ParentEvidenceBinding> {
+pub(crate) fn bind_parent_evidence(args: &P2ContextWiringArgs) -> Result<ParentEvidenceBinding> {
     let root = fs::canonicalize(&args.parent_root)
         .with_context(|| format!("canonicalize {}", args.parent_root.display()))?;
     if root.file_name().and_then(|name| name.to_str()) != Some(REGISTERED_PARENT_RUN_ID) {
@@ -2015,7 +2252,7 @@ pub struct P2ContextWiringArgs {
     /// Fail closed unless every registered fixed input holds (checkpoint and
     /// config hashes, 256-pair fingerprint and census, 256 updates, CUDA,
     /// clean and pushed known build provenance). Without it the run is an
-    /// unregistered preflight that cannot satisfy E2W.
+    /// unregistered preflight that cannot satisfy the registration.
     #[arg(long)]
     pub registered: bool,
     /// Updates per arm; must belong to the fixed family 8/16/32/64/128/256.
@@ -2026,7 +2263,7 @@ pub struct P2ContextWiringArgs {
     pub pairs: usize,
 }
 
-fn registered_provenance_guard(provenance: &LaunchProvenance) -> Result<()> {
+pub(crate) fn registered_provenance_guard(provenance: &LaunchProvenance) -> Result<()> {
     if !provenance.source_revision_known() {
         bail!("registered run requires an embedded build source revision");
     }
@@ -2080,7 +2317,7 @@ fn registered_provenance_guard(provenance: &LaunchProvenance) -> Result<()> {
     Ok(())
 }
 
-fn same_build_identity(left: &LaunchProvenance, right: &LaunchProvenance) -> bool {
+pub(crate) fn same_build_identity(left: &LaunchProvenance, right: &LaunchProvenance) -> bool {
     left.source_revision == right.source_revision
         && left.source_revision_origin == right.source_revision_origin
         && left.source_dirty == right.source_dirty
@@ -2105,7 +2342,7 @@ fn cuda_ordinal(device: &str) -> Result<usize> {
     }
 }
 
-fn query_gpu_identity(device: &str) -> Result<GpuIdentity> {
+pub(crate) fn query_gpu_identity(device: &str) -> Result<GpuIdentity> {
     let ordinal = cuda_ordinal(device)?;
     let output = Command::new("nvidia-smi")
         .args([
@@ -2144,6 +2381,206 @@ fn query_gpu_identity(device: &str) -> Result<GpuIdentity> {
     })
 }
 
+/// Verified fixed inputs shared by the E2W and E2C diagnostics.
+pub(crate) struct DiagnosticInputs {
+    pub(crate) train_cfg: TrainConfig,
+    pub(crate) model_config: ModelConfigSummary,
+    pub(crate) checkpoint_sha256: String,
+    pub(crate) train_config_sha256: String,
+    pub(crate) parent_evidence: ParentEvidenceBinding,
+}
+
+/// Read, validate and copy the v6 2x2 F32 config, hash the checkpoint,
+/// optionally require the registered hashes, and bind the sealed E2 parent.
+pub(crate) fn verify_diagnostic_inputs(
+    args: &P2ContextWiringArgs,
+    root: &Path,
+    require_registered_hashes: bool,
+) -> Result<DiagnosticInputs> {
+    let config_bytes = fs::read(&args.train_config)
+        .with_context(|| format!("read {}", args.train_config.display()))?;
+    let train_config_sha256 = format!("{:x}", Sha256::digest(&config_bytes));
+    fs::write(root.join(TRAIN_CONFIG_COPY_FILE), &config_bytes)?;
+    let train_cfg: TrainConfig =
+        serde_json::from_slice(&config_bytes).context("parse TrainConfig")?;
+    train_cfg.validate()?;
+    ensure_v6_2x2_f32_config(&train_cfg)?;
+    let model_config = train_cfg.model_config();
+    let model_config = ModelConfigSummary {
+        recipe: format!("{:?}", train_cfg.recipe),
+        world_core_v6: train_cfg.world_core_v6,
+        data_contract_v6: train_cfg.data_contract_v6,
+        inner_steps: model_config.inner_steps,
+        outer_steps: model_config.outer_steps,
+        hidden_dim: model_config.hidden_dim,
+        patch_size: model_config.patch_size,
+        bf16_conv: model_config.bf16_conv,
+        bf16_recurrent_core: model_config.bf16_recurrent_core,
+    };
+    let checkpoint_sha256 = file_sha256_hex(&args.checkpoint)?;
+    if require_registered_hashes {
+        if checkpoint_sha256 != REGISTERED_CHECKPOINT_SHA256 {
+            bail!(
+                "checkpoint sha256 {checkpoint_sha256} is not the registered {REGISTERED_CHECKPOINT_SHA256}"
+            );
+        }
+        if train_config_sha256 != REGISTERED_TRAIN_CONFIG_SHA256 {
+            bail!(
+                "train config sha256 {train_config_sha256} is not the registered {REGISTERED_TRAIN_CONFIG_SHA256}"
+            );
+        }
+    }
+    let parent_evidence = bind_parent_evidence(args)?;
+    Ok(DiagnosticInputs {
+        train_cfg,
+        model_config,
+        checkpoint_sha256,
+        train_config_sha256,
+        parent_evidence,
+    })
+}
+
+/// Resolved device plus, for CUDA, the GPU identity and the exclusive
+/// session lock held for the lifetime of this value.
+pub(crate) struct DiagnosticDevice {
+    pub(crate) device: Device,
+    pub(crate) gpu_identity: Option<GpuIdentity>,
+    _gpu: Option<crate::gpu_lock::GpuSessionGuard>,
+}
+
+pub(crate) fn open_diagnostic_device(spec: &str, root: &Path) -> Result<DiagnosticDevice> {
+    let cuda = spec.trim().starts_with("cuda");
+    let gpu_identity = cuda.then(|| query_gpu_identity(spec)).transpose()?;
+    let _gpu = cuda
+        .then(|| crate::gpu_lock::GpuSessionGuard::acquire(root))
+        .transpose()?;
+    let device = resolve_device(spec)?;
+    if gpu_identity.is_some() != device.is_cuda() {
+        bail!("device resolution and GPU identity disagree");
+    }
+    Ok(DiagnosticDevice {
+        device,
+        gpu_identity,
+        _gpu,
+    })
+}
+
+/// Generate the registered twin population, census and fingerprint;
+/// `require_registered` fails closed on fingerprint or census drift.
+pub(crate) fn generate_population(
+    spec: &ContextWiringSpec,
+    require_registered: bool,
+) -> Result<(Vec<AugmentedTwinPair>, PopulationRecord)> {
+    let twin_spec = spec.twin_spec();
+    let pairs = twin_memorization_population(&twin_spec)?;
+    let census = twin_memorization_census(&pairs, twin_spec.context_len);
+    validate_twin_memorization_census(&twin_spec, &census)?;
+    let fingerprint = learning_history_population_fingerprint(
+        pairs.iter().flat_map(|pair| [&pair.primary, &pair.twin]),
+    );
+    let registered_fingerprint_match =
+        (spec.pairs == REGISTERED_PAIRS).then(|| fingerprint == REGISTERED_POPULATION_FINGERPRINT);
+    if require_registered {
+        if fingerprint != REGISTERED_POPULATION_FINGERPRINT {
+            bail!("population fingerprint {fingerprint} is not the registered {REGISTERED_POPULATION_FINGERPRINT}");
+        }
+        registered_census_matches(&census)?;
+    }
+    let record = PopulationRecord {
+        population: "twin_learning_histories/unseen_seed_7x7".into(),
+        population_seed: twin_spec.population_seed,
+        pairs: pairs.len(),
+        context_len: twin_spec.context_len,
+        history: twin_spec.history,
+        fingerprint,
+        census,
+        registered_fingerprint_match,
+    };
+    Ok((pairs, record))
+}
+
+/// Fail closed if the checkpoint or the running binary changed during a run.
+pub(crate) fn verify_no_input_drift(
+    checkpoint: &Path,
+    checkpoint_sha256: &str,
+    provenance: &LaunchProvenance,
+) -> Result<()> {
+    let checkpoint_after = file_sha256_hex(checkpoint)?;
+    if checkpoint_after != checkpoint_sha256 {
+        bail!("checkpoint changed during the run: {checkpoint_sha256} -> {checkpoint_after}");
+    }
+    let binary_after = file_sha256_hex(&provenance.binary_path)
+        .unwrap_or_else(|_| crate::p2::evidence::UNKNOWN_PROVENANCE.into());
+    let binary_after = format!("sha256:{binary_after}");
+    if binary_after != provenance.binary_sha256 {
+        bail!(
+            "binary changed during the run: {} -> {binary_after}",
+            provenance.binary_sha256
+        );
+    }
+    Ok(())
+}
+
+/// Create the never-reused run root (no root, external manifest or sidecar
+/// may exist), write the running lifecycle and log the command line.
+pub(crate) fn open_run_root(
+    root: &Path,
+    lifecycle: &LifecycleRecord,
+    tag: &str,
+) -> Result<Vec<String>> {
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let (external_manifest, external_sidecar) = external_manifest_paths(root)?;
+    if external_manifest.exists() || external_sidecar.exists() {
+        bail!(
+            "fresh output identity already has an external manifest or sidecar: {} / {}",
+            external_manifest.display(),
+            external_sidecar.display()
+        );
+    }
+    fs::create_dir(root).with_context(|| {
+        format!(
+            "create never-reused output root {} (it must not already exist)",
+            root.display()
+        )
+    })?;
+    write_lifecycle(root, lifecycle)?;
+    let command = std::env::args().collect::<Vec<_>>();
+    append_command_log(
+        root,
+        tag,
+        &format!("start {}", serde_json::to_string(&command)?),
+    )?;
+    Ok(command)
+}
+
+/// Write the final report and lifecycle, log the end state, then seal the
+/// root with a freshly written and re-verified external manifest.
+pub(crate) fn seal_run_root(
+    root: &Path,
+    tag: &str,
+    report: &impl Serialize,
+    lifecycle: &LifecycleRecord,
+) -> Result<String> {
+    write_json_report(&root.join(REPORT_FILE), report)?;
+    write_lifecycle(root, lifecycle)?;
+    append_command_log(
+        root,
+        tag,
+        &format!("end state={} note={}", lifecycle.state, lifecycle.note),
+    )?;
+    let manifest_digest = finalize_root_manifest(root)?;
+    eprintln!(
+        "[{tag}] finalized {} (external manifest sha256 {manifest_digest})",
+        root.display()
+    );
+    Ok(manifest_digest)
+}
+
 fn run_inner(
     args: &P2ContextWiringArgs,
     report: &mut ContextWiringReport,
@@ -2174,107 +2611,49 @@ fn run_inner(
             bail!("the bindable 256-pair, 8-update preflight requires CUDA");
         }
     }
-    let config_bytes = fs::read(&args.train_config)
-        .with_context(|| format!("read {}", args.train_config.display()))?;
-    report.train_config_sha256 = format!("{:x}", Sha256::digest(&config_bytes));
-    fs::write(root.join(TRAIN_CONFIG_COPY_FILE), &config_bytes)?;
-    let train_cfg: TrainConfig =
-        serde_json::from_slice(&config_bytes).context("parse TrainConfig")?;
-    train_cfg.validate()?;
-    ensure_v6_2x2_f32_config(&train_cfg)?;
-    let model_config = train_cfg.model_config();
-    report.model_config = Some(ModelConfigSummary {
-        recipe: format!("{:?}", train_cfg.recipe),
-        world_core_v6: train_cfg.world_core_v6,
-        data_contract_v6: train_cfg.data_contract_v6,
-        inner_steps: model_config.inner_steps,
-        outer_steps: model_config.outer_steps,
-        hidden_dim: model_config.hidden_dim,
-        patch_size: model_config.patch_size,
-        bf16_conv: model_config.bf16_conv,
-        bf16_recurrent_core: model_config.bf16_recurrent_core,
-    });
-    report.checkpoint_sha256 = file_sha256_hex(&args.checkpoint)?;
-    if args.registered || exact_preflight {
-        if report.checkpoint_sha256 != REGISTERED_CHECKPOINT_SHA256 {
-            bail!(
-                "checkpoint sha256 {} is not the registered {REGISTERED_CHECKPOINT_SHA256}",
-                report.checkpoint_sha256
-            );
-        }
-        if report.train_config_sha256 != REGISTERED_TRAIN_CONFIG_SHA256 {
-            bail!(
-                "train config sha256 {} is not the registered {REGISTERED_TRAIN_CONFIG_SHA256}",
-                report.train_config_sha256
-            );
-        }
-    }
-    report.parent_evidence = Some(bind_parent_evidence(args)?);
+    let inputs = verify_diagnostic_inputs(args, root, args.registered || exact_preflight)?;
+    report.train_config_sha256 = inputs.train_config_sha256;
+    report.checkpoint_sha256 = inputs.checkpoint_sha256;
+    report.model_config = Some(inputs.model_config);
+    report.parent_evidence = Some(inputs.parent_evidence);
+    let train_cfg = inputs.train_cfg;
     append_command_log(
         root,
+        COMMAND_TAG,
         &format!(
             "inputs verified: checkpoint={} config={} class={}",
             report.checkpoint_sha256, report.train_config_sha256, report.run_class
         ),
     )?;
 
-    if args.device.trim().starts_with("cuda") {
-        report.gpu_identity = Some(query_gpu_identity(&args.device)?);
-    }
-    let _gpu = args
-        .device
-        .trim()
-        .starts_with("cuda")
-        .then(|| crate::gpu_lock::GpuSessionGuard::acquire(root))
-        .transpose()?;
-    let device = resolve_device(&args.device)?;
+    let diagnostic_device = open_diagnostic_device(&args.device, root)?;
+    report.gpu_identity = diagnostic_device.gpu_identity.clone();
+    let device = diagnostic_device.device.clone();
     report.device_is_cuda = device.is_cuda();
-    if report.gpu_identity.is_some() != report.device_is_cuda {
-        bail!("device resolution and GPU identity disagree");
-    }
 
     let population_started = Instant::now();
-    let twin_spec = report.spec.twin_spec();
-    let pairs = twin_memorization_population(&twin_spec)?;
-    let census = twin_memorization_census(&pairs, twin_spec.context_len);
-    validate_twin_memorization_census(&twin_spec, &census)?;
-    let fingerprint = learning_history_population_fingerprint(
-        pairs.iter().flat_map(|pair| [&pair.primary, &pair.twin]),
-    );
-    let registered_fingerprint_match = (report.spec.pairs == REGISTERED_PAIRS)
-        .then(|| fingerprint == REGISTERED_POPULATION_FINGERPRINT);
-    report.population = Some(PopulationRecord {
-        population: "twin_learning_histories/unseen_seed_7x7".into(),
-        population_seed: twin_spec.population_seed,
-        pairs: pairs.len(),
-        context_len: twin_spec.context_len,
-        history: twin_spec.history.clone(),
-        fingerprint: fingerprint.clone(),
-        census: census.clone(),
-        registered_fingerprint_match,
-    });
+    let (pairs, population) =
+        generate_population(&report.spec, args.registered || exact_preflight)?;
     report.timing.population_seconds = population_started.elapsed().as_secs_f64();
-    if args.registered || exact_preflight {
-        if fingerprint != REGISTERED_POPULATION_FINGERPRINT {
-            bail!("population fingerprint {fingerprint} is not the registered {REGISTERED_POPULATION_FINGERPRINT}");
-        }
-        registered_census_matches(&census)?;
-    }
     append_command_log(
         root,
+        COMMAND_TAG,
         &format!(
-            "population: pairs={} fingerprint={fingerprint} outcome_changing_rows={} evidence_rows={}",
+            "population: pairs={} fingerprint={} outcome_changing_rows={} evidence_rows={}",
             pairs.len(),
-            census.outcome_changing_rows,
-            census.scorable_rows_with_evidence_in_window
+            population.fingerprint,
+            population.census.outcome_changing_rows,
+            population.census.scorable_rows_with_evidence_in_window
         ),
     )?;
+    let context_len = population.context_len;
+    report.population = Some(population);
 
-    let gameplay_pixels = gameplay_rows(model_config.world_core_v6) * FRAME_SIDE;
-    let (selection, rows) =
-        select_context_wiring_rows(&pairs, twin_spec.context_len, gameplay_pixels)?;
+    let gameplay_pixels = gameplay_rows(train_cfg.world_core_v6) * FRAME_SIDE;
+    let (selection, rows) = select_context_wiring_rows(&pairs, context_len, gameplay_pixels)?;
     append_command_log(
         root,
+        COMMAND_TAG,
         &format!(
             "selection: meta_episode_id={} position={} disagreement_pixels={} primary_row={} twin_row={}",
             selection.meta_episode_id,
@@ -2297,28 +2676,18 @@ fn run_inner(
     let load_arm = move || load_model(&train_cfg, &checkpoint, &arm_device);
     let (arms, verdict) =
         run_context_wiring_arms(&report.spec, &rows, &device, &load_arm, |line| {
-            append_command_log(root, line)
+            append_command_log(root, COMMAND_TAG, line)
         })?;
     report.timing.arms_seconds = arms_started.elapsed().as_secs_f64();
     report.arms = Some(arms);
     report.verdict = Some(verdict);
 
-    let checkpoint_after = file_sha256_hex(&args.checkpoint)?;
-    if checkpoint_after != report.checkpoint_sha256 {
-        bail!(
-            "checkpoint changed during the run: {} -> {checkpoint_after}",
-            report.checkpoint_sha256
-        );
-    }
-    let binary_after = file_sha256_hex(&report.provenance.binary_path)
-        .unwrap_or_else(|_| crate::p2::evidence::UNKNOWN_PROVENANCE.into());
-    let binary_after = format!("sha256:{binary_after}");
-    if binary_after != report.provenance.binary_sha256 {
-        bail!(
-            "binary changed during the run: {} -> {binary_after}",
-            report.provenance.binary_sha256
-        );
-    }
+    verify_no_input_drift(
+        &args.checkpoint,
+        &report.checkpoint_sha256,
+        &report.provenance,
+    )?;
+    drop(diagnostic_device);
     report.timing.wall_seconds = started.elapsed().as_secs_f64();
     Ok(())
 }
@@ -2328,31 +2697,11 @@ pub fn run_p2_context_wiring(args: P2ContextWiringArgs) -> Result<()> {
     let spec = ContextWiringSpec::with_budget(args.pairs, args.max_updates);
     spec.validate()?;
     let run_class = if args.registered {
-        "registered_diagnostic"
+        RUN_CLASS_REGISTERED
     } else {
-        "unregistered_preflight"
+        RUN_CLASS_PREFLIGHT
     };
     let root = &args.output_root;
-    if let Some(parent) = root
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let (external_manifest, external_sidecar) = external_manifest_paths(root)?;
-    if external_manifest.exists() || external_sidecar.exists() {
-        bail!(
-            "fresh output identity already has an external manifest or sidecar: {} / {}",
-            external_manifest.display(),
-            external_sidecar.display()
-        );
-    }
-    fs::create_dir(root).with_context(|| {
-        format!(
-            "create never-reused output root {} (it must not already exist)",
-            root.display()
-        )
-    })?;
     let lifecycle = LifecycleRecord {
         state: LIFECYCLE_RUNNING.into(),
         unix_seconds: unix_seconds(),
@@ -2360,9 +2709,7 @@ pub fn run_p2_context_wiring(args: P2ContextWiringArgs) -> Result<()> {
         run_class: run_class.into(),
         note: "E2W two-row context-wiring diagnostic in progress".into(),
     };
-    write_lifecycle(root, &lifecycle)?;
-    let command = std::env::args().collect::<Vec<_>>();
-    append_command_log(root, &format!("start {}", serde_json::to_string(&command)?))?;
+    let command = open_run_root(root, &lifecycle, COMMAND_TAG)?;
     let mut report = ContextWiringReport {
         schema: CONTEXT_WIRING_SCHEMA.into(),
         evidence_class: EVIDENCE_CLASS.into(),
@@ -2423,7 +2770,7 @@ pub fn run_p2_context_wiring(args: P2ContextWiringArgs) -> Result<()> {
             LifecycleRecord {
                 state: LIFECYCLE_FAILED.into(),
                 unix_seconds: unix_seconds(),
-                evidence_class: "failed_infrastructure_or_integrity".into(),
+                evidence_class: FAILED_EVIDENCE_CLASS.into(),
                 run_class: run_class.into(),
                 note: format!("{error:#}"),
             }
@@ -2432,20 +2779,8 @@ pub fn run_p2_context_wiring(args: P2ContextWiringArgs) -> Result<()> {
     if report.identity_root.is_empty() {
         report.identity_root = identity_root(&report)?;
     }
-    write_json_report(&root.join(REPORT_FILE), &report)?;
-    write_lifecycle(root, &report.lifecycle)?;
-    append_command_log(
-        root,
-        &format!(
-            "end state={} note={}",
-            report.lifecycle.state, report.lifecycle.note
-        ),
-    )?;
-    let manifest_digest = finalize_root_manifest(root)?;
-    eprintln!(
-        "[p2-context-wiring] finalized {} (external manifest sha256 {manifest_digest})",
-        root.display()
-    );
+    let lifecycle = report.lifecycle.clone();
+    seal_run_root(root, COMMAND_TAG, &report, &lifecycle)?;
     outcome
 }
 

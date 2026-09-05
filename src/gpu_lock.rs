@@ -76,7 +76,8 @@ fn is_tofy_gpu_process(pid: u32) -> bool {
                     || cmd.contains("p2-eval")
                     || cmd.contains("p2-arc3-live-eval")
                     || cmd.contains("p2-arc3-bridge")
-                    || cmd.contains("p2-context-wiring"))
+                    || cmd.contains("p2-context-wiring")
+                    || cmd.contains("p2-context-confirmation"))
         })
         .unwrap_or(false)
 }
