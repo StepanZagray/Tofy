@@ -567,6 +567,141 @@ pair is inspected.
   must bind and re-verify its report and external manifest. The preflight cannot satisfy E2C. The third arm raises total
   work only; per-arm physical batch remains 2 and accumulation 1.
 
+## Post-E2 confirmation E2D: canonical-singleton scoring with semantic batch invariance (2026-09-05)
+
+This section was frozen after E2C's checkpoint-0 integrity failure was read and
+before any E2D training output. E2C is not reclassified: preflight
+`v6-e2c-preflight-20260905T050507-CDT` (manifest
+`sha256:9338ef26e42d4b24d90f15ee54459383df7ec66fe9803d4fdeecacf992424b6f`)
+and its failure-forensics rerun
+`v6-e2c-preflight-diagnostic-20260905T051337-CDT` (manifest
+`sha256:75022190ecdb765911ddaa49c48cc4a0fd76fa236089d7d8ec91b5f92320d575`)
+both stopped before update 1. The second run measured batch-1 versus batch-2
+raw-NLL differences of `2.1521534239177242e-6` and
+`4.621488707723387e-6`; its within-batch-2 duplicate K0 rows were otherwise
+bit-identical in every registered decoder field. E2C therefore produced failed
+evaluator-integrity evidence only, not a negative model result. Its NLL
+bit-identity gate is neither relaxed nor assigned a post-hoc tolerance.
+
+- **Bounded claim and evidence class.** Starting from the same sealed E2
+  step-4096 EMA
+  (`sha256:c53bf0c42dc6c8f7945ff4d17bd6bd63a6db23e8b6e377b6b0b92903e66d694a`),
+  the 2x2 context path under E2C's canonically ordered
+  diagnostic optimizer can fit both targets of meta-episode 2 exactly, and
+  swapping only the histories reverses the routing. E2D is the same one
+  additional pair and checkpoint initialization as E2C; reusing it is fixed
+  because no E2C optimizer step or trained response was observed. This remains
+  a single-seed `implementation_smoke`, not population learning,
+  generalization, planning, model promotion, E3, or ARC evidence.
+- **Fixed inputs and selection.** Retain every E2C source-data contract: the
+  sealed E2 parent/checkpoint/config, all 256 seed-`1000002` TRAINING-shape
+  pairs and fingerprint, K=16, v6 2x2 F32 recurrence, UNKNOWN operator
+  conditioning, and model-free scan from meta-episode 2. Require the same
+  selected meta-episode 2 at position 20, 28 target-disagreement pixels, row,
+  window, target, and disagreement-mask digests already recorded by the failed
+  E2C preflights: primary/twin rows
+  `sha256:7b7de9f9ac4ce4372aefd3728626e0f73011c8b3923c520de41a3938a3352d9b` /
+  `sha256:bad5c1241a9f0364be50b7a573c6d585ae423656415bf450f00cc05273a5d1ca`,
+  windows
+  `sha256:926163e3e4d0a2f7b4e67b08e19f62a75f050a4bbd6fe52fedc72b22e28f6f86` /
+  `sha256:7923eeba11a02c5c899249f10ab286199828a481c38549947fb56eeb1e19236b`,
+  targets
+  `sha256:95392091831edd5b3fac05b786c10c32eb5cff17d6ad4da19c1fa6e7b27c7792` /
+  `sha256:6062508b01e502976238ae983190c63189760d09e77366b07737617da7c843b6`,
+  and mask
+  `sha256:a725cdaaf2cb9101b2987fca0fcd328c6e40a6e2deef5e883c61e3feb52a818e`.
+  Put both prior E2C manifest digests in the E2D fixed spec and identity root;
+  they identify the prior failed evidence but do not promote it. Any selection
+  drift is integrity failure. No public ARC data may be read.
+- **Matched training arms and numerical order.** Retain `correct_a`,
+  `correct_b`, and `swapped`, bit-identical initialization, fresh zero-state
+  AdamW, and canonical name order for every floating parameter used by AdamW,
+  the global-norm reduction/clip, context-gradient norm, and state hash.
+  Retain E2C's direct disagreement-pixel Unimix loss, hyperparameters, physical
+  batch 2 per arm, accumulation 1, fixed row order, zero noise, maximum 256
+  updates, and checkpoint family `0, 8, 16, 32, 64, 128, 256`.
+  Report correct-A versus correct-B update records, state hashes, and complete
+  checkpoint differences. Bit identity establishes within-process stability
+  only, not independent replication or cross-launch stability. Any A/B
+  divergence is an integrity failure because their inputs and ordered update
+  operations are identical.
+- **Canonical scoring evaluator and legacy parity.** All reported `own`,
+  `paired`, and K0 scores use the existing batch-1 singleton evaluator. This
+  is the only estimator used by `D`, probability sensitivity, and exact
+  correctness gates. Preserve every E2W field and require the unchanged
+  batch-1 evaluator to match every meta-episode-1 checkpoint-0 field in sealed
+  E2W report
+  `sha256:0d3e54f9a8f8fa17be553cb48db44b4184259242b7ea2e782a565b3166a04eca`
+  under manifest
+  `sha256:af133734e0e5d886e29427b4f8e06a8e94337e2d0ae8daeec861fe77321a403d`.
+  The implementation must retain the exact singleton K0 decode used for its
+  reported score so the semantic comparison below does not re-run or
+  substitute the estimator.
+- **K0 integrity and semantic batch invariance.** Retain E2W's same-shape
+  mixed-K0 bit invariant. Decode the two data-true K0 directions together as
+  one batch of two identical query inputs and require their latent, raw
+  probabilities, log probabilities, copy gate, context summary, raw argmax,
+  and composed argmax to be bit-identical. Compare each retained canonical
+  batch-1 singleton K0 decode with its corresponding batch-2 row and require
+  the raw and composed argmax label arrays to be exactly identical over all
+  4,096 gameplay pixels. This discrete semantic condition has no learned or
+  post-hoc tolerance. Record batch-1 versus batch-2 raw and Unimix NLL values
+  and absolute differences descriptively; NLL bit identity and f64 ULP counts
+  are not gates or evidence of leakage. Require aggregate canonical K0 raw
+  correctness `<= m` of `2m`; violation of any same-shape identity, semantic
+  label identity, or finite bound is an integrity failure.
+- **In-process evaluator null control.** At checkpoint 0, before training,
+  run `correct_a`'s complete canonical evaluation twice in the same operation
+  order and require bit-identical reported checkpoint fields. Report this as
+  `in_process_evaluator_parity`; it is a determinism control, not model
+  evidence. Failure stops before update 1.
+- **Cross-launch parity and attribution.** Require the exact 256-pair,
+  8-update CUDA preflight and registered run to match each other bit-for-bit
+  over E2C's registered parity set. Report two conjunctive components:
+  `evaluator_parity` binds
+  arm initialization hashes, ordered names, the in-process null control, and
+  every checkpoint-0 field; `optimizer_parity` binds update records 1..8,
+  update-8 parameter hashes, and every checkpoint-8 field. Overall launch
+  parity passes only if both components pass. Any mismatch is integrity
+  failure and stops the registered run at update 8; it is not a negative model
+  result.
+- **Unchanged causal and exact gates.** Use E2C's `D` definition and fixed
+  thresholds without alteration: each correct arm `D > 1e-4`, swapped
+  `D < -1e-4`, both correct-minus-swapped interactions `> 2e-4`, and each arm
+  has pooled own-versus-paired raw probability L1 `> 1e-6` or at least one raw
+  argmax disagreement. At the same checkpoint, each correct arm must score own
+  `2m/2m` and paired `0/2m`; swapped must score own `0/2m` and paired `2m/2m`.
+  All K0 integrity controls must pass. `correct-own > K0` remains a derived
+  theorem once exactness and the finite bound hold, not independent evidence.
+- **Verdict and stop rule.** Outcome `semantic_batch_confirmation_pass`
+  requires the continuous and exact gates in all three arms at the same two
+  consecutive fixed checkpoints. Stop at the second checkpoint of the first
+  such pair. Otherwise run through update 256 with outcome
+  `reject_second_pair_exact_wiring_by_update_256`, where `second_pair` means
+  the second selected twin pair (meta-episode 2), not a checkpoint pair. An
+  unregistered preflight
+  always reports
+  `no_semantic_batch_confirmation_within_preflight_budget`, even if its two
+  observed checkpoints meet the model gates. No post-hoc checkpoint, arm,
+  direction, metric, threshold, tolerance, or closeness selection is allowed.
+  A pass authorizes only a separately preregistered small simultaneous
+  multi-pair objective screen; no E2D weights are saved or promoted. Report no
+  confidence interval or population inference.
+- **Execution and failure contract.** Retain E2C's fixed parent/E2W seals,
+  reviewed and pushed Tofy source, candle_graph
+  `8e012f25e38f0c597c14268f0c705e504a5b5c28`, exact locked release+cuDNN
+  build command, one binary and GPU UUID, global GPU lock, never-reused roots,
+  explicit lifecycle, propagated errors, and recursively verified external
+  manifests. Run a 256-pair/8-update exact-binary CUDA preflight first; it
+  cannot satisfy E2D. Bind its full report and manifest to the registered run.
+  Preserve E2C's fail-closed conditions plus the new semantic and in-process
+  parity gates. On failure, set both the report's top-level evidence class and
+  lifecycle evidence class to `failed_infrastructure_or_integrity`; do not
+  retain `implementation_smoke` as the top-level class of a failed root.
+  Enforce 2-minute preflight and 10-minute registered caps both internally
+  between updates and with outer process timeouts. Do not read public ARC data
+  or save arm weights.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`

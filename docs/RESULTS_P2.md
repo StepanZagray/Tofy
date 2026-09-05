@@ -17,6 +17,52 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2C batch-shape integrity failure (2026-09-05; failed preflight)
+
+E2C produced no wiring result and no registered run was launched. Its exact
+CUDA preflight stopped at checkpoint 0, before any optimizer update, because
+the preregistered same-row K0 NLL bit-identity check compared a batch-1 decode
+with a batch-2 decode. The first failed root,
+`v6-e2c-preflight-20260905T050507-CDT`, used Tofy
+`5fc8008982fb40931f7f262461a138ace97d3423`, cuDNN release binary
+`sha256:cc5c5ba6c846787f149f33c64dcd7a4fc199002ee54ae4ed58b91b40c5669a9e`,
+and is sealed by manifest
+`sha256:9338ef26e42d4b24d90f15ee54459383df7ec66fe9803d4fdeecacf992424b6f`.
+It failed in 2.51 s with zero updates.
+
+A failure-forensics-only rerun,
+`v6-e2c-preflight-diagnostic-20260905T051337-CDT`, used Tofy
+`18864730541323b8360b6f73aac30dfe8f9e1036`, binary
+`sha256:4bb976aa130774154118c24d2408a95b16365cc4bcc756e196261a6963f4f028`,
+and is sealed by manifest
+`sha256:75022190ecdb765911ddaa49c48cc4a0fd76fa236089d7d8ec91b5f92320d575`.
+It reproduced the same checkpoint-0 failure in 2.56 s and quantified the
+batch-shape deltas:
+
+| Direction | Raw NLL batch 1 | Raw NLL batch 2 | Absolute delta | Unimix absolute delta |
+|---|---:|---:|---:|---:|
+| primary | 2.523148322 | 2.523150474 | 2.152e-6 | 2.233e-6 |
+| twin | 2.722665046 | 2.722660424 | 4.621e-6 | 4.633e-6 |
+
+Every within-batch-2 K0 identity field passed: latent, raw probabilities, log
+probabilities, copy gate, raw argmax, and composed argmax had zero differing
+elements between the two identical query rows. The finite control also passed
+(`K0 = 16/56 <= m = 28`). The sealed E2W meta-episode-1 checkpoint-0
+legacy parity passed bit-for-bit in both arms. E2C selected the preregistered
+meta-episode 2, position 20, with 28 disagreement pixels and mask digest
+`sha256:a725cdaaf2cb9101b2987fca0fcd328c6e40a6e2deef5e883c61e3feb52a818e`.
+No public ARC data was read.
+
+This is a failed infrastructure/evaluator-integrity artifact, not
+`reject_second_pair_exact_wiring_by_update_256` and not evidence that the model
+cannot route context. The report's top-level `evidence_class` retains the
+implementation-smoke schema value, but its lifecycle correctly classifies the
+artifact as `failed_infrastructure_or_integrity`; both roots are excluded from
+model evidence. Choosing a tolerance from these observed deltas would be
+post-hoc, so the E2C gate is not relaxed. A freshly preregistered successor must
+keep one canonical scoring batch shape and use a discrete cross-shape semantic
+invariant before the three-arm comparison can resume.
+
 ## V6 2x2 E2W context-wiring diagnostic (2026-09-05; implementation smoke)
 
 The registered E2W diagnostic used Tofy
