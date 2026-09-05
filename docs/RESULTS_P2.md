@@ -17,6 +17,56 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2W context-wiring diagnostic (2026-09-05; implementation smoke)
+
+The registered E2W diagnostic used Tofy
+`70ed5710d224336e019ecacb50484fe1f855f05d`, candle_graph
+`8e012f25e38f0c597c14268f0c705e504a5b5c28`, and cuDNN release binary
+`sha256:5c967c8eb4e50611414e272ae84f5a3065e46a209b0d45d541bd9db0324b7bdd`.
+It loaded the sealed E2 step-4096 EMA, scanned the fixed 256-pair population,
+and selected meta-episode 1 at position 20 with two target-disagreement pixels.
+The exact-binary 8-update CUDA preflight completed in 4.41 s and is sealed by
+manifest `sha256:e56e0674d7e9117e0a02b360c1a4b28b9114c6ecc7f53094eb3f36086af488fc`.
+The 256-update registered run completed in 49.68 s and is sealed by manifest
+`sha256:af133734e0e5d886e29427b4f8e06a8e94337e2d0ae8daeec861fe77321a403d`.
+No public ARC data was read.
+
+| Update | D correct | D swapped | Interaction | Correct L1 | Swapped L1 | Wiring | Promotion |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 64 | +0.000234842 | -0.000284314 | 0.000519156 | 0.000234476 | 0.000283901 | pass | fail |
+| 128 | +17.2984 | -10.6980 | 27.9964 | 1.999999 | 1.999527 | pass | fail |
+| 256 | +20.0497 | -21.2306 | 41.2803 | 2.000000 | 2.000000 | pass | fail |
+
+At updates 128 and 256, the correct arm scored own context `4/4`, paired
+context `0/4`, and aggregate K0 `2/4`; the swapped arm exactly reversed own
+and paired. Every mixed-batch K0 bit-identity check passed. This establishes
+only that the repaired 2x2 path is locally trainable on the selected pair.
+
+The registered outcome is `wiring_only_no_promotion`, so it cannot promote a
+model, authorize E3, or establish planning/ARC performance. The promotion gate
+failed because it required strict own-over-K0 improvement in each direction:
+K0 was already `2/2` on the twin target, making `own > K0` mathematically
+impossible there even though own context was perfect on both targets and paired
+context was wrong on both. Aggregate own-over-K0 would pass, but it was not the
+registered metric and is not substituted post hoc. The preflight and registered
+update-8 trajectories also differed despite identical recorded inputs. Source
+inspection found that E2W constructed AdamW variables and the global clip
+reduction from randomized `VarMap` `HashMap` iteration; floating reduction order
+is therefore an avoidable cross-arm/cross-process confound in addition to any
+CUDA nondeterminism. A fresh confirmation must sort parameters and require
+exact preflight-versus-registered update-8 parity.
+
+```bash
+./target/release/tofy p2-context-wiring \
+  --checkpoint <sealed-e2-root>/checkpoints/step-000000004096/ema.safetensors \
+  --train-config <sealed-e2-root>/config.json \
+  --parent-root <sealed-e2-root> \
+  --parent-manifest <sealed-e2-manifest> \
+  --preflight-report <sealed-e2w-preflight>/report.json \
+  --output-root <never-reused-e2w-root> \
+  --device cuda --pairs 256 --max-updates 256 --registered
+```
+
 ## SIGReg/action-conditioning A/B v1 (experimental; not a positive claim)
 
 The controlled experiment is preregistered under

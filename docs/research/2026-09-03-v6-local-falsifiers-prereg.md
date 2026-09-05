@@ -447,6 +447,126 @@ or provide ARC-AGI-3 planning evidence.
   evidence and can authorize only the explicitly stated small multi-pair
   follow-up, never a model promotion or E3.
 
+## Post-E2 confirmation E2C: second-pair exact wiring and launch stability (2026-09-05)
+
+E2W was read before this section was written. Its registered verdict remains
+`wiring_only_no_promotion` and is not reclassified. E2W exposed both (a) a
+counterexample to its promotion metric—a perfect K0 direction cannot be
+strictly improved—and (b) different update-8 trajectories across its exact
+preflight and registered launches. Source inspection then found that E2W built
+the AdamW variable list and global clip reduction from randomized `HashMap`
+iteration, an avoidable floating-reduction-order confound across arms and
+processes. E2C repairs those diagnostic contracts before any output on its new
+pair is inspected.
+
+- **Bounded claim and evidence class.** Starting from the sealed E2 step-4096
+  EMA (`sha256:c53bf0c42dc6c8f7945ff4d17bd6bd63a6db23e8b6e377b6b0b92903e66d694a`),
+  the 2x2 context path under a deterministically ordered diagnostic optimizer
+  can fit both targets of the next model-free qualifying twin pair exactly,
+  and swapping only their histories reverses the routing. E2C is one additional
+  pair at the same checkpoint initialization (seed 2), not replication across
+  seeds, model initializations, or a population. Its two correct arms check
+  within-condition trajectory stability; only the separate preflight-versus-
+  registered parity check addresses cross-launch stability. This remains a
+  single-seed `implementation_smoke`, not multi-pair learning, generalization,
+  planning, model promotion, E3, or ARC evidence.
+- **Fixed source, population, and new selection.** Use the same sealed E2 parent
+  manifest
+  `sha256:59ce9db70fd71bc0395a89eefca378c0849a83d4dfa23f090f2481cb8e0a1c97`
+  and train config
+  `sha256:f479cc4eb1dd6d687fcbdb3ef7bdbe71d29a219ddd44e9aeee3334ad6507160f`.
+  Generate all 256 `UnseenSeed7x7` TRAINING-shape twin pairs with population
+  seed `1000002`, meta-episode IDs `0..255`, K=16, UNKNOWN operator
+  conditioning, v6 data contract, and fingerprint
+  `sha256:484e8615e41102895997ddb9bec19665604fb7f62d21db9cc5ecea1470e58f42`.
+  Meta-episode 0 was rejected by E2W's model-free scan and meta-episode 1 was
+  E2W's trained pair; exclude both, scan meta-episode IDs `2..255` in ascending
+  order, and select the first pair and earliest `p >= 16` satisfying every E2W
+  model-free selection/query-identity invariant. Freeze and report all pair,
+  row, window, target, and disagreement-mask hashes before model load. Fail
+  closed if none qualifies. No public ARC data may be read.
+- **Three matched arms and ordered optimization.** Initialize `correct_a`,
+  `correct_b`, and `swapped` bit-identically from the fixed EMA, with fresh
+  zero-state AdamW. The correct arms receive identical rows, targets, order,
+  and own histories; `swapped` receives the same rows and targets but exchanges
+  only their histories. Sort every floating parameter by canonical name before
+  constructing AdamW, computing the global gradient norm, applying the clip,
+  and hashing checkpoint state; require identical ordered name lists in all
+  arms. Train with direct exact-decoder Unimix CE
+  (`0.99 * model_probability + 0.01/16`) only on disagreement pixels,
+  F32 production 2x2 zero-noise recurrence, constant learning rate `1e-3`,
+  betas `(0.9, 0.999)`, epsilon `1e-8`, weight decay 0, global clip `1.0`,
+  physical batch 2 per arm, accumulation 1, fixed row order, and at most 256
+  updates. This ordered diagnostic clip is a deliberate numerical-contract
+  repair, not a claim about unchanged production-optimizer bits.
+- **Fixed checkpoints and legacy parity.** Evaluate all arms at
+  `0, 8, 16, 32, 64, 128, 256`; at evaluation, `own` and `paired` always mean
+  the data-true context assignment regardless of training arm. Preserve and
+  report E2W's raw-softmax/Unimix NLL, raw probability L1, latent/context/gate,
+  raw/composed argmax, gradient, and mixed-K0 fields. Before E2C training, the
+  new binary must re-evaluate E2W's meta-episode-1 checkpoint-0 inputs and match
+  every legacy checkpoint-0 field bit-for-bit against sealed E2W report
+  `sha256:0d3e54f9a8f8fa17be553cb48db44b4184259242b7ea2e782a565b3166a04eca`
+  under E2W root manifest
+  `sha256:af133734e0e5d886e29427b4f8e06a8e94337e2d0ae8daeec861fe77321a403d`.
+  Any difference must fail integrity; none may be silently justified.
+- **K0 and duplicate invariants.** Retain E2W's mixed-batch K0 invariant. Also
+  decode the two data-true K0 directions together and require their latent, raw
+  probabilities, log probabilities, gate, raw argmax, and composed argmax to be
+  bit-identical. Their target NLLs need not equal because the labels differ;
+  instead require each direction's raw and Unimix NLL to be bit-identical
+  between this shared decode and its same-row singleton decode. Violation of
+  either identity, or aggregate K0 raw correctness above `m` of `2m`, is an
+  integrity failure, not a negative result. Report correct-A versus correct-B
+  state hashes and own/paired/K0 continuous and argmax differences. If the
+  replicas are bit-identical, report only within-process stability—not
+  independent replication or evidence about cross-launch variation.
+- **Cross-launch parity gate.** The exact 256-pair/8-update CUDA preflight and
+  registered run must have bit-identical arm initialization hashes, ordered
+  parameter names, parameter hashes after update 8, update records 1..8, and
+  all checkpoint-0/checkpoint-8 evaluation fields for each of the three arms.
+  Any mismatch is an integrity failure and the registered run stops at update
+  8; it cannot be interpreted as a negative model result. This gate directly
+  tests the launch variation observed in E2W.
+- **Continuous wiring gate.** Define `D` exactly as E2W: raw-softmax
+  `NLL(paired K16) - NLL(own K16)` over disagreement pixels, averaged within
+  each query direction and then equally across directions. At one checkpoint,
+  both correct arms must separately have `D > 1e-4`; swapped must have
+  `D < -1e-4`; and each correct-versus-swapped interaction must exceed `2e-4`.
+  Every arm must have pooled own-versus-paired raw probability L1 `> 1e-6` or
+  at least one raw argmax disagreement. All K0 invariants must pass.
+- **Exact confirmation gate and finite control.** Let `m > 0` be the number of
+  disagreement pixels per direction. In each correct arm, own must score
+  exactly `2m/2m` raw-argmax pixels across the two directions and paired must
+  score `0/2m`; in swapped, own must score `0/2m` and paired `2m/2m`.
+  Cross-direction K0 identity and differing targets imply the finite bound
+  `K0 <= m/2m`. Therefore `correct-own > K0` is recorded as a derived evaluator
+  invariant, not independent model evidence.
+- **Verdict, uncertainty, multiplicity, and stop rules.** `confirmation_pass`
+  requires the continuous and exact gates in both correct arms and swapped at
+  the same two consecutive fixed checkpoints. Stop at the second checkpoint of
+  the first such pair; otherwise run through update 256 with verdict
+  `reject_second_pair_exact_wiring_by_update_256` and reject only the bounded
+  single-pair claim. Report no confidence interval or population
+  inference. No post-hoc checkpoint, arm, direction, metric, seed, threshold,
+  or closeness selection is allowed. A pass authorizes only a separately
+  preregistered small simultaneous multi-pair objective screen and does not
+  promote or preserve any E2C weights.
+- **Fail-closed execution contract.** Fail on zero/non-finite update-1 context
+  gradient, any non-finite value, source/data/hash drift, CUDA error, K0 leak,
+  cross-launch mismatch, evaluator-parity mismatch, unordered/mismatched
+  parameters, or root/seal failure. The preflight wall-clock cap is 2 minutes;
+  the registered cap is 10 minutes, enforced both by the executable between
+  updates and an outer process timeout. Use reviewed/pushed Tofy source, pinned
+  candle_graph `8e012f25e38f0c597c14268f0c705e504a5b5c28`, exact build command
+  `cargo build --release --locked --features cudnn`, one binary and GPU UUID,
+  never-reused roots, the fixed parent/E2W seals, global GPU lock, explicit
+  lifecycle, propagated log errors, and recursively verified external
+  manifests. Bind the preflight to the exact source, dependency, binary,
+  checkpoint, config, selected rows, three arms, and GPU; the registered report
+  must bind and re-verify its report and external manifest. The preflight cannot satisfy E2C. The third arm raises total
+  work only; per-arm physical batch remains 2 and accumulation 1.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`
