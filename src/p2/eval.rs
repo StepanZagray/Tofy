@@ -34,7 +34,7 @@ use crate::p2::latent_planning::trust::{
 use crate::p2::model::{
     flatten_latent, latent_mse_per_sample, pool_latent, ContextBatch, PtrmConfig, RecursionDepth,
     RecursionOpts, RecursionStepProbe, WorldModel, EVENT_EXHAUSTED, EVENT_GOAL_FAILED,
-    EVENT_GOAL_SATISFIED, EVENT_NOOP,
+    EVENT_GOAL_SATISFIED, EVENT_NOOP, PALETTE_SIZE,
 };
 use crate::p2::representation::{
     RepresentationRowCollector, RepresentationSeam, RepresentationSeamCollector,
@@ -77,13 +77,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// v19 (2026-09-05): the v6 twin diagnostic adds frozen continuous-response
+/// comparisons without changing its registered exact statistic or verdict.
 /// v18 (2026-08-27): overall semantic reducer omits content-derived
 /// false-edit scalars; foundation-v2 SIGReg scored on the content-masked
 /// canonical population (whole-population, batch-invariant); identifiability
 /// split is group-disjoint; the correctness seam is composed copy-gate
 /// semantics; content masks honor the provenance origin; v5_holdout_gates
 /// added. v17 and v18 reports are not field-for-field comparable.
-pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v18";
+pub const EVAL_REPORT_SCHEMA: &str = "p2.eval_report.v19";
 pub const ACTION_CONTROLLABILITY_LATENT_DISTANCE_THRESHOLD: f64 = 1e-3;
 
 fn log_eval_phase(phase: &str, detail: &str, elapsed: Duration) {
@@ -4302,6 +4304,54 @@ pub struct TwinMemorizationCensus {
     pub scorable_rows_with_evidence_in_window: usize,
 }
 
+/// One continuous treatment-versus-baseline response on the same rows as the
+/// registered exact statistic. These are diagnostic effect sizes only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TwinContinuousResponseMetrics {
+    pub gameplay_pixels: usize,
+    pub factually_changed_pixels: usize,
+    /// RMS difference between the two encoded context summaries. K=0 with no
+    /// ContextBatch is represented by the contract's exact zero summary.
+    pub context_summary_rms_difference: Option<f64>,
+    /// RMS difference between the two predicted spatial latents.
+    pub latent_rms_difference: Option<f64>,
+    /// Mean L1 distance between the two 16-color distributions per gameplay
+    /// pixel (range 0..=2).
+    pub mean_probability_l1_all_pixels: Option<f64>,
+    /// The same probability distance restricted to factually changed pixels.
+    pub mean_probability_l1_changed_pixels: Option<f64>,
+    /// Mean target negative log-likelihood on factually changed pixels.
+    pub target_nll_treatment_changed_pixels: Option<f64>,
+    pub target_nll_baseline_changed_pixels: Option<f64>,
+    /// `NLL(baseline) - NLL(treatment)`; positive favors the treatment.
+    pub target_nll_improvement_changed_pixels: Option<f64>,
+    /// Mean absolute difference between the two per-pixel copy-gate
+    /// probabilities.
+    pub mean_copy_gate_absolute_difference: Option<f64>,
+    pub raw_argmax_disagreement_rows: usize,
+    pub raw_argmax_disagreement_row_fraction: Option<f64>,
+    pub raw_argmax_disagreement_pixels: usize,
+    pub raw_argmax_disagreement_pixel_fraction: Option<f64>,
+    pub composed_argmax_disagreement_rows: usize,
+    pub composed_argmax_disagreement_row_fraction: Option<f64>,
+    pub composed_argmax_disagreement_pixels: usize,
+    pub composed_argmax_disagreement_pixel_fraction: Option<f64>,
+}
+
+/// Three frozen-checkpoint comparisons that distinguish useful history
+/// content from quantization and the mixed-batch K=0 FiLM-bias seam.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TwinContinuousResponseReport {
+    /// Own K=context_len history (treatment) versus K=0 / no ContextBatch.
+    pub full_context_vs_no_context: TwinContinuousResponseMetrics,
+    /// Own history (treatment) versus the paired twin's history on the same
+    /// current frame/action/target row.
+    pub own_context_vs_paired_context: TwinContinuousResponseMetrics,
+    /// K=0 inside a context-bearing mixed batch (treatment) versus K=0 with no
+    /// ContextBatch. A difference isolates batch-mask / FiLM-bias behavior.
+    pub mixed_zero_context_vs_no_context: TwinContinuousResponseMetrics,
+}
+
 /// One row set scored with exactly `K = context_len` and with `K = 0`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TwinMemorizationMetrics {
@@ -4316,6 +4366,8 @@ pub struct TwinMemorizationMetrics {
     pub composed_changed_exact_full_context: Option<f64>,
     pub composed_changed_exact_no_context: Option<f64>,
     pub composed_delta: Option<f64>,
+    /// Frozen-checkpoint continuous response diagnostics on these exact rows.
+    pub continuous_response: TwinContinuousResponseReport,
 }
 
 /// The registered §5.1 rule applied to the evidence-filtered delta.
@@ -4502,6 +4554,7 @@ fn twin_memorization_scoring_row(
 /// [`FOUNDATION_V2_GATE_PHYSICAL_BATCH`] rows: the frame encoder, the context
 /// encoder and the dynamics forward never see more rows than that, and only
 /// the decoded palettes (host `Vec<u8>`) survive each slice.
+#[cfg(test)]
 fn decode_rows_bounded(
     model: &WorldModel,
     rows: &[TransitionSample],
@@ -4519,6 +4572,309 @@ fn decode_rows_bounded(
     Ok(decodes)
 }
 
+/// Detached prediction details needed to localize an exact-metric tie. Kept
+/// separate from [`AdaptationFalsifierDecodes`] so E3 does not pay the memory
+/// or host-transfer cost of E2R's continuous diagnostic.
+struct TwinContinuousDecodes {
+    true_predictions: Vec<Vec<u8>>,
+    composed: Vec<Vec<u8>>,
+    latent: Vec<Vec<f32>>,
+    log_probs: Vec<Vec<f32>>,
+    copy_gate: Vec<Vec<f32>>,
+    context_summary: Vec<Vec<f32>>,
+}
+
+fn twin_continuous_decode_rows(
+    model: &WorldModel,
+    rows: &[TransitionSample],
+    device: &Device,
+) -> Result<TwinContinuousDecodes> {
+    let batch = batch_from_samples(rows, device)?;
+    let (current, _target) = model.encode_state_pair(&batch.frames, &batch.next_frames)?;
+    let prediction = forward_gate_rows_chunked(
+        model,
+        &current.detach(),
+        &batch.actions,
+        &batch.action_coords,
+        &batch.goals,
+        &batch.operator_conditioning,
+        batch.context.as_ref(),
+        RecursionDepth::from_config(model.config()),
+        FOUNDATION_V2_GATE_PHYSICAL_BATCH,
+    )?;
+    let logits = model.exact_gameplay_logits_detached(&prediction)?;
+    let copy_gate = model.exact_copy_gate(&prediction)?.detach();
+    let gameplay_height = gameplay_rows(model.config().world_core_v6);
+    let current_pixels = batch
+        .frames
+        .narrow(2, 0, gameplay_height)?
+        .squeeze(1)?
+        .to_dtype(DType::U32)?;
+    let true_predictions = logits
+        .argmax(D::Minus1)?
+        .reshape((rows.len(), ()))?
+        .to_dtype(DType::U8)?
+        .to_vec2::<u8>()?;
+    let composed = model
+        .composed_gameplay_decode_from_parts(&logits, &copy_gate, &current_pixels)?
+        .reshape((rows.len(), ()))?
+        .to_dtype(DType::U8)?
+        .to_vec2::<u8>()?;
+    let latent = flatten_latent(&prediction)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    let log_probs = ops::log_softmax(&logits, D::Minus1)?
+        .reshape((rows.len(), ()))?
+        .to_vec2::<f32>()?;
+    let copy_gate = copy_gate
+        .reshape((rows.len(), ()))?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    let context_summary = match batch.context.as_ref() {
+        Some(context) => model
+            .context_summary(context)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?,
+        None => vec![vec![0.0; model.config().hidden_dim]; rows.len()],
+    };
+    Ok(TwinContinuousDecodes {
+        true_predictions,
+        composed,
+        latent,
+        log_probs,
+        copy_gate,
+        context_summary,
+    })
+}
+
+fn twin_continuous_decode_rows_bounded(
+    model: &WorldModel,
+    rows: &[TransitionSample],
+    device: &Device,
+) -> Result<TwinContinuousDecodes> {
+    let mut decodes = TwinContinuousDecodes {
+        true_predictions: Vec::with_capacity(rows.len()),
+        composed: Vec::with_capacity(rows.len()),
+        latent: Vec::with_capacity(rows.len()),
+        log_probs: Vec::with_capacity(rows.len()),
+        copy_gate: Vec::with_capacity(rows.len()),
+        context_summary: Vec::with_capacity(rows.len()),
+    };
+    for slice in rows.chunks(FOUNDATION_V2_GATE_PHYSICAL_BATCH) {
+        let part = twin_continuous_decode_rows(model, slice, device)?;
+        decodes.true_predictions.extend(part.true_predictions);
+        decodes.composed.extend(part.composed);
+        decodes.latent.extend(part.latent);
+        decodes.log_probs.extend(part.log_probs);
+        decodes.copy_gate.extend(part.copy_gate);
+        decodes.context_summary.extend(part.context_summary);
+    }
+    Ok(decodes)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TwinContinuousAccum {
+    rows: usize,
+    gameplay_pixels: usize,
+    changed_pixels: usize,
+    latent_elements: usize,
+    latent_squared_difference: f64,
+    context_summary_elements: usize,
+    context_summary_squared_difference: f64,
+    probability_l1_all: f64,
+    probability_l1_changed: f64,
+    target_nll_full_changed: f64,
+    target_nll_none_changed: f64,
+    copy_gate_absolute_difference: f64,
+    raw_disagreement_rows: usize,
+    raw_disagreement_pixels: usize,
+    composed_disagreement_rows: usize,
+    composed_disagreement_pixels: usize,
+}
+
+impl TwinContinuousAccum {
+    fn metrics(&self) -> TwinContinuousResponseMetrics {
+        let ratio = |numerator: f64, denominator: usize| {
+            (denominator > 0).then(|| numerator / denominator as f64)
+        };
+        let nll_full = ratio(self.target_nll_full_changed, self.changed_pixels);
+        let nll_none = ratio(self.target_nll_none_changed, self.changed_pixels);
+        TwinContinuousResponseMetrics {
+            gameplay_pixels: self.gameplay_pixels,
+            factually_changed_pixels: self.changed_pixels,
+            context_summary_rms_difference: ratio(
+                self.context_summary_squared_difference,
+                self.context_summary_elements,
+            )
+            .map(f64::sqrt),
+            latent_rms_difference: ratio(self.latent_squared_difference, self.latent_elements)
+                .map(f64::sqrt),
+            mean_probability_l1_all_pixels: ratio(self.probability_l1_all, self.gameplay_pixels),
+            mean_probability_l1_changed_pixels: ratio(
+                self.probability_l1_changed,
+                self.changed_pixels,
+            ),
+            target_nll_treatment_changed_pixels: nll_full,
+            target_nll_baseline_changed_pixels: nll_none,
+            target_nll_improvement_changed_pixels: match (nll_full, nll_none) {
+                (Some(full), Some(none)) => Some(none - full),
+                _ => None,
+            },
+            mean_copy_gate_absolute_difference: ratio(
+                self.copy_gate_absolute_difference,
+                self.gameplay_pixels,
+            ),
+            raw_argmax_disagreement_rows: self.raw_disagreement_rows,
+            raw_argmax_disagreement_row_fraction: ratio(
+                self.raw_disagreement_rows as f64,
+                self.rows,
+            ),
+            raw_argmax_disagreement_pixels: self.raw_disagreement_pixels,
+            raw_argmax_disagreement_pixel_fraction: ratio(
+                self.raw_disagreement_pixels as f64,
+                self.gameplay_pixels,
+            ),
+            composed_argmax_disagreement_rows: self.composed_disagreement_rows,
+            composed_argmax_disagreement_row_fraction: ratio(
+                self.composed_disagreement_rows as f64,
+                self.rows,
+            ),
+            composed_argmax_disagreement_pixels: self.composed_disagreement_pixels,
+            composed_argmax_disagreement_pixel_fraction: ratio(
+                self.composed_disagreement_pixels as f64,
+                self.gameplay_pixels,
+            ),
+        }
+    }
+
+    fn add_row(
+        &mut self,
+        sample: &TransitionSample,
+        full: &TwinContinuousDecodes,
+        none: &TwinContinuousDecodes,
+        full_index: usize,
+        none_index: usize,
+    ) -> Result<()> {
+        let raw_full = &full.true_predictions[full_index];
+        let raw_none = &none.true_predictions[none_index];
+        let composed_full = &full.composed[full_index];
+        let composed_none = &none.composed[none_index];
+        let latent_full = &full.latent[full_index];
+        let latent_none = &none.latent[none_index];
+        let log_probs_full = &full.log_probs[full_index];
+        let log_probs_none = &none.log_probs[none_index];
+        let gate_full = &full.copy_gate[full_index];
+        let gate_none = &none.copy_gate[none_index];
+        let summary_full = &full.context_summary[full_index];
+        let summary_none = &none.context_summary[none_index];
+        let pixels = raw_full.len();
+        let expected_probs = pixels * PALETTE_SIZE;
+        if raw_none.len() != pixels
+            || composed_full.len() != pixels
+            || composed_none.len() != pixels
+            || gate_full.len() != pixels
+            || gate_none.len() != pixels
+            || log_probs_full.len() != expected_probs
+            || log_probs_none.len() != expected_probs
+            || latent_full.len() != latent_none.len()
+            || summary_full.len() != summary_none.len()
+        {
+            bail!("the continuous twin arms have mismatched row shapes");
+        }
+        let (current, target) = gameplay_pixels(sample, pixels);
+        if current.len() != pixels || target.len() != pixels {
+            bail!("the continuous twin row does not match the gameplay target");
+        }
+        if latent_full
+            .iter()
+            .chain(latent_none)
+            .chain(log_probs_full)
+            .chain(log_probs_none)
+            .chain(gate_full)
+            .chain(gate_none)
+            .chain(summary_full)
+            .chain(summary_none)
+            .any(|value| !value.is_finite())
+        {
+            bail!("the continuous twin diagnostic encountered a non-finite value");
+        }
+
+        self.rows += 1;
+        self.gameplay_pixels += pixels;
+        self.latent_elements += latent_full.len();
+        self.latent_squared_difference += latent_full
+            .iter()
+            .zip(latent_none)
+            .map(|(full, none)| {
+                let difference = f64::from(*full) - f64::from(*none);
+                difference * difference
+            })
+            .sum::<f64>();
+        self.context_summary_elements += summary_full.len();
+        self.context_summary_squared_difference += summary_full
+            .iter()
+            .zip(summary_none)
+            .map(|(full, none)| {
+                let difference = f64::from(*full) - f64::from(*none);
+                difference * difference
+            })
+            .sum::<f64>();
+        let mut raw_disagreement = 0usize;
+        let mut composed_disagreement = 0usize;
+        for pixel in 0..pixels {
+            raw_disagreement += usize::from(raw_full[pixel] != raw_none[pixel]);
+            composed_disagreement += usize::from(composed_full[pixel] != composed_none[pixel]);
+            self.copy_gate_absolute_difference +=
+                (f64::from(gate_full[pixel]) - f64::from(gate_none[pixel])).abs();
+            let probability_l1 = (0..PALETTE_SIZE)
+                .map(|color| {
+                    let offset = pixel * PALETTE_SIZE + color;
+                    (f64::from(log_probs_full[offset]).exp()
+                        - f64::from(log_probs_none[offset]).exp())
+                    .abs()
+                })
+                .sum::<f64>();
+            self.probability_l1_all += probability_l1;
+            if current[pixel] == target[pixel] {
+                continue;
+            }
+            let target_color = usize::from(target[pixel]);
+            if target_color >= PALETTE_SIZE {
+                bail!("the continuous twin target is outside the palette");
+            }
+            self.changed_pixels += 1;
+            self.probability_l1_changed += probability_l1;
+            let target_offset = pixel * PALETTE_SIZE + target_color;
+            self.target_nll_full_changed -= f64::from(log_probs_full[target_offset]);
+            self.target_nll_none_changed -= f64::from(log_probs_none[target_offset]);
+        }
+        self.raw_disagreement_pixels += raw_disagreement;
+        self.composed_disagreement_pixels += composed_disagreement;
+        self.raw_disagreement_rows += usize::from(raw_disagreement > 0);
+        self.composed_disagreement_rows += usize::from(composed_disagreement > 0);
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.gameplay_pixels += other.gameplay_pixels;
+        self.changed_pixels += other.changed_pixels;
+        self.latent_elements += other.latent_elements;
+        self.latent_squared_difference += other.latent_squared_difference;
+        self.context_summary_elements += other.context_summary_elements;
+        self.context_summary_squared_difference += other.context_summary_squared_difference;
+        self.probability_l1_all += other.probability_l1_all;
+        self.probability_l1_changed += other.probability_l1_changed;
+        self.target_nll_full_changed += other.target_nll_full_changed;
+        self.target_nll_none_changed += other.target_nll_none_changed;
+        self.copy_gate_absolute_difference += other.copy_gate_absolute_difference;
+        self.raw_disagreement_rows += other.raw_disagreement_rows;
+        self.raw_disagreement_pixels += other.raw_disagreement_pixels;
+        self.composed_disagreement_rows += other.composed_disagreement_rows;
+        self.composed_disagreement_pixels += other.composed_disagreement_pixels;
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct TwinMemorizationAccum {
     rows: usize,
@@ -4527,6 +4883,9 @@ struct TwinMemorizationAccum {
     exact_none: usize,
     composed_full: usize,
     composed_none: usize,
+    full_vs_none: TwinContinuousAccum,
+    own_vs_paired: TwinContinuousAccum,
+    mixed_zero_vs_none: TwinContinuousAccum,
 }
 
 impl TwinMemorizationAccum {
@@ -4546,6 +4905,11 @@ impl TwinMemorizationAccum {
             composed_changed_exact_full_context: composed_full,
             composed_changed_exact_no_context: composed_none,
             composed_delta: delta(composed_full, composed_none),
+            continuous_response: TwinContinuousResponseReport {
+                full_context_vs_no_context: self.full_vs_none.metrics(),
+                own_context_vs_paired_context: self.own_vs_paired.metrics(),
+                mixed_zero_context_vs_no_context: self.mixed_zero_vs_none.metrics(),
+            },
         }
     }
 }
@@ -4564,6 +4928,7 @@ fn twin_memorization_episode(
     model: &WorldModel,
     device: &Device,
     history: &AugmentedLearningHistory,
+    paired_history: &AugmentedLearningHistory,
     divergence: &TwinPairDivergence,
     spec: &TwinMemorizationSpec,
     accums: &mut TwinMemorizationAccums,
@@ -4572,6 +4937,9 @@ fn twin_memorization_episode(
     let len = history.chronological.len();
     if len <= k {
         return Ok(());
+    }
+    if paired_history.chronological.len() != len {
+        bail!("the two twin histories have different chronological lengths");
     }
     let positions = (k..len).collect::<Vec<_>>();
     let full = positions
@@ -4587,8 +4955,40 @@ fn twin_memorization_episode(
             row
         })
         .collect::<Vec<_>>();
-    let full_decodes = decode_rows_bounded(model, &full, device)?;
-    let none_decodes = decode_rows_bounded(model, &none, device)?;
+    let paired = positions
+        .iter()
+        .enumerate()
+        .map(|(index, &position)| {
+            let mut row = full[index].clone();
+            let window = paired_history.context_window_before(position);
+            if window.len() < k {
+                bail!("paired row {position} cannot carry a window of exactly {k} transitions");
+            }
+            row.context = window[window.len() - k..].to_vec();
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Each K=0 row is followed by a K>0 carrier. The even chunk bound keeps
+    // every slice context-bearing while each even row has zero valid slots.
+    let mixed_rows = none
+        .iter()
+        .zip(&full)
+        .flat_map(|(none, carrier)| [none.clone(), carrier.clone()])
+        .collect::<Vec<_>>();
+    // Matched-size baseline for the mixed comparison. Duplicating each K=0
+    // row preserves the same 2N batch geometry without creating a
+    // ContextBatch, so batch-size-dependent kernel rounding cannot masquerade
+    // as a FiLM-bias effect.
+    let no_context_control_rows = none
+        .iter()
+        .flat_map(|row| [row.clone(), row.clone()])
+        .collect::<Vec<_>>();
+    let full_decodes = twin_continuous_decode_rows_bounded(model, &full, device)?;
+    let none_decodes = twin_continuous_decode_rows_bounded(model, &none, device)?;
+    let paired_decodes = twin_continuous_decode_rows_bounded(model, &paired, device)?;
+    let mixed_decodes = twin_continuous_decode_rows_bounded(model, &mixed_rows, device)?;
+    let no_context_control_decodes =
+        twin_continuous_decode_rows_bounded(model, &no_context_control_rows, device)?;
     for (index, &position) in positions.iter().enumerate() {
         let row = std::slice::from_ref(&full[index]);
         let count = |prediction: &Vec<u8>| -> Result<(usize, usize)> {
@@ -4601,6 +5001,18 @@ fn twin_memorization_episode(
         if changed != changed_none || changed != changed_composed {
             bail!("the two arms disagree on whether row {position} is a changed transition");
         }
+        let mut full_vs_none = TwinContinuousAccum::default();
+        full_vs_none.add_row(&full[index], &full_decodes, &none_decodes, index, index)?;
+        let mut own_vs_paired = TwinContinuousAccum::default();
+        own_vs_paired.add_row(&full[index], &full_decodes, &paired_decodes, index, index)?;
+        let mut mixed_zero_vs_none = TwinContinuousAccum::default();
+        mixed_zero_vs_none.add_row(
+            &full[index],
+            &mixed_decodes,
+            &no_context_control_decodes,
+            index * 2,
+            index * 2,
+        )?;
         let outcome = TwinMemorizationAccum {
             rows: 1,
             changed,
@@ -4608,6 +5020,9 @@ fn twin_memorization_episode(
             exact_none,
             composed_full,
             composed_none,
+            full_vs_none,
+            own_vs_paired,
+            mixed_zero_vs_none,
         };
         let add = |accum: &mut TwinMemorizationAccum| {
             accum.rows += outcome.rows;
@@ -4616,6 +5031,9 @@ fn twin_memorization_episode(
             accum.exact_none += outcome.exact_none;
             accum.composed_full += outcome.composed_full;
             accum.composed_none += outcome.composed_none;
+            accum.full_vs_none.merge(outcome.full_vs_none);
+            accum.own_vs_paired.merge(outcome.own_vs_paired);
+            accum.mixed_zero_vs_none.merge(outcome.mixed_zero_vs_none);
         };
         add(&mut accums.unfiltered);
         if twin_after_first_divergence(divergence, position) {
@@ -4717,11 +5135,14 @@ fn evaluate_twin_memorization_on(
     let mut accums = TwinMemorizationAccums::default();
     timed_eval_phase("twin_memorization", "score_k_full_vs_k0", || {
         for pair in pairs {
-            for history in [&pair.primary, &pair.twin] {
+            for (history, paired_history) in
+                [(&pair.primary, &pair.twin), (&pair.twin, &pair.primary)]
+            {
                 twin_memorization_episode(
                     model,
                     device,
                     history,
+                    paired_history,
                     &pair.divergence,
                     spec,
                     &mut accums,
@@ -12935,6 +13356,33 @@ mod tests {
             } else {
                 assert_eq!(metrics.delta, None);
             }
+            for response in [
+                &metrics.continuous_response.full_context_vs_no_context,
+                &metrics.continuous_response.own_context_vs_paired_context,
+                &metrics.continuous_response.mixed_zero_context_vs_no_context,
+            ] {
+                assert_eq!(response.latent_rms_difference, Some(0.0));
+                assert_eq!(response.mean_probability_l1_all_pixels, Some(0.0));
+                assert_eq!(response.mean_probability_l1_changed_pixels, Some(0.0));
+                assert_eq!(response.target_nll_improvement_changed_pixels, Some(0.0));
+                assert_eq!(response.mean_copy_gate_absolute_difference, Some(0.0));
+                assert_eq!(response.raw_argmax_disagreement_rows, 0);
+                assert_eq!(response.raw_argmax_disagreement_pixels, 0);
+                assert_eq!(response.composed_argmax_disagreement_rows, 0);
+                assert_eq!(response.composed_argmax_disagreement_pixels, 0);
+            }
+            assert!(metrics
+                .continuous_response
+                .full_context_vs_no_context
+                .context_summary_rms_difference
+                .is_some_and(|value| value > 0.0));
+            assert_eq!(
+                metrics
+                    .continuous_response
+                    .mixed_zero_context_vs_no_context
+                    .context_summary_rms_difference,
+                Some(0.0)
+            );
         }
         assert_eq!(
             report.verdict.promotion_delta,
@@ -12948,9 +13396,162 @@ mod tests {
         assert!(!report.verdict.pass, "{:?}", report.verdict);
         let json = serde_json::to_string(&report)?;
         let back: TwinMemorizationReport = serde_json::from_str(&json)?;
-        assert_eq!(back, report);
+        assert_eq!(back.population_fingerprint, report.population_fingerprint);
+        assert_eq!(back.census, report.census);
+        assert_eq!(back.verdict, report.verdict);
+        assert_eq!(back.unfiltered.delta, report.unfiltered.delta);
+        assert!(
+            (back
+                .unfiltered
+                .continuous_response
+                .full_context_vs_no_context
+                .context_summary_rms_difference
+                .expect("serialized rows have context")
+                - report
+                    .unfiltered
+                    .continuous_response
+                    .full_context_vs_no_context
+                    .context_summary_rms_difference
+                    .expect("rows have context"))
+            .abs()
+                < 1e-12
+        );
         let again = evaluate_twin_memorization_on(&model, &device, &spec, &pairs)?;
-        assert_eq!(again, report);
+        assert_eq!(again.population_fingerprint, report.population_fingerprint);
+        assert_eq!(again.census, report.census);
+        assert_eq!(again.verdict, report.verdict);
+        assert_eq!(again.unfiltered.delta, report.unfiltered.delta);
+        assert_eq!(
+            again.unfiltered.composed_delta,
+            report.unfiltered.composed_delta
+        );
+        let summary_rms = |result: &TwinMemorizationReport| {
+            result
+                .unfiltered
+                .continuous_response
+                .full_context_vs_no_context
+                .context_summary_rms_difference
+                .expect("rows have context")
+        };
+        assert!((summary_rms(&again) - summary_rms(&report)).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn twin_continuous_probe_detects_film_bias_on_a_zero_valid_row() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        let (spec, pairs) = twin_population(3, LearningHistoryConfig::training())?;
+        let history = pairs
+            .iter()
+            .flat_map(|pair| [&pair.primary, &pair.twin])
+            .find(|history| history.chronological.len() > spec.context_len)
+            .expect("fixture has a scorable row");
+        let full = twin_memorization_scoring_row(history, spec.context_len, spec.context_len)?;
+        let mut none = full.clone();
+        none.context.clear();
+        none.provenance.context_len = 0;
+        let no_context =
+            twin_continuous_decode_rows(&model, &[none.clone(), none.clone()], &device)?;
+        let mixed = twin_continuous_decode_rows(&model, &[none.clone(), full.clone()], &device)?;
+        let mut response = TwinContinuousAccum::default();
+        response.add_row(&full, &mixed, &no_context, 0, 0)?;
+        let identity_response = response.metrics();
+        assert_eq!(identity_response.context_summary_rms_difference, Some(0.0));
+        assert_eq!(identity_response.latent_rms_difference, Some(0.0));
+        assert_eq!(identity_response.mean_probability_l1_all_pixels, Some(0.0));
+        assert_eq!(
+            identity_response.mean_copy_gate_absolute_difference,
+            Some(0.0)
+        );
+
+        {
+            let data = varmap.data().lock().unwrap();
+            let bias = data
+                .get("context_film_beta.bias")
+                .expect("context FiLM beta bias exists");
+            bias.set(&Tensor::full(0.25f32, bias.shape().dims(), &device)?)?;
+        }
+        let no_context =
+            twin_continuous_decode_rows(&model, &[none.clone(), none.clone()], &device)?;
+        let mixed = twin_continuous_decode_rows(&model, &[none, full.clone()], &device)?;
+        let mut response = TwinContinuousAccum::default();
+        response.add_row(&full, &mixed, &no_context, 0, 0)?;
+        let response = response.metrics();
+        assert_eq!(response.context_summary_rms_difference, Some(0.0));
+        assert!(
+            response
+                .latent_rms_difference
+                .is_some_and(|value| value > 0.0),
+            "{response:?}"
+        );
+        assert!(
+            response
+                .mean_probability_l1_all_pixels
+                .is_some_and(|value| value > 0.0),
+            "{response:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn twin_paired_context_changes_output_and_detailed_decode_preserves_exact_path() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, varmap) = tiny_v6_model(&device)?;
+        {
+            let data = varmap.data().lock().unwrap();
+            for name in ["context_film_gamma.weight", "context_film_beta.weight"] {
+                let weight = data.get(name).expect("context FiLM weight exists");
+                weight.set(&Tensor::full(0.05f32, weight.shape().dims(), &device)?)?;
+            }
+        }
+        let (spec, pairs) = twin_population(8, LearningHistoryConfig::training())?;
+        let (pair, position) = pairs
+            .iter()
+            .find_map(|pair| {
+                let len = pair.primary.chronological.len();
+                (spec.context_len..len)
+                    .find(|&position| {
+                        pair.primary.context_window_before(position)
+                            != pair.twin.context_window_before(position)
+                    })
+                    .map(|position| (pair, position))
+            })
+            .expect("fixture has a divergent context window");
+        let own = twin_memorization_scoring_row(&pair.primary, position, spec.context_len)?;
+        let mut paired = own.clone();
+        let paired_window = pair.twin.context_window_before(position);
+        paired.context = paired_window[paired_window.len() - spec.context_len..].to_vec();
+
+        let own_detailed =
+            twin_continuous_decode_rows(&model, std::slice::from_ref(&own), &device)?;
+        let paired_detailed =
+            twin_continuous_decode_rows(&model, std::slice::from_ref(&paired), &device)?;
+        let mut response = TwinContinuousAccum::default();
+        response.add_row(&own, &own_detailed, &paired_detailed, 0, 0)?;
+        let response = response.metrics();
+        assert!(
+            response
+                .context_summary_rms_difference
+                .is_some_and(|value| value > 0.0),
+            "{response:?}"
+        );
+        assert!(
+            response
+                .latent_rms_difference
+                .is_some_and(|value| value > 0.0),
+            "{response:?}"
+        );
+        assert!(
+            response
+                .mean_probability_l1_all_pixels
+                .is_some_and(|value| value > 0.0),
+            "{response:?}"
+        );
+
+        let legacy = adaptation_falsifier_decode_rows(&model, std::slice::from_ref(&own), &device)?;
+        assert_eq!(own_detailed.true_predictions, legacy.true_predictions);
+        assert_eq!(own_detailed.composed, legacy.composed);
         Ok(())
     }
 
@@ -13129,6 +13730,7 @@ mod tests {
             composed_changed_exact_full_context: Some(0.50),
             composed_changed_exact_no_context: Some(0.50),
             composed_delta: Some(0.0),
+            continuous_response: TwinContinuousResponseReport::default(),
         };
         let at_threshold = metrics(TWIN_MEMORIZATION_PROMOTION_DELTA);
         assert!(

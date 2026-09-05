@@ -36,7 +36,7 @@ the exact source, binary, build, hardware, batch, and preflight hashes. Full V4
 rejects gradient accumulation above one so the EP population matches the
 physical batch.
 
-## Eval (schema `p2.eval_report.v18`)
+## Eval (schema `p2.eval_report.v19`)
 
 Split held-out probes aligned with training stages:
 

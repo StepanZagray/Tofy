@@ -270,6 +270,70 @@ not a claim that 2x2 is globally optimal.
   uninterpretable. Runtime must be registered from a fresh 2x2/3x3 batch and
   timing smoke; the old estimate is not valid evidence.
 
+## Post-E2 diagnostic E2R: frozen continuous context response (2026-09-05)
+
+The fresh registered 2x2 E2 run completed and failed: the exact K=16 minus
+K=0 changed-exact delta was `0.0` at all four measured checkpoints, including
+the fixed step-4096 EMA checkpoint, versus the registered `0.05` threshold.
+E3 and the pod campaign remain blocked. Before any retraining, E2R localizes
+the failure with a frozen-checkpoint rescore; it is exploratory diagnostic
+evidence and cannot promote the model.
+
+- **Claim.** On the exact E2 population and step-4096 EMA checkpoint, K=16
+  changes the model's predictive distribution relative to K=0, and any change
+  can be classified as target-helpful or target-harmful before choosing a
+  training intervention. This is a checkpoint-local empirical hypothesis,
+  not a claim about v6 generally.
+- **Invariants and comparator.** Use Tofy
+  `dadc3e5f4c18751f7f205100738f0653d243580c`'s sealed E2 checkpoint
+  `c53bf0c42dc6c8f7945ff4d17bd6bd63a6db23e8b6e377b6b0b92903e66d694a`
+  as the source model; evaluator code may add read-only reductions but must not
+  change model parameters, population generation, seed 1000002, 256 pairs,
+  TRAINING history shape, K=16/K=0 arms, row filters, or exact metrics. The
+  population fingerprint must remain
+  `sha256:484e8615e41102895997ddb9bec19665604fb7f62d21db9cc5ecea1470e58f42`
+  and its registered census must match exactly. No public ARC data is read.
+- **Comparisons and metrics.** For all three existing row sets, compare (1)
+  own K=16 versus K=0/`ContextBatch=None`, (2) own K=16 versus the paired
+  twin's K=16 on the same current-frame/action/target row, and (3) a zero-valid
+  K=0 row carried inside a context-bearing mixed batch versus
+  a same-size interleaved all-K=0 batch with `ContextBatch=None`. Comparison
+  (2) isolates history content from the
+  learned global context-FiLM bias; comparison (3) measures that bias seam
+  directly. Each comparison reports context-summary and latent RMS distance;
+  mean L1 distance
+  between the two 16-color distributions over all gameplay pixels and over
+  factually changed gameplay pixels; mean target NLL in each arm and
+  `NLL(baseline) - NLL(treatment)` over factually changed pixels; mean absolute
+  copy-gate difference; and raw/composed argmax disagreement row and pixel
+  counts/fractions. Exact changed-exact fields and the registered verdict
+  retain their meanings and reduction populations.
+- **Fixed interpretation rule.** On evidence-bearing rows, call the predictor
+  distribution-sensitive if changed-pixel mean probability L1 is `> 1e-6` or
+  any raw argmax pixel differs. Call the continuous change target-helpful only
+  if changed-pixel NLL improvement is `> 1e-4`; values in
+  `[-1e-4, 1e-4]` are inconclusive at this precision, and values `< -1e-4`
+  are target-harmful. Context is operationally inert only if probability L1,
+  latent RMS, and gate absolute difference are all `<= 1e-6` and both raw and
+  composed argmax disagreement counts are zero. These thresholds select a
+  diagnosis, not a promotion. A nonzero mixed-K0 comparison confirms the
+  batch-mask defect is behaviorally active in this checkpoint; own-versus-twin
+  response is the stricter content-use test. The matched 2N K=0 baseline keeps
+  batch geometry constant so kernel selection or batch-size rounding is not
+  attributed to context-FiLM bias.
+- **Branch.** Inert output leads to an instrumented context-summary/FiLM probe
+  and a tiny one-twin overfit wiring test. Sensitive but non-helpful output
+  leads to the same overfit test plus a context-contrastive or rule-prediction
+  objective proposal. Helpful sub-argmax output leads to a changed-pixel
+  context-amplification treatment, which still requires a fresh registered
+  train/eval confirmation. No branch authorizes E3, a 3x3 ablation, or remote
+  training.
+- **Budget and stop rule.** One local CUDA rescore of the frozen checkpoint,
+  bounded by the existing 32-row evaluator slices and 30 minutes wall time.
+  Stop and fail closed on source/checkpoint/population/census drift, non-finite
+  continuous values, CUDA failure, or changed legacy exact fields. Preserve
+  the old report and write E2R into a never-reused root.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`
