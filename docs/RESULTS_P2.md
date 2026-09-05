@@ -50,6 +50,39 @@ are zero. This remains an implementation smoke with `research_claim=false`,
 not model evidence or an ARC result. It authorizes only the separately
 preregistered split-CE pressure screen.
 
+## V6 split-CE coefficient-mass screen (2026-09-05; support for confirmation)
+
+The exact pushed revision
+`96f0c449633b16930b840d92b6f8c4b36b26d085`, locked cuDNN release binary
+`sha256:4c52ff7351e137f59d61c61b61026121ac559d07439c0e52544d4a0fb4340988`,
+and RTX 5060 Laptop GPU ran three matched one-update V6 2x2 arms at data/init
+seed 2. Each arm consumed 128 main plus 32 rollout rows with 16 fragments and
+used identical population/content fingerprints. Every artifact hash passed;
+the finalized parent recursive seal-manifest digest is
+`sha256:386328081d13a5fbabd8830e28e1a43af966d9816d95a37b48c1c3825cc78ea8`.
+
+| Arm | Split-CE coefficients | Prediction global L2 | Combined global cosine to prediction | Combined Muon cosine to prediction |
+|---|---:|---:|---:|---:|
+| A CurrentDouble | `50 / 1` (mass 51) | `408.288757` | `0.9970859` | `0.9983581` |
+| B EqualMeans | `25.5 / 25.5` (mass 51) | `290.258240` | `0.9946433` | `0.9973892` |
+| C UnitMassBalanced | `0.5 / 0.5` (mass 1) | `5.691411` | `0.1653788` | `0.2720963` |
+
+A reproduced the prior packet. B kept both cosines above `0.95`, so changing
+class ratio while preserving mass did not trigger the registered alternative
+branch. C reduced prediction L2 `71.74x` versus A and passed every support gate.
+The B/C prediction-norm ratio was `50.99935`, matching their exact 51x
+coefficient-mass ratio. This supports legacy coefficient mass as sufficient
+for initial prediction-direction dominance on the seed-2 batch.
+
+The treatment is not prediction-only: `split_ce_weighting` also changes the
+next-frame half of encoder CE. B/C scaling is mostly arithmetic; the meaningful
+new-seed premise is non-collinearity of the other objectives. All arms remained
+fully clipped, so clip scale is not an effective LR or update-magnitude result.
+No learned-quality, planning, evaluator, or ARC outcome was measured, and unit
+mass cuts the changed-pixel coefficient from 50 to 0.5. Fable 5.1 High judged
+the evidence integrity-clean and authorized only a relative-gate A/B/C
+confirmation at seeds 3 and 4 before any multi-step comparison.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
