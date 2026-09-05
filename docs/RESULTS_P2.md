@@ -123,6 +123,67 @@ The eventual quality screen must then include a unit-mass changed-share
 `50/51` control so total mass is separated from the candidate's 100x reduction
 in changed-pixel coefficient.
 
+## V6 CurrentDouble baseline floor (2026-09-05; registered FAIL)
+
+The clean seed-5 CurrentDouble baseline at pushed preregistration/source
+revision `d0468a808d0d3cd2754dc1b31e4a85ab636fcc36` completed all 2,048
+updates with the locked cuDNN release binary
+`sha256:aa4e2498a4f83295fe4f65be1a99ec1194f7f04e7a6a8926166d3d016b447611`
+on the RTX 5060 Laptop GPU. The never-reused root
+`baseline-floor-current-double-seed5-20260905T121849-CDT` passed its
+population, provenance, checkpoint, profile, pressure, rollout, non-finite,
+and recursive-manifest integrity gates; its 124-file external seal-manifest
+digest is
+`sha256:e686a783b13eadc9f099d2ba5bdce68ecc10923e686db6fc86cc9bb4c02abfc5`.
+
+The preregistered final raw changed exact count was exactly `3/382`, below the
+FAIL ceiling of four and far below the PASS floor of ten. Final composed
+changed exactness and full exactness were both zero. The full final-EMA P2
+evaluation used 683 synthetic episodes on the fixed seeds and found that
+one-step predictions matched the background zero-control on all four
+synthetic sets. Learned changed-transition latent MSE was approximately
+`1.03--1.04`, versus about `0.003` for copy-forward; action shuffle,
+rollout-beats-copy, non-collapse, Q, and planner gates all failed. The decoder
+still reconstructed encoder latents, localizing the observed endpoint failure
+to off-manifold world-core predictions rather than a dead decoder.
+
+This is a registered negative diagnostic on synthetic data, not an ARC result
+and not a proof that CurrentDouble can never work. It selected no informative
+training budget, so the planned A/C/D quality comparison remained blocked.
+Fable 5.1 High independently judged the evidence admissible and routed next to
+frozen raw/EMA checkpoint rescoring before any new training.
+
+## V6 CurrentDouble frozen-checkpoint trajectory (2026-09-05; diagnostic)
+
+At pushed preregistration revision
+`aaa51d6eda03ba4316038b2ad90f44a9899bc350`, twenty representation-only
+rescans covered raw and EMA weights at steps
+`0, 2, 256, 512, 768, 1024, 1280, 1536, 1792, 2048`. The never-reused root
+`current-double-checkpoint-trajectory-20260905T141030-CDT` passed exact
+endpoint replay, fixed-population identity, semantic-count, checkpoint-hash,
+sidecar, finiteness, runtime, and process-cleanup gates. Its 67-file external
+seal-manifest digest is
+`sha256:5a476f37c88624d37fb43d500f3e8c71dfd1fcedfe7e9315cf339b18a9627930`.
+
+The literal registered branch is `EMA_MASKING` at step 512: raw weights sit
+inside both never-learned bands while EMA foreground accuracy is `0.028890`,
+above the `0.01` band. This is chance-sensitive initialization residue, not
+useful masked learning. No raw or EMA checkpoint beats the background control
+by the registered `0.02`; the largest positive delta is only `0.002570`, about
+9 of 3,502 changed pixels, and no foreground score reaches its `0.070006`
+positive threshold. Raw weights move from worse than background to a
+background-like decode, while learned latent MSE never approaches copy-forward.
+
+EMA is initialized from raw weights and uses decay `0.999` without bias
+correction, retaining about 77% and 60% of initialization at steps 256 and
+512. Sparse checkpoints cannot reconstruct every intervening EMA update, so
+this trajectory supports a lag interpretation but does not prove historical
+recurrence correctness. The result has no promotion authority, uses no public
+ARC data, and keeps A/C/D blocked. Fable 5.1 High independently reproduced the
+integrity and literal classification; the next discriminator must avoid the
+chance-sensitive foreground rule and test same-row controls plus a tiny
+positive-control overfit before any longer retraining.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
