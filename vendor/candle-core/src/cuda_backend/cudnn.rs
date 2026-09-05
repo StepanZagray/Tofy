@@ -6,6 +6,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const DETERMINISTIC_CONV_BWD_FILTER_ALGO: cudarc::cudnn::sys::cudnnConvolutionBwdFilterAlgo_t =
+    cudarc::cudnn::sys::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1;
+const DETERMINISTIC_CONV_BWD_DATA_ALGO: cudarc::cudnn::sys::cudnnConvolutionBwdDataAlgo_t =
+    cudarc::cudnn::sys::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+
 // The cudnn handles are stored per thread here rather than on the CudaDevice as they are neither
 // send nor sync.
 thread_local! {
@@ -208,7 +213,7 @@ pub(crate) fn launch_conv2d_bwd_filter<
         dw: &dw_desc,
         dy: &dy_desc,
     };
-    let alg = conv_bwd_filter.pick_algorithm()?;
+    let alg = DETERMINISTIC_CONV_BWD_FILTER_ALGO;
     let workspace_size = conv_bwd_filter.get_workspace_size(alg)?;
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {
@@ -295,7 +300,7 @@ pub(crate) fn launch_conv2d_bwd_data<
         w: &w_desc,
         dy: &dy_desc,
     };
-    let alg = conv_bwd_data.pick_algorithm()?;
+    let alg = DETERMINISTIC_CONV_BWD_DATA_ALGO;
     let workspace_size = conv_bwd_data.get_workspace_size(alg)?;
     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
     unsafe {

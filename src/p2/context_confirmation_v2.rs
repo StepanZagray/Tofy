@@ -2208,21 +2208,33 @@ mod tests {
         let mask = disagreement_mask_sha256(&rows.disagreement, gameplay)?;
         let matched = FixedSelectionDigests::of(&selection, &mask);
         assert!(matched.mismatches(&selection, &mask).is_empty());
-        let drift = FixedSelectionDigests::registered().mismatches(&selection, &mask);
-        assert!(
-            drift
-                .iter()
-                .any(|line| line.starts_with("primary_row_sha256: fixed 7b7de9f9")),
-            "{drift:?}"
-        );
-        assert!(drift
-            .iter()
-            .any(|line| line.starts_with("disagreement_mask_sha256: fixed a725cdaa")));
-        let mut one_bit = matched.clone();
-        one_bit.twin_window_sha256.replace_range(..1, "f");
-        let drift = one_bit.mismatches(&selection, &mask);
-        assert_eq!(drift.len(), 1);
-        assert!(drift[0].starts_with("twin_window_sha256"));
+        assert!(FixedSelectionDigests::registered()
+            .mismatches(&selection, &mask)
+            .is_empty());
+
+        type DigestField = for<'a> fn(&'a mut FixedSelectionDigests) -> &'a mut String;
+        let fields: &[(&str, DigestField)] = &[
+            ("primary_row_sha256", |fixed| &mut fixed.primary_row_sha256),
+            ("twin_row_sha256", |fixed| &mut fixed.twin_row_sha256),
+            ("primary_window_sha256", |fixed| {
+                &mut fixed.primary_window_sha256
+            }),
+            ("twin_window_sha256", |fixed| &mut fixed.twin_window_sha256),
+            ("primary_target_sha256", |fixed| {
+                &mut fixed.primary_target_sha256
+            }),
+            ("twin_target_sha256", |fixed| &mut fixed.twin_target_sha256),
+            ("disagreement_mask_sha256", |fixed| {
+                &mut fixed.disagreement_mask_sha256
+            }),
+        ];
+        for (field, select) in fields {
+            let mut one_digest = matched.clone();
+            select(&mut one_digest).replace_range(..1, "f");
+            let drift = one_digest.mismatches(&selection, &mask);
+            assert_eq!(drift.len(), 1, "{field}: {drift:?}");
+            assert!(drift[0].starts_with(field), "{field}: {drift:?}");
+        }
         Ok(())
     }
 

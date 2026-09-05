@@ -71,3 +71,15 @@ The probe binary is named `conv_kernel_probe`, benchmarks the Foundation-V2 recu
 and synchronizes every forward/backward sample. Candle has no convolution-level TF32 toggle, so
 the F32 arm measures cuDNN's existing default math behavior; use an Nsight Systems trace of this
 binary to identify the selected F32 and BF16 kernels.
+
+## 4. Deterministic cuDNN Conv2D backward algorithms
+
+The cuDNN safe wrapper's backward algorithm picker returns the fastest heuristic candidate
+without filtering for determinism. NVIDIA's cuDNN 9.25 headers classify backward-filter
+algorithms 0 and 3 and backward-data algorithm 0 as nondeterministic. This tree therefore pins
+backward-filter and backward-data to their documented deterministic `ALGO_1` variants. Forward
+convolution remains on its existing configured or heuristic path.
+
+This local choice establishes only the algorithms requested from cuDNN. Whole-training
+bit-determinism must still be verified empirically because other CUDA operations can remain
+nondeterministic.
