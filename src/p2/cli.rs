@@ -17,6 +17,9 @@ use crate::p2::eval::{emit_phase_a_calibration, evaluate, evaluate_arc3, EvalCon
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
 use crate::p2::muon::MUON_RMS_SCALE;
+pub use crate::p2::positive_control::{
+    run_p2_fixed_batch_positive_control, P2FixedBatchPositiveControlArgs,
+};
 use crate::p2::representation::VicRegConfig;
 use crate::p2::train::{
     default_data_workers, train, PromotionMetric, SigregTarget, SplitCeWeighting, TrainConfig,

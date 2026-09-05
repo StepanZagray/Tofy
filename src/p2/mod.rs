@@ -25,6 +25,7 @@ pub mod latent_planning;
 pub mod model;
 pub mod muon;
 pub mod optimizer;
+pub mod positive_control;
 pub mod prefetch;
 pub mod representation;
 pub mod residual_probe;

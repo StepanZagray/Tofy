@@ -3225,6 +3225,28 @@ fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<
         .map_err(Into::into)
 }
 
+/// Raw exact-decoder predictions on caller-owned rows using the same bounded,
+/// context-aware forward seam as the Foundation-v2 gate evaluator.
+pub(crate) fn raw_one_step_predictions(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<Vec<Vec<u8>>> {
+    let encoded = encode_gate_support_population(model, samples, None, device)?;
+    let prediction = forward_gate_rows_chunked(
+        model,
+        &encoded.current,
+        &encoded.batch.actions,
+        &encoded.batch.action_coords,
+        &encoded.batch.goals,
+        &encoded.batch.operator_conditioning,
+        encoded.context.as_ref(),
+        RecursionDepth::from_config(model.config()),
+        FOUNDATION_V2_GATE_PHYSICAL_BATCH,
+    )?;
+    exact_palette_predictions(model, &prediction)
+}
+
 /// Evaluate all four automated run-gate measurements on one fixed batch.
 /// Callers own and persist the held-out population; this function never
 /// samples or mutates it.

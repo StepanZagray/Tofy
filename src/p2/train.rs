@@ -2765,7 +2765,7 @@ impl From<&TrainConfig> for TrainingContract {
     }
 }
 
-fn adam_params(cfg: &TrainConfig) -> ParamsAdamW {
+pub(crate) fn adam_params(cfg: &TrainConfig) -> ParamsAdamW {
     ParamsAdamW {
         lr: cfg.lr,
         weight_decay: cfg.weight_decay,
@@ -3592,6 +3592,17 @@ pub struct PreparedFoundationV2BatchHost {
 impl PreparedFoundationV2BatchHost {
     pub fn context(&self) -> Option<&ContextBatchHost> {
         self.context.as_ref()
+    }
+
+    /// Exact row-major operator-conditioning vectors consumed by the model.
+    /// Diagnostic callers use this to prove that same-frame factual branches
+    /// differ only in their action input.
+    pub(crate) fn operator_conditioning(&self) -> &[f32] {
+        &self.operator_conditioning
+    }
+
+    pub(crate) fn batch_size(&self) -> usize {
+        self.batch_size
     }
 }
 
@@ -4675,7 +4686,7 @@ pub fn batch_latent_covariance_frobenius(z: &Tensor) -> Result<f64> {
     Ok(err.sqrt())
 }
 
-fn event_slot_weight_tensor(device: &Device) -> Result<Tensor> {
+pub(crate) fn event_slot_weight_tensor(device: &Device) -> Result<Tensor> {
     Tensor::from_slice(&EVENT_SLOT_WEIGHTS, (1, DEFAULT_NUM_EVENTS), device).map_err(Into::into)
 }
 
@@ -4868,7 +4879,7 @@ fn ensure_all_finite(named: &[(&str, &Tensor)]) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn gradient_l2_for_parameter_prefix(
+pub(crate) fn gradient_l2_for_parameter_prefix(
     grads: &GradStore,
     varmap: &VarMap,
     prefix: &str,
@@ -5116,7 +5127,7 @@ fn foundation_v2_gradient_component_sample(
     })
 }
 
-fn retain_parameter_gradients(grads: GradStore, varmap: &VarMap) -> Result<GradStore> {
+pub(crate) fn retain_parameter_gradients(grads: GradStore, varmap: &VarMap) -> Result<GradStore> {
     let mut retained = None;
     accumulate_parameter_gradients(&mut retained, grads, varmap)?;
     Ok(retained.expect("parameter-gradient filtering always initializes the store"))
@@ -6212,7 +6223,7 @@ pub fn foundation_v2_rollout_falsifier(
 /// Production rollout seam for the dedicated fragment-counted population.
 /// This fails closed instead of returning the legacy inert zero when the ADR
 /// trace floor is not met.
-fn foundation_v2_dedicated_rollout_loss(
+pub(crate) fn foundation_v2_dedicated_rollout_loss(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
     device: &Device,
@@ -6494,7 +6505,7 @@ pub fn foundation_v2_training_loss(
     )
 }
 
-fn foundation_v2_training_loss_with_event_weights(
+pub(crate) fn foundation_v2_training_loss_with_event_weights(
     model: &WorldModel,
     mixed: &MixedStreamBatch,
     host: &PreparedFoundationV2BatchHost,
@@ -9193,7 +9204,7 @@ fn foundation_v2_nonfinite_skip_exhausted(skipped_steps: &[u64]) -> Option<Strin
     None
 }
 
-fn foundation_v2_loss_values(
+pub(crate) fn foundation_v2_loss_values(
     losses: &FoundationV2LossBreakdown,
     total: &Tensor,
     pre_clip_gradient_norm: f64,
