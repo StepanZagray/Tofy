@@ -769,6 +769,84 @@ model verdict and cannot be reclassified by E2E.
   to the first mismatching operation, considering filter-only, data-only, or
   non-convolution CUDA sources without weakening bit identity.
 
+## Post-E2 confirmation E2F: registered deterministic semantic confirmation (2026-09-05)
+
+This section was frozen after the sealed E2E premise result was analyzed and
+before any E2F registered output. E2F reuses the already-built E2E exact binary
+and the unchanged `p2-context-confirmation-v2` implementation; `E2F` is the
+experiment registration name, not a post-hoc relabeling of E2E or E2D.
+
+- **Exact bounded claim.** Starting from the sealed E2 step-4096 EMA on the
+  fixed synthetic 256-pair population, the repaired 2x2 context path can learn
+  the preregistered second twin pair under the two-row direct disagreement-pixel
+  objective so both independent correct replicas route their own histories and
+  swapping only the histories exactly reverses routing at the same two
+  consecutive fixed checkpoints by update 256. “Better” means satisfying the
+  continuous and exact gates below, not lower training loss. This is one fixed
+  pair, one initialization, and one GPU; it is an implementation-level local
+  wiring confirmation, not population evidence, model promotion, planning, or
+  ARC-AGI level completion.
+- **Fixed implementation and prerequisite.** Use pushed Tofy
+  `e2fb4b66c270f154d8f2c2ed81b561b5ca5974e8`, which pins only cuDNN
+  backward-filter and backward-data convolution to algorithm 1, candle_graph
+  `8e012f25e38f0c597c14268f0c705e504a5b5c28`, and the already-built exact
+  binary
+  `sha256:4bda8befc5e492031833c779a3fbc1f65a4652b16875ca24e88c3e3e3ae9114f`.
+  Bind E2E preflight `v6-e2e-preflight-20260905T070253-CDT`, report
+  `sha256:68a74d7d2078ca35afc0e67861c542b783ea3b972d20b4ce574db9cf927a35aa`,
+  and external manifest
+  `sha256:e9bc531a58bab2908b4cad6150652b48a15de10314d9d7cf971a68c587a4bf5d`.
+  E2E passed every checkpoint-0 evaluator/semantic gate and exact
+  correct-replica equality through update 8. E2D under manifest
+  `sha256:cc8d40651aec5f2b3254961c41fe6ed3feb9821cf775d7bc55f4bafef1f4c660`
+  remains failed integrity evidence and contributes no model comparator.
+- **Matched arms, inputs, and budget.** Retain E2D's fixed parent and E2W
+  seals, fixed meta-episode 2 position 20, all row/window/target/mask digests,
+  28 disagreement pixels per direction, `correct_a`, `correct_b`, and
+  `swapped` arms, bit-identical initialization, canonical parameter order,
+  fresh zero-state AdamW, F32, physical batch 2 per arm, accumulation 1, fixed
+  row order, zero noise, and maximum 256 updates. Retain checkpoint family
+  `0, 8, 16, 32, 64, 128, 256` and stop only at the second checkpoint of the
+  first consecutive passing pair. No arm weights are saved.
+- **Evaluator and integrity gates.** Keep canonical batch-1 own/paired/K0
+  scoring. At every evaluated checkpoint require same-shape mixed-K0 identity,
+  batch-2 duplicate identity including context summary, exact batch-1 versus
+  batch-2 raw and composed argmax identity over all 4,096 pixels per direction,
+  retained-decode score reproduction, and aggregate K0 raw correctness
+  `<= 28/56`; NLL cross-shape differences remain descriptive. Require the
+  complete checkpoint-0 evaluator replay to be bit-identical. Require
+  `correct_a` and `correct_b` update records, parameter hashes, and complete
+  checkpoints to be bit-identical at every checked boundary. Any mismatch is
+  failed infrastructure/integrity, not a negative model result.
+- **Cross-launch parity.** The registered run must bind and recursively verify
+  the E2E preflight and use the same build identity, binary, GPU UUID, parent,
+  E2W evidence, population, selection, and mask. At update 8 require exact
+  evaluator parity at checkpoint 0 and exact optimizer/complete-checkpoint
+  parity through update 8. Any difference stops before interpreting later
+  fields.
+- **Causal and exact model gates.** At one checkpoint require each correct arm
+  `D > 1e-4`, swapped `D < -1e-4`, both correct-minus-swapped interactions
+  `> 2e-4`, and each arm pooled own-versus-paired raw-probability L1 `> 1e-6`
+  or at least one raw-argmax disagreement. At that same checkpoint, each
+  correct arm must score own `56/56` and paired `0/56`, while swapped must score
+  own `0/56` and paired `56/56`; all K0 and integrity gates must pass. Require
+  the complete conjunction at two consecutive checkpoints in the fixed family.
+- **Verdict and decision.** PASS is `semantic_batch_confirmation_pass` at the
+  second checkpoint of the first consecutive passing pair. Otherwise the
+  registered outcome is `reject_second_pair_exact_wiring_by_update_256`.
+  Neither result is population evidence. PASS authorizes only a separately
+  preregistered simultaneous multi-pair objective screen on synthetic data;
+  FAIL blocks that screen and localizes whether capacity, interference, or the
+  direct objective is responsible. Do not select a checkpoint, threshold,
+  tolerance, arm, or direction after observing results.
+- **Execution contract.** Launch from a clean checkout at the embedded E2E
+  source revision with `--registered --pairs 256 --max-updates 256` and the
+  exact sealed E2E `--preflight-report`. Use the same GPU under the global lock,
+  a never-reused root, and both internal and outer 10-minute caps. Re-verify all
+  input seals before launch, stop telemetry and child processes, seal and
+  recursively verify the final root, and record the manifest digest outside
+  it. Do not read public ARC data.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`

@@ -17,6 +17,44 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 2x2 E2E deterministic-backward premise (2026-09-05; implementation smoke)
+
+E2E changed only vendored Candle's cuDNN convolution backward-filter and
+backward-data choices from unfiltered fastest-heuristic selection to the
+documented deterministic algorithm-1 variants; forward convolution and all
+model, data, evaluator, loss, optimizer, ordering, and budget fields remained
+unchanged. The reviewed, pushed Tofy revision was
+`e2fb4b66c270f154d8f2c2ed81b561b5ca5974e8`, the exact locked cuDNN release
+binary was
+`sha256:4bda8befc5e492031833c779a3fbc1f65a4652b16875ca24e88c3e3e3ae9114f`,
+and the dynamically linked cuDNN runtime was 9.25.0. The run used the same
+NVIDIA GeForce RTX 5060 Laptop GPU
+`GPU-216be468-8184-1801-0563-7c67555dbc45` as E2D.
+
+The preregistered 8-update run,
+`v6-e2e-preflight-20260905T070253-CDT`, completed in 5.43 s. Its report is
+`sha256:68a74d7d2078ca35afc0e67861c542b783ea3b972d20b4ce574db9cf927a35aa`
+and its recursively verified external manifest is
+`sha256:e9bc531a58bab2908b4cad6150652b48a15de10314d9d7cf971a68c587a4bf5d`.
+Both correct replicas matched bit-for-bit at checkpoint 0 and checkpoint 8 in
+every update record, parameter digest, and complete checkpoint field. At
+update 1 both recorded loss `2.607574462890625`, pre-clip norm
+`1.6909115314483643`, clip scale `0.59139699588153`, and context-gradient norm
+`0.1568803931726758`; at update 8 those fields were respectively
+`1.9157449007034302`, `3.0478193759918213`, `0.3281034328599542`, and
+`0.780906425882186`, with shared parameter digest
+`sha256:e4c4f02a2ac644faf8841d095e9d56f560d49955ca21fb6f84178d5fd128a994`.
+Fixed selection, E2W legacy parity, in-process evaluator replay, semantic K0
+batch invariance, and the finite K0 bound also passed.
+
+This supports the narrow causal claim that the pinned backward algorithms
+remove the observed within-process E2D replica divergence for this exact
+8-update workload. It does not prove global CUDA determinism or improve a
+model: E2E was an unregistered infrastructure smoke, its update-8 model gates
+were false by design, and its outcome cannot satisfy E2D. No public ARC data
+was read and no weights were saved. Its PASS authorizes only the freshly
+preregistered E2F registered semantic confirmation below.
+
 ## V6 2x2 E2D GPU replica-integrity failure (2026-09-05; failed preflight)
 
 E2D produced no model verdict and no registered run was launched. A first
