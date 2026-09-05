@@ -184,6 +184,39 @@ integrity and literal classification; the next discriminator must avoid the
 chance-sensitive foreground rule and test same-row controls plus a tiny
 positive-control overfit before any longer retraining.
 
+## V6 CurrentDouble frozen EMA-lag audit (2026-09-05; no fault detected)
+
+The retrospective deterministic audit at pushed revision
+`a94bc9e5b71561e06c697a2d565a8c6cc4671b49` used no GPU, training, evaluator,
+or public ARC data. Its successful never-reused root
+`current-double-ema-lag-audit-20260905T145928-CDT` completed in 0.34 seconds
+and is sealed by external manifest
+`sha256:29947fbbd8181fa849181487a2f03bf4b79c87faa1a1198804a8e6cf65c276bf`.
+Two earlier script attempts exited before producing reports and are separately
+sealed failed infrastructure; they contribute no evidence.
+
+Step-0 raw and EMA weights were byte-identical. Saved step-2 Adam moments
+allowed raw step 1 to be reconstructed for 37 tensors / 48,833 elements;
+decay-0.999 F32 replay matched 48,614 elements exactly (99.5515%) with maximum
+error 2 ULPs, while three wrong-decay controls matched only 22.26%, 19.05%,
+and 2.24%. Six optimizer-step-zero tensors replayed all saved EMA boundaries
+bit-for-bit. Seven linear-path sparse-window fits, 424 trained-tensor alias
+checks, source binding, and all checkpoint manifest/schema/finiteness gates
+passed. Fable 5.1 High independently recomputed every value and returned GO.
+
+The admissible verdict is `consistent_no_ema_fault_detected`, not proof of all
+historical updates. Roughly 1,790 updates are outside exact reconstruction, and
+the 256-step window diagnostic assumes approximately linear raw drift. The
+previous whole-model norm-ratio proposal is invalid: three correctly behaving
+bias tensors violate it when raw weights return toward initialization. A dead
+duplicate-key guard in the standalone parser is harmless for these Candle-
+written, manifest-hashed inputs but must be fixed before script reuse.
+
+EMA health does not change the raw no-learning result. The EMA branch is
+closed; proceed to a separately preregistered raw-weight-gated, same-row 2x2
+positive-control overfit after proving its target receives gradients. A/C/D
+and ARC claims remain blocked.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
