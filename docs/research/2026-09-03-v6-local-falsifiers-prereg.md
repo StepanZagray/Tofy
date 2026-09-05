@@ -334,6 +334,114 @@ evidence and cannot promote the model.
   continuous values, CUDA failure, or changed legacy exact fields. Preserve
   the old report and write E2R into a never-reused root.
 
+## Post-E2 diagnostic E2W: two-row context-wiring overfit (2026-09-05)
+
+E2R found that the frozen 2x2 checkpoint reacts strongly to the presence of
+the context pathway but barely to the context's factual content: on 4,998
+factually changed pixels, own K=16 versus paired K=16 changed probability by
+only `0.0000838796685474991` mean L1 and changed target NLL by
+`-0.00000022291517032257957`, while context-present versus context-absent
+changed probability by `0.02139037169509837`. E2W is the cheapest decisive
+test of whether the corrected pathway is locally trainable. It is an
+`implementation_smoke` and cannot promote a model, unblock E3, justify 3x3,
+or provide ARC-AGI-3 planning evidence.
+
+- **Bounded claim.** Starting from the sealed E2 step-4096 EMA, the production
+  2x2 exact decoder can learn, within 256 full-model AdamW updates, to assign
+  each of two otherwise-identical queries to the target associated with its
+  own K=16 history; swapping those histories during training reverses that
+  association. This tests local context-to-decoder wiring on one selected
+  synthetic twin pair. It does not test generalization, policy quality,
+  rollouts, planning, or global method optimality.
+- **Fixed source and data boundary.** The initial checkpoint is the sealed E2
+  EMA with SHA-256
+  `c53bf0c42dc6c8f7945ff4d17bd6bd63a6db23e8b6e377b6b0b92903e66d694a`.
+  Generate only the registered 256-pair E2 TRAINING-shape synthetic twin
+  population on `UnseenSeed7x7`, seed `1000002`, meta-episode IDs `0..255`,
+  K=16, UNKNOWN operator conditioning, and the v6 data contract. No public ARC
+  data may be read. The diagnostic implementation, CUDA build, and exact
+  binary hash must be reviewed, committed, pushed, and recorded before the
+  registered execution.
+- **Model-free row selection.** Scan those 256 twin pairs in ascending
+  meta-episode ID and select the first pair that is not single-frame rule
+  identifiable and the earliest position `p >= 16` where (a) the two targets
+  differ, (b) the transition at `p` is outcome-changing, and (c) at least one
+  earlier outcome-changing transition lies in `p-16..p-1`. Fail closed if no
+  pair qualifies. Freeze and report the selected pair/row identities and
+  cryptographic hashes. Before loading a model, require
+  `state_differing_positions == 0`; corresponding current frames and actions
+  to be bit-identical throughout both selected K=16 windows; and the two score
+  rows to be bit-identical in every model-visible query input except context:
+  current frame, action, coordinates, goal, content mask, and v6 UNKNOWN
+  operator conditioning. Require their targets to differ and the
+  target-disagreement mask to be nonempty. Thus the histories may differ only
+  in rule-dependent outcomes. Any failed invariant is an integrity failure,
+  not a negative model result.
+- **Two arms and one causal difference.** Initialize both arms bit-identically
+  from the fixed checkpoint, including identical fresh zero optimizer state.
+  In the `correct` arm,
+  each target row receives its own preceding K=16 history. In the `swapped`
+  arm, the same two target rows in the same order receive one another's
+  histories. Train all model parameters, including the context projector,
+  with direct raw exact-decoder Unimix cross-entropy (`0.99` model
+  probability plus `0.01/16`) reduced only over target-disagreement pixels.
+  Use constant, unscheduled AdamW learning rate `1e-3`, beta1 `0.9`, beta2
+  `0.999`, epsilon `1e-8`, weight decay `0`, global gradient clip `1.0`, F32
+  computation, physical batch `2`, accumulation `1`, fixed row order, and the
+  production 2x2 training recurrence with exactly zero latent/training noise.
+  This deliberately removes every competing production objective; it is a
+  wiring test, not a training-recipe candidate.
+- **Budget, checkpoints, and stop rule.** Evaluate before training and after
+  updates `8, 16, 32, 64, 128, 256`; the hard cap is 256 updates per arm.
+  Record direct loss, update-1 context-parameter gradient norm, global
+  pre-clip norm, and clip scale, and fail closed on zero/non-finite context
+  gradient, any non-finite value, source/data/hash drift, CUDA failure, or a
+  mixed-batch K0 leak. Early success requires both the wiring and promotion
+  gates below at the earliest two consecutive evaluation checkpoints; a
+  continuous-only wiring pass continues through update 256 and returns
+  `wiring_only_no_promotion`. Otherwise run both arms through update 256. No
+  fine-tuned checkpoint may be reused as held-out, E2, E3, or ARC evidence.
+- **Frozen evaluation comparisons.** At every evaluation checkpoint, score
+  both query directions with own K=16, paired K=16, and K0 context. Over only
+  target-disagreement pixels report raw-softmax target NLL, the Unimix
+  objective NLL, raw-softmax probability L1, latent/context-summary/copy-gate
+  differences, and raw/composed argmax pixel counts. Define verdict statistic
+  `D = raw_softmax_NLL(paired) - raw_softmax_NLL(own)`, first averaged within
+  each query direction and then equally across the two directions. Probability
+  L1 is analogously pooled across both directions within each arm. Also compare
+  a K0 row inside `[K0, own-context carrier]` with the same row inside a
+  shape-matched all-K0 batch; latent, raw probabilities, gate, both NLLs, and
+  argmax must be bit-identical for the K0 row.
+- **Preregistered verdict.** `wiring_pass` requires, at the same two
+  consecutive evaluation checkpoints, `D_correct > 1e-4`,
+  `D_swapped < -1e-4`, interaction
+  `D_correct - D_swapped > 2e-4`, and, in **each** arm, either pooled
+  own-versus-paired raw-softmax probability L1 `> 1e-6` or at least one raw
+  argmax disagreement, with the exact mixed-K0 invariant passing. Failure by
+  update 256 rejects local trainability under this intervention and budget. A
+  continuous-only pass is not enough to scale training: the `promotion_pass`
+  needed to authorize a fresh, small, multi-pair objective experiment
+  additionally requires that the correct arm's own context have strictly more
+  correct raw-logit argmax predictions than paired context and K0 over
+  target-disagreement pixels in **each** query direction at those same two
+  checkpoints. Composed exactness is reported but not gated because the copy
+  gate is not a training target in this diagnostic.
+- **Uncertainty and multiplicity.** This is one deterministic selected pair,
+  so no confidence interval or population-level inference is reported. The
+  complete checkpoint family is fixed to `0, 8, 16, 32, 64, 128, 256`; only
+  the first two consecutive registered checkpoints satisfying the stated
+  gates may produce early success, and no post-hoc checkpoint, direction,
+  metric, seed, or threshold selection is allowed.
+- **Execution evidence.** Use a never-reused run root with lifecycle state,
+  exact Tofy and sibling revisions, locked build command/features, binary and
+  checkpoint SHA-256, device identity, selected physical batch/accumulation,
+  row/population hashes, configuration, per-checkpoint metrics, command log,
+  and an external finalized-file manifest digest. A bounded CUDA launch
+  preflight on the exact binary must pass first; that preflight cannot satisfy
+  E2W. The registered E2W result itself remains `implementation_smoke`
+  evidence and can authorize only the explicitly stated small multi-pair
+  follow-up, never a model promotion or E3.
+
 ## Corrections from the 2026-09-04 independent audit (thread 16c2f6f6)
 
 1. **E2 ran at effective batch 128, not 256.** `apply_foundation_v2_recipe`
