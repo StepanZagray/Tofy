@@ -564,16 +564,7 @@ fn run_serve_loop<R: BufRead, W: Write, P: LivePolicy>(
         };
         match op {
             "observe" => {
-                let parsed = request
-                    .get("observation")
-                    .cloned()
-                    .context("observe request is missing observation")
-                    .and_then(|value| {
-                        serde_json::from_value::<ApiObservation>(value)
-                            .context("parse serve observation")
-                    })
-                    .and_then(|value| value.into_arc_observation(true));
-                let observation = match parsed {
+                let observation = match parse_serve_observation(&request, "observe") {
                     Ok(observation) => observation,
                     Err(error) => {
                         write_serve_error(&mut writer, format!("{error:#}"))?;
@@ -581,6 +572,37 @@ fn run_serve_loop<R: BufRead, W: Write, P: LivePolicy>(
                     }
                 };
                 match serve_observation(&mut streams, policy, recordings_dir, observation) {
+                    Ok(response) => write_json_line(&mut writer, &response)?,
+                    Err(error) => write_serve_error(&mut writer, format!("{error:#}"))?,
+                }
+            }
+            "finish_observation" => {
+                let Some(reason) = request
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                else {
+                    write_serve_error(
+                        &mut writer,
+                        "finish_observation request is missing non-empty string reason",
+                    )?;
+                    continue;
+                };
+                let observation = match parse_serve_observation(&request, "finish_observation") {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        write_serve_error(&mut writer, format!("{error:#}"))?;
+                        continue;
+                    }
+                };
+                match finish_serve_observation(
+                    &mut streams,
+                    policy,
+                    recordings_dir,
+                    observation,
+                    reason,
+                ) {
                     Ok(response) => write_json_line(&mut writer, &response)?,
                     Err(error) => write_serve_error(&mut writer, format!("{error:#}"))?,
                 }
@@ -598,17 +620,34 @@ fn run_serve_loop<R: BufRead, W: Write, P: LivePolicy>(
     }
 }
 
-fn serve_observation<P: LivePolicy>(
+fn parse_serve_observation(request: &Value, operation: &str) -> Result<ArcObservation> {
+    request
+        .get("observation")
+        .cloned()
+        .with_context(|| format!("{operation} request is missing observation"))
+        .and_then(|value| {
+            serde_json::from_value::<ApiObservation>(value).with_context(|| {
+                if operation == "observe" {
+                    "parse serve observation".into()
+                } else {
+                    format!("parse {operation} observation")
+                }
+            })
+        })
+        .and_then(|value| value.into_arc_observation(true))
+}
+
+fn ingest_serve_observation<P: LivePolicy>(
     streams: &mut BTreeMap<(String, String), ServeStream>,
     policy: &mut P,
     recordings_dir: Option<&Path>,
-    observation: ArcObservation,
-) -> Result<Value> {
+    observation: &ArcObservation,
+) -> Result<(String, String)> {
     observation.validate()?;
     let key = (observation.game_id.clone(), observation.guid.clone());
     if !streams.contains_key(&key) {
         let recording = recordings_dir
-            .map(|root| LiveRecordingRun::start(root, &observation))
+            .map(|root| LiveRecordingRun::start(root, observation))
             .transpose()?;
         streams.insert(
             key.clone(),
@@ -626,7 +665,7 @@ fn serve_observation<P: LivePolicy>(
         match pending {
             PendingServeAction::Reset { retry } => {
                 if let Some(recording) = stream.recording.as_mut() {
-                    recording.push_reset(&observation)?;
+                    recording.push_reset(observation)?;
                 }
                 if retry {
                     policy.on_reset_retry("serve_game_over");
@@ -634,14 +673,14 @@ fn serve_observation<P: LivePolicy>(
             }
             PendingServeAction::Action { action, telemetry } => {
                 if let Some(recording) = stream.recording.as_mut() {
-                    recording.push_action(&observation, &action, &telemetry)?;
+                    recording.push_action(observation, &action, &telemetry)?;
                 }
                 if let Some(previous) = stream.last_observation.as_ref() {
                     let same_session = previous.guid == observation.guid
                         && !observation.full_reset
                         && observation.levels_completed >= previous.levels_completed;
                     if same_session {
-                        policy.on_confirmed_transition(previous, &action, &observation);
+                        policy.on_confirmed_transition(previous, &action, observation);
                     }
                 }
             }
@@ -657,6 +696,17 @@ fn serve_observation<P: LivePolicy>(
         policy.on_game_start(&observation.game_id);
         stream.policy_started = true;
     }
+    Ok(key)
+}
+
+fn serve_observation<P: LivePolicy>(
+    streams: &mut BTreeMap<(String, String), ServeStream>,
+    policy: &mut P,
+    recordings_dir: Option<&Path>,
+    observation: ArcObservation,
+) -> Result<Value> {
+    let key = ingest_serve_observation(streams, policy, recordings_dir, &observation)?;
+    let stream = streams.get_mut(&key).expect("stream was ingested");
 
     if observation.terminal() {
         let retry = observation.state == "GAME_OVER";
@@ -702,6 +752,26 @@ fn serve_observation<P: LivePolicy>(
     });
     stream.pending = Some(PendingServeAction::Action { action, telemetry });
     Ok(response)
+}
+
+fn finish_serve_observation<P: LivePolicy>(
+    streams: &mut BTreeMap<(String, String), ServeStream>,
+    policy: &mut P,
+    recordings_dir: Option<&Path>,
+    observation: ArcObservation,
+    reason: &str,
+) -> Result<Value> {
+    let key = ingest_serve_observation(streams, policy, recordings_dir, &observation)?;
+    let mut stream = streams.remove(&key).expect("stream was ingested");
+    debug_assert!(stream.pending.is_none());
+    if stream.policy_started {
+        policy.on_game_end(reason);
+        stream.policy_started = false;
+    }
+    if let Some(recording) = stream.recording.take() {
+        recording.finish()?;
+    }
+    Ok(json!({ "ok": { "finished": true } }))
 }
 
 fn finish_serve_session<P: LivePolicy>(
@@ -1010,10 +1080,15 @@ mod tests {
     #[derive(Default)]
     struct TransitionPolicy {
         transitions: Vec<(u16, u8, u16, bool)>,
+        choose_count: usize,
+        level_transitions: Vec<u16>,
+        game_ends: Vec<String>,
+        reset_retries: Vec<String>,
     }
 
     impl LivePolicy for TransitionPolicy {
         fn choose_action(&mut self, observation: &ArcObservation) -> Result<ActionDecision> {
+            self.choose_count += 1;
             let mut first = FirstPolicy;
             first.choose_action(observation)
         }
@@ -1030,6 +1105,18 @@ mod tests {
                 next.levels_completed,
                 current.frame != next.frame,
             ));
+        }
+
+        fn on_level_transition(&mut self, levels_completed: u16) {
+            self.level_transitions.push(levels_completed);
+        }
+
+        fn on_reset_retry(&mut self, reason: &str) {
+            self.reset_retries.push(reason.into());
+        }
+
+        fn on_game_end(&mut self, outcome: &str) {
+            self.game_ends.push(outcome.into());
         }
     }
 
@@ -1066,6 +1153,120 @@ mod tests {
             policy.transitions,
             vec![(0, 1, 0, true), (0, 1, 0, true), (0, 1, 1, false)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finish_observation_resolves_action_and_closes_stream_without_another_decision() -> Result<()>
+    {
+        let mut final_observation = wire_observation("game", "guid", "NOT_FINISHED", &[1]);
+        final_observation["frame"][0][0][0] = json!(3);
+        final_observation["levels_completed"] = json!(1);
+        final_observation["win_levels"] = json!(2);
+        let input = response_lines(&[
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "finish_observation",
+                "observation": final_observation,
+                "reason": "action_cap"
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = TransitionPolicy::default();
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        let lines = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1]["ok"]["action_id"], 1);
+        assert_eq!(lines[2], json!({ "ok": { "finished": true } }));
+        assert_eq!(lines[3], json!({ "ok": { "bye": true } }));
+        assert_eq!(policy.choose_count, 1);
+        assert_eq!(policy.transitions, vec![(0, 1, 1, true)]);
+        assert_eq!(policy.level_transitions, [1]);
+        assert_eq!(policy.game_ends, ["action_cap"]);
+        assert!(policy.reset_retries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finish_terminal_observation_does_not_emit_reset_or_decision() -> Result<()> {
+        let input = response_lines(&[
+            json!({
+                "op": "observe",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "finish_observation",
+                "observation": wire_observation("game", "guid", "GAME_OVER", &[]),
+                "reason": "time_cap"
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = TransitionPolicy::default();
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        let lines = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[2], json!({ "ok": { "finished": true } }));
+        assert_eq!(policy.choose_count, 1);
+        assert_eq!(policy.transitions.len(), 1);
+        assert_eq!(policy.game_ends, ["time_cap"]);
+        assert!(policy.reset_retries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finish_observation_rejects_missing_reason_and_malformed_observation() -> Result<()> {
+        let input = response_lines(&[
+            json!({
+                "op": "finish_observation",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1])
+            }),
+            json!({
+                "op": "finish_observation",
+                "observation": wire_observation("game", "guid", "NOT_FINISHED", &[1]),
+                "reason": "  "
+            }),
+            json!({
+                "op": "finish_observation",
+                "observation": { "game_id": "game" },
+                "reason": "action_cap"
+            }),
+            json!({ "op": "shutdown" }),
+        ]);
+        let mut output = Vec::new();
+        let mut policy = TransitionPolicy::default();
+        run_serve_loop(input, &mut output, &mut policy, None)?;
+        let lines = String::from_utf8(output)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1]["err"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty string reason")));
+        assert!(lines[2]["err"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty string reason")));
+        assert!(lines[3]["err"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("parse finish_observation observation")));
+        assert_eq!(lines[4], json!({ "ok": { "bye": true } }));
+        assert_eq!(policy.choose_count, 0);
+        assert!(policy.transitions.is_empty());
+        assert!(policy.game_ends.is_empty());
         Ok(())
     }
 
