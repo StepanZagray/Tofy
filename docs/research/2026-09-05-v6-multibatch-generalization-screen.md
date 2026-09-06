@@ -1,6 +1,6 @@
 # V6 multi-batch function-learning screen (preregistered)
 
-Status: **design freeze; host-only foundation implemented; no runnable command or GPU launch yet**
+Status: **design freeze; runnable implementation reviewed GO; no CUDA launch yet**
 Date: 2026-09-05 CDT  
 Evidence class: **selection-only single-seed screen**  
 Research claim: **false until a complete registered root is analyzed**  
@@ -23,6 +23,12 @@ Host Slice 1 NO-GO review: Fable 5.1 High, SHA-256
 
 Corrected host Slice 1 GO review: Fable 5.1 High, SHA-256
 `ec13909147dbddc8000c6845257abd2c228e83bb1b26d7d8ba2ec91170500193`
+
+Runnable Slice 2 NO-GO review: Fable 5.1 High, SHA-256
+`a67e88512235a32818d98be4b0d2e9cf6f55ec2b1e889c5c5bc835575e3ffd89`
+
+Corrected runnable Slice 2 GO review: Fable 5.1 High, SHA-256
+`02df7fd5b68f64ba1998909fa9924168d365b6cfa31e370c4637aec1353786ab`
 
 Pre-implementation census clarification (recorded before any preflight or G
 checkpoint existed): the frozen `1006/1005` tuple counts include the sidecar
