@@ -1,6 +1,6 @@
 # V6 frozen train/raw seam characterization (preregistered)
 
-Status: **corrected design independently reviewed GO; implementation not started**
+Status: **implementation independently reviewed GO; exact run not started**
 Date: 2026-09-06 CDT
 Evidence class: **characterization-only implementation/integrity diagnostic**
 Research claim: **false**
@@ -40,6 +40,18 @@ Corrected preregistration GO review: Opus 5 High fallback, recorded at
 `/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-seam-characterization-prereg-go-20260906.md`,
 SHA-256 `8f426d132aff2a49ecdcaadc91eb5ff90a9b6a46493222b9ead319c55d2b2ee5`.
 No blocking finding remains.
+
+Implementation review NO-GO: Opus 5 XHigh, recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-seam-characterization-implementation-nogo-xhigh-20260906.md`,
+SHA-256 `f180848699216654095ab830d758a3b4dd63fa950d81a0df7d72e90748c2c388`.
+Its two blockers required direct tests for logit argmax/accounting and the
+inert operator-conditioning exception; both were added.
+
+Corrected implementation GO review: Opus 5 XHigh, recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-seam-characterization-implementation-go-xhigh-20260906.md`,
+SHA-256 `09003d1a115091c884c0ca4a0404ad0125310d229f1ceb2921f491487cdd5359`.
+No blocking finding remains. Fable 5.1 remained quota-blocked and is not
+credited for either implementation verdict.
 
 ## 1. Exact question and bounded claim
 

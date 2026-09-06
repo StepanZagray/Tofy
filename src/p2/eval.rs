@@ -3235,6 +3235,17 @@ pub(crate) fn raw_one_step_logits(
     samples: &[TransitionSample],
     device: &Device,
 ) -> Result<Tensor> {
+    raw_one_step_logits_with_chunk(model, samples, device, FOUNDATION_V2_GATE_PHYSICAL_BATCH)
+}
+
+/// Diagnostic-only form of the raw seam with an explicit recursion/decode
+/// chunk. The production wrapper above remains pinned to its existing value.
+pub(crate) fn raw_one_step_logits_with_chunk(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+    chunk: usize,
+) -> Result<Tensor> {
     let encoded = encode_gate_support_population(model, samples, None, device)?;
     let prediction = forward_gate_rows_chunked(
         model,
@@ -3245,7 +3256,7 @@ pub(crate) fn raw_one_step_logits(
         &encoded.batch.operator_conditioning,
         encoded.context.as_ref(),
         RecursionDepth::from_config(model.config()),
-        FOUNDATION_V2_GATE_PHYSICAL_BATCH,
+        chunk,
     )?;
     model.exact_gameplay_logits_detached(&prediction)
 }

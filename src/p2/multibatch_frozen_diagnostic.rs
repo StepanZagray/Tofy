@@ -13,8 +13,8 @@ use crate::p2::context_wiring::{
     LifecycleRecord, FAILED_EVIDENCE_CLASS, LIFECYCLE_COMPLETE, LIFECYCLE_FAILED,
     LIFECYCLE_RUNNING, REPORT_FILE, RUN_CLASS_PREFLIGHT, RUN_CLASS_REGISTERED,
 };
-use crate::p2::data::{MixedStreamBatch, V5Sample, FRAME_SIDE};
-use crate::p2::eval::raw_one_step_logits;
+use crate::p2::data::{MixedStreamBatch, TransitionSample, V5Sample, FRAME_SIDE};
+use crate::p2::eval::{raw_one_step_logits, raw_one_step_logits_with_chunk};
 use crate::p2::evidence::{launch_provenance, LaunchProvenance};
 use crate::p2::model::{WorldModel, PALETTE_SIZE};
 use crate::p2::multibatch_screen::{
@@ -31,13 +31,13 @@ use crate::p2::positive_control::{
     REGISTERED_SIGREG_PROJECTIONS,
 };
 use crate::p2::train::{
-    event_slot_weight_tensor, foundation_v2_dedicated_rollout_loss,
-    foundation_v2_gradient_route_stats, foundation_v2_loss_values,
-    foundation_v2_training_loss_with_event_weights, gradient_cosine_for_optimizer_route,
-    gradient_l2_for_optimizer_route, load_train_config, load_varmap_exact,
-    prepare_foundation_v2_batch_host, retain_parameter_gradients, sync_cuda_device,
-    FoundationV2GradientRouteStats, FoundationV2LossMeans, FoundationV2ObjectiveConfig,
-    OptimizerRoute, PreparedFoundationV2BatchHost, TrainConfig,
+    batch_from_foundation_v2_host, batch_from_samples, event_slot_weight_tensor,
+    foundation_v2_dedicated_rollout_loss, foundation_v2_gradient_route_stats,
+    foundation_v2_loss_values, foundation_v2_training_loss_with_event_weights,
+    gradient_cosine_for_optimizer_route, gradient_l2_for_optimizer_route, load_train_config,
+    load_varmap_exact, prepare_foundation_v2_batch_host, retain_parameter_gradients,
+    sync_cuda_device, BatchTensors, FoundationV2GradientRouteStats, FoundationV2LossMeans,
+    FoundationV2ObjectiveConfig, OptimizerRoute, PreparedFoundationV2BatchHost, TrainConfig,
 };
 use anyhow::{ensure, Context, Result};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, D};
@@ -71,6 +71,21 @@ const INTERNAL_CONFLICT_COSINE: f64 = -0.25;
 const FALSE_EDIT_AUX_CONFLICT_COSINE: f64 = -0.25;
 const ATTRACTOR_PERSISTENCE: f64 = 0.60;
 const ATTRACTOR_MARGIN: f64 = 1.0;
+const SEAM_CHARACTERIZATION_SCHEMA: &str = "p2.v6_frozen_seam_characterization.v1";
+const SEAM_CHARACTERIZATION_EVIDENCE_CLASS: &str =
+    "characterization_only_implementation_integrity_diagnostic";
+const SEAM_CHARACTERIZATION_RUN_CLASS: &str = "registered_characterization";
+const SEAM_CHARACTERIZATION_TAG: &str = "p2-v6-frozen-seam-characterization";
+const SEAM_CHARACTERIZATION_MAX_WALL: Duration = Duration::from_secs(120);
+const FAILED_PREFLIGHT_REPORT_SHA256: &str =
+    "54cc1ddf07aca7e6f8ffd72cb3f216d4d1b079899f995610f807c00fbeb3cb74";
+const FAILED_PREFLIGHT_MANIFEST_SHA256: &str =
+    "41705d4a9103702600523647475205301fea9383df0011b98a854e7a53b33dbb";
+const FAILED_PREFLIGHT_IDENTITY: &str =
+    "sha256:ce0d4b5a75488459e01790aee59bc2b7f5994bd17e6c1162c92b6a14c082228e";
+const FAILED_PREFLIGHT_SOURCE: &str = "7907731b6fa69043089c55ddb92c573a79b2f29d";
+const FAILED_PREFLIGHT_BINARY_SHA256: &str =
+    "sha256:22781d436df998f98213390e8770cffdbcea3f8ae53ca9080278469d8f4d3691";
 const REGISTERED_G_REPORT_SHA256: &str =
     "03f645a5cccfbd4dcf72bf9927ac15589dc8fa579c6330f254101ed70c18789f";
 const REGISTERED_G_MANIFEST_SHA256: &str =
@@ -126,6 +141,123 @@ pub struct P2MultibatchFrozenDiagnosticArgs {
     /// Sealed same-binary diagnostic preflight; required only when registered.
     #[arg(long)]
     pub preflight_report: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct P2FrozenSeamCharacterizationArgs {
+    /// Sealed registered G report.
+    #[arg(long)]
+    pub g_report: PathBuf,
+
+    /// Exact sealed failed preflight that selected this characterization.
+    #[arg(long)]
+    pub failed_preflight_report: PathBuf,
+
+    #[arg(long, default_value = "cuda")]
+    pub device: String,
+
+    #[arg(long)]
+    pub output_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorFingerprint {
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorInputComparison {
+    pub training: TensorFingerprint,
+    pub evaluator: TensorFingerprint,
+    pub exact_equal: bool,
+    pub active_for_predicted_latent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputComparisonReport {
+    pub fields: BTreeMap<String, TensorInputComparison>,
+    pub active_inputs_equal: bool,
+    pub operator_conditioning_equal: bool,
+    pub accepted_inert_operator_non_identity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NumericSummary {
+    pub count: usize,
+    pub zero_count: usize,
+    pub min: Option<f64>,
+    pub median: Option<f64>,
+    pub p90: Option<f64>,
+    pub p99: Option<f64>,
+    pub max: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogitVariantReport {
+    pub name: String,
+    pub logits: TensorFingerprint,
+    pub seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogitComparisonReport {
+    pub left: String,
+    pub right: String,
+    pub bit_identical: bool,
+    pub argmax_disagreement_pixels: usize,
+    pub argmax_disagreement_rows: usize,
+    pub absolute_logit_delta: NumericSummary,
+    pub disagreement_reference_margin: NumericSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamCharacterizationTiming {
+    pub population_seconds: f64,
+    pub input_comparison_seconds: f64,
+    pub wall_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamCharacterizationReport {
+    pub schema: String,
+    pub evidence_class: String,
+    pub run_class: String,
+    pub registered: bool,
+    pub research_claim: bool,
+    pub public_data_read: bool,
+    pub no_backward_calls: bool,
+    pub no_optimizer_step: bool,
+    pub no_ema_update: bool,
+    pub no_checkpoint_write: bool,
+    pub lifecycle: LifecycleRecord,
+    pub provenance: LaunchProvenance,
+    pub command: Vec<String>,
+    pub device: String,
+    pub device_is_cuda: bool,
+    pub gpu_identity: Option<GpuIdentity>,
+    pub output_root: PathBuf,
+    pub g: Option<EvidenceBinding>,
+    pub failed_preflight: Option<EvidenceBinding>,
+    pub train_config_sha256: String,
+    pub cargo_lock_sha256: String,
+    pub population_census_sha256: String,
+    pub population: Option<PopulationCensus>,
+    pub checkpoint_sha256: String,
+    pub inputs: Option<InputComparisonReport>,
+    pub variants: BTreeMap<String, LogitVariantReport>,
+    pub comparisons: BTreeMap<String, LogitComparisonReport>,
+    pub self_repeat_unstable: bool,
+    pub active_input_preparation_differs: bool,
+    pub execution_shape_argmax_flip: bool,
+    pub same_shape_train_eval_argmax_flip: bool,
+    pub numeric_shape_drift_without_argmax: bool,
+    pub numeric_same_shape_drift_without_argmax: bool,
+    pub branch: Option<String>,
+    pub timing: SeamCharacterizationTiming,
+    pub identity_root: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2823,6 +2955,949 @@ pub fn run_p2_multibatch_frozen_diagnostic(args: P2MultibatchFrozenDiagnosticArg
     outcome
 }
 
+fn bind_failed_frozen_preflight(path: &Path) -> Result<EvidenceBinding> {
+    let report_path = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize failed preflight {}", path.display()))?;
+    let report: FrozenDiagnosticReport =
+        serde_json::from_slice(&fs::read(&report_path)?).context("parse failed preflight")?;
+    let root = fs::canonicalize(&report.output_root)?;
+    ensure!(
+        report_path == fs::canonicalize(root.join(REPORT_FILE))?,
+        "failed preflight report is outside its claimed root"
+    );
+    let (manifest, _) = external_manifest_paths(&root)?;
+    let manifest = fs::canonicalize(manifest)?;
+    let manifest_sha256 = verify_manifest(&root, &manifest)?;
+    verify_manifest_sidecar(&manifest, &manifest_sha256)?;
+    validate_report_files(&root, &report)?;
+    ensure!(
+        file_sha256_hex(&report_path)? == FAILED_PREFLIGHT_REPORT_SHA256
+            && manifest_sha256 == FAILED_PREFLIGHT_MANIFEST_SHA256
+            && report.identity_root == FAILED_PREFLIGHT_IDENTITY
+            && report.identity_root == diagnostic_identity(&report)?,
+        "failed preflight identity differs from the frozen characterization parent"
+    );
+    ensure!(
+        report.lifecycle.state == LIFECYCLE_FAILED
+            && report.evidence_class == FAILED_EVIDENCE_CLASS
+            && report.device_is_cuda
+            && report.provenance.source_revision == FAILED_PREFLIGHT_SOURCE
+            && report.provenance.binary_sha256 == FAILED_PREFLIGHT_BINARY_SHA256
+            && report.error.as_deref() == Some("training and raw prediction seams disagree")
+            && report.gradients.is_empty()
+            && report.rescoring.len() == 1,
+        "failed preflight does not reproduce the frozen seam falsifier"
+    );
+    Ok(EvidenceBinding {
+        report: report_path,
+        root,
+        manifest,
+        manifest_sha256,
+        identity_root: report.identity_root,
+    })
+}
+
+fn seam_characterization_identity(report: &SeamCharacterizationReport) -> Result<String> {
+    identity_frame_sha256(&[
+        ("domain", report.schema.as_bytes().to_vec()),
+        (
+            "source",
+            report.provenance.source_revision.as_bytes().to_vec(),
+        ),
+        (
+            "binary",
+            report.provenance.binary_sha256.as_bytes().to_vec(),
+        ),
+        ("cargo", report.cargo_lock_sha256.as_bytes().to_vec()),
+        (
+            "g",
+            report
+                .g
+                .as_ref()
+                .map(|binding| binding.identity_root.as_bytes().to_vec())
+                .unwrap_or_default(),
+        ),
+        (
+            "failed_preflight",
+            report
+                .failed_preflight
+                .as_ref()
+                .map(|binding| binding.identity_root.as_bytes().to_vec())
+                .unwrap_or_default(),
+        ),
+        ("config", report.train_config_sha256.as_bytes().to_vec()),
+        (
+            "population",
+            report.population_census_sha256.as_bytes().to_vec(),
+        ),
+        ("checkpoint", report.checkpoint_sha256.as_bytes().to_vec()),
+        (
+            "frozen_order",
+            b"V5a,V5b,V4,V1a,V1b,V5c;step=0;train_batch=0;eval_chunk=32;full_chunk=128;wall=120"
+                .to_vec(),
+        ),
+    ])
+}
+
+fn tensor_fingerprint(tensor: &Tensor) -> Result<TensorFingerprint> {
+    let shape = tensor.dims().to_vec();
+    let dtype = format!("{:?}", tensor.dtype());
+    let flat = tensor.flatten_all()?.contiguous()?;
+    let bytes = match tensor.dtype() {
+        DType::U8 => flat.to_vec1::<u8>()?,
+        DType::U32 => flat
+            .to_vec1::<u32>()?
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+        DType::F32 => flat
+            .to_vec1::<f32>()?
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        other => anyhow::bail!("unsupported characterization tensor dtype {other:?}"),
+    };
+    let sha256 = identity_frame_sha256(&[
+        ("dtype", dtype.as_bytes().to_vec()),
+        ("shape", serde_json::to_vec(&shape)?),
+        ("values", bytes),
+    ])?;
+    Ok(TensorFingerprint {
+        shape,
+        dtype,
+        sha256,
+    })
+}
+
+fn compare_input_tensor(
+    fields: &mut BTreeMap<String, TensorInputComparison>,
+    name: &str,
+    training: &Tensor,
+    evaluator: &Tensor,
+    active_for_predicted_latent: bool,
+) -> Result<()> {
+    let training = tensor_fingerprint(training)?;
+    let evaluator = tensor_fingerprint(evaluator)?;
+    let exact_equal = training == evaluator;
+    fields.insert(
+        name.into(),
+        TensorInputComparison {
+            training,
+            evaluator,
+            exact_equal,
+            active_for_predicted_latent,
+        },
+    );
+    Ok(())
+}
+
+fn compare_batch_inputs(
+    training: &BatchTensors,
+    evaluator: &BatchTensors,
+) -> Result<InputComparisonReport> {
+    let mut fields = BTreeMap::new();
+    for (name, training, evaluator, active) in [
+        ("frames", &training.frames, &evaluator.frames, true),
+        (
+            "next_frames",
+            &training.next_frames,
+            &evaluator.next_frames,
+            true,
+        ),
+        (
+            "model_frames",
+            &training.model_frames,
+            &evaluator.model_frames,
+            false,
+        ),
+        (
+            "model_next_frames",
+            &training.model_next_frames,
+            &evaluator.model_next_frames,
+            false,
+        ),
+        ("actions", &training.actions, &evaluator.actions, true),
+        (
+            "action_coords",
+            &training.action_coords,
+            &evaluator.action_coords,
+            true,
+        ),
+        ("goals", &training.goals, &evaluator.goals, false),
+        (
+            "event_targets",
+            &training.event_targets,
+            &evaluator.event_targets,
+            false,
+        ),
+        (
+            "event_mask",
+            &training.event_mask,
+            &evaluator.event_mask,
+            false,
+        ),
+        (
+            "operator_conditioning",
+            &training.operator_conditioning,
+            &evaluator.operator_conditioning,
+            false,
+        ),
+    ] {
+        compare_input_tensor(&mut fields, name, training, evaluator, active)?;
+    }
+    let training_context = training
+        .context
+        .as_ref()
+        .context("training seam lacks frozen V6 context")?;
+    let evaluator_context = evaluator
+        .context
+        .as_ref()
+        .context("evaluator seam lacks frozen V6 context")?;
+    ensure!(
+        training_context.k() == evaluator_context.k()
+            && training_context.current.dims() == evaluator_context.current.dims()
+            && training_context.next.dims() == evaluator_context.next.dims()
+            && training_context.actions.dims() == evaluator_context.actions.dims()
+            && training_context.coords.dims() == evaluator_context.coords.dims()
+            && training_context.valid.dims() == evaluator_context.valid.dims(),
+        "training and evaluator context geometry differs"
+    );
+    for (name, training, evaluator) in [
+        (
+            "context.current",
+            &training_context.current,
+            &evaluator_context.current,
+        ),
+        (
+            "context.next",
+            &training_context.next,
+            &evaluator_context.next,
+        ),
+        (
+            "context.actions",
+            &training_context.actions,
+            &evaluator_context.actions,
+        ),
+        (
+            "context.coords",
+            &training_context.coords,
+            &evaluator_context.coords,
+        ),
+        (
+            "context.valid",
+            &training_context.valid,
+            &evaluator_context.valid,
+        ),
+    ] {
+        compare_input_tensor(&mut fields, name, training, evaluator, true)?;
+    }
+    let active_inputs_equal = fields
+        .values()
+        .filter(|field| field.active_for_predicted_latent)
+        .all(|field| field.exact_equal);
+    let operator_conditioning_equal = fields
+        .get("operator_conditioning")
+        .is_some_and(|field| field.exact_equal);
+    Ok(InputComparisonReport {
+        fields,
+        active_inputs_equal,
+        operator_conditioning_equal,
+        accepted_inert_operator_non_identity: !operator_conditioning_equal,
+    })
+}
+
+#[derive(Debug)]
+struct LogitCapture {
+    fingerprint: TensorFingerprint,
+    values: Vec<f32>,
+    predictions: Vec<Vec<u8>>,
+}
+
+fn capture_logits(logits: &Tensor) -> Result<LogitCapture> {
+    ensure!(
+        logits.dims4()? == (REGISTERED_BATCH_SIZE, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE),
+        "seam characterization logits have the wrong shape"
+    );
+    ensure!(
+        logits.dtype() == DType::F32,
+        "characterization logits are not F32"
+    );
+    let predictions = predictions_from_logits(logits)?;
+    let fingerprint = tensor_fingerprint(logits)?;
+    let values = logits.flatten_all()?.contiguous()?.to_vec1::<f32>()?;
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "characterization logits contain a non-finite value"
+    );
+    Ok(LogitCapture {
+        fingerprint,
+        values,
+        predictions,
+    })
+}
+
+fn run_logit_variant<F>(
+    name: &str,
+    device: &Device,
+    forward: F,
+) -> Result<(LogitCapture, LogitVariantReport)>
+where
+    F: FnOnce() -> Result<Tensor>,
+{
+    sync_cuda_device(device)?;
+    let started = Instant::now();
+    let logits = forward()?;
+    sync_cuda_device(device)?;
+    let seconds = started.elapsed().as_secs_f64();
+    ensure!(seconds.is_finite(), "non-finite variant duration");
+    let capture = capture_logits(&logits)?;
+    let report = LogitVariantReport {
+        name: name.into(),
+        logits: capture.fingerprint.clone(),
+        seconds,
+    };
+    Ok((capture, report))
+}
+
+fn selected_numeric_summary(mut values: Vec<f64>) -> Result<NumericSummary> {
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "numeric summary contains a non-finite value"
+    );
+    if values.is_empty() {
+        return Ok(NumericSummary {
+            count: 0,
+            zero_count: 0,
+            min: None,
+            median: None,
+            p90: None,
+            p99: None,
+            max: None,
+        });
+    }
+    let count = values.len();
+    let zero_count = values.iter().filter(|value| **value == 0.0).count();
+    let min = values.iter().copied().reduce(f64::min);
+    let max = values.iter().copied().reduce(f64::max);
+    let select = |values: &mut [f64], q: f64| {
+        let index = ((values.len() - 1) as f64 * q).round() as usize;
+        *values.select_nth_unstable_by(index, f64::total_cmp).1
+    };
+    let median = Some(select(&mut values, 0.5));
+    let p90 = Some(select(&mut values, 0.9));
+    let p99 = Some(select(&mut values, 0.99));
+    Ok(NumericSummary {
+        count,
+        zero_count,
+        min,
+        median,
+        p90,
+        p99,
+        max,
+    })
+}
+
+fn reference_margin(logits: &[f32]) -> Result<f64> {
+    ensure!(logits.len() == PALETTE_SIZE, "margin palette width drift");
+    let mut first = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
+    for value in logits {
+        ensure!(value.is_finite(), "margin input is non-finite");
+        if *value > first {
+            second = first;
+            first = *value;
+        } else if *value > second {
+            second = *value;
+        }
+    }
+    let margin = f64::from(first) - f64::from(second);
+    ensure!(
+        margin.is_finite() && margin >= 0.0,
+        "invalid top-two margin"
+    );
+    Ok(margin)
+}
+
+fn compare_logit_captures(
+    left_name: &str,
+    left: &LogitCapture,
+    right_name: &str,
+    right: &LogitCapture,
+) -> Result<LogitComparisonReport> {
+    ensure!(
+        left.values.len() == right.values.len()
+            && left.predictions.len() == right.predictions.len()
+            && left
+                .predictions
+                .iter()
+                .chain(&right.predictions)
+                .all(|row| row.len() == FRAME_SIDE * FRAME_SIDE)
+            && left.values.len() == left.predictions.len() * FRAME_SIDE * FRAME_SIDE * PALETTE_SIZE,
+        "logit comparison geometry drift"
+    );
+    let deltas = left
+        .values
+        .iter()
+        .zip(&right.values)
+        .map(|(left, right)| f64::from((*left - *right).abs()))
+        .collect::<Vec<_>>();
+    let mut disagreement_rows = 0usize;
+    let mut disagreement_pixels = 0usize;
+    let mut margins = Vec::new();
+    for (row, (left_predictions, right_predictions)) in
+        left.predictions.iter().zip(&right.predictions).enumerate()
+    {
+        let mut row_disagrees = false;
+        for (pixel, (left_prediction, right_prediction)) in
+            left_predictions.iter().zip(right_predictions).enumerate()
+        {
+            if left_prediction == right_prediction {
+                continue;
+            }
+            row_disagrees = true;
+            disagreement_pixels += 1;
+            let offset = (row * FRAME_SIDE * FRAME_SIDE + pixel) * PALETTE_SIZE;
+            margins.push(reference_margin(
+                &left.values[offset..offset + PALETTE_SIZE],
+            )?);
+        }
+        disagreement_rows += usize::from(row_disagrees);
+    }
+    Ok(LogitComparisonReport {
+        left: left_name.into(),
+        right: right_name.into(),
+        bit_identical: left.fingerprint == right.fingerprint,
+        argmax_disagreement_pixels: disagreement_pixels,
+        argmax_disagreement_rows: disagreement_rows,
+        absolute_logit_delta: selected_numeric_summary(deltas)?,
+        disagreement_reference_margin: selected_numeric_summary(margins)?,
+    })
+}
+
+fn seam_branch(
+    inputs: &InputComparisonReport,
+    comparisons: &BTreeMap<String, LogitComparisonReport>,
+) -> Result<String> {
+    let comparison = |name: &str| {
+        comparisons
+            .get(name)
+            .with_context(|| format!("missing seam comparison {name}"))
+    };
+    let self_repeat_unstable = ["v5a_v5b", "v5a_v5c", "v1a_v1b"]
+        .into_iter()
+        .try_fold(false, |unstable, name| {
+            Ok::<_, anyhow::Error>(unstable || !comparison(name)?.bit_identical)
+        })?;
+    if self_repeat_unstable {
+        return Ok("SELF_REPEAT_UNSTABLE".into());
+    }
+    if !inputs.active_inputs_equal {
+        return Ok("ACTIVE_INPUT_PREPARATION_DIFFERS".into());
+    }
+    let shape = comparison("v4_v5a")?.argmax_disagreement_pixels > 0;
+    let same_shape = comparison("v1a_v4")?.argmax_disagreement_pixels > 0;
+    Ok(match (shape, same_shape) {
+        (true, true) => "COMPOUND_SHAPE_AND_SAME_SHAPE",
+        (true, false) => "EXECUTION_SHAPE",
+        (false, true) => "SAME_SHAPE_TRAIN_EVAL",
+        (false, false) => "NOT_REPRODUCED",
+    }
+    .into())
+}
+
+fn training_seam_logits(
+    cfg: &TrainConfig,
+    ep_weight: f64,
+    model: &WorldModel,
+    mixed: &MixedStreamBatch,
+    host: &PreparedFoundationV2BatchHost,
+    device: &Device,
+    event_slot_weights: &Tensor,
+) -> Result<Tensor> {
+    let losses = foundation_v2_training_loss_with_event_weights(
+        model,
+        mixed,
+        host,
+        device,
+        FoundationV2ObjectiveConfig {
+            ep_weight,
+            sigreg_projections: REGISTERED_SIGREG_PROJECTIONS,
+            sigreg_knots: REGISTERED_SIGREG_KNOTS,
+            sigreg_seed: REGISTERED_SEED,
+            q_mse_threshold: cfg.q_mse_threshold,
+            rollout_enabled: false,
+            split_ce_weighting: cfg.split_ce_weighting,
+            split_ce_changed_budget: cfg.split_ce_changed_budget,
+            capture_mechanism_seams: false,
+            capture_pred_per_pixel: true,
+        },
+        event_slot_weights,
+    )?;
+    losses
+        .diagnostic_predicted_logits
+        .context("training seam did not capture prediction logits")
+}
+
+fn record_logit_variant(
+    root: &Path,
+    report: &mut SeamCharacterizationReport,
+    captures: &mut BTreeMap<String, LogitCapture>,
+    name: &str,
+    result: (LogitCapture, LogitVariantReport),
+) -> Result<()> {
+    let (capture, variant) = result;
+    ensure!(
+        captures.insert(name.into(), capture).is_none()
+            && report.variants.insert(name.into(), variant).is_none(),
+        "duplicate characterization variant {name}"
+    );
+    write_json_report(&root.join("progress.json"), report)
+}
+
+fn ensure_seam_characterization_complete(report: &SeamCharacterizationReport) -> Result<()> {
+    ensure!(
+        report.schema == SEAM_CHARACTERIZATION_SCHEMA
+            && report.evidence_class == SEAM_CHARACTERIZATION_EVIDENCE_CLASS
+            && report.run_class == SEAM_CHARACTERIZATION_RUN_CLASS
+            && report.registered
+            && !report.research_claim
+            && !report.public_data_read
+            && report.no_backward_calls
+            && report.no_optimizer_step
+            && report.no_ema_update
+            && report.no_checkpoint_write
+            && report.lifecycle.state == LIFECYCLE_COMPLETE
+            && report.device_is_cuda
+            && report.g.is_some()
+            && report.failed_preflight.is_some()
+            && report.population.is_some()
+            && report.inputs.is_some()
+            && report.variants.len() == 6
+            && report.comparisons.len() == 6
+            && report.branch.is_some()
+            && report.error.is_none(),
+        "seam characterization completion contract failed"
+    );
+    let expected_logits = REGISTERED_BATCH_SIZE * FRAME_SIDE * FRAME_SIDE * PALETTE_SIZE;
+    for comparison in report.comparisons.values() {
+        ensure!(
+            comparison.absolute_logit_delta.count == expected_logits
+                && comparison.disagreement_reference_margin.count
+                    == comparison.argmax_disagreement_pixels
+                && comparison.argmax_disagreement_pixels
+                    <= REGISTERED_BATCH_SIZE * FRAME_SIDE * FRAME_SIDE
+                && comparison.argmax_disagreement_rows <= REGISTERED_BATCH_SIZE,
+            "seam comparison count contract failed"
+        );
+    }
+    let inputs = report.inputs.as_ref().context("missing completed inputs")?;
+    ensure!(
+        report.active_input_preparation_differs != inputs.active_inputs_equal
+            && report.self_repeat_unstable
+                == ["v5a_v5b", "v5a_v5c", "v1a_v1b"].into_iter().any(|name| {
+                    report
+                        .comparisons
+                        .get(name)
+                        .is_some_and(|comparison| !comparison.bit_identical)
+                })
+            && report.execution_shape_argmax_flip
+                == report
+                    .comparisons
+                    .get("v4_v5a")
+                    .is_some_and(|value| value.argmax_disagreement_pixels > 0)
+            && report.same_shape_train_eval_argmax_flip
+                == report
+                    .comparisons
+                    .get("v1a_v4")
+                    .is_some_and(|value| value.argmax_disagreement_pixels > 0)
+            && report.branch.as_ref() == Some(&seam_branch(inputs, &report.comparisons)?),
+        "seam branch does not reproduce from its frozen inputs"
+    );
+    if !matches!(
+        report.branch.as_deref(),
+        Some("SELF_REPEAT_UNSTABLE" | "NOT_REPRODUCED")
+    ) {
+        ensure!(
+            report
+                .comparisons
+                .get("v1a_v5a")
+                .is_some_and(|value| value.argmax_disagreement_pixels > 0),
+            "characterization branch did not reproduce the original argmax disagreement"
+        );
+    }
+    ensure!(
+        report.timing.population_seconds.is_finite()
+            && report.timing.population_seconds >= 0.0
+            && report.timing.input_comparison_seconds.is_finite()
+            && report.timing.input_comparison_seconds >= 0.0
+            && report.timing.wall_seconds > 0.0
+            && report.timing.wall_seconds <= SEAM_CHARACTERIZATION_MAX_WALL.as_secs_f64()
+            && report
+                .variants
+                .values()
+                .all(|variant| variant.seconds.is_finite() && variant.seconds >= 0.0),
+        "seam characterization timing contract failed"
+    );
+    ensure!(
+        seam_characterization_identity(report)? == report.identity_root,
+        "seam characterization identity drift"
+    );
+    Ok(())
+}
+
+fn run_seam_characterization_inner(
+    args: &P2FrozenSeamCharacterizationArgs,
+    report: &mut SeamCharacterizationReport,
+    started: Instant,
+) -> Result<()> {
+    let root = args.output_root.as_path();
+    ensure!(
+        args.device.trim().starts_with("cuda"),
+        "seam characterization requires CUDA"
+    );
+    registered_provenance_guard(&report.provenance)?;
+    ensure_source_descends_from_g(&report.provenance)?;
+
+    let (g, g_binding) = bind_g(&args.g_report)?;
+    report.g = Some(g_binding.clone());
+    let failed_preflight = bind_failed_frozen_preflight(&args.failed_preflight_report)?;
+    report.failed_preflight = Some(failed_preflight.clone());
+
+    let config_path = g_binding.root.join("train_config.json");
+    report.train_config_sha256 = file_sha256_hex(&config_path)?;
+    ensure!(
+        report.train_config_sha256 == REGISTERED_TRAIN_CONFIG_SHA256
+            && report.train_config_sha256 == g.train_config_sha256,
+        "seam characterization train config drift"
+    );
+    fs::copy(&config_path, root.join("train_config.json"))?;
+    let cfg = load_train_config(&config_path)?;
+    cfg.validate()?;
+    ensure_registered_config(&cfg)?;
+    ensure!(
+        cfg.seed == REGISTERED_SEED
+            && cfg.physical_batch == REGISTERED_BATCH_SIZE
+            && cfg.data_contract_v6
+            && args.device == cfg.device,
+        "seam characterization config drift"
+    );
+
+    let cargo_lock = fs::canonicalize(std::env::current_dir()?.join("Cargo.lock"))?;
+    report.cargo_lock_sha256 = file_sha256_hex(&cargo_lock)?;
+    ensure!(
+        report.cargo_lock_sha256 == REGISTERED_G_CARGO_LOCK_SHA256,
+        "seam characterization Cargo.lock differs from G"
+    );
+    fs::copy(&cargo_lock, root.join("Cargo.lock"))?;
+
+    let population_started = Instant::now();
+    let population =
+        MultibatchPopulation::compose(cfg.seed, cfg.physical_batch, cfg.data_contract_v6)?;
+    let census = population.write(root)?;
+    let census_path = root.join("population/census.json");
+    report.population_census_sha256 = file_sha256_hex(&census_path)?;
+    ensure!(
+        g.population.as_ref() == Some(&census)
+            && g.population_census_sha256.as_deref()
+                == Some(report.population_census_sha256.as_str()),
+        "seam characterization population differs from G"
+    );
+    report.population = Some(census);
+    let mixed = population
+        .train_main
+        .first()
+        .context("G population lacks train batch position 0")?;
+    ensure!(
+        mixed.samples().len() == REGISTERED_BATCH_SIZE
+            && mixed.factual_group_ranges().len() == 1
+            && mixed.factual_group_ranges()[0] == (43..53),
+        "seam characterization batch-0 geometry drift"
+    );
+    let host = prepare_foundation_v2_batch_host(mixed)?;
+    let transitions = mixed
+        .transitions()
+        .cloned()
+        .collect::<Vec<TransitionSample>>();
+    report.timing.population_seconds = population_started.elapsed().as_secs_f64();
+
+    report.gpu_identity = Some(query_gpu_identity(&args.device)?);
+    ensure!(
+        report.gpu_identity == g.gpu_identity,
+        "seam characterization GPU identity differs from G"
+    );
+    let expected = snapshot_by_step(&g, 0)?;
+    let checkpoint = checked_snapshot_path(&g_binding.root, expected)?;
+    report.checkpoint_sha256 = file_sha256_hex(&checkpoint)?;
+    ensure!(
+        report.checkpoint_sha256 == expected.raw_sha256,
+        "step-0 checkpoint hash drift"
+    );
+    report.identity_root = seam_characterization_identity(report)?;
+    write_json_report(&root.join("progress.json"), report)?;
+
+    let _pid_guard = TrainPidGuard::install(root)?;
+    let diagnostic_device = open_diagnostic_device(&args.device, root)?;
+    ensure!(
+        diagnostic_device.device.is_cuda() && diagnostic_device.gpu_identity == report.gpu_identity,
+        "seam characterization CUDA identity changed during open"
+    );
+    report.device_is_cuda = true;
+    let device = &diagnostic_device.device;
+    let varmap = VarMap::new();
+    let model = WorldModel::new(
+        cfg.model_config(),
+        VarBuilder::from_varmap(&varmap, DType::F32, device),
+    )?;
+    load_varmap_exact(&varmap, &checkpoint)?;
+    ensure_operator_projection_zero(&varmap)?;
+
+    sync_cuda_device(device)?;
+    let inputs_started = Instant::now();
+    let training_batch = batch_from_foundation_v2_host(&host, device)?;
+    let evaluator_batch = batch_from_samples(&transitions, device)?;
+    report.inputs = Some(compare_batch_inputs(&training_batch, &evaluator_batch)?);
+    sync_cuda_device(device)?;
+    report.timing.input_comparison_seconds = inputs_started.elapsed().as_secs_f64();
+    write_json_report(&root.join("progress.json"), report)?;
+
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    let mut captures = BTreeMap::<String, LogitCapture>::new();
+
+    let result = run_logit_variant("V5a", device, || {
+        raw_one_step_logits(&model, &transitions, device)
+    })?;
+    record_logit_variant(root, report, &mut captures, "V5a", result)?;
+    let result = run_logit_variant("V5b", device, || {
+        raw_one_step_logits(&model, &transitions, device)
+    })?;
+    record_logit_variant(root, report, &mut captures, "V5b", result)?;
+    let result = run_logit_variant("V4", device, || {
+        raw_one_step_logits_with_chunk(&model, &transitions, device, REGISTERED_BATCH_SIZE)
+    })?;
+    record_logit_variant(root, report, &mut captures, "V4", result)?;
+    let result = run_logit_variant("V1a", device, || {
+        training_seam_logits(
+            &cfg,
+            expected.ep_weight,
+            &model,
+            mixed,
+            &host,
+            device,
+            &event_slot_weights,
+        )
+    })?;
+    record_logit_variant(root, report, &mut captures, "V1a", result)?;
+    let result = run_logit_variant("V1b", device, || {
+        training_seam_logits(
+            &cfg,
+            expected.ep_weight,
+            &model,
+            mixed,
+            &host,
+            device,
+            &event_slot_weights,
+        )
+    })?;
+    record_logit_variant(root, report, &mut captures, "V1b", result)?;
+    let result = run_logit_variant("V5c", device, || {
+        raw_one_step_logits(&model, &transitions, device)
+    })?;
+    record_logit_variant(root, report, &mut captures, "V5c", result)?;
+
+    for (name, left, right) in [
+        ("v5a_v5b", "V5a", "V5b"),
+        ("v5a_v5c", "V5a", "V5c"),
+        ("v1a_v1b", "V1a", "V1b"),
+        ("v4_v5a", "V4", "V5a"),
+        ("v1a_v4", "V1a", "V4"),
+        ("v1a_v5a", "V1a", "V5a"),
+    ] {
+        let comparison = compare_logit_captures(
+            left,
+            captures
+                .get(left)
+                .with_context(|| format!("missing variant {left}"))?,
+            right,
+            captures
+                .get(right)
+                .with_context(|| format!("missing variant {right}"))?,
+        )?;
+        ensure!(
+            report.comparisons.insert(name.into(), comparison).is_none(),
+            "duplicate seam comparison {name}"
+        );
+        ensure!(
+            started.elapsed() <= SEAM_CHARACTERIZATION_MAX_WALL,
+            "seam characterization wall-time cap exceeded"
+        );
+        write_json_report(&root.join("progress.json"), report)?;
+    }
+    let inputs = report
+        .inputs
+        .as_ref()
+        .context("input comparison disappeared")?;
+    report.self_repeat_unstable = ["v5a_v5b", "v5a_v5c", "v1a_v1b"]
+        .into_iter()
+        .any(|name| !report.comparisons[name].bit_identical);
+    report.active_input_preparation_differs = !inputs.active_inputs_equal;
+    report.execution_shape_argmax_flip =
+        report.comparisons["v4_v5a"].argmax_disagreement_pixels > 0;
+    report.same_shape_train_eval_argmax_flip =
+        report.comparisons["v1a_v4"].argmax_disagreement_pixels > 0;
+    report.numeric_shape_drift_without_argmax =
+        !report.comparisons["v4_v5a"].bit_identical && !report.execution_shape_argmax_flip;
+    report.numeric_same_shape_drift_without_argmax =
+        !report.comparisons["v1a_v4"].bit_identical && !report.same_shape_train_eval_argmax_flip;
+    report.branch = Some(seam_branch(inputs, &report.comparisons)?);
+
+    sync_cuda_device(device)?;
+    drop(captures);
+    drop(training_batch);
+    drop(evaluator_batch);
+    drop(diagnostic_device);
+
+    let (_, rebound_g) = bind_g(&args.g_report)?;
+    ensure!(rebound_g == g_binding, "G changed during characterization");
+    ensure!(
+        bind_failed_frozen_preflight(&args.failed_preflight_report)? == failed_preflight,
+        "failed preflight changed during characterization"
+    );
+    ensure!(
+        file_sha256_hex(&config_path)? == report.train_config_sha256
+            && file_sha256_hex(&cargo_lock)? == report.cargo_lock_sha256
+            && file_sha256_hex(&census_path)? == report.population_census_sha256
+            && file_sha256_hex(&checkpoint)? == report.checkpoint_sha256
+            && file_sha256_hex(&root.join("train_config.json"))? == report.train_config_sha256
+            && file_sha256_hex(&root.join("Cargo.lock"))? == report.cargo_lock_sha256,
+        "characterization input changed during device work"
+    );
+    ensure!(
+        format!(
+            "sha256:{}",
+            file_sha256_hex(&report.provenance.binary_path)?
+        ) == report.provenance.binary_sha256,
+        "characterization binary changed during device work"
+    );
+    ensure!(
+        Some(query_gpu_identity(&args.device)?) == report.gpu_identity,
+        "characterization GPU identity changed"
+    );
+    report.timing.wall_seconds = started.elapsed().as_secs_f64();
+    ensure!(
+        report.timing.wall_seconds <= SEAM_CHARACTERIZATION_MAX_WALL.as_secs_f64(),
+        "seam characterization wall-time cap exceeded during validation"
+    );
+    Ok(())
+}
+
+pub fn run_p2_frozen_seam_characterization(args: P2FrozenSeamCharacterizationArgs) -> Result<()> {
+    let started = Instant::now();
+    let lifecycle = LifecycleRecord {
+        state: LIFECYCLE_RUNNING.into(),
+        unix_seconds: unix_seconds(),
+        evidence_class: SEAM_CHARACTERIZATION_EVIDENCE_CLASS.into(),
+        run_class: SEAM_CHARACTERIZATION_RUN_CLASS.into(),
+        note: "no-gradient V6 train/raw seam characterization in progress".into(),
+    };
+    let command = open_run_root(&args.output_root, &lifecycle, SEAM_CHARACTERIZATION_TAG)?;
+    let mut report = SeamCharacterizationReport {
+        schema: SEAM_CHARACTERIZATION_SCHEMA.into(),
+        evidence_class: SEAM_CHARACTERIZATION_EVIDENCE_CLASS.into(),
+        run_class: SEAM_CHARACTERIZATION_RUN_CLASS.into(),
+        registered: true,
+        research_claim: false,
+        public_data_read: false,
+        no_backward_calls: true,
+        no_optimizer_step: true,
+        no_ema_update: true,
+        no_checkpoint_write: true,
+        lifecycle,
+        provenance: launch_provenance().clone(),
+        command,
+        device: args.device.clone(),
+        device_is_cuda: false,
+        gpu_identity: None,
+        output_root: args.output_root.clone(),
+        g: None,
+        failed_preflight: None,
+        train_config_sha256: String::new(),
+        cargo_lock_sha256: String::new(),
+        population_census_sha256: String::new(),
+        population: None,
+        checkpoint_sha256: String::new(),
+        inputs: None,
+        variants: BTreeMap::new(),
+        comparisons: BTreeMap::new(),
+        self_repeat_unstable: false,
+        active_input_preparation_differs: false,
+        execution_shape_argmax_flip: false,
+        same_shape_train_eval_argmax_flip: false,
+        numeric_shape_drift_without_argmax: false,
+        numeric_same_shape_drift_without_argmax: false,
+        branch: None,
+        timing: SeamCharacterizationTiming {
+            population_seconds: 0.0,
+            input_comparison_seconds: 0.0,
+            wall_seconds: 0.0,
+        },
+        identity_root: String::new(),
+        error: None,
+    };
+    let mut outcome = run_seam_characterization_inner(&args, &mut report, started);
+    report.timing.wall_seconds = started.elapsed().as_secs_f64();
+    if report.identity_root.is_empty() && report.population.is_some() {
+        match seam_characterization_identity(&report) {
+            Ok(identity) => report.identity_root = identity,
+            Err(error) => outcome = Err(error.context("compute seam characterization identity")),
+        }
+    }
+    report.lifecycle = match &outcome {
+        Ok(()) => LifecycleRecord {
+            state: LIFECYCLE_COMPLETE.into(),
+            unix_seconds: unix_seconds(),
+            evidence_class: SEAM_CHARACTERIZATION_EVIDENCE_CLASS.into(),
+            run_class: SEAM_CHARACTERIZATION_RUN_CLASS.into(),
+            note: format!(
+                "{}; characterization only; no gradient, model update, or training authority",
+                report.branch.as_deref().unwrap_or("missing_branch")
+            ),
+        },
+        Err(error) => {
+            report.error = Some(format!("{error:#}"));
+            report.evidence_class = FAILED_EVIDENCE_CLASS.into();
+            LifecycleRecord {
+                state: LIFECYCLE_FAILED.into(),
+                unix_seconds: unix_seconds(),
+                evidence_class: FAILED_EVIDENCE_CLASS.into(),
+                run_class: SEAM_CHARACTERIZATION_RUN_CLASS.into(),
+                note: format!("{error:#}"),
+            }
+        }
+    };
+    if outcome.is_ok() {
+        if let Err(error) = ensure_seam_characterization_complete(&report) {
+            report.error = Some(format!("{error:#}"));
+            report.evidence_class = FAILED_EVIDENCE_CLASS.into();
+            report.lifecycle = LifecycleRecord {
+                state: LIFECYCLE_FAILED.into(),
+                unix_seconds: unix_seconds(),
+                evidence_class: FAILED_EVIDENCE_CLASS.into(),
+                run_class: SEAM_CHARACTERIZATION_RUN_CLASS.into(),
+                note: format!("{error:#}"),
+            };
+            outcome = Err(error.context("post-completion seam characterization validation"));
+        }
+    }
+    let lifecycle = report.lifecycle.clone();
+    seal_run_root(
+        &args.output_root,
+        SEAM_CHARACTERIZATION_TAG,
+        &report,
+        &lifecycle,
+    )?;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3033,6 +4108,195 @@ mod tests {
     fn frozen_parent_binary_digest_matches_launch_provenance_representation() {
         assert_eq!(REGISTERED_G_BINARY_SHA256.len(), "sha256:".len() + 64);
         assert!(REGISTERED_G_BINARY_SHA256.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn tensor_fingerprint_binds_f32_bits_shape_and_dtype() -> Result<()> {
+        let left = Tensor::from_vec(vec![0.0f32, -0.0, 1.0], (3,), &Device::Cpu)?;
+        let same = Tensor::from_vec(vec![0.0f32, -0.0, 1.0], (3,), &Device::Cpu)?;
+        let signed_zero_drift = Tensor::from_vec(vec![0.0f32, 0.0, 1.0], (3,), &Device::Cpu)?;
+        let reshaped = Tensor::from_vec(vec![0.0f32, -0.0, 1.0], (1, 3), &Device::Cpu)?;
+        assert_eq!(tensor_fingerprint(&left)?, tensor_fingerprint(&same)?);
+        assert_ne!(
+            tensor_fingerprint(&left)?,
+            tensor_fingerprint(&signed_zero_drift)?
+        );
+        assert_ne!(tensor_fingerprint(&left)?, tensor_fingerprint(&reshaped)?);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_summary_uses_frozen_nearest_rank_and_rejects_nonfinite() -> Result<()> {
+        let summary = selected_numeric_summary(vec![4.0, 0.0, 3.0, 1.0, 2.0])?;
+        assert_eq!(summary.count, 5);
+        assert_eq!(summary.zero_count, 1);
+        assert_eq!(summary.min, Some(0.0));
+        assert_eq!(summary.median, Some(2.0));
+        assert_eq!(summary.p90, Some(4.0));
+        assert_eq!(summary.p99, Some(4.0));
+        assert_eq!(summary.max, Some(4.0));
+        assert!(selected_numeric_summary(vec![f64::NAN]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn input_comparison_accepts_only_the_inert_operator_exception() -> Result<()> {
+        let population =
+            MultibatchPopulation::compose(REGISTERED_SEED, REGISTERED_BATCH_SIZE, true)?;
+        let mixed = population
+            .train_main
+            .first()
+            .context("missing train batch")?;
+        let host = prepare_foundation_v2_batch_host(mixed)?;
+        let training = batch_from_foundation_v2_host(&host, &Device::Cpu)?;
+        let transitions = mixed.transitions().cloned().collect::<Vec<_>>();
+        let mut evaluator = batch_from_samples(&transitions, &Device::Cpu)?;
+        evaluator.operator_conditioning = (&training.operator_conditioning + 1.0)?;
+
+        let comparison = compare_batch_inputs(&training, &evaluator)?;
+        assert!(comparison.active_inputs_equal);
+        assert!(!comparison.operator_conditioning_equal);
+        assert!(comparison.accepted_inert_operator_non_identity);
+        assert!(!comparison.fields["operator_conditioning"].active_for_predicted_latent);
+        assert!(comparison
+            .fields
+            .values()
+            .filter(|field| field.active_for_predicted_latent)
+            .all(|field| field.exact_equal));
+        Ok(())
+    }
+
+    #[test]
+    fn logit_comparison_counts_exact_argmax_location_and_reference_margin() -> Result<()> {
+        let rows = 2;
+        let elements = rows * FRAME_SIDE * FRAME_SIDE * PALETTE_SIZE;
+        let mut left_values = vec![0.0f32; elements];
+        let mut right_values = left_values.clone();
+        let row = 1;
+        let pixel = 2;
+        let offset = (row * FRAME_SIDE * FRAME_SIDE + pixel) * PALETTE_SIZE;
+        left_values[offset] = 5.0;
+        left_values[offset + 2] = 3.0;
+        right_values[offset] = 1.0;
+        right_values[offset + 1] = 4.0;
+        let mut left_predictions = vec![vec![0u8; FRAME_SIDE * FRAME_SIDE]; rows];
+        let mut right_predictions = left_predictions.clone();
+        left_predictions[row][pixel] = 0;
+        right_predictions[row][pixel] = 1;
+        let fingerprint = |sha256: &str| TensorFingerprint {
+            shape: vec![rows, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE],
+            dtype: "F32".into(),
+            sha256: sha256.into(),
+        };
+        let left = LogitCapture {
+            fingerprint: fingerprint("left"),
+            values: left_values,
+            predictions: left_predictions,
+        };
+        let right = LogitCapture {
+            fingerprint: fingerprint("right"),
+            values: right_values,
+            predictions: right_predictions,
+        };
+
+        let comparison = compare_logit_captures("left", &left, "right", &right)?;
+        assert!(!comparison.bit_identical);
+        assert_eq!(comparison.argmax_disagreement_pixels, 1);
+        assert_eq!(comparison.argmax_disagreement_rows, 1);
+        assert_eq!(comparison.absolute_logit_delta.count, elements);
+        assert_eq!(comparison.absolute_logit_delta.zero_count, elements - 3);
+        assert_eq!(comparison.disagreement_reference_margin.count, 1);
+        assert_eq!(comparison.disagreement_reference_margin.min, Some(2.0));
+        assert_eq!(comparison.disagreement_reference_margin.max, Some(2.0));
+        Ok(())
+    }
+
+    fn seam_comparison(bit_identical: bool, disagreements: usize) -> LogitComparisonReport {
+        LogitComparisonReport {
+            left: String::new(),
+            right: String::new(),
+            bit_identical,
+            argmax_disagreement_pixels: disagreements,
+            argmax_disagreement_rows: usize::from(disagreements > 0),
+            absolute_logit_delta: NumericSummary {
+                count: 1,
+                zero_count: usize::from(bit_identical),
+                min: Some(if bit_identical { 0.0 } else { 1.0 }),
+                median: Some(if bit_identical { 0.0 } else { 1.0 }),
+                p90: Some(if bit_identical { 0.0 } else { 1.0 }),
+                p99: Some(if bit_identical { 0.0 } else { 1.0 }),
+                max: Some(if bit_identical { 0.0 } else { 1.0 }),
+            },
+            disagreement_reference_margin: NumericSummary {
+                count: disagreements,
+                zero_count: 0,
+                min: (disagreements > 0).then_some(1.0),
+                median: (disagreements > 0).then_some(1.0),
+                p90: (disagreements > 0).then_some(1.0),
+                p99: (disagreements > 0).then_some(1.0),
+                max: (disagreements > 0).then_some(1.0),
+            },
+        }
+    }
+
+    fn seam_comparisons(
+        shape: usize,
+        same_shape: usize,
+    ) -> BTreeMap<String, LogitComparisonReport> {
+        BTreeMap::from([
+            ("v5a_v5b".into(), seam_comparison(true, 0)),
+            ("v5a_v5c".into(), seam_comparison(true, 0)),
+            ("v1a_v1b".into(), seam_comparison(true, 0)),
+            ("v4_v5a".into(), seam_comparison(shape == 0, shape)),
+            (
+                "v1a_v4".into(),
+                seam_comparison(same_shape == 0, same_shape),
+            ),
+            (
+                "v1a_v5a".into(),
+                seam_comparison(shape == 0 && same_shape == 0, shape + same_shape),
+            ),
+        ])
+    }
+
+    fn seam_inputs(active_inputs_equal: bool) -> InputComparisonReport {
+        InputComparisonReport {
+            fields: BTreeMap::new(),
+            active_inputs_equal,
+            operator_conditioning_equal: false,
+            accepted_inert_operator_non_identity: true,
+        }
+    }
+
+    #[test]
+    fn seam_branch_priority_and_matrix_are_exact() -> Result<()> {
+        assert_eq!(
+            seam_branch(&seam_inputs(true), &seam_comparisons(0, 0))?,
+            "NOT_REPRODUCED"
+        );
+        assert_eq!(
+            seam_branch(&seam_inputs(true), &seam_comparisons(1, 0))?,
+            "EXECUTION_SHAPE"
+        );
+        assert_eq!(
+            seam_branch(&seam_inputs(true), &seam_comparisons(0, 1))?,
+            "SAME_SHAPE_TRAIN_EVAL"
+        );
+        assert_eq!(
+            seam_branch(&seam_inputs(true), &seam_comparisons(1, 1))?,
+            "COMPOUND_SHAPE_AND_SAME_SHAPE"
+        );
+        assert_eq!(
+            seam_branch(&seam_inputs(false), &seam_comparisons(1, 1))?,
+            "ACTIVE_INPUT_PREPARATION_DIFFERS"
+        );
+        let mut unstable = seam_comparisons(1, 1);
+        unstable.insert("v5a_v5b".into(), seam_comparison(false, 0));
+        assert_eq!(
+            seam_branch(&seam_inputs(false), &unstable)?,
+            "SELF_REPEAT_UNSTABLE"
+        );
+        Ok(())
     }
 
     #[test]

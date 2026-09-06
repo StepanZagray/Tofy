@@ -7,10 +7,11 @@ use crate::p2::cli::{
     run_p2_arc3_bridge, run_p2_arc3_eval, run_p2_arc3_live_eval, run_p2_bf16_bench,
     run_p2_bf16_drift, run_p2_context_confirmation, run_p2_context_confirmation_v2,
     run_p2_context_wiring, run_p2_eval, run_p2_fixed_batch_positive_control,
-    run_p2_multibatch_frozen_diagnostic, run_p2_multibatch_generalization_screen,
-    run_p2_residual_probe, run_p2_train, P2Arc3BridgeArgs, P2Arc3EvalArgs, P2Arc3LiveEvalArgs,
-    P2Bf16BenchArgs, P2Bf16DriftArgs, P2ContextConfirmationArgs, P2ContextConfirmationV2Args,
-    P2ContextWiringArgs, P2EvalArgs, P2FixedBatchPositiveControlArgs,
+    run_p2_frozen_seam_characterization, run_p2_multibatch_frozen_diagnostic,
+    run_p2_multibatch_generalization_screen, run_p2_residual_probe, run_p2_train, P2Arc3BridgeArgs,
+    P2Arc3EvalArgs, P2Arc3LiveEvalArgs, P2Bf16BenchArgs, P2Bf16DriftArgs,
+    P2ContextConfirmationArgs, P2ContextConfirmationV2Args, P2ContextWiringArgs, P2EvalArgs,
+    P2FixedBatchPositiveControlArgs, P2FrozenSeamCharacterizationArgs,
     P2MultibatchFrozenDiagnosticArgs, P2MultibatchScreenArgs, P2ResidualProbeArgs, P2TrainArgs,
 };
 use crate::p2::view::{run_p2_view, P2ViewArgs};
@@ -47,6 +48,9 @@ enum Commands {
     /// P2: read-only frozen-checkpoint diagnosis selected by failed multi-batch G
     #[command(name = "p2-v6-multibatch-frozen-diagnostic")]
     P2MultibatchFrozenDiagnostic(Box<P2MultibatchFrozenDiagnosticArgs>),
+    /// P2: no-gradient localization of the frozen train/raw prediction seam
+    #[command(name = "p2-v6-frozen-seam-characterization")]
+    P2FrozenSeamCharacterization(Box<P2FrozenSeamCharacterizationArgs>),
     /// P2: held-out synthetic world-model and PTRM evaluation
     #[command(name = "p2-eval")]
     P2Eval(P2EvalArgs),
@@ -88,6 +92,7 @@ pub fn run_cli() -> Result<()> {
             run_p2_multibatch_generalization_screen(*args)?
         }
         Commands::P2MultibatchFrozenDiagnostic(args) => run_p2_multibatch_frozen_diagnostic(*args)?,
+        Commands::P2FrozenSeamCharacterization(args) => run_p2_frozen_seam_characterization(*args)?,
         Commands::P2Eval(args) => run_p2_eval(args)?,
         Commands::P2Arc3Eval(args) => run_p2_arc3_eval(args)?,
         Commands::P2Arc3LiveEval(args) => run_p2_arc3_live_eval(args)?,

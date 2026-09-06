@@ -3819,7 +3819,7 @@ pub(crate) fn prepare_foundation_v2_batch_host(
     })
 }
 
-fn batch_from_foundation_v2_host(
+pub(crate) fn batch_from_foundation_v2_host(
     host: &PreparedFoundationV2BatchHost,
     device: &Device,
 ) -> Result<BatchTensors> {
