@@ -16,6 +16,7 @@ import json
 import math
 import os
 import platform
+import random
 import re
 import selectors
 import signal
@@ -83,8 +84,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise DriverError(f"{field} must be a positive integer")
     for field in ("max_seconds_per_game", "max_seconds_total", "decision_timeout"):
         positive_number(config.get(field), field)
-    if config.get("agent", {}).get("kind") not in ("tofy", "local_chat"):
-        raise DriverError("agent.kind must be tofy or local_chat")
+    if config.get("agent", {}).get("kind") not in ("tofy", "local_chat", "random"):
+        raise DriverError("agent.kind must be tofy, local_chat or random")
     if not config.get("limitations"):
         raise DriverError("record the reference agent's known limitations")
     agent = config["agent"]
@@ -98,7 +99,7 @@ def validate_config(config: dict[str, Any]) -> None:
             "policy",
             "phase_a_calibration",
         }
-    else:
+    elif agent["kind"] == "local_chat":
         allowed |= {
             "model",
             "model_file",
@@ -584,9 +585,34 @@ def play_game(
     }
 
 
+class RandomAgent:
+    """Uniform input-ID reference; coordinate input is uniform over the canvas."""
+
+    def __init__(self, seed: int, timeout: float):
+        self.rng = random.Random(seed)
+        self.timeout = timeout
+
+    def choose_action(self, observation: dict[str, Any]) -> dict[str, int]:
+        available = [action for action in observation["available_actions"] if action]
+        if not available:
+            raise DriverError("random reference has no available non-reset action")
+        decision = {"action_id": self.rng.choice(available)}
+        if decision["action_id"] == 6:
+            decision.update(x=self.rng.randrange(64), y=self.rng.randrange(64))
+        return decision
+
+    def observe_terminal(self, observation: dict[str, Any]) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 def make_agent(config: dict[str, Any], directory: Path, timeout: float) -> Any:
     if config["kind"] == "tofy":
         return TofyAgent(config, directory, timeout)
+    if config["kind"] == "random":
+        return RandomAgent(config["seed"], timeout)
     return ManagedChatAgent(config, directory, timeout)
 
 
@@ -735,14 +761,14 @@ def provenance(config: dict[str, Any]) -> dict[str, Any]:
         identities[str(path)] = actual
     if not identities:
         raise DriverError(
-            "register hashes for the model/checkpoint and inference binary"
+            "register hashes for the agent artifacts and experiment registration"
         )
     agent = config["agent"]
-    required = (
-        ("binary", "checkpoint", "train_config")
-        if agent["kind"] == "tofy"
-        else ("model_file", "server_binary")
-    )
+    required = {
+        "tofy": ("binary", "checkpoint", "train_config"),
+        "local_chat": ("model_file", "server_binary"),
+        "random": (),
+    }[agent["kind"]]
     if agent.get("phase_a_calibration"):
         required += ("phase_a_calibration",)
     for field in required:

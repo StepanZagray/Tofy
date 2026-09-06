@@ -593,6 +593,42 @@ impl<M: PhaseAModel> PhaseAPolicy<M> {
         decoded[..rows] == observed[..rows]
     }
 
+    /// Insert a confirmed successor before folding its pending edge. Terminal
+    /// observations legitimately advertise no actions; active observations use
+    /// the same expanded ACTION6 set as `choose_action`.
+    fn insert_confirmed_observation(
+        &mut self,
+        observation: &ArcObservation,
+    ) -> Result<(RawObservationId, Vec<u8>)> {
+        let pixels: Vec<u8> = observation.frame.pixels.to_vec();
+        if pixels.len() != FRAME_PIXELS {
+            bail!(
+                "Phase A expects a {FRAME_SIDE}x{FRAME_SIDE} canvas, got {} pixels",
+                pixels.len()
+            );
+        }
+        let id = Self::raw_id(observation, &pixels);
+        let legal = if observation.available_actions.is_empty() {
+            observation.validate()?;
+            Vec::new()
+        } else {
+            enumerate_actions_with(
+                observation,
+                self.action6_max_candidates,
+                self.action6_grid_stride,
+                self.adapter.whole_frame(),
+            )?
+            .iter()
+            .map(phase_a_action_key)
+            .collect()
+        };
+        match self.graph.insert_node(id, pixels.clone(), legal) {
+            Ok(()) | Err(ObservedGraphError::ObservationCollision(_)) => {}
+            Err(error) => bail!("observed-state graph rejected confirmed node: {error}"),
+        }
+        Ok((id, pixels))
+    }
+
     /// Fold the previous real transition into the graph and posterior.
     fn observe_pending(
         &mut self,
@@ -1218,6 +1254,24 @@ impl<M: PhaseAModel> LivePolicy for PhaseAPolicy<M> {
         action: &ArcAction,
         next: &ArcObservation,
     ) {
+        // Lifecycle claim: every valid confirmed successor is folded exactly
+        // once here, before a terminal retry or level callback can clear state.
+        // The callback is infallible, so mismatched/invalid direct calls discard
+        // the pending prediction rather than attach it to the wrong transition.
+        let current_pixels: Vec<u8> = current.frame.pixels.to_vec();
+        let matches_pending = self.pending.as_ref().is_some_and(|pending| {
+            current_pixels.len() == FRAME_PIXELS
+                && pending.prev_id == Self::raw_id(current, &current_pixels)
+                && pending.key == phase_a_action_key(action)
+        });
+        if matches_pending {
+            match self.insert_confirmed_observation(next) {
+                Ok((id, pixels)) => self.observe_pending(next, id, &pixels),
+                Err(_) => self.pending = None,
+            }
+        } else if self.pending.is_some() {
+            self.pending = None;
+        }
         self.context.observe(
             &current.frame,
             action,
@@ -1356,6 +1410,22 @@ mod tests {
             win_levels: 3,
             available_actions: vec![1, 2, 3],
         }
+    }
+
+    fn observation_with_state(
+        levels: u16,
+        marker: bool,
+        state: &str,
+        available_actions: Vec<u8>,
+    ) -> ArcObservation {
+        let mut observation = observation(levels, marker);
+        observation.state = state.into();
+        observation.available_actions = available_actions;
+        observation
+    }
+
+    fn raw_id(observation: &ArcObservation) -> RawObservationId {
+        PhaseAPolicy::<FakeModel>::raw_id(observation, &observation.frame.pixels)
     }
 
     fn permissive_calibration() -> PhaseACalibration {
@@ -1756,6 +1826,172 @@ mod tests {
         // recorded action: the frontier advances.
         let second = policy.choose_action(&observation(0, true))?;
         assert_ne!(first.chosen.action, second.chosen.action);
+        Ok(())
+    }
+
+    /// Confirmed terminal observations do not trigger another decision. The
+    /// failure edge must therefore exist before the retry callback fires.
+    #[test]
+    fn confirmed_game_over_is_folded_before_retry() -> Result<()> {
+        let mut policy = PhaseAPolicy::new(
+            FakeModel::new(0.0),
+            PhaseAConfig::default(),
+            permissive_calibration(),
+            8,
+            8,
+        );
+        let current = observation(0, true);
+        let decision = policy.choose_action(&current)?;
+        let action = decision.chosen.action;
+        let source_id = raw_id(&current);
+        let terminal = observation_with_state(0, false, "GAME_OVER", Vec::new());
+        let terminal_id = raw_id(&terminal);
+
+        policy.on_confirmed_transition(&current, &action, &terminal);
+
+        assert!(policy.pending.is_none());
+        let edge =
+            &policy.graph.node(source_id).expect("source node").edges[&phase_a_action_key(&action)];
+        assert_eq!(edge.next_raw_id, Some(terminal_id));
+        assert_eq!(edge.terminal, TerminalChannel::Failed);
+        assert!(policy
+            .graph
+            .node(terminal_id)
+            .expect("terminal successor node")
+            .legal_actions
+            .is_empty());
+
+        policy.on_reset_retry("game_over");
+        assert_eq!(
+            policy
+                .graph
+                .node(source_id)
+                .expect("source survives retry")
+                .edges[&phase_a_action_key(&action)]
+                .terminal,
+            TerminalChannel::Failed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_ordinary_transition_is_not_folded_again_by_choose() -> Result<()> {
+        let mut policy = PhaseAPolicy::new(
+            FakeModel::new(0.0),
+            PhaseAConfig::default(),
+            permissive_calibration(),
+            8,
+            8,
+        );
+        let current = observation(0, true);
+        let decision = policy.choose_action(&current)?;
+        let action = decision.chosen.action;
+        let source_id = raw_id(&current);
+        let belief_before_callback = policy.belief.clone();
+
+        policy.on_confirmed_transition(&current, &action, &current);
+        let belief_after_callback = policy.belief.clone();
+        assert!(belief_after_callback.is_some());
+        assert_ne!(belief_after_callback, belief_before_callback);
+        assert!(policy.pending.is_none());
+        assert_eq!(
+            policy
+                .graph
+                .node(source_id)
+                .expect("source node")
+                .edges
+                .len(),
+            1
+        );
+
+        policy.choose_action(&current)?;
+        assert_eq!(policy.belief, belief_after_callback);
+        assert_eq!(
+            policy
+                .graph
+                .node(source_id)
+                .expect("source node")
+                .edges
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    /// The driver reports the confirmed WIN before clearing the completed
+    /// level, so the satisfied edge must be observable in that interval.
+    #[test]
+    fn confirmed_win_is_folded_before_level_state_is_cleared() -> Result<()> {
+        let mut policy = PhaseAPolicy::new(
+            FakeModel::new(0.0),
+            PhaseAConfig::default(),
+            permissive_calibration(),
+            8,
+            8,
+        );
+        let current = observation(0, true);
+        let decision = policy.choose_action(&current)?;
+        let action = decision.chosen.action;
+        let source_id = raw_id(&current);
+        let win = observation_with_state(1, false, "WIN", Vec::new());
+        let win_id = raw_id(&win);
+
+        policy.on_confirmed_transition(&current, &action, &win);
+
+        let edge =
+            &policy.graph.node(source_id).expect("source node").edges[&phase_a_action_key(&action)];
+        assert_eq!(edge.next_raw_id, Some(win_id));
+        assert_eq!(edge.terminal, TerminalChannel::Satisfied);
+        assert!(policy
+            .graph
+            .node(win_id)
+            .expect("WIN successor node")
+            .legal_actions
+            .is_empty());
+
+        policy.on_level_transition(1);
+        assert!(policy.graph.node(source_id).is_none());
+        assert!(policy.graph.node(win_id).is_none());
+        assert!(policy.pending.is_none() && policy.belief.is_none());
+        Ok(())
+    }
+
+    /// Final budget-cutoff ingestion has no following decision or lifecycle
+    /// transition; it must still leave the factual edge and successor node.
+    #[test]
+    fn confirmed_final_cutoff_is_folded_without_followup_decision() -> Result<()> {
+        let mut policy = PhaseAPolicy::new(
+            FakeModel::new(0.0),
+            PhaseAConfig::default(),
+            permissive_calibration(),
+            8,
+            8,
+        );
+        let current = observation(0, true);
+        let decision = policy.choose_action(&current)?;
+        let action = decision.chosen.action;
+        let source_id = raw_id(&current);
+        let final_observation = observation_with_state(0, false, "NOT_FINISHED", vec![2, 3]);
+        let final_id = raw_id(&final_observation);
+
+        policy.on_confirmed_transition(&current, &action, &final_observation);
+        policy.on_game_end("action_cap");
+
+        assert!(policy.pending.is_none());
+        let edge =
+            &policy.graph.node(source_id).expect("source node").edges[&phase_a_action_key(&action)];
+        assert_eq!(edge.next_raw_id, Some(final_id));
+        assert_eq!(edge.terminal, TerminalChannel::Ordinary);
+        assert_eq!(
+            policy
+                .graph
+                .node(final_id)
+                .expect("final successor node")
+                .legal_actions,
+            [ActionKey::from("2"), ActionKey::from("3")]
+                .into_iter()
+                .collect()
+        );
         Ok(())
     }
 

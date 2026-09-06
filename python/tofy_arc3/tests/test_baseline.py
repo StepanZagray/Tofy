@@ -12,6 +12,7 @@ from unittest.mock import patch
 from arcengine import GameState
 from tofy_arc3.run_baseline import (
     DriverError,
+    RandomAgent,
     evaluate,
     play_game,
     screen_contract,
@@ -119,6 +120,22 @@ class FakeArcade:
 
 
 class BaselineTests(unittest.TestCase):
+    def test_random_reference_is_session_local_and_respects_available_inputs(self):
+        observation = {"available_actions": [0, 3, 6]}
+        first, second = RandomAgent(7, 1), RandomAgent(7, 1)
+        expected = [first.choose_action(observation) for _ in range(256)]
+        second.observe_terminal({"state": "GAME_OVER"})
+        self.assertEqual(expected, [second.choose_action(observation) for _ in range(256)])
+        self.assertEqual({row["action_id"] for row in expected}, {3, 6})
+        for row in expected:
+            validate_action(row, observation)
+        different_seed = RandomAgent(8, 1)
+        self.assertNotEqual(
+            expected, [different_seed.choose_action(observation) for _ in range(256)]
+        )
+        with self.assertRaises(DriverError):
+            first.choose_action({"available_actions": [0]})
+
     def test_initial_observation_is_reused_and_terminal_feedback_precedes_reset(self):
         events = []
         environment = FakeEnvironment(
