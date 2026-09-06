@@ -271,6 +271,70 @@ deselects conditional Q and the simple one-batch 2,048-update extension. The
 next allowed experiment is the separately preregistered eight-train/eight-index-
 held-out function-learning screen; A/C/D and public ARC remain blocked.
 
+## V6 multi-batch generalization screen (2026-09-06; DOES_NOT_SCALE)
+
+The clean pushed source `dba110de8ed467b58dbaa2a936565f0dc8a7b794`
+and locked cuDNN binary
+`sha256:faf6fb74820582de8f1a62675392de19a729a9961a2573fc8bf8c96358631f44`
+ran the registered eight-train/eight-index-held-out screen from the same seed-5
+initialization. The same-binary eight-update preflight root is
+`v6-multibatch-preflight-20260906T001650-CDT`; registered G is
+`v6-multibatch-g-registered-20260906T002436-CDT`. G completed 2,048 finite
+updates—256 visits per train batch—in 2,596.29 seconds wall time on the RTX
+5060 Laptop GPU. Its report SHA-256 is
+`03f645a5cccfbd4dcf72bf9927ac15589dc8fa579c6330f254101ed70c18789f`,
+identity is
+`sha256:1d470fc1b5680e33efa07e32c51bf74fa0a73bea6e839828da09fd7922eee265`,
+and all 49 finalized files verify under external manifest
+`sha256:900488b44e0f1623513234839f0f777d2c1d052ec3c46458fb714383868748d4`.
+
+| Raw update-2,048 gate | Measured | Required | Pass |
+|---|---:|---:|:---:|
+| Train full exact | `2/725` | `>=363/725` | no |
+| Held-out changed exact | `3/726` | `>=146/726` and above background `3` | no |
+| Held-out full exact | `0/726` | `>=73/726` and above background `0` | no |
+| Held-out action-routed groups | `0/8` | `>=2/8` | no |
+| Held-out counterfactual pixels | `507/1456` | `>=728`, above factual `472`, copy `643`, and background `571` | no |
+| Held-out coordinate groups | `0` | `>=2` | no |
+
+Train changed-pixel exactness rose from `4/725` at step 0 to `709/725`, and
+the train false-edit rate fell from `0.9407` to `0.00456`. That apparent
+pixel-level fit still left 19,100 false-edit pixels across 1,022/1,024 train
+rows, so only two changed boards were fully exact. Held-out changed exact
+ended at `3/726`, exactly the background control; held-out full exact remained
+zero. The frozen extension signal was also false: train full exact moved only
+`0` to `2` between updates 1,024 and 2,048, below the preregistered `+73`
+threshold. The fixed-priority verdict is therefore `DOES_NOT_SCALE`.
+
+This literal verdict is visit-confounded: the extension window gives each
+batch only 128 to 256 visits, while parent P also had zero full-exact rows at
+256 visits and reached `70/95` only after 512. It binds the registered branch
+but does not establish that a 512-visit extension would fail. The global LR
+schedules also differ, the EP controller observes only batch 7, and this is a
+single seed with deterministic same-distribution-by-index held-out data.
+Fable 5.1 High independently rehashed and recomputed the artifact and returned
+GO under review SHA-256
+`0a70421897844ed80ad40dada18c80d1087fc638990281e84a9d7399ee8b89ed`.
+
+The next allowed branch is frozen-checkpoint gradient/false-edit/per-batch
+diagnosis followed by a separately preregistered matched eight-batch
+prediction-only discriminator. No checkpoint, generalization, ARC, or
+level-completion claim is promoted, and “Best So Far” is unchanged.
+
+Exact registered command:
+
+```bash
+/home/stepan/Coding/Personal/.tofy-build/target-v6-multibatch-dba110de/release/tofy p2-v6-multibatch-generalization-screen \
+  --checkpoint /home/stepan/Coding/Personal/.tofy-build/baseline-floor-current-double-seed5-20260905T121849-CDT/checkpoints/step-000000000000/model.safetensors \
+  --train-config /home/stepan/Coding/Personal/.tofy-build/baseline-floor-current-double-seed5-20260905T121849-CDT/config.json \
+  --device cuda \
+  --output-root /home/stepan/Coding/Personal/.tofy-build/v6-multibatch-g-registered-20260906T002436-CDT \
+  --max-updates 2048 \
+  --registered \
+  --parent-p-report /home/stepan/Coding/Personal/.tofy-build/v6-fixed-batch-p-registered-20260905T170914-CDT/report.json \
+  --preflight-report /home/stepan/Coding/Personal/.tofy-build/v6-multibatch-preflight-20260906T001650-CDT/report.json
+```
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as

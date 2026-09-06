@@ -1,9 +1,9 @@
 # V6 multi-batch function-learning screen (preregistered)
 
-Status: **design freeze; runnable implementation reviewed GO; no CUDA launch yet**
+Status: **registered run complete and independently verified; `DOES_NOT_SCALE`**
 Date: 2026-09-05 CDT  
 Evidence class: **selection-only single-seed screen**  
-Research claim: **false until a complete registered root is analyzed**  
+Research claim: **false; completed evidence is selection-only and negative**
 Promotion authority: **next-diagnostic branch selection only; no checkpoint promotion**  
 Public ARC authorization: **none**  
 Selected by: registered fixed-batch P outcome `same_row_action_conditioned_fit`  
@@ -29,6 +29,52 @@ Runnable Slice 2 NO-GO review: Fable 5.1 High, SHA-256
 
 Corrected runnable Slice 2 GO review: Fable 5.1 High, SHA-256
 `02df7fd5b68f64ba1998909fa9924168d365b6cfa31e370c4637aec1353786ab`
+
+Locked binary GO review: Fable 5.1 High, SHA-256
+`e441361ef19a3337efb1a63f34007d8ec78be5ef582d213cf3dbf1c4c0ae2990`
+
+Same-binary preflight packet / GO review SHA-256:
+`b050b9676fba4c2f195dc54a5aea0817d55fa89364b6f70b8e81c123a3d9a4c7` /
+`adb828f8f6e97f80336fcbf93497c65460ce1783946d6d23367ef89d76a9fc6f`
+
+Registered G outcome GO review: Fable 5.1 High, SHA-256
+`0a70421897844ed80ad40dada18c80d1087fc638990281e84a9d7399ee8b89ed`
+
+## Registered outcome (2026-09-06 CDT)
+
+The clean pushed source `dba110de8ed467b58dbaa2a936565f0dc8a7b794`
+and locked cuDNN binary
+`sha256:faf6fb74820582de8f1a62675392de19a729a9961a2573fc8bf8c96358631f44`
+passed the eight-update same-binary preflight, then completed all 2,048
+registered updates on the RTX 5060 Laptop GPU. The registered root is
+`/home/stepan/Coding/Personal/.tofy-build/v6-multibatch-g-registered-20260906T002436-CDT`.
+Its report SHA-256 is
+`03f645a5cccfbd4dcf72bf9927ac15589dc8fa579c6330f254101ed70c18789f`,
+identity is
+`sha256:1d470fc1b5680e33efa07e32c51bf74fa0a73bea6e839828da09fd7922eee265`,
+and all 49 manifest entries verify under external manifest SHA-256
+`900488b44e0f1623513234839f0f777d2c1d052ec3c46458fb714383868748d4`.
+
+At raw update 2,048, train full exact was `2/725` (floor `363`), held-out
+changed exact was `3/726` (floor `146` and tied with background), held-out
+full exact was `0/726` (floor `73`), held-out AR and coordinate groups were
+both `0`, and counterfactual correctness was `507/1456` versus factual `472`,
+copy `643`, and background `571`. Every registered gate was false. Train
+changed exact nevertheless reached `709/725`, while 19,100 false-edit pixels
+across 1,022/1,024 train rows prevented board-level fit.
+
+The fixed-priority verdict is `DOES_NOT_SCALE`. The extension signal is false:
+train full exact rose only `0` to `2` from updates 1,024 to 2,048, below the
+fixed `+73` threshold. This selects a new matched eight-batch prediction-only
+discriminator after frozen-checkpoint gradient, false-edit, and per-batch
+diagnostics; it does not authorize an automatic 4,096-update extension.
+
+The class is visit-confounded. G supplied only 128 to 256 visits per batch in
+the extension-signal window, while parent P also had zero full-exact rows at
+256 visits and reached `70/95` only after 512. Therefore the false signal binds
+the preregistered branch but does not show that a 512-visit extension would
+fail. G is selection-only, single-seed evidence with no checkpoint,
+generalization, public ARC, or level-completion claim.
 
 Pre-implementation census clarification (recorded before any preflight or G
 checkpoint existed): the frozen `1006/1005` tuple counts include the sidecar
