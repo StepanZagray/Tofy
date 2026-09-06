@@ -4,6 +4,95 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Offline public reference and evaluator correction (2026-09-06)
+
+The frozen G final raw step-2048 checkpoint completed **0/23 levels** with
+canonical engine **0/100** on three public games. The corrected run consumed
+exactly **128 charged actions per game (127 policy actions + one retry reset)**,
+384 total, in **57.593 seconds**. This is a bounded evaluator confirmation,
+not a model improvement or private competition score. The greedy policy has
+no trained reward/value objective, uses UNKNOWN rule conditioning, and the G
+checkpoint already failed held-out synthetic transition gates. Factual v6
+context is enabled; no online adaptation occurred and richer AgentSession state
+is not consumed. No optimizer or training update occurred.
+
+| Public game | Levels | Charged actions | Policy actions / resets | Elapsed seconds |
+|---|---:|---:|---:|---:|
+| ar25-0c556536 | 0/8 | 128 | 127 / 1 | 20.298 |
+| bp35-0a0ad940 | 0/9 | 128 | 127 / 1 | 18.545 |
+| cd82-fb555c5d | 0/6 | 128 | 127 / 1 | 18.748 |
+
+ar25 repeated ACTION5 127 times. bp35 clicked (1,1) 127 times. cd82 used
+82 ACTION5, 31 ACTION2 and 14 clicks at (0,0). These observed patterns do not
+identify a causal model defect by themselves. All games hit the action cap;
+the short cap cannot establish what would happen with the official runtime.
+
+The first screen at c2dfa009 incorrectly excluded charged retry resets from
+its cap: 128 policy actions + one reset = 129 native actions per game, 387 total.
+It scored 0 and remains exploratory evidence with a registered budget deviation.
+The new counter includes resets, versions the contract digest, reports both
+charged/non-reset counts and fails if its counts disagree with the native
+scorecard. In the fresh confirmation, every action/coordinate and observed
+frame/state/level prefix matched the original run; each omitted only the last
+old policy action. All final frames were ingested without an extra decision.
+The SDK retains an earlier GAME_OVER across a retry; routine NOT_FINISHED
+observations do not clear its stored terminal state. The last factual frames
+here were NOT_FINISHED. Scorecard closure does not change that state, and its
+GAME_OVER is not an additional policy-induced failure.
+
+The local pretrained reference **did not run**: the pinned Qwen3.5-9B Q4_K_M
+weights did not finish downloading within the bounded asset-preparation attempts.
+Its text-only client and managed server are fixture-tested; actual model loading,
+context fit and gameplay remain unverified. Thus the original two-arm screen
+has not passed or completed, and there is no Tofy-versus-Qwen comparison.
+The candidate lacks vision, Python tools and explicit long-term rule memory;
+those remain separate interventions, not demonstrated capabilities.
+
+Implementation and validation: 21 Python tests, 6 targeted Rust lifecycle tests,
+Ruff 0.16.6, Rust formatting and CUDA/cuDNN release builds passed. Both exact
+binaries passed separate two-action real-engine smokes. The original and
+corrected three-game runs sealed successfully; all manifest entries verified
+and all evaluator/model PIDs exited. Retained partial model bytes are preparation
+artifacts only. The older run_local and Kaggle wrappers already existed; this
+work adds a common controlled runner. Their separate legacy lifecycle gaps
+are not fixed by this new runner, and submission readiness is not certified.
+
+**Exact provenance**
+
+- Confirmed evaluator source: `9d78323444e36852f5cd24d20a96e63656597268` (clean, reviewed, pushed).
+- Dependency: `8e012f25e38f0c597c14268f0c705e504a5b5c28` (clean and pushed).
+- Build: `cargo build --release --locked --features cudnn`.
+- Binary SHA-256: `b77096856a0f40e8436a6311a24caa06ed2a2fec5c754e09f879f933afd4f92c`.
+- G raw checkpoint SHA-256: `07ef8d1b3b79d99fad61c3fb9ae4de193ff2a2fc77ba8a4a1e5b33bcbdb70b1a`; source run
+  `v6-multibatch-g-registered-20260906T002436-CDT` at
+  `dba110de8ed467b58dbaa2a936565f0dc8a7b794`.
+- Hardware: RTX 5060 Laptop, 8151 MiB, driver 610.57.04; candidate batch 128,
+  no gradient accumulation/training. Python 3.12, arc-agi 0.9.9, arcengine 0.9.3,
+  NumPy 2.5.2. Full exact identity is in the preparation root below.
+- Corrected run: `/home/stepan/Coding/Personal/.tofy-build/prize-tofy-charged-confirmation-20260906T163500-CDT`.
+- Corrected report SHA-256: `f3e4a62102461afbaac6622434b419d6161edc92c21efa3feb35c7bc75daa7bd`.
+- Corrected external manifest SHA-256: `631db53c16d4f4a557e68c64bd0671afc56501d7d2e8b272266aafc34f297bff`.
+- Original root: `/home/stepan/Coding/Personal/.tofy-build/prize-tofy-public-screen-20260906T162700-CDT`;
+  manifest `60a7e1cc07553240d2ff313503ebb723225a1d37a01ca624409f9f623d06bf46`.
+- Corrected verification/config/build root: `/home/stepan/Coding/Personal/.tofy-build/prize-charged-actions-preparation-20260906T163300-CDT`.
+
+Exact corrected command, from the clean launch checkout:
+
+```bash
+PYTHONPATH=python /home/stepan/Coding/Personal/.tofy-build/arcagi-0.9.9-venv/bin/python -m tofy_arc3.run_baseline \
+  --config /home/stepan/Coding/Personal/.tofy-build/prize-charged-actions-preparation-20260906T163300-CDT/tofy-screen.json \
+  --output-dir /home/stepan/Coding/Personal/.tofy-build/prize-tofy-charged-confirmation-20260906T163500-CDT
+```
+
+The output root is sealed and must not be reused. The
+[initial preregistration](research/2026-09-06-arc3-reference-screen-prereg.md),
+[accounting amendment](research/2026-09-06-arc3-charged-actions-confirmation.md)
+and [runner instructions](ARC3_BASELINES.md) own the contract and reproduction
+procedure. New confirmation roots are implementation evidence only; one seed
+and previously public games cannot support generalization or prize forecasts.
+Next: complete the pinned pretrained asset and non-game device/context checks,
+then register its reference screen. No automatic Tofy retraining is justified.
+
 ## Frozen fields for the first experimental run
 
 Before inspecting a full run, record here:
