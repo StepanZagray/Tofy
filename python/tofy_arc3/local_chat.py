@@ -1,0 +1,323 @@
+"""Deterministic local-chat baseline for ARC-AGI-3 observations."""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import re
+import time
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+
+_MAX_RESPONSE_BYTES = 1 << 20
+_FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
+
+SYSTEM_PROMPT = """You are an ARC-AGI-3 game-playing policy. Infer the visible game's rules and goal only from the observation sequence and the results of prior actions. Aim to make progress and reach WIN while using actions efficiently. The board is provided as lossless text; you have no vision, code-execution, external-data, or game-source tools.
+
+The available decision actions use the normal ARC action protocol: ACTION1=up input, ACTION2=down input, ACTION3=left input, ACTION4=right input, ACTION5=interact, ACTION6=coordinate input, and ACTION7=undo. RESET is handled by the caller and cannot be selected here. These are interface meanings only: an action's actual game effect can vary, and directional inputs do not necessarily move a player. Palette symbols 0-F are categorical values with no assumed color or object meaning.
+
+Choose one listed available action. Reply with exactly one JSON object. For ACTION6 use {"action_id":6,"x":0,"y":0}, with x and y in 0..63. For every other action use {"action_id":N} and omit x and y. Do not include prose or extra keys."""
+
+
+class LocalChatError(RuntimeError):
+    """The local endpoint or its assistant response violated the contract."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _completion_url(endpoint: str) -> str:
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("endpoint must be a non-empty URL")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("endpoint must be an HTTP(S) loopback URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("endpoint credentials are not allowed")
+    if parsed.query or parsed.fragment:
+        raise ValueError("endpoint query strings and fragments are not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("endpoint port is invalid") from exc
+    host = parsed.hostname.lower()
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError as exc:
+        raise ValueError("endpoint host must be numeric loopback") from exc
+    if host not in {"127.0.0.1", "::1"}:
+        raise ValueError("endpoint host must be 127.0.0.1 or ::1")
+    path = parsed.path
+    if path in {"", "/"}:
+        path = "/v1/chat/completions"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _integer(value: Any, field: str, *, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{field} must be in 0..{maximum}")
+    return value
+
+
+def _observation_text(
+    observation: dict[str, Any], *, require_actions: bool = True
+) -> tuple[tuple[str, str], str, list[int], str]:
+    if not isinstance(observation, dict):
+        raise ValueError("observation must be a JSON object")
+    game_id = observation.get("game_id")
+    guid = observation.get("guid")
+    if not isinstance(game_id, str) or not game_id:
+        raise ValueError("observation game_id must be a non-empty string")
+    if not isinstance(guid, str) or not guid:
+        raise ValueError("observation guid must be a non-empty string")
+    state = observation.get("state")
+    if state not in {"NOT_STARTED", "NOT_FINISHED", "WIN", "GAME_OVER"}:
+        raise ValueError("observation state is invalid")
+    levels_completed = _integer(observation.get("levels_completed"), "levels_completed")
+    win_levels = _integer(observation.get("win_levels"), "win_levels")
+    full_reset = observation.get("full_reset")
+    if not isinstance(full_reset, bool):
+        raise ValueError("observation full_reset must be a boolean")
+    available = observation.get("available_actions")
+    if not isinstance(available, list) or (require_actions and not available):
+        requirement = "a non-empty list" if require_actions else "a list"
+        raise ValueError(f"observation available_actions must be {requirement}")
+    for index, action_id in enumerate(available):
+        _integer(action_id, f"available_actions[{index}]", maximum=7)
+    if len(set(available)) != len(available):
+        raise ValueError("observation available_actions must be unique")
+    if require_actions:
+        available = [action_id for action_id in available if action_id != 0]
+        if not available:
+            raise ValueError("observation has no available non-reset action")
+
+    frames = observation.get("frame")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("observation frame must contain at least one layer")
+    rendered: list[str] = []
+    for layer_index, layer in enumerate(frames):
+        if not isinstance(layer, list) or len(layer) != 64:
+            raise ValueError(f"frame layer {layer_index} must have 64 rows")
+        rows: list[str] = []
+        for row_index, row in enumerate(layer):
+            if not isinstance(row, list) or len(row) != 64:
+                raise ValueError(
+                    f"frame layer {layer_index} row {row_index} must have 64 cells"
+                )
+            values = [
+                _integer(value, f"frame[{layer_index}][{row_index}]", maximum=15)
+                for value in row
+            ]
+            rows.append("".join(format(value, "X") for value in values))
+        rendered.append(f"layer {layer_index}:\n" + "\n".join(rows))
+
+    text = (
+        "Visible observation:\n"
+        f"state={state}\n"
+        f"levels_completed={levels_completed}\n"
+        f"win_levels={win_levels}\n"
+        f"full_reset={json.dumps(full_reset)}\n"
+        f"available_actions={json.dumps(available, separators=(',', ':'))}\n"
+        "Each frame row is 64 lossless hexadecimal palette symbols (0-F); x is the "
+        "column and y is the row.\n"
+        + "\n".join(rendered)
+    )
+    return (game_id, guid), text, available, state
+
+
+def _parse_action(content: str, available: list[int]) -> dict[str, int]:
+    candidate = content.strip()
+    fenced = _FENCED_JSON.fullmatch(candidate)
+    if fenced:
+        candidate = fenced.group(1).strip()
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(candidate, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise LocalChatError("assistant response is not strict JSON") from exc
+    if not isinstance(value, dict):
+        raise LocalChatError("assistant action must be a JSON object")
+    action_id = value.get("action_id")
+    if isinstance(action_id, bool) or not isinstance(action_id, int):
+        raise LocalChatError("assistant action_id must be an integer")
+    if action_id not in available:
+        raise LocalChatError(f"assistant chose unavailable action {action_id}")
+    expected_keys = {"action_id", "x", "y"} if action_id == 6 else {"action_id"}
+    if set(value) != expected_keys:
+        raise LocalChatError("assistant action has missing or extra keys")
+    result = {"action_id": action_id}
+    if action_id == 6:
+        try:
+            result["x"] = _integer(value["x"], "assistant ACTION6 x", maximum=63)
+            result["y"] = _integer(value["y"], "assistant ACTION6 y", maximum=63)
+        except ValueError as exc:
+            raise LocalChatError(str(exc)) from exc
+    return result
+
+
+class LocalChatAgent:
+    """Choose validated actions through a loopback OpenAI-compatible endpoint."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        *,
+        seed: int = 0,
+        max_tokens: int = 1024,
+        timeout: float = 30,
+        history_turns: int = 4,
+    ) -> None:
+        self.endpoint = _completion_url(endpoint)
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
+        self.model = model
+        self.seed = _integer(seed, "seed")
+        self.max_tokens = _integer(max_tokens, "max_tokens")
+        if self.max_tokens == 0:
+            raise ValueError("max_tokens must be positive")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive")
+        self.timeout = float(timeout)
+        self.history_turns = _integer(history_turns, "history_turns")
+        self._history: list[tuple[str, str | None, str | None]] = []
+        self._session: tuple[str, str] | None = None
+        self._open: Callable[..., Any] = build_opener(
+            ProxyHandler({}), _NoRedirect()
+        ).open
+
+    def choose_action(self, observation: dict[str, Any]) -> dict[str, Any]:
+        session, observation_text, available, state = _observation_text(observation)
+        if state != "NOT_FINISHED":
+            raise ValueError("choose_action requires a NOT_FINISHED observation")
+        if session != self._session:
+            self._history.clear()
+            self._session = session
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        for prior_observation, prior_action, terminal_feedback in self._history:
+            messages.append({"role": "user", "content": prior_observation})
+            if prior_action is not None:
+                messages.append({"role": "assistant", "content": prior_action})
+            if terminal_feedback is not None:
+                messages.append({"role": "user", "content": terminal_feedback})
+        messages.append({"role": "user", "content": observation_text})
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": self.seed,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        request = Request(
+            self.endpoint,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        started = time.perf_counter()
+        try:
+            with self._open(request, timeout=self.timeout) as response:
+                status = getattr(response, "status", None)
+                if status is None and hasattr(response, "getcode"):
+                    status = response.getcode()
+                if status is not None and not 200 <= status < 300:
+                    raise LocalChatError(f"chat endpoint returned HTTP {status}")
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            raise LocalChatError(f"chat endpoint returned HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise LocalChatError(f"chat request failed: {exc}") from exc
+        latency = time.perf_counter() - started
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            raise LocalChatError("chat response exceeds the size limit")
+        try:
+            envelope = json.loads(raw.decode("utf-8"))
+            choices = envelope["choices"]
+            message = choices[0]["message"]
+            content = message["content"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise LocalChatError("chat endpoint returned an invalid completion response") from exc
+        if not isinstance(content, str):
+            raise LocalChatError("assistant response content must be text")
+        action = _parse_action(content, available)
+        canonical_action = json.dumps(action, separators=(",", ":"))
+        if self.history_turns:
+            self._history.append((observation_text, canonical_action, None))
+            del self._history[:-self.history_turns]
+        usage = envelope.get("usage", {})
+        if not isinstance(usage, dict):
+            usage = {}
+        telemetry = {
+            "elapsed_seconds": latency,
+            "token_usage": usage,
+            "raw_assistant_response": content,
+        }
+        if "reasoning_content" in message:
+            telemetry["reasoning_content"] = message["reasoning_content"]
+        return {
+            **action,
+            "telemetry": telemetry,
+        }
+
+    def observe_terminal(self, observation: dict[str, Any]) -> None:
+        """Record WIN/GAME_OVER feedback without making an HTTP request."""
+        session, observation_text, _, state = _observation_text(
+            observation, require_actions=False
+        )
+        if state not in {"WIN", "GAME_OVER"}:
+            raise ValueError("observe_terminal requires a terminal observation")
+        if session != self._session:
+            self._history.clear()
+            self._session = session
+        if self.history_turns:
+            if self._history and self._history[-1][1] is not None:
+                prior_observation, prior_action, _ = self._history[-1]
+                self._history[-1] = (
+                    prior_observation,
+                    prior_action,
+                    observation_text,
+                )
+            else:
+                self._history.append((observation_text, None, None))
+                del self._history[:-self.history_turns]
+
+    def close(self) -> None:
+        """No persistent transport is held by this client."""
