@@ -42,6 +42,40 @@ same-shape train/eval differences. Two earlier roots failed before CUDA on
 build-command and digest-representation provenance checks and are preserved as
 failed infrastructure only.
 
+## V6 frozen seam characterization (2026-09-06; `EXECUTION_SHAPE`)
+
+The registered characterization at clean pushed revision
+`3d92157073d072fd81ae291074665201adc05dbd`, locked cuDNN binary
+`sha256:eec79d05f8b55b1f8c1ac86ab2dfc13f83186a0664568128e37f4649f512f2e4`,
+and the exact G GPU completed in `10.374652553 s`. All active input tensor
+fingerprints matched. Batch-128 training repeats and chunk-32 evaluator repeats
+were each bit-identical, and the batch-128 evaluator was bit-identical to the
+training seam across all 8,388,608 logits.
+
+Only batch 128 versus chunk 32 differed: 216 pixel argmaxes across 107/128
+rows. Absolute logit delta had median `0.0002049208`, p99 `0.0009038001`, and
+max `0.0021985769`; the batch-128 top-two margin at disagreement pixels had
+median `0.0002462268` and max `0.0013461113`. The preregistered threshold-free
+branch is therefore `EXECUTION_SHAPE`: chunk-32 decode is sufficient to
+reproduce the mismatch on these rows, while active-input and residual
+same-shape train/eval differences are excluded in this execution order.
+
+The sealed root is
+`v6-frozen-seam-characterization-20260906T085541-CDT`; report SHA-256 is
+`787d30d78c4c53dda54becb1a0222ace46ae1cee89f83ae2d21abc49b41b206c`,
+external manifest SHA-256 is
+`0fe477652d7d3e34e347896ac0cc427db564084f40ccb584131ce77663eebbb3`,
+and every manifest entry verified. This is characterization-only evidence: no
+backward, optimizer, EMA, checkpoint write, model-quality result, training
+authority, or public ARC access exists. Do not weaken or rerun the old rail.
+The failed comparand was not preserved and its gradient cell had a preceding
+rollout backward absent from this run, although its spec confirms the same one-
+batch 128-row encoder population. The next step is a newly reviewed diagnostic
+contract whose D1 mask and gradients use the same captured batch-128 logits,
+with chunk 32 retained only as a descriptive G-comparable control. That contract
+must replace the old D1=D2 false-edit-count invariant and forbid interpreting
+the two false-edit populations as directly comparable.
+
 ## Foundation-v2 recipe repair smoke (2026-09-05; bounded PASS)
 
 The exact pushed revision
