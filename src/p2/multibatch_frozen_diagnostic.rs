@@ -349,11 +349,23 @@ pub struct GradientComponentReport {
     pub prefixes: BTreeMap<String, PrefixGradientNorm>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReconstructionCheck {
     pub global_relative_or_absolute_residual: f64,
     pub adamw_relative_or_absolute_residual: f64,
     pub muon_relative_or_absolute_residual: f64,
+    #[serde(default)]
+    pub global_reference_l2: f64,
+    #[serde(default)]
+    pub global_absolute_residual_l2: f64,
+    #[serde(default)]
+    pub adamw_reference_l2: f64,
+    #[serde(default)]
+    pub adamw_absolute_residual_l2: f64,
+    #[serde(default)]
+    pub muon_reference_l2: f64,
+    #[serde(default)]
+    pub muon_absolute_residual_l2: f64,
     pub passed: bool,
 }
 
@@ -696,25 +708,51 @@ fn reconstruction_check(
     reconstructed: &GradStore,
     varmap: &VarMap,
 ) -> Result<ReconstructionCheck> {
-    let check = |route| -> Result<(f64, bool)> {
+    let check = |route| -> Result<(f64, bool, f64, f64)> {
         let reference = gradient_l2_for_optimizer_route(direct, varmap, route)?;
         let residual = residual_norm(direct, reconstructed, varmap, route)?;
         if reference < NORM_EPSILON {
-            Ok((residual, residual <= NORM_EPSILON))
+            Ok((residual, residual <= NORM_EPSILON, reference, residual))
         } else {
             let relative = residual / reference;
-            Ok((relative, relative <= RECONSTRUCTION_REL_TOLERANCE))
+            Ok((
+                relative,
+                relative <= RECONSTRUCTION_REL_TOLERANCE,
+                reference,
+                residual,
+            ))
         }
     };
-    let (global, global_pass) = check(OptimizerRoute::All)?;
-    let (adamw, adamw_pass) = check(OptimizerRoute::AdamW)?;
-    let (muon, muon_pass) = check(OptimizerRoute::Muon)?;
+    let (global, global_pass, global_reference_l2, global_absolute_residual_l2) =
+        check(OptimizerRoute::All)?;
+    let (adamw, adamw_pass, adamw_reference_l2, adamw_absolute_residual_l2) =
+        check(OptimizerRoute::AdamW)?;
+    let (muon, muon_pass, muon_reference_l2, muon_absolute_residual_l2) =
+        check(OptimizerRoute::Muon)?;
     Ok(ReconstructionCheck {
         global_relative_or_absolute_residual: global,
         adamw_relative_or_absolute_residual: adamw,
         muon_relative_or_absolute_residual: muon,
+        global_reference_l2,
+        global_absolute_residual_l2,
+        adamw_reference_l2,
+        adamw_absolute_residual_l2,
+        muon_reference_l2,
+        muon_absolute_residual_l2,
         passed: global_pass && adamw_pass && muon_pass,
     })
+}
+
+fn ensure_reconstructions(
+    full: &ReconstructionCheck,
+    prediction: &ReconstructionCheck,
+) -> Result<()> {
+    ensure!(
+        full.passed && prediction.passed,
+        "gradient component reconstruction failed: {}",
+        serde_json::json!({"full": full, "prediction": prediction})
+    );
+    Ok(())
 }
 
 fn bounded_cosine(
@@ -2099,10 +2137,7 @@ fn gradient_cell(
     let full_reconstruction = reconstruction_check(&direct_full, &reconstructed_full, varmap)?;
     let prediction_reconstruction =
         reconstruction_check(&prediction_grads, &reconstructed_prediction, varmap)?;
-    ensure!(
-        full_reconstruction.passed && prediction_reconstruction.passed,
-        "gradient component reconstruction failed"
-    );
+    ensure_reconstructions(&full_reconstruction, &prediction_reconstruction)?;
 
     let full_stats =
         foundation_v2_gradient_route_stats(&direct_full, Some(&prediction_grads), varmap)?;
@@ -4355,12 +4390,14 @@ mod tests {
                 adamw_relative_or_absolute_residual: 0.0,
                 muon_relative_or_absolute_residual: 0.0,
                 passed: true,
+                ..Default::default()
             },
             prediction_reconstruction: ReconstructionCheck {
                 global_relative_or_absolute_residual: 0.0,
                 adamw_relative_or_absolute_residual: 0.0,
                 muon_relative_or_absolute_residual: 0.0,
                 passed: true,
+                ..Default::default()
             },
             ns_muon_cosine_full_to_prediction: Some(0.99),
             false_edit_to_auxiliary_cosine: Some(0.0),
@@ -5226,6 +5263,74 @@ mod tests {
             bounded_cosine(&GradStore::default(), &direct, &varmap, OptimizerRoute::All)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_serialization_retains_reference_and_absolute_residual() -> Result<()> {
+        let varmap = VarMap::new();
+        let var = Var::from_tensor(&Tensor::zeros((2,), DType::F32, &Device::Cpu)?)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("test.bias".into(), var.clone());
+        let mut direct = GradStore::default();
+        direct.insert(var.as_tensor(), Tensor::new(&[3f32, 4.0], &Device::Cpu)?);
+        let mut reconstructed = GradStore::default();
+        reconstructed.insert(var.as_tensor(), Tensor::new(&[4f32, 3.0], &Device::Cpu)?);
+        let check = reconstruction_check(&direct, &reconstructed, &varmap)?;
+        assert!(!check.passed);
+        let matching = reconstruction_check(&direct, &direct, &varmap)?;
+        ensure_reconstructions(&matching, &matching)?;
+        let error = ensure_reconstructions(&check, &matching)
+            .unwrap_err()
+            .to_string();
+        let serialized = error
+            .strip_prefix("gradient component reconstruction failed: ")
+            .unwrap();
+        let failure: serde_json::Value = serde_json::from_str(serialized)?;
+        assert_eq!(failure["full"], serde_json::to_value(&check)?);
+        assert_eq!(failure["prediction"], serde_json::to_value(&matching)?);
+        let value = serde_json::to_value(check)?;
+        assert_eq!(value["global_reference_l2"], 5.0);
+        assert!(
+            (value["global_absolute_residual_l2"].as_f64().unwrap() - 2f64.sqrt()).abs() < 1e-6
+        );
+        assert_eq!(value["muon_reference_l2"], 0.0);
+        assert_eq!(value["muon_absolute_residual_l2"], 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_capture_preserves_relative_and_near_zero_boundaries() -> Result<()> {
+        let varmap = VarMap::new();
+        let var = Var::from_tensor(&Tensor::zeros((1,), DType::F32, &Device::Cpu)?)?;
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert("test.bias".into(), var.clone());
+        let gradient = |value: f32| -> Result<GradStore> {
+            let mut store = GradStore::default();
+            store.insert(var.as_tensor(), Tensor::new(&[value], &Device::Cpu)?);
+            Ok(store)
+        };
+        for (reference, delta, expected) in [
+            (1f32, 5e-6, true),
+            (1.0, 2e-5, false),
+            (0.0, 5e-7, true),
+            (0.0, 2e-6, false),
+        ] {
+            let check = reconstruction_check(
+                &gradient(reference)?,
+                &gradient(reference + delta)?,
+                &varmap,
+            )?;
+            assert_eq!(check.passed, expected);
+            assert_eq!(check.global_reference_l2, f64::from(reference));
+            assert!(check.global_absolute_residual_l2 > 0.0);
+        }
         Ok(())
     }
 

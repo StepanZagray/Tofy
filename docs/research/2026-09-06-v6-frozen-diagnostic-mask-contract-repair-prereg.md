@@ -1,6 +1,6 @@
 # V6 frozen diagnostic mask-contract repair (preregistered design)
 
-Status: **implementation independently reviewed GO; CUDA preflight pending**
+Status: **CUDA preflight failed gradient reconstruction; full diagnostic blocked**
 Date: 2026-09-06 CDT
 Evidence class: **diagnostic implementation/integrity repair**
 Research claim: **false until a separately admitted registered run completes**
@@ -290,3 +290,20 @@ internally coherent on the frozen control grid. It does not restore the old
 failed run, prove model quality, select prediction-only training, authorize a
 long run, or permit public ARC evaluation. The registered diagnostic remains
 the next evidence step only after separate analysis and review.
+
+## Executed preflight outcome (2026-09-06 CDT)
+
+The single preflight at source `b8599aed5a50ef9cb868fd8d8db893c6f18f50ae`
+used binary `9a422b4adceb65e58a88b7efd7eb22bb01ff01444926d2a103271429102794de`
+and root `v6-mask-contract-preflight-20260906T105609-CDT`. It sealed after
+18.690125872 seconds with `gradient component reconstruction failed`, zero
+completed D1 cells, step-0 train/held-out primary and legacy rescoring only, and
+no runtime estimate or verdict. Both step-0 primary hosts were accepted; later
+checkpoints and completion-time D1 bindings remain untested. The failure guard
+discarded both reconstruction residuals, so its cause is unknown.
+
+Report SHA-256: `3b5f0e5e79a89c29e2b0a39e9a546c95843908cc049cf350e8785adf677b403a`.
+External manifest SHA-256: `1cb732c54756a0b1cca3428c05a9dc901c2727be83f7e5d3bb9ff4cdad2d0eec`.
+Every manifest entry verified and PID 31839 exited. No optimizer/EMA update or
+public ARC access occurred. This is failed infrastructure/integrity evidence;
+the full diagnostic remains blocked and this registration authorizes no retry.

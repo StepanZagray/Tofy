@@ -17,6 +17,33 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 repaired diagnostic preflight (2026-09-06; reconstruction failure)
+
+At clean pushed source `b8599aed5a50ef9cb868fd8d8db893c6f18f50ae`, binary
+`9a422b4adceb65e58a88b7efd7eb22bb01ff01444926d2a103271429102794de`, the one
+reviewed CUDA preflight accepted step-0 batch-128 train and held-out primary
+scoring and preserved the separate chunk-32 controls. Primary/legacy argmax
+disagreement was 216 pixels across 107 train rows and 213 across 104 held-out
+rows. It then failed `gradient component reconstruction failed` before its
+first completed D1 cell. The run took 18.690125872 seconds and no optimizer/EMA
+step. Neither reconstruction residual was saved, so the failed route, magnitude,
+and cause remain unknown; later anatomy, runtime admission, and classification
+were not reached. These are initialization/integrity observations, not model
+quality evidence or a completed mask-binding success.
+
+Root: `v6-mask-contract-preflight-20260906T105609-CDT`. Report SHA-256:
+`3b5f0e5e79a89c29e2b0a39e9a546c95843908cc049cf350e8785adf677b403a`; external
+manifest SHA-256: `1cb732c54756a0b1cca3428c05a9dc901c2727be83f7e5d3bb9ff4cdad2d0eec`.
+All sealed files verified and the process exited. The full diagnostic and
+treatment training remain blocked. Audit the sum algebra before a separately
+registered residual-capture experiment; retain every frozen tolerance.
+
+```bash
+../binaries/tofy-b8599aed-9a422b4adceb-cudnn p2-v6-multibatch-frozen-diagnostic \
+  --g-report ../v6-multibatch-g-registered-20260906T002436-CDT/report.json \
+  --device cuda --output-root ../v6-mask-contract-preflight-20260906T105609-CDT
+```
+
 ## V6 frozen-diagnostic seam prerequisite (2026-09-06; falsified)
 
 The reviewed frozen-checkpoint diagnostic at pushed revision
