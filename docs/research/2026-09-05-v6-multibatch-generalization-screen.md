@@ -1,6 +1,6 @@
 # V6 multi-batch function-learning screen (preregistered)
 
-Status: **design freeze; no implementation or GPU launch yet**  
+Status: **design freeze; host-only foundation implemented; no runnable command or GPU launch yet**
 Date: 2026-09-05 CDT  
 Evidence class: **selection-only single-seed screen**  
 Research claim: **false until a complete registered root is analyzed**  
@@ -17,6 +17,22 @@ Preregistration NO-GO review: Fable 5.1 High, SHA-256
 `edeaab6097ae1276b8d991948e9c12926c664f0a237b4425813c0628459fc0f6`  
 Corrected preregistration GO review: Fable 5.1 High, SHA-256
 `60fa397ee99ed06b4d457838fa6e339713fb2cd12eac39b9a48ea13d6a0d30fd`
+
+Host Slice 1 NO-GO review: Fable 5.1 High, SHA-256
+`b9d2741c0fa45cc46a7b5ada213f4d3ce5651ce3e9a04a54ad671e8ec8ec5028`
+
+Corrected host Slice 1 GO review: Fable 5.1 High, SHA-256
+`ec13909147dbddc8000c6845257abd2c228e83bb1b26d7d8ba2ec91170500193`
+
+Pre-implementation census clarification (recorded before any preflight or G
+checkpoint existed): the frozen `1006/1005` tuple counts include the sidecar
+episode operator used for exact counterfactual replay; they are not the
+operator conditioning visible to the V6 model. Recomputing the same keys with
+the model-visible UNKNOWN operator gives `955/945` unique train/held-out
+tuples. Both definitions have exactly zero train/held-out overlap. The
+implementation freezes and checks both. This corrects terminology and adds a
+strictly coarser leakage check; it changes no population, threshold, outcome,
+or branch rule.
 
 This document must be reviewed, committed, and pushed before implementation.
 The implementation commit, exact locked CUDA binary, and its sealed preflight
@@ -127,11 +143,11 @@ Held-out per-group counts of distinct changed ACTION6 target classes are
 gate below.
 
 Train/held-out exact overlaps are zero for current frames, frame-action keys,
-and `(current, action, goal, context, operator)` model-input tuples. Unique
-train/held-out counts are `701/706` frames, `871/876` frame-action keys, and
-`1006/1005` model-input tuples. Population construction must reproduce every
-count or fail before CUDA training. Serialize every batch, hash it, and bind an
-ordered union identity.
+sidecar-operator input tuples, and model-visible UNKNOWN-operator input tuples.
+Unique train/held-out counts are `701/706` frames, `871/876` frame-action keys,
+`1006/1005` sidecar-operator tuples, and `955/945` model-visible tuples.
+Population construction must reproduce every count or fail before CUDA
+training. Serialize every batch, hash it, and bind an ordered union identity.
 
 The eight train rollout batches contain 256 rows, 256 unique current frames,
 and 256 unique frame-action keys. Their exact current-frame and frame-action
