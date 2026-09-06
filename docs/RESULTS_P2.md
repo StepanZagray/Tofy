@@ -17,6 +17,98 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 frozen-model precision control (2026-09-06)
+
+For the exact G step-0 checkpoint and train batch position 0 under the frozen
+paired warmup, NVIDIA_TF32_OVERRIDE=0 was sufficient to make both full and
+prediction reconstruction pass all six route checks. Default CUDA failed all
+six. The relative tolerance stayed at 1e-5; every reference norm was nonzero
+and well above the 1e-6 near-zero branch threshold. Every parameter fingerprint
+was unchanged before/after each arm, and both arms rebound the same sealed G.
+
+| Reconstruction | Route | Default relative residual | TF32 disabled relative residual |
+|---|---|---:|---:|
+| full | global | 0.0002365730125 | 1.111078057e-06 |
+| full | adamw | 0.0002228097424 | 1.035291711e-06 |
+| full | muon | 0.0002538104713 | 1.204993784e-06 |
+| prediction | global | 0.0002095010641 | 1.047552722e-06 |
+| prediction | adamw | 0.0002052264268 | 9.523671357e-07 |
+| prediction | muon | 0.0002150186259 | 1.161431628e-06 |
+
+All six default residuals are near 2e-4; all disabled-arm residuals are below
+1.3e-6. This is a numerical characterization, not a model-quality improvement.
+The original step-0 default residuals from the 274ad4b7 capture were reproduced
+to small F32 reduction differences despite the explicitly different warmup.
+
+Precision also changed the forward: the captured false-edit mask count was
+496886 with default math and 496914 with the override (+28). Each arm's count
+and fingerprint matched its own captured logits/mask binding. Logit and mask
+hashes differ across arms. These are initialization outputs, not performance
+promotion metrics; no claim of prediction improvement follows. The experiment
+changes precision for the whole process, not only backward execution, so it
+does not separate forward perturbations from backward kernel behavior.
+
+## Interpretation and limits
+
+The paired intervention supports a backend precision explanation for this
+fixed reconstruction failure. Together with the prior fixed-convolution control,
+it shows that exact real-arithmetic additivity cannot be assumed to meet the
+frozen tolerance under the default backend. It does not identify exact TF32
+kernels, exclude algorithm changes induced by the override, or guarantee the
+same result at later checkpoints/batches. No repeated model pair or multiseed
+promotion claim was registered, so none is inferred.
+
+The test-only stop intentionally occurred before original reconstruction
+admission, G loss/route checks, held-out/D2 scores, later checkpoints, anatomy,
+classifier and runtime admission. Those remain unmeasured. Its warmup was one
+legacy raw train-batch forward, not the original D2/held-out allocator history.
+The production CLI and guard are unchanged. No optimizer, EMA, public ARC or
+training update occurred. The prior G model-quality failure remains unchanged.
+
+## Exact provenance
+
+- Source: `1ffa75917c5748e19605336c7fe5b792746ca7b3` (clean and pushed).
+- Dependency: `8e012f25e38f0c597c14268f0c705e504a5b5c28` (clean and pushed).
+- Binary SHA-256: `2a87c29313fc814d1cbad9f81ac03277252edd814bcb9124f7c8a8f72448120e`.
+- Build: `cargo test --release --locked --features cudnn --lib --no-run`; CUDA/cuDNN and release profile verified in build identity.
+- Root: `/home/stepan/Coding/Personal/.tofy-build/v6-frozen-reconstruction-precision-20260906T120014-CDT`.
+- Report SHA-256: `4dacaab638a5f8caa40689e444ae1afcea04a67a9c2fe9295da48b8bae8c6b03`.
+- External manifest SHA-256: `d58ddfd624edcb00d77659fbaa3104a25ba73bd95d73f5ca9ebb68afb980136f`.
+- G report SHA-256: `03f645a5cccfbd4dcf72bf9927ac15589dc8fa579c6330f254101ed70c18789f`.
+- G external manifest SHA-256: `900488b44e0f1623513234839f0f777d2c1d052ec3c46458fb714383868748d4`.
+- Step-0 checkpoint SHA-256: `0446ba05f4af1cc0603086bd10e2c38c23b9931473bb5ec3cf4536ca026ffa79`.
+- Census SHA-256: `062cc3ebcd1f0b2cf9dfe39ae255c58f930400eb4a28107d559add4fbdab06c3`.
+- GPU: NVIDIA GeForce RTX 5060 Laptop GPU, GPU-216be468-8184-1801-0563-7c67555dbc45, 610.57.04, 8151 MiB, 2 MiB; cuDNN 9.25.0.15, CUDA 13.3.1.
+- Physical batch 128; no optimizer/EMA step or training accumulation.
+- Default/disabled elapsed: 21.130977426/22.097731387 seconds, each below 60-second cap.
+- PIDs 78024 and 78137 exited 0; both /proc entries verified absent.
+
+Every recursive manifest entry, external digest/sidecar and binary hash verified.
+The sealed report stays complete_pending_analysis; this external analysis owns
+the decision and does not rewrite the point-in-time seal.
+
+Exact binary invocation for each arm:
+
+```bash
+/home/stepan/Coding/Personal/.tofy-build/binaries/tofy-frozen-precision-test-1ffa7591-2a87c29313fc-cudnn --ignored --exact p2::multibatch_frozen_diagnostic::tests::frozen_reconstruction_precision_characterization --nocapture --test-threads=1
+```
+
+Both set TOFY_FROZEN_RECONSTRUCTION_PROBE=1, TOFY_PRECISION_G_REPORT to the G
+report above, and TOFY_PRECISION_PROBE_ROOT to their unique arm directory.
+NVIDIA_TF32_OVERRIDE is absent in cuda_default and exactly0 in cuda_tf32_off.
+Other captured CUDA/CUBLAS environment settings are identical and unset.
+
+
+
+## Contract wording caveat from independent scrutiny
+
+The fixed-pair paragraph listed “masks” among invariants, while its interpretation
+section explicitly anticipated precision-induced forward differences. The actual
+false-edit masks differed. Read the supported result as a whole-process precision
+intervention with the same mask-construction rule, not as an experiment holding
+numerical activations and masks fixed. The archived preregistration is retained
+unchanged; this is an explicit outcome qualification, not a revised success gate.
+
 ## V6 synthetic convolution precision control (2026-09-06)
 
 On the one preregistered synthetic convolution, the default CUDA backward
