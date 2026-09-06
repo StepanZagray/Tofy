@@ -1,6 +1,6 @@
 # V6 frozen diagnostic mask-contract repair (preregistered design)
 
-Status: **design independently reviewed GO; implementation not started**
+Status: **implementation independently reviewed GO; CUDA preflight pending**
 Date: 2026-09-06 CDT
 Evidence class: **diagnostic implementation/integrity repair**
 Research claim: **false until a separately admitted registered run completes**
@@ -133,6 +133,10 @@ only: in-cell construction plus completion-time recorded-value checks. Exclude
 them from `ensure_gradient_control_matches` and
 `ensure_rescore_control_matches`. Cross-process controls continue to compare
 primary integer counts exactly and floats under the frozen tolerance.
+The descriptive `training_raw_argmax_disagreement_pixels` field is also excluded
+from cross-process controls: section 5 gives it no admission power, and its
+legacy union changes execution shape between preflight and registered runs.
+The inherited exclusion of anatomy margin quantiles is preserved.
 
 Report same-forward versus legacy argmax disagreement pixels/rows, absolute
 logit-delta summaries, and margins when both logits exist. Those fields are
@@ -233,6 +237,27 @@ Commit and push a clean source revision. Build only with
 Record source/dependency revisions, binary/Cargo/config/checkpoint/population
 hashes, exact GPU identity, command, and never-reused root. Fail closed on drift.
 
+Implementation review: **Opus 5 XHigh GO**, with no blockers, at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/mask-repair-final-20260906T104200/review.md`,
+SHA-256 `7c94c60e37c1c6d568567ca11cfb84c37c3172bcf6d0072c22d4050f887b7bcd`.
+The test-only fixture correction was independently confirmed GO at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/mask-repair-final-20260906T104200/correction-verdict.json`,
+SHA-256 `4ade6ad1aafda1662d3a46ed65925ecda78804f23f361e09995b0c089efa4446`.
+The final source file SHA-256 is `d4e0ee7ef7382b288a3b593eacc166f94a006f214d10477bba2de427d1250f90`.
+
+Validation: all-target locked compile, strict Clippy, 28 focused diagnostic
+cases (27 passed in the suite; the corrected serialization fixture passed its
+focused rerun), the unchanged chunking control, CLI help, and diff hygiene.
+The production source was unchanged during review. An earlier interrupted
+advisory and its retry's missing substantive output are not review verdicts.
+
+The reviewer confirmed the frozen thresholds now apply to the primary
+batch-128 population, that held-out training-seam rejection is a legitimate
+preflight failure, and that the added primary forwards may reject the runtime
+forecast. Redundant in-cell mask reconstruction/fingerprinting is retained;
+its measured cost remains inside the D1 timing. Descriptive comparisons have
+separate host timings and no numerical admission power.
+
 ## 9. Execution ladder and stop rule
 
 1. Run one unregistered CUDA preflight with the unchanged byte-frozen spec: D1
@@ -261,7 +286,7 @@ is sealed as infrastructure/integrity evidence and cannot satisfy admission.
 ## 10. Decision boundary
 
 A passing preflight establishes only that the repaired measurement contract is
-internally coherent on the frozen step-0 controls. It does not restore the old
+internally coherent on the frozen control grid. It does not restore the old
 failed run, prove model quality, select prediction-only training, authorize a
 long run, or permit public ARC evaluation. The registered diagnostic remains
 the next evidence step only after separate analysis and review.

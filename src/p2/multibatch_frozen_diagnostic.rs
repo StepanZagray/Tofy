@@ -58,6 +58,8 @@ const COMMAND_TAG: &str = "p2-v6-multibatch-frozen-diagnostic";
 const PREFLIGHT_MAX_WALL: Duration = Duration::from_secs(5 * 60);
 const REGISTERED_MAX_WALL: Duration = Duration::from_secs(20 * 60);
 const ADMISSION_DEVICE_SECONDS: f64 = 900.0;
+const PRIMARY_POPULATION: &str = "primary_same_forward";
+const LEGACY_POPULATION: &str = "legacy_g_chunk32";
 const NORM_EPSILON: f64 = 1e-6;
 const RECONSTRUCTION_REL_TOLERANCE: f64 = 1e-5;
 const NEGLIGIBLE_COSINE: f64 = 0.95;
@@ -368,6 +370,14 @@ pub struct GradientCellReport {
     pub sigreg_seed: u64,
     pub ep_weight: f64,
     pub false_edit_pixels: usize,
+    #[serde(default)]
+    pub mask_population: String,
+    #[serde(default)]
+    pub prediction_logits_fingerprint: Option<TensorFingerprint>,
+    #[serde(default)]
+    pub false_edit_mask_sha256: String,
+    #[serde(default)]
+    pub mask_binding: Option<SameForwardMaskBinding>,
     pub training_raw_argmax_disagreement_pixels: usize,
     pub losses: FoundationV2LossMeans,
     pub components: Vec<GradientComponentReport>,
@@ -384,8 +394,28 @@ pub struct GradientCellReport {
     pub loss_binding: Option<LossBinding>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SameForwardMaskBinding {
+    pub logits: TensorFingerprint,
+    pub mask_sha256: String,
+    pub false_edit_pixels: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticLogitComparison {
+    pub snapshot_step: usize,
+    pub batch_position: usize,
+    pub split: String,
+    pub comparison: String,
+    pub left_logits: TensorFingerprint,
+    pub right_logits: TensorFingerprint,
+    pub result: LogitComparisonReport,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerBatchScore {
+    #[serde(default)]
+    pub population: String,
     pub batch_position: usize,
     pub batch_index: u64,
     pub raw: ExactMetrics,
@@ -409,6 +439,8 @@ pub struct MarginSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FalseEditAnatomy {
+    #[serde(default)]
+    pub population: String,
     pub false_edit_pixels: usize,
     pub margins: MarginSummary,
     pub locations: BTreeMap<String, usize>,
@@ -423,8 +455,18 @@ pub struct FalseEditAnatomy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRescore {
     pub step: usize,
+    #[serde(default)]
+    pub legacy_population: String,
+    #[serde(default)]
+    pub primary_population: String,
+    #[serde(default)]
+    pub anatomy_population: String,
     pub train: Vec<PerBatchScore>,
     pub heldout: Vec<PerBatchScore>,
+    #[serde(default)]
+    pub primary_train: Vec<PerBatchScore>,
+    #[serde(default)]
+    pub primary_heldout: Vec<PerBatchScore>,
     pub train_anatomy: Option<FalseEditAnatomy>,
     pub heldout_anatomy: Option<FalseEditAnatomy>,
     pub train_anatomy_by_batch: Vec<FalseEditAnatomy>,
@@ -435,6 +477,8 @@ pub struct SnapshotRescore {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistenceReport {
+    #[serde(default)]
+    pub population: String,
     pub split: String,
     pub false_edits_1024: usize,
     pub false_edits_1536: usize,
@@ -460,6 +504,8 @@ pub struct RuntimeEstimate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticVerdict {
+    #[serde(default)]
+    pub population: String,
     pub auxiliary_class: String,
     pub conflict_cells: usize,
     pub conflict_cells_at_2048: usize,
@@ -476,6 +522,8 @@ pub struct FrozenDiagnosticTiming {
     pub population_seconds: f64,
     pub gradient_cell_seconds: Vec<f64>,
     pub rescore_seconds: Vec<f64>,
+    #[serde(default)]
+    pub comparison_seconds: Vec<f64>,
     pub wall_seconds: f64,
 }
 
@@ -504,6 +552,8 @@ pub struct FrozenDiagnosticReport {
     pub population: Option<PopulationCensus>,
     pub rescoring: Vec<SnapshotRescore>,
     pub gradients: Vec<GradientCellReport>,
+    #[serde(default)]
+    pub comparisons: Vec<DiagnosticLogitComparison>,
     pub persistence: Vec<PersistenceReport>,
     pub runtime_estimate: Option<RuntimeEstimate>,
     pub verdict: Option<DiagnosticVerdict>,
@@ -934,6 +984,7 @@ fn anatomy(
     }
     margins.sort_by(f64::total_cmp);
     let report = FalseEditAnatomy {
+        population: PRIMARY_POPULATION.into(),
         false_edit_pixels: margins.len(),
         margins: MarginSummary {
             count: margins.len(),
@@ -981,6 +1032,7 @@ fn persistence(split: &str, sets: &BTreeMap<usize, BTreeSet<u64>>) -> Result<Per
         .count();
     let persistent = at_2048.intersection(at_1536).count();
     Ok(PersistenceReport {
+        population: PRIMARY_POPULATION.into(),
         split: split.into(),
         false_edits_1024: at_1024.len(),
         false_edits_1536: at_1536.len(),
@@ -1046,6 +1098,7 @@ fn per_batch_scores(
     predictions: &[Vec<u8>],
     positions: &[usize],
     index_offset: u64,
+    population: &str,
 ) -> Result<Vec<PerBatchScore>> {
     sliced_batches(samples, predictions, positions)?
         .into_iter()
@@ -1058,6 +1111,7 @@ fn per_batch_scores(
                 "batch group drift"
             );
             Ok(PerBatchScore {
+                population: population.into(),
                 batch_position: slice.position,
                 batch_index: index_offset + slice.position as u64,
                 raw,
@@ -1221,6 +1275,79 @@ fn masks_for_prediction_sub_losses(
     })
 }
 
+fn prediction_mask_sha256(mask: &[f32]) -> Result<String> {
+    identity_frame_sha256(&[
+        ("dtype", b"F32".to_vec()),
+        ("shape", serde_json::to_vec(&[mask.len()])?),
+        (
+            "values",
+            mask.iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .collect(),
+        ),
+    ])
+}
+
+fn bind_prediction_masks(
+    samples: &[V5Sample],
+    capture: &LogitCapture,
+) -> Result<(PredictionMasks, SameForwardMaskBinding)> {
+    let masks = masks_for_prediction_sub_losses(samples, &capture.predictions)?;
+    // Rebuild the binding from the captured argmax, independently of the mask
+    // vectors consumed by the gradient losses. No second forward or argmax.
+    let recomputed = masks_for_prediction_sub_losses(samples, &capture.predictions)?;
+    let binding = SameForwardMaskBinding {
+        logits: capture.fingerprint.clone(),
+        mask_sha256: prediction_mask_sha256(&recomputed.false_edit)?,
+        false_edit_pixels: recomputed.false_edit_count,
+    };
+    ensure!(
+        masks.false_edit_count == binding.false_edit_pixels
+            && prediction_mask_sha256(&masks.false_edit)? == binding.mask_sha256,
+        "same-forward mask reconstruction failed"
+    );
+    Ok((masks, binding))
+}
+
+fn ensure_same_forward_binding(cell: &GradientCellReport) -> Result<()> {
+    let binding = cell
+        .mask_binding
+        .as_ref()
+        .context("missing same-forward binding")?;
+    ensure!(
+        cell.mask_population == PRIMARY_POPULATION
+            && cell.prediction_logits_fingerprint.as_ref() == Some(&binding.logits)
+            && cell.false_edit_mask_sha256 == binding.mask_sha256
+            && cell.false_edit_pixels == binding.false_edit_pixels
+            && !binding.mask_sha256.is_empty()
+            && !binding.logits.sha256.is_empty(),
+        "same-forward count or fingerprint binding drift"
+    );
+    Ok(())
+}
+
+fn diagnostic_objective(
+    cfg: &TrainConfig,
+    ep_weight: f64,
+    snapshot_step: usize,
+    batch_position: usize,
+) -> FoundationV2ObjectiveConfig {
+    FoundationV2ObjectiveConfig {
+        ep_weight,
+        sigreg_projections: REGISTERED_SIGREG_PROJECTIONS,
+        sigreg_knots: REGISTERED_SIGREG_KNOTS,
+        sigreg_seed: REGISTERED_SEED
+            .wrapping_add(snapshot_step as u64)
+            .wrapping_add(batch_position as u64),
+        q_mse_threshold: cfg.q_mse_threshold,
+        rollout_enabled: false,
+        split_ce_weighting: cfg.split_ce_weighting,
+        split_ce_changed_budget: cfg.split_ce_changed_budget,
+        capture_mechanism_seams: false,
+        capture_pred_per_pixel: true,
+    }
+}
+
 fn masked_prediction_loss(
     per_pixel: &Tensor,
     mask: Vec<f32>,
@@ -1330,6 +1457,26 @@ fn classify(
     rescoring: &[SnapshotRescore],
     persistence_rows: &[PersistenceReport],
 ) -> Result<DiagnosticVerdict> {
+    ensure!(
+        gradients
+            .iter()
+            .all(|cell| cell.mask_population == PRIMARY_POPULATION)
+            && rescoring.iter().all(|snapshot| {
+                snapshot.primary_population == PRIMARY_POPULATION
+                    && snapshot.anatomy_population == PRIMARY_POPULATION
+                    && snapshot
+                        .train_anatomy
+                        .iter()
+                        .chain(&snapshot.heldout_anatomy)
+                        .chain(&snapshot.train_anatomy_by_batch)
+                        .chain(&snapshot.heldout_anatomy_by_batch)
+                        .all(|anatomy| anatomy.population == PRIMARY_POPULATION)
+            })
+            && persistence_rows
+                .iter()
+                .all(|row| row.population == PRIMARY_POPULATION),
+        "classifier requires primary_same_forward populations"
+    );
     let cells = gradients
         .iter()
         .filter(|cell| GRADIENT_STEPS.contains(&cell.snapshot_step))
@@ -1397,6 +1544,7 @@ fn classify(
         "preregister the G-mandated matched prediction-only arm as the weakest direct discriminator and launch nothing without new authority"
     };
     Ok(DiagnosticVerdict {
+        population: PRIMARY_POPULATION.into(),
         auxiliary_class: auxiliary_class.into(),
         conflict_cells: conflicts,
         conflict_cells_at_2048: conflicts_at_2048,
@@ -1404,7 +1552,7 @@ fn classify(
         pred_blind,
         internal_conflict,
         attractor,
-        interpretation_caveat: "step-2048 auxiliary pressure is measured with the recorded EP controller weight 0.0002540643898500332 and is nearly EP-off; NS-only conflicts may reflect memoryless Muon whitening rather than objective competition".into(),
+        interpretation_caveat: "classifier thresholds were registered on chunk-32 and now apply to the batch-128 primary population; primary D2 is backward-free and does not reproduce D1 rollout-backward allocator history; step-2048 EP weight is 0.0002540643898500332 (nearly EP-off); NS-only conflicts may reflect memoryless Muon whitening rather than objective competition".into(),
         next_action: next_action.into(),
     })
 }
@@ -1425,7 +1573,7 @@ fn runtime_estimate(report: &FrozenDiagnosticReport) -> Result<RuntimeEstimate> 
         .copied()
         .reduce(f64::max)
         .context("preflight lacks a D2/D3 timing")?;
-    let estimated_device_seconds = 24.0 * d1_cell_seconds + 56.0 * d2d3_pair_seconds;
+    let estimated_device_seconds = 25.0 * d1_cell_seconds + 56.0 * d2d3_pair_seconds;
     Ok(RuntimeEstimate {
         d1_cell_seconds,
         d2d3_pair_seconds,
@@ -1631,11 +1779,25 @@ fn ensure_gradient_control_matches(
     expected: &GradientCellReport,
     observed: &GradientCellReport,
 ) -> Result<()> {
+    let projected = |cell: &GradientCellReport| -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(cell)?;
+        let object = value
+            .as_object_mut()
+            .context("gradient control is not an object")?;
+        object.remove("prediction_logits_fingerprint");
+        object.remove("false_edit_mask_sha256");
+        object.remove("training_raw_argmax_disagreement_pixels");
+        if let Some(binding) = object
+            .get_mut("mask_binding")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            binding.remove("logits");
+            binding.remove("mask_sha256");
+        }
+        Ok(value)
+    };
     ensure!(
-        json_values_approximately_equal(
-            &serde_json::to_value(expected)?,
-            &serde_json::to_value(observed)?
-        ),
+        json_values_approximately_equal(&projected(expected)?, &projected(observed)?),
         "registered gradient control differs from preflight beyond the frozen tolerance"
     );
     Ok(())
@@ -1649,11 +1811,21 @@ fn ensure_rescore_control_matches(
         "step": expected.step,
         "train": expected.train.first(),
         "heldout": expected.heldout.first(),
+        "primary_train": expected.primary_train.first(),
+        "primary_heldout": expected.primary_heldout.first(),
+        "primary_population": expected.primary_population,
+        "anatomy_population": expected.anatomy_population,
+        "legacy_population": expected.legacy_population,
     });
     let observed_control = serde_json::json!({
         "step": observed.step,
         "train": observed.train.first(),
         "heldout": observed.heldout.first(),
+        "primary_train": observed.primary_train.first(),
+        "primary_heldout": observed.primary_heldout.first(),
+        "primary_population": observed.primary_population,
+        "anatomy_population": observed.anatomy_population,
+        "legacy_population": observed.legacy_population,
     });
     ensure!(
         json_values_approximately_equal(&expected_control, &observed_control),
@@ -1680,6 +1852,10 @@ fn ensure_rescore_control_matches(
                 anatomy_integer_control(expected_anatomy)
                     == anatomy_integer_control(observed_anatomy),
                 "registered {split} anatomy integer control differs at step {step}"
+            );
+            ensure!(
+                expected_anatomy.population == observed_anatomy.population,
+                "registered {split} primary anatomy population differs at step {step}"
             );
         }
     }
@@ -1790,17 +1966,14 @@ fn gradient_cell(
     d2_predictions: &[Vec<u8>],
     controls: &BTreeMap<usize, ScreenUpdateRecord>,
     g: &MultibatchScreenReport,
-) -> Result<GradientCellReport> {
+) -> Result<(GradientCellReport, LogitCapture)> {
     let samples = main.samples();
     ensure!(
         d2_predictions.len() == REGISTERED_BATCH_SIZE,
         "D1 raw prediction row drift"
     );
-    let masks = masks_for_prediction_sub_losses(samples, d2_predictions)?;
-
-    let sigreg_seed = REGISTERED_SEED
-        .wrapping_add(snapshot_step as u64)
-        .wrapping_add(batch_position as u64);
+    let objective = diagnostic_objective(cfg, ep_weight, snapshot_step, batch_position);
+    let sigreg_seed = objective.sigreg_seed;
     let event_slot_weights = event_slot_weight_tensor(device)?;
     let (attached_rollout, rollout_fragments) =
         foundation_v2_dedicated_rollout_loss(model, rollout, device)?;
@@ -1817,28 +1990,11 @@ fn gradient_cell(
         main,
         host,
         device,
-        FoundationV2ObjectiveConfig {
-            ep_weight,
-            sigreg_projections: REGISTERED_SIGREG_PROJECTIONS,
-            sigreg_knots: REGISTERED_SIGREG_KNOTS,
-            sigreg_seed,
-            q_mse_threshold: cfg.q_mse_threshold,
-            rollout_enabled: false,
-            split_ce_weighting: cfg.split_ce_weighting,
-            split_ce_changed_budget: cfg.split_ce_changed_budget,
-            capture_mechanism_seams: false,
-            capture_pred_per_pixel: true,
-        },
+        objective,
         &event_slot_weights,
     )?;
     losses.rollout = rollout_value.clone();
     losses.rollout_fragments = rollout_fragments;
-    ensure!(
-        losses.changed_weights.changed_pixels == masks.changed_count
-            && losses.changed_weights.unchanged_pixels == masks.unchanged_count
-            && losses.changed_weights.changed_weight == 50.0,
-        "CurrentDouble changed/unchanged geometry drift"
-    );
     let per_pixel = losses
         .pred_per_pixel
         .as_ref()
@@ -1847,8 +2003,18 @@ fn gradient_cell(
         .diagnostic_predicted_logits
         .as_ref()
         .context("diagnostic training logits were not captured")?;
-    let training_predictions = predictions_from_logits(training_logits)?;
-    let training_raw_argmax_disagreement_pixels = training_predictions
+    let capture = capture_logits(training_logits)?;
+    let (masks, mask_binding) = bind_prediction_masks(samples, &capture)?;
+    ensure!(
+        losses.changed_weights.changed_pixels == masks.changed_count
+            && losses.changed_weights.unchanged_pixels == masks.unchanged_count
+            && losses.changed_weights.changed_weight == 50.0,
+        "CurrentDouble changed/unchanged geometry drift"
+    );
+    let prediction_logits_fingerprint = tensor_fingerprint(training_logits)?;
+    let false_edit_mask_sha256 = prediction_mask_sha256(&masks.false_edit)?;
+    let training_raw_argmax_disagreement_pixels = capture
+        .predictions
         .iter()
         .zip(d2_predictions)
         .map(|(training, raw)| {
@@ -1859,10 +2025,6 @@ fn gradient_cell(
                 .count()
         })
         .sum::<usize>();
-    ensure!(
-        training_raw_argmax_disagreement_pixels == 0,
-        "training and raw prediction seams disagree"
-    );
 
     let changed_loss = masked_prediction_loss(
         per_pixel,
@@ -2040,12 +2202,16 @@ fn gradient_cell(
         gradient_l2_for_optimizer_route(&false_edit_grads, varmap, OptimizerRoute::All)?,
         prediction_stats.global_l2,
     );
-    Ok(GradientCellReport {
+    let report = GradientCellReport {
         snapshot_step,
         batch_position,
         sigreg_seed,
         ep_weight,
         false_edit_pixels: masks.false_edit_count,
+        mask_population: PRIMARY_POPULATION.into(),
+        prediction_logits_fingerprint: Some(prediction_logits_fingerprint),
+        false_edit_mask_sha256,
+        mask_binding: Some(mask_binding),
         training_raw_argmax_disagreement_pixels,
         losses: observed_losses,
         components,
@@ -2075,7 +2241,9 @@ fn gradient_cell(
         )?,
         false_edit_share_of_prediction,
         loss_binding,
-    })
+    };
+    ensure_same_forward_binding(&report)?;
+    Ok((report, capture))
 }
 
 fn selected_samples(batches: &[MixedStreamBatch], positions: &[usize]) -> Result<Vec<V5Sample>> {
@@ -2151,26 +2319,109 @@ fn partial_group_matches(
 
 struct ScoredSnapshot {
     report: SnapshotRescore,
-    train_predictions: Vec<Vec<u8>>,
+    primary_train_captures: Vec<LogitCapture>,
+    legacy_train_captures: Vec<LogitCapture>,
+    comparisons: Vec<DiagnosticLogitComparison>,
+    comparison_seconds: f64,
     train_keys: Option<BTreeSet<u64>>,
     heldout_keys: Option<BTreeSet<u64>>,
 }
 
 struct SplitScore {
     scores: Vec<PerBatchScore>,
-    predictions: Vec<Vec<u8>>,
+    captures: Vec<LogitCapture>,
     anatomy: Option<AnatomyWithKeys>,
     anatomy_by_batch: Vec<FalseEditAnatomy>,
 }
 
+fn finish_split_score(
+    samples: &[V5Sample],
+    positions: &[usize],
+    index_offset: u64,
+    population: &str,
+    captures: Vec<LogitCapture>,
+    anatomy_enabled: bool,
+) -> Result<SplitScore> {
+    let predictions = captures
+        .iter()
+        .flat_map(|capture| capture.predictions.iter().cloned())
+        .collect::<Vec<_>>();
+    let scores = per_batch_scores(samples, &predictions, positions, index_offset, population)?;
+    let (anatomy, anatomy_by_batch) = if anatomy_enabled {
+        ensure!(
+            population == PRIMARY_POPULATION,
+            "legacy scorer cannot produce anatomy"
+        );
+        let host_logits = captures
+            .iter()
+            .flat_map(|capture| capture.values.iter().copied())
+            .collect::<Vec<_>>();
+        let row_stride = FRAME_SIDE * FRAME_SIDE * PALETTE_SIZE;
+        let mut by_batch = Vec::with_capacity(positions.len());
+        for (slot, position) in positions.iter().enumerate() {
+            let start = slot * REGISTERED_BATCH_SIZE;
+            let end = start + REGISTERED_BATCH_SIZE;
+            by_batch.push(
+                anatomy(
+                    &samples[start..end],
+                    &predictions[start..end],
+                    &host_logits[start * row_stride..end * row_stride],
+                    &[*position],
+                )?
+                .report,
+            );
+        }
+        (
+            Some(anatomy(samples, &predictions, &host_logits, positions)?),
+            by_batch,
+        )
+    } else {
+        (None, Vec::new())
+    };
+    Ok(SplitScore {
+        scores,
+        captures,
+        anatomy,
+        anatomy_by_batch,
+    })
+}
+
+fn diagnostic_comparison(
+    snapshot_step: usize,
+    batch_position: usize,
+    split: &str,
+    comparison: &str,
+    left: &LogitCapture,
+    right: &LogitCapture,
+) -> Result<DiagnosticLogitComparison> {
+    let right_population = if comparison == "d1_primary_vs_d2_primary" {
+        PRIMARY_POPULATION
+    } else {
+        LEGACY_POPULATION
+    };
+    Ok(DiagnosticLogitComparison {
+        snapshot_step,
+        batch_position,
+        split: split.into(),
+        comparison: comparison.into(),
+        left_logits: left.fingerprint.clone(),
+        right_logits: right.fingerprint.clone(),
+        result: compare_logit_captures(PRIMARY_POPULATION, left, right_population, right)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn score_frozen_snapshot(
     step: usize,
     spec: &FrozenDiagnosticSpec,
     anatomy_enabled: bool,
     population: &MultibatchPopulation,
     expected: &ScreenSnapshot,
+    cfg: &TrainConfig,
     model: &WorldModel,
     device: &Device,
+    train_hosts: &[PreparedFoundationV2BatchHost],
+    heldout_hosts: &[PreparedFoundationV2BatchHost],
 ) -> Result<ScoredSnapshot> {
     let started = Instant::now();
     let train_positions = spec.train_batch_positions.as_slice();
@@ -2184,51 +2435,82 @@ fn score_frozen_snapshot(
                 .map(|sample| sample.transition.clone())
                 .collect::<Vec<_>>();
             let logits = raw_one_step_logits(model, &transitions, device)?;
-            let predictions = predictions_from_logits(&logits)?;
-            let scores = per_batch_scores(samples, &predictions, positions, index_offset)?;
-            let (anatomy, anatomy_by_batch) = if anatomy_enabled {
-                let host_logits = logits
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let row_stride = FRAME_SIDE * FRAME_SIDE * PALETTE_SIZE;
-                let mut by_batch = Vec::with_capacity(positions.len());
-                for (slot, position) in positions.iter().enumerate() {
-                    let start = slot * REGISTERED_BATCH_SIZE;
-                    let end = start + REGISTERED_BATCH_SIZE;
-                    by_batch.push(
-                        anatomy(
-                            &samples[start..end],
-                            &predictions[start..end],
-                            &host_logits[start * row_stride..end * row_stride],
-                            &[*position],
-                        )?
-                        .report,
-                    );
-                }
-                (
-                    Some(anatomy(samples, &predictions, &host_logits, positions)?),
-                    by_batch,
-                )
-            } else {
-                (None, Vec::new())
-            };
-            Ok(SplitScore {
-                scores,
-                predictions,
-                anatomy,
-                anatomy_by_batch,
-            })
+            let captures = (0..positions.len())
+                .map(|slot| {
+                    capture_logits(&logits.narrow(
+                        0,
+                        slot * REGISTERED_BATCH_SIZE,
+                        REGISTERED_BATCH_SIZE,
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            finish_split_score(
+                samples,
+                positions,
+                index_offset,
+                LEGACY_POPULATION,
+                captures,
+                false,
+            )
         };
     let train_split = score_split(&train_samples, train_positions, 0)?;
     let heldout_split = score_split(&heldout_samples, heldout_positions, TRAIN_BATCHES as u64)?;
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    let score_primary_split = |samples: &[V5Sample],
+                               batches: &[MixedStreamBatch],
+                               hosts: &[PreparedFoundationV2BatchHost],
+                               positions: &[usize],
+                               index_offset: u64|
+     -> Result<SplitScore> {
+        let mut captures = Vec::with_capacity(positions.len());
+        for position in positions {
+            let batch = batches
+                .get(*position)
+                .with_context(|| format!("missing primary batch position {position}"))?;
+            let host = hosts
+                .get(*position)
+                .with_context(|| format!("missing primary host position {position}"))?;
+            let logits = training_seam_logits(
+                diagnostic_objective(cfg, expected.ep_weight, step, *position),
+                model,
+                batch,
+                host,
+                device,
+                &event_slot_weights,
+            )?;
+            captures.push(capture_logits(&logits)?);
+        }
+        finish_split_score(
+            samples,
+            positions,
+            index_offset,
+            PRIMARY_POPULATION,
+            captures,
+            anatomy_enabled,
+        )
+    };
+    let primary_train_split = score_primary_split(
+        &train_samples,
+        &population.train_main,
+        train_hosts,
+        train_positions,
+        0,
+    )?;
+    let primary_heldout_split = score_primary_split(
+        &heldout_samples,
+        &population.heldout_main,
+        heldout_hosts,
+        heldout_positions,
+        TRAIN_BATCHES as u64,
+    )?;
     let train = train_split.scores;
-    let train_predictions = train_split.predictions;
-    let train_anatomy = train_split.anatomy;
-    let train_anatomy_by_batch = train_split.anatomy_by_batch;
+    let primary_train = primary_train_split.scores;
+    let train_anatomy = primary_train_split.anatomy;
+    let train_anatomy_by_batch = primary_train_split.anatomy_by_batch;
     let heldout = heldout_split.scores;
-    let heldout_anatomy = heldout_split.anatomy;
-    let heldout_anatomy_by_batch = heldout_split.anatomy_by_batch;
+    let primary_heldout = primary_heldout_split.scores;
+    let heldout_anatomy = primary_heldout_split.anatomy;
+    let heldout_anatomy_by_batch = primary_heldout_split.anatomy_by_batch;
     let complete_union_binding = train_positions.len() == TRAIN_BATCHES
         && heldout_positions.len() == TRAIN_BATCHES
         && additive_matches(&train, &expected.train.raw)
@@ -2250,7 +2532,7 @@ fn score_frozen_snapshot(
     if let Some(anatomy) = &train_anatomy {
         ensure!(
             anatomy.report.false_edit_pixels
-                == train
+                == primary_train
                     .iter()
                     .map(|score| score.raw.false_edit_pixels)
                     .sum::<usize>(),
@@ -2260,7 +2542,7 @@ fn score_frozen_snapshot(
     if let Some(anatomy) = &heldout_anatomy {
         ensure!(
             anatomy.report.false_edit_pixels
-                == heldout
+                == primary_heldout
                     .iter()
                     .map(|score| score.raw.false_edit_pixels)
                     .sum::<usize>(),
@@ -2282,13 +2564,13 @@ fn score_frozen_snapshot(
                 },
         "per-batch anatomy grid drift"
     );
-    for (score, anatomy) in train.iter().zip(&train_anatomy_by_batch) {
+    for (score, anatomy) in primary_train.iter().zip(&train_anatomy_by_batch) {
         ensure!(
             score.raw.false_edit_pixels == anatomy.false_edit_pixels,
             "train per-batch anatomy differs from D2"
         );
     }
-    for (score, anatomy) in heldout.iter().zip(&heldout_anatomy_by_batch) {
+    for (score, anatomy) in primary_heldout.iter().zip(&heldout_anatomy_by_batch) {
         ensure!(
             score.raw.false_edit_pixels == anatomy.false_edit_pixels,
             "held-out per-batch anatomy differs from D2"
@@ -2296,11 +2578,44 @@ fn score_frozen_snapshot(
     }
     sync_cuda_device(device)?;
     let seconds = started.elapsed().as_secs_f64();
+    let comparison_started = Instant::now();
+    let mut comparisons = Vec::new();
+    for (split, positions, primary, legacy) in [
+        (
+            "train",
+            train_positions,
+            &primary_train_split.captures,
+            &train_split.captures,
+        ),
+        (
+            "heldout",
+            heldout_positions,
+            &primary_heldout_split.captures,
+            &heldout_split.captures,
+        ),
+    ] {
+        for ((position, primary), legacy) in positions.iter().zip(primary).zip(legacy) {
+            comparisons.push(diagnostic_comparison(
+                step,
+                *position,
+                split,
+                "d2_primary_vs_legacy",
+                primary,
+                legacy,
+            )?);
+        }
+    }
+    let comparison_seconds = comparison_started.elapsed().as_secs_f64();
     Ok(ScoredSnapshot {
         report: SnapshotRescore {
             step,
+            legacy_population: "legacy_g_chunk32".into(),
+            primary_population: "primary_same_forward".into(),
+            anatomy_population: "primary_same_forward".into(),
             train,
             heldout,
+            primary_train,
+            primary_heldout,
             train_anatomy: train_anatomy.as_ref().map(|value| value.report.clone()),
             heldout_anatomy: heldout_anatomy.as_ref().map(|value| value.report.clone()),
             train_anatomy_by_batch,
@@ -2308,7 +2623,10 @@ fn score_frozen_snapshot(
             complete_union_binding,
             seconds,
         },
-        train_predictions,
+        primary_train_captures: primary_train_split.captures,
+        legacy_train_captures: train_split.captures,
+        comparisons,
+        comparison_seconds,
         train_keys: train_anatomy.map(|value| value.keys),
         heldout_keys: heldout_anatomy.map(|value| value.keys),
     })
@@ -2339,6 +2657,68 @@ fn validate_report_files(root: &Path, report: &FrozenDiagnosticReport) -> Result
             file_sha256_hex(&root.join(&record.file))? == record.population_sha256,
             "serialized diagnostic batch hash drift"
         );
+    }
+    Ok(())
+}
+
+fn ensure_comparison_grid(report: &FrozenDiagnosticReport) -> Result<()> {
+    let mut expected = BTreeSet::new();
+    for snapshot in &report.rescoring {
+        for (split, positions) in [
+            ("train", &report.spec.train_batch_positions),
+            ("heldout", &report.spec.heldout_batch_positions),
+        ] {
+            for position in positions {
+                expected.insert((snapshot.step, *position, split, "d2_primary_vs_legacy"));
+            }
+        }
+    }
+    for cell in &report.gradients {
+        for name in ["d1_primary_vs_d2_primary", "d1_primary_vs_legacy"] {
+            expected.insert((cell.snapshot_step, cell.batch_position, "train", name));
+        }
+    }
+    let observed = report
+        .comparisons
+        .iter()
+        .map(|row| {
+            (
+                row.snapshot_step,
+                row.batch_position,
+                row.split.as_str(),
+                row.comparison.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        observed == expected && observed.len() == report.comparisons.len(),
+        "diagnostic descriptive comparison grid drift"
+    );
+    for row in &report.comparisons {
+        let right_population = if row.comparison == "d1_primary_vs_d2_primary" {
+            PRIMARY_POPULATION
+        } else {
+            LEGACY_POPULATION
+        };
+        ensure!(
+            row.result.left == PRIMARY_POPULATION && row.result.right == right_population,
+            "diagnostic descriptive comparison population drift"
+        );
+        if row.comparison.starts_with("d1_") {
+            let cell = report
+                .gradients
+                .iter()
+                .find(|cell| {
+                    cell.snapshot_step == row.snapshot_step
+                        && cell.batch_position == row.batch_position
+                })
+                .context("comparison lacks D1 cell")?;
+            ensure!(
+                cell.prediction_logits_fingerprint.as_ref() == Some(&row.left_logits),
+                "descriptive D1 comparison fingerprint is not bound to its cell"
+            );
+        }
+        // Numerical disagreement is descriptive, never an equality premise.
     }
     Ok(())
 }
@@ -2378,11 +2758,41 @@ fn ensure_completed_cleanly(report: &FrozenDiagnosticReport) -> Result<()> {
         report.gradients.iter().all(|cell| {
             cell.full_reconstruction.passed
                 && cell.prediction_reconstruction.passed
-                && cell.training_raw_argmax_disagreement_pixels == 0
                 && cell.components.len() == 14
                 && cell.components.iter().all(all_zero_prefixes)
         }),
         "diagnostic gradient integrity failed"
+    );
+    for cell in &report.gradients {
+        ensure_same_forward_binding(cell)?;
+    }
+    ensure_comparison_grid(report)?;
+    ensure!(
+        report.rescoring.iter().all(|snapshot| {
+            snapshot.legacy_population == "legacy_g_chunk32"
+                && snapshot.primary_population == "primary_same_forward"
+                && snapshot.anatomy_population == "primary_same_forward"
+                && snapshot.primary_train.len() == report.spec.train_batch_positions.len()
+                && snapshot.primary_heldout.len() == report.spec.heldout_batch_positions.len()
+                && snapshot
+                    .primary_train
+                    .iter()
+                    .chain(&snapshot.primary_heldout)
+                    .all(|score| score.population == PRIMARY_POPULATION)
+                && snapshot
+                    .train
+                    .iter()
+                    .chain(&snapshot.heldout)
+                    .all(|score| score.population == LEGACY_POPULATION)
+                && snapshot
+                    .train_anatomy
+                    .iter()
+                    .chain(&snapshot.heldout_anatomy)
+                    .chain(&snapshot.train_anatomy_by_batch)
+                    .chain(&snapshot.heldout_anatomy_by_batch)
+                    .all(|anatomy| anatomy.population == PRIMARY_POPULATION)
+        }),
+        "diagnostic score population contract failed"
     );
     let expected_cells = if report.registered { 25 } else { 2 };
     ensure!(
@@ -2476,22 +2886,6 @@ fn ensure_completed_cleanly(report: &FrozenDiagnosticReport) -> Result<()> {
                 }
             }),
             "registered D3 anatomy grid is incomplete"
-        );
-        ensure!(
-            report.gradients.iter().all(|cell| {
-                report
-                    .rescoring
-                    .iter()
-                    .find(|snapshot| snapshot.step == cell.snapshot_step)
-                    .and_then(|snapshot| {
-                        snapshot
-                            .train
-                            .iter()
-                            .find(|score| score.batch_position == cell.batch_position)
-                    })
-                    .is_some_and(|score| score.raw.false_edit_pixels == cell.false_edit_pixels)
-            }),
-            "D1 false-edit mask does not equal the D2 union-sliced argmax mask"
         );
         ensure!(
             report.verdict.as_ref()
@@ -2652,6 +3046,11 @@ fn run_inner(
         .iter()
         .map(prepare_foundation_v2_batch_host)
         .collect::<Result<Vec<_>>>()?;
+    let heldout_hosts = population
+        .heldout_main
+        .iter()
+        .map(prepare_foundation_v2_batch_host)
+        .collect::<Result<Vec<_>>>()?;
     report.timing.population_seconds = population_started.elapsed().as_secs_f64();
 
     report.gpu_identity = Some(query_gpu_identity(&args.device)?);
@@ -2707,7 +3106,7 @@ fn run_inner(
         load_varmap_exact(&varmap, &checkpoint)?;
         ensure_operator_projection_zero(&varmap)?;
 
-        let mut d2_train_predictions = None;
+        let mut d2_train_captures = None;
         if report.spec.rescore_steps.contains(&step) {
             let anatomy_enabled = report.spec.anatomy_steps.contains(&step);
             let scored = score_frozen_snapshot(
@@ -2716,8 +3115,11 @@ fn run_inner(
                 anatomy_enabled,
                 &population,
                 expected,
+                &cfg,
                 &model,
                 device,
+                &hosts,
+                &heldout_hosts,
             )?;
             if let Some(preflight) = bound_preflight.as_ref() {
                 if let Some(expected_control) = preflight_rescore_control(preflight, step) {
@@ -2731,7 +3133,12 @@ fn run_inner(
                 heldout_key_sets.insert(step, keys);
             }
             report.timing.rescore_seconds.push(scored.report.seconds);
-            d2_train_predictions = Some(scored.train_predictions);
+            report
+                .timing
+                .comparison_seconds
+                .push(scored.comparison_seconds);
+            report.comparisons.extend(scored.comparisons);
+            d2_train_captures = Some((scored.primary_train_captures, scored.legacy_train_captures));
             report.rescoring.push(scored.report);
             write_progress(root, report)?;
         }
@@ -2746,20 +3153,16 @@ fn run_inner(
         for position in gradient_positions {
             sync_cuda_device(device)?;
             let cell_started = Instant::now();
-            let d2_predictions = d2_train_predictions
+            let (d2_primary, d2_legacy) = d2_train_captures
                 .as_ref()
                 .context("D1 requires the frozen D2 raw-logit prediction seam")?;
-            let d2_slice = {
-                let slot = report
-                    .spec
-                    .train_batch_positions
-                    .iter()
-                    .position(|candidate| *candidate == position)
-                    .expect("gradient position belongs to D2 positions");
-                let start = slot * REGISTERED_BATCH_SIZE;
-                &d2_predictions[start..start + REGISTERED_BATCH_SIZE]
-            };
-            let cell = gradient_cell(
+            let slot = report
+                .spec
+                .train_batch_positions
+                .iter()
+                .position(|candidate| *candidate == position)
+                .expect("gradient position belongs to D2 positions");
+            let (cell, capture) = gradient_cell(
                 step,
                 position,
                 expected.ep_weight,
@@ -2770,7 +3173,7 @@ fn run_inner(
                 &population.train_rollout[position],
                 &hosts[position],
                 device,
-                d2_slice,
+                &d2_legacy[slot].predictions,
                 &controls,
                 &g,
             )?;
@@ -2791,6 +3194,19 @@ fn run_inner(
                 .timing
                 .gradient_cell_seconds
                 .push(cell_started.elapsed().as_secs_f64());
+            let comparison_started = Instant::now();
+            for (name, right) in [
+                ("d1_primary_vs_d2_primary", &d2_primary[slot]),
+                ("d1_primary_vs_legacy", &d2_legacy[slot]),
+            ] {
+                report.comparisons.push(diagnostic_comparison(
+                    step, position, "train", name, &capture, right,
+                )?);
+            }
+            report
+                .timing
+                .comparison_seconds
+                .push(comparison_started.elapsed().as_secs_f64());
             report.gradients.push(cell);
             write_progress(root, report)?;
         }
@@ -2889,6 +3305,7 @@ pub fn run_p2_multibatch_frozen_diagnostic(args: P2MultibatchFrozenDiagnosticArg
         population: None,
         rescoring: Vec::new(),
         gradients: Vec::new(),
+        comparisons: Vec::new(),
         persistence: Vec::new(),
         runtime_estimate: None,
         verdict: None,
@@ -2896,6 +3313,7 @@ pub fn run_p2_multibatch_frozen_diagnostic(args: P2MultibatchFrozenDiagnosticArg
             population_seconds: 0.0,
             gradient_cell_seconds: Vec::new(),
             rescore_seconds: Vec::new(),
+            comparison_seconds: Vec::new(),
             wall_seconds: 0.0,
         },
         identity_root: String::new(),
@@ -3406,8 +3824,7 @@ fn seam_branch(
 }
 
 fn training_seam_logits(
-    cfg: &TrainConfig,
-    ep_weight: f64,
+    objective: FoundationV2ObjectiveConfig,
     model: &WorldModel,
     mixed: &MixedStreamBatch,
     host: &PreparedFoundationV2BatchHost,
@@ -3419,18 +3836,7 @@ fn training_seam_logits(
         mixed,
         host,
         device,
-        FoundationV2ObjectiveConfig {
-            ep_weight,
-            sigreg_projections: REGISTERED_SIGREG_PROJECTIONS,
-            sigreg_knots: REGISTERED_SIGREG_KNOTS,
-            sigreg_seed: REGISTERED_SEED,
-            q_mse_threshold: cfg.q_mse_threshold,
-            rollout_enabled: false,
-            split_ce_weighting: cfg.split_ce_weighting,
-            split_ce_changed_budget: cfg.split_ce_changed_budget,
-            capture_mechanism_seams: false,
-            capture_pred_per_pixel: true,
-        },
+        objective,
         event_slot_weights,
     )?;
     losses
@@ -3677,8 +4083,7 @@ fn run_seam_characterization_inner(
     record_logit_variant(root, report, &mut captures, "V4", result)?;
     let result = run_logit_variant("V1a", device, || {
         training_seam_logits(
-            &cfg,
-            expected.ep_weight,
+            diagnostic_objective(&cfg, expected.ep_weight, 0, 0),
             &model,
             mixed,
             &host,
@@ -3689,8 +4094,7 @@ fn run_seam_characterization_inner(
     record_logit_variant(root, report, &mut captures, "V1a", result)?;
     let result = run_logit_variant("V1b", device, || {
         training_seam_logits(
-            &cfg,
-            expected.ep_weight,
+            diagnostic_objective(&cfg, expected.ep_weight, 0, 0),
             &model,
             mixed,
             &host,
@@ -3924,6 +4328,22 @@ mod tests {
             sigreg_seed: 0,
             ep_weight: 0.1,
             false_edit_pixels: 1,
+            mask_population: "primary_same_forward".into(),
+            prediction_logits_fingerprint: Some(TensorFingerprint {
+                shape: vec![REGISTERED_BATCH_SIZE, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE],
+                dtype: "F32".into(),
+                sha256: "sha256:test".into(),
+            }),
+            false_edit_mask_sha256: "sha256:test-mask".into(),
+            mask_binding: Some(SameForwardMaskBinding {
+                logits: TensorFingerprint {
+                    shape: vec![REGISTERED_BATCH_SIZE, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE],
+                    dtype: "F32".into(),
+                    sha256: "sha256:test".into(),
+                },
+                mask_sha256: "sha256:test-mask".into(),
+                false_edit_pixels: 1,
+            }),
             training_raw_argmax_disagreement_pixels: 0,
             losses: FoundationV2LossMeans::default(),
             components: Vec::new(),
@@ -3953,6 +4373,7 @@ mod tests {
 
     fn classification_context() -> (Vec<SnapshotRescore>, Vec<PersistenceReport>) {
         let anatomy = FalseEditAnatomy {
+            population: PRIMARY_POPULATION.into(),
             false_edit_pixels: 1,
             margins: MarginSummary {
                 count: 1,
@@ -3973,8 +4394,13 @@ mod tests {
         };
         let rescoring = vec![SnapshotRescore {
             step: 2048,
+            legacy_population: "legacy_g_chunk32".into(),
+            primary_population: "primary_same_forward".into(),
+            anatomy_population: "primary_same_forward".into(),
             train: Vec::new(),
             heldout: Vec::new(),
+            primary_train: Vec::new(),
+            primary_heldout: Vec::new(),
             train_anatomy: Some(anatomy),
             heldout_anatomy: None,
             train_anatomy_by_batch: Vec::new(),
@@ -3983,6 +4409,7 @@ mod tests {
             seconds: 1.0,
         }];
         let persistence = vec![PersistenceReport {
+            population: PRIMARY_POPULATION.into(),
             split: "train".into(),
             false_edits_1024: 1,
             false_edits_1536: 1,
@@ -4039,6 +4466,7 @@ mod tests {
             population: None,
             rescoring: Vec::new(),
             gradients: Vec::new(),
+            comparisons: Vec::new(),
             persistence: Vec::new(),
             runtime_estimate: None,
             verdict: None,
@@ -4046,6 +4474,7 @@ mod tests {
                 population_seconds: 1.0,
                 gradient_cell_seconds: vec![1.0, 1.0],
                 rescore_seconds: vec![1.0, 1.0, 1.0],
+                comparison_seconds: Vec::new(),
                 wall_seconds: 1.0,
             },
             identity_root: String::new(),
@@ -4056,8 +4485,13 @@ mod tests {
     fn empty_rescore(step: usize) -> SnapshotRescore {
         SnapshotRescore {
             step,
+            legacy_population: "legacy_g_chunk32".into(),
+            primary_population: "primary_same_forward".into(),
+            anatomy_population: "primary_same_forward".into(),
             train: Vec::new(),
             heldout: Vec::new(),
+            primary_train: Vec::new(),
+            primary_heldout: Vec::new(),
             train_anatomy: None,
             heldout_anatomy: None,
             train_anatomy_by_batch: Vec::new(),
@@ -4440,6 +4874,317 @@ mod tests {
             masks.changed_count + masks.unchanged_count,
             FRAME_SIDE * FRAME_SIDE
         );
+        Ok(())
+    }
+
+    #[test]
+    fn same_forward_mask_fingerprint_is_bound_to_its_argmax() -> Result<()> {
+        let population =
+            MultibatchPopulation::compose(REGISTERED_SEED, REGISTERED_BATCH_SIZE, true)?;
+        let sample = population.train_main[0].samples()[0].clone();
+        let pixel = (0..FRAME_SIDE * FRAME_SIDE)
+            .find(|pixel| {
+                sample.content_mask.values[*pixel] != 0
+                    && sample.transition.current.pixels[*pixel]
+                        == sample.transition.next.pixels[*pixel]
+            })
+            .context("sample lacks unchanged content")?;
+        let samples = vec![sample; REGISTERED_BATCH_SIZE];
+        let targets = samples
+            .iter()
+            .flat_map(|sample| sample.transition.next.pixels.iter().map(|v| u32::from(*v)))
+            .collect::<Vec<_>>();
+        let mut values = vec![0.0f32; targets.len() * PALETTE_SIZE];
+        for (offset, target) in targets.iter().enumerate() {
+            values[offset * PALETTE_SIZE + *target as usize] = 6.0;
+        }
+        let offset = pixel * PALETTE_SIZE;
+        values[offset + targets[pixel] as usize] = 0.0;
+        values[offset + (targets[pixel] as usize + 1) % PALETTE_SIZE] = 6.0;
+        let logits = candle_core::Var::from_tensor(&Tensor::from_vec(
+            values,
+            (REGISTERED_BATCH_SIZE, FRAME_SIDE, FRAME_SIDE, PALETTE_SIZE),
+            &Device::Cpu,
+        )?)?;
+        let labels = Tensor::from_vec(
+            targets,
+            (REGISTERED_BATCH_SIZE, FRAME_SIDE, FRAME_SIDE),
+            &Device::Cpu,
+        )?;
+        // Exercise the same CE primitive and detached logit capture used by the
+        // production training loss, including a real backward with no update.
+        let per_pixel = crate::p2::train::foundation_v2_unimix_ce(logits.as_tensor(), &labels)?;
+        let capture = capture_logits(&logits.detach())?;
+        let (masks, binding) = bind_prediction_masks(&samples, &capture)?;
+        assert_eq!(masks.false_edit_count, 1);
+        let loss = masked_prediction_loss(
+            &per_pixel,
+            masks.false_edit.clone(),
+            masks.unchanged_count,
+            1.0,
+        )?;
+        assert!(loss.to_scalar::<f32>()? > 0.0);
+        let grads = loss.backward()?;
+        let gradient = grads
+            .get(logits.as_tensor())
+            .context("missing prediction gradient")?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(gradient[offset..offset + PALETTE_SIZE]
+            .iter()
+            .any(|v| *v != 0.0));
+        assert!(gradient[..offset]
+            .iter()
+            .chain(&gradient[offset + PALETTE_SIZE..])
+            .all(|v| *v == 0.0));
+        assert_eq!(tensor_fingerprint(logits.as_tensor())?, binding.logits);
+
+        let unrelated = capture_logits(&logits.affine(-1.0, 0.0)?)?;
+        let (_, unrelated_binding) = bind_prediction_masks(&samples, &unrelated)?;
+        assert_ne!(binding.mask_sha256, unrelated_binding.mask_sha256);
+        let (_, rebound) = bind_prediction_masks(&samples, &capture)?;
+        assert_eq!(binding, rebound);
+        assert_eq!(
+            prediction_mask_sha256(&masks.false_edit)?,
+            binding.mask_sha256
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cross_process_gradient_control_excludes_hashes_but_not_integer_counts() -> Result<()> {
+        let expected = cell(0, 0);
+        let mut observed = expected.clone();
+        observed
+            .prediction_logits_fingerprint
+            .as_mut()
+            .unwrap()
+            .sha256 = "different".into();
+        observed.false_edit_mask_sha256 = "different-mask".into();
+        observed.mask_binding.as_mut().unwrap().logits.sha256 = "different-binding".into();
+        observed.mask_binding.as_mut().unwrap().mask_sha256 = "different-binding-mask".into();
+        observed.training_raw_argmax_disagreement_pixels = 17;
+        ensure_gradient_control_matches(&expected, &observed)?;
+        observed.false_edit_pixels += 1;
+        assert!(ensure_gradient_control_matches(&expected, &observed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn completion_binding_rejects_logit_bit_mask_bit_and_pixel_corruption() -> Result<()> {
+        let valid = cell(0, 0);
+        ensure_same_forward_binding(&valid)?;
+        let mut corrupted = valid.clone();
+        corrupted
+            .prediction_logits_fingerprint
+            .as_mut()
+            .unwrap()
+            .sha256
+            .push('1');
+        assert!(ensure_same_forward_binding(&corrupted).is_err());
+        corrupted = valid.clone();
+        corrupted.false_edit_mask_sha256.push('1');
+        assert!(ensure_same_forward_binding(&corrupted).is_err());
+        corrupted = valid.clone();
+        corrupted.false_edit_pixels += 1;
+        assert!(ensure_same_forward_binding(&corrupted).is_err());
+        corrupted = valid.clone();
+        corrupted.mask_binding = None;
+        assert!(ensure_same_forward_binding(&corrupted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn classifier_rejects_legacy_labels_and_ignores_descriptive_disagreement() -> Result<()> {
+        let mut cells = GRADIENT_STEPS
+            .into_iter()
+            .flat_map(|step| (0..TRAIN_BATCHES).map(move |position| cell(step, position)))
+            .collect::<Vec<_>>();
+        let (mut scores, mut persistent) = classification_context();
+        let baseline = classify(&cells, &scores, &persistent)?;
+        for cell in &mut cells {
+            cell.training_raw_argmax_disagreement_pixels = 100;
+        }
+        assert_eq!(baseline, classify(&cells, &scores, &persistent)?);
+        scores[0].train_anatomy.as_mut().unwrap().population = LEGACY_POPULATION.into();
+        assert!(classify(&cells, &scores, &persistent).is_err());
+        scores[0].train_anatomy.as_mut().unwrap().population = PRIMARY_POPULATION.into();
+        persistent[0].population = LEGACY_POPULATION.into();
+        assert!(classify(&cells, &scores, &persistent).is_err());
+        persistent[0].population = PRIMARY_POPULATION.into();
+        cells[0].mask_population = LEGACY_POPULATION.into();
+        assert!(classify(&cells, &scores, &persistent).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn descriptive_primary_mismatch_does_not_fail_completion_binding() -> Result<()> {
+        let mut report = minimal_report(false);
+        let cell = cell(0, 0);
+        let fingerprint = cell.prediction_logits_fingerprint.clone().unwrap();
+        for (name, right) in [
+            ("d1_primary_vs_d2_primary", PRIMARY_POPULATION),
+            ("d1_primary_vs_legacy", LEGACY_POPULATION),
+        ] {
+            let mut result = seam_comparison(false, 13);
+            result.left = PRIMARY_POPULATION.into();
+            result.right = right.into();
+            report.comparisons.push(DiagnosticLogitComparison {
+                snapshot_step: 0,
+                batch_position: 0,
+                split: "train".into(),
+                comparison: name.into(),
+                left_logits: fingerprint.clone(),
+                right_logits: TensorFingerprint {
+                    sha256: "different-forward".into(),
+                    ..fingerprint.clone()
+                },
+                result,
+            });
+        }
+        report.gradients.push(cell);
+        ensure_same_forward_binding(&report.gradients[0])?;
+        ensure_comparison_grid(&report)?;
+        report.comparisons.pop();
+        assert!(ensure_comparison_grid(&report).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn primary_objective_uses_registered_step_and_position_seed() {
+        let cfg = TrainConfig::default();
+        let objective = diagnostic_objective(&cfg, 0.2, 1024, 7);
+        assert_eq!(objective.sigreg_seed, REGISTERED_SEED + 1024 + 7);
+        assert_eq!(objective.ep_weight, 0.2);
+        assert_eq!(objective.sigreg_projections, REGISTERED_SIGREG_PROJECTIONS);
+        assert_eq!(objective.sigreg_knots, REGISTERED_SIGREG_KNOTS);
+        assert!(!objective.rollout_enabled);
+        assert!(objective.capture_pred_per_pixel);
+    }
+
+    #[test]
+    fn score_population_labels_round_trip_and_default_for_sealed_parent() -> Result<()> {
+        let current = empty_rescore(0);
+        let round_trip: SnapshotRescore = serde_json::from_value(serde_json::to_value(&current)?)?;
+        assert_eq!(round_trip.primary_population, "primary_same_forward");
+        assert_eq!(round_trip.legacy_population, "legacy_g_chunk32");
+
+        let mut legacy = serde_json::to_value(current)?;
+        let object = legacy.as_object_mut().context("rescore fixture")?;
+        for field in [
+            "legacy_population",
+            "primary_population",
+            "anatomy_population",
+            "primary_train",
+            "primary_heldout",
+        ] {
+            object.remove(field);
+        }
+        let legacy: SnapshotRescore = serde_json::from_value(legacy)?;
+        assert!(legacy.legacy_population.is_empty());
+        assert!(legacy.primary_train.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_report_defaults_preserve_identity_and_nested_population_labels() -> Result<()> {
+        let mut report = minimal_report(false);
+        report.gradients.push(cell(0, 0));
+        (report.rescoring, report.persistence) = classification_context();
+        let score = PerBatchScore {
+            population: PRIMARY_POPULATION.into(),
+            batch_position: 0,
+            batch_index: 0,
+            raw: ExactMetrics {
+                rows: 1,
+                changed_rows: 1,
+                changed_exact: 0,
+                full_exact: 0,
+                all_row_exact: 0,
+                unchanged_pixels: 1,
+                false_edit_pixels: 1,
+                false_edit_rows: 1,
+                changed_exact_fraction: 0.0,
+                full_exact_fraction: 0.0,
+                all_row_exact_fraction: 0.0,
+                false_edit_rate: 1.0,
+            },
+            action_routed: false,
+            raw_full_exact_branches: 0,
+            reproduced_distinct_changed_classes: 0,
+            action6_changed_full_exact: 0,
+            action6_coordinate_routed: false,
+        };
+        report.rescoring[0].primary_train.push(score);
+        let current = serde_json::to_value(&report)?;
+        let round_trip: FrozenDiagnosticReport = serde_json::from_value(current.clone())?;
+        assert_eq!(round_trip, report);
+        assert_eq!(
+            round_trip.rescoring[0].primary_train[0].population,
+            PRIMARY_POPULATION
+        );
+        assert_eq!(
+            round_trip.rescoring[0]
+                .train_anatomy
+                .as_ref()
+                .unwrap()
+                .population,
+            PRIMARY_POPULATION
+        );
+        assert_eq!(round_trip.persistence[0].population, PRIMARY_POPULATION);
+
+        fn strip_additions(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for key in [
+                        "population",
+                        "mask_population",
+                        "prediction_logits_fingerprint",
+                        "false_edit_mask_sha256",
+                        "mask_binding",
+                        "comparisons",
+                        "comparison_seconds",
+                        "legacy_population",
+                        "primary_population",
+                        "anatomy_population",
+                        "primary_train",
+                        "primary_heldout",
+                    ] {
+                        object.remove(key);
+                    }
+                    for child in object.values_mut() {
+                        strip_additions(child);
+                    }
+                }
+                serde_json::Value::Array(array) => {
+                    for child in array {
+                        strip_additions(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut legacy = current;
+        strip_additions(&mut legacy);
+        // The report-level population census is an original field, unrelated
+        // to the new string-valued labels stripped from nested objects.
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("population".into(), serde_json::Value::Null);
+        let parsed: FrozenDiagnosticReport = serde_json::from_value(legacy)?;
+        assert_eq!(diagnostic_identity(&report)?, diagnostic_identity(&parsed)?);
+        assert!(parsed.gradients[0].mask_binding.is_none());
+        assert!(parsed.persistence[0].population.is_empty());
+        assert!(parsed.comparisons.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn registered_runtime_forecast_counts_all_twenty_five_d1_cells() -> Result<()> {
+        let report = minimal_report(false);
+        let estimate = runtime_estimate(&report)?;
+        assert_eq!(estimate.estimated_device_seconds, 81.0);
         Ok(())
     }
 
