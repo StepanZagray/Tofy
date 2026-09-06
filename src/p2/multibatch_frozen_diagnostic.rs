@@ -4342,6 +4342,87 @@ mod tests {
     use super::*;
     use candle_core::Var;
 
+    /// A bounded backend control, not a model or frozen-diagnostic admission test.
+    #[test]
+    #[ignore = "manual precision characterization; requires a preregistered device run"]
+    #[cfg(feature = "cudnn")]
+    fn convolution_backward_additivity_characterization() -> Result<()> {
+        let requested = std::env::var("TOFY_PRECISION_PROBE_DEVICE")?;
+        let device = match requested.as_str() {
+            "cpu" => Device::Cpu,
+            "cuda" => Device::new_cuda(0)?,
+            _ => anyhow::bail!("precision probe device must be cpu or cuda"),
+        };
+        // Host-generated dyadic values give all processes exactly the same fixture.
+        let fixture = |count: usize, seed: u32| {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((state >> 8) as i32 % 16_384 - 8_192) as f32 / 8_192.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let input_values = fixture(8 * 32 * 16 * 16, 17);
+        let weight_values = fixture(32 * 32 * 3 * 3, 29);
+        let input = Var::from_vec(input_values.clone(), (8, 32, 16, 16), &device)?;
+        let weight = Var::from_vec(weight_values.clone(), (32, 32, 3, 3), &device)?;
+        let varmap = VarMap::new();
+        {
+            let mut vars = varmap.data().lock().unwrap();
+            vars.insert("probe.input".into(), input.clone());
+            vars.insert("probe.weight".into(), weight.clone());
+        }
+        let output = input.conv2d(weight.as_tensor(), 1, 1, 1, 1)?;
+        let left = Tensor::from_vec(fixture(output.elem_count(), 41), output.dims(), &device)?;
+        let right = Tensor::from_vec(fixture(output.elem_count(), 53), output.dims(), &device)?;
+        let left_loss = output.mul(&left)?.sum_all()?;
+        let right_loss = output.mul(&right)?.sum_all()?;
+        let combined_loss = left_loss.add(&right_loss)?;
+        let direct = retain_parameter_gradients(combined_loss.backward()?, &varmap)?;
+        let repeated = retain_parameter_gradients(combined_loss.backward()?, &varmap)?;
+        let mut summed = None;
+        accumulate_parameter_gradients(&mut summed, left_loss.backward()?, &varmap)?;
+        accumulate_parameter_gradients(&mut summed, right_loss.backward()?, &varmap)?;
+        let summed = summed.context("missing probe gradients")?;
+        let mut comparisons = BTreeMap::new();
+        for (name, parameter) in [("input", &input), ("weight", &weight)] {
+            let one = VarMap::new();
+            one.data()
+                .lock()
+                .unwrap()
+                .insert(format!("probe.{name}"), parameter.clone());
+            comparisons.insert(
+                name,
+                serde_json::json!({
+                    "additivity": reconstruction_check(&direct, &summed, &one)?,
+                    "repeat": reconstruction_check(&direct, &repeated, &one)?,
+                }),
+            );
+        }
+        sync_cuda_device(&device)?;
+        ensure!(
+            input.flatten_all()?.to_vec1::<f32>()? == input_values
+                && weight.flatten_all()?.to_vec1::<f32>()? == weight_values,
+            "precision probe mutated its fixture"
+        );
+        println!(
+            "TOFY_CONV_ADDITIVITY {}",
+            serde_json::json!({
+                "schema": "p2.convolution_backward_additivity.v1",
+                "evidence_class": "synthetic_backend_characterization_only",
+                "device": requested,
+                "tf32_override": std::env::var("NVIDIA_TF32_OVERRIDE").ok(),
+                "input_shape": input.dims(),
+                "weight_shape": weight.dims(),
+                "fixture_unchanged": true,
+                "comparisons": comparisons,
+            })
+        );
+        // A passed test means telemetry was captured, not that additivity passed.
+        Ok(())
+    }
+
     fn geometry(cosine: Option<f64>, share: Option<f64>, kappa: Option<f64>) -> RoutedGeometry {
         let route = RouteGeometry {
             l2: 1.0,

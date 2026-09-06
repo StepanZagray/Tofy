@@ -1,6 +1,6 @@
 # Frozen gradient reconstruction failure capture
 
-Status: reviewed and frozen for one telemetry-only preflight; outcome pending
+Status: completed characterization; failure reproduced on both reconstructions and routes
 Date: 2026-09-06 CDT
 Evidence class: infrastructure characterization only
 Training / model promotion / public ARC authority: none
@@ -105,3 +105,56 @@ primary validation passed `cargo check --all-targets --locked`,
 `cargo clippy --all-targets --locked -- -D warnings`, all 30 focused diagnostic
 tests, formatting and diff hygiene. No threshold or arithmetic change followed
 the review. The earlier Opus timeouts and Fable quota rejection supplied no verdict.
+
+## Outcome
+
+The telemetry-only replay reproduced the failure in 18.098100267 seconds.
+Both full and prediction checks fail globally and on AdamW and Muon; every
+reference is above the 1e-6 branch boundary. All relative residuals are about
+2e-4, exceeding the unchanged 1e-5 tolerance. This is failed infrastructure
+with usable characterization telemetry, not a valid D1 cell or model result.
+No optimizer/EMA update, later anatomy, runtime admission, classifier or public
+ARC evaluation occurred. The guard still stops execution before G loss/route
+and completed same-forward binding checks.
+
+| Reconstruction | Route | Reference L2 | Residual L2 | Relative residual |
+|---|---|---:|---:|---:|
+| full | global | 450.406097 | 0.106553927 | 0.000236573012 |
+| full | adamw | 340.671967 | 0.0759050325 | 0.00022280974 |
+| full | muon | 294.632385 | 0.0747807845 | 0.000253810471 |
+| prediction | global | 444.903625 | 0.0932077691 | 0.000209501033 |
+| prediction | adamw | 335.658875 | 0.0688860714 | 0.000205226427 |
+| prediction | muon | 292.014313 | 0.0627885163 | 0.000215018626 |
+
+Source: `274ad4b7793051ccbfc5d9ac39f9f3ac541d39de` (clean, pushed). Binary: `d7ff974d1e8de8d1d508e6ba890c31447d87f208c18e7690f89a0bab938a642e`.
+Dependency: `8e012f25e38f0c597c14268f0c705e504a5b5c28`. Build: `cargo build --release --locked --features cudnn`.
+Root: `/home/stepan/Coding/Personal/.tofy-build/v6-gradient-reconstruction-capture-20260906T113302-CDT`. Report SHA-256: `7acf3077244b4aff51a79c6448ec77fa7c4a29d3ff1e0651e6798dd25b7ad044`.
+External manifest SHA-256: `a905630ba8e780db0bd1ba3b62e0abf023bf6200b8293fca554f8e85c616217e`. All recursive entries and sidecar verified.
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU, GPU-216be468-8184-1801-0563-7c67555dbc45, 610.57.04, 8151 MiB, 2 MiB. Physical batch 128, no accumulation/update.
+cuDNN 9.25.0.15, CUDA 13.3.1. NVIDIA_TF32_OVERRIDE and CUBLAS_WORKSPACE_CONFIG unset.
+PID 60722 exited 1 and its /proc entry is absent.
+
+Exact command:
+
+```bash
+/home/stepan/Coding/Personal/.tofy-build/binaries/tofy-274ad4b7-d7ff974d1e8d-cudnn p2-v6-multibatch-frozen-diagnostic --g-report /home/stepan/Coding/Personal/.tofy-build/v6-multibatch-g-registered-20260906T002436-CDT/report.json --device cuda --output-root /home/stepan/Coding/Personal/.tofy-build/v6-gradient-reconstruction-capture-20260906T113302-CDT
+```
+
+## Decision and next falsifier
+
+Do not relax the reconstruction threshold or launch the full diagnostic.
+The source algebra matches in real arithmetic; residual magnitude alone does
+not identify an omitted loss, harmless roundoff, or backend defect. Candidate
+causes include affine grouping, separate backward accumulation, and reduced
+precision. Current NVIDIA documentation allows TF32 under default cuDNN math;
+this build leaves F32 convolution math at the default. That is an applicability
+hypothesis, not evidence that a particular kernel used TF32.
+
+The next cheapest control is a fixed synthetic convolution VJP additivity
+characterization, using the same pinned executable with NVIDIA_TF32_OVERRIDE
+unset versus 0 and a CPU reference. It can falsify the assumption that default
+CUDA backward additivity always meets 1e-5. It cannot uniquely explain this
+whole-model failure or authorize different G controls. Freeze this separate
+control before execution.
+
+Source: [NVIDIA cuDNN math type reference](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnnmathtype-t), retrieved 2026-09-06 CDT; `vendor/candle-core/src/cuda_backend/cudnn.rs` at 274ad4b7 sets tensor-op math explicitly only for BF16, leaving F32 default. No current architecture paper is needed to answer this numerical prerequisite; local Tofy literature map through September 4 was consulted.
