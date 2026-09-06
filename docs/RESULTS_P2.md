@@ -4,6 +4,65 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Graph exploration control (2026-09-06)
+
+The uncalibrated graph controller completed **0/23 development levels on both
+fixed seeds**, native score **0/100**. Uniform random input completed **1/23**
+on seed0, score **0.001282398/100**, and **0/23** on seed1. The single random
+completion was cd82 level1. It is an exploration control, not a learned-model
+improvement or a promoted result. Neither arm meets the campaign target.
+
+| Arm | Seed | ar25 / bp35 / cd82 levels | Charged actions by game | Suite seconds |
+|---|---:|---|---|---:|
+| Random | 0 | 0 / 0 / 1 | 1912 / 1119 / 2000 | 8.116 |
+| Graph | 0 | 0 / 0 / 0 | 1896 / 498 / 2000 | 11.737 |
+| Random | 1 | 0 / 0 / 0 | 1953 / 1099 / 2000 | 8.430 |
+| Graph | 1 | 0 / 0 / 0 | 1896 / 498 / 2000 | 9.345 |
+
+These were registered exploratory screens at up to2000 charged actions/game,
+20 GAME_OVER retries,180 seconds/game; ar25/bp35 stopped at the retry limit,
+cd82 at the action cap. Graph uses existing generic coordinate candidates;
+random chooses an input ID uniformly then a coordinate uniformly. This proposal
+confound and the absence of agent-requested RESET limit interpretation. The
+full-frame graph still distinguishes status/counter changes. It made **zero
+model evaluations**, verified in every action trace: G is loaded by the bridge
+but does not choose these actions. No training or online adaptation occurred.
+The graph observation/action summaries were identical across seeds; these are
+not independent stochastic replications. The other22 public games remain reserved.
+
+The confirmed-transition fix records terminal/final edges before lifecycle
+clearing;13 focused Rust tests pass. The random reference and existing runner
+have22 passing Python tests; formatting/Ruff and the cuDNN build pass. Two-action
+smokes passed on the exact binary/device. The first random smoke failed before
+inference because its one-game registration pointed at the three-game cache;
+it was retained as failed infrastructure, then corrected with a new run root.
+All four screen manifests, file sets, native action counts and process cleanup
+verified. No per-game threshold or solution was fitted to the trajectories.
+
+Source: `c7e671a5051d185fc6fb5de2bc527ebb0d7c599a`; sibling dependency
+`8e012f25e38f0c597c14268f0c705e504a5b5c28`. Build:
+`cargo build --release --locked --features cudnn`. Binary SHA256:
+`b478935c57e6d82920e273f1c85d910768517400c48d35183fc07f71b41e6d00`.
+RTX5060 Laptop8151MiB, driver610.57.04; arc-agi0.9.9/arcengine0.9.3.
+No training batch/accumulation; configured candidate batch128 is unexercised.
+Exact configurations, external manifest digests and run roots are in
+`/home/stepan/Coding/Personal/.tofy-build/graph-screen-preparation-20260906T182200-CDT/screen-verification.json`.
+
+Commands for each fixed seed0/1 and arm graph/random used the clean checkout:
+
+```bash
+PYTHONPATH=python /home/stepan/Coding/Personal/.tofy-build/arcagi-0.9.9-venv/bin/python -m tofy_arc3.run_baseline \
+  --config /home/stepan/Coding/Personal/.tofy-build/graph-screen-preparation-20260906T182200-CDT/random-screen-seed0.json \
+  --output-dir /home/stepan/Coding/Personal/.tofy-build/prize-random-development-seed0-20260906T182900-CDT
+```
+
+The exact sealed root must not be reused. The other three commands substitute
+both arm and seed in the config/output names. Decision: reject the registered
+standalone graph hypothesis; keep it as a control. Proceed to the separately
+registered non-ARC online-effect prerequisite and prepreview language-model
+capacity check. This result does not prove that exploration cannot work.
+[Registration](research/2026-09-06-graph-exploration-screen.md).
+
 ## Offline public reference and evaluator correction (2026-09-06)
 
 The frozen G final raw step-2048 checkpoint completed **0/23 levels** with
@@ -1778,6 +1837,13 @@ dose-by-seed comparison while dropping the secondary update-125 trajectory quest
 the run must record this scope note and cannot support a learning-trajectory claim.
 
 ## Best So Far
+
+**Public development controls (not trained-model promotion):** random seed0
+reached1/23 levels and0.001282398/100 at the2000-action cap; seed1 and both
+graph seeds reached0. The exact command and seed-specific limitations are in
+[the graph control record](#graph-exploration-control-2026-09-06).
+The frozen learned G policy remains0/23 at its separately registered128-action cap;
+these budgets are not matched and the random result is not a model improvement.
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
 
