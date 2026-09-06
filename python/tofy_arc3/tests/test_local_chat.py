@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import unittest
+from typing import Self
 from urllib.error import URLError
 
-from tofy_arc3.local_chat import LocalChatAgent, LocalChatError, SYSTEM_PROMPT
+from tofy_arc3.local_chat import SYSTEM_PROMPT, LocalChatAgent, LocalChatError
 
 
 def observation(
@@ -29,7 +30,7 @@ class FakeResponse:
         self.status = status
         self.body = body if isinstance(body, bytes) else json.dumps(body).encode()
 
-    def __enter__(self) -> "FakeResponse":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -73,7 +74,9 @@ class LocalChatAgentTests(unittest.TestCase):
         agent._open = fake
         return agent, fake
 
-    def test_constructs_deterministic_llama_server_request_without_identifiers(self) -> None:
+    def test_constructs_deterministic_llama_server_request_without_identifiers(
+        self,
+    ) -> None:
         agent, fake = self.agent(
             ['```json\n{"action_id":6,"x":12,"y":63}\n```'],
             seed=7,
@@ -231,6 +234,17 @@ class LocalChatAgentTests(unittest.TestCase):
         bad["frame"][0][0][0] = 16
         with self.assertRaisesRegex(ValueError, "0..15"):
             agent.choose_action(bad)
+
+    def test_transport_preserves_direct_and_wrapped_timeouts(self) -> None:
+        for error in (TimeoutError("budget"), URLError(TimeoutError("socket"))):
+            agent, _ = self.agent([])
+
+            def unavailable(request, timeout, error=error):
+                raise error
+
+            agent._open = unavailable
+            with self.assertRaises(TimeoutError):
+                agent.choose_action(observation())
         bad = observation()
         bad["available_actions"] = [1, True]
         with self.assertRaisesRegex(ValueError, "non-negative integer"):

@@ -1,4 +1,5 @@
-"""Deterministic local-chat baseline for ARC-AGI-3 observations."""
+# SPDX-License-Identifier: MIT-0
+"""Local-chat baseline with fixed decoding settings for ARC-AGI-3."""
 
 from __future__ import annotations
 
@@ -6,7 +7,8 @@ import ipaddress
 import json
 import re
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import (
@@ -15,7 +17,6 @@ from urllib.request import (
     Request,
     build_opener,
 )
-
 
 _MAX_RESPONSE_BYTES = 1 << 20
 _FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
@@ -55,7 +56,7 @@ def _completion_url(endpoint: str) -> str:
     if parsed.query or parsed.fragment:
         raise ValueError("endpoint query strings and fragments are not allowed")
     try:
-        parsed.port
+        _ = parsed.port
     except ValueError as exc:
         raise ValueError("endpoint port is invalid") from exc
     host = parsed.hostname.lower()
@@ -83,7 +84,7 @@ def _observation_text(
     observation: dict[str, Any], *, require_actions: bool = True
 ) -> tuple[tuple[str, str], str, list[int], str]:
     if not isinstance(observation, dict):
-        raise ValueError("observation must be a JSON object")
+        raise TypeError("observation must be a JSON object")
     game_id = observation.get("game_id")
     guid = observation.get("guid")
     if not isinstance(game_id, str) or not game_id:
@@ -97,7 +98,7 @@ def _observation_text(
     win_levels = _integer(observation.get("win_levels"), "win_levels")
     full_reset = observation.get("full_reset")
     if not isinstance(full_reset, bool):
-        raise ValueError("observation full_reset must be a boolean")
+        raise TypeError("observation full_reset must be a boolean")
     available = observation.get("available_actions")
     if not isinstance(available, list) or (require_actions and not available):
         requirement = "a non-empty list" if require_actions else "a list"
@@ -139,8 +140,7 @@ def _observation_text(
         f"full_reset={json.dumps(full_reset)}\n"
         f"available_actions={json.dumps(available, separators=(',', ':'))}\n"
         "Each frame row is 64 lossless hexadecimal palette symbols (0-F); x is the "
-        "column and y is the row.\n"
-        + "\n".join(rendered)
+        "column and y is the row.\n" + "\n".join(rendered)
     )
     return (game_id, guid), text, available, state
 
@@ -226,9 +226,7 @@ class LocalChatAgent:
             self._history.clear()
             self._session = session
 
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
+        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         for prior_observation, prior_action, terminal_feedback in self._history:
             messages.append({"role": "user", "content": prior_observation})
             if prior_action is not None:
@@ -263,7 +261,13 @@ class LocalChatAgent:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             raise LocalChatError(f"chat endpoint returned HTTP {exc.code}") from exc
-        except (URLError, TimeoutError, OSError) as exc:
+        except TimeoutError:
+            raise
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise exc.reason from exc
+            raise LocalChatError(f"chat request failed: {exc}") from exc
+        except OSError as exc:
             raise LocalChatError(f"chat request failed: {exc}") from exc
         latency = time.perf_counter() - started
         if len(raw) > _MAX_RESPONSE_BYTES:
@@ -273,15 +277,23 @@ class LocalChatAgent:
             choices = envelope["choices"]
             message = choices[0]["message"]
             content = message["content"]
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-            raise LocalChatError("chat endpoint returned an invalid completion response") from exc
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ) as exc:
+            raise LocalChatError(
+                "chat endpoint returned an invalid completion response"
+            ) from exc
         if not isinstance(content, str):
             raise LocalChatError("assistant response content must be text")
         action = _parse_action(content, available)
         canonical_action = json.dumps(action, separators=(",", ":"))
         if self.history_turns:
             self._history.append((observation_text, canonical_action, None))
-            del self._history[:-self.history_turns]
+            del self._history[: -self.history_turns]
         usage = envelope.get("usage", {})
         if not isinstance(usage, dict):
             usage = {}
@@ -317,7 +329,7 @@ class LocalChatAgent:
                 )
             else:
                 self._history.append((observation_text, None, None))
-                del self._history[:-self.history_turns]
+                del self._history[: -self.history_turns]
 
     def close(self) -> None:
         """No persistent transport is held by this client."""
