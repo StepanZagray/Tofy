@@ -2137,6 +2137,21 @@ fn gradient_cell(
     let full_reconstruction = reconstruction_check(&direct_full, &reconstructed_full, varmap)?;
     let prediction_reconstruction =
         reconstruction_check(&prediction_grads, &reconstructed_prediction, varmap)?;
+    // The ignored characterization stops here in a test executable so it can
+    // observe both pass and fail outcomes without changing production admission.
+    #[cfg(test)]
+    if std::env::var("TOFY_FROZEN_RECONSTRUCTION_PROBE").as_deref() == Ok("1") {
+        anyhow::bail!(
+            "TOFY_FROZEN_RECONSTRUCTION {}",
+            serde_json::json!({
+                "full": full_reconstruction,
+                "prediction": prediction_reconstruction,
+                "logits": capture.fingerprint,
+                "mask_binding": mask_binding,
+                "false_edit_pixels": masks.false_edit_count,
+            })
+        );
+    }
     ensure_reconstructions(&full_reconstruction, &prediction_reconstruction)?;
 
     let full_stats =
@@ -4341,6 +4356,118 @@ pub fn run_p2_frozen_seam_characterization(args: P2FrozenSeamCharacterizationArg
 mod tests {
     use super::*;
     use candle_core::Var;
+
+    #[cfg(feature = "cudnn")]
+    fn parameter_tensor_fingerprints(
+        varmap: &VarMap,
+    ) -> Result<BTreeMap<String, TensorFingerprint>> {
+        varmap
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, var)| Ok((name.clone(), tensor_fingerprint(var.as_tensor())?)))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "manual frozen-checkpoint precision characterization"]
+    #[cfg(feature = "cudnn")]
+    fn frozen_reconstruction_precision_characterization() -> Result<()> {
+        ensure!(
+            std::env::var("TOFY_FROZEN_RECONSTRUCTION_PROBE").as_deref() == Ok("1"),
+            "frozen precision probe requires its explicit test-only stop"
+        );
+        let g_path = PathBuf::from(std::env::var("TOFY_PRECISION_G_REPORT")?);
+        let root = PathBuf::from(std::env::var("TOFY_PRECISION_PROBE_ROOT")?);
+        let (g, binding) = bind_g(&g_path)?;
+        let cfg_path = binding.root.join("train_config.json");
+        ensure!(
+            file_sha256_hex(&cfg_path)? == REGISTERED_TRAIN_CONFIG_SHA256,
+            "precision probe config drift"
+        );
+        let cfg = load_train_config(&cfg_path)?;
+        cfg.validate()?;
+        ensure_registered_config(&cfg)?;
+        let population =
+            MultibatchPopulation::compose(cfg.seed, cfg.physical_batch, cfg.data_contract_v6)?;
+        let census = population.write(&root)?;
+        ensure!(
+            g.population.as_ref() == Some(&census)
+                && g.population_census_sha256.as_deref()
+                    == Some(file_sha256_hex(&root.join("population/census.json"))?.as_str()),
+            "precision probe population drift"
+        );
+        let expected = snapshot_by_step(&g, 0)?;
+        let checkpoint = checked_snapshot_path(&binding.root, expected)?;
+        ensure!(
+            Some(query_gpu_identity("cuda")?) == g.gpu_identity,
+            "precision probe GPU drift"
+        );
+        let device = Device::new_cuda(0)?;
+        let varmap = VarMap::new();
+        let model = WorldModel::new(
+            cfg.model_config(),
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+        )?;
+        load_varmap_exact(&varmap, &checkpoint)?;
+        ensure_operator_projection_zero(&varmap)?;
+        let before = parameter_tensor_fingerprints(&varmap)?;
+        let host = prepare_foundation_v2_batch_host(&population.train_main[0])?;
+        let transitions = population.train_main[0]
+            .transitions()
+            .cloned()
+            .collect::<Vec<_>>();
+        // Identical bounded warmup in both arms; no claim to reproduce the
+        // original preflight's full D2/held-out allocator history.
+        let raw = capture_logits(&raw_one_step_logits(&model, &transitions, &device)?)?;
+        let error = gradient_cell(
+            0,
+            0,
+            expected.ep_weight,
+            &cfg,
+            &model,
+            &varmap,
+            &population.train_main[0],
+            &population.train_rollout[0],
+            &host,
+            &device,
+            &raw.predictions,
+            &load_loss_controls(&g)?,
+            &g,
+        )
+        .err()
+        .context("precision probe did not stop at reconstruction capture")?
+        .to_string();
+        let checks: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("TOFY_FROZEN_RECONSTRUCTION ")
+                .context(error.clone())?,
+        )?;
+        sync_cuda_device(&device)?;
+        ensure!(
+            before == parameter_tensor_fingerprints(&varmap)?,
+            "probe changed weights"
+        );
+        let (_, rebound) = bind_g(&g_path)?;
+        ensure!(binding == rebound, "precision probe G changed");
+        println!(
+            "TOFY_FROZEN_PRECISION {}",
+            serde_json::json!({
+                "schema": "p2.frozen_reconstruction_precision.v1",
+                "evidence_class": "frozen_checkpoint_precision_characterization_only",
+                "tf32_override": std::env::var("NVIDIA_TF32_OVERRIDE").ok(),
+                "snapshot_step": 0,
+                "batch_position": 0,
+                "physical_batch": cfg.physical_batch,
+                "checkpoint_sha256": expected.raw_sha256,
+                "population_census_sha256": file_sha256_hex(&root.join("population/census.json"))?,
+                "parameters_unchanged": true,
+                "checks": checks,
+            })
+        );
+        Ok(())
+    }
 
     /// A bounded backend control, not a model or frozen-diagnostic admission test.
     #[test]

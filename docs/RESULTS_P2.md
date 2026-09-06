@@ -17,6 +17,54 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 synthetic convolution precision control (2026-09-06)
+
+On the one preregistered synthetic convolution, the default CUDA backward
+failed the fixed 1e-5 additivity tolerance for both input and filter. Disabling
+TF32 restored it; CPU also passed. Every same-graph repeated backward had zero
+residual, every reference norm was nonzero (about 1960–1970), and both fixture
+tensors remained unchanged. All three processes exited successfully.
+
+| Arm | Input relative residual | Filter relative residual | Repeat residuals |
+|---|---:|---:|---:|
+| cpu | 1.73907786e-07 | 1.12640845e-06 | 0, 0 |
+| cuda_default | 0.000269405847 | 0.000272102774 | 0, 0 |
+| cuda_tf32_off | 4.1812145e-07 | 3.04660142e-07 | 0, 0 |
+
+The registered favorable pattern is satisfied. NVIDIA_TF32_OVERRIDE=0 is
+sufficient to restore additivity within the fixed tolerance for this fixture.
+This falsifies a universal assumption that default F32 cuDNN backward additivity
+must meet 1e-5. It supports the precision hypothesis for Tofy's observed 2e-4
+reconstruction error, but does not identify exact kernels, exclude algorithm
+changes induced by the override, uniquely explain the full model, or authorize
+training/model promotion. A single fixture is a numerical control, not a
+statistical distribution-level result. The unused optimizer route for each
+single tensor has a structural zero norm; the nonempty route and global norm
+own the stated test result.
+
+## Provenance and verification
+
+Source: `dc299bb77430e4b67e621f7f1a79977d23951661` (clean and pushed); dependency `8e012f25e38f0c597c14268f0c705e504a5b5c28`.
+Binary SHA-256: `e2385b6f1b6e949189fa23bd96b5a86171b5faf62c958f4fd235816aedd61d67`.
+Build: `cargo test --release --locked --features cudnn --lib --no-run`. The pinned test executable records clean/pushed
+source, dependency, CUDA/cuDNN features and release profile in build-identity.txt.
+Root: `/home/stepan/Coding/Personal/.tofy-build/v6-convolution-additivity-20260906T114328-CDT`.
+Report SHA-256: `f516f9e495e216f18372ad4f7cd1845c260049e3b0688af7dd267c771c1649cb`.
+External manifest SHA-256: `c7c3431a7db35b60de80202f2f3018967a2e0e4f485c6869ea053f4283567dc2`. Every recursive entry and sidecar verified.
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU, GPU-216be468-8184-1801-0563-7c67555dbc45, 610.57.04, 8151 MiB, 2 MiB. cuDNN 9.25.0.15; CUDA 13.3.1.
+CPU/default-CUDA/TF32-off elapsed: 0.064417,
+0.466984, 0.417433 seconds.
+PIDs 68067, 68085 and 68094 exited and /proc entries are absent.
+Physical synthetic batch 8; no optimizer, EMA, training accumulation or ARC data.
+
+All arms used this exact command with TOFY_PRECISION_PROBE_DEVICE=cpu/cuda/cuda
+and NVIDIA_TF32_OVERRIDE absent/absent/0, respectively:
+
+```bash
+/home/stepan/Coding/Personal/.tofy-build/binaries/tofy-conv-test-dc299bb7-e2385b6f1b6e-cudnn --ignored --exact p2::multibatch_frozen_diagnostic::tests::convolution_backward_additivity_characterization --nocapture --test-threads=1
+```
+
+
 ## V6 gradient residual capture (2026-09-06)
 
 The telemetry-only replay reproduced the failure in 18.098100267 seconds.
