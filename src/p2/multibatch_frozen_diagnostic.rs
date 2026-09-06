@@ -79,7 +79,7 @@ const REGISTERED_G_IDENTITY: &str =
     "sha256:1d470fc1b5680e33efa07e32c51bf74fa0a73bea6e839828da09fd7922eee265";
 const REGISTERED_G_SOURCE: &str = "dba110de8ed467b58dbaa2a936565f0dc8a7b794";
 const REGISTERED_G_BINARY_SHA256: &str =
-    "faf6fb74820582de8f1a62675392de19a729a9961a2573fc8bf8c96358631f44";
+    "sha256:faf6fb74820582de8f1a62675392de19a729a9961a2573fc8bf8c96358631f44";
 const REGISTERED_G_CARGO_LOCK_SHA256: &str =
     "b3d7c2e65ee49f07e5fb8c0ba5d3e183bb839c9f0117ef5e7ff820d80bc367cc";
 const REGISTERED_TRAIN_CONFIG_SHA256: &str =
@@ -3027,6 +3027,12 @@ mod tests {
         assert_eq!(spec.gradient_steps, [0, 1024]);
         assert_eq!(spec.rescore_steps, [0, 1024, 2048]);
         assert_eq!(spec.anatomy_steps, [2048]);
+    }
+
+    #[test]
+    fn frozen_parent_binary_digest_matches_launch_provenance_representation() {
+        assert_eq!(REGISTERED_G_BINARY_SHA256.len(), "sha256:".len() + 64);
+        assert!(REGISTERED_G_BINARY_SHA256.starts_with("sha256:"));
     }
 
     #[test]

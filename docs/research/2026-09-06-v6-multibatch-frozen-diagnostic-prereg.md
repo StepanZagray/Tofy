@@ -1,6 +1,6 @@
 # V6 multi-batch frozen-checkpoint diagnostic (preregistered)
 
-Status: **implementation independently reviewed GO; no CUDA run yet**
+Status: **corrected implementation independently reviewed GO; no CUDA work yet**
 Date: 2026-09-06 CDT
 Evidence class: **selection-only single-seed frozen-checkpoint diagnostic**
 Research claim: **false**
@@ -58,6 +58,28 @@ Fable 5.1 was requested first for the document review, but both the initial
 call and required retry were rejected by its account usage limit. Opus is
 identified explicitly as the fallback; its verdict is not attributed to
 Fable.
+
+Preflight launch audit: root
+`/home/stepan/Coding/Personal/.tofy-build/v6-frozen-diagnostic-preflight-20260906T040923-CDT`
+failed before CUDA because its otherwise locked cuDNN binary embedded an
+unknown build command. Report SHA-256
+`bd19023875ef5ed700d3df91bc0f982c0db9ab7ddf5d54fbf91ee1c70e4f1f88`;
+external manifest SHA-256
+`6bbd2b15f1aea83a47bad50d957944a18e833210997395f94b6e2c6fbe682711`.
+Root
+`/home/stepan/Coding/Personal/.tofy-build/v6-frozen-diagnostic-preflight-20260906T041036-CDT`
+then failed before CUDA because the frozen G binary constant omitted the
+`sha256:` representation prefix used by `LaunchProvenance`. Report SHA-256
+`bc80214c7468200c6bfca04cb02d70263a03b4303221e3faab4fbf91df619d5c`;
+external manifest SHA-256
+`bf77e296c2fa31929e17e07fd4f208714c6fc55b5650ad4d29b68a6891d3ca6d`.
+Both are failed infrastructure/integrity evidence with `device_is_cuda=false`;
+neither is model evidence. The latter correction changes only digest string
+representation, not the frozen scientific contract.
+Its bounded independent review is recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-parent-digest-go-20260906.md`,
+SHA-256 `f075284892231ae3c27d1a7e7a8310fc99b1db737c382a21f4287869e4d05e62`.
+Verdict: GO.
 
 This document must receive independent review, then be committed and pushed
 before diagnostic implementation. The implementation, exact locked CUDA
