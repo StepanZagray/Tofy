@@ -68,12 +68,12 @@ pub const REGISTERED_ROLLOUT_ROWS: usize = 32;
 pub const REGISTERED_SIGREG_PROJECTIONS: usize = 1024;
 pub const REGISTERED_SIGREG_KNOTS: usize = 17;
 pub const MAX_WALL_TIME: Duration = Duration::from_secs(90 * 60);
-const MAX_GRAD_NORM: f64 = 1.0;
-const ROLLOUT_SEED_DOMAIN: u64 = 0xA011_0A77_0000_0002;
+pub(crate) const MAX_GRAD_NORM: f64 = 1.0;
+pub(crate) const ROLLOUT_SEED_DOMAIN: u64 = 0xA011_0A77_0000_0002;
 const COMMAND_TAG: &str = "p2-v6-fixed-batch-positive-control";
-const FULL_OBJECTIVE: &str = "full_objective";
+pub(crate) const FULL_OBJECTIVE: &str = "full_objective";
 const PREDICTION_ONLY: &str = "prediction_only";
-const OUTCOME_PASS: &str = "same_row_action_conditioned_fit";
+pub(crate) const OUTCOME_PASS: &str = "same_row_action_conditioned_fit";
 const OUTCOME_PARTIAL: &str = "partial_fit";
 const OUTCOME_WITHOUT_ACTION: &str = "fit_without_action";
 const OUTCOME_FAIL: &str = "fail";
@@ -225,7 +225,7 @@ pub struct RouteNorms {
 }
 
 impl RouteNorms {
-    fn passed(&self) -> bool {
+    pub(crate) fn passed(&self) -> bool {
         self.positive_pass && self.zero_pass
     }
 }
@@ -376,7 +376,7 @@ pub struct PositiveControlReport {
     pub error: Option<String>,
 }
 
-fn bytes_hex(bytes: &[u8]) -> String {
+pub(crate) fn bytes_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;
@@ -385,15 +385,15 @@ fn bytes_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn registered_sigreg_seed(seed: u64, zero_based_update: usize) -> u64 {
+pub(crate) fn registered_sigreg_seed(seed: u64, zero_based_update: usize) -> u64 {
     seed.wrapping_add(zero_based_update as u64)
 }
 
-fn board_changed(sample: &V5Sample) -> bool {
+pub(crate) fn board_changed(sample: &V5Sample) -> bool {
     let pixels = gameplay_rows(true) * FRAME_SIDE;
     sample.transition.current.pixels[..pixels] != sample.transition.next.pixels[..pixels]
 }
@@ -533,7 +533,7 @@ fn population_record(
     })
 }
 
-fn ensure_registered_config(cfg: &TrainConfig) -> Result<()> {
+pub(crate) fn ensure_registered_config(cfg: &TrainConfig) -> Result<()> {
     ensure!(cfg.recipe == TrainingRecipe::FoundationV2, "recipe drift");
     ensure!(cfg.seed == 5 && cfg.init_seed == Some(5), "seed drift");
     ensure!(
@@ -578,7 +578,7 @@ fn ensure_registered_config(cfg: &TrainConfig) -> Result<()> {
     Ok(())
 }
 
-fn route_norms(grads: &GradStore, varmap: &VarMap) -> Result<RouteNorms> {
+pub(crate) fn route_norms(grads: &GradStore, varmap: &VarMap) -> Result<RouteNorms> {
     let mut norms = BTreeMap::new();
     for route in REQUIRED_POSITIVE_ROUTES {
         norms.insert(
@@ -631,7 +631,10 @@ fn gradient_l2_or_absent_zero(grads: &GradStore, varmap: &VarMap, prefix: &str) 
     }
 }
 
-fn exact_metrics(samples: &[V5Sample], predictions: &[Vec<u8>]) -> Result<PredictionExactMetrics> {
+pub(crate) fn exact_metrics(
+    samples: &[V5Sample],
+    predictions: &[Vec<u8>],
+) -> Result<PredictionExactMetrics> {
     ensure!(
         samples.len() == predictions.len(),
         "prediction row mismatch"
@@ -678,7 +681,7 @@ fn exact_metrics(samples: &[V5Sample], predictions: &[Vec<u8>]) -> Result<Predic
     })
 }
 
-fn control_predictions(samples: &[V5Sample], kind: &str) -> Vec<Vec<u8>> {
+pub(crate) fn control_predictions(samples: &[V5Sample], kind: &str) -> Vec<Vec<u8>> {
     let pixels = gameplay_rows(true) * FRAME_SIDE;
     samples
         .iter()
@@ -691,7 +694,7 @@ fn control_predictions(samples: &[V5Sample], kind: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn action_class_metrics(
+pub(crate) fn action_class_metrics(
     samples: &[V5Sample],
     group: Range<usize>,
     predictions: &[Vec<u8>],
@@ -871,11 +874,11 @@ fn save_snapshot(
     })
 }
 
-fn approximately(observed: f64, expected: f64) -> bool {
+pub(crate) fn approximately(observed: f64, expected: f64) -> bool {
     (observed - expected).abs() <= 1e-6f64.max(expected.abs() * 1e-6)
 }
 
-fn update_one_binding(
+pub(crate) fn update_one_binding(
     observed: UpdateRecord,
     changed_pixels: usize,
     unchanged_pixels: usize,
@@ -1051,7 +1054,7 @@ fn report_identity(report: &PositiveControlReport) -> Result<String> {
     ])
 }
 
-fn bind_report(path: &Path) -> Result<(PositiveControlReport, EvidenceBinding)> {
+pub(crate) fn bind_report(path: &Path) -> Result<(PositiveControlReport, EvidenceBinding)> {
     let report_path = fs::canonicalize(path)
         .with_context(|| format!("canonicalize report {}", path.display()))?;
     let bytes = fs::read(&report_path)?;
@@ -1189,7 +1192,7 @@ fn compare_route_norms(left: &RouteNorms, right: &RouteNorms) -> bool {
         })
 }
 
-fn ensure_operator_projection_zero(varmap: &VarMap) -> Result<()> {
+pub(crate) fn ensure_operator_projection_zero(varmap: &VarMap) -> Result<()> {
     let data = varmap.data().lock().unwrap();
     for name in [
         "operator_conditioning_proj.weight",
