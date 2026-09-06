@@ -16,6 +16,9 @@ use crate::p2::branch_learning::BranchLearningConfig;
 use crate::p2::eval::{emit_phase_a_calibration, evaluate, evaluate_arc3, EvalConfig, EvalMode};
 use crate::p2::experiment::{ConsumerReadoutTopology, SigregStatistic, TrainingRecipe};
 use crate::p2::grounding::{DecodeComposition, PatchGroundingMode};
+pub use crate::p2::multibatch_frozen_diagnostic::{
+    run_p2_multibatch_frozen_diagnostic, P2MultibatchFrozenDiagnosticArgs,
+};
 pub use crate::p2::multibatch_screen::{
     run_p2_multibatch_generalization_screen, P2MultibatchScreenArgs,
 };

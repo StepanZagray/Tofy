@@ -3216,8 +3216,11 @@ pub fn one_step_false_edit_rate_with_content_masks(
 
 fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<Vec<u8>>> {
     let batch = latent.dim(0)?;
-    model
-        .exact_gameplay_logits(latent)?
+    exact_palette_predictions_from_logits(&model.exact_gameplay_logits(latent)?, batch)
+}
+
+fn exact_palette_predictions_from_logits(logits: &Tensor, batch: usize) -> Result<Vec<Vec<u8>>> {
+    logits
         .argmax(D::Minus1)?
         .reshape((batch, ()))?
         .to_dtype(DType::U8)?
@@ -3227,11 +3230,11 @@ fn exact_palette_predictions(model: &WorldModel, latent: &Tensor) -> Result<Vec<
 
 /// Raw exact-decoder predictions on caller-owned rows using the same bounded,
 /// context-aware forward seam as the Foundation-v2 gate evaluator.
-pub(crate) fn raw_one_step_predictions(
+pub(crate) fn raw_one_step_logits(
     model: &WorldModel,
     samples: &[TransitionSample],
     device: &Device,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Tensor> {
     let encoded = encode_gate_support_population(model, samples, None, device)?;
     let prediction = forward_gate_rows_chunked(
         model,
@@ -3244,7 +3247,17 @@ pub(crate) fn raw_one_step_predictions(
         RecursionDepth::from_config(model.config()),
         FOUNDATION_V2_GATE_PHYSICAL_BATCH,
     )?;
-    exact_palette_predictions(model, &prediction)
+    model.exact_gameplay_logits_detached(&prediction)
+}
+
+/// Argmax wrapper retained as G's bit-identical raw scoring seam.
+pub(crate) fn raw_one_step_predictions(
+    model: &WorldModel,
+    samples: &[TransitionSample],
+    device: &Device,
+) -> Result<Vec<Vec<u8>>> {
+    let batch = samples.len();
+    exact_palette_predictions_from_logits(&raw_one_step_logits(model, samples, device)?, batch)
 }
 
 /// Evaluate all four automated run-gate measurements on one fixed batch.
@@ -12777,6 +12790,13 @@ mod tests {
             assert!(
                 worst <= 1e-5,
                 "chunked gate forward changed the prediction by {worst:e}"
+            );
+            let logits = raw_one_step_logits(&model, &samples, &device)?;
+            let from_logits = exact_palette_predictions_from_logits(&logits, samples.len())?;
+            assert_eq!(
+                from_logits,
+                raw_one_step_predictions(&model, &samples, &device)?,
+                "the detached-logit seam must preserve the existing raw argmax wrapper"
             );
         }
         Ok(())

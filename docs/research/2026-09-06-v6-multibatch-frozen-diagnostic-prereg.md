@@ -1,6 +1,6 @@
 # V6 multi-batch frozen-checkpoint diagnostic (preregistered)
 
-Status: **corrected design freeze independently reviewed GO; no implementation or CUDA run yet**
+Status: **implementation independently reviewed GO; no CUDA run yet**
 Date: 2026-09-06 CDT
 Evidence class: **selection-only single-seed frozen-checkpoint diagnostic**
 Research claim: **false**
@@ -24,6 +24,35 @@ Preregistration NO-GO review: Opus 5 High fallback, SHA-256
 
 Corrected preregistration GO review: Opus 5 High fallback, SHA-256
 `6e1df6e1ef5cbf351e904d8f3ca95ed20759955409742738fca0c5ba283b84a7`
+
+Initial implementation NO-GO review: Opus 5 High fallback, recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-implementation-nogo-20260906.md`,
+SHA-256 `a3afaae6d6632ebb830f4029d0ef87ef1bd7cd21cf0d2c262455d14977fd35b1`.
+It found cross-process bit-exact float comparison and mismatched preflight D2
+coverage; both require correction and a fresh implementation review before
+preflight. Fable 5.1 High was attempted twice first and remained unavailable
+because of its account usage limit; that failure is recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/fable-v6-frozen-diagnostic-implementation-unavailable-20260906.md`.
+Its SHA-256 is
+`596de3830cdbb35a7cc94f58697d9712d48673649a01d76fc84d7df175c9bd6d`.
+
+Post-fix implementation NO-GO review: Opus 5 High fallback, recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-postfix-nogo-20260906.md`,
+SHA-256 `e253cd81f3e60412a21c5c8fc5189ef79c49731ee953ce1ff9c563019318badc`.
+It found registered-only snapshot lookups, absent step-1,024 preflight anatomy,
+and invalid cross-shape margin-float admission. All three are corrected below
+and required a fresh review verdict before commit/build.
+
+Final implementation review: Opus 5 High fallback, recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-final-go-20260906.md`,
+SHA-256 `a5d2cdbf796a22c5b5dc14c72b923e067e75ac910224e8556e8b1669356b400d`.
+Verdict: GO with no blocking findings. The primary agent nevertheless corrected
+its one medium fail-closed tolerance risk and four low contract weaknesses.
+The bounded post-correction review is recorded at
+`/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-postcorrection-go-20260906.md`,
+SHA-256 `6dcabc5817c3bbc464f32d887d12fba6157f3efc988c1d275d0c50074637c5b1`.
+Verdict: GO; all five corrections were confirmed and no blocking regression
+was found.
 
 Fable 5.1 was requested first for the document review, but both the initial
 call and required retry were rejected by its account usage limit. Opus is
@@ -263,10 +292,33 @@ prefix norms use the same norm tolerance. Every loss, gradient, margin, norm,
 cosine, kappa, and count must be finite when mathematically defined.
 
 The exact diagnostic binary first runs an unregistered preflight containing
-the step-0 and step-1,024 batch-0 control cells, step-2,048 train/held-out
-batch-0 rescoring, and one logit-anatomy pass. It takes no optimizer step. The
+the step-0 and step-1,024 batch-0 control cells, batch-0 D2 rescoring at steps
+0 and 1,024 so both D1 masks come from the required union-sliced seam,
+step-2,048 train/held-out batch-0 rescoring, and one logit-anatomy pass. It
+takes no optimizer step. The
 full registered run must bind that preflight's source, binary, Cargo,
 dependency, G parent, population, GPU, control values, and report identity.
+
+The zero training-vs-raw argmax-disagreement requirement is retained after
+implementation review as a cheap fail-closed preflight falsifier. Backend
+batch-shape numerics could make it fail despite mathematical seam equality; if
+that happens, the preflight is failed evidence and the rail will not be
+weakened after observing the result. Any revised rail requires a new frozen
+registration and independent review before another CUDA attempt.
+
+Cross-process D2 controls are compared only at the preflight's frozen steps
+`[0,1024,2048]`; registered-only steps are not required to appear in the
+preflight. At step 1,024 the registered run additionally computes D3 anatomy,
+while the preflight deliberately does not, so only the shared D2 batch-0
+record is compared. At step 2,048 the 128-row preflight and 1,024-row
+registered union use different encoder batch shapes. The cross-process D3
+binding therefore compares the full integer anatomy (counts, bins, locations,
+class pairs, distance and row histograms) but not the floating margin
+quantiles. D2 integer fields still fail on any argmax/count change. Margin
+floats remain required finite and are reported within each run, but a
+cross-shape `~1e-5` logit drift cannot invalidate an otherwise identical
+preflight under the §7 same-shape `1e-6` loss tolerance. This exclusion is
+frozen before CUDA and may not be changed after observing preflight output.
 
 Both runs require CUDA, the exact G GPU name, UUID, memory, and driver, a fresh
 never-reused root, a process guard, no public data, explicit lifecycle, and a
@@ -356,6 +408,12 @@ complete D1 cell and one train-plus-held-out D2/D3 batch pair. Estimate device
 work as `24 * D1_cell_seconds + 7 * 8 * D2D3_pair_seconds`; admission requires
 that estimate to be at most 900 seconds, preserving five minutes for complete
 integrity checks and sealing.
+
+The registered run also recomputes one non-classifying step-0 D4 gradient
+control. The frozen admission formula intentionally counts only the 24-cell D1
+classification grid; the five-minute integrity reserve covers that 25th cell,
+checkpoint hashing, population verification, and sealing. This is an explicit
+conservative-budget limitation, not an unreported 24-cell execution claim.
 
 The implementation is limited to:
 

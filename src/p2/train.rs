@@ -4982,7 +4982,7 @@ fn gradient_cosine_for_parameter_prefix(
 }
 
 #[derive(Clone, Copy)]
-enum OptimizerRoute {
+pub(crate) enum OptimizerRoute {
     All,
     AdamW,
     Muon,
@@ -4996,7 +4996,7 @@ fn parameter_uses_route(name: &str, tensor: &Tensor, route: OptimizerRoute) -> b
     }
 }
 
-fn gradient_l2_for_optimizer_route(
+pub(crate) fn gradient_l2_for_optimizer_route(
     grads: &GradStore,
     varmap: &VarMap,
     route: OptimizerRoute,
@@ -5026,7 +5026,7 @@ fn gradient_l2_for_optimizer_route(
     Ok(norm)
 }
 
-fn gradient_cosine_for_optimizer_route(
+pub(crate) fn gradient_cosine_for_optimizer_route(
     left: &GradStore,
     right: &GradStore,
     varmap: &VarMap,
@@ -5089,7 +5089,7 @@ fn gradient_cosine_for_optimizer_route(
     Ok(Some((dot / (left_norm * right_norm)).clamp(-1.0, 1.0)))
 }
 
-fn foundation_v2_gradient_route_stats(
+pub(crate) fn foundation_v2_gradient_route_stats(
     grads: &GradStore,
     prediction_grads: Option<&GradStore>,
     varmap: &VarMap,
@@ -5611,6 +5611,9 @@ pub struct FoundationV2ObjectiveConfig {
     /// Collect detached seam tensors for a profiled update's mechanism
     /// packet. Off on ordinary updates.
     pub capture_mechanism_seams: bool,
+    /// Retain the attached per-pixel prediction CE for a read-only diagnostic.
+    /// Off in every production and registered-training caller.
+    pub capture_pred_per_pixel: bool,
 }
 
 impl Default for FoundationV2ObjectiveConfig {
@@ -5625,6 +5628,7 @@ impl Default for FoundationV2ObjectiveConfig {
             split_ce_weighting: SplitCeWeighting::CurrentDouble,
             split_ce_changed_budget: None,
             capture_mechanism_seams: false,
+            capture_pred_per_pixel: false,
         }
     }
 }
@@ -5653,6 +5657,11 @@ pub struct FoundationV2LossBreakdown {
     pub event: Tensor,
     pub q: Tensor,
     pub reliability: Tensor,
+    /// Attached only when explicitly requested by a read-only diagnostic.
+    pub pred_per_pixel: Option<Tensor>,
+    /// Detached training-path logits paired with `pred_per_pixel` for an
+    /// argmax-equivalence integrity check.
+    pub diagnostic_predicted_logits: Option<Tensor>,
     pub changed_weights: ChangedPixelWeights,
     pub factual_groups: usize,
     pub equivalent_pairs: usize,
@@ -5771,6 +5780,7 @@ fn benchmark_bf16_arm(
                 split_ce_weighting: cfg.split_ce_weighting,
                 split_ce_changed_budget: cfg.split_ce_changed_budget,
                 capture_mechanism_seams: false,
+                capture_pred_per_pixel: false,
             },
             &event_slot_weights,
         )?;
@@ -6841,6 +6851,12 @@ pub(crate) fn foundation_v2_training_loss_with_event_weights(
             predicted_canonical: predicted_canonical.detach(),
             gate_logits: gate_logits.detach(),
         });
+    let captured_pred_per_pixel = objective
+        .capture_pred_per_pixel
+        .then(|| pred_per_pixel.clone());
+    let diagnostic_predicted_logits = objective
+        .capture_pred_per_pixel
+        .then(|| predicted_logits.detach());
     Ok(FoundationV2LossBreakdown {
         total,
         non_ep_total,
@@ -6856,6 +6872,8 @@ pub(crate) fn foundation_v2_training_loss_with_event_weights(
         event,
         q,
         reliability,
+        pred_per_pixel: captured_pred_per_pixel,
+        diagnostic_predicted_logits,
         changed_weights,
         factual_groups: mixed.factual_group_ranges().len(),
         equivalent_pairs,
@@ -10265,6 +10283,7 @@ fn train_foundation_v2(requested_cfg: &TrainConfig) -> Result<TrainReport> {
             capture_mechanism_seams: cg_profile
                 .as_ref()
                 .is_some_and(RepresentativeUpdateCapture::active),
+            capture_pred_per_pixel: false,
         };
         let mut losses = if let Some(profile) = &cg_profile {
             profile.synchronized_phase(
@@ -13272,6 +13291,7 @@ mod tests {
             split_ce_weighting: Default::default(),
             split_ce_changed_budget: None,
             capture_mechanism_seams: false,
+            capture_pred_per_pixel: false,
         };
         let host = prepare_foundation_v2_batch_host(&mixed)?;
         assert_eq!(host.gameplay_rows, FRAME_SIDE);

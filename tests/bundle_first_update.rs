@@ -63,6 +63,7 @@ fn bundle_treatments_first_update_gradient_is_finite_and_bounded() -> Result<()>
             split_ce_weighting: Default::default(),
             split_ce_changed_budget: None,
             capture_mechanism_seams: false,
+            capture_pred_per_pixel: false,
         },
     )?;
     let grads = losses.total.backward()?;

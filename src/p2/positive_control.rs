@@ -1293,6 +1293,7 @@ fn run_training(
                 split_ce_weighting: cfg.split_ce_weighting,
                 split_ce_changed_budget: cfg.split_ce_changed_budget,
                 capture_mechanism_seams: false,
+                capture_pred_per_pixel: false,
             },
             &event_slot_weights,
         )?;
