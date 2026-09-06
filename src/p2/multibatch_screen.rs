@@ -1,37 +1,63 @@
-//! Host-only foundation for the V6 multi-batch function-learning screen.
+//! V6 multi-batch function-learning screen.
 //!
 //! Registered in
 //! `docs/research/2026-09-05-v6-multibatch-generalization-screen.md`. This
-//! module freezes the contract, builds and censuses the populations, and
-//! scores predictions; it exposes no command, opens no device, and cannot
-//! launch training. Parent `positive_control.rs` behavior is unchanged.
+//! module freezes the contract, builds and censuses the populations before CUDA
+//! opens, runs the exact production Foundation-v2 update over eight cycled
+//! train batches, and scores raw snapshots on train and index-held-out unions.
+//! Parent `positive_control.rs` behavior is unchanged.
 
+use crate::gpu_lock::TrainPidGuard;
+use crate::p2::bf16_falsifier::write_json_report;
 use crate::p2::context_wiring::{
-    file_sha256_hex, identity_frame_sha256, GpuIdentity, LifecycleRecord, RUN_CLASS_REGISTERED,
+    external_manifest_paths, file_sha256_hex, identity_frame_sha256, open_diagnostic_device,
+    open_run_root, query_gpu_identity, registered_provenance_guard, same_build_identity,
+    seal_run_root, unix_seconds, verify_manifest, verify_manifest_sidecar, verify_no_input_drift,
+    GpuIdentity, LifecycleRecord, EVIDENCE_CLASS, FAILED_EVIDENCE_CLASS, LIFECYCLE_COMPLETE,
+    LIFECYCLE_FAILED, LIFECYCLE_RUNNING, REPORT_FILE, RUN_CLASS_PREFLIGHT, RUN_CLASS_REGISTERED,
 };
 use crate::p2::data::{
     adaptation_v6_stream_schedule, compose_mixed_stream_batch, compose_rollout_fragment_batch,
     ArcFrame, MixedStreamBatch, MixedStreamConfig, TransitionSample, V5DataSplit, V5Sample,
     FRAME_SIDE,
 };
-use crate::p2::evidence::LaunchProvenance;
+use crate::p2::eval::raw_one_step_predictions;
+use crate::p2::evidence::{launch_provenance, LaunchProvenance};
+use crate::p2::model::WorldModel;
+use crate::p2::optimizer::{
+    accumulate_parameter_gradients, clip_gradients_gpu_with_stats, CheckpointHybridOptimizer,
+    ModelEma,
+};
 use crate::p2::positive_control::{
     action_class_metrics, bind_report, board_changed, bytes_hex, control_predictions, digest_bytes,
-    registered_sigreg_seed, ActionClassMetrics, EvidenceBinding, RoutePremise, UpdateOneBinding,
-    FULL_OBJECTIVE, MAX_WALL_TIME, OUTCOME_PASS, POSITIVE_CONTROL_SCHEMA,
-    REGISTERED_CHECKPOINT_SHA256, REGISTERED_ROLLOUT_FRAGMENTS, REGISTERED_SIGREG_KNOTS,
-    REGISTERED_SIGREG_PROJECTIONS, REGISTERED_TRAIN_CONFIG_SHA256,
+    ensure_operator_projection_zero, ensure_registered_config, registered_sigreg_seed, route_norms,
+    update_one_binding, ActionClassMetrics, EvidenceBinding, RoutePremise, UpdateOneBinding,
+    UpdateRecord, FULL_OBJECTIVE, MAX_GRAD_NORM, MAX_WALL_TIME, OUTCOME_PASS,
+    POSITIVE_CONTROL_SCHEMA, REGISTERED_CHECKPOINT_SHA256, REGISTERED_ROLLOUT_FRAGMENTS,
+    REGISTERED_SIGREG_KNOTS, REGISTERED_SIGREG_PROJECTIONS, REGISTERED_TRAIN_CONFIG_SHA256,
     REGISTERED_UPDATES as PARENT_P_UPDATES, ROLLOUT_SEED_DOMAIN,
 };
 use crate::p2::semantic_eval::shuffled_action_control_population;
-use crate::p2::train::training_content_batch_digest;
+use crate::p2::train::{
+    adam_params, event_slot_weight_tensor, foundation_v2_dedicated_rollout_loss,
+    foundation_v2_ep_weight_update, foundation_v2_loss_values,
+    foundation_v2_training_loss_with_event_weights, foundation_v2_wsd_learning_rate,
+    gradient_l2_for_parameter_prefix, load_train_config, load_varmap_exact,
+    prepare_foundation_v2_batch_host, retain_parameter_gradients, sync_cuda_device,
+    training_content_batch_digest, FoundationV2ObjectiveConfig, PreparedFoundationV2BatchHost,
+    TrainConfig,
+};
 use anyhow::{ensure, Context, Result};
+use candle_core::{DType, Device};
+use candle_nn::{VarBuilder, VarMap};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const MULTIBATCH_SCREEN_SCHEMA: &str = "p2.v6_multibatch_generalization_screen.v1";
 pub const POPULATION_CENSUS_SCHEMA: &str = "p2.v6_multibatch_population_census.v1";
@@ -95,6 +121,14 @@ pub const GROUP_AR_MIN_GROUPS: usize = 2;
 pub const COORD_MIN_GROUPS: usize = 2;
 const BATCH_SELECTION_CONTRACT: &str = "zero_based_update % 8 for main and rollout";
 const SIGREG_SEED_CONTRACT: &str = "seed.wrapping_add(zero_based_update)";
+const COMMAND_TAG: &str = "p2-v6-multibatch-generalization-screen";
+/// Registered G is a selection-only single-seed screen; the preflight is
+/// implementation smoke. Neither is completed model evidence.
+pub const SCREEN_EVIDENCE_CLASS: &str = "selection_only_single_seed_screen";
+const INITIAL_EP_WEIGHT: f64 = 0.01;
+const LOSS_LOG_FILE: &str = "loss_log.jsonl";
+const PROGRESS_FILE: &str = "progress.json";
+const CENSUS_FILE: &str = "population/census.json";
 
 /// Union-level counts that must reproduce exactly before CUDA opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +269,7 @@ pub const REGISTERED_HELDOUT_SHUFFLE_CONTROLS: ShuffleControls = ShuffleControls
     },
 };
 
-/// Command arguments. Not wired to any command in this slice.
+/// `p2-v6-multibatch-generalization-screen` arguments.
 #[derive(Debug, Clone, Args)]
 pub struct P2MultibatchScreenArgs {
     #[arg(long)]
@@ -1648,6 +1682,8 @@ pub struct MultibatchScreenReport {
     pub checkpoint_sha256: String,
     pub train_config: PathBuf,
     pub train_config_sha256: String,
+    pub cargo_lock: PathBuf,
+    pub cargo_lock_sha256: String,
     pub spec: MultibatchScreenSpec,
     pub population: Option<PopulationCensus>,
     pub population_census_sha256: Option<String>,
@@ -1667,11 +1703,1036 @@ pub struct MultibatchScreenReport {
     pub error: Option<String>,
 }
 
+pub fn evidence_class(registered: bool) -> &'static str {
+    if registered {
+        SCREEN_EVIDENCE_CLASS
+    } else {
+        EVIDENCE_CLASS
+    }
+}
+
+pub fn run_class(registered: bool) -> &'static str {
+    if registered {
+        RUN_CLASS_REGISTERED
+    } else {
+        RUN_CLASS_PREFLIGHT
+    }
+}
+
+/// One `loss_log.jsonl` line: the parent update record plus the cycled batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenUpdateRecord {
+    pub train_batch_position: usize,
+    pub train_main_index: u64,
+    pub train_rollout_index: u64,
+    #[serde(flatten)]
+    pub update: UpdateRecord,
+}
+
+/// Domain-separated identity over checkpoint, config, build, the three ordered
+/// union hashes, the census file, the spec, and both evidence bindings.
+pub fn report_identity(report: &MultibatchScreenReport) -> Result<String> {
+    let population = report
+        .population
+        .as_ref()
+        .context("identity requires population")?;
+    let census = report
+        .population_census_sha256
+        .as_deref()
+        .context("identity requires the census hash")?;
+    identity_frame_sha256(&[
+        ("domain", MULTIBATCH_SCREEN_SCHEMA.as_bytes().to_vec()),
+        ("checkpoint", report.checkpoint_sha256.as_bytes().to_vec()),
+        ("config", report.train_config_sha256.as_bytes().to_vec()),
+        ("cargo_lock", report.cargo_lock_sha256.as_bytes().to_vec()),
+        (
+            "source_revision",
+            report.provenance.source_revision.as_bytes().to_vec(),
+        ),
+        (
+            "binary",
+            report.provenance.binary_sha256.as_bytes().to_vec(),
+        ),
+        (
+            "train_union",
+            population.train_union_sha256.as_bytes().to_vec(),
+        ),
+        (
+            "train_rollout_union",
+            population.train_rollout_union_sha256.as_bytes().to_vec(),
+        ),
+        (
+            "heldout_union",
+            population.heldout_union_sha256.as_bytes().to_vec(),
+        ),
+        ("census", census.as_bytes().to_vec()),
+        ("spec", serde_json::to_vec(&report.spec)?),
+        ("parent_p", serde_json::to_vec(&report.parent_p)?),
+        ("preflight", serde_json::to_vec(&report.preflight)?),
+    ])
+}
+
+fn root_file(root: &Path, relative: &Path) -> Result<PathBuf> {
+    ensure!(
+        !relative.is_absolute()
+            && !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "artifact path {} escapes the run root",
+        relative.display()
+    );
+    let path = fs::canonicalize(root.join(relative))
+        .with_context(|| format!("canonicalize artifact {}", relative.display()))?;
+    ensure!(
+        path.starts_with(root),
+        "artifact path {} resolves outside the run root",
+        relative.display()
+    );
+    Ok(path)
+}
+
+fn json_numbers_are_finite(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+        serde_json::Value::Array(values) => values.iter().all(json_numbers_are_finite),
+        serde_json::Value::Object(values) => values.values().all(json_numbers_are_finite),
+        _ => true,
+    }
+}
+
+fn validate_loss_log(root: &Path, report: &MultibatchScreenReport) -> Result<()> {
+    let expected_sha256 = report
+        .loss_log_sha256
+        .as_deref()
+        .context("report lacks loss log hash")?;
+    let path = root_file(root, Path::new(LOSS_LOG_FILE))?;
+    ensure!(
+        file_sha256_hex(&path)? == expected_sha256,
+        "loss log hash differs from the report"
+    );
+    let file = fs::File::open(&path)?;
+    let mut rows = 0usize;
+    for (zero_based_update, line) in BufReader::new(file).lines().enumerate() {
+        ensure!(
+            zero_based_update < report.spec.max_updates,
+            "loss log contains more than {} updates",
+            report.spec.max_updates
+        );
+        let line = line?;
+        let record: ScreenUpdateRecord =
+            serde_json::from_str(&line).context("parse multibatch loss row")?;
+        let position = train_batch_position(zero_based_update);
+        let expected_step = zero_based_update + 1;
+        ensure!(
+            record.update.step == expected_step
+                && record.train_batch_position == position
+                && record.train_main_index == report.spec.train_main_indices[position]
+                && record.train_rollout_index == report.spec.train_rollout_indices[position]
+                && record.update.sigreg_seed == sigreg_seed(zero_based_update)
+                && record.update.rollout_fragments == REGISTERED_ROLLOUT_FRAGMENTS
+                && record.update.learning_rate.to_bits()
+                    == foundation_v2_wsd_learning_rate(
+                        expected_step,
+                        report.spec.total_schedule_steps,
+                    )
+                    .to_bits()
+                && record.update.ep_weight.is_finite()
+                && record.update.ep_weight >= 0.0
+                && json_numbers_are_finite(&serde_json::to_value(&record.update.losses)?),
+            "loss log update {expected_step} violates the frozen schedule"
+        );
+        rows += 1;
+    }
+    ensure!(
+        rows == report.spec.max_updates,
+        "loss log has {rows} updates, expected {}",
+        report.spec.max_updates
+    );
+    Ok(())
+}
+
+fn validate_report_files(root: &Path, report: &MultibatchScreenReport) -> Result<()> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize run root {}", root.display()))?;
+    ensure!(
+        file_sha256_hex(&root_file(&root, Path::new("train_config.json"))?)?
+            == report.train_config_sha256,
+        "copied train config hash differs from the report"
+    );
+    ensure!(
+        file_sha256_hex(&root_file(&root, Path::new("Cargo.lock"))?)? == report.cargo_lock_sha256,
+        "copied Cargo.lock hash differs from the report"
+    );
+    let census_path = root_file(&root, Path::new(CENSUS_FILE))?;
+    ensure!(
+        Some(file_sha256_hex(&census_path)?) == report.population_census_sha256,
+        "bound census file hash drifted"
+    );
+    let stored_census: PopulationCensus = serde_json::from_slice(&fs::read(&census_path)?)
+        .context("parse stored population census")?;
+    stored_census.ensure_registered()?;
+    ensure!(
+        report.population.as_ref() == Some(&stored_census),
+        "stored census differs from the report"
+    );
+    for record in &stored_census.batches {
+        let expected = PathBuf::from("population")
+            .join(record.role.directory())
+            .join(format!("batch-{:02}.json", record.index));
+        ensure!(
+            record.file == expected,
+            "batch {} has a noncanonical artifact path",
+            record.index
+        );
+        ensure!(
+            file_sha256_hex(&root_file(&root, &record.file)?)? == record.population_sha256,
+            "serialized batch {} hash differs from the census",
+            record.file.display()
+        );
+    }
+    for snapshot in &report.snapshots {
+        let directory = PathBuf::from("snapshots").join(format!("step-{:012}", snapshot.step));
+        let expected_raw = directory.join("model.safetensors");
+        let expected_ema = directory.join("ema.safetensors");
+        ensure!(
+            snapshot.raw_checkpoint == expected_raw && snapshot.ema_checkpoint == expected_ema,
+            "snapshot {} carries noncanonical checkpoint paths",
+            snapshot.step
+        );
+        ensure!(
+            file_sha256_hex(&root_file(&root, &snapshot.raw_checkpoint)?)? == snapshot.raw_sha256
+                && file_sha256_hex(&root_file(&root, &snapshot.ema_checkpoint)?)?
+                    == snapshot.ema_sha256,
+            "snapshot {} checkpoint hash differs from the report",
+            snapshot.step
+        );
+    }
+    validate_loss_log(&root, report)
+}
+
+/// Pure completion check for a sealed screen report of either run class.
+pub fn ensure_completed_cleanly(report: &MultibatchScreenReport) -> Result<()> {
+    let evidence = evidence_class(report.registered);
+    ensure!(
+        report.schema == MULTIBATCH_SCREEN_SCHEMA,
+        "bound report schema is {}, expected {MULTIBATCH_SCREEN_SCHEMA}",
+        report.schema
+    );
+    ensure!(
+        report.run_class == run_class(report.registered)
+            && report.lifecycle.run_class == report.run_class,
+        "bound report run class disagrees with its registration flag"
+    );
+    ensure!(
+        report.lifecycle.state == LIFECYCLE_COMPLETE
+            && report.evidence_class == evidence
+            && report.lifecycle.evidence_class == evidence
+            && report.error.is_none(),
+        "bound evidence did not complete cleanly"
+    );
+    ensure!(
+        report.device_is_cuda
+            && report.gpu_identity.is_some()
+            && !report.public_data_read
+            && !report.research_claim,
+        "bound report is not a CUDA screen with the frozen data boundary"
+    );
+    ensure!(
+        !report.cargo_lock.as_os_str().is_empty() && report.cargo_lock_sha256.len() == 64,
+        "bound report lacks Cargo.lock provenance"
+    );
+    report.spec.validate(report.registered)?;
+    ensure!(
+        report.updates_completed == report.spec.max_updates
+            && report.visits_per_train_batch
+                == vec![report.spec.max_updates / TRAIN_BATCHES; TRAIN_BATCHES],
+        "bound report did not complete every update with equal batch visits"
+    );
+    ensure!(
+        report.route_premise.as_ref().is_some_and(|r| r.passed)
+            && report.update_one_binding.as_ref().is_some_and(|b| b.passed)
+            && report
+                .step_one_checkpoint_binding
+                .as_ref()
+                .is_some_and(|b| b.len() == 2 && b.values().all(|ok| *ok)),
+        "bound report did not pass route, update-1, and step-1 checkpoint binding to parent P"
+    );
+    ensure!(
+        report.population.is_some()
+            && report.population_census_sha256.is_some()
+            && report.parent_p.is_some()
+            && report.loss_log_sha256.is_some()
+            && report.verdict.is_some(),
+        "bound report lacks population, parent P, loss log, or verdict"
+    );
+    report
+        .population
+        .as_ref()
+        .expect("checked population")
+        .ensure_registered()?;
+    let steps = report
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.step)
+        .collect::<Vec<_>>();
+    let snapshot_seconds = report
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.seconds)
+        .collect::<Vec<_>>();
+    ensure!(
+        steps == report.spec.snapshot_steps
+            && report.timing.snapshot_seconds == snapshot_seconds
+            && snapshot_seconds
+                .iter()
+                .all(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            && report.timing.population_seconds.is_finite()
+            && report.timing.population_seconds >= 0.0
+            && report.timing.training_seconds.is_finite()
+            && report.timing.training_seconds > 0.0
+            && report.timing.wall_seconds.is_finite()
+            && report.timing.wall_seconds > 0.0
+            && report.timing.wall_seconds <= report.spec.max_wall_seconds as f64,
+        "bound report snapshots or snapshot timings do not match the schedule"
+    );
+    ensure!(
+        report.verdict.as_ref() == Some(&final_verdict(&report.spec, &report.snapshots)?),
+        "bound report verdict does not reproduce from its snapshots"
+    );
+    let stored_estimate = report
+        .runtime_estimate
+        .as_ref()
+        .context("bound report lacks its runtime estimate")?;
+    if report.registered {
+        ensure!(
+            report.preflight.is_some() && stored_estimate.admitted,
+            "registered report lacks an admitted bound preflight"
+        );
+    } else {
+        let recomputed = runtime_estimate(
+            report.timing.training_seconds,
+            &report.timing.snapshot_seconds,
+        )?;
+        ensure!(
+            report.preflight.is_none() && stored_estimate == &recomputed,
+            "preflight runtime estimate does not reproduce from its timings"
+        );
+    }
+    Ok(())
+}
+
+/// Reverify a sealed screen report from its root, external manifest, sidecar,
+/// identity, and census file.
+pub fn bind_screen_report(path: &Path) -> Result<(MultibatchScreenReport, EvidenceBinding)> {
+    let report_path = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize report {}", path.display()))?;
+    let report: MultibatchScreenReport = serde_json::from_slice(&fs::read(&report_path)?)
+        .context("parse multibatch screen report")?;
+    let root = fs::canonicalize(&report.output_root)?;
+    ensure!(
+        report_path == fs::canonicalize(root.join(REPORT_FILE))?,
+        "bound report is not inside its claimed root"
+    );
+    let (manifest, _) = external_manifest_paths(&root)?;
+    let manifest = fs::canonicalize(manifest)?;
+    let manifest_sha256 = verify_manifest(&root, &manifest)?;
+    verify_manifest_sidecar(&manifest, &manifest_sha256)?;
+    ensure_completed_cleanly(&report)?;
+    ensure!(
+        !report.identity_root.is_empty() && report.identity_root == report_identity(&report)?,
+        "bound report identity root is missing or invalid"
+    );
+    validate_report_files(&root, &report)?;
+    let binding = EvidenceBinding {
+        report: report_path,
+        root,
+        manifest,
+        manifest_sha256,
+        identity_root: report.identity_root.clone(),
+    };
+    Ok((report, binding))
+}
+
+/// Pure admission of a sealed preflight for a registered launch: same
+/// checkpoint, config, population, census, build, parent P, and an admitted
+/// runtime estimate.
+pub fn ensure_preflight_binds(
+    preflight: &MultibatchScreenReport,
+    current: &MultibatchScreenReport,
+) -> Result<RuntimeEstimate> {
+    ensure!(
+        !preflight.registered
+            && preflight.spec.arm == FULL_OBJECTIVE
+            && preflight.spec.max_updates == PREFLIGHT_UPDATES
+            && preflight.verdict.as_ref().map(|v| v.outcome.as_str()) == Some(OUTCOME_PREFLIGHT),
+        "preflight is not the completed eight-update full-objective run"
+    );
+    ensure_completed_cleanly(preflight)?;
+    ensure!(
+        current.registered && current.spec.max_updates == REGISTERED_UPDATES,
+        "only registered G binds a preflight"
+    );
+    ensure!(
+        preflight.checkpoint_sha256 == current.checkpoint_sha256
+            && preflight.train_config_sha256 == current.train_config_sha256
+            && preflight.cargo_lock_sha256 == current.cargo_lock_sha256,
+        "preflight checkpoint, config, or Cargo.lock differs from the registered launch"
+    );
+    ensure!(
+        current.population.is_some()
+            && current.population_census_sha256.is_some()
+            && preflight.population == current.population
+            && preflight.population_census_sha256 == current.population_census_sha256,
+        "preflight population or census differs from the registered launch"
+    );
+    ensure!(
+        same_build_identity(&preflight.provenance, &current.provenance),
+        "preflight binary, source, or build identity differs from the registered launch"
+    );
+    ensure!(
+        current.parent_p.is_some() && preflight.parent_p == current.parent_p,
+        "preflight and registered launch bind different parent P evidence"
+    );
+    ensure!(
+        preflight.gpu_identity.is_some() && preflight.gpu_identity == current.gpu_identity,
+        "preflight GPU identity differs from the registered launch"
+    );
+    let estimate = runtime_estimate(
+        preflight.timing.training_seconds,
+        &preflight.timing.snapshot_seconds,
+    )?;
+    ensure!(
+        preflight.runtime_estimate.as_ref() == Some(&estimate),
+        "preflight runtime estimate does not reproduce from its timings"
+    );
+    ensure!(
+        estimate.admitted,
+        "preflight runtime estimate {:.1} s exceeds the {MAX_ADMISSION_ESTIMATE_SECONDS} s admission cap",
+        estimate.estimated_registered_seconds
+    );
+    Ok(estimate)
+}
+
+/// Host-side scoring state built before CUDA opens. Held-out rows exist only
+/// here and reach the model solely through read-only prediction.
+struct SnapshotPopulation {
+    train: BatchUnion,
+    heldout: BatchUnion,
+    train_transitions: Vec<TransitionSample>,
+    heldout_transitions: Vec<TransitionSample>,
+    train_shuffle: ShuffleSet,
+    heldout_shuffle: ShuffleSet,
+}
+
+impl SnapshotPopulation {
+    fn build(population: &MultibatchPopulation, census: &PopulationCensus) -> Result<Self> {
+        let train = population.train_union();
+        let heldout = population.heldout_union();
+        let train_shuffle = ShuffleSet::build(&train.samples)?;
+        let heldout_shuffle = ShuffleSet::build(&heldout.samples)?;
+        ensure!(
+            heldout_shuffle.outcome_changing_tuples
+                == REGISTERED_HELDOUT_UNION.shuffle_outcome_changing_tuples,
+            "held-out shuffle has {} outcome-changing tuples, expected {}",
+            heldout_shuffle.outcome_changing_tuples,
+            REGISTERED_HELDOUT_UNION.shuffle_outcome_changing_tuples
+        );
+        let controls = heldout_shuffle.controls(&heldout.samples)?;
+        ensure!(
+            controls == REGISTERED_HELDOUT_SHUFFLE_CONTROLS
+                && controls == census.heldout_shuffle_controls
+                && train_shuffle.disagreement_pixels == census.train_shuffle_disagreement_pixels,
+            "snapshot shuffle controls drifted from the verified census"
+        );
+        let transitions = |samples: &[V5Sample]| {
+            samples
+                .iter()
+                .map(|sample| sample.transition.clone())
+                .collect::<Vec<_>>()
+        };
+        Ok(Self {
+            train_transitions: transitions(&train.samples),
+            heldout_transitions: transitions(&heldout.samples),
+            train,
+            heldout,
+            train_shuffle,
+            heldout_shuffle,
+        })
+    }
+}
+
+struct TrainingState<'a> {
+    cfg: &'a TrainConfig,
+    population: &'a MultibatchPopulation,
+    hosts: &'a [PreparedFoundationV2BatchHost],
+    scoring: &'a SnapshotPopulation,
+    device: &'a Device,
+    model: &'a WorldModel,
+    varmap: &'a VarMap,
+    optimizer: CheckpointHybridOptimizer,
+    ema: ModelEma,
+}
+
+fn write_progress(root: &Path, report: &MultibatchScreenReport) -> Result<()> {
+    write_json_report(&root.join(PROGRESS_FILE), report)
+}
+
+fn append_loss(root: &Path, update: &ScreenUpdateRecord) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(LOSS_LOG_FILE))?;
+    serde_json::to_writer(&mut file, update)?;
+    writeln!(file)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Save raw and EMA weights, then score both unions with raw weights on the
+/// factual rows and on the fixed shuffled rows. Timed after a device sync so
+/// snapshot seconds exclude the training tail.
+fn save_snapshot(
+    root: &Path,
+    step: usize,
+    ep_weight: f64,
+    state: &TrainingState<'_>,
+) -> Result<ScreenSnapshot> {
+    let device = state.device;
+    sync_cuda_device(device)?;
+    let snapshot_started = Instant::now();
+    let directory = root.join("snapshots").join(format!("step-{step:012}"));
+    fs::create_dir_all(&directory)?;
+    let raw_checkpoint = directory.join("model.safetensors");
+    let ema_checkpoint = directory.join("ema.safetensors");
+    state.varmap.save(&raw_checkpoint)?;
+    state.ema.weights().save(&ema_checkpoint)?;
+    let score = |union: &BatchUnion, transitions: &[TransitionSample], shuffle: &ShuffleSet| {
+        let predictions = raw_one_step_predictions(state.model, transitions, device)?;
+        let shuffled = raw_one_step_predictions(state.model, &shuffle.shuffled, device)?;
+        score_union(union, shuffle, &predictions, &shuffled)
+    };
+    let scoring = state.scoring;
+    let train = score(
+        &scoring.train,
+        &scoring.train_transitions,
+        &scoring.train_shuffle,
+    )?;
+    let heldout = score(
+        &scoring.heldout,
+        &scoring.heldout_transitions,
+        &scoring.heldout_shuffle,
+    )?;
+    sync_cuda_device(device)?;
+    let relative = |path: &Path| path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    Ok(ScreenSnapshot {
+        step,
+        raw_checkpoint: relative(&raw_checkpoint),
+        raw_sha256: file_sha256_hex(&raw_checkpoint)?,
+        ema_checkpoint: relative(&ema_checkpoint),
+        ema_sha256: file_sha256_hex(&ema_checkpoint)?,
+        ep_weight,
+        seconds: snapshot_started.elapsed().as_secs_f64(),
+        train,
+        heldout,
+    })
+}
+
+fn record_snapshot(
+    root: &Path,
+    report: &mut MultibatchScreenReport,
+    step: usize,
+    ep_weight: f64,
+    state: &TrainingState<'_>,
+) -> Result<()> {
+    let snapshot = save_snapshot(root, step, ep_weight, state)?;
+    report.timing.snapshot_seconds.push(snapshot.seconds);
+    report.snapshots.push(snapshot);
+    write_progress(root, report)
+}
+
+/// The exact parent-P production update, cycling main/rollout position
+/// `zero_based_update % 8` from precomputed hosts.
+fn run_training(
+    root: &Path,
+    report: &mut MultibatchScreenReport,
+    mut state: TrainingState<'_>,
+    started: Instant,
+) -> Result<()> {
+    let device = state.device;
+    let varmap = state.varmap;
+    let cfg = state.cfg;
+    let event_slot_weights = event_slot_weight_tensor(device)?;
+    let mut training = Duration::ZERO;
+    let mut ep_weight = INITIAL_EP_WEIGHT;
+    let mut visits = vec![0usize; TRAIN_BATCHES];
+    record_snapshot(root, report, 0, ep_weight, &state)?;
+
+    for zero_based_update in 0..report.spec.max_updates {
+        ensure!(
+            started.elapsed() <= MAX_WALL_TIME,
+            "multibatch screen wall-time cap exceeded"
+        );
+        let update_started = Instant::now();
+        let step = zero_based_update + 1;
+        let position = train_batch_position(zero_based_update);
+        let main = &state.population.train_main[position];
+        let rollout = &state.population.train_rollout[position];
+        let host = &state.hosts[position];
+        visits[position] += 1;
+
+        let (attached_rollout, rollout_fragments) =
+            foundation_v2_dedicated_rollout_loss(state.model, rollout, device)?;
+        ensure!(
+            rollout_fragments == REGISTERED_ROLLOUT_FRAGMENTS,
+            "rollout fragment count drifted at update {step}"
+        );
+        let rollout_loss = attached_rollout.detach();
+        let weighted = attached_rollout.affine(cfg.rollout_weight, 0.0)?;
+        let mut rollout_grads = Some(retain_parameter_gradients(weighted.backward()?, varmap)?);
+        drop(weighted);
+        drop(attached_rollout);
+
+        let sigreg_seed = sigreg_seed(zero_based_update);
+        ensure!(
+            sigreg_seed == registered_sigreg_seed(cfg.seed, zero_based_update),
+            "SIGReg seed drifted from the registered 5..=2052 progression"
+        );
+        let mut losses = foundation_v2_training_loss_with_event_weights(
+            state.model,
+            main,
+            host,
+            device,
+            FoundationV2ObjectiveConfig {
+                ep_weight,
+                sigreg_projections: REGISTERED_SIGREG_PROJECTIONS,
+                sigreg_knots: REGISTERED_SIGREG_KNOTS,
+                sigreg_seed,
+                q_mse_threshold: cfg.q_mse_threshold,
+                rollout_enabled: false,
+                split_ce_weighting: cfg.split_ce_weighting,
+                split_ce_changed_budget: cfg.split_ce_changed_budget,
+                capture_mechanism_seams: false,
+            },
+            &event_slot_weights,
+        )?;
+        losses.rollout = rollout_loss.clone();
+        losses.rollout_fragments = rollout_fragments;
+
+        let prediction_route = if step == 1 {
+            Some(route_norms(
+                &retain_parameter_gradients(losses.pred_ce.backward()?, varmap)?,
+                varmap,
+            )?)
+        } else {
+            None
+        };
+
+        if ep_controller_step(step) {
+            let ep_grads = retain_parameter_gradients(losses.ep.backward()?, varmap)?;
+            let pred_grads = retain_parameter_gradients(losses.pred_ce.backward()?, varmap)?;
+            let ep_norm = gradient_l2_for_parameter_prefix(&ep_grads, varmap, "encoder.")?;
+            let pred_norm = gradient_l2_for_parameter_prefix(&pred_grads, varmap, "encoder.")?;
+            ep_weight = foundation_v2_ep_weight_update(ep_weight, ep_norm, pred_norm);
+        }
+
+        let main_total = losses
+            .non_ep_total
+            .add(&losses.ep.affine(ep_weight, 0.0)?)?;
+        let logged_total = main_total.add(&rollout_loss.affine(cfg.rollout_weight, 0.0)?)?;
+        let mut accumulated = None;
+        accumulate_parameter_gradients(&mut accumulated, main_total.backward()?, varmap)?;
+        if let Some(grads) = rollout_grads.take() {
+            accumulate_parameter_gradients(&mut accumulated, grads, varmap)?;
+        }
+        let mut grads = accumulated.context("multibatch update has no gradients")?;
+        let clip = clip_gradients_gpu_with_stats(&mut grads, varmap, MAX_GRAD_NORM)?;
+        let learning_rate = foundation_v2_wsd_learning_rate(step, report.spec.total_schedule_steps);
+        let values =
+            foundation_v2_loss_values(&losses, &logged_total, clip.pre_clip_norm, clip.scale)?;
+        let update = ScreenUpdateRecord {
+            train_batch_position: position,
+            train_main_index: report.spec.train_main_indices[position],
+            train_rollout_index: report.spec.train_rollout_indices[position],
+            update: UpdateRecord {
+                step,
+                sigreg_seed,
+                learning_rate,
+                ep_weight,
+                rollout_fragments,
+                losses: values,
+            },
+        };
+
+        if step == 1 {
+            let prediction_unclipped = prediction_route.context("missing update-1 route")?;
+            let combined_clipped = route_norms(&grads, varmap)?;
+            let route = RoutePremise {
+                passed: prediction_unclipped.passed() && combined_clipped.passed(),
+                prediction_unclipped,
+                combined_clipped,
+            };
+            let weights = losses.changed_weights;
+            let binding = update_one_binding(
+                update.update.clone(),
+                weights.changed_pixels,
+                weights.unchanged_pixels,
+                weights.changed_weight,
+                weights.changed_weight + 1.0,
+            );
+            report.route_premise = Some(route.clone());
+            report.update_one_binding = Some(binding.clone());
+            write_progress(root, report)?;
+            ensure!(
+                route.passed,
+                "registered prediction-gradient route premise failed"
+            );
+            ensure!(
+                binding.passed,
+                "update-1 numeric binding to parent P failed"
+            );
+        }
+
+        state.optimizer.set_learning_rate(learning_rate)?;
+        state.optimizer.step(&grads)?;
+        state.ema.update(varmap)?;
+        append_loss(root, &update)?;
+        report.updates_completed = step;
+        drop(grads);
+        drop(logged_total);
+        drop(main_total);
+        drop(losses);
+
+        let snapshot_due = report.spec.snapshot_steps.contains(&step);
+        if snapshot_due {
+            sync_cuda_device(device)?;
+        }
+        training += update_started.elapsed();
+        if snapshot_due {
+            record_snapshot(root, report, step, ep_weight, &state)?;
+            if step == 1 {
+                let snapshot = report.snapshots.last().context("step-1 snapshot")?;
+                let binding =
+                    step_one_checkpoint_binding(&snapshot.raw_sha256, &snapshot.ema_sha256);
+                let passed = binding.values().all(|ok| *ok);
+                report.step_one_checkpoint_binding = Some(binding);
+                write_progress(root, report)?;
+                ensure!(
+                    passed,
+                    "step-1 raw/EMA checkpoint hashes differ from parent P"
+                );
+            }
+        }
+        ensure!(
+            started.elapsed() <= MAX_WALL_TIME,
+            "multibatch screen wall-time cap exceeded"
+        );
+    }
+    sync_cuda_device(device)?;
+    report.timing.training_seconds = training.as_secs_f64();
+    ensure!(
+        visits == vec![report.spec.max_updates / TRAIN_BATCHES; TRAIN_BATCHES],
+        "train batch visits {visits:?} are not equal"
+    );
+    report.visits_per_train_batch = visits;
+    report.loss_log_sha256 = Some(file_sha256_hex(&root.join(LOSS_LOG_FILE))?);
+    report.verdict = Some(final_verdict(&report.spec, &report.snapshots)?);
+    Ok(())
+}
+
+fn run_inner(
+    args: &P2MultibatchScreenArgs,
+    report: &mut MultibatchScreenReport,
+    started: Instant,
+) -> Result<()> {
+    let root = args.output_root.as_path();
+    report.spec.validate(args.registered)?;
+    ensure!(
+        args.device.trim().starts_with("cuda"),
+        "multibatch preflight and registered runs require CUDA"
+    );
+    registered_provenance_guard(&report.provenance)?;
+    if args.registered {
+        ensure!(
+            args.preflight_report.is_some(),
+            "registered G requires --preflight-report"
+        );
+    } else {
+        ensure!(
+            args.preflight_report.is_none(),
+            "--preflight-report is valid only with --registered"
+        );
+    }
+
+    let config_bytes = fs::read(&args.train_config)
+        .with_context(|| format!("read {}", args.train_config.display()))?;
+    report.train_config_sha256 = digest_bytes(&config_bytes);
+    ensure!(
+        report.train_config_sha256 == REGISTERED_TRAIN_CONFIG_SHA256,
+        "train config hash is not registered"
+    );
+    fs::write(root.join("train_config.json"), &config_bytes)?;
+    let cargo_lock = fs::canonicalize(std::env::current_dir()?.join("Cargo.lock"))
+        .context("canonicalize runtime Cargo.lock")?;
+    let cargo_lock_bytes =
+        fs::read(&cargo_lock).with_context(|| format!("read {}", cargo_lock.display()))?;
+    report.cargo_lock_sha256 = digest_bytes(&cargo_lock_bytes);
+    report.cargo_lock = cargo_lock;
+    fs::write(root.join("Cargo.lock"), &cargo_lock_bytes)?;
+    let cfg = load_train_config(&args.train_config)?;
+    cfg.validate()?;
+    ensure_registered_config(&cfg)?;
+    ensure!(
+        cfg.seed == REGISTERED_SEED
+            && cfg.physical_batch == REGISTERED_BATCH_SIZE
+            && cfg.steps_per_lesson == TOTAL_SCHEDULE_STEPS
+            && cfg.data_contract_v6,
+        "frozen population or schedule config drift"
+    );
+    ensure!(
+        args.device == cfg.device,
+        "device differs from frozen config"
+    );
+    report.gpu_identity = Some(query_gpu_identity(&args.device)?);
+    report.checkpoint_sha256 = file_sha256_hex(&args.checkpoint)?;
+    ensure!(
+        report.checkpoint_sha256 == REGISTERED_CHECKPOINT_SHA256,
+        "step-0 checkpoint hash is not registered"
+    );
+
+    let population_started = Instant::now();
+    let population =
+        MultibatchPopulation::compose(cfg.seed, cfg.physical_batch, cfg.data_contract_v6)?;
+    let census = population.write(root)?;
+    let census_path = root.join(CENSUS_FILE);
+    report.population_census_sha256 = Some(file_sha256_hex(&census_path)?);
+    report.population = Some(census.clone());
+    let hosts = population
+        .train_main
+        .iter()
+        .map(prepare_foundation_v2_batch_host)
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        hosts.len() == TRAIN_BATCHES
+            && hosts
+                .iter()
+                .all(|host| host.batch_size() == REGISTERED_BATCH_SIZE),
+        "precomputed host batch drift"
+    );
+    let scoring = SnapshotPopulation::build(&population, &census)?;
+    report.timing.population_seconds = population_started.elapsed().as_secs_f64();
+    write_progress(root, report)?;
+
+    report.parent_p = Some(bind_parent_p(&args.parent_p_report)?);
+    if let Some(path) = args.preflight_report.as_deref() {
+        let (preflight, binding) = bind_screen_report(path)?;
+        report.runtime_estimate = Some(ensure_preflight_binds(&preflight, report)?);
+        report.preflight = Some(binding);
+    }
+    report.identity_root = report_identity(report)?;
+    write_progress(root, report)?;
+
+    let _pid_guard = TrainPidGuard::install(root)?;
+    let diagnostic_device = open_diagnostic_device(&args.device, root)?;
+    report.device_is_cuda = diagnostic_device.device.is_cuda();
+    ensure!(
+        diagnostic_device.gpu_identity == report.gpu_identity,
+        "GPU identity changed between preflight binding and CUDA device open"
+    );
+    ensure!(report.device_is_cuda, "resolved device is not CUDA");
+    let device = &diagnostic_device.device;
+    let varmap = VarMap::new();
+    let model = WorldModel::new(
+        cfg.model_config(),
+        VarBuilder::from_varmap(&varmap, DType::F32, device),
+    )?;
+    load_varmap_exact(&varmap, &args.checkpoint)?;
+    ensure_operator_projection_zero(&varmap)?;
+    let optimizer = CheckpointHybridOptimizer::new(
+        &varmap,
+        adam_params(&cfg),
+        cfg.muon_momentum,
+        cfg.muon_rms_scale,
+    )?;
+    let ema = ModelEma::with_default_decay(&varmap)?;
+    run_training(
+        root,
+        report,
+        TrainingState {
+            cfg: &cfg,
+            population: &population,
+            hosts: &hosts,
+            scoring: &scoring,
+            device,
+            model: &model,
+            varmap: &varmap,
+            optimizer,
+            ema,
+        },
+        started,
+    )?;
+    verify_no_input_drift(
+        &args.checkpoint,
+        &report.checkpoint_sha256,
+        &report.provenance,
+    )?;
+    ensure!(
+        digest_bytes(&fs::read(&args.train_config)?) == report.train_config_sha256,
+        "train config changed during the run"
+    );
+    ensure!(
+        file_sha256_hex(&report.cargo_lock)? == report.cargo_lock_sha256,
+        "Cargo.lock changed during the run"
+    );
+    ensure!(
+        Some(file_sha256_hex(&census_path)?) == report.population_census_sha256,
+        "population census changed during the run"
+    );
+    for record in &census.batches {
+        ensure!(
+            file_sha256_hex(&root.join(&record.file))? == record.population_sha256,
+            "serialized batch {} changed during the run",
+            record.file.display()
+        );
+    }
+    drop(diagnostic_device);
+    report.timing.wall_seconds = started.elapsed().as_secs_f64();
+    if !args.registered {
+        report.runtime_estimate = Some(runtime_estimate(
+            report.timing.training_seconds,
+            &report.timing.snapshot_seconds,
+        )?);
+    }
+    ensure!(
+        report_identity(report)? == report.identity_root,
+        "report identity drifted during the run"
+    );
+    validate_report_files(root, report)?;
+    report.timing.wall_seconds = started.elapsed().as_secs_f64();
+    ensure!(
+        started.elapsed() <= MAX_WALL_TIME,
+        "multibatch screen wall-time cap exceeded during final validation"
+    );
+    Ok(())
+}
+
+pub fn run_p2_multibatch_generalization_screen(args: P2MultibatchScreenArgs) -> Result<()> {
+    let started = Instant::now();
+    let spec = MultibatchScreenSpec::from_args(&args);
+    let run_class = run_class(args.registered);
+    let evidence = evidence_class(args.registered);
+    let lifecycle = LifecycleRecord {
+        state: LIFECYCLE_RUNNING.into(),
+        unix_seconds: unix_seconds(),
+        evidence_class: evidence.into(),
+        run_class: run_class.into(),
+        note: "V6 multi-batch function-learning screen in progress".into(),
+    };
+    let command = open_run_root(&args.output_root, &lifecycle, COMMAND_TAG)?;
+    let mut report = MultibatchScreenReport {
+        schema: MULTIBATCH_SCREEN_SCHEMA.into(),
+        evidence_class: evidence.into(),
+        run_class: run_class.into(),
+        registered: args.registered,
+        research_claim: false,
+        public_data_read: false,
+        lifecycle,
+        provenance: launch_provenance().clone(),
+        command,
+        device: args.device.clone(),
+        device_is_cuda: false,
+        gpu_identity: None,
+        output_root: args.output_root.clone(),
+        checkpoint: args.checkpoint.clone(),
+        checkpoint_sha256: String::new(),
+        train_config: args.train_config.clone(),
+        train_config_sha256: String::new(),
+        cargo_lock: PathBuf::new(),
+        cargo_lock_sha256: String::new(),
+        spec,
+        population: None,
+        population_census_sha256: None,
+        parent_p: None,
+        preflight: None,
+        runtime_estimate: None,
+        route_premise: None,
+        update_one_binding: None,
+        step_one_checkpoint_binding: None,
+        updates_completed: 0,
+        visits_per_train_batch: Vec::new(),
+        snapshots: Vec::new(),
+        loss_log_sha256: None,
+        verdict: None,
+        timing: ScreenTiming {
+            population_seconds: 0.0,
+            training_seconds: 0.0,
+            snapshot_seconds: Vec::new(),
+            wall_seconds: 0.0,
+        },
+        identity_root: String::new(),
+        error: None,
+    };
+    let mut outcome = run_inner(&args, &mut report, started);
+    report.timing.wall_seconds = started.elapsed().as_secs_f64();
+    if report.identity_root.is_empty() && report.population.is_some() {
+        match report_identity(&report) {
+            Ok(identity) => report.identity_root = identity,
+            Err(error) => outcome = Err(error.context("compute multibatch screen identity")),
+        }
+    }
+    report.lifecycle = match &outcome {
+        Ok(()) => LifecycleRecord {
+            state: LIFECYCLE_COMPLETE.into(),
+            unix_seconds: unix_seconds(),
+            evidence_class: evidence.into(),
+            run_class: run_class.into(),
+            note: format!(
+                "{}; selection-only screen; no checkpoint promotion; A/C/D and public ARC remain blocked",
+                report
+                    .verdict
+                    .as_ref()
+                    .map_or("completed without verdict", |verdict| verdict
+                        .outcome
+                        .as_str())
+            ),
+        },
+        Err(error) => {
+            report.error = Some(format!("{error:#}"));
+            report.evidence_class = FAILED_EVIDENCE_CLASS.into();
+            LifecycleRecord {
+                state: LIFECYCLE_FAILED.into(),
+                unix_seconds: unix_seconds(),
+                evidence_class: FAILED_EVIDENCE_CLASS.into(),
+                run_class: run_class.into(),
+                note: format!("{error:#}"),
+            }
+        }
+    };
+    if outcome.is_ok() {
+        if let Err(error) = ensure_completed_cleanly(&report)
+            .context("post-completion multibatch report validation")
+        {
+            report.error = Some(format!("{error:#}"));
+            report.evidence_class = FAILED_EVIDENCE_CLASS.into();
+            report.lifecycle = LifecycleRecord {
+                state: LIFECYCLE_FAILED.into(),
+                unix_seconds: unix_seconds(),
+                evidence_class: FAILED_EVIDENCE_CLASS.into(),
+                run_class: run_class.into(),
+                note: format!("{error:#}"),
+            };
+            outcome = Err(error);
+        }
+    }
+    let lifecycle = report.lifecycle.clone();
+    seal_run_root(&args.output_root, COMMAND_TAG, &report, &lifecycle)?;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2::positive_control::exact_metrics as parent_exact_metrics;
-    use crate::p2::train::foundation_v2_wsd_learning_rate;
+    use crate::p2::positive_control::{exact_metrics as parent_exact_metrics, RouteNorms};
+    use crate::p2::train::{foundation_v2_wsd_learning_rate, FoundationV2LossMeans};
     use std::sync::OnceLock;
 
     fn population() -> &'static MultibatchPopulation {
@@ -2075,6 +3136,429 @@ mod tests {
             })
             .coord
         );
+        Ok(())
+    }
+
+    fn provenance() -> LaunchProvenance {
+        LaunchProvenance {
+            source_revision: "feedface".into(),
+            source_revision_origin: "embedded-build:git".into(),
+            source_dirty: Some(false),
+            source_pushed: Some(true),
+            build_command: "cargo build --release --locked --features cudnn".into(),
+            cargo_features: vec!["cudnn".into()],
+            cargo_profile: "release".into(),
+            cargo_target: "x86_64-unknown-linux-gnu".into(),
+            binary_path: PathBuf::from("tofy"),
+            binary_sha256: "sha256:binary".into(),
+            candle_graph_revision: "cafe".into(),
+            candle_graph_dirty: Some(false),
+            candle_graph_pushed: Some(true),
+            runtime_checkout: Default::default(),
+        }
+    }
+
+    /// Direct-target predictions on the held-out union, scored once.
+    fn target_scored_union() -> &'static UnionSnapshotMetrics {
+        static SCORED: OnceLock<UnionSnapshotMetrics> = OnceLock::new();
+        SCORED.get_or_init(|| {
+            let union = population().heldout_union();
+            let target = control_predictions(&union.samples, "target");
+            let shuffle = ShuffleSet::build(&union.samples).expect("shuffle");
+            score_union(&union, &shuffle, &target, &target).expect("score")
+        })
+    }
+
+    /// A synthetic cleanly completed report with parent-P bindings satisfied.
+    fn complete_report(registered: bool) -> Result<MultibatchScreenReport> {
+        let max_updates = if registered {
+            REGISTERED_UPDATES
+        } else {
+            PREFLIGHT_UPDATES
+        };
+        let spec = MultibatchScreenSpec::from_args(&P2MultibatchScreenArgs {
+            registered,
+            ..args(max_updates)
+        });
+        let metrics = target_scored_union();
+        let snapshots = spec
+            .snapshot_steps
+            .iter()
+            .map(|step| ScreenSnapshot {
+                step: *step,
+                raw_checkpoint: PathBuf::from(format!(
+                    "snapshots/step-{step:012}/model.safetensors"
+                )),
+                raw_sha256: "raw".into(),
+                ema_checkpoint: PathBuf::from(format!("snapshots/step-{step:012}/ema.safetensors")),
+                ema_sha256: "ema".into(),
+                ep_weight: INITIAL_EP_WEIGHT,
+                seconds: 12.0,
+                train: metrics.clone(),
+                heldout: metrics.clone(),
+            })
+            .collect::<Vec<_>>();
+        let route = RouteNorms {
+            norms: BTreeMap::new(),
+            positive_pass: true,
+            zero_pass: true,
+        };
+        let evidence = evidence_class(registered);
+        let run = run_class(registered);
+        let mut report = MultibatchScreenReport {
+            schema: MULTIBATCH_SCREEN_SCHEMA.into(),
+            evidence_class: evidence.into(),
+            run_class: run.into(),
+            registered,
+            research_claim: false,
+            public_data_read: false,
+            lifecycle: LifecycleRecord {
+                state: LIFECYCLE_COMPLETE.into(),
+                unix_seconds: 0,
+                evidence_class: evidence.into(),
+                run_class: run.into(),
+                note: String::new(),
+            },
+            provenance: provenance(),
+            command: Vec::new(),
+            device: "cuda".into(),
+            device_is_cuda: true,
+            gpu_identity: Some(GpuIdentity {
+                ordinal: 0,
+                name: "test-gpu".into(),
+                uuid: "GPU-test".into(),
+                memory_total_mib: "8192".into(),
+                driver_version: "test-driver".into(),
+            }),
+            output_root: "out".into(),
+            checkpoint: "checkpoint".into(),
+            checkpoint_sha256: REGISTERED_CHECKPOINT_SHA256.into(),
+            train_config: "config".into(),
+            train_config_sha256: REGISTERED_TRAIN_CONFIG_SHA256.into(),
+            cargo_lock: "Cargo.lock".into(),
+            cargo_lock_sha256: "0".repeat(64),
+            timing: ScreenTiming {
+                population_seconds: 1.0,
+                training_seconds: 8.0,
+                snapshot_seconds: vec![12.0; spec.snapshot_steps.len()],
+                wall_seconds: 60.0,
+            },
+            spec,
+            population: Some(census().clone()),
+            population_census_sha256: Some("census".into()),
+            parent_p: Some(EvidenceBinding {
+                report: "parent/report.json".into(),
+                root: "parent".into(),
+                manifest: "parent.manifest.sha256".into(),
+                manifest_sha256: PARENT_P_MANIFEST_SHA256.into(),
+                identity_root: PARENT_P_IDENTITY.into(),
+            }),
+            preflight: registered.then(|| EvidenceBinding {
+                report: "preflight/report.json".into(),
+                root: "preflight".into(),
+                manifest: "preflight.manifest.sha256".into(),
+                manifest_sha256: "1".repeat(64),
+                identity_root: format!("sha256:{}", "2".repeat(64)),
+            }),
+            runtime_estimate: Some(runtime_estimate(8.0, &[12.0; 3])?),
+            route_premise: Some(RoutePremise {
+                prediction_unclipped: route.clone(),
+                combined_clipped: route,
+                passed: true,
+            }),
+            update_one_binding: Some(UpdateOneBinding {
+                passed: true,
+                checks: BTreeMap::new(),
+                observed: UpdateRecord {
+                    step: 1,
+                    sigreg_seed: sigreg_seed(0),
+                    learning_rate: 2e-6,
+                    ep_weight: INITIAL_EP_WEIGHT,
+                    rollout_fragments: REGISTERED_ROLLOUT_FRAGMENTS,
+                    losses: FoundationV2LossMeans::default(),
+                },
+                changed_pixels: 176,
+                unchanged_pixels: 524_112,
+                changed_coefficient: 50.0,
+                coefficient_mass: 51.0,
+            }),
+            step_one_checkpoint_binding: Some(step_one_checkpoint_binding(
+                REGISTERED_STEP1_RAW_SHA256,
+                REGISTERED_STEP1_EMA_SHA256,
+            )),
+            updates_completed: max_updates,
+            visits_per_train_batch: vec![max_updates / TRAIN_BATCHES; TRAIN_BATCHES],
+            snapshots,
+            loss_log_sha256: Some("loss".into()),
+            verdict: None,
+            identity_root: String::new(),
+            error: None,
+        };
+        report.verdict = Some(final_verdict(&report.spec, &report.snapshots)?);
+        report.identity_root = report_identity(&report)?;
+        Ok(report)
+    }
+
+    #[test]
+    fn completed_report_check_fails_closed() -> Result<()> {
+        let preflight = complete_report(false)?;
+        ensure_completed_cleanly(&preflight)?;
+        assert_eq!(
+            preflight.verdict.as_ref().map(|v| v.outcome.as_str()),
+            Some(OUTCOME_PREFLIGHT)
+        );
+        let registered = complete_report(true)?;
+        ensure_completed_cleanly(&registered)?;
+        assert_eq!(
+            registered.verdict.as_ref().map(|v| v.outcome.as_str()),
+            Some(OUTCOME_FRAME_GENERALIZES_ACTION_FAIL)
+        );
+        let broken = |edit: fn(&mut MultibatchScreenReport)| {
+            let mut report = complete_report(false).expect("report");
+            edit(&mut report);
+            ensure_completed_cleanly(&report).is_err()
+        };
+        assert!(broken(|r| r.error = Some("boom".into())));
+        assert!(broken(|r| r.lifecycle.state = LIFECYCLE_FAILED.into()));
+        assert!(broken(|r| r.evidence_class = SCREEN_EVIDENCE_CLASS.into()));
+        assert!(broken(|r| r.registered = true));
+        assert!(broken(|r| r.run_class = RUN_CLASS_REGISTERED.into()));
+        assert!(broken(|r| r.updates_completed -= 1));
+        assert!(broken(|r| r.visits_per_train_batch[0] += 1));
+        assert!(broken(|r| r.device_is_cuda = false));
+        assert!(broken(|r| r.gpu_identity = None));
+        assert!(broken(|r| r.public_data_read = true));
+        assert!(broken(|r| r.cargo_lock = PathBuf::new()));
+        assert!(broken(|r| r.cargo_lock_sha256.clear()));
+        assert!(broken(|r| r
+            .route_premise
+            .as_mut()
+            .expect("route")
+            .passed = false));
+        assert!(broken(|r| r
+            .update_one_binding
+            .as_mut()
+            .expect("binding")
+            .passed = false));
+        assert!(broken(|r| {
+            r.step_one_checkpoint_binding
+                .as_mut()
+                .expect("step one")
+                .insert("ema".into(), false);
+        }));
+        assert!(broken(|r| r.step_one_checkpoint_binding = None));
+        assert!(broken(|r| {
+            r.snapshots.pop();
+        }));
+        assert!(broken(|r| {
+            r.timing.snapshot_seconds.pop();
+        }));
+        assert!(broken(|r| r.parent_p = None));
+        assert!(broken(|r| r.loss_log_sha256 = None));
+        assert!(broken(|r| r.runtime_estimate = None));
+        assert!(broken(|r| {
+            r.runtime_estimate
+                .as_mut()
+                .expect("estimate")
+                .estimated_registered_seconds += 1.0;
+        }));
+        assert!(broken(|r| {
+            r.verdict.as_mut().expect("verdict").outcome = OUTCOME_GENERALIZES.into();
+        }));
+        assert!(broken(|r| r.snapshots[0].seconds += 1.0));
+        assert!(broken(
+            |r| r.timing.wall_seconds = r.spec.max_wall_seconds as f64 + 1.0
+        ));
+        assert!(broken(|r| r.spec.max_updates = REGISTERED_UPDATES));
+        let mut registered_without_preflight = complete_report(true)?;
+        registered_without_preflight.preflight = None;
+        assert!(ensure_completed_cleanly(&registered_without_preflight).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_binding_requires_same_identity_and_admitted_runtime() -> Result<()> {
+        let preflight = complete_report(false)?;
+        let current = complete_report(true)?;
+        let estimate = ensure_preflight_binds(&preflight, &current)?;
+        assert_eq!(estimate.median_snapshot_seconds, 12.0);
+        assert_eq!(estimate.estimated_registered_seconds, 2048.0 + 84.0);
+        assert!(estimate.admitted);
+        assert!(ensure_preflight_binds(&current, &current).is_err());
+        assert!(ensure_preflight_binds(&preflight, &preflight).is_err());
+        let rejects = |edit: fn(&mut MultibatchScreenReport)| {
+            let mut preflight = complete_report(false).expect("preflight");
+            edit(&mut preflight);
+            ensure_preflight_binds(&preflight, &current).is_err()
+        };
+        assert!(rejects(|p| p.checkpoint_sha256 = "other".into()));
+        assert!(rejects(|p| p.train_config_sha256 = "other".into()));
+        assert!(rejects(|p| p.cargo_lock_sha256 = "f".repeat(64)));
+        assert!(rejects(
+            |p| p.population_census_sha256 = Some("other".into())
+        ));
+        assert!(rejects(|p| {
+            p.population.as_mut().expect("census").heldout_union_sha256 = "other".into()
+        }));
+        assert!(rejects(
+            |p| p.provenance.binary_sha256 = "sha256:other".into()
+        ));
+        assert!(rejects(|p| p.provenance.source_revision = "other".into()));
+        assert!(rejects(|p| p.provenance.cargo_features.clear()));
+        assert!(rejects(|p| {
+            p.parent_p.as_mut().expect("parent").identity_root = "other".into()
+        }));
+        assert!(rejects(|p| {
+            p.gpu_identity.as_mut().expect("gpu").uuid = "GPU-other".into()
+        }));
+        assert!(rejects(|p| {
+            p.runtime_estimate
+                .as_mut()
+                .expect("estimate")
+                .estimated_registered_seconds += 1.0
+        }));
+        assert!(rejects(|p| p.timing.training_seconds = 18.0));
+        assert!(rejects(|p| p.timing.snapshot_seconds = vec![800.0; 3]));
+        assert!(rejects(|p| {
+            p.verdict.as_mut().expect("verdict").outcome = OUTCOME_GENERALIZES.into()
+        }));
+        assert!(rejects(|p| p.error = Some("boom".into())));
+        let mut unbound_current = complete_report(true)?;
+        unbound_current.parent_p = None;
+        assert!(ensure_preflight_binds(&preflight, &unbound_current).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn report_identity_binds_population_spec_and_evidence() -> Result<()> {
+        let report = complete_report(false)?;
+        assert!(report.identity_root.starts_with("sha256:"));
+        assert_eq!(PARENT_P_IDENTITY.len(), report.identity_root.len());
+        assert_eq!(report_identity(&report)?, report.identity_root);
+        assert_ne!(report.identity_root, complete_report(true)?.identity_root);
+        let changed = |edit: fn(&mut MultibatchScreenReport)| {
+            let mut report = complete_report(false).expect("report");
+            edit(&mut report);
+            report_identity(&report).expect("identity") != report.identity_root
+        };
+        assert!(changed(|r| r.checkpoint_sha256 = "other".into()));
+        assert!(changed(|r| r.train_config_sha256 = "other".into()));
+        assert!(changed(|r| r.cargo_lock_sha256 = "f".repeat(64)));
+        assert!(changed(|r| r.spec.snapshot_steps.push(2047)));
+        assert!(changed(
+            |r| r.population_census_sha256 = Some("other".into())
+        ));
+        assert!(changed(|r| {
+            r.population
+                .as_mut()
+                .expect("census")
+                .train_rollout_union_sha256 = "other".into()
+        }));
+        assert!(changed(
+            |r| r.provenance.binary_sha256 = "sha256:other".into()
+        ));
+        assert!(changed(|r| r.provenance.source_revision = "other".into()));
+        assert!(changed(|r| r.parent_p = None));
+        assert!(changed(|r| r.preflight = r.parent_p.clone()));
+        assert!(!changed(|r| r.timing.wall_seconds += 1.0));
+        assert!(!changed(|r| r.lifecycle.state = LIFECYCLE_FAILED.into()));
+        assert!(!changed(|r| r.snapshots.clear()));
+        assert!(!changed(|r| r.gpu_identity = None));
+        let mut missing = complete_report(false)?;
+        missing.population = None;
+        assert!(report_identity(&missing).is_err());
+        let mut missing = complete_report(false)?;
+        missing.population_census_sha256 = None;
+        assert!(report_identity(&missing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn loss_log_record_flattens_parent_update_and_classes_follow_registration() -> Result<()> {
+        let record = ScreenUpdateRecord {
+            train_batch_position: train_batch_position(11),
+            train_main_index: 3,
+            train_rollout_index: 3,
+            update: UpdateRecord {
+                step: 12,
+                sigreg_seed: sigreg_seed(11),
+                learning_rate: foundation_v2_wsd_learning_rate(12, TOTAL_SCHEDULE_STEPS),
+                ep_weight: INITIAL_EP_WEIGHT,
+                rollout_fragments: REGISTERED_ROLLOUT_FRAGMENTS,
+                losses: FoundationV2LossMeans::default(),
+            },
+        };
+        let json = serde_json::to_value(&record)?;
+        assert_eq!(json["train_batch_position"], 3);
+        assert_eq!(json["step"], 12);
+        assert_eq!(json["sigreg_seed"], 16);
+        assert!(json.get("update").is_none());
+        let round_trip: ScreenUpdateRecord = serde_json::from_value(json)?;
+        assert_eq!(round_trip, record);
+        assert_eq!(evidence_class(true), SCREEN_EVIDENCE_CLASS);
+        assert_eq!(evidence_class(false), EVIDENCE_CLASS);
+        assert_eq!(run_class(true), RUN_CLASS_REGISTERED);
+        assert_eq!(run_class(false), RUN_CLASS_PREFLIGHT);
+        Ok(())
+    }
+
+    #[test]
+    fn loss_log_validation_replays_the_frozen_schedule() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "tofy-multibatch-loss-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let mut report = complete_report(true)?;
+        let records = (0..REGISTERED_UPDATES)
+            .map(|zero_based_update| {
+                let position = train_batch_position(zero_based_update);
+                ScreenUpdateRecord {
+                    train_batch_position: position,
+                    train_main_index: report.spec.train_main_indices[position],
+                    train_rollout_index: report.spec.train_rollout_indices[position],
+                    update: UpdateRecord {
+                        step: zero_based_update + 1,
+                        sigreg_seed: sigreg_seed(zero_based_update),
+                        learning_rate: foundation_v2_wsd_learning_rate(
+                            zero_based_update + 1,
+                            report.spec.total_schedule_steps,
+                        ),
+                        ep_weight: if zero_based_update >= 895 {
+                            0.0
+                        } else {
+                            INITIAL_EP_WEIGHT
+                        },
+                        rollout_fragments: REGISTERED_ROLLOUT_FRAGMENTS,
+                        losses: FoundationV2LossMeans::default(),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records[895].update.step, 896);
+        assert_eq!(records[895].update.ep_weight, 0.0);
+        let serialize = |records: &[ScreenUpdateRecord]| -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            for record in records {
+                serde_json::to_writer(&mut bytes, record)?;
+                bytes.push(b'\n');
+            }
+            Ok(bytes)
+        };
+        let loss_path = root.join(LOSS_LOG_FILE);
+        fs::write(&loss_path, serialize(&records)?)?;
+        report.loss_log_sha256 = Some(file_sha256_hex(&loss_path)?);
+        validate_loss_log(&root, &report)?;
+
+        let mut corrupted = records;
+        corrupted[0].train_batch_position = 1;
+        fs::write(&loss_path, serialize(&corrupted)?)?;
+        report.loss_log_sha256 = Some(file_sha256_hex(&loss_path)?);
+        assert!(validate_loss_log(&root, &report).is_err());
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
