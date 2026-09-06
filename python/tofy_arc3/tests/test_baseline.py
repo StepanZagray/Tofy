@@ -244,7 +244,9 @@ class BaselineTests(unittest.TestCase):
         arcade = FakeArcade(FakeEnvironment([raw(GameState.WIN, 2)], events), events)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            result = evaluate(arcade, config(), root, lambda *_: FakeAgent(events))
+            result = evaluate(
+                arcade, config(), root, lambda *_, events=events: FakeAgent(events)
+            )
             self.assertEqual(result["engine_score"], 42.0)
             self.assertEqual(result["status"], "complete_pending_analysis")
             self.assertNotIn(
@@ -290,7 +292,12 @@ class BaselineTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 with self.assertRaisesRegex(DriverError, "actions"):
-                    evaluate(arcade, config(), root, lambda *_: FakeAgent(events))
+                    evaluate(
+                        arcade,
+                        config(),
+                        root,
+                        lambda *_, events=events: FakeAgent(events),
+                    )
                 self.assertEqual(
                     json.loads((root / "report.json").read_text())["status"],
                     "failed_integrity_or_evaluation",
