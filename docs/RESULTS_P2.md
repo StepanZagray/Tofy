@@ -217,6 +217,60 @@ closed; proceed to a separately preregistered raw-weight-gated, same-row 2x2
 positive-control overfit after proving its target receives gradients. A/C/D
 and ARC claims remain blocked.
 
+## V6 fixed-batch positive control (2026-09-05; registered PASS)
+
+The clean pushed source `55d3e691cbb03e8aa6a7ccea6190944fb8c75bad`
+and locked cuDNN binary
+`sha256:2a36dc76d0310e747d13edbad9ade71de6b66914708fc820c55ef672e6fe0e2f`
+ran the registered full-objective P arm from the frozen seed-5 initialization.
+The corrected same-binary two-update preflight is
+`v6-fixed-batch-preflight-provenance-20260905T170403-CDT`; the registered root
+is `v6-fixed-batch-p-registered-20260905T170914-CDT`. It completed 1,024
+updates in 1,145.93 seconds on the RTX 5060 Laptop GPU. All 27 finalized files
+verify under external manifest
+`sha256:9867affe63584b5736c81d41833ab8259509a13fc056e88ae3036c2c65d7908f`.
+
+| Raw snapshot | Changed exact | Full-board exact | Exact shared-frame outcome classes |
+|---:|---:|---:|---:|
+| 512 | `91/95` | `70/95` | `0` |
+| 768 | `91/95` | `77/95` | `2` |
+| 1,024 | `91/95` | `81/95` | `4` |
+
+BF(768), BF(1024), MONO, AR(768), and AR(1024) all pass, yielding the
+preregistered class `same_row_action_conditioned_fit`. All nine required
+gradient routes were finite and positive before and after clipping, all three
+intentionally bypassed routes were zero, and every frozen update-1 production
+binding passed. Fable 5.1 High independently recomputed the artifact identity,
+manifest, census, update log, and gates and returned PASS VERIFIED.
+
+This is a one-seed, one-fixed-batch memorization result, not broad model
+quality. The four final exact branches are action ids 1, 2, 5, and 7; none of
+four ACTION6 coordinate branches is exact. On all 27 outcome-changing shuffled
+ACTION5/ACTION6 tuples, predictions follow the counterfactual target on only
+`13/111` disagreement pixels (`11.7%`) while retaining the factual target on
+`89/111` (`80.2%`). The result therefore proves that the full objective and
+discrete action path can fit directly supervised rows, but does not establish
+counterfactual action rules, coordinate conditioning, held-out transfer,
+checkpoint promotion, or ARC readiness.
+
+Exact registered command:
+
+```bash
+/home/stepan/Coding/Personal/.tofy-build/target-fixed-batch-55d3e691-provenance/release/tofy p2-v6-fixed-batch-positive-control \
+  --checkpoint /home/stepan/Coding/Personal/.tofy-build/baseline-floor-current-double-seed5-20260905T121849-CDT/checkpoints/step-000000000000/model.safetensors \
+  --train-config /home/stepan/Coding/Personal/.tofy-build/baseline-floor-current-double-seed5-20260905T121849-CDT/config.json \
+  --device cuda \
+  --output-root /home/stepan/Coding/Personal/.tofy-build/v6-fixed-batch-p-registered-20260905T170914-CDT \
+  --max-updates 1024 \
+  --registered \
+  --preflight-report /home/stepan/Coding/Personal/.tofy-build/v6-fixed-batch-preflight-provenance-20260905T170403-CDT/report.json
+```
+
+This selection-only diagnostic does not update “Best So Far.” Its PASS
+deselects conditional Q and the simple one-batch 2,048-update extension. The
+next allowed experiment is the separately preregistered eight-train/eight-index-
+held-out function-learning screen; A/C/D and public ARC remain blocked.
+
 ## V6 2x2 E2 recipe-contract audit (2026-09-05; integrity invalid)
 
 The independently sealed E2 root at Tofy `dadc3e5f` is no longer admissible as
