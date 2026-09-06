@@ -10,6 +10,11 @@ on the native 0–100 scale for the explicitly registered local public subset.
 It is not a Private Kaggle score. Do not average every entry in `runs`: an empty
 initialization run can otherwise halve the value. This runner calls `make` once
 per game and reads `observation_space`, avoiding the legacy second opening RESET.
+Action budgets and report `actions` count policy actions plus charged GAME_OVER
+retry resets. `non_reset_actions` and `resets` separate those components. The
+runner rejects disagreement with the engine's per-game or total action count.
+The [charged-action correction](research/2026-09-06-arc3-charged-actions-confirmation.md)
+records the earlier screen's accounting deviation and the fresh verification.
 
 ## Setup and execution
 
@@ -35,7 +40,7 @@ preregistration and run the bounded engine/device smoke. Required fields:
   "games": ["ar25-0c556536", "bp35-0a0ad940", "cd82-fb555c5d"],
   "environments_dir": "/absolute/path/to/only-these-game-versions",
   "seed": 0,
-  "expected_screen_contract_sha256": "2656cdff54be80460e010872e1dcfbb7fdd6775281a10cc5e40d71f40a041f2a",
+  "expected_screen_contract_sha256": "905416cf8ac752e34628cd3f9bed796e503cf7f5ad96fcd0313c1c61d72f8a76",
   "max_actions_per_game": 128,
   "max_actions_per_level": 128,
   "max_level_retries": 3,

@@ -33,6 +33,8 @@ from arcengine import GameAction
 
 from .run_local import DriverError, _arcade, _stderr_logger, observation_json
 
+ACTION_ACCOUNTING = "engine_charged_including_retry_reset_v1"
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -130,7 +132,13 @@ def screen_contract(config: dict[str, Any]) -> str:
         "max_seconds_total",
         "decision_timeout",
     )
-    encoded = json.dumps({key: config[key] for key in fields}, sort_keys=True).encode()
+    encoded = json.dumps(
+        {
+            **{key: config[key] for key in fields},
+            "action_accounting": ACTION_ACCOUNTING,
+        },
+        sort_keys=True,
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -462,7 +470,7 @@ def play_game(
         if time.monotonic() >= deadline:
             reason = "time_limit"
             break
-        if actions >= config["max_actions_per_game"]:
+        if actions + resets >= config["max_actions_per_game"]:
             reason = "action_limit"
             break
         if per_level.get(level, 0) >= config["max_actions_per_level"]:
@@ -475,6 +483,7 @@ def play_game(
             retries[level] = retries.get(level, 0) + 1
             result = environment.reset()
             resets += 1
+            per_level[level] = per_level.get(level, 0) + 1
             kind = "reset"
             fields: dict[str, Any] = {}
         else:
@@ -554,7 +563,8 @@ def play_game(
         record("final_bridge_flush", executed=False)
     return {
         "game_id": game_id,
-        "actions": actions,
+        "actions": actions + resets,
+        "non_reset_actions": actions,
         "resets": resets,
         "decisions": decisions,
         "levels_completed": observation["levels_completed"],
@@ -592,6 +602,7 @@ def evaluate(
         "status": "running",
         "evidence_class": config["evidence_class"],
         "screen_contract_sha256": screen_contract(config),
+        "action_accounting": ACTION_ACCOUNTING,
         "limitations": config["limitations"],
         "games": [],
     }
@@ -661,6 +672,21 @@ def evaluate(
             ):
                 raise DriverError("invalid engine score")
             report["engine_score"] = score
+            if failure is None:
+                charged = {
+                    game["id"]: game["actions"] for game in scorecard["environments"]
+                }
+                for game in report["games"]:
+                    if charged.get(game["game_id"]) != game["actions"]:
+                        raise DriverError(
+                            "reported actions disagree with engine charged actions"
+                        )
+                if scorecard["total_actions"] != sum(
+                    game["actions"] for game in report["games"]
+                ):
+                    raise DriverError(
+                        "engine total actions disagree with completed game reports"
+                    )
             report["score_semantics"] = (
                 "arc-agi root score, native 0..100 scale; local public subset"
             )
@@ -680,7 +706,12 @@ def evaluate(
         write_json(output / "report.json", report)
     if failure:
         raise DriverError(
-            report.get("error", report.get("scorecard_error", "evaluation failed"))
+            report.get(
+                "error",
+                report.get(
+                    "scorecard_error", report.get("budget_error", "evaluation failed")
+                ),
+            )
         ) from failure
     return report
 

@@ -106,8 +106,14 @@ class FakeArcade:
                 "api_key": "must-not-persist",
                 "score": 42.0,
                 "environments": [
-                    {"score": 42.0, "runs": [{"score": 0}, {"score": 42.0}]}
+                    {
+                        "id": "test-12345678",
+                        "actions": 1,
+                        "score": 42.0,
+                        "runs": [{"score": 0}, {"score": 42.0}],
+                    }
                 ],
+                "total_actions": 1,
             }
         )
 
@@ -135,7 +141,8 @@ class BaselineTests(unittest.TestCase):
             ],
         )
         self.assertEqual(environment.reset_count, 1)
-        self.assertEqual(result["actions"], 2)
+        self.assertEqual(result["actions"], 3)
+        self.assertEqual(result["non_reset_actions"], 2)
         self.assertEqual(result["resets"], 1)
         self.assertTrue(result["won"])
         self.assertEqual(
@@ -165,6 +172,25 @@ class BaselineTests(unittest.TestCase):
                 time.monotonic() + 10,
             )
         self.assertEqual(events, ["choose"])
+
+    def test_retry_consumes_the_remaining_engine_action_budget(self):
+        events = []
+        cfg = config()
+        cfg["max_actions_per_game"] = 2
+        result = play_game(
+            FakeEnvironment([raw(GameState.GAME_OVER)], events),
+            FakeAgent(events),
+            cfg,
+            io.StringIO(),
+            time.monotonic() + 10,
+        )
+        self.assertEqual(events, ["choose", "step", "notify_GAME_OVER", "reset"])
+        self.assertEqual(
+            (result["actions"], result["non_reset_actions"], result["resets"]),
+            (2, 1, 1),
+        )
+        self.assertEqual(result["actions_by_level"], {0: 2})
+        self.assertEqual(result["stop_reason"], "action_limit")
 
     def test_final_frame_is_ingested_without_an_extra_decision(self):
         events = []
@@ -243,6 +269,32 @@ class BaselineTests(unittest.TestCase):
             self.assertEqual(report["status"], "failed_integrity_or_evaluation")
             self.assertIn("integer", report["error"])
         self.assertEqual(events[-2:], ["agent_close", "card_close"])
+
+    def test_disagreement_with_engine_action_accounting_fails_closed(self):
+        for field in ("game", "total"):
+            events = []
+            arcade = FakeArcade(
+                FakeEnvironment([raw(GameState.WIN, 2)], events), events
+            )
+            original_close = arcade.close_scorecard
+
+            def mismatched(card, original_close=original_close, field=field):
+                data = original_close(card).model_dump()
+                if field == "game":
+                    data["environments"][0]["actions"] += 1
+                else:
+                    data["total_actions"] += 1
+                return SimpleNamespace(model_dump=lambda **_: data)
+
+            arcade.close_scorecard = mismatched
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaisesRegex(DriverError, "actions"):
+                    evaluate(arcade, config(), root, lambda *_: FakeAgent(events))
+                self.assertEqual(
+                    json.loads((root / "report.json").read_text())["status"],
+                    "failed_integrity_or_evaluation",
+                )
 
     def test_config_rejects_unversioned_duplicate_and_traversal_ids(self):
         for games in (["test"], ["test-12345678"] * 2, ["../../other-12345678"]):
