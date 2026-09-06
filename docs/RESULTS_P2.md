@@ -17,6 +17,31 @@ Before inspecting a full run, record here:
 - checkpoint-selection metric;
 - exact train/evaluation commands.
 
+## V6 frozen-diagnostic seam prerequisite (2026-09-06; falsified)
+
+The reviewed frozen-checkpoint diagnostic at pushed revision
+`7907731b6fa69043089c55ddb92c573a79b2f29d` reached its unregistered CUDA
+preflight with locked cuDNN binary
+`sha256:22781d436df998f98213390e8770cffdbcea3f8ae53ca9080278469d8f4d3691`.
+The fresh root
+`v6-frozen-diagnostic-preflight-20260906T041517-CDT` reconstructed the exact G
+population and completed one step-0 batch-0 train/held-out raw rescore, then
+failed before its first gradient cell because the attached training-path and
+chunk-32 raw-evaluator argmaxes disagreed. It took no optimizer or EMA step and
+sealed after `8.138813185 s`; report SHA-256 is
+`54cc1ddf07aca7e6f8ffd72cb3f216d4d1b079899f995610f807c00fbeb3cb74`
+and external manifest SHA-256 is
+`41705d4a9103702600523647475205301fea9383df0011b98a854e7a53b33dbb`.
+
+This is failed integrity evidence, not a gradient or model result. The frozen
+zero-disagreement rail is not weakened post hoc, and the full diagnostic and
+prediction-only treatment remain blocked. A separate no-gradient seam
+characterization is preregistered to distinguish same-process instability,
+active input construction, batch-128 versus chunk-32 execution, and residual
+same-shape train/eval differences. Two earlier roots failed before CUDA on
+build-command and digest-representation provenance checks and are preserved as
+failed infrastructure only.
+
 ## Foundation-v2 recipe repair smoke (2026-09-05; bounded PASS)
 
 The exact pushed revision

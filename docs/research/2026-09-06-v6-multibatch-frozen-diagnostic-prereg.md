@@ -1,6 +1,6 @@
 # V6 multi-batch frozen-checkpoint diagnostic (preregistered)
 
-Status: **corrected implementation independently reviewed GO; no CUDA work yet**
+Status: **preflight prerequisite falsified; full diagnostic blocked**
 Date: 2026-09-06 CDT
 Evidence class: **selection-only single-seed frozen-checkpoint diagnostic**
 Research claim: **false**
@@ -80,6 +80,22 @@ Its bounded independent review is recorded at
 `/home/stepan/Coding/Personal/.tofy-build/reviews/opus-v6-frozen-diagnostic-parent-digest-go-20260906.md`,
 SHA-256 `f075284892231ae3c27d1a7e7a8310fc99b1db737c382a21f4287869e4d05e62`.
 Verdict: GO.
+
+The valid-provenance CUDA preflight at
+`/home/stepan/Coding/Personal/.tofy-build/v6-frozen-diagnostic-preflight-20260906T041517-CDT`
+then failed the frozen zero-disagreement prerequisite before the first gradient
+cell. Report SHA-256
+`54cc1ddf07aca7e6f8ffd72cb3f216d4d1b079899f995610f807c00fbeb3cb74`;
+external manifest SHA-256
+`41705d4a9103702600523647475205301fea9383df0011b98a854e7a53b33dbb`;
+source `7907731b6fa69043089c55ddb92c573a79b2f29d`; binary
+`sha256:22781d436df998f98213390e8770cffdbcea3f8ae53ca9080278469d8f4d3691`.
+It opened the exact CUDA device, completed one step-0 D2 rescore, produced zero
+gradient cells, and took no optimizer or EMA step. Per the frozen rule below,
+the rail is not weakened and the full registered diagnostic is not launched.
+The next action is the separately preregistered characterization-only seam
+localization in
+`docs/research/2026-09-06-v6-frozen-seam-characterization-prereg.md`.
 
 This document must receive independent review, then be committed and pushed
 before diagnostic implementation. The implementation, exact locked CUDA
