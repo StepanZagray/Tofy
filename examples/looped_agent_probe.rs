@@ -29,6 +29,8 @@ enum Mode {
     Train,
     Evaluate,
     Inspect,
+    Fit,
+    FitSmoke,
 }
 
 #[derive(Debug, Parser)]
@@ -343,6 +345,98 @@ fn argmax(values: &[f32]) -> usize {
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
         .unwrap()
         .0
+}
+
+fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
+    let mut samples = Vec::new();
+    for layout in 0..8 {
+        let mut reference = None;
+        let mut labels = [0; ACTIONS];
+        for rule in task::permutation_ids(Split::Train) {
+            let ep =
+                task::episode_with_permutation(args.data_seed ^ TRAIN_TAG, layout, rule, 1, 1)?;
+            let sample = task::sample(&ep)?;
+            if let Some(current) = &reference {
+                ensure!(
+                    current == &sample.current,
+                    "fixed-set query pixels vary with rule"
+                );
+            } else {
+                reference = Some(sample.current.clone());
+            }
+            let label = argmax(&sample.policy);
+            ensure!(
+                sample.policy[label] == 1.0,
+                "fixed-set label must be unique"
+            );
+            labels[label] += 1;
+            samples.push((rule, sample));
+        }
+        ensure!(
+            labels == [4; ACTIONS],
+            "fixed-set labels must be balanced within each layout"
+        );
+    }
+    Ok(samples)
+}
+
+fn fitting_check(
+    args: &Args,
+    model: &LoopedAgent,
+    samples: &[(usize, Sample)],
+    device: &Device,
+    started: Instant,
+    update: usize,
+) -> Result<Value> {
+    let mut arms = Vec::new();
+    for clear in [false, true] {
+        let mut ce = 0.0f64;
+        let mut correct = 0;
+        let mut actions = std::collections::BTreeSet::new();
+        let mut hash = Sha256::new();
+        for (_, sample) in samples {
+            deadline(args, started)?;
+            let mut input = sample.inputs.clone();
+            if clear {
+                input.patches[..(TOKENS - PATCH_COUNT) * PATCH_PIXELS].fill(0);
+                input.metadata[..(TOKENS - PATCH_COUNT) * META_DIM].fill(0.0);
+            }
+            let out = predict(model, &[input], args.loops, device)?;
+            let logits = out.policy_logits.flatten_all()?.to_vec1::<f32>()?;
+            ensure!(
+                logits.iter().all(|v| v.is_finite()),
+                "non-finite fitting readout"
+            );
+            for v in &logits {
+                hash.update(v.to_le_bytes());
+            }
+            let label = argmax(&sample.policy);
+            let action = argmax(&logits);
+            actions.insert(action);
+            correct += usize::from(action == label);
+            ce -= f64::from(
+                candle_nn::ops::log_softmax(&out.policy_logits, D::Minus1)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?[label],
+            );
+        }
+        ce /= samples.len() as f64;
+        if clear {
+            ensure!(
+                correct * 4 == samples.len() && ce >= 4.0f64.ln() - 0.0001,
+                "fixed-set blind information bound failed"
+            );
+        }
+        arms.push(json!({"cleared":clear,"examples":samples.len(),"policy_ce":ce,"accuracy":correct as f64/samples.len() as f64,"distinct_actions":actions.len(),"action_ids":actions,"prediction_sha256":format!("{:x}",hash.finalize())}));
+    }
+    let pass = arms[0]["accuracy"]
+        .as_f64()
+        .context("missing fit accuracy")?
+        >= 0.9
+        && arms[0]["policy_ce"].as_f64().context("missing fit loss")? <= 0.35;
+    Ok(
+        json!({"update":update,"loops":args.loops,"arms":arms,"fit_gate_pass":pass,"elapsed_seconds":started.elapsed().as_secs_f64()}),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -776,8 +870,8 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         .map(|v| v.elem_count())
         .sum::<usize>();
     let updates = match args.mode {
-        Mode::Smoke => 2,
-        Mode::Train => args.updates,
+        Mode::Smoke | Mode::FitSmoke => 2,
+        Mode::Train | Mode::Fit => args.updates,
         Mode::Evaluate | Mode::Inspect => 0,
     };
     let mut optimizer = AdamW::new(
@@ -790,12 +884,66 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     )?;
     let mut log = BufWriter::new(File::create(args.output_dir.join("updates.jsonl"))?);
     vars.save(args.output_dir.join("initial.safetensors"))?;
+    let fixed = if matches!(args.mode, Mode::Fit | Mode::FitSmoke) {
+        ensure!(
+            file_hash(&args.output_dir.join("initial.safetensors"))?
+                == "4cd502f7a76fe3dd9729f6693e9d707c670972f7ebe58ad1cbdde37ea2bb2802",
+            "fixed fit initialization differs from the original screen"
+        );
+        Some(fixed_samples(args)?)
+    } else {
+        None
+    };
+    let mut fit_log = if fixed.is_some() {
+        Some(BufWriter::new(File::create(
+            args.output_dir.join("fit.jsonl"),
+        )?))
+    } else {
+        None
+    };
+    let mut fit_result = None;
+    if let Some(samples) = &fixed {
+        let mut hash = Sha256::new();
+        for (rule, s) in samples {
+            hash.update((*rule as u64).to_le_bytes());
+            for p in &s.inputs.patches {
+                hash.update(p.to_le_bytes());
+            }
+            for m in &s.inputs.metadata {
+                hash.update(m.to_le_bytes());
+            }
+            for p in &s.next {
+                hash.update(p.to_le_bytes());
+            }
+            for p in s.policy {
+                hash.update(p.to_le_bytes());
+            }
+        }
+        write_json(
+            &args.output_dir.join("fixed-set.json"),
+            &json!({"layouts":8,"rules":task::permutation_ids(Split::Train),"examples":samples.len(),"order":"layout-major then increasing training rule ID; repeated cyclically","distance":1,"sha256":format!("{:x}",hash.finalize())}),
+        )?;
+        let row = fitting_check(
+            args,
+            &frozen(&vars, &config, &device)?,
+            samples,
+            &device,
+            started,
+            0,
+        )?;
+        let writer = fit_log.as_mut().context("missing fit log")?;
+        serde_json::to_writer(&mut *writer, &row)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        fit_result = Some(row);
+    }
     let mut stream_hash = Sha256::new();
     let train_start = Instant::now();
+    let mut updates_done = 0;
     for update in 0..updates {
         deadline(args, started)?;
         let update_start = Instant::now();
-        let loops = if args.mode == Mode::Smoke {
+        let loops = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
             args.loops
         } else {
             [1, 2, args.loops][update % 3].min(args.loops)
@@ -809,15 +957,19 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             let mut samples = Vec::with_capacity(micro_batch);
             for b in 0..micro_batch {
                 let id = (update * args.effective_batch + micro * args.batch + b) as u64;
-                let (min, max) = if id.is_multiple_of(2) {
-                    (1, 1)
+                let (permutation_id, sample) = if let Some(pool) = &fixed {
+                    pool[id as usize % pool.len()].clone()
                 } else {
-                    (2, 10)
+                    let (min, max) = if id.is_multiple_of(2) {
+                        (1, 1)
+                    } else {
+                        (2, 10)
+                    };
+                    let ep = task::episode(args.data_seed ^ TRAIN_TAG, id, Split::Train, min, max)?;
+                    (ep.permutation_id, task::sample(&ep)?)
                 };
-                let ep = task::episode(args.data_seed ^ TRAIN_TAG, id, Split::Train, min, max)?;
-                let sample = task::sample(&ep)?;
                 stream_hash.update(id.to_le_bytes());
-                stream_hash.update((ep.permutation_id as u64).to_le_bytes());
+                stream_hash.update((permutation_id as u64).to_le_bytes());
                 for pixel in &sample.inputs.patches {
                     stream_hash.update(pixel.to_le_bytes());
                 }
@@ -838,7 +990,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             "invalid gradient norm"
         );
         optimizer.step(&grads)?;
+        drop(grads);
         device.synchronize()?;
+        updates_done = update + 1;
         let row = json!({"update":update+1,"loops":loops,"losses":means,"gradient_l2":clip.pre_clip_norm,"clip_scale":clip.scale,"update_seconds":update_start.elapsed().as_secs_f64(),"elapsed_seconds":started.elapsed().as_secs_f64()});
         serde_json::to_writer(&mut log, &row)?;
         log.write_all(b"\n")?;
@@ -846,12 +1000,45 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         if (update + 1) % 16 == 0 || update == 0 {
             println!("{}", row);
         }
+        if let Some(samples) = &fixed {
+            if args.mode == Mode::FitSmoke
+                || updates_done.is_multiple_of(25)
+                || updates_done == updates
+            {
+                let row = fitting_check(
+                    args,
+                    &frozen(&vars, &config, &device)?,
+                    samples,
+                    &device,
+                    started,
+                    updates_done,
+                )?;
+                let pass = row["fit_gate_pass"]
+                    .as_bool()
+                    .context("missing fitting gate")?;
+                let writer = fit_log.as_mut().context("missing fit log")?;
+                serde_json::to_writer(&mut *writer, &row)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+                println!("{}", row);
+                fit_result = Some(row);
+                if pass && args.mode == Mode::Fit {
+                    break;
+                }
+            }
+        }
     }
     let train_seconds = train_start.elapsed().as_secs_f64();
     drop(log);
     drop(optimizer);
     drop(model);
+    drop(fit_log);
     vars.save(args.output_dir.join("final.safetensors"))?;
+    if let Some(fit) = fit_result {
+        return Ok(
+            json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::FitSmoke {"implementation_smoke"} else {"fitting_diagnostic"},"claim_boundary":"fixed-set fitting ability only; no generalization or ARC claim","parameters":parameters,"optimizer_updates":updates_done,"requested_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_and_fit_check_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"fit":fit,"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
+        );
+    }
     let model = frozen(&vars, &config, &device)?;
     let predictions = prediction_metrics(args, &model, &device, started)?;
     let rule_probe = rule_probe(args, &model, &device, started)?;
@@ -955,6 +1142,54 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_set_preserves_the_blind_information_bound() -> Result<()> {
+        let args = Args::parse_from([
+            "probe",
+            "--mode",
+            "smoke",
+            "--output-dir",
+            "unused",
+            "--device",
+            "cpu",
+            "--hidden",
+            "16",
+            "--heads",
+            "2",
+            "--layers",
+            "1",
+            "--loops",
+            "1",
+            "--max-loops",
+            "1",
+        ]);
+        let samples = fixed_samples(&args)?;
+        assert_eq!(samples.len(), 128);
+        let vars = VarMap::new();
+        let config = LoopedConfig {
+            hidden: 16,
+            heads: 2,
+            layers: 1,
+            max_loops: 1,
+        };
+        let _model = LoopedAgent::new(
+            config.clone(),
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu),
+        )?;
+        initialize(&vars, 57)?;
+        let report = fitting_check(
+            &args,
+            &frozen(&vars, &config, &Device::Cpu)?,
+            &samples,
+            &Device::Cpu,
+            Instant::now(),
+            0,
+        )?;
+        assert_eq!(report["arms"][1]["accuracy"], json!(0.25));
+        assert!(report["arms"][1]["policy_ce"].as_f64().unwrap() >= 4.0f64.ln() - 0.0001);
+        Ok(())
+    }
 
     #[test]
     fn paired_rule_evaluator_obeys_exact_blind_bound() -> Result<()> {
