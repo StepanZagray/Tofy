@@ -22,6 +22,7 @@ pub(crate) mod evidence;
 pub mod experiment;
 pub mod grounding;
 pub mod latent_planning;
+pub mod looped_agent;
 pub mod model;
 pub mod multibatch_frozen_diagnostic;
 pub mod multibatch_screen;
