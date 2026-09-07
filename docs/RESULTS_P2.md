@@ -1,5 +1,71 @@
 # Results P2
 
+## First looped-transformer screen fails rule use (2026-09-07)
+
+The from-scratch, non-LLM model at
+`2d194f894b78da1edc0bf323f1b075752e34c93f` selected action 2 on all 768 paired
+one-step queries. True, cleared and valid mismatched support each yield exactly
+25% accuracy on both splits. All five learning gates fail. The scripted,
+fully informative calibration, visible goal and four-action synthetic maze are
+only a prerequisite; autonomous exploration, hidden objectives and public ARC
+performance were not tested. No Best So Far ARC metric changes.
+
+| Metric | Training-rule split | Held-out-rule split |
+|---|---:|---:|
+| Paired rule accuracy | 128/512 (25%) | 64/256 (25%) |
+| Direct wins, each of 1/2/4/8 loops | 1/32 | 3/32 |
+| Learned-search wins | 1/32 | 3/32 |
+| Random wins | 9/32 | 9/32 |
+| Observation-limited oracle wins | 32/32 | 32/32 |
+| Exact next frames / copy exact | 0/128 / 42/128 | 0/128 / 42/128 |
+| Changed-pixel accuracy | 62.59% | 62.49% |
+| Immediate-success TP / positives | 0/16 | 0/16 |
+
+Value MSE was about 0.00980 against 0.01008 for the fixed 0.9 predictor. Search
+used 20 extra imagined nodes per action, with terminal states untrained as inputs;
+its failure does not settle search's general merit. The held-out paired bootstrap
+random-minus-direct difference is 18.75 points, percentile 95% interval
+[3.125,34.375]; search-minus-direct is zero on every paired episode. The exact
+25% rule result follows from a constant action on balanced labels, not learned
+generalization. Single-seed exploratory evidence supports diagnosis only.
+
+Model: 992,393 parameters, width 128, four attention heads, two shared blocks,
+training loops 1/2/4 and inference through eight loops. **Actual normalization is
+RMS**, contrary to the original registration's LayerNorm wording; preserve this
+documented recipe deviation. Training used 256 AdamW updates and 16,384 fresh
+queries. Physical batch 33, effective batch 64, two microbatches (33+31), selected
+after exact-binary CUDA capacity tests. RTX 5060 Laptop 8,151 MiB; sampled training
+peak 7,494 MiB, maximum sampled temperature 65 C. The optimizer phase took 337.46 seconds;
+the full supervised run and frozen evaluation took 554.54 seconds including the
+external supervisor. Sampling gives a lower bound on instantaneous peak memory.
+
+Exact binary SHA-256:
+`4180e0121cdceb12796774e8a7b9dde81ba7f3ef6e6fe85760b63dc40fcb291c`.
+Sibling `candle_graph`: `8e012f25e38f0c597c14268f0c705e504a5b5c28`.
+Build: `cargo build --release --locked --offline --features cudnn --example looped_agent_probe`.
+Run root:
+`/home/stepan/Coding/Personal/.tofy-build/looped-agent-campaign-20260907T082305-CDT/screen/screen-seed0`.
+Manifest: `edef7757ea59180f4b6e1d5f1bcf45ff5d6a8dfef150a19f03f100bfc649fbd2`.
+All artifact hashes, episode totals, controls and owned-process cleanup passed.
+The preceding source `1696b474` failed its first CUDA smoke on noncontiguous
+batched readout rows; the fix and five model tests passed before the new campaign.
+Capacity OOM probes and all smokes remain implementation evidence only.
+
+Exact launcher:
+
+```bash
+python scripts/looped_agent_run.py screen --binary /home/stepan/Coding/Personal/.tofy-build/looped-agent-campaign-20260907T082305-CDT/looped-agent-2d194f89-4180e0121cdc --root /home/stepan/Coding/Personal/.tofy-build/looped-agent-campaign-20260907T082305-CDT/screen --capacity-root /home/stepan/Coding/Personal/.tofy-build/looped-agent-campaign-20260907T082305-CDT/capacity
+```
+
+Claude Opus 5 xHigh reviewed both the design and negative result. Verified fixes
+included the calibration/difficulty confound and correct normalization reporting.
+Constant argmax does not prove constant logits, and clipping does not simply scale
+AdamW's effective learning rate by the clipping factor. The next registered check
+measures frozen CPU/CUDA agreement, probability sensitivity to support, and the
+vacated/destination decomposition before considering a balanced fixed-set fit.
+The analysis and qualification records live under research run
+`2026-09-07T131851Z-tofy-looped-control-first-screen` in the local research library.
+
 P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.

@@ -1,5 +1,12 @@
 # Looped control: first screen registration
 
+Post-run correction (September 7, 2026): the committed model actually used RMS
+normalization with a clamped second moment and no learned gain. The LayerNorm
+wording below, including the final paragraph's denial of RMS, was an integration
+review/documentation error. Preserve that original registration text and the
+negative result; this is a named recipe deviation, not a retroactive clean match.
+See `2026-09-07-looped-agent-frozen-diagnostic.md` for the next bounded check.
+
 Registered before CUDA execution or training outcomes. This is a bounded empirical
 prerequisite screen, not an ARC performance claim or a proof of optimal design.
 

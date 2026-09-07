@@ -28,6 +28,7 @@ enum Mode {
     Smoke,
     Train,
     Evaluate,
+    Inspect,
 }
 
 #[derive(Debug, Parser)]
@@ -535,6 +536,11 @@ fn prediction_metrics(
         let mut copy_exact = 0;
         let mut changed_correct = 0;
         let mut changed_total = 0;
+        let mut vacated_total = 0;
+        let mut vacated_correct = 0;
+        let mut destination_total = 0;
+        let mut destination_correct = 0;
+        let mut inconsistent_patches = 0;
         let mut policy_correct = 0;
         let mut reward_positive = 0;
         let mut reward_tp = 0;
@@ -589,8 +595,23 @@ fn prediction_metrics(
                     if real[p] != sample.current[p] {
                         changed += 1;
                         correct += usize::from(real[p] == predicted[p]);
+                        if sample.current[p] == 2 && real[p] == 0 {
+                            vacated_total += 1;
+                            vacated_correct += usize::from(real[p] == predicted[p]);
+                        } else {
+                            ensure!(
+                                [0, 3].contains(&sample.current[p]) && [2, 4].contains(&real[p]),
+                                "unexpected changed pixel in diagnostic decomposition"
+                            );
+                            destination_total += 1;
+                            destination_correct += usize::from(real[p] == predicted[p]);
+                        }
                     }
                 }
+                inconsistent_patches += predicted
+                    .chunks_exact(PATCH_PIXELS)
+                    .filter(|patch| patch.iter().any(|p| *p != patch[0]))
+                    .count();
                 changed_total += changed;
                 changed_correct += correct;
                 let positive = sample.rewards[a] > 0.5;
@@ -604,7 +625,11 @@ fn prediction_metrics(
                 rows_log.write_all(b"\n")?;
             }
         }
-        reports.push(json!({"split":split,"rows":count,"action_tuples":count*ACTIONS,"next_frame_exact":exact,"copy_frame_exact":copy_exact,"changed_pixels":changed_total,"changed_correct":changed_correct,"changed_accuracy":changed_correct as f64/changed_total.max(1) as f64,"policy_optimal_action_accuracy":policy_correct as f64/count as f64,"value_mse":value_squared/count as f64,"constant_value_prediction":0.9,"constant_value_mse":constant_value_squared/count as f64,"reward_positive":reward_positive,"reward_true_positive":reward_tp,"reward_false_positive":reward_fp}));
+        ensure!(
+            vacated_total + destination_total == changed_total,
+            "changed-pixel decomposition is incomplete"
+        );
+        reports.push(json!({"split":split,"rows":count,"action_tuples":count*ACTIONS,"next_frame_exact":exact,"copy_frame_exact":copy_exact,"changed_pixels":changed_total,"changed_correct":changed_correct,"changed_accuracy":changed_correct as f64/changed_total.max(1) as f64,"policy_optimal_action_accuracy":policy_correct as f64/count as f64,"value_mse":value_squared/count as f64,"constant_value_prediction":0.9,"constant_value_mse":constant_value_squared/count as f64,"reward_positive":reward_positive,"reward_true_positive":reward_tp,"reward_false_positive":reward_fp,"decomposition":{"vacated_pixels":vacated_total,"vacated_correct":vacated_correct,"destination_pixels":destination_total,"destination_correct":destination_correct,"inconsistent_predicted_patches":inconsistent_patches}}));
     }
     rows_log.flush()?;
     Ok(json!(reports))
@@ -663,13 +688,43 @@ fn rule_probe(
                 ];
                 // Each call is B=1 so this control also runs in the smallest capacity smoke.
                 let mut actions = Vec::new();
+                let mut logits = Vec::new();
+                let mut probabilities = Vec::new();
+                let mut values = Vec::new();
+                let mut rewards = Vec::new();
+                let mut input_hashes = Vec::new();
                 for input in inputs {
-                    actions.push(argmax(
-                        &predict(model, &[input], args.loops, device)?
-                            .policy_logits
+                    let mut hash = Sha256::new();
+                    for p in &input.patches {
+                        hash.update(p.to_le_bytes());
+                    }
+                    for m in &input.metadata {
+                        hash.update(m.to_le_bytes());
+                    }
+                    input_hashes.push(format!("{:x}", hash.finalize()));
+                    let output = predict(model, &[input], args.loops, device)?;
+                    let policy = output.policy_logits.flatten_all()?.to_vec1::<f32>()?;
+                    ensure!(
+                        policy.iter().all(|p| p.is_finite()),
+                        "non-finite policy logit"
+                    );
+                    actions.push(argmax(&policy));
+                    logits.push(policy);
+                    probabilities.push(
+                        candle_nn::ops::softmax(&output.policy_logits, D::Minus1)?
                             .flatten_all()?
                             .to_vec1::<f32>()?,
-                    ));
+                    );
+                    values.push(
+                        candle_nn::ops::sigmoid(&output.value)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?[0],
+                    );
+                    rewards.push(
+                        candle_nn::ops::sigmoid(&output.reward_logits)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                    );
                 }
                 rows += 1;
                 true_correct += usize::from(actions[0] == truth);
@@ -678,7 +733,7 @@ fn rule_probe(
                 follows_wrong_rule += usize::from(actions[2] == wrong_truth);
                 serde_json::to_writer(
                     &mut log,
-                    &json!({"split":split,"layout":layout,"rule":rule,"wrong_rule":wrong_id,"correct_action":truth,"wrong_rule_action":wrong_truth,"predictions_true_clear_wrong":actions}),
+                    &json!({"split":split,"layout":layout,"rule":rule,"wrong_rule":wrong_id,"correct_action":truth,"wrong_rule_action":wrong_truth,"predictions_true_clear_wrong":actions,"input_sha256_true_clear_wrong":input_hashes,"policy_logits_true_clear_wrong":logits,"policy_probabilities_true_clear_wrong":probabilities,"value_true_clear_wrong":values,"reward_probabilities_true_clear_wrong":rewards}),
                 )?;
                 log.write_all(b"\n")?;
             }
@@ -723,7 +778,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let updates = match args.mode {
         Mode::Smoke => 2,
         Mode::Train => args.updates,
-        Mode::Evaluate => 0,
+        Mode::Evaluate | Mode::Inspect => 0,
     };
     let mut optimizer = AdamW::new(
         vars.all_vars(),
@@ -800,9 +855,13 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let model = frozen(&vars, &config, &device)?;
     let predictions = prediction_metrics(args, &model, &device, started)?;
     let rule_probe = rule_probe(args, &model, &device, started)?;
-    let episodes = evaluate(args, &model, &device, started)?;
+    let episodes = if args.mode == Mode::Inspect {
+        json!([])
+    } else {
+        evaluate(args, &model, &device, started)?
+    };
     Ok(
-        json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::Smoke {"implementation_smoke"} else {"exploratory"},"claim_boundary":"synthetic calibrated control prerequisite, not ARC performance","parameters":parameters,"optimizer_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"predictions":predictions,"rule_probe":rule_probe,"episodes":episodes,"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
+        json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::Smoke {"implementation_smoke"} else if args.mode==Mode::Inspect {"frozen_checkpoint_diagnostic"} else {"exploratory"},"claim_boundary":"synthetic calibrated control prerequisite, not ARC performance","parameters":parameters,"optimizer_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"predictions":predictions,"rule_probe":rule_probe,"episodes":episodes,"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
     )
 }
 
@@ -861,11 +920,11 @@ fn main() -> Result<()> {
         "invalid learning rate"
     );
     ensure!(
-        args.mode != Mode::Evaluate || args.checkpoint.is_some(),
+        !matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_some(),
         "evaluation requires a checkpoint"
     );
     ensure!(
-        args.mode == Mode::Evaluate || args.checkpoint.is_none(),
+        matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
     fs::create_dir(&args.output_dir).context("run root must be new, with an existing parent")?;
