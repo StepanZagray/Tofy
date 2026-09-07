@@ -26,7 +26,9 @@
 //! millisecond averages for `generate`, `stage`, `forward`, `backward`,
 //! `optimizer`, `metrics`, and `checkpoint`. Each boundary syncs the device
 //! before timing so numbers reflect real GPU work (opt-in because syncs cost
-//! throughput). See `StepProfile` in `p2::train`.
+//! throughput). The interval controls reporting, not which updates synchronize.
+//! This switch is consumed only by the legacy loop; Foundation-v2 uses its
+//! selected candle-graph phase spans. See `StepProfile` in `p2::train`.
 //!
 //! ## Nsight Systems (`nsys`) — CPU + GPU
 //!
@@ -34,12 +36,17 @@
 //! Capture and normalize it by wrapping the training binary directly:
 //!
 //! ```bash
+//! cargo build --release --locked --features cudnn,profiling
 //! nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas --sample=cpu -- \
-//!   cargo run --release --features cudnn,profiling -- p2-train \
-//!   --device cuda --output-dir runs/p2/example --profile-update 2 ...
+//!   target/release/tofy p2-train --recipe foundation-v2 \
+//!   --device cuda --output-dir runs/p2/example --profile-updates 2 ...
 //! ```
 //!
-//! The bundle retains `.nsys-rep`, official CSV reports, agent evidence, and unified HTML.
+//! Tofy publishes its application bundle before external Nsight reports are
+//! available and does not attach them automatically. Export the supported CSV
+//! reports, supply a matching capture manifest, and publish a separate bundle
+//! from the original trace with `candle-graph report --nsight-dir`.
+//! See `docs/CANDLE_GRAPH.md`; never modify an already-published bundle.
 //!
 //! ## Host RSS (`alloc`)
 //!

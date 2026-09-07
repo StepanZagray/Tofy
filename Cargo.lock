@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "candle-graph"
-version = "0.9.5"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "candle-core",

@@ -139,6 +139,9 @@ impl RepresentativeUpdateCapture {
             // than an uninstrumented production-equivalent timing claim.
             measurement_scope: MeasurementScope::ProfiledWork,
             operations: CoverageLevel::None,
+            // Activation-category linkage is not established for this capture, so the
+            // contract claims no activation coverage rather than an unproven level.
+            activations: CoverageLevel::None,
             tensors: CoverageLevel::Partial,
             gradients: CoverageLevel::Complete,
             gradient_contract: Some(gradient_plan.contract().clone()),
@@ -228,6 +231,9 @@ impl RepresentativeUpdateCapture {
         let contract = CaptureContract {
             measurement_scope: MeasurementScope::ProfiledWork,
             operations: CoverageLevel::None,
+            // Activation-category linkage is not established for this capture, so the
+            // contract claims no activation coverage rather than an unproven level.
+            activations: CoverageLevel::None,
             tensors: CoverageLevel::None,
             gradients: CoverageLevel::None,
             gradient_contract: None,

@@ -85,7 +85,7 @@
   hardware, physical batch/accumulation pair, source-run identity, and evaluation seed in the run.
 - Run a bounded device smoke test on the exact launch binary before a long campaign. Verify the
   required accelerator backend is compiled (P2 RunPod builds normally require
-  `cargo build --release --locked --features cudnn`), the expected device opens, and one minimal
+  `cargo build --release --locked --features cudnn,profiling`), the expected device opens, and one minimal
   evaluation reaches its metric/integrity checks. A successful CPU build is not a CUDA preflight.
 - Before an automatic handoff, test repository fetch authentication and exact-commit availability,
   verify the parent run is sealed and its manifest passes, and never replace a binary still used by
@@ -129,15 +129,67 @@
 Sibling crate: [`../candle_graph`](../candle_graph). **Guide:**
 [`docs/CANDLE_GRAPH.md`](docs/CANDLE_GRAPH.md).
 
+- Use `candle_graph` whenever applicable to training, evaluation, model inspection, numerical
+  debugging, and performance investigation. It records executed, explicitly instrumented work;
+  it cannot reconstruct unrecorded operations from Rust source. Prefer verified runtime bundles
+  and focused queries when assessing what the model actually did.
+- Train with **all supported profilers enabled**. Keep the `candle-graph` dependency's `all`
+  feature (Candle helpers plus HTML viewer), and build Tofy with `profiling` plus the required
+  device backend; CUDA/cuDNN training normally uses
+  `cargo build --release --locked --features cudnn,profiling`. The dependency's `all` feature
+  alone does not activate Tofy's NVTX/Chrome tracing or collect every evidence plane.
+- Set `TOFY_PERF_TRACE` to a unique run-owned JSON path to enable Chrome/Perfetto host tracing;
+  the `profiling` build also enables the matching NVTX ranges. For the legacy training loop,
+  set `TOFY_P2_STEP_PROFILE` to a positive reporting interval (e.g. `100`). That interval controls
+  reporting, not sampling: phase synchronization runs on every update. Foundation-v2 does not
+  consume this variable; inspect its candle-graph phase spans instead. See
+  [`src/perf.rs`](src/perf.rs) for the activation controls.
+- Explicitly preregister representative capture updates within the planned training budget:
+  legacy uses `--profile-update 2`; Foundation-v2 requires a nonempty `--profile-updates` list
+  (e.g. `--profile-updates 2,100,1000` for a sufficiently long run). Foundation-v2's empty default
+  captures no training updates, and `--profile-update` does not replace its list. Select reachable
+  updates on short runs and resumes. Keep `--profile-eval true` for supported evaluators.
+  Enable all available evidence on the selected invocations; candle-graph intentionally stays
+  inactive on other invocations. Record capture cadence and profiler overhead in the run budget
+  and match profiling settings across comparison arms.
+- On NVIDIA training, also collect Nsight Systems evidence with supported CUDA, NVTX, OS-runtime,
+  cuDNN/cuBLAS tracing and CPU sampling. Retain the `.nsys-rep`, supported official
+  `nsys stats --format csv` reports, and a matching `capture-manifest.json`. Bind them to the
+  corresponding trace using `CaptureRun::with_nsight_dir` before publication, or publish a new
+  separate bundle with `cargo candle-graph report TRACE --nsight-dir DIR --bundle NEW_BUNDLE`.
+  Tofy's current trainer does not attach Nsight automatically; never add files to a finalized
+  bundle. Follow the sibling [runtime guide](../candle_graph/docs/runtime-analysis-guide.md)
+  and [CLI reference](../candle_graph/docs/cli-reference.md) for the evidence contract.
+- Before a long run, verify an actual capture from the exact launch binary, its enabled
+  profilers, and its recorded capabilities. Enable every wired evidence plane and disclose
+  unavailable tools, permissions, unsupported backends, and unwired probes before launch;
+  do not silently disable profilers for speed or describe partial coverage as full profiling.
+  Current Tofy captures include semantic spans, labelled tensor/seam statistics, host scalars,
+  and manifest-checked training gradients, but do not record operations/activation hotspots,
+  logical allocation lifetimes, physical-memory checkpoints, or device-event intervals.
+  Those need producer instrumentation; enabling Cargo features cannot supply them. Host span
+  durations are not CUDA kernel durations, and tensor footprints are not peak VRAM measurements.
+
 ```bash
-sed -n '1,220p' runs/p2/v15/profile/update-000000000001/EVIDENCE.md
-cargo p2-view runs/p2/v15/profile/update-000000000001 \
-  --output runs/p2/v15/profile/update-000000000001/viewer.html
-cargo candle-graph summary runs/p2/v15/profile/update-000000000001/application.jsonl
+cargo candle-graph protocol
+cargo candle-graph campaign-status --manifest runs/p2/example/profile/campaign.json
+cargo candle-graph overview runs/p2/example/profile/update-000000000002
+cargo candle-graph query runs/p2/example/profile/update-000000000002 --kind labels
+cargo candle-graph query runs/p2/example/profile/update-000000000002 \
+  --kind tensor-stats --label-prefix loss/ --limit 20
+cargo p2-view runs/p2/example/profile/update-000000000002 \
+  --output /tmp/tofy-update-2-viewer.html
 ```
 
-Agents start from `EVIDENCE.md`/`evidence.json`, verify `health.trusted` and gaps, then use bounded
-queries. Use `compare` with an explicit baseline before attributing a performance change. Optional
-Nsight facts appear in the same packet/viewer; their absence is a stated gap, not a training error.
+Start with `overview`; check `health.structurally_valid`, `health.capture_complete`, capabilities,
+and gaps. Discover labels before querying; collection queries return 50 rows by default. Follow
+`result.next_offset` with `--offset`, or deliberately export `--all --output FILE`. Keep finalized
+bundles immutable: regenerate viewers outside the bundle. The Measurements tab exposes scalar
+values, seam statistics, and gradient states with declared family expectations.
+
+Current Tofy captures declare `profiled_work`, so timing comparisons are ineligible by design.
+`compare` can still provide diagnostic numerical comparisons; a timing verdict requires compatible
+production-equivalent captures and at least five independent bundles per cohort. Missing Nsight,
+operation, and memory-lifetime evidence are stated gaps, not zero cost or a training error.
 
 `.cargo/config.toml` aliases: `candle-graph`, `p2-view`.
