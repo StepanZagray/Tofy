@@ -10,6 +10,7 @@ from tofy_arc3.readout_fixtures import (
     generate_readout_fixtures,
     score_effects,
     score_grounding,
+    score_reasoning_effects,
 )
 
 
@@ -125,6 +126,86 @@ class ReadoutFixtureTests(unittest.TestCase):
             score_effects(rows[:-1])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             score_effects(rows + [copy.deepcopy(rows[0])])
+
+    def test_alternate_layout_seed_is_fixed_and_mode_filter_is_strict(self) -> None:
+        layout_seed = 2060907
+        _, oracle = generate_readout_fixtures(layout_seed=layout_seed)
+        self.assertEqual(
+            fixture_digest(layout_seed=layout_seed),
+            "30715f4a1cfe932bd480f149db2bde8394662a0953d613b9cb6c8207b29b7841",
+        )
+        rows = oracle_predictions("A", oracle["grounding"], ("grounding",))
+        on = [{**row, "mode": "on"} for row in rows]
+        off = [
+            {**row, "mode": "off", "action": {"action_id": 6, "x": 31, "y": 31}}
+            for row in rows
+        ]
+        self.assertTrue(
+            score_grounding(on + off, layout_seed=layout_seed, mode="on")["pass"]
+        )
+        self.assertFalse(
+            score_grounding(on + off, layout_seed=layout_seed, mode="off")["pass"]
+        )
+        with self.assertRaisesRegex(ValueError, "layout_seed must be an integer"):
+            generate_readout_fixtures(layout_seed=True)
+
+    def test_reasoning_effect_score_reports_paired_discordance(self) -> None:
+        _, oracle = generate_readout_fixtures(layout_seed=2060907)
+        rows = []
+        for seed in (0, 1):
+            for mode in ("off", "on"):
+                for item, target in enumerate(oracle["effects"]):
+                    action = copy.deepcopy(target["target_action"])
+                    if mode == "off" and item < 3:
+                        action["x"] = (action["x"] + 1) % 64
+                    rows.append(
+                        {
+                            "task": "B",
+                            "seed": seed,
+                            "mode": mode,
+                            "arm": "raw",
+                            "item": item,
+                            "action": action,
+                        }
+                    )
+        result = score_reasoning_effects(rows, layout_seed=2060907)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["by_seed"]["0"]["gain"], 3)
+        self.assertEqual(
+            result["by_seed"]["0"]["paired_mode_outcomes"],
+            {"both_correct": 21, "off_only": 0, "on_only": 3, "neither": 0},
+        )
+        self.assertEqual(result["by_seed"]["0"]["mode_prediction_changed"], 3)
+        self.assertEqual(
+            result["by_seed"]["0"]["counterfactual_pairs"]["on"],
+            {
+                "both_correct": 12,
+                "first_only": 0,
+                "second_only": 0,
+                "neither_correct": 0,
+                "prediction_changed": 12,
+                "prediction_same": 0,
+            },
+        )
+        self.assertEqual(
+            result["by_seed"]["0"]["gate_margins"],
+            {
+                "on_accuracy_margin_from_21": 3,
+                "gain_margin_from_3": 0,
+            },
+        )
+        self.assertEqual(
+            result["population_controls"],
+            {
+                "counterfactual_pairs": 12,
+                "target_side_counts": {"left": 12, "right": 12},
+                "unique_target_actions": 24,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "unknown reasoning mode"):
+            score_reasoning_effects([{**rows[0], "mode": "summary"}] + rows[1:])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            score_reasoning_effects(rows[:-1])
 
     def test_score_rejects_non_integer_keys_and_has_no_ceiling_exception(self) -> None:
         _, oracle = generate_readout_fixtures()
