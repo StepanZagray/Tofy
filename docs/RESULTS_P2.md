@@ -4,6 +4,72 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Prepreview model fits memory but failed output protocol (2026-09-06)
+
+Pinned official Qwen3-8B Q4_K_M fully downloaded and hash-verified. The first
+non-ARC serving qualification atfe5571d3 loaded the model with context16384,
+logical/physical prompt batch1024/1024, F16 KV, and sampled7120MiB GPU use.
+One valid action took5.885s (471 prompt/266 completion tokens). On the second
+request, the256-token reasoning cutoff was followed by continued prose in the
+answer field; generation exhausted1024 tokens and the strict JSON parser
+rejected it. No public environment was accessed. This is failed protocol
+qualification, not gameplay/model-quality evidence. All server and telemetry
+processes stopped and the artifact tree sealed with digest
+`2d4633e22faf9dd04abeb8983b84d8a13b64ea45a7e4c60ac88eafe3b5ab5972`.
+Default logs also omitted layer placement, so all-layer offload remains unproved
+by the registered log check despite actual GPU execution and memory use.
+
+Source `fe5571d355f41d636b0f652621f79a4bdba07801`; llama-server build10760,
+commit e2f1e6f, executable SHA256
+`a95769434fbc62e18b2128a0912f1839b33bcc316b0c2961a1589166047d620e`.
+Model revision `7c41481f57cb95916b40956ab2f0b139b296d974`, SHA256
+`d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785`.
+The May2025 model artifact predates the first public preview; this supports
+public noncontamination, not a full original-corpus audit. No training occurs.
+The agent currently has only compact lossless observations/four-turn history,
+no code tool, persistent hypothesis memory, search or connected online CNN.
+
+Decision: separately register a protocol repair using supported nonthinking
+mode, explicit available-action JSON schema, and diagnostic layer-placement
+logging. This is a combined engineering repair, not a causal performance study;
+nonthinking mode may reduce gameplay reasoning ability. Keep the first failure
+sealed. Qwen's official documentation supports a hard thinking switch and warns
+against greedy thinking-mode decoding; the original temperature0 configuration
+was not its recommended thinking sampler. Related llama.cpp grammar/thinking
+issues support investigating the interaction but do not prove its exact local
+cause. [Qwen documentation](https://qwen.readthedocs.io/en/v3.0/getting_started/quickstart.html),
+[upstream grammar report](https://github.com/ggml-org/llama.cpp/issues/20345).
+
+Exact first root:
+`/home/stepan/Coding/Personal/.tofy-build/pretrained/qwen3-8b-q4km-prepreview/capacity-runs/qualification-20260906T193115137729-0500-pid295669`.
+[Original qualification registration](research/2026-09-06-prepreview-agent-capacity.md).
+
+## Frozen effect scores exclude threshold-only repair (2026-09-06)
+
+Three fe5571d3 CUDA reproductions exactly match all prior conditioned data,
+initial/final prediction fingerprints, held-out and prequential metrics, and
+learner totals. Physical64/accumulation1,512 updates each; total25.004s and
+sampled510MiB peak each. Exact binary SHA256
+`705ad59219496cc5a4c1028d7cd959d2ce08fb140ee4b73ba021e83fde647209`.
+Independent rescoring matches every old0.5 confusion count. Exploratory maximum
+F1 across thresholds is0.810867/0.991969/0.691269 for seeds0/1/2, with average
+precision0.673848/0.994657/0.496185. Thus a threshold-only change cannot make all
+three pass0.70; the registered FAIL stands. At the approximate training-prior
+correction threshold0.999144, F1=.448/.744/.454 and click F1=.171/0/0.
+These selected maxima are diagnostic, never promotion evidence.
+
+A local constructive CNN representation fits this generator within existing
+width16:11 input-feature channels,9 gated change channels,1 summed mask channel.
+An exhaustive448-case Boolean check passes; this proves local representability,
+not optimizer convergence or public-game capability. Test more replay updates
+per identical factual observation before increasing representation. No learned
+goal/value objective or public controller is connected to the CNN.
+
+Exact reproduction roots, external digests and all score curves are indexed by
+`/home/stepan/Coding/Personal/.tofy-build/effect-separability-preparation-20260906T191407-CDT/`.
+All manifests verified and all experiment/telemetry PIDs stopped.
+[Registration](research/2026-09-06-effect-frozen-separability.md).
+
 ## Online effect prerequisite failed absolute F1 (2026-09-06)
 
 The fresh online effect CNN learned action ranking on independent non-ARC

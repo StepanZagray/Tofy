@@ -33,6 +33,8 @@ pub struct OnlineEffectConfig {
     pub replay_capacity: usize,
     /// Number of most-recent replay rows used by one optimizer update.
     pub physical_batch: usize,
+    /// Repeated optimizer steps over the same selected replay batch per observation.
+    pub optimizer_updates_per_observation: usize,
     pub learning_rate: f64,
 }
 
@@ -42,6 +44,7 @@ impl Default for OnlineEffectConfig {
             hidden_channels: 16,
             replay_capacity: 256,
             physical_batch: 16,
+            optimizer_updates_per_observation: 1,
             learning_rate: 1e-3,
         }
     }
@@ -52,6 +55,10 @@ impl OnlineEffectConfig {
         ensure!(self.hidden_channels > 0, "hidden_channels must be positive");
         ensure!(self.replay_capacity > 0, "replay_capacity must be positive");
         ensure!(self.physical_batch > 0, "physical_batch must be positive");
+        ensure!(
+            (1..=16).contains(&self.optimizer_updates_per_observation),
+            "optimizer_updates_per_observation must be in 1..=16"
+        );
         ensure!(
             self.physical_batch <= self.replay_capacity,
             "physical_batch {} exceeds replay_capacity {}",
@@ -121,7 +128,10 @@ pub struct ObserveResult {
     /// Prediction made before this factual pair changed the parameters.
     pub pre_update: ChangePrediction,
     pub pre_update_metrics: EffectMetrics,
+    /// Final optimizer update for callers that only need the post-observation endpoint.
     pub update: EffectUpdate,
+    /// Ordered diagnostics for every optimizer update caused by this observation.
+    pub updates: Vec<EffectUpdate>,
     pub totals: EffectTotals,
 }
 
@@ -241,11 +251,12 @@ impl OnlineEffectLearner {
         probabilities_from_logits(&logits, actions)
     }
 
-    /// Score, retain, and train once on a confirmed factual transition.
+    /// Score, retain, and train on a confirmed factual transition.
     ///
     /// The returned prediction and metrics are computed before the optimizer
-    /// sees this pair. Replay sampling is deterministic: one update uses the
-    /// most recent `physical_batch` retained transitions.
+    /// sees this pair. The factual transition is retained exactly once, then
+    /// `optimizer_updates_per_observation` updates each use the same most-recent
+    /// `physical_batch` retained transitions.
     pub fn observe(
         &mut self,
         current: &ArcFrame,
@@ -274,13 +285,22 @@ impl OnlineEffectLearner {
         self.totals.observed_changed_pixels += pre_update_metrics.changed_pixels as u64;
         self.totals.observed_unchanged_pixels += pre_update_metrics.unchanged_pixels as u64;
 
-        let update = self.train_recent_replay()?;
-        self.totals.optimizer_updates = update.update;
+        let mut updates = Vec::with_capacity(self.config.optimizer_updates_per_observation);
+        for _ in 0..self.config.optimizer_updates_per_observation {
+            let update = self.train_recent_replay()?;
+            self.totals.optimizer_updates = update.update;
+            updates.push(update);
+        }
+        let update = updates
+            .last()
+            .cloned()
+            .context("validated optimizer update count produced no updates")?;
         self.totals.replay_len = self.replay.len();
         Ok(ObserveResult {
             pre_update: probabilities,
             pre_update_metrics,
             update,
+            updates,
             totals: self.totals.clone(),
         })
     }
@@ -686,10 +706,19 @@ mod tests {
     use super::*;
 
     fn config(replay_capacity: usize, physical_batch: usize) -> OnlineEffectConfig {
+        config_with_updates(replay_capacity, physical_batch, 1)
+    }
+
+    fn config_with_updates(
+        replay_capacity: usize,
+        physical_batch: usize,
+        optimizer_updates_per_observation: usize,
+    ) -> OnlineEffectConfig {
         OnlineEffectConfig {
             hidden_channels: 2,
             replay_capacity,
             physical_batch,
+            optimizer_updates_per_observation,
             learning_rate: 1e-3,
         }
     }
@@ -742,6 +771,54 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_updates_match_manual_replay_updates_without_duplicate_observations() -> Result<()> {
+        let device = Device::Cpu;
+        let repeated_config = config_with_updates(4, 2, 3);
+        let mut repeated = OnlineEffectLearner::new(43, &device, repeated_config)?;
+        let mut manual = OnlineEffectLearner::new(43, &device, config(4, 2))?;
+        let current = frame(0);
+        let mut next = current.clone();
+        next.pixels[9 * FRAME_SIDE + 7] = 3;
+        let action = ArcAction::new(1, None, None)?;
+
+        let repeated_result = repeated.observe(&current, &action, &next)?;
+        let manual_result = manual.observe(&current, &action, &next)?;
+        let mut manual_updates = vec![manual_result.update];
+        for _ in 1..repeated_config.optimizer_updates_per_observation {
+            let update = manual.train_recent_replay()?;
+            manual.totals.optimizer_updates = update.update;
+            manual_updates.push(update);
+        }
+
+        assert_eq!(repeated_result.pre_update, manual_result.pre_update);
+        assert_eq!(
+            repeated_result.pre_update_metrics,
+            manual_result.pre_update_metrics
+        );
+        assert_eq!(repeated_result.updates, manual_updates);
+        assert_eq!(
+            repeated_result.update,
+            *repeated_result
+                .updates
+                .last()
+                .expect("updates are nonempty")
+        );
+        assert_eq!(parameter_bits(&repeated)?, parameter_bits(&manual)?);
+        assert_eq!(repeated.totals(), manual.totals());
+        assert_eq!(repeated.totals().observations, 1);
+        assert_eq!(repeated.totals().optimizer_updates, 3);
+        assert_eq!(repeated.totals().replay_len, 1);
+
+        assert_eq!(
+            OnlineEffectConfig::default().optimizer_updates_per_observation,
+            1
+        );
+        assert!(OnlineEffectLearner::new(1, &device, config_with_updates(4, 2, 0)).is_err());
+        assert!(OnlineEffectLearner::new(1, &device, config_with_updates(4, 2, 17)).is_err());
         Ok(())
     }
 

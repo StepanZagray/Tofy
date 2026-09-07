@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tofy::p2::data::{ArcAction, ArcFrame, FRAME_SIDE};
 use tofy::p2::online_effect::{
-    ChangePrediction, EffectMetrics, OnlineEffectConfig, OnlineEffectLearner,
+    ChangePrediction, EffectMetrics, EffectUpdate, OnlineEffectConfig, OnlineEffectLearner,
 };
 use tofy::p2::train::resolve_device;
 
@@ -78,13 +78,17 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     data_seed: u64,
 
-    /// Number of online observations and optimizer updates.
+    /// Number of online observations.
     #[arg(long, default_value_t = 256)]
     steps: usize,
 
     /// Maximum physical replay batch; the effective batch ramps from one.
     #[arg(long, default_value_t = 64)]
     batch: usize,
+
+    /// Optimizer updates over the same selected replay batch per observation.
+    #[arg(long, default_value_t = 1)]
+    updates_per_observation: usize,
 
     /// Actual actions, or constant ACTION5 inputs with unchanged true targets.
     #[arg(long, value_enum)]
@@ -227,6 +231,7 @@ fn main() -> Result<()> {
                 "model_seed": args.seed,
                 "data_seed": args.data_seed,
                 "arm": args.arm.as_str(),
+                "optimizer_updates_per_observation": args.updates_per_observation,
                 "save_heldout_predictions": args.save_heldout_predictions,
                 "held_out_predictions_artifact_identity": HELD_OUT_PREDICTIONS_ID,
                 "provenance": provenance,
@@ -241,6 +246,10 @@ fn main() -> Result<()> {
 fn validate_args(args: &Args) -> Result<()> {
     ensure!(args.steps > 0, "--steps must be greater than zero");
     ensure!((1..=64).contains(&args.batch), "--batch must be in 1..=64");
+    ensure!(
+        (1..=16).contains(&args.updates_per_observation),
+        "--updates-per-observation must be in 1..=16"
+    );
     ensure!(
         args.max_seconds > 0,
         "--max-seconds must be greater than zero"
@@ -257,6 +266,9 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
     } else {
         HELD_OUT_FRAMES
     };
+    let expected_optimizer_updates = steps
+        .checked_mul(args.updates_per_observation)
+        .context("expected optimizer update count overflow")?;
     let data = generate_data(args.data_seed, steps, held_out_frames)?;
     check_deadline(started, deadline, "procedural generation")?;
 
@@ -272,11 +284,13 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         "generator_schema": GENERATOR_SCHEMA,
         "generated_data_sha256": data.sha256,
         "generated_data_hash_excludes_arm": true,
+        "generated_data_hash_excludes_optimizer_updates_per_observation": true,
         "generator_seed_construction": seed_construction(args.data_seed),
         "environment_palette": {"background": data.background, "object": data.object},
         "position_split": {"training_center_parity": "even", "held_out_center_parity": "odd"},
         "movement_action_permutation": movement_json(&data.movement),
         "training_steps": steps,
+        "expected_optimizer_updates": expected_optimizer_updates,
         "held_out_frames": held_out_frames,
         "held_out_action_tuples": held_out_frames * 7,
         "save_heldout_predictions": args.save_heldout_predictions,
@@ -285,6 +299,7 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
             "hidden_channels": HIDDEN_CHANNELS,
             "replay_capacity": REPLAY_CAPACITY,
             "physical_batch": args.batch,
+            "optimizer_updates_per_observation": args.updates_per_observation,
             "learning_rate": LEARNING_RATE,
             "gradient_accumulation": 1,
             "gradient_clipping": null,
@@ -304,6 +319,7 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         hidden_channels: HIDDEN_CHANNELS,
         replay_capacity: REPLAY_CAPACITY,
         physical_batch: args.batch,
+        optimizer_updates_per_observation: args.updates_per_observation,
         learning_rate: LEARNING_RATE,
     };
     let mut learner = OnlineEffectLearner::new(args.seed, &device, config)?;
@@ -333,6 +349,12 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         let update_started = Instant::now();
         let observed = learner.observe(&transition.current, &model_action, &transition.next)?;
         check_deadline(started, deadline, "online training")?;
+        ensure!(
+            observed.updates.len() == args.updates_per_observation,
+            "learner returned {} optimizer updates for one observation, expected {}",
+            observed.updates.len(),
+            args.updates_per_observation
+        );
         accumulate_metrics(&mut prequential, &observed.pre_update_metrics);
         prequential_bce_sum += observed.pre_update_metrics.balanced_bce;
         let row = json!({
@@ -346,6 +368,7 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
             "model_input_actually_replaced": input_replaced,
             "prequential": effect_metrics_json(&observed.pre_update_metrics),
             "optimizer": {
+                "statistic": "final_update_for_observation",
                 "update": observed.update.update,
                 "batch_size": observed.update.batch_size,
                 "loss": observed.update.loss,
@@ -355,6 +378,11 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
                 "unchanged_weight": observed.update.unchanged_weight,
                 "gradient_l2": observed.update.gradient_l2,
             },
+            "optimizer_updates_for_observation": observed
+                .updates
+                .iter()
+                .map(effect_update_json)
+                .collect::<Vec<_>>(),
             "totals": {
                 "observations": observed.totals.observations,
                 "optimizer_updates": observed.totals.optimizer_updates,
@@ -441,7 +469,8 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
     );
     let totals = learner.totals();
     ensure!(
-        totals.observations == steps as u64 && totals.optimizer_updates == steps as u64,
+        totals.observations == steps as u64
+            && totals.optimizer_updates == expected_optimizer_updates as u64,
         "learner totals do not match requested updates"
     );
     ensure!(
@@ -462,8 +491,11 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         "arm": args.arm.as_str(),
         "training_steps": steps,
         "physical_batch": args.batch,
+        "optimizer_updates_per_observation": args.updates_per_observation,
+        "expected_optimizer_updates": expected_optimizer_updates,
         "generated_data_sha256": data.sha256,
         "generated_data_hash_excludes_arm": true,
+        "generated_data_hash_excludes_optimizer_updates_per_observation": true,
         "generator_seed_construction": seed_construction(args.data_seed),
         "environment_palette": {"background": data.background, "object": data.object},
         "position_split": {"training_center_parity": "even", "held_out_center_parity": "odd"},
@@ -1031,6 +1063,19 @@ fn effect_metrics_json(metrics: &EffectMetrics) -> Value {
     })
 }
 
+fn effect_update_json(update: &EffectUpdate) -> Value {
+    json!({
+        "update": update.update,
+        "batch_size": update.batch_size,
+        "loss": update.loss,
+        "changed_pixels": update.changed_pixels,
+        "unchanged_pixels": update.unchanged_pixels,
+        "changed_weight": update.changed_weight,
+        "unchanged_weight": update.unchanged_weight,
+        "gradient_l2": update.gradient_l2,
+    })
+}
+
 fn confusion_json(confusion: &Confusion) -> Value {
     json!({
         "true_positive": confusion.true_positive,
@@ -1555,6 +1600,36 @@ mod tests {
         assert_eq!(count(&first_constant["model_input_action"], "id"), 5);
         assert_eq!(first_constant["model_input_actually_replaced"], true);
         assert_eq!(first_constant["model_input_identity"], COMPARATOR_ID);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_defaults_to_one_bounded_update_per_observation() -> Result<()> {
+        let defaults = Args::try_parse_from([
+            "online-effect-probe",
+            "--arm",
+            "conditioned",
+            "--output-dir",
+            "/tmp/unused-online-effect-defaults",
+        ])?;
+        assert_eq!(defaults.updates_per_observation, 1);
+        validate_args(&defaults)?;
+
+        let repeated = Args::try_parse_from([
+            "online-effect-probe",
+            "--arm",
+            "constant",
+            "--output-dir",
+            "/tmp/unused-online-effect-repeated",
+            "--updates-per-observation",
+            "16",
+        ])?;
+        assert_eq!(repeated.updates_per_observation, 16);
+        validate_args(&repeated)?;
+
+        let mut invalid = repeated;
+        invalid.updates_per_observation = 17;
+        assert!(validate_args(&invalid).is_err());
         Ok(())
     }
 }
