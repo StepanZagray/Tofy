@@ -66,3 +66,16 @@ observed failure: objective competition, pairwise transition representation, or
 optimization. Do not change several factors or infer the winning remedy from
 advisor agreement. All fit artifacts are exploratory fitting diagnostics, not
 the previous screen's held-out evidence and not completed ARC capability.
+
+## Restart after requested pause — September 7, 1:34 p.m. CDT
+
+The first fit was interrupted by the user after 308 updates, before its registered
+decision. At update 300 it had 31.25% accuracy and CE 1.381405; no learned weights
+were saved. Preserve that partial run as interrupted exploration. A new run starts
+from the same original initialization with the same model, dataset, losses,
+optimizer, batch, depth schedule, thresholds and 1,200-update/35-minute budget.
+The runner now saves a weight-only checkpoint at every existing fitting check,
+using a temporary file and rename, and records its hash in the check row. These
+files support rescoring and protect partial progress; they do not contain AdamW
+state and cannot support an exact optimizer resume. No metric-based checkpoint
+selection beyond the original first-passing-check rule is introduced.

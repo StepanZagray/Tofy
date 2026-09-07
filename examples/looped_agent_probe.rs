@@ -347,6 +347,16 @@ fn argmax(values: &[f32]) -> usize {
         .0
 }
 
+fn save_fitting_checkpoint(vars: &VarMap, root: &Path, update: usize) -> Result<Value> {
+    let name = format!("checkpoint-{update:06}.safetensors");
+    let path = root.join(&name);
+    ensure!(!path.exists(), "checkpoint must be new");
+    let temporary = path.with_extension("tmp");
+    vars.save(&temporary)?;
+    fs::rename(&temporary, &path)?;
+    Ok(json!({"file":name,"sha256":file_hash(&path)?,"weights_only":true}))
+}
+
 fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
     let mut samples = Vec::new();
     for layout in 0..8 {
@@ -1005,7 +1015,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 || updates_done.is_multiple_of(25)
                 || updates_done == updates
             {
-                let row = fitting_check(
+                let mut row = fitting_check(
                     args,
                     &frozen(&vars, &config, &device)?,
                     samples,
@@ -1013,6 +1023,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                     started,
                     updates_done,
                 )?;
+                row["checkpoint"] = save_fitting_checkpoint(&vars, &args.output_dir, updates_done)?;
                 let pass = row["fit_gate_pass"]
                     .as_bool()
                     .context("missing fitting gate")?;
@@ -1142,6 +1153,29 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fitting_checkpoint_preserves_weights_and_rejects_overwrite() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("tofy-fit-save-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let vars = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+            let weight = vb.get((2, 3), "weight")?;
+            let before = weight.to_vec2::<f32>()?;
+            let saved = save_fitting_checkpoint(&vars, &root, 25)?;
+            let path = root.join(saved["file"].as_str().unwrap());
+            let restored = candle_core::safetensors::load(&path, &Device::Cpu)?;
+            assert_eq!(before, restored["weight"].to_vec2::<f32>()?);
+            assert_eq!(before, weight.to_vec2::<f32>()?);
+            assert_eq!(saved["sha256"], file_hash(&path)?);
+            assert!(save_fitting_checkpoint(&vars, &root, 25).is_err());
+            assert!(!path.with_extension("tmp").exists());
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
 
     #[test]
     fn fixed_set_preserves_the_blind_information_bound() -> Result<()> {
