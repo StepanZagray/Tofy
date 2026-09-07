@@ -4,6 +4,75 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Grounding passes; factual effect summaries fail (2026-09-06)
+
+The completed nonthinking readout at `1c8c9f426cc015d2dd346f3c990328dc5e11f104`
+scored 12/12 exact named-component centroids on each seed, but only 11/24 effect
+attributions with raw history and 12/24 with exact summaries on each seed.
+The summary gate required >=21/24 and >=3/24 gain, so it fails. All 12 paired
+summary histories produced identical answers despite opposite correct actions.
+Named-centroid success can be metadata readout; it is not hidden-goal inference.
+All 120 completions and integrity checks passed with no public data or training.
+The run consumed 107,776 prompt/2,022 completion tokens and 87.882 seconds of
+summed decisions. Manifest: `d5afa5b35e1a81546be04a13cf154cd3b15ca8115e3176038a08325916ae4ff9`.
+Exact root:
+`/home/stepan/Coding/Personal/.tofy-build/readout-probe-preparation-20260906T203934-CDT/runs/readout-20260906T212012806857-0500-pid353747`.
+
+The next protocol smoke at `7008c23d8b9df3fb66b01efc547f98ed61528a07` passed
+ten strict actions with thinking on and budget 256. Prompt counts were exact,
+all responses ended normally and contained reasoning; all ten actions were
+ACTION5, so this establishes no behavior gain. Latencies were 5.901–11.297
+seconds, 41,340 prompt/2,660 completion tokens. The server reported no separate
+reasoning-token counts. Manifest:
+`a08913af3439925487b6c7ecd6446342003d6714d825fdb9b9b712db385819e9`.
+Root:
+`/home/stepan/Coding/Personal/.tofy-build/thinking-protocol-preparation-20260906T2105-CDT/runs/thinking-protocol-20260906T212349089860-0500-pid357333`.
+
+Both tests used identical qualified production core bytes, all 37 CUDA layers,
+16K F16 context and prompt/physical batch 1024/1024; sampled peak 7,126 MiB.
+No optimizer accumulation applies. All owned processes stopped before sealing;
+independent verification reconciled full artifact trees, scores and cleanup.
+Decision: reject summary-only deployment, test thinking on/off on fresh synthetic
+layouts before spending another public evaluation budget. No ARC metric improved.
+
+## Frozen Qwen reference completes; both public seeds fail (2026-09-06)
+
+The context-budgeted source `92cce2456a58dfc75b69c6956c3f9ef5c3672af4`
+completed all three fixed development games on seeds 0 and 1: **0/23 levels and
+native score 0 on each seed**. All six game runs reached 128 engine-charged
+actions, including four retry resets across the pair; 764 model decisions ran.
+Combined wall time was 2684.693 seconds. All current lossless observations and
+exact prompt-token accounting passed, and no time cap stopped a game.
+
+Both ar25 seeds repeated click (31,31) for 128 exact last-frame noops. bp35
+needed 125 history evictions per seed and usually retained only one prior turn;
+its changing pixels were not evidence of useful board effects. This frozen
+nonthinking policy had no online updates, note memory, planner, tools or connected
+CNN. The independent CNN's procedural training success is not a public gain.
+All 22 reserved games remain untouched; no Best So Far metric improves.
+
+The model/server/config are the pinned identities below, with 16K F16 context,
+37/37 CUDA layers and prompt/physical batch 1024/1024. Inference has no optimizer
+accumulation. Prompt/completion totals were 2,784,193/6,050 for seed 0 and
+2,784,818/6,367 for seed 1. The official prepreview artifact chronology supports
+noncontamination but is not a complete corpus audit.
+
+Exact prep:
+`/home/stepan/Coding/Personal/.tofy-build/context-budget-public-reference-20260906T203451-CDT`.
+Runs: `runs/reference-seed0-20260906T203528539096--0500` and
+`runs/reference-seed1-20260906T205748620874--0500`.
+Driver manifests: `cc5b81844f8769abba2324d4cc5683deae909dcdd4bcd9559b04fb16cdcdb9ac`
+and `f27fb6cdab6c6878bd000d4d067de26438550aae322898155a89244d91f351ed`.
+`paired-reference-independent.json` verifies file sets/hashes, native accounting,
+token totals and exact process cleanup. This completed registered pair supersedes
+the failed partial attempt below; that failed evidence remains preserved.
+
+The prior repaired context qualification passed ten non-ARC requests, followed
+by a four-action native bp35 smoke. These infrastructure checks did not improve
+policy behavior. Decision: reject the frozen policy at this budget; run the
+registered synthetic grounding/effect-readout diagnostic and the separate
+thinking/schema protocol qualification before selecting a policy intervention.
+
 ## Local model protocol passed; public reference hit context limit (2026-09-06)
 
 The repaired ae4bc401 nonthinking Qwen qualification passed all five strict
