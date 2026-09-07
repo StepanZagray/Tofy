@@ -25,6 +25,7 @@ _MAX_RESPONSE_BYTES = 1 << 20
 _FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
 _FRAME_FORMATS = {"raw_hex", "compact"}
 _SAMPLING_FIELDS = {"temperature", "top_p", "top_k", "min_p"}
+_CONTEXT_SAFETY_TOKENS = 128
 
 SYSTEM_PROMPT = """You are an ARC-AGI-3 game-playing policy. Infer the visible game's rules and goal only from the observation sequence and the results of prior actions. Aim to make progress and reach WIN while using actions efficiently. The board is provided as lossless text; you have no vision, code-execution, external-data, or game-source tools.
 
@@ -302,6 +303,7 @@ class LocalChatAgent:
         history_turns: int = 4,
         frame_format: str = "raw_hex",
         sampling: object | None = None,
+        context_size: int | None = None,
     ) -> None:
         self.endpoint = _completion_url(endpoint)
         if not isinstance(model, str) or not model:
@@ -323,13 +325,102 @@ class LocalChatAgent:
             raise ValueError("frame_format must be raw_hex or compact")
         self.frame_format = frame_format
         self.sampling = {} if sampling is None else validate_sampling(sampling)
+        self.context_size = (
+            None if context_size is None else _integer(context_size, "context_size")
+        )
+        if self.context_size == 0:
+            raise ValueError("context_size must be positive")
         self._history: list[tuple[str, str | None, str | None]] = []
         self._session: tuple[str, str] | None = None
         self._open: Callable[..., Any] = build_opener(
             ProxyHandler({}), _NoRedirect()
         ).open
 
+    def _budget_request(
+        self, path: str, payload: dict[str, Any], deadline: float
+    ) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("context budgeting exceeded the decision deadline")
+        parsed = urlsplit(self.endpoint)
+        request = Request(
+            urlunsplit((parsed.scheme, parsed.netloc, path, "", "")),
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._open(request, timeout=remaining) as response:
+                status = getattr(response, "status", None)
+                if status is not None and not 200 <= status < 300:
+                    raise LocalChatError(f"context endpoint returned HTTP {status}")
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            raise LocalChatError(f"context endpoint returned HTTP {exc.code}") from exc
+        except TimeoutError:
+            raise
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise exc.reason from exc
+            raise LocalChatError(f"context request failed: {exc}") from exc
+        except OSError as exc:
+            raise LocalChatError(f"context request failed: {exc}") from exc
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            raise LocalChatError("context response exceeds the size limit")
+        try:
+            value = json.loads(raw.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LocalChatError("context endpoint returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise LocalChatError("context endpoint returned a non-object response")
+        if time.monotonic() > deadline:
+            raise TimeoutError("context budgeting exceeded the decision deadline")
+        return value
+
+    def _fit_messages(
+        self, current: str, deadline: float
+    ) -> tuple[list[dict[str, str]], int, int]:
+        groups: list[list[dict[str, str]]] = []
+        for prior, action, terminal in self._history:
+            group = [{"role": "user", "content": prior}]
+            if action is not None:
+                group.append({"role": "assistant", "content": action})
+            if terminal is not None:
+                group.append({"role": "user", "content": terminal})
+            groups.append(group)
+        for evicted in range(len(groups) + 1):
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend(item for group in groups[evicted:] for item in group)
+            messages.append({"role": "user", "content": current})
+            applied = self._budget_request(
+                "/apply-template", {"messages": messages}, deadline
+            )
+            prompt = applied.get("prompt")
+            if not isinstance(prompt, str):
+                raise LocalChatError("apply-template response has no string prompt")
+            tokenized = self._budget_request(
+                "/tokenize",
+                {"content": prompt, "add_special": False, "parse_special": True},
+                deadline,
+            )
+            tokens = tokenized.get("tokens")
+            if not isinstance(tokens, list) or any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0
+                for token in tokens
+            ):
+                raise LocalChatError("tokenize response has no valid token ID list")
+            estimated = len(tokens)
+            if (
+                estimated + self.max_tokens + _CONTEXT_SAFETY_TOKENS
+                <= self.context_size
+            ):
+                return messages, evicted, estimated
+        raise LocalChatError(
+            "system prompt and current lossless observation exceed context_size"
+        )
+
     def choose_action(self, observation: dict[str, Any]) -> dict[str, Any]:
+        decision_started = time.perf_counter()
         session, observation_text, available, state = _observation_text(
             observation, frame_format=self.frame_format
         )
@@ -339,14 +430,26 @@ class LocalChatAgent:
             self._history.clear()
             self._session = session
 
-        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for prior_observation, prior_action, terminal_feedback in self._history:
-            messages.append({"role": "user", "content": prior_observation})
-            if prior_action is not None:
-                messages.append({"role": "assistant", "content": prior_action})
-            if terminal_feedback is not None:
-                messages.append({"role": "user", "content": terminal_feedback})
-        messages.append({"role": "user", "content": observation_text})
+        deadline = (
+            None if self.context_size is None else time.monotonic() + self.timeout
+        )
+        if self.context_size is None:
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            for prior_observation, prior_action, terminal_feedback in self._history:
+                messages.append({"role": "user", "content": prior_observation})
+                if prior_action is not None:
+                    messages.append({"role": "assistant", "content": prior_action})
+                if terminal_feedback is not None:
+                    messages.append({"role": "user", "content": terminal_feedback})
+            messages.append({"role": "user", "content": observation_text})
+            evicted, estimated = 0, None
+        else:
+            preflight_started = time.perf_counter()
+            messages, evicted, estimated = self._fit_messages(
+                observation_text, deadline
+            )
+            preflight_seconds = time.perf_counter() - preflight_started
+        history_before = len(self._history)
         payload = {
             "model": self.model,
             "messages": messages,
@@ -366,7 +469,12 @@ class LocalChatAgent:
         )
         started = time.perf_counter()
         try:
-            with self._open(request, timeout=self.timeout) as response:
+            remaining = (
+                self.timeout if deadline is None else deadline - time.monotonic()
+            )
+            if deadline is not None and remaining <= 0:
+                raise TimeoutError("context budgeting exceeded the decision deadline")
+            with self._open(request, timeout=remaining) as response:
                 status = getattr(response, "status", None)
                 if status is None and hasattr(response, "getcode"):
                     status = response.getcode()
@@ -405,17 +513,38 @@ class LocalChatAgent:
             raise LocalChatError("assistant response content must be text")
         action = _parse_action(content, available)
         canonical_action = json.dumps(action, separators=(",", ":"))
-        if self.history_turns:
-            self._history.append((observation_text, canonical_action, None))
-            del self._history[: -self.history_turns]
         usage = envelope.get("usage", {})
         if not isinstance(usage, dict):
             usage = {}
+        actual = usage.get("prompt_tokens")
+        if self.context_size is not None:
+            if isinstance(actual, bool) or not isinstance(actual, int) or actual < 0:
+                raise LocalChatError("completion did not report valid prompt_tokens")
+            if abs(actual - estimated) > _CONTEXT_SAFETY_TOKENS:
+                raise LocalChatError("actual prompt usage drifted from token estimate")
+            if actual + self.max_tokens + _CONTEXT_SAFETY_TOKENS > self.context_size:
+                raise LocalChatError("actual prompt usage exceeded context_size")
+            del self._history[:evicted]
+        if self.history_turns:
+            self._history.append((observation_text, canonical_action, None))
+            del self._history[: -self.history_turns]
         telemetry = {
             "elapsed_seconds": latency,
             "token_usage": usage,
             "raw_assistant_response": content,
         }
+        if self.context_size is not None:
+            telemetry["context_budget"] = {
+                "context_size": self.context_size,
+                "safety_tokens": _CONTEXT_SAFETY_TOKENS,
+                "max_tokens": self.max_tokens,
+                "estimated_prompt_tokens": estimated,
+                "actual_prompt_tokens": actual,
+                "history_turns_kept": history_before - evicted,
+                "history_turns_evicted": evicted,
+                "preflight_seconds": preflight_seconds,
+                "total_decision_seconds": time.perf_counter() - decision_started,
+            }
         if "reasoning_content" in message:
             telemetry["reasoning_content"] = message["reasoning_content"]
         return {

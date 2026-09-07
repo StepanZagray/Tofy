@@ -4,6 +4,53 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Local model protocol passed; public reference hit context limit (2026-09-06)
+
+The repaired ae4bc401 nonthinking Qwen qualification passed all five strict
+non-ARC requests, including11163 prompt tokens, with37/37 layers on CUDA and
+7126MiB sampled peak. Logical/physical prompt batch1024/1024,context16384,F16
+KV; latency0.349–3.330s. The two-action native ar25 smoke also passed in3.963s.
+These are infrastructure checks; no gameplay promotion follows.
+
+The registered seed0 public suite then failed after74.414s: bp35's third
+request was17063 tokens, beyond the16384 context. Two bp35 actions executed;
+cd82 and seed1 did not run. Do not report a completed0/23 reference. The ar25
+prefix completed128 charged actions/0 resets,0/8 levels: every action was
+ACTION6(31,31), with128 exact last-frame noops. It consumed667640 prompt/2176
+completion tokens in64.889s including startup. This is a partial negative
+behavior observation within failed infrastructure evidence.
+
+The pretrained model has no optimizer updates, semantic note memory, search,
+tools or connected online CNN. Nonthinking mode and four-turn history limit
+reasoning. Token-budget repair alone is not expected to fix the fitting ar25
+loop. The independent CNN's procedural success is not a public controller gain.
+All22 reserved games remain untouched; there is no new ARC Best So Far result.
+
+Exact source `ae4bc4010c49f463ffc2403c32e9ef6da97952e2`, model SHA256
+`d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785`, server
+`a95769434fbc62e18b2128a0912f1839b33bcc316b0c2961a1589166047d620e`.
+The official May2025 artifact predates public preview, not a full corpus audit.
+Nonthinking sampler temperature0.7/top_p0.8/top_k20/min_p0,1024 output tokens.
+No training batch/accumulation applies. All processes stopped and trees verified.
+
+Evidence prep:
+`/home/stepan/Coding/Personal/.tofy-build/prepreview-public-reference-preparation-20260906T195436-CDT`;
+failed root `runs/reference-seed0-20260906T200915186188--0500`,
+driver manifest `c627113f83b8262e2399bd0f43bf7dbc409e3b164185572fa13ed5d83b50b1ae`;
+external file-tree digest SHA256
+`2ee425728bcfd59fc4efb7d88d68a538de87152e1b4d64609de7534f0841a190`.
+The earlier qualification manifest is
+`affec8291fc2a5017c3550e9c192f0491ab81b4a34f6175cab21d078b87c81bb`;
+native smoke outer manifest
+`40d550385bddfa50b2a00fd2581b7a7d24fd9f712d34f7959323e199f9969731`.
+The prep retains exact commands/configs, failure and exploratory behavior checks.
+
+Decision: exact token counting and oldest-whole-turn eviction, retaining all
+current pixels/animation frames, with a new dense non-ARC qualification and
+four-action bp35 smoke before fresh paired development runs. Preserve the old
+failure and treat context and policy repetition separately.
+[New registration](research/2026-09-06-prepreview-context-budget.md).
+
 ## Replay optimization passes local effect prerequisite (2026-09-06)
 
 All three fresh seeds pass the registered local procedural prerequisite with

@@ -66,6 +66,28 @@ class FakeOpen:
         return FakeResponse({"choices": [{"message": message}], "usage": self.usage})
 
 
+class FakeContextOpen(FakeOpen):
+    def __init__(
+        self, contents: list[str], token_counts: list[int], *, usage: object = None
+    ) -> None:
+        super().__init__(contents, usage=usage)
+        self.token_counts = iter(token_counts)
+
+    def __call__(self, request: object, *, timeout: float) -> FakeResponse:
+        self.calls.append((request, timeout))
+        payload = json.loads(request.data)
+        if request.full_url.endswith("/apply-template"):
+            return FakeResponse({"prompt": json.dumps(payload["messages"])})
+        if request.full_url.endswith("/tokenize"):
+            return FakeResponse({"tokens": [0] * next(self.token_counts)})
+        return FakeResponse(
+            {
+                "choices": [{"message": {"content": next(self.contents)}}],
+                "usage": self.usage,
+            }
+        )
+
+
 class LocalChatAgentTests(unittest.TestCase):
     def agent(
         self, contents: list[str], **kwargs: object
@@ -199,6 +221,131 @@ class LocalChatAgentTests(unittest.TestCase):
             ["system", "user"],
         )
 
+    def test_context_fit_preserves_exact_messages_when_no_eviction_needed(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080",
+            "local-model",
+            context_size=700,
+            max_tokens=100,
+        )
+        agent._session = ("game-secret", "session-a")
+        agent._history = [("prior observation", '{"action_id":1}', None)]
+        fake = FakeContextOpen(['{"action_id":1}'], [300], usage={"prompt_tokens": 300})
+        agent._open = fake
+
+        result = agent.choose_action(observation())
+
+        applied = json.loads(fake.calls[0][0].data)
+        tokenized = json.loads(fake.calls[1][0].data)
+        completion = json.loads(fake.calls[2][0].data)
+        self.assertEqual(applied["messages"], completion["messages"])
+        unbudgeted, unbudgeted_open = self.agent(['{"action_id":1}'], max_tokens=100)
+        unbudgeted._session = ("game-secret", "session-a")
+        unbudgeted._history = [("prior observation", '{"action_id":1}', None)]
+        unbudgeted.choose_action(observation())
+        self.assertEqual(fake.calls[2][0].data, unbudgeted_open.calls[0][0].data)
+        self.assertEqual(
+            tokenized,
+            {
+                "content": json.dumps(applied["messages"]),
+                "add_special": False,
+                "parse_special": True,
+            },
+        )
+        context_budget = result["telemetry"]["context_budget"]
+        preflight_seconds = context_budget.pop("preflight_seconds")
+        total_decision_seconds = context_budget.pop("total_decision_seconds")
+        self.assertGreaterEqual(preflight_seconds, 0)
+        self.assertGreaterEqual(total_decision_seconds, preflight_seconds)
+        self.assertEqual(
+            context_budget,
+            {
+                "context_size": 700,
+                "safety_tokens": 128,
+                "max_tokens": 100,
+                "estimated_prompt_tokens": 300,
+                "actual_prompt_tokens": 300,
+                "history_turns_kept": 1,
+                "history_turns_evicted": 0,
+            },
+        )
+
+    def test_context_evicts_oldest_whole_turn_and_keeps_terminal_group(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080", "model", context_size=600, max_tokens=100
+        )
+        agent._session = ("game-secret", "session-a")
+        agent._history = [
+            ("old observation", '{"action_id":1}', "old terminal"),
+            ("kept observation", '{"action_id":5}', "kept terminal"),
+        ]
+        fake = FakeContextOpen(
+            ['{"action_id":1}'], [800, 300], usage={"prompt_tokens": 300}
+        )
+        agent._open = fake
+
+        result = agent.choose_action(observation())
+
+        completion = json.loads(fake.calls[-1][0].data)
+        contents = [item["content"] for item in completion["messages"]]
+        self.assertNotIn("old observation", contents)
+        self.assertNotIn("old terminal", contents)
+        self.assertIn("kept observation", contents)
+        self.assertIn('{"action_id":5}', contents)
+        self.assertIn("kept terminal", contents)
+        self.assertEqual(agent._history[0][2], "kept terminal")
+        self.assertEqual(result["telemetry"]["context_budget"]["history_turns_kept"], 1)
+        self.assertEqual(
+            result["telemetry"]["context_budget"]["history_turns_evicted"], 1
+        )
+
+    def test_context_rejects_oversized_current_and_malformed_tokens(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080", "model", context_size=600, max_tokens=100
+        )
+        too_large = FakeContextOpen(['{"action_id":1}'], [400])
+        agent._open = too_large
+        with self.assertRaisesRegex(LocalChatError, "current lossless observation"):
+            agent.choose_action(observation())
+        self.assertEqual(len(too_large.calls), 2)
+
+        malformed_tokens: object = "not-an-array"
+
+        def malformed(request: object, *, timeout: float) -> FakeResponse:
+            if request.full_url.endswith("/apply-template"):
+                return FakeResponse({"prompt": "rendered"})
+            return FakeResponse({"tokens": malformed_tokens})
+
+        for malformed_tokens in ("not-an-array", [1, True], [1, -1], [1, "2"]):
+            agent._open = malformed
+            with (
+                self.subTest(malformed_tokens=malformed_tokens),
+                self.assertRaisesRegex(LocalChatError, "token ID list"),
+            ):
+                agent.choose_action(observation())
+
+    def test_context_rejects_actual_usage_over_capacity(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080", "model", context_size=600, max_tokens=100
+        )
+        agent._open = FakeContextOpen(
+            ['{"action_id":1}'], [300], usage={"prompt_tokens": 400}
+        )
+        with self.assertRaisesRegex(LocalChatError, "actual prompt usage"):
+            agent.choose_action(observation())
+        self.assertEqual(agent._history, [])
+
+    def test_context_rejects_estimate_drift_even_when_actual_usage_fits(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080", "model", context_size=1000, max_tokens=100
+        )
+        agent._open = FakeContextOpen(
+            ['{"action_id":1}'], [300], usage={"prompt_tokens": 500}
+        )
+        with self.assertRaisesRegex(LocalChatError, "drifted"):
+            agent.choose_action(observation())
+        self.assertEqual(agent._history, [])
+
     def test_raw_hex_remains_the_exact_default_observation_format(self) -> None:
         default_agent, default_open = self.agent(['{"action_id":1}'])
         explicit_agent, explicit_open = self.agent(
@@ -286,6 +433,7 @@ class LocalChatAgentTests(unittest.TestCase):
             validate_config(config(reasoning_mode=reasoning_mode))
         for server_log_verbosity in (0, 5):
             validate_config(config(server_log_verbosity=server_log_verbosity))
+        validate_config(config(context_size=16384))
         validate_config(
             config(
                 sampling={
@@ -304,6 +452,9 @@ class LocalChatAgentTests(unittest.TestCase):
         for server_log_verbosity in (-1, 6, True, "5"):
             with self.assertRaisesRegex(DriverError, "server_log_verbosity"):
                 validate_config(config(server_log_verbosity=server_log_verbosity))
+        for context_size in (0, True, 1.5):
+            with self.assertRaisesRegex(DriverError, "context_size"):
+                validate_config(config(context_size=context_size))
         with self.assertRaisesRegex(DriverError, "sampling.top_p"):
             validate_config(config(sampling={"top_p": 0}))
 

@@ -144,6 +144,13 @@ def validate_config(config: dict[str, Any]) -> None:
                 validate_sampling(agent["sampling"])
             except (TypeError, ValueError) as exc:
                 raise DriverError(f"agent.{exc}") from exc
+        context_size = agent.get("context_size", 32768)
+        if (
+            isinstance(context_size, bool)
+            or not isinstance(context_size, int)
+            or context_size <= 0
+        ):
+            raise DriverError("agent.context_size must be a positive integer")
     if agent.get("seed", config["seed"]) != config["seed"]:
         raise DriverError("this screen uses one explicit environment/model seed")
     if config.get("expected_screen_contract_sha256") != screen_contract(config):
@@ -291,6 +298,7 @@ class ManagedChatAgent:
                 history_turns=config.get("history_turns", 4),
                 frame_format=config.get("frame_format", "raw_hex"),
                 sampling=config.get("sampling"),
+                context_size=config.get("context_size", 32768),
             )
         except BaseException:
             self.close()
