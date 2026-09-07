@@ -205,9 +205,11 @@ impl LoopedAgent {
         }
         let state = rms_norm(&state)?;
 
-        let readout = state.narrow(1, 0, 1)?.squeeze(1)?;
+        // Narrowing leaves gaps between batches; CUDA linear readouts require
+        // packed rows even though the batch-one layout appears contiguous.
+        let readout = state.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
         let current_start = 1 + TOKENS - PATCH_COUNT;
-        let current_patches = state.narrow(1, current_start, PATCH_COUNT)?;
+        let current_patches = state.narrow(1, current_start, PATCH_COUNT)?.contiguous()?;
         let mut next_by_action = Vec::with_capacity(ACTIONS);
         for head in &self.next_heads {
             next_by_action.push(head.forward(&current_patches)?.reshape((
@@ -343,6 +345,35 @@ mod tests {
             output.next_logits.dims(),
             &[1, ACTIONS, PATCH_COUNT, PATCH_PIXELS, PALETTE]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn batched_readouts_match_separate_rows() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = model(&device)?;
+        let (patches, metadata) = inputs(&device)?;
+        let other = Tensor::ones((1, TOKENS, PATCH_PIXELS), DType::U32, &device)?;
+        let batch = model.forward(
+            &Tensor::cat(&[&patches, &other], 0)?,
+            &Tensor::cat(&[&metadata, &metadata], 0)?,
+            2,
+        )?;
+        for (i, input) in [&patches, &other].into_iter().enumerate() {
+            let single = model.forward(input, &metadata, 2)?;
+            for (joined, separate) in [
+                (&batch.policy_logits, &single.policy_logits),
+                (&batch.next_logits, &single.next_logits),
+            ] {
+                let error = joined
+                    .narrow(0, i, 1)?
+                    .sub(separate)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?;
+                assert!(error < 1e-4, "batched prediction differs: {error}");
+            }
+        }
         Ok(())
     }
 
