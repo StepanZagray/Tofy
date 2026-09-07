@@ -116,6 +116,7 @@ def validate_config(config: dict[str, Any]) -> None:
             "reasoning_mode",
             "server_log_verbosity",
             "sampling",
+            "factual_transition_ledger",
         }
     if set(agent) - allowed:
         raise DriverError(f"unsupported agent fields: {sorted(set(agent) - allowed)}")
@@ -144,6 +145,9 @@ def validate_config(config: dict[str, Any]) -> None:
                 validate_sampling(agent["sampling"])
             except (TypeError, ValueError) as exc:
                 raise DriverError(f"agent.{exc}") from exc
+        factual_transition_ledger = agent.get("factual_transition_ledger", False)
+        if not isinstance(factual_transition_ledger, bool):
+            raise DriverError("agent.factual_transition_ledger must be a boolean")
         context_size = agent.get("context_size", 32768)
         if (
             isinstance(context_size, bool)
@@ -299,6 +303,9 @@ class ManagedChatAgent:
                 frame_format=config.get("frame_format", "raw_hex"),
                 sampling=config.get("sampling"),
                 context_size=config.get("context_size", 32768),
+                factual_transition_ledger=config.get(
+                    "factual_transition_ledger", False
+                ),
             )
         except BaseException:
             self.close()

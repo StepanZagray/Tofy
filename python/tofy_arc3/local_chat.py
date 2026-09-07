@@ -8,7 +8,9 @@ import json
 import math
 import re
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -19,13 +21,20 @@ from urllib.request import (
     build_opener,
 )
 
-from .frame_memory import PALETTE, encode_frame, summarize_components
+from .frame_memory import (
+    PALETTE,
+    Frame,
+    encode_frame,
+    summarize_components,
+    summarize_frame_change,
+)
 
 _MAX_RESPONSE_BYTES = 1 << 20
 _FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
 _FRAME_FORMATS = {"raw_hex", "compact"}
 _SAMPLING_FIELDS = {"temperature", "top_p", "top_k", "min_p"}
 _CONTEXT_SAFETY_TOKENS = 128
+_TRANSITION_LEDGER_ROWS = 8
 
 SYSTEM_PROMPT = """You are an ARC-AGI-3 game-playing policy. Infer the visible game's rules and goal only from the observation sequence and the results of prior actions. Aim to make progress and reach WIN while using actions efficiently. The board is provided as lossless text; you have no vision, code-execution, external-data, or game-source tools.
 
@@ -36,6 +45,20 @@ Choose one listed available action. Reply with exactly one JSON object. For ACTI
 
 class LocalChatError(RuntimeError):
     """The local endpoint or its assistant response violated the contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TransitionBefore:
+    last_frame: Frame
+    levels_completed: int
+    frame_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTransition:
+    session: tuple[str, str]
+    action: str
+    before: _TransitionBefore
 
 
 def validate_sampling(sampling: object) -> dict[str, int | float]:
@@ -304,6 +327,7 @@ class LocalChatAgent:
         frame_format: str = "raw_hex",
         sampling: object | None = None,
         context_size: int | None = None,
+        factual_transition_ledger: bool = False,
     ) -> None:
         self.endpoint = _completion_url(endpoint)
         if not isinstance(model, str) or not model:
@@ -330,11 +354,80 @@ class LocalChatAgent:
         )
         if self.context_size == 0:
             raise ValueError("context_size must be positive")
+        if not isinstance(factual_transition_ledger, bool):
+            raise TypeError("factual_transition_ledger must be a boolean")
+        self.factual_transition_ledger = factual_transition_ledger
         self._history: list[tuple[str, str | None, str | None]] = []
         self._session: tuple[str, str] | None = None
+        self._transitions: deque[str] = deque(maxlen=_TRANSITION_LEDGER_ROWS)
+        self._pending_transition: _PendingTransition | None = None
         self._open: Callable[..., Any] = build_opener(
             ProxyHandler({}), _NoRedirect()
         ).open
+
+    def _clear_transition_ledger(self) -> None:
+        self._transitions.clear()
+        self._pending_transition = None
+
+    def _advance_session(
+        self, session: tuple[str, str], observation: dict[str, Any]
+    ) -> None:
+        if session != self._session:
+            self._history.clear()
+            self._clear_transition_ledger()
+            self._session = session
+        elif self.factual_transition_ledger and observation["full_reset"]:
+            self._clear_transition_ledger()
+
+    def _fold_pending_transition(
+        self, session: tuple[str, str], observation: dict[str, Any]
+    ) -> None:
+        if not self.factual_transition_ledger or self._pending_transition is None:
+            return
+        pending = self._pending_transition
+        if pending.session != session:
+            self._pending_transition = None
+            return
+        frames = observation["frame"]
+        change = summarize_frame_change(pending.before.last_frame, frames[-1])
+        outcome = {
+            "last_frame_changed_pixel_count": change.changed_pixel_count,
+            "last_frame_changed_bbox": change.bbox,
+            "state_after": observation["state"],
+            "levels_completed_delta": (
+                observation["levels_completed"] - pending.before.levels_completed
+            ),
+            "full_reset_after": observation["full_reset"],
+            "frame_count_before": pending.before.frame_count,
+            "frame_count_after": len(frames),
+        }
+        self._transitions.append(
+            f'{{"action":{pending.action},"outcome":'
+            + json.dumps(outcome, separators=(",", ":"))
+            + "}"
+        )
+        self._pending_transition = None
+
+    def _current_observation(self, observation_text: str) -> str:
+        if not self.factual_transition_ledger or not self._transitions:
+            return observation_text
+        return (
+            observation_text
+            + "\n\nExperienced factual transition ledger (oldest to newest):\n"
+            + "\n".join(self._transitions)
+        )
+
+    def _transition_before(
+        self, observation: dict[str, Any]
+    ) -> _TransitionBefore | None:
+        if not self.factual_transition_ledger:
+            return None
+        frames = observation["frame"]
+        return _TransitionBefore(
+            last_frame=tuple(tuple(row) for row in frames[-1]),
+            levels_completed=observation["levels_completed"],
+            frame_count=len(frames),
+        )
 
     def _budget_request(
         self, path: str, payload: dict[str, Any], deadline: float
@@ -426,9 +519,11 @@ class LocalChatAgent:
         )
         if state != "NOT_FINISHED":
             raise ValueError("choose_action requires a NOT_FINISHED observation")
-        if session != self._session:
-            self._history.clear()
-            self._session = session
+        self._advance_session(session, observation)
+        if not observation["full_reset"]:
+            self._fold_pending_transition(session, observation)
+        current_observation = self._current_observation(observation_text)
+        transition_before = self._transition_before(observation)
 
         deadline = (
             None if self.context_size is None else time.monotonic() + self.timeout
@@ -441,12 +536,12 @@ class LocalChatAgent:
                     messages.append({"role": "assistant", "content": prior_action})
                 if terminal_feedback is not None:
                     messages.append({"role": "user", "content": terminal_feedback})
-            messages.append({"role": "user", "content": observation_text})
+            messages.append({"role": "user", "content": current_observation})
             evicted, estimated = 0, None
         else:
             preflight_started = time.perf_counter()
             messages, evicted, estimated = self._fit_messages(
-                observation_text, deadline
+                current_observation, deadline
             )
             preflight_seconds = time.perf_counter() - preflight_started
         history_before = len(self._history)
@@ -528,6 +623,12 @@ class LocalChatAgent:
         if self.history_turns:
             self._history.append((observation_text, canonical_action, None))
             del self._history[: -self.history_turns]
+        if transition_before is not None:
+            self._pending_transition = _PendingTransition(
+                session=session,
+                action=canonical_action,
+                before=transition_before,
+            )
         telemetry = {
             "elapsed_seconds": latency,
             "token_usage": usage,
@@ -561,9 +662,9 @@ class LocalChatAgent:
         )
         if state not in {"WIN", "GAME_OVER"}:
             raise ValueError("observe_terminal requires a terminal observation")
-        if session != self._session:
-            self._history.clear()
-            self._session = session
+        self._advance_session(session, observation)
+        if not observation["full_reset"]:
+            self._fold_pending_transition(session, observation)
         if self.history_turns:
             if self._history and self._history[-1][1] is not None:
                 prior_observation, prior_action, _ = self._history[-1]
