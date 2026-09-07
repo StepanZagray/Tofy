@@ -4,6 +4,19 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Historical public exposure boundary (2026-09-06)
+
+The August 27 live report evaluated all 25 exact version IDs in the current
+public population, in identical order. Its SHA-256 is
+`85f995803ff96f7867b51dc998c41ee7340862118b1f5de9a30c983a5ba4ef9b`.
+It records frozen-weight evaluation with per-game factual memory; start/end
+weight equality is unverified because no post-evaluation model hash was retained,
+and there is no evidence of gradient fitting. The 22 games omitted from this
+campaign's three-game reference were only reserved from new campaign runs.
+Full-public results on this population are repeated public evaluation. This
+corrects the scope of reserved/untouched wording below and does not permit public
+pretraining.
+
 ## Grounding passes; factual effect summaries fail (2026-09-06)
 
 The completed nonthinking readout at `1c8c9f426cc015d2dd346f3c990328dc5e11f104`
@@ -49,7 +62,8 @@ needed 125 history evictions per seed and usually retained only one prior turn;
 its changing pixels were not evidence of useful board effects. This frozen
 nonthinking policy had no online updates, note memory, planner, tools or connected
 CNN. The independent CNN's procedural training success is not a public gain.
-All 22 reserved games remain untouched; no Best So Far metric improves.
+The other 22 games were not newly run in this campaign, but all 25 current
+versions were already prior-evaluation-exposed; no Best So Far metric improves.
 
 The model/server/config are the pinned identities below, with 16K F16 context,
 37/37 CUDA layers and prompt/physical batch 1024/1024. Inference has no optimizer
@@ -93,7 +107,8 @@ The pretrained model has no optimizer updates, semantic note memory, search,
 tools or connected online CNN. Nonthinking mode and four-turn history limit
 reasoning. Token-budget repair alone is not expected to fix the fitting ar25
 loop. The independent CNN's procedural success is not a public controller gain.
-All22 reserved games remain untouched; there is no new ARC Best So Far result.
+The other 22 games had not been newly run in this campaign at this stage, but
+were already prior-evaluation-exposed; there is no new ARC Best So Far result.
 
 Exact source `ae4bc4010c49f463ffc2403c32e9ef6da97952e2`, model SHA256
 `d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785`, server
@@ -173,7 +188,8 @@ do not call the synthetic result ARC readiness or claim arbitrary game effects
 are covered. The independent prepreview LM protocol/development route continues.
 No ARC Best So Far metric changes. Next falsifier: measure the learned change
 signal on factual public-development experience only after registering its
-controller role, budgets and controls; keep22 reserved games untouched.
+controller role, budgets and controls; keep the other 22 out of new campaign
+runs until that registration, while labeling them prior-evaluation-exposed.
 
 [Registration](research/2026-09-06-effect-optimization-screen.md).
 Exact commands, run roots and external digests are indexed by
@@ -332,7 +348,8 @@ full-frame graph still distinguishes status/counter changes. It made **zero
 model evaluations**, verified in every action trace: G is loaded by the bridge
 but does not choose these actions. No training or online adaptation occurred.
 The graph observation/action summaries were identical across seeds; these are
-not independent stochastic replications. The other22 public games remain reserved.
+not independent stochastic replications. The other 22 public games were not
+newly run in this campaign, but all 25 current versions are prior-exposed.
 
 The confirmed-transition fix records terminal/final edges before lifecycle
 clearing;13 focused Rust tests pass. The random reference and existing runner
