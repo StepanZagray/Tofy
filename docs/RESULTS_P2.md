@@ -17,6 +17,43 @@ Full-public results on this population are repeated public evaluation. This
 corrects the scope of reserved/untouched wording below and does not permit public
 pretraining.
 
+## Short thinking fails the raw-history readout gate (2026-09-06)
+
+The completed 144-request comparison at `d85d837c2ebfef88621297271edc2456cb9dc25c`
+changed effect attribution from 14/24 to 17/24 on seed 0 and from 12/24 to 11/24
+on seed 1. Thinking required >=21/24 and >=3/24 gain on each seed; it fails.
+Grounding passed: off 12/12 on both seeds, on 11/12 and 12/12 exact centroids.
+This supports no public thinking launch or Best So Far improvement.
+
+Fresh layout seed 2060907; only server reasoning off/on changed, with the existing
+256-token thinking budget. The proposed summary arm was removed before inference.
+Every paired completion request was identical; all 144 strict responses finished
+normally, all 72 thinking responses contained reasoning, prompt counts were exact
+and no history was evicted. Whole-tree/external-digest checks, literal oracle
+rescoring and all eleven owned process IDs passed independent verification.
+
+Same pinned Qwen3-8B Q4_K_M/server/core as the reference; 37/37 CUDA layers,
+16K F16 KV and prompt/physical batch 1024/1024, no optimizer accumulation. Total
+149,540 prompt/21,056 completion tokens and 535.096 seconds summed decision time;
+sampled peak 7,126/8,151 MiB. Actual decoding compute was not matched. No public
+data or weight updates were used; fixed synthetic instructed tasks and a short
+thinking budget cannot establish unrestricted reasoning or hidden-goal ability.
+
+Exact launch:
+
+```bash
+cd /home/stepan/Coding/Personal/.tofy-build/thinking-readout-preparation-20260906T2126-CDT
+PYTHONDONTWRITEBYTECODE=1 /home/stepan/Coding/Personal/.tofy-build/arcagi-0.9.9-venv/bin/python run_thinking_readout.py --checkout /home/stepan/Coding/Personal/.tofy-build/thinking-readout --revision d85d837c2ebfef88621297271edc2456cb9dc25c
+```
+
+Run `runs/thinking-readout-20260906T215343510535-0500-pid373838`, manifest
+`6675e3652f79b3104b363491dd545304fb6a02c00c9d103d870cc5c3655343df`.
+The separate abbreviated-revision attempt stopped before GPU work and is excluded
+failed infrastructure. Decision: reject this setting and test an exact factual
+action/outcome ledger inside the current observation, holding nonthinking and raw
+history fixed on fresh layouts. The ledger has no learned goal/value objective;
+the separately trained CNN still has no connected public controller.
+
 ## Grounding passes; factual effect summaries fail (2026-09-06)
 
 The completed nonthinking readout at `1c8c9f426cc015d2dd346f3c990328dc5e11f104`
