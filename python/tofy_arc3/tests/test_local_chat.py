@@ -7,6 +7,7 @@ import unittest
 from typing import Self
 from urllib.error import URLError
 
+from tofy_arc3.frame_memory import encode_frame
 from tofy_arc3.local_chat import SYSTEM_PROMPT, LocalChatAgent, LocalChatError
 
 
@@ -136,6 +137,92 @@ class LocalChatAgentTests(unittest.TestCase):
             [message["role"] for message in reset_payload["messages"]],
             ["system", "user"],
         )
+
+    def test_raw_hex_remains_the_exact_default_observation_format(self) -> None:
+        default_agent, default_open = self.agent(['{"action_id":1}'])
+        explicit_agent, explicit_open = self.agent(
+            ['{"action_id":1}'], frame_format="raw_hex"
+        )
+        current = observation(2)
+        default_agent.choose_action(current)
+        explicit_agent.choose_action(current)
+
+        self.assertEqual(default_open.calls[0][0].data, explicit_open.calls[0][0].data)
+        payload = json.loads(default_open.calls[0][0].data)
+        expected_observation = (
+            "Visible observation:\n"
+            "state=NOT_FINISHED\n"
+            "levels_completed=2\n"
+            "win_levels=3\n"
+            "full_reset=false\n"
+            "available_actions=[1,5,6]\n"
+            "Each frame row is 64 lossless hexadecimal palette symbols (0-F); x is the "
+            "column and y is the row.\n"
+            "layer 0:\n" + "\n".join(["2" * 64] * 64)
+        )
+        self.assertEqual(payload["messages"][-1]["content"], expected_observation)
+
+    def test_compact_format_retains_all_layers_and_bottom_row(self) -> None:
+        current = observation()
+        first = [[0 for _ in range(64)] for _ in range(64)]
+        first[63] = list(range(16)) * 4
+        second = [[(x + y) % 2 for x in range(64)] for y in range(64)]
+        current["frame"] = [first, second]
+        agent, fake = self.agent(['{"action_id":1}'], frame_format="compact")
+
+        agent.choose_action(current)
+        prompt = json.loads(fake.calls[0][0].data)["messages"][-1]["content"]
+
+        self.assertIn(f"layer 0 compact:\n{encode_frame(first)}\n", prompt)
+        self.assertIn(f"layer 1 compact:\n{encode_frame(second)}\n", prompt)
+        self.assertIn("Pn:<row> repeats a raw row n times", prompt)
+        self.assertIn("Rn:<runs> repeats an RLE row n times", prompt)
+        self.assertIn("components layer 0:", prompt)
+        self.assertIn("components layer 1: total=4096 shown=32 truncated=4064", prompt)
+        self.assertNotIn("game-secret", prompt)
+        self.assertNotIn("session-a", prompt)
+
+    def test_rejects_invalid_frame_format(self) -> None:
+        for frame_format in ("raw", "compact ", "", None, []):
+            with (
+                self.subTest(frame_format=frame_format),
+                self.assertRaisesRegex(ValueError, "frame_format"),
+            ):
+                LocalChatAgent(
+                    "http://127.0.0.1:8080", "model", frame_format=frame_format
+                )
+
+    def test_baseline_config_accepts_compact_and_preserves_raw_default(self) -> None:
+        from tofy_arc3.run_baseline import (
+            DriverError,
+            screen_contract,
+            validate_config,
+        )
+
+        def config(frame_format: object = None) -> dict:
+            agent = {"kind": "local_chat", "seed": 0}
+            if frame_format is not None:
+                agent["frame_format"] = frame_format
+            value = {
+                "games": ["ab12-01234567"],
+                "evidence_class": "implementation_smoke",
+                "seed": 0,
+                "max_level_retries": 0,
+                "max_actions_per_game": 1,
+                "max_actions_per_level": 1,
+                "max_seconds_per_game": 1,
+                "max_seconds_total": 1,
+                "decision_timeout": 1,
+                "limitations": ["configuration validation fixture"],
+                "agent": agent,
+            }
+            value["expected_screen_contract_sha256"] = screen_contract(value)
+            return value
+
+        validate_config(config())
+        validate_config(config("compact"))
+        with self.assertRaisesRegex(DriverError, "frame_format"):
+            validate_config(config("raw"))
 
     def test_terminal_observation_is_retained_without_http(self) -> None:
         agent, fake = self.agent(

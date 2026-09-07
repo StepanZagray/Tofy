@@ -11,7 +11,7 @@ use rand_chacha::ChaCha8Rng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -34,6 +34,8 @@ const COMPARATOR_ID: &str = "constant-action5-input-same-seed-stream-v1";
 const COPY_ZERO_ID: &str = "fixed-copy-zero-change-map-v1";
 const ORACLE_ID: &str = "factual-change-map-oracle-v1";
 const INITIAL_PROBE_ID: &str = "held-out-true-actions-before-training-v1";
+const HELD_OUT_PREDICTIONS_ID: &str = "online-effect-held-out-predictions-v1";
+const HELD_OUT_PREDICTIONS_FILE: &str = "held-out-predictions.jsonl";
 const EMBEDDED_SOURCE_REVISION: &str = env!("TOFY_EMBEDDED_SOURCE_REVISION");
 const EMBEDDED_SOURCE_DIRTY: &str = env!("TOFY_EMBEDDED_SOURCE_DIRTY");
 const EMBEDDED_SOURCE_PUSHED: &str = env!("TOFY_EMBEDDED_SOURCE_PUSHED");
@@ -95,6 +97,10 @@ struct Args {
     /// Run a two-update, two-frame implementation fixture.
     #[arg(long)]
     smoke: bool,
+
+    /// Save raw held-out predictions and factual changed-pixel indices as JSONL.
+    #[arg(long)]
+    save_heldout_predictions: bool,
 
     /// Hard wall-clock bound for generation, training, and evaluation.
     #[arg(long, default_value_t = 300)]
@@ -221,6 +227,8 @@ fn main() -> Result<()> {
                 "model_seed": args.seed,
                 "data_seed": args.data_seed,
                 "arm": args.arm.as_str(),
+                "save_heldout_predictions": args.save_heldout_predictions,
+                "held_out_predictions_artifact_identity": HELD_OUT_PREDICTIONS_ID,
                 "provenance": provenance,
             });
             write_json(&args.output_dir.join("report.json"), &report)
@@ -271,6 +279,8 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         "training_steps": steps,
         "held_out_frames": held_out_frames,
         "held_out_action_tuples": held_out_frames * 7,
+        "save_heldout_predictions": args.save_heldout_predictions,
+        "held_out_predictions_artifact": held_out_artifact_declaration(args),
         "model": {
             "hidden_channels": HIDDEN_CHANNELS,
             "replay_capacity": REPLAY_CAPACITY,
@@ -358,12 +368,55 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         updates.flush()?;
     }
 
-    let mut evaluation = evaluate(&learner, &data.held_out, args.arm, started, deadline)?;
+    let predictions_path = args.output_dir.join(HELD_OUT_PREDICTIONS_FILE);
+    let mut predictions_writer = args
+        .save_heldout_predictions
+        .then(|| {
+            File::create(&predictions_path)
+                .map(BufWriter::new)
+                .with_context(|| {
+                    format!(
+                        "create held-out prediction artifact {}",
+                        predictions_path.display()
+                    )
+                })
+        })
+        .transpose()?;
+    let capture = predictions_writer
+        .as_mut()
+        .map(|writer| writer as &mut dyn Write);
+    let mut evaluation = evaluate(
+        &learner,
+        &data.held_out,
+        args.arm,
+        started,
+        deadline,
+        capture,
+    )?;
+    if let Some(writer) = predictions_writer.as_mut() {
+        writer
+            .flush()
+            .context("flush held-out prediction artifact")?;
+    }
+    drop(predictions_writer);
+    let predictions_artifact = if args.save_heldout_predictions {
+        json!({
+            "identity": HELD_OUT_PREDICTIONS_ID,
+            "path": HELD_OUT_PREDICTIONS_FILE,
+            "enabled": true,
+            "rows": data.held_out.len() * 7,
+            "sha256": file_sha256(&predictions_path)?,
+            "input_arm_identity": input_arm_identity(args.arm),
+        })
+    } else {
+        held_out_artifact_declaration(args)
+    };
     let oracle = evaluate_with_predictor(
         &data.held_out,
         Arm::Conditioned,
         started,
         deadline,
+        None,
         oracle_predictions,
     )?;
     let copy_zero = evaluate_with_predictor(
@@ -371,6 +424,7 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         Arm::Conditioned,
         started,
         deadline,
+        None,
         |_, actions| Ok(copy_zero_predictions(actions)),
     )?;
     let held_out_object = evaluation
@@ -418,6 +472,8 @@ fn run(args: &Args, exact_args: &[String], provenance: &Value, started: Instant)
         "initial_prediction_probe_uses_true_actions": true,
         "final_prediction_sha256": evaluation.prediction_sha256,
         "training_model_input_actually_replaced_tuples": training_replaced_tuples,
+        "save_heldout_predictions": args.save_heldout_predictions,
+        "held_out_predictions_artifact": predictions_artifact,
         "prequential": {
             "balanced_bce_mean": prequential_bce_sum / steps as f64,
             "confusion": confusion_json(&prequential),
@@ -578,6 +634,22 @@ fn model_action(arm: Arm, actual: &ArcAction) -> Result<ArcAction> {
     }
 }
 
+fn input_arm_identity(arm: Arm) -> &'static str {
+    match arm {
+        Arm::Conditioned => "actual-action-tuple-v1",
+        Arm::Constant => COMPARATOR_ID,
+    }
+}
+
+fn held_out_artifact_declaration(args: &Args) -> Value {
+    json!({
+        "identity": HELD_OUT_PREDICTIONS_ID,
+        "path": HELD_OUT_PREDICTIONS_FILE,
+        "enabled": args.save_heldout_predictions,
+        "input_arm_identity": input_arm_identity(args.arm),
+    })
+}
+
 fn prediction_fingerprint(
     learner: &OnlineEffectLearner,
     held_out: &[HeldOutFrame],
@@ -606,10 +678,16 @@ fn evaluate(
     arm: Arm,
     started: Instant,
     deadline: Duration,
+    capture: Option<&mut dyn Write>,
 ) -> Result<Evaluation> {
-    evaluate_with_predictor(held_out, arm, started, deadline, |frame, actions| {
-        learner.predict_batch(&frame.current, actions)
-    })
+    evaluate_with_predictor(
+        held_out,
+        arm,
+        started,
+        deadline,
+        capture,
+        |frame, actions| learner.predict_batch(&frame.current, actions),
+    )
 }
 
 fn evaluate_with_predictor<F>(
@@ -617,6 +695,7 @@ fn evaluate_with_predictor<F>(
     arm: Arm,
     started: Instant,
     deadline: Duration,
+    mut capture: Option<&mut dyn Write>,
     mut predictor: F,
 ) -> Result<Evaluation>
 where
@@ -640,7 +719,7 @@ where
     let mut fingerprint = Sha256::new();
     fingerprint.update(b"online-effect-predictions-v1");
 
-    for frame in held_out {
+    for (frame_index, frame) in held_out.iter().enumerate() {
         check_deadline(started, deadline, "held-out evaluation")?;
         let actions = frame
             .outcomes
@@ -653,6 +732,9 @@ where
             "held-out prediction count mismatch"
         );
         hash_predictions(&mut fingerprint, &predictions)?;
+        if let Some(writer) = capture.as_deref_mut() {
+            write_prediction_rows(writer, frame_index, frame, &actions, &predictions, arm)?;
+        }
 
         let mut changed_scores = Vec::new();
         let mut noop_scores = Vec::new();
@@ -797,10 +879,7 @@ where
             .enumerate()
             .map(|(index, evaluation)| action_evaluation_json((index + 1) as u8, evaluation))
             .collect::<Vec<_>>(),
-        "input_arm_identity": match arm {
-            Arm::Conditioned => "actual-action-tuple-v1",
-            Arm::Constant => COMPARATOR_ID,
-        },
+        "input_arm_identity": input_arm_identity(arm),
         "action_independent_comparator_identity": COMPARATOR_ID,
     });
     ensure_finite_json(&value)?;
@@ -808,6 +887,75 @@ where
         value,
         prediction_sha256: hex_digest(fingerprint.finalize()),
     })
+}
+
+fn write_prediction_rows(
+    writer: &mut dyn Write,
+    frame_index: usize,
+    frame: &HeldOutFrame,
+    input_actions: &[ArcAction],
+    predictions: &[ChangePrediction],
+    arm: Arm,
+) -> Result<()> {
+    ensure!(
+        frame.outcomes.len() == input_actions.len() && input_actions.len() == predictions.len(),
+        "capture tuple count mismatch"
+    );
+    let input_frame_sha256 = frame_fingerprint(&frame.current);
+    for (tuple_index, ((outcome, input_action), prediction)) in frame
+        .outcomes
+        .iter()
+        .zip(input_actions)
+        .zip(predictions)
+        .enumerate()
+    {
+        ensure!(
+            prediction.action == *input_action,
+            "captured prediction action does not match model input action"
+        );
+        ensure!(
+            prediction.probabilities.len() == FRAME_PIXELS
+                && prediction
+                    .probabilities
+                    .iter()
+                    .all(|value| value.is_finite()),
+            "captured probabilities must contain {FRAME_PIXELS} finite values"
+        );
+        let actual_changed_pixel_indices = outcome
+            .current
+            .pixels
+            .iter()
+            .zip(outcome.next.pixels.iter())
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect::<Vec<_>>();
+        let row = json!({
+            "schema": HELD_OUT_PREDICTIONS_ID,
+            "frame_index": frame_index,
+            "tuple_index": tuple_index,
+            "input_frame_sha256": input_frame_sha256,
+            "actual_action": action_json(&outcome.action),
+            "model_input_action": action_json(input_action),
+            "model_input_actually_replaced": input_action != &outcome.action,
+            "model_input_identity": input_arm_identity(arm),
+            "actual_changed_pixel_indices": actual_changed_pixel_indices,
+            "probabilities": prediction.probabilities,
+        });
+        serde_json::to_writer(&mut *writer, &row).context("write held-out prediction row")?;
+        writer
+            .write_all(b"\n")
+            .context("terminate held-out prediction row")?;
+    }
+    Ok(())
+}
+
+fn frame_fingerprint(frame: &ArcFrame) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"online-effect-input-frame-v1");
+    hasher.update(frame.width.to_le_bytes());
+    hasher.update(frame.height.to_le_bytes());
+    hasher.update(frame.pixels.as_ref());
+    hex_digest(hasher.finalize())
 }
 
 fn oracle_predictions(
@@ -1040,6 +1188,24 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut reader = BufReader::new(
+        File::open(path).with_context(|| format!("open artifact {}", path.display()))?,
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("read artifact {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize()))
+}
+
 fn ensure_finite_json(value: &Value) -> Result<()> {
     match value {
         Value::Array(values) => {
@@ -1249,6 +1415,7 @@ mod tests {
             Arm::Conditioned,
             Instant::now(),
             Duration::from_secs(30),
+            None,
             oracle_predictions,
         )?;
         let copy_zero = evaluate_with_predictor(
@@ -1256,6 +1423,7 @@ mod tests {
             Arm::Conditioned,
             Instant::now(),
             Duration::from_secs(30),
+            None,
             |_, actions| Ok(copy_zero_predictions(actions)),
         )?;
 
@@ -1296,6 +1464,97 @@ mod tests {
             number(&copy_zero.value, "no_op_false_positive_pixel_rate"),
             0.0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn held_out_capture_preserves_metrics_and_records_rescorable_rows() -> Result<()> {
+        let data = generate_data(101, 1, SMOKE_HELD_OUT_FRAMES)?;
+        let baseline = evaluate_with_predictor(
+            &data.held_out,
+            Arm::Conditioned,
+            Instant::now(),
+            Duration::from_secs(30),
+            None,
+            oracle_predictions,
+        )?;
+        let mut captured = Vec::new();
+        let with_capture = evaluate_with_predictor(
+            &data.held_out,
+            Arm::Conditioned,
+            Instant::now(),
+            Duration::from_secs(30),
+            Some(&mut captured),
+            oracle_predictions,
+        )?;
+        assert_eq!(baseline.value, with_capture.value);
+        assert_eq!(baseline.prediction_sha256, with_capture.prediction_sha256);
+
+        let rows = captured
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), SMOKE_HELD_OUT_FRAMES * 7);
+        for row in &rows {
+            let frame_index = count(row, "frame_index") as usize;
+            let tuple_index = count(row, "tuple_index") as usize;
+            assert_eq!(row["schema"], HELD_OUT_PREDICTIONS_ID);
+            assert_eq!(
+                row["input_frame_sha256"],
+                frame_fingerprint(&data.held_out[frame_index].current)
+            );
+            assert_eq!(
+                count(&row["actual_action"], "id"),
+                data.held_out[frame_index].outcomes[tuple_index].action.id as u64
+            );
+            assert_eq!(row["model_input_actually_replaced"], false);
+            assert_eq!(
+                row["model_input_identity"],
+                input_arm_identity(Arm::Conditioned)
+            );
+            let probabilities = row["probabilities"]
+                .as_array()
+                .context("captured probabilities are not an array")?;
+            assert_eq!(probabilities.len(), FRAME_PIXELS);
+            let changed = row["actual_changed_pixel_indices"]
+                .as_array()
+                .context("captured target is not an array")?
+                .iter()
+                .map(|index| index.as_u64().context("target index is not an integer"))
+                .collect::<Result<BTreeSet<_>>>()?;
+            assert!(changed.iter().all(|index| *index < FRAME_PIXELS as u64));
+            for (index, probability) in probabilities.iter().enumerate() {
+                assert_eq!(
+                    probability.as_f64().context("probability is not numeric")?,
+                    if changed.contains(&(index as u64)) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
+
+        let mut constant_capture = Vec::new();
+        evaluate_with_predictor(
+            &data.held_out,
+            Arm::Constant,
+            Instant::now(),
+            Duration::from_secs(30),
+            Some(&mut constant_capture),
+            |_, actions| Ok(copy_zero_predictions(actions)),
+        )?;
+        let first_constant: Value = serde_json::from_slice(
+            constant_capture
+                .split(|byte| *byte == b'\n')
+                .next()
+                .context("constant capture is empty")?,
+        )?;
+        assert_eq!(count(&first_constant["actual_action"], "id"), 1);
+        assert_eq!(count(&first_constant["model_input_action"], "id"), 5);
+        assert_eq!(first_constant["model_input_actually_replaced"], true);
+        assert_eq!(first_constant["model_input_identity"], COMPARATOR_ID);
         Ok(())
     }
 }

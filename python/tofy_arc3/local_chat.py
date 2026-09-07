@@ -18,8 +18,11 @@ from urllib.request import (
     build_opener,
 )
 
+from .frame_memory import PALETTE, encode_frame, summarize_components
+
 _MAX_RESPONSE_BYTES = 1 << 20
 _FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
+_FRAME_FORMATS = {"raw_hex", "compact"}
 
 SYSTEM_PROMPT = """You are an ARC-AGI-3 game-playing policy. Infer the visible game's rules and goal only from the observation sequence and the results of prior actions. Aim to make progress and reach WIN while using actions efficiently. The board is provided as lossless text; you have no vision, code-execution, external-data, or game-source tools.
 
@@ -81,7 +84,10 @@ def _integer(value: Any, field: str, *, maximum: int | None = None) -> int:
 
 
 def _observation_text(
-    observation: dict[str, Any], *, require_actions: bool = True
+    observation: dict[str, Any],
+    *,
+    require_actions: bool = True,
+    frame_format: str = "raw_hex",
 ) -> tuple[tuple[str, str], str, list[int], str]:
     if not isinstance(observation, dict):
         raise TypeError("observation must be a JSON object")
@@ -120,6 +126,7 @@ def _observation_text(
         if not isinstance(layer, list) or len(layer) != 64:
             raise ValueError(f"frame layer {layer_index} must have 64 rows")
         rows: list[str] = []
+        values_by_row: list[list[int]] = []
         for row_index, row in enumerate(layer):
             if not isinstance(row, list) or len(row) != 64:
                 raise ValueError(
@@ -129,9 +136,44 @@ def _observation_text(
                 _integer(value, f"frame[{layer_index}][{row_index}]", maximum=15)
                 for value in row
             ]
+            values_by_row.append(values)
             rows.append("".join(format(value, "X") for value in values))
-        rendered.append(f"layer {layer_index}:\n" + "\n".join(rows))
+        if frame_format == "raw_hex":
+            rendered.append(f"layer {layer_index}:\n" + "\n".join(rows))
+        else:
+            components = summarize_components(values_by_row, max_components=32)
+            component_lines = [
+                (
+                    f"components layer {layer_index}: total={components.total_components} "
+                    f"shown={len(components.components)} "
+                    f"truncated={components.truncated_count}"
+                )
+            ]
+            component_lines.extend(
+                (
+                    f"color={PALETTE[component.color]} area={component.area} "
+                    f"bbox={component.bbox} centroid={component.centroid}"
+                )
+                for component in components.components
+            )
+            rendered.append(
+                f"layer {layer_index} compact:\n{encode_frame(values_by_row)}\n"
+                + "\n".join(component_lines)
+            )
 
+    if frame_format == "raw_hex":
+        frame_legend = (
+            "Each frame row is 64 lossless hexadecimal palette symbols (0-F); x is the "
+            "column and y is the row.\n"
+        )
+    else:
+        frame_legend = (
+            "Compact frame legend: each header gives x/y origin, size, and categorical "
+            "palette; a bare 64-symbol line is one raw row; Pn:<row> repeats a raw "
+            "row n times; Rn:<runs> repeats an RLE row n times; comma-separated "
+            "symbol*count entries are horizontal runs (a bare symbol has count 1); n "
+            "is the number of decoded rows.\n"
+        )
     text = (
         "Visible observation:\n"
         f"state={state}\n"
@@ -139,8 +181,8 @@ def _observation_text(
         f"win_levels={win_levels}\n"
         f"full_reset={json.dumps(full_reset)}\n"
         f"available_actions={json.dumps(available, separators=(',', ':'))}\n"
-        "Each frame row is 64 lossless hexadecimal palette symbols (0-F); x is the "
-        "column and y is the row.\n" + "\n".join(rendered)
+        + frame_legend
+        + "\n".join(rendered)
     )
     return (game_id, guid), text, available, state
 
@@ -195,6 +237,7 @@ class LocalChatAgent:
         max_tokens: int = 1024,
         timeout: float = 30,
         history_turns: int = 4,
+        frame_format: str = "raw_hex",
     ) -> None:
         self.endpoint = _completion_url(endpoint)
         if not isinstance(model, str) or not model:
@@ -212,6 +255,9 @@ class LocalChatAgent:
             raise ValueError("timeout must be positive")
         self.timeout = float(timeout)
         self.history_turns = _integer(history_turns, "history_turns")
+        if not isinstance(frame_format, str) or frame_format not in _FRAME_FORMATS:
+            raise ValueError("frame_format must be raw_hex or compact")
+        self.frame_format = frame_format
         self._history: list[tuple[str, str | None, str | None]] = []
         self._session: tuple[str, str] | None = None
         self._open: Callable[..., Any] = build_opener(
@@ -219,7 +265,9 @@ class LocalChatAgent:
         ).open
 
     def choose_action(self, observation: dict[str, Any]) -> dict[str, Any]:
-        session, observation_text, available, state = _observation_text(observation)
+        session, observation_text, available, state = _observation_text(
+            observation, frame_format=self.frame_format
+        )
         if state != "NOT_FINISHED":
             raise ValueError("choose_action requires a NOT_FINISHED observation")
         if session != self._session:
@@ -312,7 +360,9 @@ class LocalChatAgent:
     def observe_terminal(self, observation: dict[str, Any]) -> None:
         """Record WIN/GAME_OVER feedback without making an HTTP request."""
         session, observation_text, _, state = _observation_text(
-            observation, require_actions=False
+            observation,
+            require_actions=False,
+            frame_format=self.frame_format,
         )
         if state not in {"WIN", "GAME_OVER"}:
             raise ValueError("observe_terminal requires a terminal observation")

@@ -4,6 +4,67 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Online effect prerequisite failed absolute F1 (2026-09-06)
+
+The fresh online effect CNN learned action ranking on independent non-ARC
+procedural streams, but **all three conditioned seeds failed the registered
+absolute changed-pixel F1 gate**. Seed0 also failed click F1. The matched
+constant-input arms tied action scores by construction; their training measures
+spatial prediction under identical initialization, factual rows and update budget.
+There is no public ARC training or gameplay result here, and no goal/value
+objective or online public controller is connected to this learner.
+
+| Arm | Seed | Change F1 | Precision | Recall | Action rank | Noop FP rate | Click F1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| constant | 0 | 0.283007 | 0.164827 | 1.000000 | 0.5 | 0.00517731 | 0.046010 |
+| conditioned | 0 | 0.563421 | 0.392196 | 1.000000 | 1.0 | 0.00005341 | 0.460432 |
+| constant | 1 | 0.281938 | 0.164103 | 1.000000 | 0.5 | 0.00520935 | 0.045812 |
+| conditioned | 1 | 0.639116 | 0.470482 | 0.996173 | 1.0 | 0.00000916 | 0.901408 |
+| constant | 2 | 0.284987 | 0.166172 | 1.000000 | 0.5 | 0.00514526 | 0.046377 |
+| conditioned | 2 | 0.612739 | 0.441690 | 1.000000 | 1.0 | 0.00000000 | 0.969697 |
+
+The requirement was F1 >=0.70, >=0.15 gain over constant input, action ranking
+>=0.90, noop false-positive pixel rate <=0.001, and click F1 >=0.50 on every
+seed. All seeds pass the margin, ranking and noop gates. Recall near1 with
+precision0.39–0.47 identifies broad masks; it does not establish the cause.
+Each final evaluation has448 tuples,288 changed/160 noop,1568 changed pixels,
+and704 genuinely changed-vs-noop pairs. Oracle F1/ranking1 and copy F1=0 pass.
+
+Exactly512 optimizer updates per arm; model/data seeds (0,101),(1,102),(2,103).
+Three3x3 convolutions and one1x1 output, width16, F32, AdamW0.001, zero weight
+decay, no clipping/schedule. Physical batch64, accumulation1, latest-row replay
+ramp1–64/capacity256. Batch64 was the largest stable tested batch up to the
+intended effective64, after selection-only16/32/64 probes. All six training
+runs took47.124 seconds combined, with sampled peak510–542MiB on RTX5060 Laptop
+8151MiB (driver610.57.04). The200ms telemetry can miss instantaneous peaks.
+
+Source `3a925df002225aa766b23b049eeb837c7c112fff`, sibling
+`8e012f25e38f0c597c14268f0c705e504a5b5c28`, build
+`cargo build --release --locked --features cudnn --example online_effect_probe`.
+Binary SHA256 `de0459298e2708713a56d306a562ec5e22dcd19861b4563bb24da850b8457219`.
+The exact CUDA smoke and all manifests, controls, source checks, matched data/
+initial-probe hashes, and process cleanup passed. Code validation:6 learner and
+2 probe CPU tests, Clippy/format. No model weights or per-pixel held-out scores
+were retained, so arbitrary frozen rescoring of these sealed roots is impossible.
+
+Decision: reject this configuration at512 updates under the original gate.
+Keep the gate unchanged. Analyze the class-balanced objective and finite-budget
+optimization before one new intervention. For fixed positive/negative weights,
+the population minimizer is q = w1*p/(w1*p+w0*(1-p)); a0.5 threshold corresponds
+to p >=w0/(w1+w0), not necessarily p >=0.5. This is a local mathematical fact,
+not an explanation proved for this run: per-batch weights vary, and deterministic
+representable targets still have the correct0/1 optimum. A fresh reproduction
+that saves frozen score maps can distinguish threshold separability from rank/
+representation failure without selecting a new training checkpoint. Any threshold
+search is exploratory and needs new seeds for confirmation. The independent
+pretrained-agent capacity and public-development route remains admissible.
+
+Registration: [online effect screen](research/2026-09-06-online-effect-training-screen.md).
+Exact commands, roots and external digests are in
+`/home/stepan/Coding/Personal/.tofy-build/online-effect-preparation-20260906T185013-CDT/`:
+`training-results.json`, six `*-seed*.verification.json`, and `run_probe.py`.
+Do not reuse those sealed roots. No ARC Best So Far metric changes.
+
 ## Graph exploration control (2026-09-06)
 
 The uncalibrated graph controller completed **0/23 development levels on both

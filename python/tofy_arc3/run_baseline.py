@@ -111,9 +111,17 @@ def validate_config(config: dict[str, Any]) -> None:
             "physical_batch",
             "gpu_layers",
             "reasoning_budget",
+            "frame_format",
         }
     if set(agent) - allowed:
         raise DriverError(f"unsupported agent fields: {sorted(set(agent) - allowed)}")
+    if agent["kind"] == "local_chat":
+        frame_format = agent.get("frame_format", "raw_hex")
+        if not isinstance(frame_format, str) or frame_format not in {
+            "raw_hex",
+            "compact",
+        }:
+            raise DriverError("agent.frame_format must be raw_hex or compact")
     if agent.get("seed", config["seed"]) != config["seed"]:
         raise DriverError("this screen uses one explicit environment/model seed")
     if config.get("expected_screen_contract_sha256") != screen_contract(config):
@@ -255,6 +263,7 @@ class ManagedChatAgent:
                 max_tokens=config.get("max_tokens", 1024),
                 timeout=timeout,
                 history_turns=config.get("history_turns", 4),
+                frame_format=config.get("frame_format", "raw_hex"),
             )
         except BaseException:
             self.close()
