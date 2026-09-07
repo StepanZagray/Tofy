@@ -2,6 +2,9 @@
 //!
 //! The first environment is a synthetic prerequisite, not an ARC game.
 
+pub mod model;
+pub mod task;
+
 pub const FRAME_SIDE: usize = 64;
 pub const PATCH_SIDE: usize = 8;
 pub const PATCH_PIXELS: usize = PATCH_SIDE * PATCH_SIDE;
