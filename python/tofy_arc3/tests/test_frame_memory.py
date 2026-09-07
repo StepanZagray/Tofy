@@ -14,6 +14,7 @@ from tofy_arc3.frame_memory import (
     decode_frame,
     encode_frame,
     summarize_components,
+    summarize_frame_change,
 )
 
 
@@ -111,6 +112,26 @@ class ComponentSummaryTests(unittest.TestCase):
             [component.bbox for component in truncated.components],
             [(0, 0, 0, 0), (1, 0, 1, 0), (2, 0, 2, 0)],
         )
+
+
+class FrameChangeSummaryTests(unittest.TestCase):
+    def test_reports_exact_changed_count_and_inclusive_bbox(self) -> None:
+        before = blank()
+        after = blank()
+        after[3][9] = 4
+        after[60][2] = 7
+        after[12][31] = 4
+
+        summary = summarize_frame_change(before, after)
+
+        self.assertEqual(summary.changed_pixel_count, 3)
+        self.assertEqual(summary.bbox, (2, 3, 31, 60))
+
+    def test_reports_a_nullable_bbox_for_a_no_op(self) -> None:
+        summary = summarize_frame_change(blank(5), blank(5))
+
+        self.assertEqual(summary.changed_pixel_count, 0)
+        self.assertIsNone(summary.bbox)
 
 
 class FrameLedgerTests(unittest.TestCase):

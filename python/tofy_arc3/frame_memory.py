@@ -265,6 +265,37 @@ class FrameDiff:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameChangeSummary:
+    """Exact geometry of changed cells between two visible frames."""
+
+    changed_pixel_count: int
+    bbox: tuple[int, int, int, int] | None
+
+
+def summarize_frame_change(
+    before: Sequence[Sequence[int]], after: Sequence[Sequence[int]]
+) -> FrameChangeSummary:
+    """Compare two validated frames and bound all changed cells inclusively."""
+
+    before_rows = _freeze_frame(before)
+    after_rows = _freeze_frame(after)
+    changed_pixel_count = 0
+    min_x = min_y = FRAME_SIZE
+    max_x = max_y = -1
+    for y in range(FRAME_SIZE):
+        for x in range(FRAME_SIZE):
+            if before_rows[y][x] == after_rows[y][x]:
+                continue
+            changed_pixel_count += 1
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+    return FrameChangeSummary(
+        changed_pixel_count=changed_pixel_count,
+        bbox=(min_x, min_y, max_x, max_y) if changed_pixel_count else None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class FrameMemoryConfig:
     max_entries: int = 128
     max_note_chars: int = 256

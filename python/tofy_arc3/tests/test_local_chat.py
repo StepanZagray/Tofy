@@ -347,9 +347,11 @@ class LocalChatAgentTests(unittest.TestCase):
         self.assertEqual(agent._history, [])
 
     def test_raw_hex_remains_the_exact_default_observation_format(self) -> None:
-        default_agent, default_open = self.agent(['{"action_id":1}'])
+        default_agent, default_open = self.agent(['{"action_id":1}'] * 2)
         explicit_agent, explicit_open = self.agent(
-            ['{"action_id":1}'], frame_format="raw_hex"
+            ['{"action_id":1}'] * 2,
+            frame_format="raw_hex",
+            factual_transition_ledger=False,
         )
         current = observation(2)
         default_agent.choose_action(current)
@@ -369,6 +371,247 @@ class LocalChatAgentTests(unittest.TestCase):
             "layer 0:\n" + "\n".join(["2" * 64] * 64)
         )
         self.assertEqual(payload["messages"][-1]["content"], expected_observation)
+
+        default_agent.choose_action(observation(3))
+        explicit_agent.choose_action(observation(3))
+        self.assertEqual(default_open.calls[1][0].data, explicit_open.calls[1][0].data)
+        self.assertNotIn("transition ledger", default_open.calls[1][0].data.decode())
+
+    def test_ledger_renders_visible_action_then_raw_outcome(self) -> None:
+        common = observation()
+        common["secret_oracle"] = "never render this"
+        first_before = observation()
+        first_before["frame"][0][1][1] = 3
+        second_before = observation()
+        second_before["frame"][0][1][1] = 3
+        second_before["frame"][0][2][2] = 4
+        first, first_open = self.agent(
+            ['{"action_id":1}', '{"action_id":5}'],
+            factual_transition_ledger=True,
+        )
+        second, second_open = self.agent(
+            ['{"action_id":5}', '{"action_id":1}'],
+            factual_transition_ledger=True,
+        )
+
+        first.choose_action(first_before)
+        second.choose_action(second_before)
+        first_before["frame"][0][1][1] = 0
+        first.choose_action(common)
+        second.choose_action(common)
+
+        first_current = json.loads(first_open.calls[1][0].data)["messages"][-1][
+            "content"
+        ]
+        second_current = json.loads(second_open.calls[1][0].data)["messages"][-1][
+            "content"
+        ]
+        first_row = first_current.splitlines()[-1]
+        second_row = second_current.splitlines()[-1]
+        self.assertLess(first_row.index('"action"'), first_row.index('"outcome"'))
+        self.assertEqual(
+            json.loads(first_row),
+            {
+                "action": {"action_id": 1},
+                "outcome": {
+                    "last_frame_changed_pixel_count": 1,
+                    "last_frame_changed_bbox": [1, 1, 1, 1],
+                    "state_after": "NOT_FINISHED",
+                    "levels_completed_delta": 0,
+                    "full_reset_after": False,
+                    "frame_count_before": 1,
+                    "frame_count_after": 1,
+                },
+            },
+        )
+        self.assertEqual(json.loads(second_row)["action"], {"action_id": 5})
+        self.assertEqual(
+            json.loads(second_row)["outcome"]["last_frame_changed_pixel_count"],
+            2,
+        )
+        self.assertNotEqual(first_row, second_row)
+        ledger = first_current.split("Experienced factual transition ledger", 1)[
+            1
+        ].lower()
+        for word in (
+            "oracle",
+            "success",
+            "progress",
+            "value",
+            "target",
+            "recommendation",
+        ):
+            self.assertNotIn(word, ledger)
+
+    def test_ledger_covers_changed_noop_metadata_and_frame_counts(self) -> None:
+        agent, fake = self.agent(
+            ['{"action_id":6,"x":4,"y":5}', '{"action_id":5}', '{"action_id":1}'],
+            factual_transition_ledger=True,
+        )
+        before = observation()
+        changed = observation()
+        changed_last = [[0 for _ in range(64)] for _ in range(64)]
+        changed_last[7][2] = 9
+        changed_last[8][4] = 8
+        changed["frame"] = [
+            [[15 for _ in range(64)] for _ in range(64)],
+            changed_last,
+        ]
+        metadata_only = observation(1)
+        metadata_only["frame"] = [changed_last]
+
+        agent.choose_action(before)
+        agent.choose_action(changed)
+        agent.choose_action(metadata_only)
+
+        rows = [json.loads(row) for row in agent._transitions]
+        self.assertEqual(
+            rows[0],
+            {
+                "action": {"action_id": 6, "x": 4, "y": 5},
+                "outcome": {
+                    "last_frame_changed_pixel_count": 2,
+                    "last_frame_changed_bbox": [2, 7, 4, 8],
+                    "state_after": "NOT_FINISHED",
+                    "levels_completed_delta": 0,
+                    "full_reset_after": False,
+                    "frame_count_before": 1,
+                    "frame_count_after": 2,
+                },
+            },
+        )
+        self.assertEqual(
+            rows[1]["outcome"],
+            {
+                "last_frame_changed_pixel_count": 0,
+                "last_frame_changed_bbox": None,
+                "state_after": "NOT_FINISHED",
+                "levels_completed_delta": 1,
+                "full_reset_after": False,
+                "frame_count_before": 2,
+                "frame_count_after": 1,
+            },
+        )
+        self.assertEqual(len(json.loads(fake.calls[2][0].data)["messages"]), 6)
+
+    def test_ledger_folds_once_across_failure_terminal_and_retry(self) -> None:
+        agent, fake = self.agent(
+            ['{"action_id":1}', "not json", '{"action_id":5}', '{"action_id":1}'],
+            factual_transition_ledger=True,
+        )
+        agent.choose_action(observation())
+        after = observation()
+        after["frame"][0][3][4] = 7
+        with self.assertRaises(LocalChatError):
+            agent.choose_action(after)
+        self.assertEqual(len(agent._transitions), 1)
+
+        agent.choose_action(after)
+        self.assertEqual(len(agent._transitions), 1)
+        terminal = observation()
+        terminal["state"] = "GAME_OVER"
+        terminal["available_actions"] = []
+        agent.observe_terminal(terminal)
+        agent.observe_terminal(terminal)
+        self.assertEqual(len(agent._transitions), 2)
+
+        retry = observation()
+        agent.choose_action(retry)
+        current = json.loads(fake.calls[-1][0].data)["messages"][-1]["content"]
+        rows = current.split("Experienced factual transition ledger", 1)[
+            1
+        ].splitlines()[1:]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(json.loads(rows[-1])["outcome"]["state_after"], "GAME_OVER")
+
+    def test_ledger_clears_on_session_switch_and_full_reset(self) -> None:
+        switched, switched_open = self.agent(
+            ['{"action_id":1}', '{"action_id":1}'],
+            factual_transition_ledger=True,
+        )
+        switched.choose_action(observation())
+        switched.choose_action(observation(guid="session-b"))
+        switched_current = json.loads(switched_open.calls[1][0].data)["messages"][-1][
+            "content"
+        ]
+        self.assertNotIn("transition ledger", switched_current)
+        self.assertEqual(len(switched._transitions), 0)
+
+        reset, reset_open = self.agent(
+            ['{"action_id":1}'] * 3,
+            factual_transition_ledger=True,
+        )
+        reset.choose_action(observation())
+        changed = observation()
+        changed["frame"][0][0][0] = 1
+        reset.choose_action(changed)
+        whole_reset = observation()
+        whole_reset["full_reset"] = True
+        reset.choose_action(whole_reset)
+        reset_current = json.loads(reset_open.calls[2][0].data)["messages"][-1][
+            "content"
+        ]
+        self.assertNotIn("transition ledger", reset_current)
+        self.assertEqual(len(reset._transitions), 0)
+
+    def test_ledger_keeps_only_the_last_eight_rows_in_order(self) -> None:
+        agent, fake = self.agent(
+            ['{"action_id":1}'] * 11,
+            factual_transition_ledger=True,
+        )
+        for changed_pixels in range(11):
+            current = observation()
+            for x in range(changed_pixels):
+                current["frame"][0][0][x] = 1
+            agent.choose_action(current)
+
+        prompt = json.loads(fake.calls[-1][0].data)["messages"][-1]["content"]
+        rows = prompt.split("Experienced factual transition ledger", 1)[1].splitlines()[
+            1:
+        ]
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(
+            json.loads(rows[0])["outcome"]["last_frame_changed_bbox"], [2, 0, 2, 0]
+        )
+        self.assertEqual(
+            json.loads(rows[-1])["outcome"]["last_frame_changed_bbox"],
+            [9, 0, 9, 0],
+        )
+
+    def test_context_budgeting_uses_ledger_without_storing_it_in_history(self) -> None:
+        agent = LocalChatAgent(
+            "http://127.0.0.1:8080",
+            "model",
+            context_size=700,
+            max_tokens=100,
+            factual_transition_ledger=True,
+        )
+        fake = FakeContextOpen(
+            ['{"action_id":1}', '{"action_id":5}'],
+            [300, 700, 300],
+            usage={"prompt_tokens": 300},
+        )
+        agent._open = fake
+        agent.choose_action(observation())
+        current = observation()
+        current["frame"][0][63][63] = 2
+        result = agent.choose_action(current)
+
+        applied = json.loads(fake.calls[5][0].data)["messages"]
+        completion = json.loads(fake.calls[7][0].data)["messages"]
+        self.assertEqual(applied, completion)
+        self.assertEqual(
+            result["telemetry"]["context_budget"]["history_turns_evicted"], 1
+        )
+        self.assertEqual(len(completion), 2)
+        current_prompt = completion[-1]["content"]
+        self.assertTrue(current_prompt.startswith(agent._history[-1][0]))
+        self.assertIn("layer 0:\n", current_prompt)
+        self.assertIn("transition ledger", current_prompt)
+        self.assertNotIn("transition ledger", agent._history[-1][0])
+        first_candidate = json.loads(fake.calls[3][0].data)["messages"]
+        self.assertEqual(first_candidate[-1]["content"], current_prompt)
+        self.assertNotIn("transition ledger", first_candidate[-3]["content"])
 
     def test_compact_format_retains_all_layers_and_bottom_row(self) -> None:
         current = observation()
@@ -400,6 +643,17 @@ class LocalChatAgentTests(unittest.TestCase):
                     "http://127.0.0.1:8080", "model", frame_format=frame_format
                 )
 
+        for enabled in (None, 0, 1, "true", []):
+            with (
+                self.subTest(factual_transition_ledger=enabled),
+                self.assertRaisesRegex(TypeError, "factual_transition_ledger"),
+            ):
+                LocalChatAgent(
+                    "http://127.0.0.1:8080",
+                    "model",
+                    factual_transition_ledger=enabled,
+                )
+
     def test_baseline_config_accepts_compact_and_preserves_raw_default(self) -> None:
         from tofy_arc3.run_baseline import (
             DriverError,
@@ -429,6 +683,8 @@ class LocalChatAgentTests(unittest.TestCase):
 
         validate_config(config())
         validate_config(config("compact"))
+        validate_config(config(factual_transition_ledger=False))
+        validate_config(config(factual_transition_ledger=True))
         for reasoning_mode in ("auto", "on", "off"):
             validate_config(config(reasoning_mode=reasoning_mode))
         for server_log_verbosity in (0, 5):
@@ -457,6 +713,9 @@ class LocalChatAgentTests(unittest.TestCase):
                 validate_config(config(context_size=context_size))
         with self.assertRaisesRegex(DriverError, "sampling.top_p"):
             validate_config(config(sampling={"top_p": 0}))
+        for enabled in (None, 0, 1, "true", []):
+            with self.assertRaisesRegex(DriverError, "factual_transition_ledger"):
+                validate_config(config(factual_transition_ledger=enabled))
 
     def test_terminal_observation_is_retained_without_http(self) -> None:
         agent, fake = self.agent(
