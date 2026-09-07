@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 import time
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from .frame_memory import PALETTE, encode_frame, summarize_components
 _MAX_RESPONSE_BYTES = 1 << 20
 _FENCED_JSON = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL | re.IGNORECASE)
 _FRAME_FORMATS = {"raw_hex", "compact"}
+_SAMPLING_FIELDS = {"temperature", "top_p", "top_k", "min_p"}
 
 SYSTEM_PROMPT = """You are an ARC-AGI-3 game-playing policy. Infer the visible game's rules and goal only from the observation sequence and the results of prior actions. Aim to make progress and reach WIN while using actions efficiently. The board is provided as lossless text; you have no vision, code-execution, external-data, or game-source tools.
 
@@ -33,6 +35,31 @@ Choose one listed available action. Reply with exactly one JSON object. For ACTI
 
 class LocalChatError(RuntimeError):
     """The local endpoint or its assistant response violated the contract."""
+
+
+def validate_sampling(sampling: object) -> dict[str, int | float]:
+    """Return a validated copy of supported llama-server sampling fields."""
+    if not isinstance(sampling, dict):
+        raise TypeError("sampling must be an object")
+    unknown = set(sampling) - _SAMPLING_FIELDS
+    if unknown:
+        raise ValueError(f"sampling has unknown fields: {sorted(map(str, unknown))}")
+    result: dict[str, int | float] = {}
+    for name, value in sampling.items():
+        if name == "top_k":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("sampling.top_k must be a nonnegative integer")
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or (name == "temperature" and not 0 <= value <= 2)
+            or (name == "top_p" and not 0 < value <= 1)
+            or (name == "min_p" and not 0 <= value <= 1)
+        ):
+            raise ValueError(f"sampling.{name} is outside its allowed finite range")
+        result[name] = value
+    return result
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -225,6 +252,42 @@ def _parse_action(content: str, available: list[int]) -> dict[str, int]:
     return result
 
 
+def _action_response_format(available: list[int]) -> dict[str, Any]:
+    branches: list[dict[str, Any]] = []
+    simple = [action_id for action_id in available if action_id != 6]
+    if simple:
+        branches.append(
+            {
+                "type": "object",
+                "properties": {"action_id": {"type": "integer", "enum": simple}},
+                "required": ["action_id"],
+                "additionalProperties": False,
+            }
+        )
+    if 6 in available:
+        coordinate = {"type": "integer", "minimum": 0, "maximum": 63}
+        branches.append(
+            {
+                "type": "object",
+                "properties": {
+                    "action_id": {"type": "integer", "const": 6},
+                    "x": coordinate,
+                    "y": coordinate,
+                },
+                "required": ["action_id", "x", "y"],
+                "additionalProperties": False,
+            }
+        )
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "arc_action",
+            "strict": True,
+            "schema": {"anyOf": branches},
+        },
+    }
+
+
 class LocalChatAgent:
     """Choose validated actions through a loopback OpenAI-compatible endpoint."""
 
@@ -238,6 +301,7 @@ class LocalChatAgent:
         timeout: float = 30,
         history_turns: int = 4,
         frame_format: str = "raw_hex",
+        sampling: object | None = None,
     ) -> None:
         self.endpoint = _completion_url(endpoint)
         if not isinstance(model, str) or not model:
@@ -258,6 +322,7 @@ class LocalChatAgent:
         if not isinstance(frame_format, str) or frame_format not in _FRAME_FORMATS:
             raise ValueError("frame_format must be raw_hex or compact")
         self.frame_format = frame_format
+        self.sampling = {} if sampling is None else validate_sampling(sampling)
         self._history: list[tuple[str, str | None, str | None]] = []
         self._session: tuple[str, str] | None = None
         self._open: Callable[..., Any] = build_opener(
@@ -290,8 +355,9 @@ class LocalChatAgent:
             "top_p": 1.0,
             "seed": self.seed,
             "stream": False,
-            "response_format": {"type": "json_object"},
+            "response_format": _action_response_format(available),
         }
+        payload.update(self.sampling)
         request = Request(
             self.endpoint,
             data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),

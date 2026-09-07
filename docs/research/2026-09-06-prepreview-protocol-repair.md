@@ -7,10 +7,14 @@ the256-token reasoning cutoff. The strict parser rejected it; no public game
 ran. Default server logs also failed to establish all-layer offload. Preserve
 that failed run and its manifest; it cannot satisfy a qualification gate.
 
-This new engineering test changes three explicitly named settings: supported
+This new engineering test changes four explicitly named settings: supported
 nonthinking mode (`--reasoning off`), constrained decoding with a schema for
 exactly the currently available action/coordinate alternatives, and verbose
-startup logging sufficient to establish layer placement. The first two can
+startup logging sufficient to establish layer placement, and Qwen's recommended
+nonthinking sampler (temperature0.7/top_p0.8/top_k20/min_p0). Sampling is fixed
+before this new qualification and any public gameplay; it allows the fixed
+seeds to affect sampling instead of merely repeating greedy decoding. The first
+two settings and the sampler can
 change generated behavior; this is a combined protocol repair, not an isolated
 causal performance experiment. Nonthinking mode removes the explicit thinking
 trace and can reduce reasoning ability; it is an initial reference only.
@@ -27,7 +31,7 @@ this installed build. The installed help documents `--reasoning off` and
 All other qualification settings and boundaries remain those in the
 [original registration](2026-09-06-prepreview-agent-capacity.md): same official
 model revision/whole-file hash, same server executable hash, all layers on CUDA,
-F16 KV, flash on/fit off, one slot, max1024 output, temperature0, seed0, four
+F16 KV, flash on/fit off, one slot, max1024 output, seed0, four
 prior turns and compact lossless frames. The configured256 reasoning budget
 is inactive in nonthinking mode; require no nonempty reasoning-content trace.
 No training, game source/assets, public interaction, code tools or fallback.

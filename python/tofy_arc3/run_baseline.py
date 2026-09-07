@@ -32,6 +32,7 @@ from urllib.request import ProxyHandler, build_opener
 from arc_agi import OperationMode
 from arcengine import GameAction
 
+from .local_chat import validate_sampling
 from .run_local import DriverError, _arcade, _stderr_logger, observation_json
 
 ACTION_ACCOUNTING = "engine_charged_including_retry_reset_v1"
@@ -112,6 +113,9 @@ def validate_config(config: dict[str, Any]) -> None:
             "gpu_layers",
             "reasoning_budget",
             "frame_format",
+            "reasoning_mode",
+            "server_log_verbosity",
+            "sampling",
         }
     if set(agent) - allowed:
         raise DriverError(f"unsupported agent fields: {sorted(set(agent) - allowed)}")
@@ -122,6 +126,24 @@ def validate_config(config: dict[str, Any]) -> None:
             "compact",
         }:
             raise DriverError("agent.frame_format must be raw_hex or compact")
+        reasoning_mode = agent.get("reasoning_mode")
+        if "reasoning_mode" in agent and (
+            not isinstance(reasoning_mode, str)
+            or reasoning_mode not in {"auto", "on", "off"}
+        ):
+            raise DriverError("agent.reasoning_mode must be auto, on or off")
+        verbosity = agent.get("server_log_verbosity")
+        if "server_log_verbosity" in agent and (
+            isinstance(verbosity, bool)
+            or not isinstance(verbosity, int)
+            or not 0 <= verbosity <= 5
+        ):
+            raise DriverError("agent.server_log_verbosity must be an integer in 0..5")
+        if "sampling" in agent:
+            try:
+                validate_sampling(agent["sampling"])
+            except (TypeError, ValueError) as exc:
+                raise DriverError(f"agent.{exc}") from exc
     if agent.get("seed", config["seed"]) != config["seed"]:
         raise DriverError("this screen uses one explicit environment/model seed")
     if config.get("expected_screen_contract_sha256") != screen_contract(config):
@@ -223,6 +245,10 @@ class ManagedChatAgent:
             "deepseek",
             "--jinja",
         ]
+        if "reasoning_mode" in config:
+            command += ["--reasoning", config["reasoning_mode"]]
+        if "server_log_verbosity" in config:
+            command += ["--log-verbosity", str(config["server_log_verbosity"])]
         write_json(directory / "server-command.json", command)
         try:
             self.process = subprocess.Popen(
@@ -264,6 +290,7 @@ class ManagedChatAgent:
                 timeout=timeout,
                 history_turns=config.get("history_turns", 4),
                 frame_format=config.get("frame_format", "raw_hex"),
+                sampling=config.get("sampling"),
             )
         except BaseException:
             self.close()

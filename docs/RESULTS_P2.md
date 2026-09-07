@@ -4,6 +4,67 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Replay optimization passes local effect prerequisite (2026-09-06)
+
+All three fresh seeds pass the registered local procedural prerequisite with
+four replay optimizer updates per factual observation. The one-update arms
+fail absolute F1 on all three. This is a validated optimization-schedule gain
+on the same512-observation stream per environment, at four times the optimizer
+updates. It is not a matched-compute improvement or public ARC result. No goal/
+value objective, next-state palette prediction or public controller is connected
+to this binary change-map learner. Its7x7 click receptive field cannot represent
+arbitrary remote click effects. The training weights are not a deployed agent;
+a future online component starts fresh from its own game's factual experience.
+
+| Seed | Conditioned K1 F1 | Conditioned K4 F1 | Constant K4 F1 | K4 action rank | K4 click F1 | K4 noop FP rate |
+|---|---:|---:|---:|---:|---:|---:|
+|10|0.529909|0.955692|0.285524|0.998580|0.941176|0.00000763|
+|11|0.599272|0.994595|0.285714|1.000000|1.000000|0.00000153|
+|12|0.563623|0.847339|0.284264|1.000000|0.901408|0.00000610|
+
+Every K4 conditioned arm passes F1>=0.70, >=0.15 gain over the matched-K4
+constant-input comparator, action ranking>=0.90, click F1>=0.50, noop FP<=0.001,
+and >=0.05 F1 gain over its failing K1 baseline. All seeds are included; no
+checkpoint/threshold selection or population confidence claim is made. The
+constant arm's ranking0.5 is fixed by identical inputs, while its spatial F1
+is empirical. Model/data seeds (10,201),(11,202),(12,203); held-out448 tuples,
+288 changed/160 noop,1568 changed pixels,704 true outcome-different action pairs.
+Oracle/copy and matched stream/initialization checks pass.
+
+Architecture/loss/optimizer/data order remain fixed: width16, three3x3 plus1x1
+convolutions, F32 balanced BCE, AdamW0.001/weight decay0, no clipping/schedule,
+replay256/latest64, physical64/accumulation1 after original ramp. A transition
+is retained and prequentially scored once, followed by K identical-batch updates.
+Thus512 observations produce512 or2048 optimizer steps; all13824 total updates
+across nine arms are enumerated in logs. Sampled peak510–542MiB, combined arm
+runtime186.860s. The exact K4 CUDA smoke and selection-only physical16/32/64
+capacity tests pass;64 is the largest tested up to intended effective64.
+Hardware is RTX5060 Laptop8151MiB, driver610.57.04. Sampler peaks are200ms lower
+bounds, not instantaneous allocator measurements.
+
+Source `e7e823882c0c1d623ab9e1a638c8daae4c676753`; sibling
+`8e012f25e38f0c597c14268f0c705e504a5b5c28`. Build
+`cargo build --release --locked --features cudnn --example online_effect_probe`;
+exact binary SHA256
+`e6790eec7def9047b5bb211d4fec7b0e5e2892c008a99bb6ecdf4073847ad3ae`.
+Seven learner/four probe CPU tests, Clippy and formatting pass. All nine run
+manifests, generated-data/common initial-prediction hashes, step/observation
+counts and exact process cleanup verified. No public data was read or trained.
+
+Decision: admit this component under the bounded local gate. Further progress
+requires a separately registered controller integration and public measurements;
+do not call the synthetic result ARC readiness or claim arbitrary game effects
+are covered. The independent prepreview LM protocol/development route continues.
+No ARC Best So Far metric changes. Next falsifier: measure the learned change
+signal on factual public-development experience only after registering its
+controller role, budgets and controls; keep22 reserved games untouched.
+
+[Registration](research/2026-09-06-effect-optimization-screen.md).
+Exact commands, run roots and external digests are indexed by
+`/home/stepan/Coding/Personal/.tofy-build/effect-optimization-preparation-20260906T193023-CDT/`:
+`training-results.json`, `training-decision.json`, nine `*-seed*.verification.json`
+and `run_probe.py`. Sealed run roots must never be reused.
+
 ## Prepreview model fits memory but failed output protocol (2026-09-06)
 
 Pinned official Qwen3-8B Q4_K_M fully downloaded and hash-verified. The first

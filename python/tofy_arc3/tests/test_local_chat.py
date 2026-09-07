@@ -101,7 +101,10 @@ class LocalChatAgentTests(unittest.TestCase):
         self.assertEqual(payload["seed"], 7)
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(payload["top_p"], 1.0)
+        self.assertNotIn("top_k", payload)
+        self.assertNotIn("min_p", payload)
         self.assertFalse(payload["stream"])
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
         prompt = "\n".join(message["content"] for message in payload["messages"])
         self.assertNotIn("game-secret", prompt)
         self.assertNotIn("session-a", prompt)
@@ -111,6 +114,64 @@ class LocalChatAgentTests(unittest.TestCase):
         self.assertIn("no vision", prompt)
         self.assertIn("A" * 64, prompt)
         self.assertIsInstance(SYSTEM_PROMPT, str)
+
+    def test_sampling_overrides_are_exact_and_invalid_values_fail(self) -> None:
+        sampling = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0}
+        agent, fake = self.agent(['{"action_id":1}'], sampling=sampling)
+        agent.choose_action(observation())
+        payload = json.loads(fake.calls[0][0].data)
+        self.assertEqual({key: payload[key] for key in sampling}, sampling)
+
+        invalid = (
+            {"temperature": float("nan")},
+            {"temperature": True},
+            {"temperature": 2.1},
+            {"top_p": 0},
+            {"top_p": float("inf")},
+            {"top_k": -1},
+            {"top_k": 1.5},
+            {"min_p": -0.1},
+            {"unknown": 1},
+            [],
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                LocalChatAgent("http://127.0.0.1:8080", "model", sampling=value)
+
+    def test_response_schema_exactly_matches_available_action_shapes(self) -> None:
+        for available in ([1, 5, 6], [1, 5], [6]):
+            response = (
+                '{"action_id":6,"x":0,"y":63}'
+                if available == [6]
+                else '{"action_id":1}'
+            )
+            agent, fake = self.agent([response])
+            agent.choose_action({**observation(), "available_actions": available})
+            response_format = json.loads(fake.calls[0][0].data)["response_format"]
+            self.assertEqual(response_format["json_schema"]["name"], "arc_action")
+            self.assertTrue(response_format["json_schema"]["strict"])
+            branches = response_format["json_schema"]["schema"]["anyOf"]
+            self.assertEqual(
+                len(branches), 2 if 6 in available and len(available) > 1 else 1
+            )
+            for branch in branches:
+                self.assertFalse(branch["additionalProperties"])
+                action = branch["properties"]["action_id"]
+                if action.get("const") == 6:
+                    self.assertEqual(branch["required"], ["action_id", "x", "y"])
+                    self.assertEqual(
+                        branch["properties"]["x"],
+                        {"type": "integer", "minimum": 0, "maximum": 63},
+                    )
+                    self.assertEqual(
+                        branch["properties"]["y"], branch["properties"]["x"]
+                    )
+                else:
+                    self.assertEqual(
+                        action["enum"], [item for item in available if item != 6]
+                    )
+                    self.assertEqual(branch["required"], ["action_id"])
+                    self.assertNotIn("x", branch["properties"])
 
     def test_history_is_bounded_and_resets_for_a_new_session(self) -> None:
         agent, fake = self.agent(
@@ -199,8 +260,8 @@ class LocalChatAgentTests(unittest.TestCase):
             validate_config,
         )
 
-        def config(frame_format: object = None) -> dict:
-            agent = {"kind": "local_chat", "seed": 0}
+        def config(frame_format: object = None, **agent_fields: object) -> dict:
+            agent = {"kind": "local_chat", "seed": 0, **agent_fields}
             if frame_format is not None:
                 agent["frame_format"] = frame_format
             value = {
@@ -221,8 +282,30 @@ class LocalChatAgentTests(unittest.TestCase):
 
         validate_config(config())
         validate_config(config("compact"))
+        for reasoning_mode in ("auto", "on", "off"):
+            validate_config(config(reasoning_mode=reasoning_mode))
+        for server_log_verbosity in (0, 5):
+            validate_config(config(server_log_verbosity=server_log_verbosity))
+        validate_config(
+            config(
+                sampling={
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "min_p": 0,
+                }
+            )
+        )
         with self.assertRaisesRegex(DriverError, "frame_format"):
             validate_config(config("raw"))
+        for reasoning_mode in ("thinking", None, []):
+            with self.assertRaisesRegex(DriverError, "reasoning_mode"):
+                validate_config(config(reasoning_mode=reasoning_mode))
+        for server_log_verbosity in (-1, 6, True, "5"):
+            with self.assertRaisesRegex(DriverError, "server_log_verbosity"):
+                validate_config(config(server_log_verbosity=server_log_verbosity))
+        with self.assertRaisesRegex(DriverError, "sampling.top_p"):
+            validate_config(config(sampling={"top_p": 0}))
 
     def test_terminal_observation_is_retained_without_http(self) -> None:
         agent, fake = self.agent(
