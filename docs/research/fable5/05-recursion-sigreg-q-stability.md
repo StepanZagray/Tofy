@@ -19,8 +19,8 @@ Grounding used here:
   [`src/p2/eval.rs`](../../../src/p2/eval.rs) (matched compute, `q_surprise`).
 - Data: `p2-output-v11-control/eval_report_64ep_v3.json`,
   `p2-output-v15/eval_report_64ep_v5.json`, `p2-output-v15/config.json`.
-- Docs: [`docs/P2.md`](../../P2.md), [`docs/P2_V13.md`](../../P2_V13.md),
-  [`docs/P2_V15.md`](../../P2_V15.md), [`docs/P2_V16.md`](../../P2_V16.md).
+- Docs: [`docs/P2.md`](../../P2.md), [`docs/archive/P2_V13.md`](../../archive/P2_V13.md),
+  [`docs/archive/P2_V15.md`](../../archive/P2_V15.md), [`docs/archive/P2_V16.md`](../../archive/P2_V16.md).
 - Papers: TRM (arXiv 2510.04871) and LeJEPA-lineage SIGReg from prior
   knowledge; PTRM (arXiv 2605.19943) and LeWorldModel (arXiv 2603.19312) could
   not be fetched this session (web access declined), so their recipes are

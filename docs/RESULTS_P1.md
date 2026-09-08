@@ -2,7 +2,7 @@
 
 Archived P1 metrics. The exact-simulator harness that produced these numbers lives
 only on the `p1` git branch; reproduce the commands below from that branch.
-Archived pre-P1 numbers are in [`RESULTS_P0.md`](RESULTS_P0.md).
+Archived pre-P1 numbers are in [`RESULTS_P0.md`](archive/RESULTS_P0.md).
 
 ## Best So Far
 
@@ -227,5 +227,5 @@ When a better metric is reported:
 2. Paste the **exact command** used.
 3. Keep oracle-normalized efficiency labeled as such (never call it RHAE).
 4. Do not mix archived VecLab/Qwen numbers into this table; that experiment is
-   archived in [`RESULTS_P0.md`](RESULTS_P0.md).
+   archived in [`RESULTS_P0.md`](archive/RESULTS_P0.md).
 5. Do not promote implementation smoke tests into this document.

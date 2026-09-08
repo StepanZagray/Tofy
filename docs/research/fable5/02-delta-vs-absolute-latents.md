@@ -50,7 +50,7 @@ changes in v12 were:
    encoder's gradient from the dynamics objective (encoder then trained only via
    SIGReg and the event/Q heads).
 2. Confounded architecture changes: dual TRM blocks (`block_z`, `block_y`),
-   dual-pool encoder, `y` warm-start from `x` (`docs/P2_V12.md`).
+   dual-pool encoder, `y` warm-start from `x` (`docs/archive/P2_V12.md`).
 
 v12 results (`p2-output-v12/chain_summary.json`): one-step MSE 0.09–2.27 (v11-control:
 0.026), rollout-8 MSE 6.7e4–1.4e24 (v11-control: 0.17). The divergence signature —

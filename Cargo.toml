@@ -3,6 +3,7 @@ name = "tofy"
 version = "0.1.0"
 edition = "2021"
 description = "Recursive world-model experiments for hidden-objective discovery and planning"
+license = "MIT-0"
 
 [features]
 default = ["jemalloc"]
@@ -24,11 +25,9 @@ candle-core = "0.11.0"
 candle-nn = "0.11.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
-dotenvy = "0.15"
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -37,7 +36,7 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-chrome = { version = "0.7", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
-candle-graph = { version = "0.9.5", path = "../candle_graph", features = ["all"] }
+candle-graph = { version = "0.10.1", path = "../candle_graph", features = ["all"] }
 
 [dev-dependencies]
 criterion = "0.5"

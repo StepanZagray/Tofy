@@ -212,7 +212,7 @@ allocation/device-memory, and Nsight evidence remain gaps.
 
 The completed pilot, preserved A40 handoff, full metric interpretation, runtime
 analysis, and next recommendations are in
-[`P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md`](P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md).
+[`P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md`](archive/P2_GEOMETRY_V2_COMPLETED_PILOT_ANALYSIS.md).
 
 #### Phase-0 repaired re-evaluation (2026-08-10)
 
@@ -229,7 +229,7 @@ cells to `0.02392` after pooling. The treatment is already collapsed before pool
 (`0.02639` spatial rank), then falls to `0.00844`. Recursion preserves each arm's
 already-limited spatial rank rather than creating a new abrupt collapse. No metric
 is promoted to "Best So Far". Full provenance, commands, tables, and validation are
-in [`P2_PHASE0_REPAIR_REEVAL_2026-08-10.md`](P2_PHASE0_REPAIR_REEVAL_2026-08-10.md).
+in [`P2_PHASE0_REPAIR_REEVAL_2026-08-10.md`](archive/P2_PHASE0_REPAIR_REEVAL_2026-08-10.md).
 
 #### Phase-1B paired TC-SIGReg seed-1 pilot
 
@@ -325,7 +325,7 @@ the pilot gate.
 
 The full forensic report, artifact inventory, timing/telemetry analysis, ranked
 hypotheses, and recovery sequence are in
-[`P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md`](P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md).
+[`P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md`](archive/P2_OVERNIGHT_GEOMETRY_V2_ANALYSIS.md).
 
 Local remediation now makes artifact validation root-authoritative and relocatable,
 serializes complete arms, runs a default 64-episode/batch-1,024 CUDA preflight for

@@ -45,7 +45,7 @@ The v12 seven-run chain uniformly failed its rollout gate. One-step MSE ranged f
 0.0947 to 2.27 and rollout-8 MSE from 6.68e4 to 1.36e24. The least bad variant was
 `exp-q005` (one-step 0.1177, open @4 8.15, open @8 6.68e4), still far behind
 v11-control. The bundled dual-block/dual-pool/stop-gradient architecture was therefore
-reverted. `P2_V12.md` and `docs/research/fable5/02-delta-vs-absolute-latents.md`
+reverted. `docs/archive/P2_V12.md` and `docs/research/fable5/02-delta-vs-absolute-latents.md`
 explain why this chain should not be interpreted as a clean test of residual-state
 dynamics.
 

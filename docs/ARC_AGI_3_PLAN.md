@@ -154,7 +154,7 @@ specific component is safe and useful enough to carry forward.
 
 ## Immediate next work
 
-1. Run Stage 1b curriculum (`docs/P2_STAGE1B.md`): exploration + hypothesis probes,
+1. Run Stage 1b curriculum (`docs/archive/P2_STAGE1B.md`): exploration + hypothesis probes,
    tighter Q threshold, PTRM rank on falsification.
 2. Freeze Stage 1 numeric thresholds before inspecting a full result.
 2. Measure the largest stable accelerator batch, record the batch/accumulation pair,
