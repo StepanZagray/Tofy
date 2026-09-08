@@ -17,6 +17,7 @@ pub(crate) mod evidence;
 pub mod experiment;
 pub mod grounding;
 pub mod latent_planning;
+pub mod looped_agent;
 pub mod model;
 pub mod muon;
 pub mod optimizer;
