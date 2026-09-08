@@ -126,3 +126,38 @@ pair; if33 is not qualified, stop and amend the capacity choice before either ar
 starts. Keep the explicit `serde_json/float_roundtrip` feature on both producer
 and Candle Graph CLI. All wired profiles remain enabled; automatic NVTX
 correlation and the previously disclosed producer-plane gaps remain limitations.
+
+## Reproducibility repair addendum — before fresh-arm outcomes
+
+The first fixed arm at273f2c6c was stopped after645 updates, retaining checkpoint625
+and its partial stream as exploratory. Initial weights, fixed data and initial
+readouts exactly matched the previous fitting run; update1 losses also matched,
+but clipping norms differed by one F32 ULP and the later trajectories diverged.
+This comparison does not prove that the reduction order caused all divergence.
+
+A direct CPU regression on identical named gradients in independently allocated
+parameter maps reproduced changing global clipping scales. The global norm loop
+used unordered VarMap iteration for non-associative F32 addition. Sort floating
+parameters by name before norm accumulation and scale application, retaining the
+same mathematical optimizer, clipping threshold and all other experiment choices.
+The regression must pass across64 independent maps, alongside optimizer tests.
+This fixes one local reproducibility defect; it is not an accuracy intervention
+or a guarantee of deterministic CUDA training.
+
+Restart BOTH full arms from initialization at the reviewed, pushed repair commit;
+do not resume or compare the interrupted arm against a repaired treatment. Keep
+the original seeds, data,1150 updates, evaluator and promotion gates. Before either
+full arm, qualify the new binary/device/profilers and require two independent
+six-update fresh-stream CUDA replicas to have identical initial/final checkpoint
+hashes and exact losses, global norms and clipping scales on every update. Ignore
+timing/root fields for this numerical comparison. Require identical initial reference
+predictions and all384 training rows, at least one clipped update, successful
+seals and profiler verification. Use reachable capture update2 in both independent
+processes. The six steps cover two1/2/4
+cycles and the first changed episodes; this is a local preflight, not a global
+determinism proof. If it fails, investigate the next numerical source before
+spending the full pair's compute budget. No threshold relaxation or favorable
+replica selection is permitted.
+
+The previous35-minute-per-arm bound applies independently to the restarted pair.
+All failed/interrupted roots remain preserved and excluded from quality evidence.

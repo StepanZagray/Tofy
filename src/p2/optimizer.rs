@@ -549,8 +549,11 @@ pub fn clip_gradients_gpu_with_stats(
     varmap: &VarMap,
     max_norm: f64,
 ) -> Result<GradientClipStats> {
+    // Floating-point addition is not associative. Hash-map iteration made the
+    // global scale vary between otherwise identical training processes.
+    let parameters = named_float_vars(varmap);
     let mut sum_sq: Option<Tensor> = None;
-    for var in varmap.all_vars() {
+    for (_, var) in &parameters {
         let t = var.as_tensor();
         if let Some(g) = grads.get(t) {
             let sq = g.to_dtype(DType::F32)?.sqr()?.sum_all()?;
@@ -577,7 +580,7 @@ pub fn clip_gradients_gpu_with_stats(
         });
     }
     let scale = max_norm / norm;
-    for var in varmap.all_vars() {
+    for (_, var) in &parameters {
         let t = var.as_tensor();
         if let Some(g) = grads.get(t) {
             grads.insert(t, g.affine(scale, 0.0)?);
@@ -595,6 +598,39 @@ mod tests {
     use crate::p2::muon::MUON_RMS_SCALE;
     use candle_core::Device;
     use candle_nn::{linear, Module, VarBuilder, VarMap};
+
+    #[test]
+    fn global_clip_is_reproducible_across_parameter_maps() -> Result<()> {
+        let mut reference = None;
+        for _ in 0..64 {
+            let vars = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+            let mut grads = GradStore::default();
+            let mut named = Vec::new();
+            for index in 0..65 {
+                let tensor = vb.get(1, &format!("parameter_{index:03}"))?;
+                let gradient =
+                    Tensor::full(if index == 0 { 4096f32 } else { 1f32 }, 1, &Device::Cpu)?;
+                grads.insert(&tensor, gradient);
+                named.push(tensor);
+            }
+            let stats = clip_gradients_gpu_with_stats(&mut grads, &vars, 1.0)?;
+            let clipped = named
+                .iter()
+                .map(|t| grads.get(t).unwrap().to_vec1::<f32>())
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            if let Some((expected_stats, expected_clipped)) = &reference {
+                assert_eq!(
+                    &stats, expected_stats,
+                    "identical named gradients changed global clipping"
+                );
+                assert_eq!(&clipped, expected_clipped);
+            } else {
+                reference = Some((stats, clipped));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn hybrid_optimizer_steps_without_error() -> Result<()> {
