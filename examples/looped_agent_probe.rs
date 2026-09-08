@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use tofy::p2::looped_agent::model::{LoopedAgent, LoopedConfig, LoopedOutput};
+use tofy::p2::looped_agent::profile::LoopedCapture;
 use tofy::p2::looped_agent::task::{self, Frame, Inputs, Sample, Split, Transition};
 use tofy::p2::looped_agent::{ACTIONS, META_DIM, PALETTE, PATCH_COUNT, PATCH_PIXELS, TOKENS};
 use tofy::p2::optimizer::{accumulate_parameter_gradients, clip_gradients_gpu_with_stats};
@@ -75,6 +76,12 @@ struct Args {
     /// Include two-step search through categorical learned successor frames.
     #[arg(long)]
     search: bool,
+    /// One-based optimizer updates with full supported runtime evidence.
+    #[arg(long, value_delimiter = ',', default_value = "2")]
+    profile_updates: Vec<usize>,
+    /// Capture the first representative evaluation forward.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    profile_eval: bool,
 }
 
 impl Args {
@@ -211,6 +218,40 @@ fn predict(
 ) -> Result<LoopedOutput> {
     let (pixels, metadata) = tensors(rows, device)?;
     model.forward(&pixels, &metadata, loops)
+}
+
+fn inspected_predict(
+    args: &Args,
+    model: &LoopedAgent,
+    input: Inputs,
+    device: &Device,
+) -> Result<LoopedOutput> {
+    let capture = LoopedCapture::begin_eval(
+        &args
+            .output_dir
+            .with_extension("profiles")
+            .join("evaluation-000001"),
+        1,
+        device,
+        1,
+        1,
+        args.loops,
+    )?;
+    device.synchronize()?;
+    let nsight = tofy::perf::NvtxRange::new("tofy.looped/capture");
+    let measured = capture.measurement();
+    let phase = capture.phase("forward", Some(candle_graph::ExecutionStep::Forward));
+    let out = predict(model, &[input], args.loops, device)?;
+    capture.record_tensor_stats(&phase, "readout/policy_logits", &out.policy_logits)?;
+    capture.record_tensor_stats(&phase, "readout/value", &out.value)?;
+    capture.record_tensor_stats(&phase, "readout/reward_logits", &out.reward_logits)?;
+    capture.record_tensor_stats(&phase, "readout/next_logits", &out.next_logits)?;
+    device.synchronize()?;
+    drop(phase);
+    drop(measured);
+    drop(nsight);
+    capture.finish()?;
+    Ok(out)
 }
 
 fn bce(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
@@ -404,14 +445,18 @@ fn fitting_check(
         let mut correct = 0;
         let mut actions = std::collections::BTreeSet::new();
         let mut hash = Sha256::new();
-        for (_, sample) in samples {
+        for (sample_index, (_, sample)) in samples.iter().enumerate() {
             deadline(args, started)?;
             let mut input = sample.inputs.clone();
             if clear {
                 input.patches[..(TOKENS - PATCH_COUNT) * PATCH_PIXELS].fill(0);
                 input.metadata[..(TOKENS - PATCH_COUNT) * META_DIM].fill(0.0);
             }
-            let out = predict(model, &[input], args.loops, device)?;
+            let out = if args.profile_eval && update == 0 && !clear && sample_index == 0 {
+                inspected_predict(args, model, input, device)?
+            } else {
+                predict(model, &[input], args.loops, device)?
+            };
             let logits = out.policy_logits.flatten_all()?.to_vec1::<f32>()?;
             ensure!(
                 logits.iter().all(|v| v.is_finite()),
@@ -806,7 +851,15 @@ fn rule_probe(
                         hash.update(m.to_le_bytes());
                     }
                     input_hashes.push(format!("{:x}", hash.finalize()));
-                    let output = predict(model, &[input], args.loops, device)?;
+                    let output = if args.profile_eval
+                        && split == Split::Train
+                        && rows == 0
+                        && actions.is_empty()
+                    {
+                        inspected_predict(args, model, input, device)?
+                    } else {
+                        predict(model, &[input], args.loops, device)?
+                    };
                     let policy = output.policy_logits.flatten_all()?.to_vec1::<f32>()?;
                     ensure!(
                         policy.iter().all(|p| p.is_finite()),
@@ -958,6 +1011,29 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         } else {
             [1, 2, args.loops][update % 3].min(args.loops)
         };
+        let capture = if args.profile_updates.contains(&(update + 1)) {
+            Some(LoopedCapture::begin(
+                &args
+                    .output_dir
+                    .with_extension("profiles")
+                    .join(format!("update-{:012}", update + 1)),
+                (update + 1) as u64,
+                &device,
+                &vars,
+                args.batch,
+                args.effective_batch,
+                loops,
+            )?)
+        } else {
+            None
+        };
+        if capture.is_some() {
+            device.synchronize()?;
+        }
+        let nsight = capture
+            .as_ref()
+            .map(|_| tofy::perf::NvtxRange::new("tofy.looped/capture"));
+        let measured = capture.as_ref().map(LoopedCapture::measurement);
         let mut grads = None;
         let mut means = [0.0f32; 4];
         for micro in 0..args.accumulation() {
@@ -986,22 +1062,84 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 samples.push(sample);
             }
             let inputs = samples.iter().map(|s| s.inputs.clone()).collect::<Vec<_>>();
+            if capture.is_some() {
+                device.synchronize()?;
+            }
+            let forward = capture.as_ref().map(|c| {
+                c.phase(
+                    &format!("micro-{micro}/forward"),
+                    Some(candle_graph::ExecutionStep::Forward),
+                )
+            });
             let out = predict(&model, &inputs, loops, &device)?;
             let (loss, metrics) = losses(&out, &samples, &device)?;
+            if let (Some(c), Some(p)) = (&capture, &forward) {
+                c.record_tensor_stats(
+                    p,
+                    &format!("micro-{micro}/policy_logits"),
+                    &out.policy_logits,
+                )?;
+                c.record_tensor_stats(p, &format!("micro-{micro}/value"), &out.value)?;
+                c.record_tensor_stats(
+                    p,
+                    &format!("micro-{micro}/reward_logits"),
+                    &out.reward_logits,
+                )?;
+                c.record_tensor_stats(p, &format!("micro-{micro}/next_logits"), &out.next_logits)?;
+                for (name, value) in ["policy", "value", "reward", "dynamics"]
+                    .into_iter()
+                    .zip(metrics)
+                {
+                    c.record_scalar(p, &format!("micro-{micro}/loss/{name}"), f64::from(value))?;
+                }
+                device.synchronize()?;
+            }
+            drop(forward);
             for i in 0..4 {
                 means[i] += metrics[i] * fraction as f32;
             }
+            let backward = capture.as_ref().map(|c| {
+                c.phase(
+                    &format!("micro-{micro}/backward"),
+                    Some(candle_graph::ExecutionStep::Backward),
+                )
+            });
             accumulate_parameter_gradients(&mut grads, (loss * fraction)?.backward()?, &vars)?;
+            if capture.is_some() {
+                device.synchronize()?;
+            }
+            drop(backward);
         }
         let mut grads = grads.context("missing gradients")?;
+        let clipping = capture
+            .as_ref()
+            .map(|c| c.phase("gradient-inspection-and-clip", None));
+        if let (Some(c), Some(p)) = (&capture, &clipping) {
+            c.record_gradients(p, &grads)?;
+        }
         let clip = clip_gradients_gpu_with_stats(&mut grads, &vars, 1.0)?;
+        if let (Some(c), Some(p)) = (&capture, &clipping) {
+            c.record_scalar(p, "gradient/pre_clip_l2", clip.pre_clip_norm)?;
+            c.record_scalar(p, "gradient/clip_scale", clip.scale)?;
+            device.synchronize()?;
+        }
+        drop(clipping);
         ensure!(
             clip.pre_clip_norm > 0.0 && clip.pre_clip_norm.is_finite(),
             "invalid gradient norm"
         );
+        let optimizer_phase = capture
+            .as_ref()
+            .map(|c| c.phase("optimizer", Some(candle_graph::ExecutionStep::Optimizer)));
         optimizer.step(&grads)?;
         drop(grads);
         device.synchronize()?;
+        drop(optimizer_phase);
+        drop(measured);
+        drop(nsight);
+        if let Some(capture) = capture {
+            capture.finish()?;
+        }
         updates_done = update + 1;
         let row = json!({"update":update+1,"loops":loops,"losses":means,"gradient_l2":clip.pre_clip_norm,"clip_scale":clip.scale,"update_seconds":update_start.elapsed().as_secs_f64(),"elapsed_seconds":started.elapsed().as_secs_f64()});
         serde_json::to_writer(&mut log, &row)?;
@@ -1098,8 +1236,42 @@ fn seal(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn bind_profiles(root: &Path) -> Result<()> {
+    fn files(root: &Path, path: &Path, hashes: &mut serde_json::Map<String, Value>) -> Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                files(root, &path, hashes)?;
+            } else {
+                ensure!(kind.is_file(), "unexpected profile artifact type");
+                hashes.insert(
+                    path.strip_prefix(root)?.to_string_lossy().into_owned(),
+                    json!(file_hash(&path)?),
+                );
+            }
+        }
+        Ok(())
+    }
+    let profile_root = root.with_extension("profiles");
+    let mut hashes = serde_json::Map::new();
+    if profile_root.exists() {
+        files(&profile_root, &profile_root, &mut hashes)?;
+    }
+    let host_trace = std::env::var_os("TOFY_PERF_TRACE")
+        .map(PathBuf::from)
+        .map(|path| -> Result<Value> { Ok(json!({"sha256":file_hash(&path)?,"path":path})) })
+        .transpose()?;
+    write_json(
+        &root.join("profiles.json"),
+        &json!({"root":profile_root,"files":hashes,"host_trace":host_trace,"nsight":"external capture and export; bind in a separate bundle after profiler exit"}),
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    let perf_guard = tofy::perf::install()?;
     ensure!(
         args.loops > 0 && args.max_loops >= args.loops,
         "inference depth must cover positive training depth"
@@ -1125,17 +1297,34 @@ fn main() -> Result<()> {
         matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
+    if !matches!(args.mode, Mode::Evaluate | Mode::Inspect) {
+        let count = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
+            2
+        } else {
+            args.updates
+        };
+        ensure!(
+            !args.profile_updates.is_empty()
+                && args.profile_updates.iter().all(|&u| u > 0 && u <= count),
+            "profile updates must be nonempty and reachable"
+        );
+        ensure!(
+            cfg!(feature = "profiling") && perf_guard.is_some(),
+            "training requires the profiling feature and TOFY_PERF_TRACE"
+        );
+    }
     fs::create_dir(&args.output_dir).context("run root must be new, with an existing parent")?;
     write_json(
         &args.output_dir.join("launch.json"),
         &json!({
-            "status":"running", "exact_args":std::env::args().collect::<Vec<_>>(),
+            "status":"running", "pid":std::process::id(), "exact_args":std::env::args().collect::<Vec<_>>(),
             "source_revision":env!("TOFY_EMBEDDED_SOURCE_REVISION"),
             "binary_sha256":file_hash(&std::env::current_exe()?)?
         }),
     )?;
     let started = Instant::now();
     let result = run(&args, started);
+    drop(perf_guard);
     match &result {
         Ok(report) => {
             write_json(&args.output_dir.join("report.json"), report)?;
@@ -1146,6 +1335,7 @@ fn main() -> Result<()> {
             &json!({"status":"failed_integrity_or_evaluation","error":format!("{error:#}"),"elapsed_seconds":started.elapsed().as_secs_f64()}),
         )?,
     }
+    bind_profiles(&args.output_dir)?;
     seal(&args.output_dir)?;
     result.map(|_| ())
 }
@@ -1197,6 +1387,8 @@ mod tests {
             "1",
             "--max-loops",
             "1",
+            "--profile-eval",
+            "false",
         ]);
         let samples = fixed_samples(&args)?;
         assert_eq!(samples.len(), 128);
@@ -1251,6 +1443,8 @@ mod tests {
             "1",
             "--max-loops",
             "1",
+            "--profile-eval",
+            "false",
         ]);
         let vars = VarMap::new();
         let config = LoopedConfig {

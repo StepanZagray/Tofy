@@ -3,6 +3,7 @@
 //! The first environment is a synthetic prerequisite, not an ARC game.
 
 pub mod model;
+pub mod profile;
 pub mod task;
 
 pub const FRAME_SIDE: usize = 64;
