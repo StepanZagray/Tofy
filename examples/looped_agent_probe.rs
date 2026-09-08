@@ -238,7 +238,6 @@ fn inspected_predict(
         args.loops,
     )?;
     device.synchronize()?;
-    let nsight = tofy::perf::NvtxRange::new("tofy.looped/capture");
     let measured = capture.measurement();
     let phase = capture.phase("forward", Some(candle_graph::ExecutionStep::Forward));
     let out = predict(model, &[input], args.loops, device)?;
@@ -249,7 +248,6 @@ fn inspected_predict(
     device.synchronize()?;
     drop(phase);
     drop(measured);
-    drop(nsight);
     capture.finish()?;
     Ok(out)
 }
@@ -1030,9 +1028,6 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         if capture.is_some() {
             device.synchronize()?;
         }
-        let nsight = capture
-            .as_ref()
-            .map(|_| tofy::perf::NvtxRange::new("tofy.looped/capture"));
         let measured = capture.as_ref().map(LoopedCapture::measurement);
         let mut grads = None;
         let mut means = [0.0f32; 4];
@@ -1136,7 +1131,6 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         device.synchronize()?;
         drop(optimizer_phase);
         drop(measured);
-        drop(nsight);
         if let Some(capture) = capture {
             capture.finish()?;
         }

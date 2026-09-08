@@ -133,6 +133,17 @@ impl LoopedCapture {
         ensure!(loops > 0, "looped capture needs positive loops");
         let label = run.correlation_id.clone();
         let gpu = run.device == "cuda";
+        let mut labels = vec!["tofy.looped/capture".to_owned()];
+        if gradients.is_some() {
+            for micro in 0..effective_batch.div_ceil(physical_batch) {
+                labels.push(format!("{label}/micro-{micro}/forward"));
+                labels.push(format!("{label}/micro-{micro}/backward"));
+            }
+            labels.push(format!("{label}/gradient-inspection-and-clip"));
+            labels.push(format!("{label}/optimizer"));
+        } else {
+            labels.push(format!("{label}/forward"));
+        }
         let contract = CaptureContract {
             measurement_scope: MeasurementScope::ProfiledWork,
             tensors: CoverageLevel::Partial,
@@ -142,9 +153,9 @@ impl LoopedCapture {
                 CoverageLevel::None
             },
             gradient_contract: gradients.as_ref().map(|plan| plan.contract().clone()),
-            required_semantic_labels: vec![label.clone()],
-            gpu_expected_semantic_labels: if gpu { vec![label.clone()] } else { vec![] },
-            cpu_only_semantic_labels: if gpu { vec![] } else { vec![label.clone()] },
+            required_semantic_labels: labels.clone(),
+            gpu_expected_semantic_labels: if gpu { labels.clone() } else { vec![] },
+            cpu_only_semantic_labels: if gpu { vec![] } else { labels },
             // Operations, activations, logical/physical memory and device events
             // are unwired. Cargo features do not supply their instrumentation.
             ..CaptureContract::default()
@@ -188,7 +199,7 @@ impl LoopedCapture {
     pub fn measurement(&self) -> LoopedRange<'_> {
         self.measurements.set(self.measurements.get() + 1);
         self.measuring.set(true);
-        self.range(&self.label, None, true)
+        self.range("tofy.looped/capture", None, true)
     }
 
     pub fn phase(&self, name: &str, step: Option<ExecutionStep>) -> LoopedRange<'_> {
@@ -409,7 +420,7 @@ mod tests {
             // A controlled loss touches every real parameter with gradient one;
             // this tests capture coverage independently of the training objective.
             let loss = {
-                let forward = capture.phase("forward", Some(ExecutionStep::Forward));
+                let forward = capture.phase("micro-0/forward", Some(ExecutionStep::Forward));
                 let loss = vars
                     .all_vars()
                     .iter()
@@ -420,9 +431,13 @@ mod tests {
                 loss
             };
             {
-                let backward = capture.phase("pre_clip", Some(ExecutionStep::Backward));
+                drop(capture.phase("micro-0/backward", Some(ExecutionStep::Backward)));
+                drop(capture.phase("micro-1/forward", Some(ExecutionStep::Forward)));
+                drop(capture.phase("micro-1/backward", Some(ExecutionStep::Backward)));
+                let backward = capture.phase("gradient-inspection-and-clip", None);
                 capture.record_gradients(&backward, &loss.backward()?)?;
             }
+            drop(capture.phase("optimizer", Some(ExecutionStep::Optimizer)));
             capture.record_scalar(&measured, "batch/rows", 64.0)?;
         }
         let receipt = capture.finish()?;
@@ -484,9 +499,10 @@ mod tests {
         let destination = dir.0.join("complete");
         let capture = LoopedCapture::begin_eval(&destination, 1, &Device::Cpu, 1, 1, 1)?;
         {
-            let measured = capture.measurement();
+            let _measured = capture.measurement();
+            let forward = capture.phase("forward", Some(ExecutionStep::Forward));
             capture.record_tensor_stats(
-                &measured,
+                &forward,
                 "policy/logits",
                 &Tensor::ones((1, 4), DType::F32, &Device::Cpu)?,
             )?;
