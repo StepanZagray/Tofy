@@ -7,7 +7,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,12 +32,24 @@ enum Mode {
     Inspect,
     Fit,
     FitSmoke,
+    Coverage,
+    CoverageAudit,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Coverage {
+    Fixed,
+    Fresh,
 }
 
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long, value_enum)]
     mode: Mode,
+    /// Balanced one-step episode stream for the matched coverage comparison.
+    #[arg(long, value_enum, default_value = "fixed")]
+    coverage: Coverage,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "cuda:0")]
@@ -429,6 +441,157 @@ fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
     Ok(samples)
 }
 
+fn coverage_sample(args: &Args, id: u64) -> Result<(u64, usize, Sample)> {
+    let rules = task::permutation_ids(Split::Train);
+    let index = id / rules.len() as u64;
+    let episode = if args.coverage == Coverage::Fixed {
+        index % 8
+    } else {
+        index
+    };
+    let rule = rules[id as usize % rules.len()];
+    let ep = task::episode_with_permutation(args.data_seed ^ TRAIN_TAG, episode, rule, 1, 1)?;
+    Ok((episode, rule, task::sample(&ep)?))
+}
+
+fn input_hash(input: &Inputs) -> String {
+    let mut hash = Sha256::new();
+    for p in &input.patches {
+        hash.update(p.to_le_bytes());
+    }
+    for m in &input.metadata {
+        hash.update(m.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn query_hash(pixels: &[u32]) -> String {
+    let mut hash = Sha256::new();
+    for p in pixels {
+        hash.update(p.to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn coverage_row(id: u64, episode: u64, rule: usize, sample: &Sample) -> Value {
+    let mut targets = Sha256::new();
+    for p in &sample.next {
+        targets.update(p.to_le_bytes());
+    }
+    for p in sample.policy {
+        targets.update(p.to_le_bytes());
+    }
+    for p in sample.rewards {
+        targets.update(p.to_le_bytes());
+    }
+    targets.update(sample.value.to_le_bytes());
+    json!({"id":id,"episode_index":episode,"rule":rule,"input_sha256":input_hash(&sample.inputs),"query_sha256":query_hash(&sample.current),"targets_sha256":format!("{:x}",targets.finalize()),"correct_action":argmax(&sample.policy)})
+}
+
+fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
+    let mut log = BufWriter::new(File::create(args.output_dir.join("training-stream.jsonl"))?);
+    let mut inputs = HashSet::new();
+    let mut queries = HashSet::new();
+    let mut episodes = HashSet::new();
+    let mut rules = [0usize; 24];
+    for id in 0..(args.updates * args.effective_batch) as u64 {
+        deadline(args, started)?;
+        let (episode, rule, sample) = coverage_sample(args, id)?;
+        let row = coverage_row(id, episode, rule, &sample);
+        inputs.insert(row["input_sha256"].as_str().unwrap().to_owned());
+        queries.insert(row["query_sha256"].as_str().unwrap().to_owned());
+        episodes.insert(episode);
+        rules[rule] += 1;
+        serde_json::to_writer(&mut log, &row)?;
+        log.write_all(b"\n")?;
+    }
+    log.flush()?;
+    let mut evaluation = BufWriter::new(File::create(
+        args.output_dir.join("evaluation-queries.jsonl"),
+    )?);
+    for split in [Split::Train, Split::HeldOut] {
+        for layout in 0..64 {
+            deadline(args, started)?;
+            let mut correct = [0usize; ACTIONS];
+            for rule in task::permutation_ids(split) {
+                let ep = task::episode_with_permutation(
+                    20260909 ^ EVAL_TAG ^ 0x52554c45,
+                    layout,
+                    rule,
+                    1,
+                    1,
+                )?;
+                let sample = task::sample(&ep)?;
+                let query = query_hash(&sample.current);
+                ensure!(
+                    !queries.contains(&query),
+                    "evaluation query overlaps training"
+                );
+                let truth = argmax(&task::oracle(&ep.support, &ep.maze.render())?.0);
+                ensure!(
+                    sample.policy[truth] == 1.0,
+                    "oracle control disagrees with target"
+                );
+                correct[truth] += 1;
+                let changed = task::permutations()[rule].map(|d| (d + 1) % ACTIONS);
+                let wrong_id = task::permutations()
+                    .iter()
+                    .position(|p| *p == changed)
+                    .context("missing changed rule")?;
+                ensure!(
+                    task::permutation_ids(split).contains(&wrong_id),
+                    "wrong rule crosses split"
+                );
+                let wrong = task::episode_with_permutation(
+                    20260909 ^ EVAL_TAG ^ 0x52554c45,
+                    layout,
+                    wrong_id,
+                    1,
+                    1,
+                )?;
+                ensure!(
+                    ep.maze.render() == wrong.maze.render(),
+                    "oracle query parity"
+                );
+                let presented = argmax(&task::oracle(&wrong.support, &wrong.maze.render())?.0);
+                ensure!(
+                    truth != presented,
+                    "oracle counterfactual not outcome changing"
+                );
+                serde_json::to_writer(
+                    &mut evaluation,
+                    &json!({"split":split,"layout":layout,"rule":rule,"query_sha256":query,"true_action":truth,"wrong_action":presented,"cleared_fixed_action":0}),
+                )?;
+                evaluation.write_all(b"\n")?;
+            }
+            ensure!(
+                correct == [task::permutation_ids(split).len() / ACTIONS; ACTIONS],
+                "blind control not balanced"
+            );
+        }
+        for id in 0..64 {
+            deadline(args, started)?;
+            let (min, max) = if id % 2 == 0 { (1, 1) } else { (2, 10) };
+            let ep = task::episode(20260909 ^ EVAL_TAG ^ 0x50524544, id, split, min, max)?;
+            let sample = task::sample(&ep)?;
+            let query = query_hash(&sample.current);
+            ensure!(
+                !queries.contains(&query),
+                "prediction evaluation query overlaps training"
+            );
+            serde_json::to_writer(
+                &mut evaluation,
+                &json!({"split":split,"episode":id,"kind":"prediction","query_sha256":query,"input_sha256":input_hash(&sample.inputs)}),
+            )?;
+            evaluation.write_all(b"\n")?;
+        }
+    }
+    evaluation.flush()?;
+    Ok(
+        json!({"status":"complete_pending_analysis","evidence_class":"data_audit","coverage":args.coverage,"optimizer_updates":0,"rows":args.updates*args.effective_batch,"unique_inputs":inputs.len(),"unique_query_frames":queries.len(),"episode_ids":episodes.len(),"rule_counts":rules,"evaluation_data_seed":20260909,"evaluation_layouts":64,"evaluation_query_overlap":0,"oracle_factual_accuracy":1.0,"oracle_wrong_under_real":0.0,"oracle_follows_presented":1.0,"cleared_fixed_action_accuracy":0.25,"elapsed_seconds":started.elapsed().as_secs_f64()}),
+    )
+}
+
 fn fitting_check(
     args: &Args,
     model: &LoopedAgent,
@@ -767,7 +930,7 @@ fn prediction_metrics(
                 reward_fp += usize::from(!positive && reward[a] >= 0.5);
                 serde_json::to_writer(
                     &mut rows_log,
-                    &json!({"split":split,"episode":id,"permutation_id":ep.permutation_id,"action":a,"frame_exact":same,"copy_exact":real==sample.current,"changed_pixels":changed,"changed_correct":correct,"reward_target":sample.rewards[a],"reward_probability":reward[a],"policy_correct":sample.policy[action]>0.0}),
+                    &json!({"split":split,"episode":id,"permutation_id":ep.permutation_id,"input_sha256":input_hash(&sample.inputs),"query_sha256":query_hash(&sample.current),"action":a,"frame_exact":same,"copy_exact":real==sample.current,"changed_pixels":changed,"changed_correct":correct,"reward_target":sample.rewards[a],"reward_probability":reward[a],"policy_correct":sample.policy[action]>0.0}),
                 )?;
                 rows_log.write_all(b"\n")?;
             }
@@ -841,14 +1004,7 @@ fn rule_probe(
                 let mut rewards = Vec::new();
                 let mut input_hashes = Vec::new();
                 for input in inputs {
-                    let mut hash = Sha256::new();
-                    for p in &input.patches {
-                        hash.update(p.to_le_bytes());
-                    }
-                    for m in &input.metadata {
-                        hash.update(m.to_le_bytes());
-                    }
-                    input_hashes.push(format!("{:x}", hash.finalize()));
+                    input_hashes.push(input_hash(&input));
                     let output = if args.profile_eval
                         && split == Split::Train
                         && rows == 0
@@ -888,7 +1044,7 @@ fn rule_probe(
                 follows_wrong_rule += usize::from(actions[2] == wrong_truth);
                 serde_json::to_writer(
                     &mut log,
-                    &json!({"split":split,"layout":layout,"rule":rule,"wrong_rule":wrong_id,"correct_action":truth,"wrong_rule_action":wrong_truth,"predictions_true_clear_wrong":actions,"input_sha256_true_clear_wrong":input_hashes,"policy_logits_true_clear_wrong":logits,"policy_probabilities_true_clear_wrong":probabilities,"value_true_clear_wrong":values,"reward_probabilities_true_clear_wrong":rewards}),
+                    &json!({"split":split,"layout":layout,"rule":rule,"wrong_rule":wrong_id,"correct_action":truth,"wrong_rule_action":wrong_truth,"query_sha256":query_hash(&task::patchify(&frame)?),"predictions_true_clear_wrong":actions,"input_sha256_true_clear_wrong":input_hashes,"policy_logits_true_clear_wrong":logits,"policy_probabilities_true_clear_wrong":probabilities,"value_true_clear_wrong":values,"reward_probabilities_true_clear_wrong":rewards}),
                 )?;
                 log.write_all(b"\n")?;
             }
@@ -915,6 +1071,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         &args.output_dir.join("metadata.json"),
         &json!({"status":"running","schema":task::SCHEMA,"exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,"model":config,"seed":args.seed,"data_seed":args.data_seed,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"objectives":{"policy":1.0,"value":0.1,"reward":0.1,"balanced_categorical_dynamics":0.5},"training_rule_ids":task::permutation_ids(Split::Train),"held_out_rule_ids":task::permutation_ids(Split::HeldOut),"boundary":"scripted three-action calibration and visible objective; no active probe selection, hidden objectives, ARC data, or pretrained language weights"}),
     )?;
+    if args.mode == Mode::CoverageAudit {
+        return coverage_audit(args, started);
+    }
     let device = resolve_device(&args.device)?;
     let mut vars = VarMap::new();
     let model = LoopedAgent::new(
@@ -932,8 +1091,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         .sum::<usize>();
     let updates = match args.mode {
         Mode::Smoke | Mode::FitSmoke => 2,
-        Mode::Train | Mode::Fit => args.updates,
+        Mode::Train | Mode::Fit | Mode::Coverage => args.updates,
         Mode::Evaluate | Mode::Inspect => 0,
+        Mode::CoverageAudit => unreachable!("data audit returns before model construction"),
     };
     let mut optimizer = AdamW::new(
         vars.all_vars(),
@@ -945,7 +1105,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     )?;
     let mut log = BufWriter::new(File::create(args.output_dir.join("updates.jsonl"))?);
     vars.save(args.output_dir.join("initial.safetensors"))?;
-    let fixed = if matches!(args.mode, Mode::Fit | Mode::FitSmoke) {
+    let fixed = if matches!(args.mode, Mode::Fit | Mode::FitSmoke | Mode::Coverage) {
         ensure!(
             file_hash(&args.output_dir.join("initial.safetensors"))?
                 == "4cd502f7a76fe3dd9729f6693e9d707c670972f7ebe58ad1cbdde37ea2bb2802",
@@ -999,6 +1159,13 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         fit_result = Some(row);
     }
     let mut stream_hash = Sha256::new();
+    let mut coverage_log = if args.mode == Mode::Coverage {
+        Some(BufWriter::new(File::create(
+            args.output_dir.join("training-stream.jsonl"),
+        )?))
+    } else {
+        None
+    };
     let train_start = Instant::now();
     let mut updates_done = 0;
     for update in 0..updates {
@@ -1038,7 +1205,13 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             let mut samples = Vec::with_capacity(micro_batch);
             for b in 0..micro_batch {
                 let id = (update * args.effective_batch + micro * args.batch + b) as u64;
-                let (permutation_id, sample) = if let Some(pool) = &fixed {
+                let (permutation_id, sample) = if args.mode == Mode::Coverage {
+                    let (episode, rule, sample) = coverage_sample(args, id)?;
+                    let log = coverage_log.as_mut().context("missing coverage log")?;
+                    serde_json::to_writer(&mut *log, &coverage_row(id, episode, rule, &sample))?;
+                    log.write_all(b"\n")?;
+                    (rule, sample)
+                } else if let Some(pool) = &fixed {
                     pool[id as usize % pool.len()].clone()
                 } else {
                     let (min, max) = if id.is_multiple_of(2) {
@@ -1176,10 +1349,13 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     drop(optimizer);
     drop(model);
     drop(fit_log);
+    if let Some(mut log) = coverage_log {
+        log.flush()?;
+    }
     vars.save(args.output_dir.join("final.safetensors"))?;
     if let Some(fit) = fit_result {
         return Ok(
-            json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::FitSmoke {"implementation_smoke"} else {"fitting_diagnostic"},"claim_boundary":"fixed-set fitting ability only; no generalization or ARC claim","parameters":parameters,"optimizer_updates":updates_done,"requested_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_and_fit_check_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"fit":fit,"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
+            json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::FitSmoke {"implementation_smoke"} else if args.mode==Mode::Coverage {"coverage_screen"} else {"fitting_diagnostic"},"coverage":args.coverage,"claim_boundary":"fixed reference fitting only; frozen paired evaluation required for generalization; no ARC claim","parameters":parameters,"optimizer_updates":updates_done,"requested_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_and_fit_check_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"fit":fit,"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
         );
     }
     let model = frozen(&vars, &config, &device)?;
@@ -1291,7 +1467,10 @@ fn main() -> Result<()> {
         matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
-    if !matches!(args.mode, Mode::Evaluate | Mode::Inspect) {
+    if !matches!(
+        args.mode,
+        Mode::Evaluate | Mode::Inspect | Mode::CoverageAudit
+    ) {
         let count = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
             2
         } else {
@@ -1337,6 +1516,54 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_sampler_preserves_fixed_problem_and_only_expands_episode_ids() -> Result<()> {
+        let mut args = Args::parse_from([
+            "probe",
+            "--mode",
+            "coverage-audit",
+            "--output-dir",
+            "unused",
+        ]);
+        let fixed = fixed_samples(&args)?;
+        for id in 0..256 {
+            let (episode, rule, sample) = coverage_sample(&args, id)?;
+            let (old_rule, old) = &fixed[id as usize % fixed.len()];
+            assert_eq!(rule, *old_rule);
+            assert_eq!(input_hash(&sample.inputs), input_hash(&old.inputs));
+            assert_eq!(sample.current, old.current);
+            assert_eq!(sample.next, old.next);
+            assert_eq!(sample.policy, old.policy);
+            assert_eq!(sample.value, old.value);
+            assert_eq!(sample.rewards, old.rewards);
+            assert!(episode < 8);
+        }
+        args.coverage = Coverage::Fresh;
+        for episode in 0..16 {
+            let mut labels = [0; ACTIONS];
+            let mut query = None;
+            for offset in 0..16 {
+                let (actual, rule, sample) = coverage_sample(&args, episode * 16 + offset)?;
+                assert_eq!(actual, episode);
+                assert!(task::permutation_ids(Split::Train).contains(&rule));
+                let current = query_hash(&sample.current);
+                if let Some(ref expected) = query {
+                    assert_eq!(expected, &current);
+                }
+                query = Some(current);
+                labels[argmax(&sample.policy)] += 1;
+                if episode < 8 {
+                    assert_eq!(
+                        input_hash(&sample.inputs),
+                        input_hash(&fixed[(episode * 16 + offset) as usize].1.inputs)
+                    );
+                }
+            }
+            assert_eq!(labels, [4; ACTIONS]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn fitting_checkpoint_preserves_weights_and_rejects_overwrite() -> Result<()> {

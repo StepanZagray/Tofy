@@ -1,8 +1,8 @@
-# Matched procedural-episode coverage screen — registered, not launched
+# Matched procedural-episode coverage screen
 
 Decision recorded September 8, 2026 IST after the completed fixed fit and frozen
 depth sweep. This is the next bounded experiment, not a queued automatic run.
-It requires a small reviewed sampler/runner change and exact-binary preflight.
+It requires a reviewed sampler/runner change and exact-binary preflight.
 
 ## Claim and controls
 
@@ -97,3 +97,32 @@ Stop on timeout, numerical failure, data/hash mismatch or profiler failure;
 preserve the failed never-reused root. Do not extend the budget or automatically
 start follow-up seeds. Source/dependency/binary/CLI hashes and source-fetch checks
 must be finalized at launch from a reviewed pushed clean checkout.
+
+## Execution addendum — September 8, 23:24 IST
+
+The user has authorized autonomous continuation. The implementation uses
+`--mode coverage --coverage fixed|fresh`; both arms run the requested update
+count even if a reference fitting check passes. The existing fixed-fit mode
+keeps its separate first-pass diagnostic contract. Model/task source, objective,
+optimizer and loop schedule remain unchanged.
+
+Before training, run `coverage-audit` for each arm at updates1150/effective64,
+data seed9173 and a300-second cap. This invokes no model or optimizer. It records
+every planned example/input/query/target hash, unique input/query/episode counts,
+rule balance, all64-layout oracle/constant controls, and query-disjointness for
+both policy and prediction evaluators at seed20260909. The actual training loop
+records the same per-example schema; analysis must verify exact agreement with
+the corresponding sealed planned stream before interpreting outcomes.
+
+Frozen policy rows add query hashes; prediction rows add complete input and query
+hashes. Existing numerical fields must match the previous evaluator on the same
+checkpoint and original32-layout inputs in one zero-update CUDA parity check.
+Then use the registered64-layout readouts for the matched experiment. Evaluator
+parity and data audits are integrity checks, not additional model-selection gates.
+
+Requalify physical33/tail31 against physical34 with the exact launch binary and
+the prior512MiB sampled memory reserve. Both comparison arms use the same selected
+pair; if33 is not qualified, stop and amend the capacity choice before either arm
+starts. Keep the explicit `serde_json/float_roundtrip` feature on both producer
+and Candle Graph CLI. All wired profiles remain enabled; automatic NVTX
+correlation and the previously disclosed producer-plane gaps remain limitations.
