@@ -4,6 +4,19 @@ P2 is implemented as a recursive latent world-model experiment. The completed
 `readiness-v2` run is recorded below as a negative diagnostic result; implementation
 smoke tests must not be promoted to research results.
 
+## Looped transformer prerequisite — September 8, 2026 IST
+
+The completed from-scratch fixed fit reached **120/128 (93.75%)**, CE **0.181683**,
+at update **1150**, but fresh-layout accuracy was **28.9% familiar / 28.5% held-out
+mappings versus 25% cleared history**. Both generalization gates failed. Inference
+at 1/2/4/8 loops stayed near chance; learned successor predictions were worse than
+copy. This is local fitting capacity, not an ARC score or a deployable planner.
+
+[Exact run, commands, metrics and profiler qualifications](research/2026-09-08-looped-fit-results.md).
+The next [matched episode-coverage screen](research/2026-09-08-looped-layout-coverage-screen.md)
+is registered but not launched. The new core still lacks learned episode memory,
+active probing and an ARC adapter. No public pretraining or LLM controller was used.
+
 ## Frozen fields for the first experimental run
 
 Before inspecting a full run, record here:
@@ -857,6 +870,20 @@ dose-by-seed comparison while dropping the secondary update-125 trajectory quest
 the run must record this scope note and cannot support a learning-trajectory claim.
 
 ## Best So Far
+
+**Looped fixed-set prerequisite (not public ARC or generalization):**
+`fit-seed0` at source `b22ce068` reached 120/128 = 93.75%, CE 0.181683, update 1150,
+physical 33 / tail 31 / effective 64. Fresh-layout results remain near chance; see the
+[full report](research/2026-09-08-looped-fit-results.md). Exact invocation:
+
+```bash
+python3 /home/stepan/Projects/code/.tofy-runs/looped-profiled-fit-20260908T2156-IST/supervise.py \
+  --binary /home/stepan/Projects/code/.tofy-runs/looped-profiled-fit-20260908T2156-IST/looped_agent_probe_roundtrip \
+  --name fit-seed0 --mode fit --batch 33 --seconds 2100
+```
+
+The existing run root is sealed and intentionally cannot be reused. Build and
+full profiler command provenance are in the linked report and saved process JSON.
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
 
