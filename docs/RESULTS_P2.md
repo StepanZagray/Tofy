@@ -996,6 +996,11 @@ The [C16 action-binding qualification](research/2026-09-09-looped-binding-qualif
 passes CUDA and batch-512 checks, then stops at the registered runtime admission
 gate. The 1,150-update fit and all 15 evaluation streams never run; no new action
 score or learning verdict changes this record.
+The subsequent [C17 completed binding screen](research/2026-09-09-looped-binding-screen-results.md)
+fits its isolated abstract task at **256/256**, but held-out mappings score only
+**71/128**, including **2/32 omitted-action cases**. Its joint gate fails. The
+**1024/1024** reused visual-cache result uses familiar mappings and privileged
+initial role attention; it adds no native-controller or ARC best metric.
 
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
@@ -1506,3 +1511,40 @@ qualification analysis records seven disposable updates and zero main-fit update
 C17 is a separate profile-cadence/amortization correction, retaining the same
 600-second cap, model, data, optimizer and scientific gates. No action/ARC,
 vision, planner, memory or useful-recurrence improvement is claimed.
+
+## Learned action binding — completed negative screen, September 9, 2026 IST
+
+C17 completes all **1150 updates /588,800 presentations** with the unchanged
+C16 numerical model, **1,580,804 parameters**, four shared loops, policy CE
+only and **physical/effective batch512, accumulation1**. The timing correction
+admits **107.5438 s** against the unchanged600-second cap; actual training is
+**82.7160 s model-reported**. C16 itself remains qualification-only evidence.
+
+The isolated abstract binder fits **256/256 canonical cases**, up from58/256,
+including all64 missing-action cases. Held-out mappings reach **71/128**, up
+from31/128, but demonstrated actions score **69/96** and omitted actions only
+**2/32**. All three held-out accuracy gates fail; fit, support-order invariance
+and ablation integrity pass. Omitted CE worsens **1.6746→10.6422**, and overall
+held-out CE **1.5907→3.6701**, despite higher overall accuracy: many wrong
+answers become more confident. This bounds this seed/recipe, not every binder
+architecture or the presence of information in its representations.
+
+All four effect-zero/query-zero streams score exactly25% because identical
+ablated inputs have balanced labels. The terminal cached visual diagnostic
+scores **1024/1024**, including256/256 omitted, but uses reused C15 initial
+privileged role attention and familiar mappings. It is neither fresh visual
+transfer nor native end-to-end inference. Held-out1/2/4/8-loop counts are
+**74/75/71/69 of128**; no depth was selected and no recurrence benefit is proved.
+
+Independent reconstruction agrees on **2927 floating fields** within1.78e-15
+and **4994 discrete fields** exactly, sharing the pinned external lifecycle
+receipt. All21 wired CUDA captures are healthy/available/bound; automatic
+correlation and operation/memory/device-event gaps remain. Maximum sampled
+VRAM is **1246 MiB**, minimum sampled reserve **6905 MiB**, maximum sampled
+temperature **74°C**. The outer seal verifies **1408 files /596,145,101 bytes,
+1050 bindings and518 recorded PIDs gone**. Source **9d4827d2**.
+
+[All counts, CE, controls, exact commands, hashes and limitations](research/2026-09-09-looped-binding-screen-results.md).
+The next hypothesis is a learned binder equivariant to renaming action IDs;
+the requested larger power-of-two batch remains a future constraint. No next
+recipe or training result is claimed. Native-policy and ARC Best So Far remain unchanged.
