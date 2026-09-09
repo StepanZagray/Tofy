@@ -1,6 +1,8 @@
 //! Synthetic prerequisite for the from-scratch looped agent. Never loads ARC games.
 #[path = "looped_agent_probe/counterfactual.rs"]
 mod counterfactual;
+#[path = "looped_agent_probe/known_mapping.rs"]
+mod known_mapping;
 
 use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
@@ -35,6 +37,8 @@ enum Mode {
     Inspect,
     Counterfactual,
     CounterfactualAudit,
+    KnownMapping,
+    KnownMappingAudit,
     Fit,
     FitSmoke,
     Coverage,
@@ -55,6 +59,9 @@ struct Args {
     /// Balanced one-step episode stream for the matched coverage comparison.
     #[arg(long, value_enum, default_value = "fixed")]
     coverage: Coverage,
+    /// Spatial prerequisite: train and evaluate only the known permutation zero.
+    #[arg(long)]
+    known_mapping: bool,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "cuda:0")]
@@ -418,7 +425,12 @@ fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
     for layout in 0..8 {
         let mut reference = None;
         let mut labels = [0; ACTIONS];
-        for rule in task::permutation_ids(Split::Train) {
+        for scheduled_rule in task::permutation_ids(Split::Train) {
+            let rule = if args.known_mapping {
+                0
+            } else {
+                scheduled_rule
+            };
             let ep =
                 task::episode_with_permutation(args.data_seed ^ TRAIN_TAG, layout, rule, 1, 1)?;
             let sample = task::sample(&ep)?;
@@ -439,7 +451,7 @@ fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
             samples.push((rule, sample));
         }
         ensure!(
-            labels == [4; ACTIONS],
+            args.known_mapping || labels == [4; ACTIONS],
             "fixed-set labels must be balanced within each layout"
         );
     }
@@ -454,7 +466,12 @@ fn coverage_sample(args: &Args, id: u64) -> Result<(u64, usize, Sample)> {
     } else {
         index
     };
-    let rule = rules[id as usize % rules.len()];
+    // Retain sixteen slots per episode even when all slots use the known rule.
+    let rule = if args.known_mapping {
+        0
+    } else {
+        rules[id as usize % rules.len()]
+    };
     let ep = task::episode_with_permutation(args.data_seed ^ TRAIN_TAG, episode, rule, 1, 1)?;
     Ok((episode, rule, task::sample(&ep)?))
 }
@@ -494,6 +511,9 @@ fn coverage_row(id: u64, episode: u64, rule: usize, sample: &Sample) -> Value {
 }
 
 fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
+    if args.known_mapping {
+        return known_mapping::coverage_audit(args, started);
+    }
     let mut log = BufWriter::new(File::create(args.output_dir.join("training-stream.jsonl"))?);
     let mut inputs = HashSet::new();
     let mut queries = HashSet::new();
@@ -642,7 +662,7 @@ fn fitting_check(
             );
         }
         ce /= samples.len() as f64;
-        if clear {
+        if clear && !args.known_mapping {
             ensure!(
                 correct * 4 == samples.len() && ce >= 4.0f64.ln() - 0.0001,
                 "fixed-set blind information bound failed"
@@ -655,9 +675,13 @@ fn fitting_check(
         .context("missing fit accuracy")?
         >= 0.9
         && arms[0]["policy_ce"].as_f64().context("missing fit loss")? <= 0.35;
-    Ok(
-        json!({"update":update,"loops":args.loops,"arms":arms,"fit_gate_pass":pass,"elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+    let mut report = json!({"update":update,"loops":args.loops,"arms":arms,"fit_gate_pass":pass,"elapsed_seconds":started.elapsed().as_secs_f64()});
+    if args.known_mapping {
+        report["known_mapping"] = known_mapping::population();
+        report["policy_controls"] =
+            known_mapping::label_controls(samples.iter().map(|(_, sample)| sample))?;
+    }
+    Ok(report)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1072,15 +1096,19 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         layers: args.layers,
         max_loops: args.max_loops,
     };
-    write_json(
-        &args.output_dir.join("metadata.json"),
-        &json!({"status":"running","schema":task::SCHEMA,"exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,"model":config,"seed":args.seed,"data_seed":args.data_seed,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"objectives":{"policy":1.0,"value":0.1,"reward":0.1,"balanced_categorical_dynamics":0.5},"training_rule_ids":task::permutation_ids(Split::Train),"held_out_rule_ids":task::permutation_ids(Split::HeldOut),"boundary":"scripted three-action calibration and visible objective; no active probe selection, hidden objectives, ARC data, or pretrained language weights"}),
-    )?;
+    let mut metadata = json!({"status":"running","schema":task::SCHEMA,"exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,"model":config,"seed":args.seed,"data_seed":args.data_seed,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"objectives":{"policy":1.0,"value":0.1,"reward":0.1,"balanced_categorical_dynamics":0.5},"training_rule_ids":task::permutation_ids(Split::Train),"held_out_rule_ids":task::permutation_ids(Split::HeldOut),"boundary":"scripted three-action calibration and visible objective; no active probe selection, hidden objectives, ARC data, or pretrained language weights"});
+    if args.known_mapping {
+        known_mapping::annotate(&mut metadata);
+    }
+    write_json(&args.output_dir.join("metadata.json"), &metadata)?;
     if args.mode == Mode::CoverageAudit {
         return coverage_audit(args, started);
     }
     if args.mode == Mode::CounterfactualAudit {
         return counterfactual::audit(args, started);
+    }
+    if args.mode == Mode::KnownMappingAudit {
+        return known_mapping::audit(args, started, &HashSet::new());
     }
     let device = resolve_device(&args.device)?;
     let mut vars = VarMap::new();
@@ -1100,8 +1128,8 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let updates = match args.mode {
         Mode::Smoke | Mode::FitSmoke => 2,
         Mode::Train | Mode::Fit | Mode::Coverage => args.updates,
-        Mode::Evaluate | Mode::Inspect | Mode::Counterfactual => 0,
-        Mode::CoverageAudit | Mode::CounterfactualAudit => {
+        Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping => 0,
+        Mode::CoverageAudit | Mode::CounterfactualAudit | Mode::KnownMappingAudit => {
             unreachable!("data audit returns before model construction")
         }
     };
@@ -1150,10 +1178,24 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 hash.update(p.to_le_bytes());
             }
         }
-        write_json(
-            &args.output_dir.join("fixed-set.json"),
-            &json!({"layouts":8,"rules":task::permutation_ids(Split::Train),"examples":samples.len(),"order":"layout-major then increasing training rule ID; repeated cyclically","distance":1,"sha256":format!("{:x}",hash.finalize())}),
-        )?;
+        let mut fixed_set = json!({"layouts":8,"rules":task::permutation_ids(Split::Train),"examples":samples.len(),"order":"layout-major then increasing training rule ID; repeated cyclically","distance":1,"sha256":format!("{:x}",hash.finalize())});
+        if args.known_mapping {
+            let queries: HashSet<_> = samples
+                .iter()
+                .map(|(_, sample)| query_hash(&sample.current))
+                .collect();
+            ensure!(
+                queries.len() == 8,
+                "known reference requires eight unique queries"
+            );
+            fixed_set["rules"] = json!([0]);
+            fixed_set["unique_query_frames"] = json!(queries.len());
+            fixed_set["order"] = json!("eight original layouts, sixteen identical known-rule samples per layout; repeated cyclically");
+            fixed_set["known_mapping"] = known_mapping::population();
+            fixed_set["policy_controls"] =
+                known_mapping::label_controls(samples.iter().map(|(_, sample)| sample))?;
+        }
+        write_json(&args.output_dir.join("fixed-set.json"), &fixed_set)?;
         let row = fitting_check(
             args,
             &frozen(&vars, &config, &device)?,
@@ -1218,7 +1260,12 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 let (permutation_id, sample) = if args.mode == Mode::Coverage {
                     let (episode, rule, sample) = coverage_sample(args, id)?;
                     let log = coverage_log.as_mut().context("missing coverage log")?;
-                    serde_json::to_writer(&mut *log, &coverage_row(id, episode, rule, &sample))?;
+                    let row = if args.known_mapping {
+                        known_mapping::training_row(id, episode, &sample)
+                    } else {
+                        coverage_row(id, episode, rule, &sample)
+                    };
+                    serde_json::to_writer(&mut *log, &row)?;
                     log.write_all(b"\n")?;
                     (rule, sample)
                 } else if let Some(pool) = &fixed {
@@ -1364,11 +1411,31 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     }
     vars.save(args.output_dir.join("final.safetensors"))?;
     if let Some(fit) = fit_result {
-        return Ok(
-            json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::FitSmoke {"implementation_smoke"} else if args.mode==Mode::Coverage {"coverage_screen"} else {"fitting_diagnostic"},"coverage":args.coverage,"claim_boundary":"fixed reference fitting only; frozen paired evaluation required for generalization; no ARC claim","parameters":parameters,"optimizer_updates":updates_done,"requested_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_and_fit_check_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"fit":fit,"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?}),
-        );
+        let mut report = json!({"status":"complete_pending_analysis","evidence_class":if args.mode==Mode::FitSmoke {"implementation_smoke"} else if args.mode==Mode::Coverage {"coverage_screen"} else {"fitting_diagnostic"},"coverage":args.coverage,"claim_boundary":"fixed reference fitting only; frozen paired evaluation required for generalization; no ARC claim","parameters":parameters,"optimizer_updates":updates_done,"requested_updates":updates,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"training_and_fit_check_seconds":train_seconds,"elapsed_seconds":started.elapsed().as_secs_f64(),"fit":fit,"training_stream_sha256":format!("{:x}",stream_hash.finalize()),"final_checkpoint_sha256":file_hash(&args.output_dir.join("final.safetensors"))?});
+        if args.known_mapping {
+            known_mapping::annotate(&mut report);
+            report["evidence_class"] = json!(if args.mode == Mode::FitSmoke {
+                "implementation_smoke"
+            } else {
+                "known_mapping_spatial_prerequisite"
+            });
+            report["claim_boundary"] = json!("single-seed fixed-known-control spatial prerequisite; fitted reference is not generalization; no variable-rule comparison or promotion");
+        }
+        return Ok(report);
     }
     let model = frozen(&vars, &config, &device)?;
+    if args.mode == Mode::KnownMapping {
+        let evaluation = known_mapping::evaluate(args, &model, &device, started)?;
+        return Ok(json!({
+            "status": "complete_pending_analysis", "evidence_class": "frozen_known_mapping_diagnostic",
+            "known_mapping": known_mapping::population(), "optimizer_updates": 0,
+            "parameters": parameters, "physical_batch": args.batch, "effective_batch": args.effective_batch,
+            "accumulation": args.accumulation(), "evaluation": evaluation,
+            "final_checkpoint_sha256": file_hash(&args.output_dir.join("final.safetensors"))?,
+            "elapsed_seconds": started.elapsed().as_secs_f64(),
+            "claim_boundary": "single-seed known spatial prerequisite; no variable-rule comparison, ARC claim or promotion"
+        }));
+    }
     if args.mode == Mode::Counterfactual {
         let counterfactual = counterfactual::evaluate(args, &model, &device, started)?;
         return Ok(json!({
@@ -1467,6 +1534,7 @@ fn bind_profiles(root: &Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    known_mapping::validate_args(&args)?;
     let perf_guard = tofy::perf::install()?;
     ensure!(
         args.loops > 0 && args.max_loops >= args.loops,
@@ -1486,20 +1554,21 @@ fn main() -> Result<()> {
         "invalid learning rate"
     );
     ensure!(
-        args.mode != Mode::Counterfactual || (args.batch == 1 && args.effective_batch == 1),
+        !matches!(args.mode, Mode::Counterfactual | Mode::KnownMapping)
+            || (args.batch == 1 && args.effective_batch == 1),
         "counterfactual evaluation requires physical/effective batch one"
     );
     ensure!(
         !matches!(
             args.mode,
-            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual
+            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping
         ) || args.checkpoint.is_some(),
         "evaluation requires a checkpoint"
     );
     ensure!(
         matches!(
             args.mode,
-            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual
+            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping
         ) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
@@ -1510,6 +1579,8 @@ fn main() -> Result<()> {
             | Mode::Counterfactual
             | Mode::CoverageAudit
             | Mode::CounterfactualAudit
+            | Mode::KnownMapping
+            | Mode::KnownMappingAudit
     ) {
         let count = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
             2

@@ -14,9 +14,9 @@ use super::{deadline, file_hash, input_hash, inspected_predict, predict, query_h
 
 const SCHEMA: &str = "looped-successor-counterfactual-v1";
 const EPISODE_TAG: u64 = 0x43464c4f4f50;
-const PROBABILITY_TOLERANCE: f64 = 1e-5;
-const PROBABILITIES_PER_INPUT: usize = ACTIONS * PIXELS * PALETTE;
-const STATES_PER_INPUT: usize = (1 + 2 * ACTIONS) * PIXELS;
+pub(super) const PROBABILITY_TOLERANCE: f64 = 1e-5;
+pub(super) const PROBABILITIES_PER_INPUT: usize = ACTIONS * PIXELS * PALETTE;
+pub(super) const STATES_PER_INPUT: usize = (1 + 2 * ACTIONS) * PIXELS;
 
 #[derive(Serialize)]
 struct InputIdentity {
@@ -155,21 +155,21 @@ pub(super) fn audit(args: &super::Args, started: Instant) -> Result<Value> {
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-struct ByteRange {
-    offset_bytes: usize,
-    length_bytes: usize,
+pub(super) struct ByteRange {
+    pub(super) offset_bytes: usize,
+    pub(super) length_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct Offsets {
-    probabilities: ByteRange,
-    states: ByteRange,
-    current: ByteRange,
-    targets: ByteRange,
-    predicted: ByteRange,
+pub(super) struct Offsets {
+    pub(super) probabilities: ByteRange,
+    pub(super) states: ByteRange,
+    pub(super) current: ByteRange,
+    pub(super) targets: ByteRange,
+    pub(super) predicted: ByteRange,
 }
 
-fn offsets(input_index: usize) -> Offsets {
+pub(super) fn offsets(input_index: usize) -> Offsets {
     let state_start = input_index * STATES_PER_INPUT;
     Offsets {
         probabilities: ByteRange {
@@ -195,7 +195,7 @@ fn offsets(input_index: usize) -> Offsets {
     }
 }
 
-fn action_range(range: ByteRange, action: usize) -> ByteRange {
+pub(super) fn action_range(range: ByteRange, action: usize) -> ByteRange {
     let length_bytes = range.length_bytes / ACTIONS;
     ByteRange {
         offset_bytes: range.offset_bytes + action * length_bytes,
@@ -203,7 +203,7 @@ fn action_range(range: ByteRange, action: usize) -> ByteRange {
     }
 }
 
-fn write_binary(
+pub(super) fn write_binary(
     probabilities_file: &mut impl Write,
     states_file: &mut impl Write,
     probabilities: &[f32],
@@ -236,7 +236,7 @@ fn write_binary(
     Ok(())
 }
 
-fn validate_probabilities(values: &[f32], classes: usize) -> Result<f64> {
+pub(super) fn validate_probabilities(values: &[f32], classes: usize) -> Result<f64> {
     ensure!(
         !values.is_empty() && values.len().is_multiple_of(classes),
         "invalid probability dimensions"
@@ -260,24 +260,29 @@ fn validate_probabilities(values: &[f32], classes: usize) -> Result<f64> {
 }
 
 #[derive(Debug, Default, Serialize)]
-struct Region {
-    correct: usize,
-    total: usize,
+pub(super) struct Region {
+    pub(super) correct: usize,
+    pub(super) total: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct Metrics {
-    class: &'static str,
-    exact: bool,
-    copy_exact: bool,
-    changed: Region,
-    unchanged: Region,
-    vacated: Region,
-    destination: Region,
-    patch_inconsistency_count: usize,
+pub(super) struct Metrics {
+    pub(super) class: &'static str,
+    pub(super) exact: bool,
+    pub(super) copy_exact: bool,
+    pub(super) changed: Region,
+    pub(super) unchanged: Region,
+    pub(super) vacated: Region,
+    pub(super) destination: Region,
+    pub(super) patch_inconsistency_count: usize,
 }
 
-fn metrics(current: &[u32], target: &[u32], predicted: &[u32], reward: f32) -> Result<Metrics> {
+pub(super) fn metrics(
+    current: &[u32],
+    target: &[u32],
+    predicted: &[u32],
+    reward: f32,
+) -> Result<Metrics> {
     ensure!(
         current.len() == PIXELS && target.len() == PIXELS && predicted.len() == PIXELS,
         "invalid successor metric dimensions"
