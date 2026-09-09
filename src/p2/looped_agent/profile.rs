@@ -53,6 +53,7 @@ impl LoopedCapture {
         effective_batch: usize,
         loops: usize,
         input_source: &str,
+        model_kind: super::binding::ModelKind,
     ) -> Result<Self> {
         ensure!(
             matches!(input_source, "abstract_effects" | "precomputed_visual"),
@@ -79,9 +80,9 @@ impl LoopedCapture {
                     .collect::<Vec<_>>();
                 named.sort_by(|a, b| a.0.cmp(&b.0));
                 ensure!(
-                    named.len() == 29
+                    named.len() == model_kind.tensor_count()
                         && named.iter().map(|(_, v)| v.elem_count()).sum::<usize>()
-                            == super::binding::PARAMETERS
+                            == model_kind.parameter_count()
                         && named.iter().all(|(n, _)| family(n).is_some()),
                     "unexpected binder parameters"
                 );
@@ -116,7 +117,8 @@ impl LoopedCapture {
         .tag("workload", "looped-action-binding")
         .tag("input_source", input_source)
         .tag("feature_seam", "action-effect-records")
-        .tag("parameter_count", super::binding::PARAMETERS.to_string())
+        .tag("parameter_count", model_kind.parameter_count().to_string())
+        .tag("model_kind", model_kind.name())
         .tag("shared_blocks", "2")
         .tag("vision_core_forwards", "0");
         Self::open(
@@ -675,94 +677,105 @@ mod tests {
 
     #[test]
     fn binding_contract_has_only_the_three_executed_families() -> Result<()> {
-        use super::super::binding::ControlBinder;
-        let dir = TestDir::new("binding");
-        let device = Device::Cpu;
-        let vars = VarMap::new();
-        let _model = ControlBinder::new(VarBuilder::from_varmap(&vars, DType::F32, &device))?;
-        let destination = dir.0.join("train");
-        let cap = LoopedCapture::begin_binding(
-            &destination,
-            2,
-            &device,
-            Some(&vars),
-            512,
-            512,
-            4,
-            "abstract_effects",
-        )?;
-        {
-            let _measured = cap.measurement();
-            let loss = {
-                let forward = cap.phase("micro-0/forward", Some(ExecutionStep::Forward));
-                let loss = vars
-                    .all_vars()
-                    .iter()
-                    .try_fold(Tensor::zeros((), DType::F32, &device)?, |sum, var| {
-                        sum.add(&var.sum_all()?)
-                    })?;
-                cap.record_tensor_stats(&forward, "loss/policy", &loss)?;
-                loss
-            };
-            let grads = {
-                let _backward = cap.phase("micro-0/backward", Some(ExecutionStep::Backward));
-                loss.backward()?
-            };
-            {
-                let inspect = cap.phase("gradient-inspection-and-clip", None);
-                cap.record_gradients(&inspect, &grads)?;
-            }
-            drop(cap.phase("optimizer", Some(ExecutionStep::Optimizer)));
-        }
-        cap.finish()?;
-        candle_graph::verify_bundle(&destination)?;
-        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
-        let health = analyze_health(&trace);
-        assert!(health.structurally_valid && health.capture_complete);
-        assert_eq!(trace.gradients.len(), 29);
-        let contract = trace
-            .run
-            .capture_contract
-            .gradient_contract
-            .as_ref()
-            .unwrap();
-        let families = contract
-            .families
-            .iter()
-            .map(|f| f.family.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            families,
-            std::collections::BTreeSet::from(["input", "shared_core", "policy"])
-        );
-        assert_eq!(trace.run.tags["parameter_count"], "1580804");
-        assert_eq!(trace.run.tags["physical_batch"], "512");
-        assert_eq!(trace.run.tags["effective_batch"], "512");
-        assert_eq!(trace.run.tags["vision_core_forwards"], "0");
-        let destination = dir.0.join("eval");
-        let cap = LoopedCapture::begin_binding(
-            &destination,
-            1,
-            &device,
-            None,
-            4,
-            4,
-            4,
-            "precomputed_visual",
-        )?;
-        {
-            let _measured = cap.measurement();
-            let forward = cap.phase("forward", Some(ExecutionStep::Forward));
-            cap.record_tensor_stats(
-                &forward,
-                "policy/logits",
-                &Tensor::zeros((4, 4), DType::F32, &device)?,
+        use super::super::binding::{Binder, ModelKind};
+        for model_kind in [ModelKind::Legacy, ModelKind::Equivariant] {
+            let dir = TestDir::new("binding");
+            let device = Device::Cpu;
+            let vars = VarMap::new();
+            let _model = Binder::new(
+                model_kind,
+                VarBuilder::from_varmap(&vars, DType::F32, &device),
             )?;
+            let destination = dir.0.join("train");
+            let cap = LoopedCapture::begin_binding(
+                &destination,
+                2,
+                &device,
+                Some(&vars),
+                512,
+                512,
+                4,
+                "abstract_effects",
+                model_kind,
+            )?;
+            {
+                let _measured = cap.measurement();
+                let loss = {
+                    let forward = cap.phase("micro-0/forward", Some(ExecutionStep::Forward));
+                    let loss = vars
+                        .all_vars()
+                        .iter()
+                        .try_fold(Tensor::zeros((), DType::F32, &device)?, |sum, var| {
+                            sum.add(&var.sum_all()?)
+                        })?;
+                    cap.record_tensor_stats(&forward, "loss/policy", &loss)?;
+                    loss
+                };
+                let grads = {
+                    let _backward = cap.phase("micro-0/backward", Some(ExecutionStep::Backward));
+                    loss.backward()?
+                };
+                {
+                    let inspect = cap.phase("gradient-inspection-and-clip", None);
+                    cap.record_gradients(&inspect, &grads)?;
+                }
+                drop(cap.phase("optimizer", Some(ExecutionStep::Optimizer)));
+            }
+            cap.finish()?;
+            candle_graph::verify_bundle(&destination)?;
+            let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+            let health = analyze_health(&trace);
+            assert!(health.structurally_valid && health.capture_complete);
+            assert_eq!(trace.gradients.len(), model_kind.tensor_count());
+            let contract = trace
+                .run
+                .capture_contract
+                .gradient_contract
+                .as_ref()
+                .unwrap();
+            let families = contract
+                .families
+                .iter()
+                .map(|f| f.family.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                families,
+                std::collections::BTreeSet::from(["input", "shared_core", "policy"])
+            );
+            assert_eq!(
+                trace.run.tags["parameter_count"],
+                model_kind.parameter_count().to_string()
+            );
+            assert_eq!(trace.run.tags["model_kind"], model_kind.name());
+            assert_eq!(trace.run.tags["physical_batch"], "512");
+            assert_eq!(trace.run.tags["effective_batch"], "512");
+            assert_eq!(trace.run.tags["vision_core_forwards"], "0");
+            let destination = dir.0.join("eval");
+            let cap = LoopedCapture::begin_binding(
+                &destination,
+                1,
+                &device,
+                None,
+                4,
+                4,
+                4,
+                "precomputed_visual",
+                model_kind,
+            )?;
+            {
+                let _measured = cap.measurement();
+                let forward = cap.phase("forward", Some(ExecutionStep::Forward));
+                cap.record_tensor_stats(
+                    &forward,
+                    "policy/logits",
+                    &Tensor::zeros((4, 4), DType::F32, &device)?,
+                )?;
+            }
+            cap.finish()?;
+            let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+            assert!(trace.run.capture_contract.gradient_contract.is_none());
+            assert_eq!(trace.run.tags["input_source"], "precomputed_visual");
         }
-        cap.finish()?;
-        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
-        assert!(trace.run.capture_contract.gradient_contract.is_none());
-        assert_eq!(trace.run.tags["input_source"], "precomputed_visual");
         Ok(())
     }
 

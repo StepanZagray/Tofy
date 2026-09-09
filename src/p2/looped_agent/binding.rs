@@ -7,6 +7,7 @@ use super::{
 use anyhow::{ensure, Result};
 use candle_core::{DType, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
+use serde::{Deserialize, Serialize};
 
 pub const RECORDS: usize = 4;
 pub const INPUT_WIDTH: usize = 7;
@@ -15,6 +16,114 @@ pub const HEADS: usize = 4;
 pub const LAYERS: usize = 2;
 pub const MAX_LOOPS: usize = 8;
 pub const PARAMETERS: usize = 1_580_804;
+pub const EQUIVARIANT_PARAMETERS: usize = 1_579_265;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    Legacy,
+    Equivariant,
+}
+
+impl ModelKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Equivariant => "equivariant",
+        }
+    }
+    pub fn parameter_count(self) -> usize {
+        match self {
+            Self::Legacy => PARAMETERS,
+            Self::Equivariant => EQUIVARIANT_PARAMETERS,
+        }
+    }
+    pub fn tensor_count(self) -> usize {
+        match self {
+            Self::Legacy => 29,
+            Self::Equivariant => 28,
+        }
+    }
+}
+
+pub enum Binder {
+    Legacy(ControlBinder),
+    Equivariant(EquivariantBinder),
+}
+
+impl Binder {
+    pub fn new(kind: ModelKind, vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(match kind {
+            ModelKind::Legacy => Self::Legacy(ControlBinder::new(vb)?),
+            ModelKind::Equivariant => Self::Equivariant(EquivariantBinder::new(vb)?),
+        })
+    }
+    pub fn forward(&self, records: &Tensor, loops: usize) -> Result<Tensor> {
+        match self {
+            Self::Legacy(model) => model.forward(records, loops),
+            Self::Equivariant(model) => model.forward(records, loops),
+        }
+    }
+}
+
+/// Four action tokens share every learned operation. The missing action keeps
+/// zero observed effect and an explicit zero observation mask; no effect is inferred.
+pub struct EquivariantBinder {
+    input_projection: Linear,
+    blocks: Vec<TransformerBlock>,
+    policy_head: Linear,
+}
+
+impl EquivariantBinder {
+    pub fn new(vb: VarBuilder<'_>) -> Result<Self> {
+        let blocks = (0..LAYERS)
+            .map(|layer| TransformerBlock::new(WIDTH, HEADS, vb.pp(format!("block_{layer}"))))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            input_projection: linear(5, WIDTH, vb.pp("input_projection"))?,
+            blocks,
+            policy_head: linear(WIDTH, 1, vb.pp("policy_head"))?,
+        })
+    }
+
+    fn action_tokens(records: &Tensor) -> Result<Tensor> {
+        let (batch, count, width) = records.dims3()?;
+        ensure!(
+            batch > 0 && count == RECORDS && width == INPUT_WIDTH && records.dtype() == DType::F32,
+            "binder requires nonempty F32 [B, {RECORDS}, {INPUT_WIDTH}] records"
+        );
+        let support = records.narrow(1, 0, 3)?;
+        let actions = support
+            .narrow(2, 2, ACTIONS)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let effects = actions.matmul(&support.narrow(2, 0, 2)?.contiguous()?)?;
+        let observed = actions.sum_keepdim(2)?;
+        let desired = records
+            .narrow(1, 3, 1)?
+            .narrow(2, 0, 2)?
+            .broadcast_as((batch, ACTIONS, 2))?;
+        Ok(Tensor::cat(&[effects, observed, desired], 2)?.contiguous()?)
+    }
+
+    pub fn forward(&self, records: &Tensor, loops: usize) -> Result<Tensor> {
+        ensure!(
+            (1..=MAX_LOOPS).contains(&loops),
+            "binder loops must be in 1..={MAX_LOOPS}"
+        );
+        let recalled = self
+            .input_projection
+            .forward(&Self::action_tokens(records)?)?;
+        let mut state = Tensor::zeros_like(&recalled)?;
+        for _ in 0..loops {
+            state = state.add(&recalled)?;
+            for block in &self.blocks {
+                state = block.forward(&state)?;
+            }
+        }
+        Ok(self.policy_head.forward(&rms_norm(&state)?)?.squeeze(2)?)
+    }
+}
 
 /// Two transformer blocks reused at every loop, followed by a four-action head.
 /// No positional encoding distinguishes the support records: reordering them
@@ -84,6 +193,12 @@ mod tests {
         let device = Device::Cpu;
         let vars = VarMap::new();
         let model = ControlBinder::new(VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        initialize_fixture(&vars)?;
+        Ok((model, vars))
+    }
+
+    fn initialize_fixture(vars: &VarMap) -> Result<()> {
+        let device = Device::Cpu;
         // Deterministic synthetic parameters; no dataset or optimizer is used.
         let named = vars
             .data()
@@ -105,7 +220,7 @@ mod tests {
                 .collect::<Vec<_>>();
             var.set(&Tensor::from_vec(values, var.shape(), &device)?)?;
         }
-        Ok((model, vars))
+        Ok(())
     }
 
     fn records(batch: usize) -> Result<Tensor> {
@@ -130,6 +245,132 @@ mod tests {
 
     fn values(tensor: &Tensor) -> Result<Vec<f32>> {
         Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
+    }
+
+    #[test]
+    fn equivariant_tokens_do_not_complete_the_missing_effect() -> Result<()> {
+        let tokens = EquivariantBinder::action_tokens(&records(1)?)?.to_vec3::<f32>()?;
+        assert_eq!(
+            tokens[0],
+            vec![
+                vec![0., -1., 1., 1., 0.],
+                vec![-1., 0., 1., 1., 0.],
+                vec![0., 1., 1., 1., 0.],
+                vec![0., 0., 0., 1., 0.],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equivariant_model_relabels_all_actions_and_ignores_support_order() -> Result<()> {
+        let vars = VarMap::new();
+        let model =
+            EquivariantBinder::new(VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu))?;
+        initialize_fixture(&vars)?;
+        assert_eq!(
+            vars.all_vars()
+                .iter()
+                .map(|v| v.elem_count())
+                .sum::<usize>(),
+            EQUIVARIANT_PARAMETERS
+        );
+        assert_eq!(EQUIVARIANT_PARAMETERS, 24 * WIDTH * WIDTH + 25 * WIDTH + 1);
+        assert_eq!(vars.all_vars().len(), 28);
+        assert!(!vars.data().lock().unwrap().contains_key("readout_token"));
+        let input = records(1)?;
+        let raw = input.to_vec3::<f32>()?;
+        let permutations = (0..4)
+            .flat_map(|a| {
+                (0..4).flat_map(move |b| {
+                    (0..4).flat_map(move |c| {
+                        (0..4).filter_map(move |d| {
+                            let p = [a, b, c, d];
+                            p.iter()
+                                .enumerate()
+                                .all(|(i, x)| !p[..i].contains(x))
+                                .then_some(p)
+                        })
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(permutations.len(), 24);
+        for loops in [1, 4, 8] {
+            let expected = values(&model.forward(&input, loops)?)?;
+            for p in &permutations {
+                let mut renamed = raw.clone();
+                for support in 0..3 {
+                    for action in 0..4 {
+                        renamed[0][support][2 + action] = raw[0][support][2 + p[action]];
+                    }
+                }
+                let renamed = Tensor::from_vec(
+                    renamed.into_iter().flatten().flatten().collect::<Vec<_>>(),
+                    (1, 4, 7),
+                    &Device::Cpu,
+                )?;
+                let actual = values(&model.forward(&renamed, loops)?)?;
+                for action in 0..4 {
+                    let target = expected[p[action]];
+                    assert!((actual[action] - target).abs() <= 1e-5 + 1e-5 * target.abs());
+                }
+            }
+            for p in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let parts = p
+                    .into_iter()
+                    .chain([3])
+                    .map(|i| input.narrow(1, i, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                assert_eq!(
+                    values(&model.forward(&Tensor::cat(&parts, 1)?, loops)?)?,
+                    expected
+                );
+            }
+        }
+        for loops in [0, 9] {
+            assert!(model.forward(&input, loops).is_err());
+        }
+        assert!(model
+            .forward(&Tensor::zeros((1, 3, 7), DType::F32, &Device::Cpu)?, 4)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn equivariant_records_and_shared_weights_receive_gradients() -> Result<()> {
+        let vars = VarMap::new();
+        let model =
+            EquivariantBinder::new(VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu))?;
+        initialize_fixture(&vars)?;
+        let input = Var::from_tensor(&records(2)?)?;
+        let logits = model.forward(&input, 4)?;
+        assert_eq!(logits.dims(), [2, 4]);
+        let grads = logits.sqr()?.mean_all()?.backward()?;
+        for record in grads
+            .get(&input)
+            .unwrap()
+            .to_vec3::<f32>()?
+            .iter()
+            .flatten()
+        {
+            assert!(record.iter().all(|v| v.is_finite()) && record.iter().any(|&v| v != 0.));
+        }
+        for (name, var) in vars.data().lock().unwrap().iter() {
+            let gradient = values(grads.get(var).unwrap_or_else(|| panic!("missing {name}")))?;
+            assert!(gradient.iter().all(|v| v.is_finite()), "nonfinite {name}");
+            if name.ends_with("weight") {
+                assert!(gradient.iter().any(|&v| v != 0.), "zero {name}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

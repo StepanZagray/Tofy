@@ -15,13 +15,14 @@ use std::{
 };
 use tofy::p2::{
     looped_agent::{
-        binding::{ControlBinder, INPUT_WIDTH, PARAMETERS, RECORDS},
+        binding::{Binder, ModelKind, INPUT_WIDTH, RECORDS},
         profile::{LoopedCapture, LoopedRange},
     },
     optimizer::{accumulate_parameter_gradients, clip_gradients_gpu_with_stats},
 };
 
-pub const EFFECTIVE: usize = 512;
+pub const MIN_EFFECTIVE: usize = 512;
+pub const MAX_EFFECTIVE: usize = 32768;
 pub const DIGEST_SCHEMA: &str = "looped-action-binding-parameters-v1";
 
 #[derive(Clone)]
@@ -40,7 +41,8 @@ impl Row {
                 "loops",
                 "cleared",
                 "query_cleared",
-                "model_input_sha256"
+                "model_input_sha256",
+                "model_kind"
             ]
             .iter()
             .all(|key| raw.get(key).is_none()),
@@ -169,10 +171,21 @@ pub type Snapshot = BTreeMap<String, (Vec<usize>, Vec<u32>)>;
 /// Domain bytes + NUL, then sorted entries: u64-LE name length/name bytes,
 /// u64-LE rank/dimensions, u64-LE element count, and u32-LE F32 bit patterns.
 pub fn parameter_digest(snapshot: &Snapshot) -> String {
+    digest_parameters(snapshot, false)
+}
+
+pub fn shared_core_parameter_digest(snapshot: &Snapshot) -> String {
+    digest_parameters(snapshot, true)
+}
+
+fn digest_parameters(snapshot: &Snapshot, shared_only: bool) -> String {
     let mut hash = Sha256::new();
     hash.update(DIGEST_SCHEMA.as_bytes());
     hash.update([0]);
-    for (name, (shape, values)) in snapshot {
+    for (name, (shape, values)) in snapshot
+        .iter()
+        .filter(|(name, _)| !shared_only || name.starts_with("block_"))
+    {
         hash.update((name.len() as u64).to_le_bytes());
         hash.update(name.as_bytes());
         hash.update((shape.len() as u64).to_le_bytes());
@@ -188,7 +201,8 @@ pub fn parameter_digest(snapshot: &Snapshot) -> String {
 }
 
 pub struct Model {
-    pub binder: ControlBinder,
+    pub binder: Binder,
+    pub kind: ModelKind,
     pub vars: VarMap,
     pub device: Device,
     names: Vec<(String, Var)>,
@@ -201,18 +215,19 @@ pub struct Changes {
     pub changed_head_names: Vec<String>,
 }
 impl Model {
-    pub fn new(device: &Device) -> Result<Self> {
+    pub fn new(device: &Device, kind: ModelKind) -> Result<Self> {
         let vars = VarMap::new();
-        let binder = ControlBinder::new(VarBuilder::from_varmap(&vars, DType::F32, device))?;
+        let binder = Binder::new(kind, VarBuilder::from_varmap(&vars, DType::F32, device))?;
         initialize(&vars, 0)?;
         let names = named(&vars)?;
         ensure!(
-            names.iter().map(|(_, v)| v.elem_count()).sum::<usize>() == PARAMETERS
-                && names.len() == 29,
+            names.iter().map(|(_, v)| v.elem_count()).sum::<usize>() == kind.parameter_count()
+                && names.len() == kind.tensor_count(),
             "binder parameter population differs"
         );
         Ok(Self {
             binder,
+            kind,
             vars,
             device: device.clone(),
             names,
@@ -320,13 +335,16 @@ impl Model {
         );
         Ok(())
     }
-    pub fn frozen(&self) -> Result<ControlBinder> {
+    pub fn frozen(&self) -> Result<Binder> {
         let tensors = self
             .names
             .iter()
             .map(|(n, v)| Ok((n.clone(), v.detach().copy()?)))
             .collect::<Result<HashMap<_, _>>>()?;
-        ControlBinder::new(VarBuilder::from_tensors(tensors, DType::F32, &self.device))
+        Binder::new(
+            self.kind,
+            VarBuilder::from_tensors(tensors, DType::F32, &self.device),
+        )
     }
     pub fn optimizer(&self) -> Result<AdamW> {
         Ok(AdamW::new(
@@ -405,7 +423,7 @@ pub struct Evaluation {
     pub correct: usize,
 }
 pub fn evaluate(
-    binder: &ControlBinder,
+    binder: &Binder,
     rows: &[Row],
     loops: usize,
     intervention: Intervention,
@@ -460,6 +478,7 @@ pub fn evaluate(
 #[derive(Serialize)]
 pub struct UpdateMetrics {
     pub rows: usize,
+    pub requested_physical_batch: usize,
     pub physical_batch: usize,
     pub microbatches: usize,
     pub tail_batch: usize,
@@ -500,18 +519,24 @@ pub fn train_update(
     model: &Model,
     rows: &[Row],
     physical: usize,
+    effective: usize,
     optimizer: &mut AdamW,
     capture: Option<&LoopedCapture>,
 ) -> Result<UpdateMetrics> {
     ensure!(
-        rows.len() == EFFECTIVE && physical.is_power_of_two() && physical <= EFFECTIVE,
-        "update requires {EFFECTIVE} rows and a power-of-two batch in 1..={EFFECTIVE}"
+        effective.is_power_of_two()
+            && (MIN_EFFECTIVE..=MAX_EFFECTIVE).contains(&effective)
+            && !rows.is_empty()
+            && rows.len() <= effective
+            && physical.is_power_of_two()
+            && physical <= effective,
+        "invalid registered effective/physical batch or tail"
     );
     train_update_rows(model, rows, physical, optimizer, capture)
 }
 
-// The registered entry point fixes 512 rows. This shared implementation also
-// permits small CPU fixtures to check row weighting, including uneven chunks.
+// Dataset validation permits a smaller terminal update. Always normalize by
+// actual rows, and do not pad a tail to the requested physical batch.
 fn train_update_rows(
     model: &Model,
     rows: &[Row],
@@ -520,6 +545,8 @@ fn train_update_rows(
     capture: Option<&LoopedCapture>,
 ) -> Result<UpdateMetrics> {
     let effective = rows.len();
+    let requested_physical_batch = physical;
+    let physical = physical.min(effective);
     ensure!(
         effective > 0 && (1..=effective).contains(&physical),
         "invalid update batch"
@@ -617,6 +644,7 @@ fn train_update_rows(
         )?;
         Ok(UpdateMetrics {
             rows: effective,
+            requested_physical_batch,
             physical_batch: physical,
             microbatches: effective.div_ceil(physical),
             tail_batch: (effective - 1) % physical + 1,
@@ -721,8 +749,8 @@ pub mod tests {
 
     #[test]
     fn exact_initializer_parity_and_stable_bit_digest() -> Result<()> {
-        let a = Model::new(&Device::Cpu)?;
-        let b = Model::new(&Device::Cpu)?;
+        let a = Model::new(&Device::Cpu, ModelKind::Legacy)?;
+        let b = Model::new(&Device::Cpu, ModelKind::Legacy)?;
         for seed in [0, 17] {
             initialize(&a.vars, seed)?;
             legacy_initialize(&b.vars, seed)?;
@@ -733,6 +761,10 @@ pub mod tests {
         let original = a.snapshot()?;
         assert_eq!(
             parameter_digest(&original),
+            "55d6d89a7e8a22049d074ae828cabb2f114093ec88886df67744a453c0cd364e"
+        );
+        assert_eq!(
+            parameter_digest(&original),
             parameter_digest(&b.snapshot()?)
         );
         let mut changed = original.clone();
@@ -740,15 +772,61 @@ pub mod tests {
         assert_ne!(parameter_digest(&original), parameter_digest(&changed));
         assert_eq!(
             original.values().map(|(_, v)| v.len()).sum::<usize>(),
-            PARAMETERS
+            ModelKind::Legacy.parameter_count()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_kind_preserves_legacy_outputs_and_exact_shared_initialization() -> Result<()> {
+        use tofy::p2::looped_agent::binding::ControlBinder;
+        let legacy = Model::new(&Device::Cpu, ModelKind::Legacy)?;
+        let equivariant = Model::new(&Device::Cpu, ModelKind::Equivariant)?;
+        assert_eq!(
+            shared_core_parameter_digest(&legacy.snapshot()?),
+            shared_core_parameter_digest(&equivariant.snapshot()?)
+        );
+        assert_ne!(
+            parameter_digest(&legacy.snapshot()?),
+            parameter_digest(&equivariant.snapshot()?)
+        );
+        let original = ControlBinder::new(VarBuilder::from_varmap(
+            &legacy.vars,
+            DType::F32,
+            &Device::Cpu,
+        ))?;
+        let rows = (0..2).map(row).collect::<Vec<_>>();
+        let input = tensors(&rows, Intervention::default(), &Device::Cpu)?;
+        for loops in [1, 4, 8] {
+            assert_eq!(
+                bits(&legacy.binder.forward(&input, loops)?)?,
+                bits(&original.forward(&input, loops)?)?
+            );
+        }
+        let a = legacy
+            .binder
+            .forward(&input, 4)?
+            .sqr()?
+            .mean_all()?
+            .backward()?;
+        let b = original.forward(&input, 4)?.sqr()?.mean_all()?.backward()?;
+        for (_, var) in &legacy.names {
+            assert_eq!(bits(a.get(var).unwrap())?, bits(b.get(var).unwrap())?);
+        }
+        let dir = Temp::new()?;
+        legacy.save(&dir.0.join("legacy.safetensors"))?;
+        equivariant.save(&dir.0.join("equivariant.safetensors"))?;
+        let before = equivariant.snapshot()?;
+        assert!(equivariant.load(&dir.0.join("legacy.safetensors")).is_err());
+        assert!(legacy.load(&dir.0.join("equivariant.safetensors")).is_err());
+        assert_eq!(equivariant.snapshot()?, before);
         Ok(())
     }
 
     #[test]
     fn strict_checkpoint_population_dtype_and_restore() -> Result<()> {
         let dir = Temp::new()?;
-        let model = Model::new(&Device::Cpu)?;
+        let model = Model::new(&Device::Cpu, ModelKind::Legacy)?;
         let before = model.snapshot()?;
         let path = dir.0.join("original.safetensors");
         model.save(&path)?;
@@ -798,7 +876,7 @@ pub mod tests {
 
     #[test]
     fn clamp_changes_only_requested_effects_and_hashes_actual_tensor() -> Result<()> {
-        let model = Model::new(&Device::Cpu)?;
+        let model = Model::new(&Device::Cpu, ModelKind::Legacy)?;
         let frozen = model.frozen()?;
         let rows = vec![row(0), row(1)];
         let before = model.snapshot()?;
@@ -882,71 +960,79 @@ pub mod tests {
 
     #[test]
     fn bounded_accumulation_matches_gradients_and_one_update_behavior() -> Result<()> {
-        let a = Model::new(&Device::Cpu)?;
-        let b = Model::new(&Device::Cpu)?;
-        let rows = (0..8).map(row).collect::<Vec<_>>();
-        let ga = accumulated(&a, &rows, 8)?;
-        let gb = accumulated(&b, &rows, 3)?;
-        for ((name, va), (_, vb)) in a.names.iter().zip(&b.names) {
-            let x = ga
-                .get(va)
-                .context("full gradient missing")?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let y = gb
-                .get(vb)
-                .context("split gradient missing")?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            for (x, y) in x.iter().zip(y) {
+        for kind in [ModelKind::Legacy, ModelKind::Equivariant] {
+            let a = Model::new(&Device::Cpu, kind)?;
+            let b = Model::new(&Device::Cpu, kind)?;
+            let rows = (0..8).map(row).collect::<Vec<_>>();
+            let ga = accumulated(&a, &rows, 8)?;
+            let gb = accumulated(&b, &rows, 3)?;
+            for ((name, va), (_, vb)) in a.names.iter().zip(&b.names) {
+                let x = ga
+                    .get(va)
+                    .context("full gradient missing")?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let y = gb
+                    .get(vb)
+                    .context("split gradient missing")?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for (x, y) in x.iter().zip(y) {
+                    assert!(
+                        (x - y).abs() <= 2e-6 + 1e-4 * x.abs(),
+                        "gradient differs {name}: {x} vs {y}"
+                    );
+                }
+            }
+            let before = a.snapshot()?;
+            let ma = train_update(&a, &rows, 32768, 32768, &mut a.optimizer()?, None)?;
+            let mb = train_update_rows(&b, &rows, 3, &mut b.optimizer()?, None)?;
+            assert_eq!((ma.rows, ma.microbatches, ma.tail_batch), (8, 1, 8));
+            assert_eq!((ma.requested_physical_batch, ma.physical_batch), (32768, 8));
+            assert_eq!((mb.rows, mb.microbatches, mb.tail_batch), (8, 3, 2));
+            assert!((ma.mean_ce - mb.mean_ce).abs() < 1e-5);
+            assert!((ma.pre_clip_norm - mb.pre_clip_norm).abs() < 1e-4);
+            // Near-zero softmax key-bias gradients can give different AdamW bit
+            // updates without changing policy. Compare the executed one-step output.
+            let x = evaluate(
+                &a.frozen()?,
+                &rows[..4],
+                4,
+                Intervention::default(),
+                &Device::Cpu,
+                None,
+            )?;
+            let y = evaluate(
+                &b.frozen()?,
+                &rows[..4],
+                4,
+                Intervention::default(),
+                &Device::Cpu,
+                None,
+            )?;
+            for (x, y) in x.logits.iter().flatten().zip(y.logits.iter().flatten()) {
                 assert!(
-                    (x - y).abs() <= 2e-6 + 1e-4 * x.abs(),
-                    "gradient differs {name}: {x} vs {y}"
+                    (x - y).abs() < 2e-4,
+                    "one-update behavior differs: {x} vs {y}"
                 );
             }
-        }
-        let before = a.snapshot()?;
-        let ma = train_update_rows(&a, &rows, 8, &mut a.optimizer()?, None)?;
-        let mb = train_update_rows(&b, &rows, 3, &mut b.optimizer()?, None)?;
-        assert_eq!((ma.rows, ma.microbatches, ma.tail_batch), (8, 1, 8));
-        assert_eq!((mb.rows, mb.microbatches, mb.tail_batch), (8, 3, 2));
-        assert!((ma.mean_ce - mb.mean_ce).abs() < 1e-5);
-        assert!((ma.pre_clip_norm - mb.pre_clip_norm).abs() < 1e-4);
-        // Near-zero softmax key-bias gradients can give different AdamW bit
-        // updates without changing policy. Compare the executed one-step output.
-        let x = evaluate(
-            &a.frozen()?,
-            &rows[..4],
-            4,
-            Intervention::default(),
-            &Device::Cpu,
-            None,
-        )?;
-        let y = evaluate(
-            &b.frozen()?,
-            &rows[..4],
-            4,
-            Intervention::default(),
-            &Device::Cpu,
-            None,
-        )?;
-        for (x, y) in x.logits.iter().flatten().zip(y.logits.iter().flatten()) {
+            let changes = a.changes(&before)?;
             assert!(
-                (x - y).abs() < 2e-4,
-                "one-update behavior differs: {x} vs {y}"
+                !changes.changed_body_names.is_empty() && !changes.changed_head_names.is_empty()
             );
+            a.restore(&before)?;
+            assert!(a.changes(&before)?.all_parameters_unchanged);
+            let mut optimizer = a.optimizer()?;
+            assert!(train_update(&a, &[], 8, 512, &mut optimizer, None).is_err());
+            let registered_rows = (0..512).map(row).collect::<Vec<_>>();
+            for physical in [0, 3, 513, 1024] {
+                assert!(
+                    train_update(&a, &registered_rows, physical, 512, &mut optimizer, None)
+                        .is_err()
+                );
+            }
+            assert!(a.changes(&before)?.all_parameters_unchanged);
         }
-        let changes = a.changes(&before)?;
-        assert!(!changes.changed_body_names.is_empty() && !changes.changed_head_names.is_empty());
-        a.restore(&before)?;
-        assert!(a.changes(&before)?.all_parameters_unchanged);
-        let mut optimizer = a.optimizer()?;
-        assert!(train_update(&a, &rows, 8, &mut optimizer, None).is_err());
-        let registered_rows = (0..EFFECTIVE).map(row).collect::<Vec<_>>();
-        for physical in [0, 3, EFFECTIVE + 1, 2 * EFFECTIVE] {
-            assert!(train_update(&a, &registered_rows, physical, &mut optimizer, None).is_err());
-        }
-        assert!(a.changes(&before)?.all_parameters_unchanged);
         Ok(())
     }
 }

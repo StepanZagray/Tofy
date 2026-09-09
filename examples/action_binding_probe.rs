@@ -7,17 +7,18 @@ mod evidence;
 use anyhow::{ensure, Context, Result};
 use candle_core::Device;
 use clap::Parser;
-use engine::EFFECTIVE;
+use engine::{MAX_EFFECTIVE, MIN_EFFECTIVE};
 use evidence::{file_hash, write_json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
     time::Instant,
 };
-use tofy::p2::looped_agent::{binding::PARAMETERS, profile::LoopedCapture};
+use tofy::p2::looped_agent::{binding::ModelKind, profile::LoopedCapture};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +41,12 @@ struct Config {
     dataset_sha256: String,
     mode: Mode,
     output_dir: PathBuf,
+    model_kind: ModelKind,
     physical_batch: usize,
+    effective_batch: usize,
+    schedule_presentations: usize,
+    schedule_sha256: String,
+    profile_updates: Vec<usize>,
     updates: usize,
     max_seconds: u64,
     checkpoint: Option<PathBuf>,
@@ -53,8 +59,20 @@ struct Config {
 impl Config {
     fn validate_mode(&self) -> Result<()> {
         ensure!(
-            self.physical_batch.is_power_of_two() && self.physical_batch <= EFFECTIVE,
-            "physical batch must be a power of two in 1..={EFFECTIVE}"
+            self.effective_batch.is_power_of_two()
+                && (MIN_EFFECTIVE..=MAX_EFFECTIVE).contains(&self.effective_batch)
+                && self.physical_batch.is_power_of_two()
+                && self.physical_batch <= self.effective_batch,
+            "invalid power-of-two physical/effective batch"
+        );
+        ensure!(
+            self.schedule_presentations > 0
+                && self.schedule_sha256.len() == 64
+                && self
+                    .schedule_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid schedule identity"
         );
         ensure!(
             self.max_seconds > 0
@@ -74,7 +92,7 @@ impl Config {
         ensure!(
             self.updates
                 == match self.mode {
-                    Mode::Train => 1150,
+                    Mode::Train => self.schedule_presentations.div_ceil(self.effective_batch),
                     Mode::BatchSmoke => self.updates,
                     _ => 0,
                 },
@@ -84,6 +102,25 @@ impl Config {
             self.mode != Mode::BatchSmoke || matches!(self.updates, 2 | 5),
             "smoke requires2or5 updates"
         );
+        match self.mode {
+            Mode::Train => ensure!(
+                self.profile_updates.len() == 3
+                    && self.profile_updates[0] == 2
+                    && self.profile_updates[2] == self.updates
+                    && self.profile_updates.windows(2).all(|p| p[0] < p[1]),
+                "training requires reachable captures at2, middle and final update"
+            ),
+            Mode::BatchSmoke => ensure!(
+                self.profile_updates == [1]
+                    && self.updates.checked_mul(self.effective_batch)
+                        == Some(self.schedule_presentations),
+                "smoke requires full candidate batches and capture1"
+            ),
+            _ => ensure!(
+                self.profile_updates.is_empty(),
+                "frozen modes capture first batch, no updates"
+            ),
+        }
         ensure!(
             !(self.cleared && self.query_cleared),
             "combined clearing forbidden"
@@ -129,7 +166,7 @@ impl Config {
     fn validate(&self) -> Result<()> {
         self.validate_mode()?;
         ensure!(
-            self.schema == "looped-action-binding-config-v1",
+            self.schema == "looped-action-binding-config-v2",
             "unknown config schema"
         );
         ensure!(
@@ -186,16 +223,42 @@ impl Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScheduleKind {
+    Training,
+    Smoke,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Schedule {
+    kind: ScheduleKind,
+    effective_batch: usize,
+    presentations: usize,
+    indices_sha256: String,
+}
+
+fn schedule_hash(updates: &[Vec<usize>]) -> String {
+    let mut hash = Sha256::new();
+    for &index in updates.iter().flatten() {
+        hash.update((index as u32).to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 struct Dataset {
     fit: Vec<engine::Row>,
     heldout: Vec<engine::Row>,
     cached_visual: Vec<engine::Row>,
     updates: Vec<Vec<usize>>,
+    schedule: Schedule,
 }
 impl Dataset {
-    fn parse(value: Value) -> Result<Self> {
+    fn parse(value: Value, config: &Config) -> Result<Self> {
+        config.validate_mode()?;
         ensure!(
-            value["schema"] == "looped-action-binding-data-v1",
+            value["schema"] == "looped-action-binding-data-v2",
             "unknown dataset schema"
         );
         let rows = |name: &str, count: usize| -> Result<Vec<engine::Row>> {
@@ -216,11 +279,25 @@ impl Dataset {
                 .collect()
         };
         let updates: Vec<Vec<usize>> = serde_json::from_value(value["updates"].clone())?;
+        let schedule: Schedule = serde_json::from_value(value["schedule"].clone())?;
         ensure!(
-            updates.len() == 1150
-                && updates
-                    .iter()
-                    .all(|u| u.len() == EFFECTIVE && u.iter().all(|&i| i < 1536)),
+            schedule.effective_batch == config.effective_batch
+                && schedule.presentations == config.schedule_presentations
+                && schedule.indices_sha256 == config.schedule_sha256
+                && (schedule.kind == ScheduleKind::Smoke) == (config.mode == Mode::BatchSmoke),
+            "schedule/config identity differs"
+        );
+        ensure!(
+            updates.len() == schedule.presentations.div_ceil(schedule.effective_batch)
+                && updates.iter().enumerate().all(|(i, u)| {
+                    let expected = if i + 1 == updates.len() {
+                        (schedule.presentations - 1) % schedule.effective_batch + 1
+                    } else {
+                        schedule.effective_batch
+                    };
+                    u.len() == expected && u.iter().all(|&index| index < 1536)
+                })
+                && schedule_hash(&updates) == schedule.indices_sha256,
             "invalid fixed update stream"
         );
         Ok(Self {
@@ -228,6 +305,7 @@ impl Dataset {
             heldout: rows("heldout", 768)?,
             cached_visual: rows("cached_visual", 1024)?,
             updates,
+            schedule,
         })
     }
     fn cohort(&self, name: &str) -> Result<&[engine::Row]> {
@@ -268,10 +346,15 @@ fn capture(
         step as u64,
         &model.device,
         training.then_some(&model.vars),
+        if training {
+            config.physical_batch.min(rows)
+        } else {
+            rows
+        },
         rows,
-        if training { EFFECTIVE } else { rows },
         config.loops,
         config.source_kind(),
+        config.model_kind,
     )
 }
 
@@ -292,6 +375,7 @@ fn evaluated_row(
     output["cleared"] = json!(config.cleared);
     output["query_cleared"] = json!(config.query_cleared);
     output["model_input_sha256"] = json!(model_input_sha256);
+    output["model_kind"] = json!(config.model_kind);
     output
 }
 
@@ -356,7 +440,7 @@ fn evaluate(
         "evaluation changed parameters"
     );
     Ok(
-        json!({"status":"complete_pending_analysis","classification":if qualify { "implementation_smoke" } else { "single_seed_screen" },"optimizer_updates":0,"input_rows":rows.len(),"physical_batch":config.physical_batch,"cohort":config.cohort,"loops":config.loops,"cleared":config.cleared,"query_cleared":config.query_cleared,"input_source":config.source_kind(),"executed_vision_core_forwards":0,"mean_ce":total_ce / rows.len() as f64,"correct":correct,"changes":changes,"evaluated_parameter_sha256":engine::parameter_digest(&before),"elapsed_seconds":started.elapsed().as_secs_f64()}),
+        json!({"status":"complete_pending_analysis","classification":if qualify { "implementation_smoke" } else { "single_seed_screen" },"optimizer_updates":0,"input_rows":rows.len(),"physical_batch":config.physical_batch,"actual_physical_batch":config.physical_batch.min(rows.len()),"microbatches":rows.len().div_ceil(config.physical_batch),"tail_batch":(rows.len()-1)%config.physical_batch+1,"cohort":config.cohort,"loops":config.loops,"cleared":config.cleared,"query_cleared":config.query_cleared,"input_source":config.source_kind(),"executed_vision_core_forwards":0,"mean_ce":total_ce / rows.len() as f64,"correct":correct,"changes":changes,"evaluated_parameter_sha256":engine::parameter_digest(&before),"elapsed_seconds":started.elapsed().as_secs_f64()}),
     )
 }
 
@@ -384,18 +468,15 @@ fn train(
             )?;
             stream.write_all(b"\n")?;
         }
-        let selected = if config.mode == Mode::Train {
-            [2, 100, 1150].contains(&update)
-        } else {
-            update == 1
-        };
+        let selected = config.profile_updates.contains(&update);
         let cap = selected
-            .then(|| capture(config, model, update, true, config.physical_batch))
+            .then(|| capture(config, model, update, true, rows.len()))
             .transpose()?;
         let metrics = engine::train_update(
             model,
             &rows,
             config.physical_batch,
+            config.effective_batch,
             &mut optimizer,
             cap.as_ref(),
         )?;
@@ -419,7 +500,9 @@ fn train(
         !changes.changed_body_names.is_empty() && !changes.changed_head_names.is_empty(),
         "body/head did not change"
     );
-    let final_parameter_sha256 = engine::parameter_digest(&model.snapshot()?);
+    let final_snapshot = model.snapshot()?;
+    let final_parameter_sha256 = engine::parameter_digest(&final_snapshot);
+    let final_shared_core_parameter_sha256 = engine::shared_core_parameter_digest(&final_snapshot);
     let checkpoint_started = Instant::now();
     let final_path = config.output_dir.join("final.safetensors");
     model.save(&final_path)?;
@@ -434,7 +517,7 @@ fn train(
         restored_sha256 = json!(file_hash(&restored)?);
     }
     Ok(
-        json!({"status":"complete_pending_analysis","classification":if config.mode == Mode::Train { "single_seed_screen" } else { "implementation_smoke" },"optimizer_updates":config.updates,"input_rows":config.updates*EFFECTIVE,"physical_batch":config.physical_batch,"effective_batch":EFFECTIVE,"accumulation":EFFECTIVE.div_ceil(config.physical_batch),"loops":4,"cleared":false,"query_cleared":false,"input_source":"abstract_effects","executed_vision_core_forwards":0,"changes":changes,"restored_changes":restoration,"restored_sha256":restored_sha256,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"final_sha256":file_hash(&final_path)?,"final_parameter_sha256":final_parameter_sha256,"elapsed_seconds":started.elapsed().as_secs_f64()}),
+        json!({"status":"complete_pending_analysis","classification":if config.mode == Mode::Train { "single_seed_screen" } else { "implementation_smoke" },"optimizer_updates":config.updates,"input_rows":data.schedule.presentations,"physical_batch":config.physical_batch,"effective_batch":config.effective_batch,"accumulation":config.effective_batch.div_ceil(config.physical_batch),"actual_physical_batch":config.physical_batch.min(data.updates[0].len()),"final_update_rows":data.updates.last().unwrap().len(),"final_update_physical_batch":config.physical_batch.min(data.updates.last().unwrap().len()),"tail_update_rows":if data.updates.last().unwrap().len()<config.effective_batch {json!(data.updates.last().unwrap().len())} else {Value::Null},"profile_updates":config.profile_updates,"loops":4,"cleared":false,"query_cleared":false,"input_source":"abstract_effects","executed_vision_core_forwards":0,"changes":changes,"restored_changes":restoration,"restored_sha256":restored_sha256,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"final_sha256":file_hash(&final_path)?,"final_parameter_sha256":final_parameter_sha256,"final_shared_core_parameter_sha256":final_shared_core_parameter_sha256,"elapsed_seconds":started.elapsed().as_secs_f64()}),
     )
 }
 
@@ -453,19 +536,25 @@ fn run(config: &Config, started: Instant) -> Result<Value> {
         fs::metadata(&config.dataset)?.len() <= 64 * 1024 * 1024,
         "dataset exceeds bound"
     );
-    let dataset = Dataset::parse(serde_json::from_slice(&fs::read(&config.dataset)?)?)?;
+    let dataset = Dataset::parse(serde_json::from_slice(&fs::read(&config.dataset)?)?, config)?;
     let device = Device::new_cuda(0)?;
-    let model = engine::Model::new(&device)?;
-    let initial_parameter_sha256 = engine::parameter_digest(&model.snapshot()?);
+    let model = engine::Model::new(&device, config.model_kind)?;
+    let initial_snapshot = model.snapshot()?;
+    let initial_parameter_sha256 = engine::parameter_digest(&initial_snapshot);
+    let initial_shared_core_parameter_sha256 =
+        engine::shared_core_parameter_digest(&initial_snapshot);
     let initial_path = config.output_dir.join("initial.safetensors");
     model.save(&initial_path)?;
     if let Some(path) = &config.checkpoint {
         model.load(path)?;
     }
-    let starting_parameter_sha256 = engine::parameter_digest(&model.snapshot()?);
+    let starting_snapshot = model.snapshot()?;
+    let starting_parameter_sha256 = engine::parameter_digest(&starting_snapshot);
+    let starting_shared_core_parameter_sha256 =
+        engine::shared_core_parameter_digest(&starting_snapshot);
     write_json(
         &config.output_dir.join("metadata.json"),
-        &json!({"schema":"looped-action-binding-v1","config":config,"provenance":source,"parameter_count":PARAMETERS,"parameter_digest_schema":engine::DIGEST_SCHEMA,"initial_parameter_sha256":initial_parameter_sha256,"input_source":config.source_kind(),"seed":0,"objective":"policy_cross_entropy_only","executed_vision_core_forwards":0,"effective_batch":if matches!(config.mode, Mode::Train | Mode::BatchSmoke) { EFFECTIVE } else { config.physical_batch },"deferred":["online_visual_adapter","reward","value","dynamics","planner","ARC_evaluation"]}),
+        &json!({"schema":"looped-action-binding-v2","config":config,"provenance":source,"parameter_count":config.model_kind.parameter_count(),"model_kind":config.model_kind,"parameter_digest_schema":engine::DIGEST_SCHEMA,"initial_parameter_sha256":initial_parameter_sha256,"input_source":config.source_kind(),"seed":0,"objective":"policy_cross_entropy_only","executed_vision_core_forwards":0,"effective_batch":if matches!(config.mode, Mode::Train | Mode::BatchSmoke) { config.effective_batch } else { config.physical_batch },"deferred":["online_visual_adapter","reward","value","dynamics","planner","ARC_evaluation"]}),
     )?;
     config.deadline(started)?;
     let mut report = if matches!(config.mode, Mode::Train | Mode::BatchSmoke) {
@@ -485,10 +574,14 @@ fn run(config: &Config, started: Instant) -> Result<Value> {
         );
     }
     config.deadline(started)?;
-    report["parameter_count"] = json!(PARAMETERS);
+    report["parameter_count"] = json!(config.model_kind.parameter_count());
+    report["model_kind"] = json!(config.model_kind);
+    report["requested_physical_batch"] = json!(config.physical_batch);
     report["parameter_digest_schema"] = json!(engine::DIGEST_SCHEMA);
     report["initial_parameter_sha256"] = json!(initial_parameter_sha256);
     report["starting_parameter_sha256"] = json!(starting_parameter_sha256);
+    report["initial_shared_core_parameter_sha256"] = json!(initial_shared_core_parameter_sha256);
+    report["starting_shared_core_parameter_sha256"] = json!(starting_shared_core_parameter_sha256);
     report["initial_sha256"] = json!(file_hash(&initial_path)?);
     report["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
     Ok(report)
@@ -537,19 +630,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn config() -> Config {
+    fn config(effective: usize, presentations: usize, mode: Mode) -> Config {
+        let updates = presentations.div_ceil(effective);
         Config {
-            schema: "looped-action-binding-config-v1".into(),
+            schema: "looped-action-binding-config-v2".into(),
             source_revision: "fixture".into(),
             registration: "/fixture/registration".into(),
             registration_sha256: String::new(),
             dataset: "/fixture/data".into(),
             dataset_sha256: String::new(),
-            mode: Mode::Train,
+            mode,
             output_dir: "/fixture/new".into(),
-            physical_batch: EFFECTIVE,
-            updates: 1150,
-            max_seconds: 600,
+            model_kind: ModelKind::Legacy,
+            physical_batch: effective,
+            effective_batch: effective,
+            schedule_presentations: presentations,
+            schedule_sha256: "0".repeat(64),
+            profile_updates: match mode {
+                Mode::Train => vec![2, 1 + updates / 2, updates],
+                Mode::BatchSmoke => vec![1],
+                _ => vec![],
+            },
+            updates: if matches!(mode, Mode::Train | Mode::BatchSmoke) {
+                updates
+            } else {
+                0
+            },
+            max_seconds: if mode == Mode::Train { 600 } else { 120 },
             checkpoint: None,
             checkpoint_sha256: None,
             cohort: None,
@@ -558,35 +665,69 @@ mod tests {
             query_cleared: false,
         }
     }
+    fn dataset_value(c: &mut Config) -> Value {
+        // Synthetic fixed stream only; no registered dataset/checkpoint is read.
+        let flat = (0..c.schedule_presentations)
+            .map(|i| i % 1536)
+            .collect::<Vec<_>>();
+        let updates = flat
+            .chunks(c.effective_batch)
+            .map(|x| x.to_vec())
+            .collect::<Vec<_>>();
+        c.schedule_sha256 = schedule_hash(&updates);
+        let rows = |count| {
+            (0..count)
+                .map(|i| engine::tests::row(i).raw)
+                .collect::<Vec<_>>()
+        };
+        json!({"schema":"looped-action-binding-data-v2","fit":rows(1536),"heldout":rows(768),
+            "cached_visual":rows(1024),"updates":updates,
+            "schedule":{"kind":if c.mode==Mode::BatchSmoke{"smoke"}else{"training"},
+                "effective_batch":c.effective_batch,"presentations":c.schedule_presentations,
+                "indices_sha256":c.schedule_sha256}})
+    }
     #[test]
-    fn mode_guards_keep_training_and_controls_separate() -> Result<()> {
-        let mut c = config();
+    fn mode_guards_bind_model_batch_budget_and_capture_reachability() -> Result<()> {
+        let mut c = config(1024, 4608, Mode::Train);
         c.validate_mode()?;
-        for physical in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
-            c.physical_batch = physical;
-            c.validate_mode()?;
+        for e in [512, 1024, 2048, 4096, 8192, 16384, 32768] {
+            let mut c = config(e, e * 5, Mode::Train);
+            for p in [1, e / 2, e] {
+                c.physical_batch = p;
+                c.validate_mode()?;
+            }
         }
-        for physical in [0, 3, 511, 513, 1024] {
-            c.physical_batch = physical;
+        for e in [0, 256, 513, 65536] {
+            let mut bad = config(1024, 4608, Mode::Train);
+            bad.effective_batch = e;
+            assert!(bad.validate_mode().is_err());
+        }
+        for p in [0, 3, 2048] {
+            c.physical_batch = p;
             assert!(c.validate_mode().is_err());
         }
-        c.physical_batch = EFFECTIVE;
-        c.updates = 1149;
+        c.physical_batch = 1024;
+        for captures in [vec![], vec![1, 3, 5], vec![2, 2, 5], vec![2, 3, 6]] {
+            c.profile_updates = captures;
+            assert!(c.validate_mode().is_err());
+        }
+        c.profile_updates = vec![2, 3, 5];
+        c.updates = 4;
         assert!(c.validate_mode().is_err());
-        c.updates = 1150;
+        c.updates = 5;
         c.query_cleared = true;
         assert!(c.validate_mode().is_err());
         c.query_cleared = false;
-        c.mode = Mode::BatchSmoke;
-        c.max_seconds = 120;
+        let mut value = serde_json::to_value(&c)?;
+        value["model_kind"] = json!("unknown");
+        assert!(serde_json::from_value::<Config>(value).is_err());
         for n in [2, 5] {
-            c.updates = n;
-            c.validate_mode()?;
+            config(32768, 32768 * n, Mode::BatchSmoke).validate_mode()?;
         }
-        c.updates = 3;
-        assert!(c.validate_mode().is_err());
-        c.mode = Mode::EvalInitial;
-        c.updates = 0;
+        assert!(config(1024, 1536, Mode::BatchSmoke)
+            .validate_mode()
+            .is_err());
+        c = config(1024, 4608, Mode::EvalInitial);
         c.cohort = Some("fit".into());
         c.validate_mode()?;
         c.cohort = Some("cached_visual".into());
@@ -614,46 +755,59 @@ mod tests {
         assert!(c.validate_mode().is_err());
         Ok(())
     }
-    fn dataset_value() -> Value {
-        let rows = |count| {
-            (0..count)
-                .map(|i| engine::tests::row(i).raw)
-                .collect::<Vec<_>>()
-        };
-        json!({"schema":"looped-action-binding-data-v1","fit":rows(1536),"heldout":rows(768),"cached_visual":rows(1024),"updates":vec![(0..EFFECTIVE).rev().collect::<Vec<_>>();1150]})
-    }
     #[test]
-    fn dataset_replay_and_export_preserve_audit_boundaries() -> Result<()> {
-        let data = Dataset::parse(dataset_value())?;
-        for index in [0, 1149] {
-            let batch = data.update(index)?;
-            assert_eq!(batch.len(), EFFECTIVE);
-            for (slot, row) in batch.iter().enumerate() {
-                assert_eq!(row.raw, data.fit[EFFECTIVE - 1 - slot].raw);
+    fn larger_schedules_preserve_the_complete_stream_and_explicit_tail() -> Result<()> {
+        let mut identity = None;
+        for effective in [512, 1024, 2048, 32768] {
+            let mut c = config(effective, 588800, Mode::Train);
+            let value = dataset_value(&mut c);
+            let data = Dataset::parse(value, &c)?;
+            assert_eq!(data.updates.len(), 588800usize.div_ceil(effective));
+            assert_eq!(
+                data.updates.last().unwrap().len(),
+                (588800 - 1) % effective + 1
+            );
+            for (i, &index) in data.updates.iter().flatten().enumerate() {
+                assert_eq!(index, i % 1536);
+            }
+            assert_eq!(data.updates.iter().map(Vec::len).sum::<usize>(), 588800);
+            if let Some(expected) = &identity {
+                assert_eq!(&data.schedule.indices_sha256, expected);
+            } else {
+                identity = Some(data.schedule.indices_sha256);
             }
         }
-        assert!(data.update(1150).is_err());
-        let mut c = config();
+        Ok(())
+    }
+    #[test]
+    fn smoke_uses_full_candidate_batches_and_preserves_raw_export() -> Result<()> {
+        let mut c = config(32768, 5 * 32768, Mode::BatchSmoke);
+        let value = dataset_value(&mut c);
+        let data = Dataset::parse(value, &c)?;
+        assert!(data.updates.iter().all(|u| u.len() == 32768));
+        assert_eq!(data.update(4)?.len(), 32768);
+        assert!(data.update(5).is_err());
         c.mode = Mode::EvalFinal;
-        c.loops = 4;
+        c.model_kind = ModelKind::Equivariant;
         c.query_cleared = true;
         let row = &data.fit[7];
         let before = row.raw.clone();
-        let exported = evaluated_row(row, &[0.0; 4], "actual-clamped-tensor-hash", &c);
+        let output = evaluated_row(row, &[0.; 4], "actual-input-hash", &c);
         for (key, value) in before.as_object().unwrap() {
-            assert_eq!(&exported[key], value);
+            assert_eq!(&output[key], value);
         }
-        assert_eq!(exported["stage"], "final");
-        assert_eq!(exported["query_cleared"], true);
-        assert_eq!(exported["model_input_sha256"], "actual-clamped-tensor-hash");
+        assert_eq!(output["stage"], "final");
+        assert_eq!(output["model_kind"], "equivariant");
+        assert_eq!(output["query_cleared"], true);
         assert_eq!(row.raw, before);
         Ok(())
     }
     #[test]
-    fn bad_schedule_or_population_fails_before_model_construction() {
-        for kind in 0..6 {
-            let mut value = dataset_value();
-            match kind {
+    fn malformed_schedule_population_or_kind_fails_before_model() {
+        for corruption in 0..8 {
+            let mut c = config(1024, 4608, Mode::Train);
+            let mut value = dataset_value(&mut c);
+            match corruption {
                 0 => {
                     value["fit"].as_array_mut().unwrap().pop();
                 }
@@ -662,10 +816,12 @@ mod tests {
                 }
                 2 => value["updates"][0][0] = json!(1536),
                 3 => value["fit"][0]["index"] = json!(1),
-                4 => value["fit"][0]["input_sha256"] = json!("0".repeat(64)),
-                _ => value["updates"][0] = json!(vec![0; 64]),
+                4 => value["updates"][0] = json!(vec![0; 512]),
+                5 => value["schedule"]["kind"] = json!("smoke"),
+                6 => value["schedule"]["presentations"] = json!(4609),
+                _ => value["updates"][0][0] = json!(1),
             }
-            assert!(Dataset::parse(value).is_err());
+            assert!(Dataset::parse(value, &c).is_err());
         }
     }
 }
