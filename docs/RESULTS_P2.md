@@ -979,6 +979,13 @@ the run must record this scope note and cannot support a learning-trajectory cla
 
 ## Best So Far
 
+**C12 does not improve this record:** integrated policy-only training with the
+privileged C10 warm start finishes at **254/1024 seen, 255/1024 familiar and
+127/512 held-out**, versus 25% frozen and cleared controls. All seven learning
+gates fail despite accepted integrity checks. Current-role argmax remains 100%,
+but target attention mass falls from almost 1 to about 0.197/0.210; retained
+winners do not establish intact soft pooling. [Completed C12 result](research/2026-09-09-looped-grounded-policy-results.md).
+
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
 and joint roles** for both initial and C7-final cores across three new 256-query
@@ -999,8 +1006,8 @@ all 30 head identities. Representative exact command used for panel 0/initial:
 
 This is a historical command; the sealed root must not be reused. The core runs
 four shared loops, the head has no recurrence, and the cached CUDA stages do not
-establish integrated training or acting. Next: qualify an integrated trainable
-spatial policy, then separately register policy-loss variable-control learning.
+establish integrated training or acting. The separately registered integrated
+C12 training screen is now complete and negative, as linked above.
 
 **Role-supervised diagnostic boundary:** [C10](research/2026-09-09-looped-role-witness-results.md)
 reaches 256/256 joint localization and hard/soft actions at both initial and final
@@ -1316,8 +1323,46 @@ heads, data and gates are unchanged. Retry model phases 216.1990 s/finalization 
 47 healthy CUDA captures retain operation/activation/memory/device-event and
 correlation gaps. The point-in-time seal verifies 3,427 files,109 bindings and 903gone PIDs.
 
-The next prerequisite is an actual integrated trainable current-token spatial
-policy, parity/gradient qualification, then a separately registered policy-loss
-variable-control screen. The common initial core and privileged fixed-head warm
-start retain shared depth; no finished training or launch claim is made. No
-mandatory intervening CLS probe, LLM controller or public-level pretraining.
+The subsequent integrated policy-loss variable-control screen is now complete;
+its negative result follows below. This does not change C11's frozen,
+known-control result or transfer that result to learned support binding.
+
+## Integrated grounded policy — completed negative, September 9, 2026 IST
+
+C12 source `5b17246cef110a866bdb8c2d2b14919710256ff3` completed all **1,150 updates
+and 73,600 rows**, using four shared loops, policy cross-entropy only and physical
+batch **34 + tail 30**, accumulation 2, effective batch 64. It started from the
+common untrained core and the privileged C10 true-role head. The audit observed
+**4,600 distinct training query images and 73,600 distinct input tuples**, with
+zero duplicates. The historical exclusion boundary is 1,280 selected C8/C11
+queries, not all past Tofy exposure. Terminal factual
+accuracy is **254/1024 (24.80%) seen, 255/1024 (24.90%) familiar and 127/512
+(24.80%) held-out**. Frozen and cleared controls each score exactly 25%; no query
+has every map variant correct. All seven learning gates fail:
+`training_feasibility_not_supported`. Integrity and independent numerical review
+pass, so this is completed negative evidence, not a failed or partial training run.
+
+Evaluation CE improves from about **1.447–1.448 to 1.406** without better action
+selection. Agent/goal attention argmax is correct on every evaluated row, while
+mean target mass falls from almost **1 to 0.197/0.210**. Keeping the largest weight
+on the right patch does not preserve a soft pool that now draws most of its weight
+from other patches. Body, head and both query gradients are finite and nonzero on
+all updates; ordinary unused heads retain their exact initial bytes.
+
+Training model time is **2,113.260 s**, with minimum sampled reserve **599 MiB**
+and maximum **75°C**. The campaign retains 17 healthy captures across 16 accepted
+invocations; five additional capacity trials remain excluded infrastructure
+records. Independent scoring agrees on 846 floating fields, with maximum
+discrepancy about `4.44e-16`. [Counts, uncertainty, provenance, exact commands and profiler limits](research/2026-09-09-looped-grounded-policy-results.md).
+
+The final outer seal records 1,295 files, 418,434,719 bytes, 63 external bindings,
+1,149 recorded PIDs gone and 17 healthy CUDA bundles.
+
+The next C13 diagnostic compares the retained terminal head with its two query
+vectors multiplied by **16**, on the seen factual cohort, with the final body
+and output decoder fixed. This exploratory test asks whether restoring attention
+concentration is sufficient to improve action binding there. It will not prove
+the original failure's cause or information absence, and selects no new training
+recipe. One seed and a privileged warm start establish no ARC gain, LLM controller,
+planner, dynamics, episode memory or useful-recurrence claim; those competencies
+were not trained or tested here.
