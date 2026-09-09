@@ -41,6 +41,48 @@ pub struct LoopedRange<'a> {
 }
 
 impl LoopedCapture {
+    /// Frozen online image -> seven selectors -> native records -> binder.
+    /// The existing selector computes pooled features and discarded four-action
+    /// logits on each frame; ordinary core output heads never execute.
+    pub fn begin_native_binding(
+        destination: &Path,
+        step: u64,
+        device: &Device,
+        batch: usize,
+        control: &str,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(control, "factual" | "uniform_attention"),
+            "unknown native control"
+        );
+        let run = ProfileRun::inference(
+            "tofy::p2::native_binding::evaluation",
+            step,
+            device_name(device),
+        )
+        .correlation_id(format!("tofy.looped/native-binding-eval-{step:012}"))
+        .tag("workload", "looped-native-binding")
+        .tag("input_source", "fresh_public_images")
+        .tag(
+            "feature_seam",
+            "post-final-rms-seven-frames-to-native-records",
+        )
+        .tag("control", control)
+        .tag("core_loops", "4")
+        .tag("binder_loops", "4")
+        .tag("frame_count", "7")
+        .tag("core_forward_batches", "1")
+        .tag("spatial_head_forward_batches", "7")
+        .tag("selector_output_logits", "executed_discarded")
+        .tag("binder_forward_batches", "1")
+        .tag("binder_kind", "equivariant")
+        .tag("binder_parameters", "1579265")
+        .tag("privileged_role_warm_start", "true")
+        .tag("optimizer_updates", "0")
+        .tag("ordinary_core_heads", "not_executed");
+        Self::open(destination, run, None, batch, batch, 4)
+    }
+
     /// Binder-only work; no vision-core or ordinary vision-head families exist.
     // Keep batch/depth capture identity and input provenance explicit at the call.
     #[allow(clippy::too_many_arguments)]
