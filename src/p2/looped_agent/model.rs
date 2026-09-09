@@ -198,6 +198,34 @@ impl LoopedAgent {
         metadata: &Tensor,
         loops: usize,
     ) -> Result<(LoopedOutput, LoopedFeatures)> {
+        let features = self.forward_features(patches, metadata, loops)?;
+        let batch = patches.dim(0)?;
+        let mut next_by_action = Vec::with_capacity(ACTIONS);
+        for head in &self.next_heads {
+            next_by_action.push(head.forward(&features.current)?.reshape((
+                batch,
+                PATCH_COUNT,
+                PATCH_PIXELS,
+                PALETTE,
+            ))?);
+        }
+
+        let output = LoopedOutput {
+            policy_logits: self.policy_head.forward(&features.cls)?,
+            value: self.value_head.forward(&features.cls)?,
+            reward_logits: self.reward_head.forward(&features.cls)?,
+            next_logits: Tensor::stack(&next_by_action, 1)?,
+        };
+        Ok((output, features))
+    }
+
+    /// Differentiable post-RMS body features, without executing ordinary heads.
+    pub fn forward_features(
+        &self,
+        patches: &Tensor,
+        metadata: &Tensor,
+        loops: usize,
+    ) -> Result<LoopedFeatures> {
         self.validate_inputs(patches, metadata, loops)?;
         let batch = patches.dim(0)?;
 
@@ -230,29 +258,10 @@ impl LoopedAgent {
         let readout = state.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
         let current_start = 1 + TOKENS - PATCH_COUNT;
         let current_patches = state.narrow(1, current_start, PATCH_COUNT)?.contiguous()?;
-        let mut next_by_action = Vec::with_capacity(ACTIONS);
-        for head in &self.next_heads {
-            next_by_action.push(head.forward(&current_patches)?.reshape((
-                batch,
-                PATCH_COUNT,
-                PATCH_PIXELS,
-                PALETTE,
-            ))?);
-        }
-
-        let output = LoopedOutput {
-            policy_logits: self.policy_head.forward(&readout)?,
-            value: self.value_head.forward(&readout)?,
-            reward_logits: self.reward_head.forward(&readout)?,
-            next_logits: Tensor::stack(&next_by_action, 1)?,
-        };
-        Ok((
-            output,
-            LoopedFeatures {
-                cls: readout,
-                current: current_patches,
-            },
-        ))
+        Ok(LoopedFeatures {
+            cls: readout,
+            current: current_patches,
+        })
     }
 
     fn validate_inputs(&self, patches: &Tensor, metadata: &Tensor, loops: usize) -> Result<()> {
@@ -631,7 +640,7 @@ mod tests {
         let parameters = vars.data().lock().unwrap();
         let names_with_gradients = parameters
             .iter()
-            .filter(|(_, var)| gradients.get(*var).is_some())
+            .filter(|(_, var)| gradients.get(var).is_some())
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         for name in ["palette_embedding.weight", "block_0.attention.query.weight"] {

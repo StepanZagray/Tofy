@@ -2,6 +2,7 @@
 //!
 //! The first environment is a synthetic prerequisite, not an ARC game.
 
+pub mod grounded_policy;
 pub mod model;
 pub mod profile;
 pub mod task;

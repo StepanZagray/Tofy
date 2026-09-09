@@ -41,6 +41,75 @@ pub struct LoopedRange<'a> {
 }
 
 impl LoopedCapture {
+    /// Feature-only looped body plus trainable spatial policy. A training capture
+    /// includes both complete VarMaps so absent ordinary-head gradients are explicit.
+    /// `None` selects evaluation without a gradient contract.
+    pub fn begin_grounded_policy(
+        destination: &Path,
+        step: u64,
+        device: &Device,
+        vars: Option<(&VarMap, &VarMap)>,
+        physical_batch: usize,
+        effective_batch: usize,
+        loops: usize,
+    ) -> Result<Self> {
+        use super::grounded_policy::{named_parameters, parameter_family};
+        let gradients = vars
+            .map(|(core, policy)| -> Result<GradientCapturePlan> {
+                let named = named_parameters(core, policy)?;
+                let families = ["core", "spatial_queries", "spatial_policy"]
+                    .into_iter()
+                    .map(|family| GradientFamilyContract::active(family, 1))
+                    .chain(
+                        ["policy", "value", "reward", "dynamics"]
+                            .into_iter()
+                            .map(GradientFamilyContract::inactive),
+                    )
+                    .collect();
+                GradientCapturePlan::from_named_vars(
+                    "parameters/pre_clip",
+                    named,
+                    |name| {
+                        parameter_family(name)
+                            .expect("validated parameter family")
+                            .into()
+                    },
+                    families,
+                )
+            })
+            .transpose()?;
+        let run = if vars.is_some() {
+            ProfileRun::training(
+                "tofy::p2::grounded_policy::optimizer_update",
+                step,
+                device_name(device),
+            )
+        } else {
+            ProfileRun::inference(
+                "tofy::p2::grounded_policy::evaluation",
+                step,
+                device_name(device),
+            )
+        }
+        .correlation_id(format!(
+            "tofy.looped/grounded-policy-{}-{step:012}",
+            if vars.is_some() { "update" } else { "eval" }
+        ))
+        .tag("workload", "looped-grounded-policy")
+        .tag("head_kind", "spatial")
+        .tag("feature_seam", "post-final-rms-current")
+        .tag("ordinary_heads", "not_executed")
+        .tag("head_recurrence", "none");
+        Self::open(
+            destination,
+            run,
+            gradients,
+            physical_batch,
+            effective_batch,
+            loops,
+        )
+    }
+
     /// Head-only work on cached tensors: never declares frozen-core gradients.
     pub fn begin_readout(
         destination: &Path,
@@ -482,6 +551,123 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn grounded_policy_contract_keeps_ordinary_heads_explicitly_inactive() -> Result<()> {
+        use super::super::grounded_policy::{active_parameters, parameter_family, SpatialPolicy};
+        use candle_graph::GradientFamilyExpectation;
+        let dir = TestDir::new("grounded");
+        let device = Device::Cpu;
+        let core = VarMap::new();
+        let policy = VarMap::new();
+        let _model = LoopedAgent::new(
+            LoopedConfig {
+                hidden: 4,
+                heads: 1,
+                layers: 1,
+                max_loops: 4,
+            },
+            VarBuilder::from_varmap(&core, DType::F32, &device),
+        )?;
+        let _policy = SpatialPolicy::new(VarBuilder::from_varmap(&policy, DType::F32, &device))?;
+        let destination = dir.0.join("train");
+        let capture = LoopedCapture::begin_grounded_policy(
+            &destination,
+            2,
+            &device,
+            Some((&core, &policy)),
+            2,
+            2,
+            4,
+        )?;
+        {
+            let _measured = capture.measurement();
+            let loss = {
+                let forward = capture.phase("micro-0/forward", Some(ExecutionStep::Forward));
+                // Isolate manifest expectations from the separate real-network
+                // gradient test: every active parameter has gradient exactly one.
+                let loss = active_parameters(&core, &policy)?
+                    .iter()
+                    .try_fold(Tensor::zeros((), DType::F32, &device)?, |sum, (_, var)| {
+                        sum.add(&var.sum_all()?)
+                    })?;
+                capture.record_tensor_stats(&forward, "loss/policy", &loss)?;
+                loss
+            };
+            let grads = {
+                let _backward = capture.phase("micro-0/backward", Some(ExecutionStep::Backward));
+                loss.backward()?
+            };
+            {
+                let inspect = capture.phase("gradient-inspection-and-clip", None);
+                capture.record_gradients(&inspect, &grads)?;
+            }
+            drop(capture.phase("optimizer", Some(ExecutionStep::Optimizer)));
+        }
+        capture.finish()?;
+        candle_graph::verify_bundle(&destination)?;
+        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+        let health = analyze_health(&trace);
+        assert!(
+            health.structurally_valid && health.capture_complete,
+            "{health:?}"
+        );
+        let contract = trace
+            .run
+            .capture_contract
+            .gradient_contract
+            .as_ref()
+            .unwrap();
+        assert_eq!(contract.families.len(), 7);
+        for family in &contract.families {
+            let active = matches!(
+                family.family.as_str(),
+                "core" | "spatial_queries" | "spatial_policy"
+            );
+            assert_eq!(
+                family.expectation,
+                if active {
+                    GradientFamilyExpectation::Active
+                } else {
+                    GradientFamilyExpectation::Inactive
+                }
+            );
+        }
+        for (expected, actual) in contract.expected.iter().zip(&trace.gradients) {
+            let active = matches!(
+                parameter_family(&expected.key),
+                Some("core" | "spatial_queries" | "spatial_policy")
+            );
+            assert_eq!(
+                actual.state,
+                if active {
+                    GradientState::Present
+                } else {
+                    GradientState::Missing
+                }
+            );
+        }
+        assert_eq!(trace.run.tags["ordinary_heads"], "not_executed");
+        assert_eq!(trace.run.tags["loops"], "4");
+        let destination = dir.0.join("eval");
+        let capture =
+            LoopedCapture::begin_grounded_policy(&destination, 1, &device, None, 2, 2, 4)?;
+        {
+            let _measured = capture.measurement();
+            let forward = capture.phase("forward", Some(ExecutionStep::Forward));
+            capture.record_tensor_stats(
+                &forward,
+                "policy/logits",
+                &Tensor::ones((2, 4), DType::F32, &device)?,
+            )?;
+        }
+        capture.finish()?;
+        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+        assert!(trace.run.capture_contract.gradient_contract.is_none());
+        assert_eq!(trace.run.tags["workload"], "looped-grounded-policy");
+        assert_eq!(fs::read_dir(&dir.0)?.count(), 2);
+        Ok(())
     }
 
     #[test]
