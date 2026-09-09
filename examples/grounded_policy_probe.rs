@@ -520,6 +520,7 @@ fn train(
     )?;
     let checkpoint_seconds = checkpoint_started.elapsed().as_secs_f64();
     let mut restored = Value::Null;
+    let mut restored_hashes: Option<(String, String)> = None;
     if config.mode == Mode::BatchSmoke {
         model.restore(&initial)?;
         let restoration = model.change_audit(&initial)?;
@@ -528,12 +529,16 @@ fn train(
             "qualification restore differs"
         );
         restored = serde_json::to_value(restoration)?;
+        let core_path = config.output_dir.join("restored-core.safetensors");
+        let head_path = config.output_dir.join("restored-head.safetensors");
+        model.save_pair(&core_path, &head_path)?;
+        restored_hashes = Some((file_hash(&core_path)?, file_hash(&head_path)?));
     }
     config.deadline(started)?;
     Ok(
         json!({"status":"complete_pending_analysis","classification":if config.mode == Mode::Train {"single_seed_screen"} else {"implementation_smoke"},
         "optimizer_updates":config.updates,"physical_batch":config.physical_batch,"effective_batch":64,"accumulation":64usize.div_ceil(config.physical_batch),
-        "input_rows":config.updates*64,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"changes":changes,"restored_changes":restored,
+        "input_rows":config.updates*64,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"changes":changes,"restored_changes":restored,"restored_core_sha256":restored_hashes.as_ref().map(|x| &x.0),"restored_head_sha256":restored_hashes.as_ref().map(|x| &x.1),
         "final_core_sha256":file_hash(&config.output_dir.join("final-core.safetensors"))?,"final_head_sha256":file_hash(&config.output_dir.join("final-head.safetensors"))?,"elapsed_seconds":started.elapsed().as_secs_f64()}),
     )
 }
