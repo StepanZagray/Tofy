@@ -979,6 +979,29 @@ the run must record this scope note and cannot support a learning-trajectory cla
 
 ## Best So Far
 
+**Fixed CUDA role-readout confirmation (known-control synthetic only):**
+[C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
+and joint roles** for both initial and C7-final cores across three new 256-query
+panels, with all six registered gates and independent raw checks passing. C10 used
+privileged role fitting; initial success receives no C7 credit. This is a separate
+frozen readout diagnostic: native policy remains 188/768 and 209/768, and no ARC or
+native-controller best metric changes. Wilson 95% is [99.5023%,100%] pooled;
+empirical [1,1] is not population perfection. C9 final spatial 33.33% versus pooled
+constant 27.21% (+6.1198 pp [1.3021,9.5052]) is retained with panel variation.
+The detailed report preserves all six exact historical true-head commands and
+all 30 head identities. Representative exact command used for panel 0/initial:
+
+```bash
+/home/stepan/venvs/tensorboard/bin/python3 -B /home/stepan/Research/_runs/2026-09-09T141234Z-tofy-looped-cuda-readout-retry/supervise_stage.py \
+  --config /home/stepan/Projects/code/.tofy-runs/looped-cuda-readout-retry-20260909T151301-IST/invocations/head-0-initial-c10_true.json \
+  --sha256 c03680adb5b11ffd35d825faf61131641f2056a3f8ed74e6ba2abcadbcb15c10
+```
+
+This is a historical command; the sealed root must not be reused. The core runs
+four shared loops, the head has no recurrence, and the cached CUDA stages do not
+establish integrated training or acting. Next: qualify an integrated trainable
+spatial policy, then separately register policy-loss variable-control learning.
+
 **Role-supervised diagnostic boundary:** [C10](research/2026-09-09-looped-role-witness-results.md)
 reaches 256/256 joint localization and hard/soft actions at both initial and final
 cores, using privileged role fitting labels and a frozen C8 policy. Inference is
@@ -1266,3 +1289,35 @@ optimizer updates. NumPy/BLAS has no Candle Graph instrumentation; existing
 extraction profiles retain their known gaps. Next: fixed Rust/CUDA heads and three
 new 256-query panels in C11, without refitting. New-core memory, probing and ARC
 integration remain absent; no optimizer-cause or architecture promotion follows.
+
+## Fixed role readout CUDA confirmation — September 9, 2026 IST
+
+C11 retry source `306582c7` confirms both fixed C10 true heads at **768/768 actions
+and joint roles**, across three registered new known-control, distance-one panels.
+Every per-panel/core gate passes; independent reconstruction agrees. Initial
+success earns no C7 credit, and role fitting used privileged labels. Native policy
+remains 188/768 initial and 209/768 final. The core runs four shared loops; the head
+is nonrecurrent and uses a separate cached-feature stage. No ARC, architecture,
+world-model/planner or policy-only learning claim follows.
+
+C9 final spatial is 256/768=33.33% versus pooled constant 209/768=27.21%,
++6.1198 pp [1.3021,9.5052]; individual panels 81/93/82 compare with 78/69/74,
+with only panel 1's interval excluding zero. Initial spatial 166/768=21.61%.
+C10 null joint localization is 0/768 both, but initial null-agent is 121/768 and
+final null-goal 12/768. Empirical [1,1] does not mean population 100%; pooled
+Wilson 95% is [99.5023%,100%]. All controls and 247 independent comparisons agree.
+[Full metrics, exact commands, failure history, seals and limits](research/2026-09-09-looped-cuda-readout-results.md).
+
+The original attempt passed qualification, generated a valid 256-row CPU audit,
+then failed an empty-trace assertion before fresh model inference. Its 47.8101 s
+model qualification,9.8009 s finalization and 32.4852 s build remain retained. Retry
+fixes only CPU auditing and a separate root-manifest reporting shadow bug; Rust,
+heads, data and gates are unchanged. Retry model phases 216.1990 s/finalization 44.5347 s;
+47 healthy CUDA captures retain operation/activation/memory/device-event and
+correlation gaps. The point-in-time seal verifies 3,427 files,109 bindings and 903gone PIDs.
+
+The next prerequisite is an actual integrated trainable current-token spatial
+policy, parity/gradient qualification, then a separately registered policy-loss
+variable-control screen. The common initial core and privileged fixed-head warm
+start retain shared depth; no finished training or launch claim is made. No
+mandatory intervening CLS probe, LLM controller or public-level pretraining.
