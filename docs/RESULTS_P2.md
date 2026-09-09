@@ -992,6 +992,10 @@ also fails its registered gates; its small exploratory contrasts do not change t
 The [C15 demonstration-grounding diagnostic](research/2026-09-09-looped-demonstration-grounding-results.md)
 passes both frozen selector-reuse gates, but current actions remain 256/1024 initial
 and 254/1024 final. This adds no policy best metric or learned-binding claim.
+The [C16 action-binding qualification](research/2026-09-09-looped-binding-qualification-results.md)
+passes CUDA and batch-512 checks, then stops at the registered runtime admission
+gate. The 1,150-update fit and all 15 evaluation streams never run; no new action
+score or learning verdict changes this record.
 
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
@@ -1468,3 +1472,37 @@ verifies **217 files /240,074,195 bytes, 109 external bindings and 103 PIDs gone
 Next is a separately registered learned before/after binding experiment, with no
 automatic training or selected recipe. Best So Far policy, ARC, planner, dynamics,
 memory and useful-recurrence claims remain unchanged.
+
+## Learned action binding — qualification only, September 9, 2026 IST
+
+C16 qualifies the **1,580,804-parameter** abstract ControlBinder at source
+**fcbf6d4a**, with four shared loops and **physical/effective batch 512,
+accumulation 1**. A four-row frozen CUDA check and disposable two- and five-update
+checks all pass. Body/head gradients are finite and nonzero; disposable updates
+change both and the saved restored checkpoints exactly match initialization.
+These are implementation checks, not evidence that action binding was learned.
+
+The five-update interval is **4.756724763 s**. The preregistered conservative rule
+computes `1.15 × (1150 / 5) × 4.756724763 + 0.010708019 = 1258.1644078325 s`,
+exceeding the **600 s** training cap. The operator therefore refuses training:
+**zero main-fit updates and none of the 15 registered evaluation streams run**.
+The outer exit code 1 records this budget refusal; it is not a native-policy
+failure or a negative learning experiment.
+
+The first selected update, including profiling/export, accounts for about
+**4.5046 s**, versus **0.2521 s** for the next four together. Scaling that first
+capture cost by 230 does not reflect the registered three-capture training
+cadence. It also does not prove a corrected run will fit: host timings are not
+kernel timings, and long-run behavior remains unmeasured. Three healthy CUDA
+captures are available and bound, with the existing instrumentation/correlation
+gaps disclosed. Maximum sampled VRAM is **1086 MiB**, minimum sampled reserve
+**7065 MiB**, and maximum sampled temperature **63°C**; these are telemetry
+samples, not an allocator peak.
+
+The completed qualification seal verifies **216 files / 93,056,179 bytes,
+71 external bindings, 94 recorded PIDs gone and three CUDA captures**. The
+qualification analysis records seven disposable updates and zero main-fit updates.
+[Exact commands, timing interpretation, provenance and qualification limits](research/2026-09-09-looped-binding-qualification-results.md).
+C17 is a separate profile-cadence/amortization correction, retaining the same
+600-second cap, model, data, optimizer and scientific gates. No action/ARC,
+vision, planner, memory or useful-recurrence improvement is claimed.
