@@ -106,6 +106,25 @@ bound profiler captures pass; unwired operation/memory/device-event gaps remain.
 Next: frozen feature/readout diagnosis before another full-model training run.
 No Best So Far or ARC gain; new-core memory, probing and ARC integration remain absent.
 
+## Frozen feature readouts — completed bounded result, September 9, 2026 IST
+
+The C8 true-agent/goal patch-selection oracle plus ridge scores **256/256** at
+both initialization and C7 final weights. This is privileged task-specific routing,
+not a learned/general controller; initial success cannot be credited to C7.
+CLS ridge **53/256 → 95/256** fails the registered gate. Native policy remains
+constant on the new panel: initial **71/256**, final **55/256**, best constant **81/256**.
+Coordinate/analytic controls pass; all five label-permutation controls are <=81/256.
+
+[Full result, all controls, exact commands and provenance](research/2026-09-09-looped-frozen-features-results.md).
+The 768 novel queries split 512 fit / 256 evaluation; frozen four-loop extraction
+uses batch/effective 1 and zero model updates. Both role probes pass the bounded
+recoverability criterion. The empirical bootstrap [1,1] reflects this all-correct
+sample, not guaranteed 100% population performance. Next: separately registered
+learned spatial readout without true-role indices/color parsing at inference.
+Four bound captures pass; known operation/memory/device-event/correlation gaps
+remain. No native Best So Far, ARC or architecture promotion; new-core memory,
+autonomous probing and ARC integration remain absent.
+
 ## Frozen fields for the first experimental run
 
 Before inspecting a full run, record here:
@@ -959,6 +978,12 @@ dose-by-seed comparison while dropping the secondary update-125 trajectory quest
 the run must record this scope note and cannot support a learning-trajectory claim.
 
 ## Best So Far
+
+**Frozen readout diagnostic boundary:** [C8](research/2026-09-09-looped-frozen-features-results.md) reaches
+256/256 only with a true-role selection oracle, including at initialization.
+This establishes no new native-controller best metric: final native policy is
+55/256 and final CLS ridge is 95/256. The older fixed-set record below remains
+scoped to its own population; C8 exact commands and confidence limits are in its report.
 
 **Looped fixed-set prerequisite (not public ARC or generalization):**
 `fit-seed0` at source `b22ce068` reached 120/128 = 93.75%, CE 0.181683, update 1150,
