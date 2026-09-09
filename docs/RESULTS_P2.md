@@ -1221,3 +1221,18 @@ When a P2 metric is reported, include the exact command and separate synthetic
 oracle-normalized efficiency from official ARC-AGI-3 RHAE. Public ARC games are
 held-out transfer evaluation and must not be used for checkpoint selection or
 hyperparameter tuning.
+
+## Learned spatial pooling — September 9, 2026 IST
+
+Six fixed 1,000-update heads completed at source06a8d76f, physical/effective512,
+accumulation1. Fresh spatial accuracy is51/256 initial and68/256 final, below
+best constant77/256; CLS49/256 and54/256, null67/256 and64/256. All routing
+success gates fail while geometry/null controls pass. Final-minus-initial spatial
+gain is+6.64pp [0.39,12.89], a bounded positive contrast without absolute competence.
+No new Best So Far or ARC gain follows; this single-initialization screen does not
+isolate feature inadequacy from optimization. [Exact results and commands](research/2026-09-09-looped-learned-readout-results.md).
+
+All12 full heads independently reconstruct, legacy raw outputs are byte-identical,
+and18 bound profiler captures pass with the stated operation/memory/device-event
+gaps. The6 fits use37.29s model phase. Next: frozen linear role-selector witness
+with explicit synthetic role supervision; core memory/probing/ARC remain absent.
