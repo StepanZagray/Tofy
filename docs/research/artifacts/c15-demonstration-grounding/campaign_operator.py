@@ -31,6 +31,7 @@ for _name, _sha in PINNED.items():
 sys.path.insert(0, str(R12))
 from supervise import read, save, digest, verify_files, require, now, root_manifest
 from driver import tracked
+sys.path.remove(str(R12))  # Do not redirect subsequent local scorer/test imports.
 
 NAMES = ('qualify-b4', 'frames-initial', 'frames-final')
 REFERENCES = {'initial': 'frozen-seen', 'final': 'final-seen-factual'}
