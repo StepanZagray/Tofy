@@ -86,6 +86,10 @@ deterministic context-free policy and cross entropy at least ln(4).
 | Value MSE | 0.014863 | 0.015314 |
 | Constant-0.9 value MSE | 0.010077 | 0.010077 |
 
+Value scope correction (September 9): every training value target is 1, whereas this
+evaluator mixes distances 1 and 2–10. The reported MSEs are correct but do not test
+in-distribution constant-target fitting. See the [matched coverage report](2026-09-09-looped-coverage-results.md) for a separate one-step value check.
+
 Intervals use the preregistered 10,000 paired whole-layout bootstrap draws,
 PCG64 seed 1907, percentile 95% with linear quantiles. Both generalization gates
 fail. The anatomy covers all 32 prediction queries and all four actions per
@@ -155,8 +159,9 @@ invariance to adding the same scalar to every score, not evidence of a dead core
 ## Decision
 
 Do not scale this checkpoint or deploy its learned planner. Local fitting is
-reachable; generalizable rule inference is unresolved. The next experiment is
-the [matched episode-coverage screen](2026-09-08-looped-layout-coverage-screen.md).
+reachable; generalizable rule inference is unresolved. The subsequent
+[matched episode-coverage screen](2026-09-09-looped-coverage-results.md)
+completed on September 9 and failed every policy promotion gate.
 The old 256-update varied-data result is budget/distribution-confounded and is
 not its control. Current loop-stability papers supply hypotheses, not evidence
 that norm placement caused this failure. No ARC score improvement is established.

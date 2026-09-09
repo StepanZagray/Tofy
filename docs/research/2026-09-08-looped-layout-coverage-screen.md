@@ -161,3 +161,15 @@ replica selection is permitted.
 
 The previous35-minute-per-arm bound applies independently to the restarted pair.
 All failed/interrupted roots remain preserved and excluded from quality evidence.
+
+## Exact-binary capacity amendment — before full-pair outcomes
+
+Qualify physical34/tail30 in independent six-update fresh-stream replicas. Select34 only if both preserve512MiB reserve and pass exact replay, seals and profiler checks. A capacity failure selects33/tail31 and requires fresh independent six-update replicas at33. A numerical mismatch in completed memory-qualified replicas stops the experiment for diagnosis; it is never a reason to select another batch. No full arm has started at this source. Use identical selected pair for both full arms; effective64, seeds, initialization, objective and all quality gates unchanged. Old33-vs-new34 quality comparisons forbidden.
+
+The repaired binary passed two physical34 capacity smokes with547/515MiB reserves; physical35 failed CUDA allocation. The prior fixed33 choice is updated only through the same512MiB safety rule. Source and binary stay713e672d/68ddaf33; record the final pair in selection.json and freeze the analyzer batch expectation before launching either full arm.
+
+## Long-run capacity rejection — before any fresh full arm
+
+Physical34 failed the existing512MiB whole-GPU reserve during the full fixed arm (7732/8151MiB;419MiB reserve). Stop and exclude this interrupted arm. The increase is not localized to the model allocator; short-run capacity did not ensure the reserved headroom under observed long-run load. Select physical33/tail31 under the already registered capacity-fallback branch. Require exact-binary depth4 capacity smoke and independent six-update replicas at33 with the same exact replay/512MiB/profiler gates. Restart BOTH full arms from initialization at source713e672d with physical33+31, all other choices unchanged. Do not compare old34 to new33. No extra seeds, metrics, checkpoints or relaxed thresholds. Preserve previous qualification and interrupted artifacts.
+
+Execution order for the final batch33 pair: fresh then fixed, both completed before paired analysis. This ordering change occurs before either final-arm outcome and changes no training/evaluator budget or gate. A monitor now terminates immediately on the existing512MiB sampled reserve failure rather than waiting for the end-of-run acceptance check.

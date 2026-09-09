@@ -13,9 +13,32 @@ at 1/2/4/8 loops stayed near chance; learned successor predictions were worse th
 copy. This is local fitting capacity, not an ARC score or a deployable planner.
 
 [Exact run, commands, metrics and profiler qualifications](research/2026-09-08-looped-fit-results.md).
-The next [matched episode-coverage screen](research/2026-09-08-looped-layout-coverage-screen.md)
-is registered but not launched. The new core still lacks learned episode memory,
+The [matched episode-coverage screen](research/2026-09-08-looped-layout-coverage-screen.md)
+is complete and negative; see the September9 result below. The new core still lacks learned episode memory,
 active probing and an ARC adapter. No public pretraining or LLM controller was used.
+
+## Matched looped episode coverage — September 9, 2026 IST
+
+Two fresh1,150-update runs at source713e672d, physical33/tail31/effective64,
+completed with identical initialization and matched data/optimizer schedules.
+Fresh complete-episode coverage scored **25.10% familiar /25.78% held-out** on
+new layouts; repeated episodes scored **24.22% /26.95%**, cleared history25%.
+Held-out fresh-minus-fixed: **−1.17pp [−4.49,+2.15]** across paired layouts.
+Every promotion gate fails. Final reference fitting is88.28% fixed versus25.78%
+fresh. No ARC improvement or architecture promotion follows from this one-seed screen.
+
+Fresh exact successors improve to32/256 per split versus0 fixed, but copy scores70/256;
+all32 exact fresh cases are reward-positive (exploratory association, no raw-state
+shortcut proof). Reward recall is zero; value close to1 fits its constant training
+target and does not establish long-horizon value. The earlier mixed-horizon value
+comparison must not be interpreted as an in-distribution value-fit failure.
+
+The run also fixes a demonstrated unordered gradient-clipping reduction and verifies
+exact six-update CUDA replay. Two interrupted precursor arms remain excluded; batch34
+failed the long-run512MiB memory reserve and both valid arms restarted at33.
+[Full counts, controls, amendments, hashes, commands and profiler limits](research/2026-09-09-looped-coverage-results.md).
+Next: frozen fixed-query successor counterfactuals, before a new representation or
+loss experiment. New-core episode memory, active probing and ARC integration remain absent.
 
 ## Frozen fields for the first experimental run
 
@@ -884,6 +907,11 @@ python3 /home/stepan/Projects/code/.tofy-runs/looped-profiled-fit-20260908T2156-
 
 The existing run root is sealed and intentionally cannot be reused. Build and
 full profiler command provenance are in the linked report and saved process JSON.
+
+The September9 [matched coverage screen](research/2026-09-09-looped-coverage-results.md)
+adds no qualified best metric. Its raw32/256 exact successors remain below copy70/256
+and are restricted to reward-positive cases; the old fitting record stays scoped to
+its own source/population. Exact new invocations are in the linked report.
 
 **Rollout dynamics (held-out synthetic, 64 episodes, eval v3):**
 
