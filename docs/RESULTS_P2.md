@@ -77,6 +77,18 @@ replay. Each current batch has only4 distinct queries repeated16 times; the
 candidate preserves each query's input/target/depth while increasing diversity.
 No public-level training or LLM; new-core memory, probing and ARC adapter remain absent.
 
+## Frozen seen-query diagnosis — September 9, 2026 IST
+
+The same C5 checkpoint fails on72 registered training queries: factual25/72 equals
+best constant25/72; all576 successor outputs are goal templates. Per condition,
+exact72/288 (terminal only), blocked0/80, nonterminal0/136; copy80/288. The24 queries
+trained and evaluated at4 loops also fail, so depth mismatch alone is insufficient.
+This does not distinguish never-learning from forgetting or measure alltrainingqueries.
+[Full strata, hashes, exact command and limitations](research/2026-09-09-looped-seen-query-results.md).
+Evaluatorae4597b6, zero updates;20 Rust/16 Python fixtures, exactlegacyparity and all
+wired profiler checks pass. Next: cohort-preserving replay on unchanged model/data/depths.
+No ARC gain; new-core memory/probing/ARC integration remain absent.
+
 ## Frozen fields for the first experimental run
 
 Before inspecting a full run, record here:
