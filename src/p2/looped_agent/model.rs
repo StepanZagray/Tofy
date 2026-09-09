@@ -1,6 +1,6 @@
 //! Learned looped-transformer controller for the synthetic prerequisite task.
 
-use super::{ACTIONS, META_DIM, PALETTE, PATCH_COUNT, PATCH_PIXELS, TOKENS};
+use super::{ACTIONS, META_DIM, OBSERVED_FRAMES, PALETTE, PATCH_COUNT, PATCH_PIXELS, TOKENS};
 use anyhow::{bail, ensure, Result};
 use candle_core::{DType, Tensor, D};
 use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder};
@@ -46,11 +46,37 @@ pub struct LoopedOutput {
 
 /// The exact post-final-RMS tensors consumed by the ordinary linear heads.
 /// Retaining these handles adds no model operations, parameters, or detachment.
+/// This also retains the full normalized state and its upstream autograd graph
+/// until the handles are dropped; support frames are not eagerly copied.
 pub struct LoopedFeatures {
     /// Policy/value/reward input, shaped [batch, hidden].
     pub cls: Tensor,
     /// Four successor heads' shared input, shaped [batch, PATCH_COUNT, hidden].
     pub current: Tensor,
+    state: Tensor,
+}
+
+impl LoopedFeatures {
+    /// Returns one exact post-final-RMS frame, shaped [batch, PATCH_COUNT, hidden].
+    /// Indices 0..6 are before/after pairs for support transitions 0, 1, and 2;
+    /// index 6 is the current frame. Indices >= OBSERVED_FRAMES return an error.
+    /// Patches retain their input order, and the result is contiguous: support
+    /// frames are packed on demand when a batched slice has gaps. Frame 6 reuses
+    /// `current`. No values are detached; a shared-storage slice can keep the full
+    /// state allocation alive even after this feature object is dropped.
+    pub fn frame(&self, index: usize) -> Result<Tensor> {
+        ensure!(
+            index < OBSERVED_FRAMES,
+            "frame index must be in 0..{OBSERVED_FRAMES}, got {index}"
+        );
+        if index == OBSERVED_FRAMES - 1 {
+            return Ok(self.current.clone());
+        }
+        Ok(self
+            .state
+            .narrow(1, 1 + index * PATCH_COUNT, PATCH_COUNT)?
+            .contiguous()?)
+    }
 }
 
 struct SelfAttention {
@@ -261,6 +287,7 @@ impl LoopedAgent {
         Ok(LoopedFeatures {
             cls: readout,
             current: current_patches,
+            state,
         })
     }
 
@@ -528,6 +555,125 @@ mod tests {
                 .collect::<Result<Vec<_>>>()?
         );
         assert_eq!(named.len(), vars.data().lock().unwrap().len());
+        Ok(())
+    }
+
+    #[test]
+    fn current_frame_is_exact_for_single_and_multiple_batches() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, _) = model(&device)?;
+        for batch in [1, 3] {
+            let patches = Tensor::from_vec(
+                (0..batch * TOKENS * PATCH_PIXELS)
+                    .map(|i| (i % PALETTE) as u32)
+                    .collect::<Vec<_>>(),
+                (batch, TOKENS, PATCH_PIXELS),
+                &device,
+            )?;
+            let metadata = Tensor::zeros((batch, TOKENS, META_DIM), DType::F32, &device)?;
+            for loops in [1, 4] {
+                let features = model.forward_features(&patches, &metadata, loops)?;
+                let current = features.frame(6)?;
+                assert_eq!(current.dims(), &[batch, PATCH_COUNT, model.config.hidden]);
+                assert!(current.is_contiguous());
+                assert_eq!(
+                    current.flatten_all()?.to_vec1::<f32>()?,
+                    features.current.flatten_all()?.to_vec1::<f32>()?
+                );
+                assert_eq!(
+                    current.flatten_all()?.to_vec1::<f32>()?,
+                    features
+                        .state
+                        .narrow(1, 1 + 6 * PATCH_COUNT, PATCH_COUNT)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn frame_slices_preserve_order_and_reject_out_of_range() -> Result<()> {
+        let device = Device::Cpu;
+        let (batch, hidden) = (2, 3);
+        // Each coordinate is unique, including the CLS row and batch boundary.
+        let state = Tensor::arange(0f32, (batch * (1 + TOKENS) * hidden) as f32, &device)?
+            .reshape((batch, 1 + TOKENS, hidden))?;
+        let features = LoopedFeatures {
+            cls: state.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?,
+            current: state
+                .narrow(1, 1 + 6 * PATCH_COUNT, PATCH_COUNT)?
+                .contiguous()?,
+            state,
+        };
+        for frame_index in 0..7 {
+            let frame = features.frame(frame_index)?;
+            assert_eq!(frame.dims(), &[batch, PATCH_COUNT, hidden]);
+            assert!(frame.is_contiguous());
+            let values = frame.to_vec3::<f32>()?;
+            for (b, patches) in values.iter().enumerate() {
+                for (p, channels) in patches.iter().enumerate() {
+                    for (h, value) in channels.iter().enumerate() {
+                        let offset =
+                            (b * (1 + TOKENS) + 1 + frame_index * PATCH_COUNT + p) * hidden + h;
+                        assert_eq!(*value, offset as f32);
+                    }
+                }
+            }
+        }
+        assert!(features.frame(7).is_err());
+        assert!(features.frame(usize::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_support_frame_retains_body_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let (model, vars) = model(&device)?;
+        let patches = Tensor::from_vec(
+            (0..2 * TOKENS * PATCH_PIXELS)
+                .map(|i| ((i / PATCH_PIXELS) % PALETTE) as u32)
+                .collect::<Vec<_>>(),
+            (2, TOKENS, PATCH_PIXELS),
+            &device,
+        )?;
+        let metadata = Tensor::from_vec(
+            (0..2 * TOKENS * META_DIM)
+                .map(|i| (i % 7) as f32 / 7.0)
+                .collect::<Vec<_>>(),
+            (2, TOKENS, META_DIM),
+            &device,
+        )?;
+        let features = model.forward_features(&patches, &metadata, 2)?;
+        let parameters = vars.data().lock().unwrap();
+        for index in 0..6 {
+            // A single-channel objective avoids the constant RMS squared norm.
+            let gradients = features
+                .frame(index)?
+                .narrow(2, 0, 1)?
+                .mean_all()?
+                .backward()?;
+            for name in [
+                "palette_embedding.weight",
+                "patch_projection.weight",
+                "metadata_projection.weight",
+                "block_0.attention.query.weight",
+            ] {
+                let values = gradients
+                    .get(&parameters[name])
+                    .unwrap_or_else(|| panic!("missing frame {index} gradient for {name}"))
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(values.iter().all(|v| v.is_finite()));
+                assert!(
+                    values.iter().any(|&v| v != 0.0),
+                    "zero frame {index} gradient for {name}"
+                );
+            }
+            assert!(gradients.get(&parameters["policy_head.weight"]).is_none());
+            assert!(gradients.get(&parameters["next_head_0.weight"]).is_none());
+        }
         Ok(())
     }
 

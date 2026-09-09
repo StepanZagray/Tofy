@@ -1,0 +1,25 @@
+{
+  "source_base": "3bc586a00ab303cc7b92a080e2958eeda44b14ea",
+  "rust_example_tests": 20,
+  "rust_looped_library_tests": 21,
+  "strict_clippy_scope": [
+    "lib",
+    "example grounded_policy_probe"
+  ],
+  "strict_clippy_passed": true,
+  "rustfmt_passed": true,
+  "diff_check_passed": true,
+  "agent_sessions_closed": [
+    36290,
+    34593,
+    13101,
+    54043
+  ],
+  "legacy_unrelated_test_clippy_warnings": "Eight pre-existing warnings outside modified scope; strict production library and changed example pass.",
+  "source_hashes": {
+    "model.rs": "58d29d0dbe22cb00df0ac1aaea9975a250f9d38c36d86c10665d0e0ac093a260",
+    "profile.rs": "ea929cda9d8750c82ff2eee33f42644e707a329e497c1bd739bf1b4364011925",
+    "grounded_policy_probe.rs": "5d85cd0b17cc765bbf52af6c4a09c66001f8a8c76e0c2f914153d6c27d696ad6",
+    "frames.rs": "87253cf9bb1fc850ece19d6baed2c4b939fa754230cdcc9f9a93af0050b3ff35"
+  }
+}

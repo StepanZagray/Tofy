@@ -41,6 +41,38 @@ pub struct LoopedRange<'a> {
 }
 
 impl LoopedCapture {
+    /// Frozen body plus the same spatial policy applied independently to all
+    /// seven observed frames. No optimizer work or gradient contract is declared.
+    pub fn begin_demonstration_grounding(
+        destination: &Path,
+        step: u64,
+        device: &Device,
+        batch: usize,
+    ) -> Result<Self> {
+        let run = ProfileRun::inference(
+            "tofy::p2::demonstration_grounding::evaluation",
+            step,
+            device_name(device),
+        )
+        .correlation_id(format!(
+            "tofy.looped/demonstration-grounding-eval-{step:012}"
+        ))
+        .tag("workload", "looped-demonstration-grounding")
+        .tag("head_kind", "spatial")
+        .tag("feature_seam", "post-final-rms-each-observed-frame")
+        .tag("frame_count", "7")
+        .tag(
+            "frame_order",
+            "before0,after0,before1,after1,before2,after2,current",
+        )
+        .tag("core_forward_batches", "1")
+        .tag("spatial_head_forward_batches", "7")
+        .tag("optimizer_updates", "0")
+        .tag("ordinary_heads", "not_executed")
+        .tag("head_recurrence", "none");
+        Self::open(destination, run, None, batch, batch, 4)
+    }
+
     /// Feature-only looped body plus trainable spatial policy. A training capture
     /// includes both complete VarMaps so absent ordinary-head gradients are explicit.
     /// `None` selects evaluation without a gradient contract.
@@ -551,6 +583,61 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn demonstration_grounding_declares_seven_frozen_frames() -> Result<()> {
+        let dir = TestDir::new("demonstration-grounding");
+        let destination = dir.0.join("eval");
+        let device = Device::Cpu;
+        let capture = LoopedCapture::begin_demonstration_grounding(&destination, 1, &device, 2)?;
+        {
+            let _measured = capture.measurement();
+            let forward = capture.phase("forward", Some(ExecutionStep::Forward));
+            for frame in 0..7 {
+                for (name, shape) in [
+                    ("features", vec![2, 64, 128]),
+                    ("attention", vec![2, 2, 64]),
+                    ("pooled", vec![2, 256]),
+                ] {
+                    capture.record_tensor_stats(
+                        &forward,
+                        &format!("frames/{frame}/{name}"),
+                        &Tensor::zeros(shape, DType::F32, &device)?,
+                    )?;
+                }
+            }
+            capture.record_tensor_stats(
+                &forward,
+                "policy/logits",
+                &Tensor::zeros((2, 4), DType::F32, &device)?,
+            )?;
+        }
+        capture.finish()?;
+        candle_graph::verify_bundle(&destination)?;
+        let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
+        let health = analyze_health(&trace);
+        assert!(
+            health.structurally_valid && health.capture_complete,
+            "{health:?}"
+        );
+        assert!(trace.run.capture_contract.gradient_contract.is_none());
+        assert_eq!(trace.run.capture_contract.gradients, CoverageLevel::None);
+        assert!(trace.gradients.is_empty());
+        assert_eq!(trace.tensors.len(), 22);
+        assert_eq!(trace.run.tags["workload"], "looped-demonstration-grounding");
+        assert_eq!(
+            trace.run.tags["feature_seam"],
+            "post-final-rms-each-observed-frame"
+        );
+        assert_eq!(trace.run.tags["frame_count"], "7");
+        assert_eq!(trace.run.tags["loops"], "4");
+        assert_eq!(trace.run.tags["physical_batch"], "2");
+        assert_eq!(trace.run.tags["effective_batch"], "2");
+        assert_eq!(trace.run.tags["ordinary_heads"], "not_executed");
+        assert_eq!(trace.run.tags["optimizer_updates"], "0");
+        assert_eq!(fs::read_dir(&dir.0)?.count(), 1);
+        Ok(())
     }
 
     #[test]

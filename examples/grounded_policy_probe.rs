@@ -5,6 +5,8 @@ mod data;
 mod engine;
 #[path = "grounded_policy/evidence.rs"]
 mod evidence;
+#[path = "grounded_policy/frames.rs"]
+mod frames;
 
 use anyhow::{ensure, Context, Result};
 use candle_core::{Device, Tensor};
@@ -38,6 +40,18 @@ enum Mode {
     Train,
     EvalInitial,
     EvalFinal,
+    EvalFramesInitial,
+    EvalFramesFinal,
+}
+
+impl Mode {
+    fn frame_evaluation(self) -> bool {
+        matches!(self, Self::EvalFramesInitial | Self::EvalFramesFinal)
+    }
+
+    fn final_checkpoint(self) -> bool {
+        matches!(self, Self::EvalFinal | Self::EvalFramesFinal)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +86,17 @@ struct Args {
 }
 impl Config {
     fn validate(&self) -> Result<()> {
+        frames::validate_mode(
+            self.mode,
+            self.cohort,
+            self.cleared,
+            self.physical_batch,
+            self.updates,
+        )?;
+        ensure!(
+            !self.mode.frame_evaluation() || self.max_seconds <= 120,
+            "frame evaluation model budget exceeds 120 seconds"
+        );
         ensure!(
             self.schema == "looped-grounded-policy-config-v1",
             "unknown config schema"
@@ -102,7 +127,7 @@ impl Config {
                 && file_hash(&self.head_checkpoint)? == self.head_sha256,
             "checkpoint hash differs"
         );
-        if self.mode != Mode::EvalFinal {
+        if !self.mode.final_checkpoint() {
             ensure!(
                 self.core_sha256 == INITIAL_CORE && self.head_sha256 == INITIAL_HEAD,
                 "exact registered initialization required"
@@ -113,7 +138,8 @@ impl Config {
             "privileged warm-start import binding differs"
         );
         let training = matches!(self.mode, Mode::Train | Mode::BatchSmoke);
-        let evaluation = matches!(self.mode, Mode::EvalInitial | Mode::EvalFinal);
+        let evaluation = matches!(self.mode, Mode::EvalInitial | Mode::EvalFinal)
+            || self.mode.frame_evaluation();
         ensure!(
             self.updates
                 == if self.mode == Mode::Train {
@@ -184,7 +210,7 @@ impl Config {
 fn load_model(config: &Config, device: &Device) -> Result<engine::Model> {
     let model = engine::Model::new(device)?;
     model.load_core(&config.core_checkpoint)?;
-    if config.mode == Mode::EvalFinal {
+    if config.mode.final_checkpoint() {
         model.load_head(&config.head_checkpoint)?;
     } else {
         let bytes = fs::read(&config.head_checkpoint)?;
@@ -250,13 +276,18 @@ fn labels_old(count: usize) -> Result<Vec<usize>> {
 
 fn run(config: &Config, started: Instant) -> Result<Value> {
     let source = evidence::provenance()?;
-    write_json(
-        &config.output_dir.join("metadata.json"),
-        &json!({"schema":"looped-grounded-policy-v1","config":config,"provenance":source,
+    let mut metadata = json!({"schema":"looped-grounded-policy-v1","config":config,"provenance":source,
         "loops":4,"hidden":128,"layers":2,"heads":4,"max_loops":8,"effective_batch":64,"seed":0,
         "objective":"policy_cross_entropy_only","privileged_role_warm_start":true,
-        "deferred":["reward","value","dynamics","planner","episode_memory","ARC_evaluation","useful_depth_test"]}),
-    )?;
+        "deferred":["reward","value","dynamics","planner","episode_memory","ARC_evaluation","useful_depth_test"]});
+    if config.mode.frame_evaluation() {
+        metadata["objective"] = json!("frozen_frame_policy_inspection");
+        metadata["classification"] = json!("exploratory_grounding");
+        metadata["effective_batch"] = json!(config.physical_batch);
+        metadata["optimizer_updates"] = json!(0);
+        metadata["frame_count"] = json!(7);
+    }
+    write_json(&config.output_dir.join("metadata.json"), &metadata)?;
     if config.mode == Mode::Audit {
         let report = data::audit(
             &config.output_dir,
@@ -300,7 +331,9 @@ fn run(config: &Config, started: Instant) -> Result<Value> {
     let report = match config.mode {
         Mode::Qualify => qualify(config, &model, &device, started)?,
         Mode::BatchSmoke | Mode::Train => train(config, &model, &device, started)?,
-        Mode::EvalInitial | Mode::EvalFinal => evaluate(config, &model, &device, started)?,
+        Mode::EvalInitial | Mode::EvalFinal | Mode::EvalFramesInitial | Mode::EvalFramesFinal => {
+            evaluate(config, &model, &device, started)?
+        }
         Mode::Audit => unreachable!(),
     };
     device.synchronize()?;
@@ -316,6 +349,18 @@ fn capture(
     training: bool,
     actual_batch: usize,
 ) -> Result<LoopedCapture> {
+    if config.mode.frame_evaluation() {
+        ensure!(!training, "frame capture cannot train");
+        return LoopedCapture::begin_demonstration_grounding(
+            &config
+                .output_dir
+                .with_extension("profiles")
+                .join(format!("update-{step:012}")),
+            step as u64,
+            device,
+            actual_batch,
+        );
+    }
     LoopedCapture::begin_grounded_policy(
         &config
             .output_dir
@@ -554,6 +599,11 @@ fn evaluate(
         cohort != data::Cohort::Training,
         "evaluation cannot select full training stream"
     );
+    let initial = config
+        .mode
+        .frame_evaluation()
+        .then(|| model.snapshot())
+        .transpose()?;
     let frozen = model.frozen()?;
     let mut output = BufWriter::new(File::create(
         config.output_dir.join("evaluation-rows.jsonl"),
@@ -571,6 +621,10 @@ fn evaluate(
     for group in 0..64 {
         rows.extend(data::group(cohort, group, config.cleared)?);
     }
+    ensure!(
+        !config.mode.frame_evaluation() || rows.len() == 1024,
+        "frame evaluation requires exactly 1024 seen rows"
+    );
     for (i, chunk) in rows.chunks(config.physical_batch).enumerate() {
         config.deadline(started)?;
         for row in chunk {
@@ -585,7 +639,15 @@ fn evaluate(
         let cap = (i == 0)
             .then(|| capture(config, model, device, 1, false, chunk.len()))
             .transpose()?;
-        let out = measured_forward(&frozen, &inputs, device, cap.as_ref())?;
+        let (out, frame_exports) = if config.mode.frame_evaluation() {
+            let (out, frames) = frames::measured_forward(&frozen, &inputs, device, cap.as_ref())?;
+            (out, Some(frames))
+        } else {
+            (
+                measured_forward(&frozen, &inputs, device, cap.as_ref())?,
+                None,
+            )
+        };
         let logits = out.policy.logits.to_vec2::<f32>()?;
         let attention = out.policy.attention.to_vec3::<f32>()?;
         let pooled = out.policy.pooled.to_vec2::<f32>()?;
@@ -604,7 +666,7 @@ fn evaluate(
                 "invalid scoring role index"
             );
             let mut row = chunk[j].audit_json.clone();
-            row["checkpointstage"] = json!(if config.mode == Mode::EvalInitial {
+            row["checkpointstage"] = json!(if !config.mode.final_checkpoint() {
                 "frozen"
             } else {
                 "final"
@@ -612,6 +674,10 @@ fn evaluate(
             row["logits"] = json!(logits[j]);
             row["attention"] = json!(attention[j]);
             row["pooled"] = json!(pooled[j]);
+            if let Some(frames) = &frame_exports {
+                row["frames"] = serde_json::to_value(&frames[j])?;
+                row["public_metadata"] = json!(inputs[j].metadata);
+            }
             serde_json::to_writer(&mut output, &row)?;
             output.write_all(b"\n")?;
         }
@@ -624,9 +690,25 @@ fn evaluate(
         "unconsumed evaluation audit rows"
     );
     output.flush()?;
-    Ok(
-        json!({"status":"complete_pending_analysis","optimizer_updates":0,"cohort":cohort,"cleared":config.cleared,"input_rows":rows.len(),"physical_batch":config.physical_batch,"elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+    let mut report = json!({"status":"complete_pending_analysis","optimizer_updates":0,"cohort":cohort,"cleared":config.cleared,"input_rows":rows.len(),"physical_batch":config.physical_batch,"elapsed_seconds":started.elapsed().as_secs_f64()});
+    if let Some(initial) = initial {
+        let changes = model.change_audit(&initial)?;
+        ensure!(
+            changes.all_parameters_unchanged && changes.unused_heads_unchanged,
+            "frame evaluation changed parameters"
+        );
+        report["classification"] = json!("exploratory_grounding");
+        report["frame_count"] = json!(7);
+        report["loops"] = json!(engine::LOOPS);
+        report["core_forward_batches"] = json!(rows.len().div_ceil(config.physical_batch));
+        report["spatial_head_forward_batches"] =
+            json!(7 * rows.len().div_ceil(config.physical_batch));
+        report["changes"] = serde_json::to_value(changes)?;
+        report["core_sha256"] = json!(config.core_sha256);
+        report["head_sha256"] = json!(config.head_sha256);
+        report["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
+    }
+    Ok(report)
 }
 
 fn main() -> Result<()> {
