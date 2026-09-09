@@ -1,6 +1,8 @@
 //! Synthetic prerequisite for the from-scratch looped agent. Never loads ARC games.
 #[path = "looped_agent_probe/counterfactual.rs"]
 mod counterfactual;
+#[path = "looped_agent_probe/known_features.rs"]
+mod known_features;
 #[path = "looped_agent_probe/known_mapping.rs"]
 mod known_mapping;
 #[path = "looped_agent_probe/known_replay.rs"]
@@ -41,6 +43,9 @@ enum Mode {
     CounterfactualAudit,
     KnownMapping,
     KnownMappingAudit,
+    KnownFeatures,
+    KnownFeaturesAudit,
+    KnownFeaturesSmoke,
     Fit,
     FitSmoke,
     Coverage,
@@ -70,6 +75,9 @@ struct Args {
     /// Reorder known fresh queries within their original training-depth cohorts.
     #[arg(long)]
     known_replay: bool,
+    /// Absolute JSONL populations whose query hashes the feature panel must exclude.
+    #[arg(long)]
+    known_features_exclude: Vec<PathBuf>,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "cuda:0")]
@@ -1112,6 +1120,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         known_mapping::annotate_seen(args, &mut metadata);
         known_replay::annotate(args, &mut metadata);
     }
+    known_features::annotate(args, &mut metadata);
     write_json(&args.output_dir.join("metadata.json"), &metadata)?;
     if args.mode == Mode::CoverageAudit {
         return coverage_audit(args, started);
@@ -1122,6 +1131,15 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     if args.mode == Mode::KnownMappingAudit {
         return known_mapping::audit(args, started, &HashSet::new());
     }
+    if args.mode == Mode::KnownFeaturesAudit {
+        return known_features::audit(args, started);
+    }
+    let feature_audit = if known_features::extracts(args.mode) {
+        known_features::check_checkpoint(args)?;
+        Some(known_features::audit(args, started)?)
+    } else {
+        None
+    };
     let device = resolve_device(&args.device)?;
     let mut vars = VarMap::new();
     let model = LoopedAgent::new(
@@ -1137,11 +1155,21 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         .iter()
         .map(|v| v.elem_count())
         .sum::<usize>();
+    if let Some(audit) = feature_audit {
+        // Return before constructing an optimizer or entering any training path.
+        drop(model);
+        return known_features::extract(args, &vars, &config, &device, parameters, audit, started);
+    }
     let updates = match args.mode {
         Mode::Smoke | Mode::FitSmoke => 2,
         Mode::Train | Mode::Fit | Mode::Coverage => args.updates,
         Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping => 0,
-        Mode::CoverageAudit | Mode::CounterfactualAudit | Mode::KnownMappingAudit => {
+        Mode::CoverageAudit
+        | Mode::CounterfactualAudit
+        | Mode::KnownMappingAudit
+        | Mode::KnownFeatures
+        | Mode::KnownFeaturesAudit
+        | Mode::KnownFeaturesSmoke => {
             unreachable!("data audit returns before model construction")
         }
     };
@@ -1567,6 +1595,11 @@ fn main() -> Result<()> {
     known_mapping::validate_args(&args)?;
     let perf_guard = tofy::perf::install()?;
     ensure!(
+        !known_features::extracts(args.mode)
+            || (cfg!(feature = "profiling") && perf_guard.is_some()),
+        "known-features extraction requires profiling and TOFY_PERF_TRACE"
+    );
+    ensure!(
         args.loops > 0 && args.max_loops >= args.loops,
         "inference depth must cover positive training depth"
     );
@@ -1591,14 +1624,24 @@ fn main() -> Result<()> {
     ensure!(
         !matches!(
             args.mode,
-            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping
+            Mode::Evaluate
+                | Mode::Inspect
+                | Mode::Counterfactual
+                | Mode::KnownMapping
+                | Mode::KnownFeatures
+                | Mode::KnownFeaturesSmoke
         ) || args.checkpoint.is_some(),
         "evaluation requires a checkpoint"
     );
     ensure!(
         matches!(
             args.mode,
-            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual | Mode::KnownMapping
+            Mode::Evaluate
+                | Mode::Inspect
+                | Mode::Counterfactual
+                | Mode::KnownMapping
+                | Mode::KnownFeatures
+                | Mode::KnownFeaturesSmoke
         ) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
@@ -1611,6 +1654,9 @@ fn main() -> Result<()> {
             | Mode::CounterfactualAudit
             | Mode::KnownMapping
             | Mode::KnownMappingAudit
+            | Mode::KnownFeatures
+            | Mode::KnownFeaturesAudit
+            | Mode::KnownFeaturesSmoke
     ) {
         let count = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
             2

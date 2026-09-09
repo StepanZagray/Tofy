@@ -15,6 +15,7 @@ const SEEN_BLOCK_STARTS: [u64; 3] = [0, 2280, 4576];
 const SEEN_DEPTH_CAVEAT: &str = "all queries are scored at four loops; this is not original-depth fitting for examples trained at one or two loops";
 
 pub(super) fn validate_args(args: &Args) -> Result<()> {
+    known_features::validate_args(args)?;
     known_replay::validate_args(args)?;
     let dedicated = matches!(args.mode, Mode::KnownMapping | Mode::KnownMappingAudit);
     ensure!(
@@ -26,7 +27,7 @@ pub(super) fn validate_args(args: &Args) -> Result<()> {
         "known-mapping modes require --known-mapping"
     );
     if args.known_mapping {
-        ensure!(matches!(args.mode, Mode::Coverage | Mode::CoverageAudit | Mode::FitSmoke | Mode::KnownMapping | Mode::KnownMappingAudit),
+        ensure!(matches!(args.mode, Mode::Coverage | Mode::CoverageAudit | Mode::FitSmoke | Mode::KnownMapping | Mode::KnownMappingAudit | Mode::KnownFeatures | Mode::KnownFeaturesAudit | Mode::KnownFeaturesSmoke),
                 "--known-mapping is scoped to coverage, coverage-audit, fit-smoke and known-mapping modes");
         ensure!(
             !args.search,

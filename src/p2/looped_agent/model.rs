@@ -44,6 +44,15 @@ pub struct LoopedOutput {
     pub next_logits: Tensor,
 }
 
+/// The exact post-final-RMS tensors consumed by the ordinary linear heads.
+/// Retaining these handles adds no model operations, parameters, or detachment.
+pub struct LoopedFeatures {
+    /// Policy/value/reward input, shaped [batch, hidden].
+    pub cls: Tensor,
+    /// Four successor heads' shared input, shaped [batch, PATCH_COUNT, hidden].
+    pub current: Tensor,
+}
+
 struct SelfAttention {
     query: Linear,
     key: Linear,
@@ -178,6 +187,17 @@ impl LoopedAgent {
         metadata: &Tensor,
         loops: usize,
     ) -> Result<LoopedOutput> {
+        self.forward_with_features(patches, metadata, loops)
+            .map(|(output, _)| output)
+    }
+
+    /// Runs the same ordinary heads once and also retains their input tensors.
+    pub fn forward_with_features(
+        &self,
+        patches: &Tensor,
+        metadata: &Tensor,
+        loops: usize,
+    ) -> Result<(LoopedOutput, LoopedFeatures)> {
         self.validate_inputs(patches, metadata, loops)?;
         let batch = patches.dim(0)?;
 
@@ -220,12 +240,19 @@ impl LoopedAgent {
             ))?);
         }
 
-        Ok(LoopedOutput {
+        let output = LoopedOutput {
             policy_logits: self.policy_head.forward(&readout)?,
             value: self.value_head.forward(&readout)?,
             reward_logits: self.reward_head.forward(&readout)?,
             next_logits: Tensor::stack(&next_by_action, 1)?,
-        })
+        };
+        Ok((
+            output,
+            LoopedFeatures {
+                cls: readout,
+                current: current_patches,
+            },
+        ))
     }
 
     fn validate_inputs(&self, patches: &Tensor, metadata: &Tensor, loops: usize) -> Result<()> {
@@ -330,6 +357,169 @@ mod tests {
         let names = parameters.keys().cloned().collect();
         let count = parameters.values().map(|var| var.elem_count()).sum();
         (names, count)
+    }
+
+    // Frozen numerical body from 8cec1006; independent of the new forwarding API.
+    fn legacy_forward(
+        model: &LoopedAgent,
+        patches: &Tensor,
+        metadata: &Tensor,
+        loops: usize,
+    ) -> Result<LoopedOutput> {
+        model.validate_inputs(patches, metadata, loops)?;
+        let batch = patches.dim(0)?;
+
+        // Embedding retains the within-patch axis. Flattening concatenates the
+        // 64 position-specific embeddings; it does not pool away any pixel.
+        let patch_features = model.palette_embedding.forward(patches)?.reshape((
+            batch,
+            TOKENS,
+            PATCH_PIXELS * PIXEL_EMBED_DIM,
+        ))?;
+        let patch_features = model.patch_projection.forward(&patch_features)?;
+        let metadata_features = model.metadata_projection.forward(metadata)?;
+        let observed_tokens = patch_features.add(&metadata_features)?;
+        let readout = model
+            .readout_token
+            .broadcast_as((batch, 1, model.config.hidden))?;
+        let recalled_input = Tensor::cat(&[&readout, &observed_tokens], 1)?;
+
+        let mut state = Tensor::zeros_like(&recalled_input)?;
+        for _ in 0..loops {
+            state = state.add(&recalled_input)?;
+            for block in &model.blocks {
+                state = block.forward(&state)?;
+            }
+        }
+        let state = rms_norm(&state)?;
+
+        // Narrowing leaves gaps between batches; CUDA linear readouts require
+        // packed rows even though the batch-one layout appears contiguous.
+        let readout = state.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
+        let current_start = 1 + TOKENS - PATCH_COUNT;
+        let current_patches = state.narrow(1, current_start, PATCH_COUNT)?.contiguous()?;
+        let mut next_by_action = Vec::with_capacity(ACTIONS);
+        for head in &model.next_heads {
+            next_by_action.push(head.forward(&current_patches)?.reshape((
+                batch,
+                PATCH_COUNT,
+                PATCH_PIXELS,
+                PALETTE,
+            ))?);
+        }
+
+        Ok(LoopedOutput {
+            policy_logits: model.policy_head.forward(&readout)?,
+            value: model.value_head.forward(&readout)?,
+            reward_logits: model.reward_head.forward(&readout)?,
+            next_logits: Tensor::stack(&next_by_action, 1)?,
+        })
+    }
+
+    #[test]
+    fn feature_api_preserves_legacy_outputs_parameters_and_gradients() -> Result<()> {
+        fn values(tensor: &Tensor) -> Result<Vec<f32>> {
+            Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
+        }
+        fn objective(output: &LoopedOutput) -> Result<Tensor> {
+            Ok(output
+                .policy_logits
+                .sqr()?
+                .mean_all()?
+                .add(&output.value.sqr()?.mean_all()?)?
+                .add(&output.reward_logits.sqr()?.mean_all()?)?
+                .add(&output.next_logits.sqr()?.mean_all()?)?)
+        }
+        let device = Device::Cpu;
+        let (model, vars) = model(&device)?;
+        let named = vars
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, var)| (name.clone(), var.clone()))
+            .collect::<Vec<_>>();
+        let before = named
+            .iter()
+            .map(|(_, v)| values(v))
+            .collect::<Result<Vec<_>>>()?;
+        let patches = Tensor::from_vec(
+            (0..2 * TOKENS * PATCH_PIXELS)
+                .map(|i| (i % 5) as u32)
+                .collect::<Vec<_>>(),
+            (2, TOKENS, PATCH_PIXELS),
+            &device,
+        )?;
+        let metadata = Tensor::from_vec(
+            (0..2 * TOKENS * META_DIM)
+                .map(|i| (i % 7) as f32 / 7.0)
+                .collect::<Vec<_>>(),
+            (2, TOKENS, META_DIM),
+            &device,
+        )?;
+        for loops in [1, 4] {
+            let legacy = legacy_forward(&model, &patches, &metadata, loops)?;
+            let ordinary = model.forward(&patches, &metadata, loops)?;
+            let (exported, features) = model.forward_with_features(&patches, &metadata, loops)?;
+            assert_eq!(features.cls.dims(), &[2, model.config.hidden]);
+            assert_eq!(
+                features.current.dims(),
+                &[2, PATCH_COUNT, model.config.hidden]
+            );
+            // Reconstruct every head from the exported handles, also testing
+            // that these handles retain the original upstream gradient graph.
+            let next = model
+                .next_heads
+                .iter()
+                .map(|head| {
+                    head.forward(&features.current)?.reshape((
+                        2,
+                        PATCH_COUNT,
+                        PATCH_PIXELS,
+                        PALETTE,
+                    ))
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let reconstructed = LoopedOutput {
+                policy_logits: model.policy_head.forward(&features.cls)?,
+                value: model.value_head.forward(&features.cls)?,
+                reward_logits: model.reward_head.forward(&features.cls)?,
+                next_logits: Tensor::stack(&next, 1)?,
+            };
+            let expected = objective(&legacy)?.backward()?;
+            for actual in [&ordinary, &exported, &reconstructed] {
+                for (a, b) in [
+                    (&legacy.policy_logits, &actual.policy_logits),
+                    (&legacy.value, &actual.value),
+                    (&legacy.reward_logits, &actual.reward_logits),
+                    (&legacy.next_logits, &actual.next_logits),
+                ] {
+                    assert_eq!(values(a)?, values(b)?);
+                }
+                let gradients = objective(actual)?.backward()?;
+                for (name, var) in &named {
+                    let a = expected
+                        .get(var)
+                        .unwrap_or_else(|| panic!("missing legacy gradient {name}"));
+                    let b = gradients
+                        .get(var)
+                        .unwrap_or_else(|| panic!("missing feature gradient {name}"));
+                    let av = values(a)?;
+                    let bv = values(b)?;
+                    assert!(av.iter().chain(&bv).all(|x| x.is_finite()));
+                    assert_eq!(av, bv, "gradient parity for {name} at depth {loops}");
+                }
+            }
+        }
+        assert_eq!(
+            before,
+            named
+                .iter()
+                .map(|(_, v)| values(v))
+                .collect::<Result<Vec<_>>>()?
+        );
+        assert_eq!(named.len(), vars.data().lock().unwrap().len());
+        Ok(())
     }
 
     #[test]
