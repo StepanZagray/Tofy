@@ -80,7 +80,20 @@ impl LoopedCapture {
         .tag("privileged_role_warm_start", "true")
         .tag("optimizer_updates", "0")
         .tag("ordinary_core_heads", "not_executed");
-        Self::open(destination, run, None, batch, batch, 4)
+        Self::open_with_forward_phases(
+            destination,
+            run,
+            None,
+            batch,
+            batch,
+            4,
+            &[
+                "vision-core",
+                "seven-selectors",
+                "native-adapter",
+                "equivariant-binder",
+            ],
+        )
     }
 
     /// Binder-only work; no vision-core or ordinary vision-head families exist.
@@ -433,6 +446,26 @@ impl LoopedCapture {
         effective_batch: usize,
         loops: usize,
     ) -> Result<Self> {
+        Self::open_with_forward_phases(
+            destination,
+            run,
+            gradients,
+            physical_batch,
+            effective_batch,
+            loops,
+            &["forward"],
+        )
+    }
+
+    fn open_with_forward_phases(
+        destination: &Path,
+        run: ProfileRun,
+        gradients: Option<GradientCapturePlan>,
+        physical_batch: usize,
+        effective_batch: usize,
+        loops: usize,
+        forward_phases: &[&str],
+    ) -> Result<Self> {
         ensure!(
             physical_batch > 0 && effective_batch >= physical_batch,
             "invalid looped capture batch sizes"
@@ -449,7 +482,11 @@ impl LoopedCapture {
             labels.push(format!("{label}/gradient-inspection-and-clip"));
             labels.push(format!("{label}/optimizer"));
         } else {
-            labels.push(format!("{label}/forward"));
+            labels.extend(
+                forward_phases
+                    .iter()
+                    .map(|phase| format!("{label}/{phase}")),
+            );
         }
         let contract = CaptureContract {
             measurement_scope: MeasurementScope::ProfiledWork,
@@ -817,6 +854,13 @@ mod tests {
             let trace = candle_graph::parse_trace(destination.join("trace.jsonl"))?;
             assert!(trace.run.capture_contract.gradient_contract.is_none());
             assert_eq!(trace.run.tags["input_source"], "precomputed_visual");
+            assert_eq!(
+                trace.run.capture_contract.required_semantic_labels,
+                vec![
+                    "tofy.looped/capture".to_owned(),
+                    format!("{}/forward", trace.run.correlation_id),
+                ]
+            );
         }
         Ok(())
     }

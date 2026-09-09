@@ -376,6 +376,39 @@ mod tests {
         assert!(
             trace.gradients.is_empty() && trace.run.capture_contract.gradient_contract.is_none()
         );
+        let mut expected = vec!["tofy.looped/capture".to_owned()];
+        expected.extend(
+            [
+                "vision-core",
+                "seven-selectors",
+                "native-adapter",
+                "equivariant-binder",
+            ]
+            .map(|phase| format!("{}/{phase}", trace.run.correlation_id)),
+        );
+        assert_eq!(
+            trace.run.capture_contract.required_semantic_labels,
+            expected
+        );
+        assert_eq!(
+            trace.run.capture_contract.cpu_only_semantic_labels,
+            expected
+        );
+        assert!(trace
+            .run
+            .capture_contract
+            .gpu_expected_semantic_labels
+            .is_empty());
+        let executed = fs::read_to_string(destination.join("trace.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|row| row["kind"] == "span_start")
+            .filter_map(|row| row["name"].as_str().map(str::to_owned))
+            .filter(|name| name.starts_with("tofy.looped/"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(executed, expected.into_iter().collect());
         let replay = model.binder.forward(&out.records, 4)?;
         assert_eq!(out.logits.to_vec2::<f32>()?, replay.to_vec2::<f32>()?);
         assert_eq!(out.attention.dims(), &[1, 7, 2, 64]);
