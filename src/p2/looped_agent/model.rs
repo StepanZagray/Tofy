@@ -125,14 +125,14 @@ impl SelfAttention {
     }
 }
 
-struct TransformerBlock {
+pub(super) struct TransformerBlock {
     attention: SelfAttention,
     mlp_in: Linear,
     mlp_out: Linear,
 }
 
 impl TransformerBlock {
-    fn new(hidden: usize, heads: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(super) fn new(hidden: usize, heads: usize, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
             attention: SelfAttention::new(hidden, heads, vb.pp("attention"))?,
             mlp_in: linear(hidden, hidden * MLP_EXPANSION, vb.pp("mlp_in"))?,
@@ -140,7 +140,7 @@ impl TransformerBlock {
         })
     }
 
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let normalized = rms_norm(input)?;
         let state = input.add(&self.attention.forward(&normalized)?)?;
         let normalized = rms_norm(&state)?;
@@ -348,7 +348,7 @@ impl LoopedAgent {
     }
 }
 
-fn rms_norm(input: &Tensor) -> Result<Tensor> {
+pub(super) fn rms_norm(input: &Tensor) -> Result<Tensor> {
     let scale = input
         .sqr()?
         .mean_keepdim(D::Minus1)?
