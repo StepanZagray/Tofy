@@ -1,4 +1,7 @@
 //! Synthetic prerequisite for the from-scratch looped agent. Never loads ARC games.
+#[path = "looped_agent_probe/counterfactual.rs"]
+mod counterfactual;
+
 use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
@@ -30,6 +33,8 @@ enum Mode {
     Train,
     Evaluate,
     Inspect,
+    Counterfactual,
+    CounterfactualAudit,
     Fit,
     FitSmoke,
     Coverage,
@@ -1074,6 +1079,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     if args.mode == Mode::CoverageAudit {
         return coverage_audit(args, started);
     }
+    if args.mode == Mode::CounterfactualAudit {
+        return counterfactual::audit(args, started);
+    }
     let device = resolve_device(&args.device)?;
     let mut vars = VarMap::new();
     let model = LoopedAgent::new(
@@ -1092,8 +1100,10 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let updates = match args.mode {
         Mode::Smoke | Mode::FitSmoke => 2,
         Mode::Train | Mode::Fit | Mode::Coverage => args.updates,
-        Mode::Evaluate | Mode::Inspect => 0,
-        Mode::CoverageAudit => unreachable!("data audit returns before model construction"),
+        Mode::Evaluate | Mode::Inspect | Mode::Counterfactual => 0,
+        Mode::CoverageAudit | Mode::CounterfactualAudit => {
+            unreachable!("data audit returns before model construction")
+        }
     };
     let mut optimizer = AdamW::new(
         vars.all_vars(),
@@ -1359,6 +1369,22 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         );
     }
     let model = frozen(&vars, &config, &device)?;
+    if args.mode == Mode::Counterfactual {
+        let counterfactual = counterfactual::evaluate(args, &model, &device, started)?;
+        return Ok(json!({
+            "status": "complete_pending_analysis",
+            "evidence_class": "frozen_checkpoint_diagnostic",
+            "claim_boundary": "synthetic successor counterfactuals only; no optimizer updates or ARC claim",
+            "parameters": parameters,
+            "optimizer_updates": updates,
+            "physical_batch": args.batch,
+            "accumulation": args.accumulation(),
+            "effective_batch": args.effective_batch,
+            "counterfactual": counterfactual,
+            "elapsed_seconds": started.elapsed().as_secs_f64(),
+            "final_checkpoint_sha256": file_hash(&args.output_dir.join("final.safetensors"))?,
+        }));
+    }
     let predictions = prediction_metrics(args, &model, &device, started)?;
     let rule_probe = rule_probe(args, &model, &device, started)?;
     let episodes = if args.mode == Mode::Inspect {
@@ -1460,16 +1486,30 @@ fn main() -> Result<()> {
         "invalid learning rate"
     );
     ensure!(
-        !matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_some(),
+        args.mode != Mode::Counterfactual || (args.batch == 1 && args.effective_batch == 1),
+        "counterfactual evaluation requires physical/effective batch one"
+    );
+    ensure!(
+        !matches!(
+            args.mode,
+            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual
+        ) || args.checkpoint.is_some(),
         "evaluation requires a checkpoint"
     );
     ensure!(
-        matches!(args.mode, Mode::Evaluate | Mode::Inspect) || args.checkpoint.is_none(),
+        matches!(
+            args.mode,
+            Mode::Evaluate | Mode::Inspect | Mode::Counterfactual
+        ) || args.checkpoint.is_none(),
         "training uses fresh initialization; resume needs optimizer provenance"
     );
     if !matches!(
         args.mode,
-        Mode::Evaluate | Mode::Inspect | Mode::CoverageAudit
+        Mode::Evaluate
+            | Mode::Inspect
+            | Mode::Counterfactual
+            | Mode::CoverageAudit
+            | Mode::CounterfactualAudit
     ) {
         let count = if matches!(args.mode, Mode::Smoke | Mode::FitSmoke) {
             2
