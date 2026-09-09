@@ -985,6 +985,8 @@ privileged C10 warm start finishes at **254/1024 seen, 255/1024 familiar and
 gates fail despite accepted integrity checks. Current-role argmax remains 100%,
 but target attention mass falls from almost 1 to about 0.197/0.210; retained
 winners do not establish intact soft pooling. [Completed C12 result](research/2026-09-09-looped-grounded-policy-results.md).
+The subsequent [C13 query-sharpening check](research/2026-09-09-looped-query-sharpening-results.md)
+restores concentrated attention but scores 25% with worse CE; it adds no Best So Far gain.
 
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
@@ -1358,11 +1360,34 @@ discrepancy about `4.44e-16`. [Counts, uncertainty, provenance, exact commands a
 The final outer seal records 1,295 files, 418,434,719 bytes, 63 external bindings,
 1,149 recorded PIDs gone and 17 healthy CUDA bundles.
 
-The next C13 diagnostic compares the retained terminal head with its two query
-vectors multiplied by **16**, on the seen factual cohort, with the final body
-and output decoder fixed. This exploratory test asks whether restoring attention
-concentration is sufficient to improve action binding there. It will not prove
-the original failure's cause or information absence, and selects no new training
-recipe. One seed and a privileged warm start establish no ARC gain, LLM controller,
-planner, dynamics, episode memory or useful-recurrence claim; those competencies
-were not trained or tested here.
+The subsequent C13 query×16 diagnostic is now complete and negative, as recorded
+below. It does not establish the original failure's cause or information absence,
+and selects no new training recipe. One seed and a privileged warm start establish
+no ARC gain, LLM controller, planner, dynamics, episode memory or useful-recurrence
+claim; those competencies were not trained or tested here.
+
+## Frozen query sharpening — completed exploratory negative, September 9, 2026 IST
+
+C13 multiplies only C12's two terminal attention-query vectors by **16**, keeping
+the terminal body and affine decoder fixed. It uses the same **64 seen query
+groups × 16 fit maps = 1,024 rows**, four loops and **zero optimizer updates**.
+The recorded F32 target attention mass becomes **1 for both roles on every row**,
+but accuracy is **256/1024 (25%)** versus **254/1024 (24.8047%)** unscaled:
+**+0.1953 pp, paired 95% CI [0,0.5859]**. The lower bound is not strictly positive;
+no query has all 16 maps correct. CE worsens **1.405918 → 1.430675**.
+Decision: `concentration_insufficient_for_accuracy_recovery`.
+
+Concentration and integrity controls pass; an independent scorer agrees on 27
+floating fields with maximum discrepancy about `4.16e-17`. The unchanged C12
+binary/source `5b17246c` runs under operator revision `f802bef4`. One healthy
+CUDA capture records **9.841228 s** model time and **0.574908 s** finalization,
+with 7,161 MiB minimum sampled reserve and maximum 57°C. Full wired profiling is
+retained with the existing operation/activation/memory/device-event and automatic
+correlation gaps. [Exact metrics, commands, setup history, seals and limits](research/2026-09-09-looped-query-sharpening-results.md).
+
+This reused seen-cohort test shows that the fixed sharpening intervention is
+insufficient with this terminal body/decoder. It does not establish C12's original
+failure mechanism, missing support information, generalization, ARC gain or
+promotion. The privileged C10 warm start remains a limitation. The next separately
+registered check is a frozen linear action-readout witness on retained C12
+features; no new end-to-end training recipe is selected.
