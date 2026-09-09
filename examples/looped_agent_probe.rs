@@ -62,6 +62,9 @@ struct Args {
     /// Spatial prerequisite: train and evaluate only the known permutation zero.
     #[arg(long)]
     known_mapping: bool,
+    /// Frozen known-mapping diagnosis on a fixed subset of training queries.
+    #[arg(long)]
+    known_seen: bool,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "cuda:0")]
@@ -1099,6 +1102,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let mut metadata = json!({"status":"running","schema":task::SCHEMA,"exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,"model":config,"seed":args.seed,"data_seed":args.data_seed,"physical_batch":args.batch,"accumulation":args.accumulation(),"effective_batch":args.effective_batch,"objectives":{"policy":1.0,"value":0.1,"reward":0.1,"balanced_categorical_dynamics":0.5},"training_rule_ids":task::permutation_ids(Split::Train),"held_out_rule_ids":task::permutation_ids(Split::HeldOut),"boundary":"scripted three-action calibration and visible objective; no active probe selection, hidden objectives, ARC data, or pretrained language weights"});
     if args.known_mapping {
         known_mapping::annotate(&mut metadata);
+        known_mapping::annotate_seen(args, &mut metadata);
     }
     write_json(&args.output_dir.join("metadata.json"), &metadata)?;
     if args.mode == Mode::CoverageAudit {
@@ -1426,7 +1430,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     let model = frozen(&vars, &config, &device)?;
     if args.mode == Mode::KnownMapping {
         let evaluation = known_mapping::evaluate(args, &model, &device, started)?;
-        return Ok(json!({
+        let mut report = json!({
             "status": "complete_pending_analysis", "evidence_class": "frozen_known_mapping_diagnostic",
             "known_mapping": known_mapping::population(), "optimizer_updates": 0,
             "parameters": parameters, "physical_batch": args.batch, "effective_batch": args.effective_batch,
@@ -1434,7 +1438,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             "final_checkpoint_sha256": file_hash(&args.output_dir.join("final.safetensors"))?,
             "elapsed_seconds": started.elapsed().as_secs_f64(),
             "claim_boundary": "single-seed known spatial prerequisite; no variable-rule comparison, ARC claim or promotion"
-        }));
+        });
+        known_mapping::annotate_seen(args, &mut report);
+        return Ok(report);
     }
     if args.mode == Mode::Counterfactual {
         let counterfactual = counterfactual::evaluate(args, &model, &device, started)?;

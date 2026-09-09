@@ -9,9 +9,17 @@ pub(super) const EVAL_SEED: u64 = 20260912;
 /// ASCII KNOWN: disjoint from the legacy and counterfactual episode namespaces.
 pub(super) const EVAL_EPISODE_TAG: u64 = 0x4b4e4f574e;
 const EVAL_LAYOUTS: usize = 64;
+const SEEN_LAYOUTS: usize = 72;
+const SEEN_SEED: u64 = 9173;
+const SEEN_BLOCK_STARTS: [u64; 3] = [0, 2280, 4576];
+const SEEN_DEPTH_CAVEAT: &str = "all queries are scored at four loops; this is not original-depth fitting for examples trained at one or two loops";
 
 pub(super) fn validate_args(args: &Args) -> Result<()> {
     let dedicated = matches!(args.mode, Mode::KnownMapping | Mode::KnownMappingAudit);
+    ensure!(
+        !args.known_seen || (dedicated && args.known_mapping),
+        "--known-seen requires --known-mapping and mode known-mapping or known-mapping-audit"
+    );
     ensure!(
         !dedicated || args.known_mapping,
         "known-mapping modes require --known-mapping"
@@ -24,10 +32,19 @@ pub(super) fn validate_args(args: &Args) -> Result<()> {
             "known-mapping prerequisite does not run search or wrong-rule stress tests"
         );
         if dedicated {
-            ensure!(
-                args.data_seed == EVAL_SEED && args.eval_episodes == EVAL_LAYOUTS,
-                "known-mapping frozen population requires --data-seed 20260912 --eval-episodes 64"
-            );
+            if args.known_seen {
+                ensure!(
+                    args.data_seed == SEEN_SEED
+                        && args.eval_episodes == SEEN_LAYOUTS
+                        && args.loops == 4,
+                    "--known-seen requires --data-seed 9173 --eval-episodes 72 --loops 4"
+                );
+            } else {
+                ensure!(
+                    args.data_seed == EVAL_SEED && args.eval_episodes == EVAL_LAYOUTS,
+                    "known-mapping frozen population requires --data-seed 20260912 --eval-episodes 64"
+                );
+            }
             ensure!(
                 args.batch == 1 && args.effective_batch == 1,
                 "known-mapping frozen/audit modes require physical/effective batch one"
@@ -51,6 +68,39 @@ pub(super) fn annotate(document: &mut Value) {
     document["known_mapping"] = population();
     document["training_rule_ids"] = json!([0]);
     document["held_out_rule_ids"] = json!([]);
+}
+
+fn panel_layouts(args: &Args) -> usize {
+    if args.known_seen {
+        SEEN_LAYOUTS
+    } else {
+        EVAL_LAYOUTS
+    }
+}
+
+fn seen_episode_id(layout: usize) -> u64 {
+    SEEN_BLOCK_STARTS[layout / 24] + (layout % 24) as u64
+}
+
+pub(super) fn annotate_seen(args: &Args, document: &mut Value) {
+    if !args.known_seen {
+        return;
+    }
+    let ids: Vec<_> = (0..SEEN_LAYOUTS).map(seen_episode_id).collect();
+    document["known_seen"] = json!({
+        "schema":"looped-known-seen-v1","training_membership":"intended; verify factual input, query and target hashes against the source training stream",
+        "episode_source":"coverage/fresh","data_seed":SEEN_SEED,"episode_seed":SEEN_SEED ^ TRAIN_TAG,
+        "training_episode_ids":ids,"temporal_blocks":["early","middle","late"],
+        "layouts_per_temporal_block":24,"layouts_per_original_depth_per_block":8,
+        "source_training_updates":1150,"source_effective_batch":64,"training_slots_per_query":16,
+        "original_training_update":"episode_index / 4 + 1",
+        "original_training_loop_depth":"[1,2,4][(episode_index / 4) % 3]",
+        "evaluation_loops":4,"depth_caveat":SEEN_DEPTH_CAVEAT,"promotion":false
+    });
+    document["known_mapping"]["frozen_data_seed"] = json!(SEEN_SEED);
+    document["known_mapping"]["frozen_episode_seed"] = json!(SEEN_SEED ^ TRAIN_TAG);
+    document["known_mapping"]["frozen_episode_id_base"] = Value::Null;
+    document["known_mapping"]["frozen_layouts"] = json!(SEEN_LAYOUTS);
 }
 
 fn controls_from_counts(counts: [usize; ACTIONS]) -> Result<Value> {
@@ -90,9 +140,21 @@ fn clear_support(input: &mut Inputs) {
     input.metadata[..(TOKENS - PATCH_COUNT) * META_DIM].fill(0.0);
 }
 
-fn panel_input(layout: usize, cleared: bool) -> Result<(Value, Sample)> {
-    let episode_id = EVAL_EPISODE_TAG + layout as u64;
-    let episode = task::episode_with_permutation(EVAL_SEED, episode_id, 0, 1, 1)?;
+fn panel_input(args: &Args, layout: usize, cleared: bool) -> Result<(Value, Sample)> {
+    ensure!(
+        layout < panel_layouts(args),
+        "known-mapping layout out of range"
+    );
+    let (data_seed, episode_seed, episode_id) = if args.known_seen {
+        (
+            args.data_seed,
+            args.data_seed ^ TRAIN_TAG,
+            seen_episode_id(layout),
+        )
+    } else {
+        (EVAL_SEED, EVAL_SEED, EVAL_EPISODE_TAG + layout as u64)
+    };
+    let episode = task::episode_with_permutation(episode_seed, episode_id, 0, 1, 1)?;
     let (policy, distance) = task::oracle(&episode.support, &episode.maze.render())?;
     ensure!(
         distance == 1 && task::inferred_controls(&episode.support)? == [0, 1, 2, 3],
@@ -108,15 +170,26 @@ fn panel_input(layout: usize, cleared: bool) -> Result<(Value, Sample)> {
     if cleared {
         clear_support(&mut sample.inputs);
     }
-    Ok((
-        json!({"schema":SCHEMA,"input_index":layout*2+usize::from(cleared),"layout_index":layout,
-        "episode_id":episode_id,"data_seed":EVAL_SEED,"permutation_id":0,"split":"KnownMapping",
+    let mut row = json!({"schema":SCHEMA,"input_index":layout*2+usize::from(cleared),"layout_index":layout,
+        "episode_id":episode_id,"data_seed":data_seed,"permutation_id":0,"split":"KnownMapping",
         "condition":if cleared {"cleared"} else {"factual"},"min_distance":1,"max_distance":1,"oracle_distance":distance,
         "factual_support_action_ids":observed,"support_cleared":cleared,
         "input_sha256":input_hash(&sample.inputs),"factual_input_sha256":factual_hash,
-        "query_sha256":query_hash(&sample.current),"target_policy":sample.policy,"target_value":sample.value}),
-        sample,
-    ))
+        "query_sha256":query_hash(&sample.current),"target_policy":sample.policy,"target_value":sample.value});
+    if args.known_seen {
+        let original_depth = [1, 2, 4][(episode_id / 4 % 3) as usize];
+        let temporal_block = ["early", "middle", "late"][layout / 24];
+        row.as_object_mut().expect("identity object").extend(json!({
+            "known_seen":true,"seen_status":if cleared {"training_query_with_cleared_support"} else {"intended_training_input"},
+            "episode_source":"coverage/fresh","episode_seed":episode_seed,
+            "training_episode_index":episode_id,"original_training_update":episode_id/4+1,
+            "original_training_loop_depth":original_depth,
+            "temporal_block":temporal_block,
+            "targets_sha256":coverage_row(episode_id*16,episode_id,0,&sample)["targets_sha256"],
+            "evaluation_loops":4,"depth_caveat":SEEN_DEPTH_CAVEAT
+        }).as_object().expect("seen identity object").clone());
+    }
+    Ok((row, sample))
 }
 
 pub(super) fn audit(
@@ -126,16 +199,19 @@ pub(super) fn audit(
 ) -> Result<Value> {
     let path = args.output_dir.join("known-mapping-input-audit.jsonl");
     let mut writer = BufWriter::new(File::create_new(&path)?);
+    let layouts = panel_layouts(args);
     let mut queries = HashSet::new();
     let mut labels = [0; ACTIONS];
-    for layout in 0..EVAL_LAYOUTS {
+    let mut overlap = 0;
+    for layout in 0..layouts {
         deadline(args, started)?;
-        let (factual, sample) = panel_input(layout, false)?;
+        let (factual, sample) = panel_input(args, layout, false)?;
         let query = factual["query_sha256"]
             .as_str()
             .context("missing query hash")?;
+        overlap += usize::from(training_queries.contains(query));
         ensure!(
-            !training_queries.contains(query),
+            args.known_seen || !training_queries.contains(query),
             "known-mapping frozen query overlaps training"
         );
         ensure!(
@@ -143,7 +219,7 @@ pub(super) fn audit(
             "known-mapping frozen layouts have duplicate queries"
         );
         labels[argmax(&sample.policy)] += 1;
-        let (cleared, other) = panel_input(layout, true)?;
+        let (cleared, other) = panel_input(args, layout, true)?;
         ensure!(
             sample.current == other.current
                 && sample.next == other.next
@@ -157,18 +233,27 @@ pub(super) fn audit(
     }
     writer.flush()?;
     drop(writer);
-    Ok(
-        json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"status":"complete_pending_analysis",
+    let mut report = json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"status":"complete_pending_analysis",
         "evidence_class":"data_audit","known_mapping":population(),"optimizer_updates":0,"model_forwards":0,
-        "layouts":EVAL_LAYOUTS,"input_rows":EVAL_LAYOUTS*2,"action_rows":EVAL_LAYOUTS*2*ACTIONS,
-        "factual_input_rows":EVAL_LAYOUTS,"factual_action_rows":EVAL_LAYOUTS*ACTIONS,
-        "cleared_input_rows":EVAL_LAYOUTS,"cleared_action_rows":EVAL_LAYOUTS*ACTIONS,
+        "layouts":layouts,"input_rows":layouts*2,"action_rows":layouts*2*ACTIONS,
+        "factual_input_rows":layouts,"factual_action_rows":layouts*ACTIONS,
+        "cleared_input_rows":layouts,"cleared_action_rows":layouts*ACTIONS,
         "policy_controls":controls_from_counts(labels)?,"unique_query_frames":queries.len(),
         "training_queries_checked":training_queries.len(),
-        "evaluation_query_overlap":if training_queries.is_empty() {Value::Null} else {json!(0)},
+        "evaluation_query_overlap":if training_queries.is_empty() {Value::Null} else {json!(overlap)},
         "artifacts":[{"file":"known-mapping-input-audit.jsonl","bytes":path.metadata()?.len(),"sha256":file_hash(&path)?}],
-        "elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+        "elapsed_seconds":started.elapsed().as_secs_f64()});
+    annotate_seen(args, &mut report);
+    if args.known_seen {
+        report["expected_training_query_members"] = json!(layouts);
+        report["external_training_query_members"] = if training_queries.is_empty() {
+            Value::Null
+        } else {
+            json!(overlap)
+        };
+        report["external_factual_input_and_target_membership_verified"] = Value::Null;
+    }
+    Ok(report)
 }
 
 pub(super) fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
@@ -320,6 +405,7 @@ pub(super) fn evaluate(
     device: &Device,
     started: Instant,
 ) -> Result<Value> {
+    let layouts = panel_layouts(args);
     let probability_path = args.output_dir.join("successor-probabilities.f32");
     let states_path = args.output_dir.join("successor-states.u8");
     let rows_path = args.output_dir.join("successor-rows.jsonl");
@@ -329,12 +415,12 @@ pub(super) fn evaluate(
     let mut scores: BTreeMap<String, Scores> = BTreeMap::new();
     let mut policies = [PolicyScores::default(), PolicyScores::default()];
     let mut maximum_probability_error = 0.0f64;
-    for layout in 0..EVAL_LAYOUTS {
+    for layout in 0..layouts {
         for (condition_index, cleared) in [false, true].into_iter().enumerate() {
             deadline(args, started)?;
             let input_index = layout * 2 + condition_index;
             let condition = if cleared { "cleared" } else { "factual" };
-            let (mut row, sample) = panel_input(layout, cleared)?;
+            let (mut row, sample) = panel_input(args, layout, cleared)?;
             let output = if input_index == 0 && args.profile_eval {
                 inspected_predict(args, model, sample.inputs.clone(), device)?
             } else {
@@ -463,16 +549,16 @@ pub(super) fn evaluate(
     drop((probabilities_file, states_file, rows_file));
     ensure!(
         probability_path.metadata()?.len()
-            == (EVAL_LAYOUTS * 2 * cf::PROBABILITIES_PER_INPUT * 4) as u64
-            && states_path.metadata()?.len() == (EVAL_LAYOUTS * 2 * cf::STATES_PER_INPUT) as u64,
+            == (layouts * 2 * cf::PROBABILITIES_PER_INPUT * 4) as u64
+            && states_path.metadata()?.len() == (layouts * 2 * cf::STATES_PER_INPUT) as u64,
         "known-mapping binary output length mismatch"
     );
     let mut arms = Vec::new();
     for (condition, policy) in ["factual", "cleared"].into_iter().zip(&policies) {
-        arms.push(json!({"condition":condition,"rows":EVAL_LAYOUTS,"correct":policy.correct,
-            "accuracy":policy.correct as f64/EVAL_LAYOUTS as f64,"policy_ce":policy.ce/EVAL_LAYOUTS as f64,
+        arms.push(json!({"condition":condition,"rows":layouts,"correct":policy.correct,
+            "accuracy":policy.correct as f64/layouts as f64,"policy_ce":policy.ce/layouts as f64,
             "policy_controls":controls_from_counts(policy.labels)?,
-            "value":{"mse":policy.value_squared_error/EVAL_LAYOUTS as f64,"constant_value_prediction":1.0,"constant_value_mse":0.0,
+            "value":{"mse":policy.value_squared_error/layouts as f64,"constant_value_prediction":1.0,"constant_value_mse":0.0,
                 "qualifier":"every query is one step from the goal, so target value is one; low MSE does not establish value generalization"}}));
         for class in ["blocked", "nonterminal", "terminal"] {
             scores.entry(format!("{condition}/{class}")).or_default();
@@ -485,12 +571,12 @@ pub(super) fn evaluate(
                              "bytes":path.metadata()?.len(),"sha256":file_hash(path)?}),
         );
     }
-    Ok(
-        json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"known_mapping":population(),
-        "status":"complete_pending_analysis","optimizer_updates":0,"data_seed":EVAL_SEED,"episode_id_base":EVAL_EPISODE_TAG,
-        "layouts":EVAL_LAYOUTS,"input_rows":EVAL_LAYOUTS*2,"action_rows":EVAL_LAYOUTS*2*ACTIONS,
-        "factual_input_rows":EVAL_LAYOUTS,"factual_action_rows":EVAL_LAYOUTS*ACTIONS,
-        "cleared_input_rows":EVAL_LAYOUTS,"cleared_action_rows":EVAL_LAYOUTS*ACTIONS,
+    let mut report = json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"known_mapping":population(),
+        "status":"complete_pending_analysis","optimizer_updates":0,"data_seed":if args.known_seen {args.data_seed} else {EVAL_SEED},
+        "episode_id_base":if args.known_seen {Value::Null} else {json!(EVAL_EPISODE_TAG)},
+        "layouts":layouts,"input_rows":layouts*2,"action_rows":layouts*2*ACTIONS,
+        "factual_input_rows":layouts,"factual_action_rows":layouts*ACTIONS,
+        "cleared_input_rows":layouts,"cleared_action_rows":layouts*ACTIONS,
         "loops":args.loops,"physical_batch":1,"effective_batch":1,"policy":arms,"successor_strata":scores,
         "reward_threshold":0.5,"profiled_forward_input_index":args.profile_eval.then_some(0),
         "maximum_successor_probability_normalization_error":maximum_probability_error,
@@ -503,8 +589,9 @@ pub(super) fn evaluate(
             "state_hash_encoding":"SHA-256 of patch-order palette indices encoded as little-endian u32 (query_hash convention)",
             "argmax_ties":"first palette index","offset_unit":"bytes from start of named file"},
         "artifacts":artifacts,"elapsed_seconds":started.elapsed().as_secs_f64(),
-        "claim_boundary":"single-seed known spatial prerequisite; factual/cleared scores have no 25% information bound; no promotion"}),
-    )
+        "claim_boundary":"single-seed known spatial prerequisite; factual/cleared scores have no 25% information bound; no promotion"});
+    annotate_seen(args, &mut report);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -520,6 +607,174 @@ mod tests {
             "unused",
             "--known-mapping",
         ])
+    }
+
+    fn seen_args() -> Args {
+        Args::parse_from([
+            "probe",
+            "--mode",
+            "known-mapping-audit",
+            "--output-dir",
+            "unused",
+            "--known-mapping",
+            "--known-seen",
+            "--data-seed",
+            "9173",
+            "--eval-episodes",
+            "72",
+            "--batch",
+            "1",
+            "--effective-batch",
+            "1",
+        ])
+    }
+
+    #[test]
+    fn seen_panel_matches_exact_training_inputs_targets_and_temporal_depth_counts() -> Result<()> {
+        let mut input = seen_args();
+        input.coverage = Coverage::Fresh;
+        validate_args(&input)?;
+        let expected: Vec<_> = (0..24).chain(2280..2304).chain(4576..4600).collect();
+        let mut counts = [[0; 3]; 3];
+        let mut queries = HashSet::new();
+        for (layout, &episode) in expected.iter().enumerate() {
+            let (factual, sample) = panel_input(&input, layout, false)?;
+            let (cleared, other) = panel_input(&input, layout, true)?;
+            let (training_episode, rule, trained) = coverage_sample(&input, episode * 16)?;
+            let identity = training_row(episode * 16, training_episode, &trained);
+            assert_eq!(seen_episode_id(layout), episode);
+            assert_eq!(training_episode, episode);
+            assert_eq!(rule, 0);
+            assert_eq!(factual["episode_id"], episode);
+            assert_eq!(factual["training_episode_index"], episode);
+            assert_eq!(factual["episode_seed"], SEEN_SEED ^ TRAIN_TAG);
+            assert_eq!(factual["original_training_update"], episode / 4 + 1);
+            let depth = (episode / 4 % 3) as usize;
+            assert_eq!(factual["original_training_loop_depth"], [1, 2, 4][depth]);
+            assert_eq!(
+                factual["temporal_block"],
+                ["early", "middle", "late"][layout / 24]
+            );
+            assert_eq!(factual["evaluation_loops"], 4);
+            assert_eq!(factual["input_index"], layout * 2);
+            assert_eq!(cleared["input_index"], layout * 2 + 1);
+            assert_eq!(factual["input_sha256"], identity["input_sha256"]);
+            assert_eq!(factual["query_sha256"], identity["query_sha256"]);
+            assert_eq!(factual["targets_sha256"], identity["targets_sha256"]);
+            assert_eq!(cleared["targets_sha256"], identity["targets_sha256"]);
+            assert_eq!(cleared["factual_input_sha256"], identity["input_sha256"]);
+            assert_ne!(cleared["input_sha256"], factual["input_sha256"]);
+            assert_eq!(sample.inputs.patches, trained.inputs.patches);
+            assert_eq!(sample.inputs.metadata, trained.inputs.metadata);
+            assert_eq!(sample.next, trained.next);
+            assert_eq!(sample.rewards, trained.rewards);
+            assert_eq!(sample.policy, trained.policy);
+            assert_eq!(sample.value, trained.value);
+            assert_eq!(other.current, sample.current);
+            assert_eq!(other.next, sample.next);
+            assert_eq!(other.rewards, sample.rewards);
+            assert_eq!(other.policy, sample.policy);
+            assert_eq!(other.value, sample.value);
+            assert!(queries.insert(query_hash(&sample.current)));
+            counts[layout / 24][depth] += 1;
+        }
+        assert_eq!(queries.len(), SEEN_LAYOUTS);
+        assert_eq!(counts, [[8; 3]; 3]);
+        assert!(panel_input(&input, SEEN_LAYOUTS, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn seen_flag_requires_the_exact_frozen_scope_and_population() -> Result<()> {
+        for mode in [Mode::KnownMapping, Mode::KnownMappingAudit] {
+            let mut input = seen_args();
+            input.mode = mode;
+            validate_args(&input)?;
+        }
+        for mode in [
+            Mode::Smoke,
+            Mode::Train,
+            Mode::Evaluate,
+            Mode::Inspect,
+            Mode::Counterfactual,
+            Mode::CounterfactualAudit,
+            Mode::Fit,
+            Mode::FitSmoke,
+            Mode::Coverage,
+            Mode::CoverageAudit,
+        ] {
+            let mut input = seen_args();
+            input.mode = mode;
+            assert!(validate_args(&input).is_err());
+        }
+        let invalid: [fn(&mut Args); 7] = [
+            |a| a.known_mapping = false,
+            |a| a.data_seed += 1,
+            |a| a.eval_episodes = EVAL_LAYOUTS,
+            |a| a.batch = 2,
+            |a| a.effective_batch = 2,
+            |a| a.loops = 2,
+            |a| a.search = true,
+        ];
+        for change in invalid {
+            let mut input = seen_args();
+            change(&mut input);
+            assert!(validate_args(&input).is_err());
+        }
+        let input = args();
+        assert!(!input.known_seen);
+        let mut original = json!({"known_mapping":population()});
+        let bytes = serde_json::to_vec(&original)?;
+        annotate_seen(&input, &mut original);
+        assert_eq!(serde_json::to_vec(&original)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn seen_audit_reports_intended_membership_and_preserves_pair_identities() -> Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tofy-known-seen-audit-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let mut input = seen_args();
+            let mut training_queries = HashSet::new();
+            for (name, checked) in [("standalone", false), ("membership", true)] {
+                input.output_dir = root.join(name);
+                fs::create_dir(&input.output_dir)?;
+                let report = audit(&input, Instant::now(), &training_queries)?;
+                assert_eq!(report["layouts"], 72);
+                assert_eq!(report["input_rows"], 144);
+                assert_eq!(report["action_rows"], 576);
+                assert_eq!(report["factual_input_rows"], 72);
+                assert_eq!(report["cleared_input_rows"], 72);
+                assert_eq!(report["expected_training_query_members"], 72);
+                assert_eq!(report["optimizer_updates"], 0);
+                assert_eq!(report["model_forwards"], 0);
+                let overlap = if checked { json!(72) } else { Value::Null };
+                assert_eq!(report["evaluation_query_overlap"], overlap);
+                assert_eq!(report["external_training_query_members"], overlap);
+                assert!(report["external_factual_input_and_target_membership_verified"].is_null());
+                assert_eq!(report["known_mapping"]["frozen_layouts"], 72);
+                assert!(report["known_mapping"]["frozen_episode_id_base"].is_null());
+                let path = input.output_dir.join("known-mapping-input-audit.jsonl");
+                assert_eq!(report["artifacts"][0]["sha256"], file_hash(&path)?);
+                let rows = fs::read_to_string(path)?;
+                assert_eq!(rows.lines().count(), 144);
+                for (index, line) in rows.lines().enumerate() {
+                    let row: Value = serde_json::from_str(line)?;
+                    assert_eq!(row, panel_input(&input, index / 2, index % 2 == 1)?.0);
+                    training_queries.insert(row["query_sha256"].as_str().unwrap().to_owned());
+                }
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
     }
 
     #[test]
@@ -596,8 +851,8 @@ mod tests {
         let mut categories = HashSet::new();
         let mut queries = HashSet::new();
         for layout in 0..EVAL_LAYOUTS {
-            let (factual, sample) = panel_input(layout, false)?;
-            let (cleared, other) = panel_input(layout, true)?;
+            let (factual, sample) = panel_input(&args(), layout, false)?;
+            let (cleared, other) = panel_input(&args(), layout, true)?;
             assert_eq!(factual["split"], "KnownMapping");
             assert_eq!(factual["episode_id"], EVAL_EPISODE_TAG + layout as u64);
             assert_eq!(factual["query_sha256"], cleared["query_sha256"]);
@@ -701,7 +956,7 @@ mod tests {
             let rows = fs::read_to_string(root.join("known-mapping-input-audit.jsonl"))?;
             for (index, line) in rows.lines().enumerate() {
                 let row: Value = serde_json::from_str(line)?;
-                assert_eq!(row, panel_input(index / 2, index % 2 == 1)?.0);
+                assert_eq!(row, panel_input(&input, index / 2, index % 2 == 1)?.0);
             }
             Ok(())
         })();
@@ -711,7 +966,7 @@ mod tests {
 
     #[test]
     fn known_region_reward_aggregates_distinguish_oracle_and_copy() -> Result<()> {
-        let (_, sample) = panel_input(0, false)?;
+        let (_, sample) = panel_input(&args(), 0, false)?;
         let mut oracle = Scores::default();
         let mut copy = Scores::default();
         for action in 0..ACTIONS {
