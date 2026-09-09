@@ -54,9 +54,28 @@ Legacy evaluator fields/rows reproduce exactly except durations. All raw outputs
 independent simulator checks and profiler integrity pass. This supplies no new
 Best So Far gain, ARC score, internal-disconnection proof or architecture promotion.
 [Full result, exact commands, hashes and limits](research/2026-09-09-looped-successor-results.md).
-Next: train the unchanged looped model on a constant known mapping and fresh
-layouts to test spatial learning before a control-learning curriculum. The new
-core still lacks learned episode memory, active probing and ARC integration.
+The known-control result below also fails; next is a frozen seen-query check and a
+registered replay-ordering intervention. The new core still lacks learned episode
+memory, active probing and ARC integration.
+
+## Known-control spatial prerequisite — September9,2026 IST
+
+The unchanged looped model trained all1,150 updates on4,600 new training queries
+with fixed known controls at source71ff87ad. On64 unseen queries, factual policy
+scores**15/64=23.4375%**, versus**18/64=28.125%** best constant; cleared12/64.
+Every action-conditioned frame is the goal-completion template:64/256 exact,
+all terminal; blocked0/72 and nonterminal0/120. Copy-current scores72/256.
+Both registered prerequisites fail. Final8-query reference50% equals its constant
+baseline; low value MSE only fits target1. No Best So Far or ARC improvement.
+
+Physical33/tail31/accumulation2/effective64,73,600 samples; training completed in
+about31minutes with631MiB minimum sampled reserve. All wired profiler and raw
+integrity checks pass; operation/memory/device-event evidence remains unwired.
+[Full counts, exact commands, hashes, confidence intervals and caveats](research/2026-09-09-looped-known-mapping-results.md).
+Next: frozen early/middle/late seen-query rescore, then test cohort-preserving
+replay. Each current batch has only4 distinct queries repeated16 times; the
+candidate preserves each query's input/target/depth while increasing diversity.
+No public-level training or LLM; new-core memory, probing and ARC adapter remain absent.
 
 ## Frozen fields for the first experimental run
 
