@@ -3,6 +3,8 @@
 mod counterfactual;
 #[path = "looped_agent_probe/known_mapping.rs"]
 mod known_mapping;
+#[path = "looped_agent_probe/known_replay.rs"]
+mod known_replay;
 
 use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
@@ -65,6 +67,9 @@ struct Args {
     /// Frozen known-mapping diagnosis on a fixed subset of training queries.
     #[arg(long)]
     known_seen: bool,
+    /// Reorder known fresh queries within their original training-depth cohorts.
+    #[arg(long)]
+    known_replay: bool,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "cuda:0")]
@@ -464,12 +469,14 @@ fn fixed_samples(args: &Args) -> Result<Vec<(usize, Sample)>> {
 fn coverage_sample(args: &Args, id: u64) -> Result<(u64, usize, Sample)> {
     let rules = task::permutation_ids(Split::Train);
     let index = id / rules.len() as u64;
-    let episode = if args.coverage == Coverage::Fixed {
+    let episode = if args.known_replay {
+        known_replay::episode_id(id)
+    } else if args.coverage == Coverage::Fixed {
         index % 8
     } else {
         index
     };
-    // Retain sixteen slots per episode even when all slots use the known rule.
+    // Known-rule slots share the original generator; replay changes only their order.
     let rule = if args.known_mapping {
         0
     } else {
@@ -1103,6 +1110,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     if args.known_mapping {
         known_mapping::annotate(&mut metadata);
         known_mapping::annotate_seen(args, &mut metadata);
+        known_replay::annotate(args, &mut metadata);
     }
     write_json(&args.output_dir.join("metadata.json"), &metadata)?;
     if args.mode == Mode::CoverageAudit {
@@ -1198,9 +1206,10 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             fixed_set["known_mapping"] = known_mapping::population();
             fixed_set["policy_controls"] =
                 known_mapping::label_controls(samples.iter().map(|(_, sample)| sample))?;
+            known_replay::annotate(args, &mut fixed_set);
         }
         write_json(&args.output_dir.join("fixed-set.json"), &fixed_set)?;
-        let row = fitting_check(
+        let mut row = fitting_check(
             args,
             &frozen(&vars, &config, &device)?,
             samples,
@@ -1208,6 +1217,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             started,
             0,
         )?;
+        known_replay::annotate(args, &mut row);
         let writer = fit_log.as_mut().context("missing fit log")?;
         serde_json::to_writer(&mut *writer, &row)?;
         writer.write_all(b"\n")?;
@@ -1264,11 +1274,14 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 let (permutation_id, sample) = if args.mode == Mode::Coverage {
                     let (episode, rule, sample) = coverage_sample(args, id)?;
                     let log = coverage_log.as_mut().context("missing coverage log")?;
-                    let row = if args.known_mapping {
+                    let mut row = if args.known_mapping {
                         known_mapping::training_row(id, episode, &sample)
                     } else {
                         coverage_row(id, episode, rule, &sample)
                     };
+                    if args.known_replay {
+                        known_replay::annotate_row(id, episode, &mut row);
+                    }
                     serde_json::to_writer(&mut *log, &row)?;
                     log.write_all(b"\n")?;
                     (rule, sample)
@@ -1389,6 +1402,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                     started,
                     updates_done,
                 )?;
+                known_replay::annotate(args, &mut row);
                 row["checkpoint"] = save_fitting_checkpoint(&vars, &args.output_dir, updates_done)?;
                 let pass = row["fit_gate_pass"]
                     .as_bool()
@@ -1424,6 +1438,16 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 "known_mapping_spatial_prerequisite"
             });
             report["claim_boundary"] = json!("single-seed fixed-known-control spatial prerequisite; fitted reference is not generalization; no variable-rule comparison or promotion");
+            known_replay::annotate(args, &mut report);
+            if args.known_replay {
+                report["evidence_class"] = json!(if args.updates == 3 {
+                    "implementation_smoke"
+                } else {
+                    "known_mapping_replay_order_screen"
+                });
+                report["training_stream_file_sha256"] =
+                    json!(file_hash(&args.output_dir.join("training-stream.jsonl"))?);
+            }
         }
         return Ok(report);
     }

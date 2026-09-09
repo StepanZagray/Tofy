@@ -15,6 +15,7 @@ const SEEN_BLOCK_STARTS: [u64; 3] = [0, 2280, 4576];
 const SEEN_DEPTH_CAVEAT: &str = "all queries are scored at four loops; this is not original-depth fitting for examples trained at one or two loops";
 
 pub(super) fn validate_args(args: &Args) -> Result<()> {
+    known_replay::validate_args(args)?;
     let dedicated = matches!(args.mode, Mode::KnownMapping | Mode::KnownMappingAudit);
     ensure!(
         !args.known_seen || (dedicated && args.known_mapping),
@@ -244,6 +245,7 @@ pub(super) fn audit(
         "artifacts":[{"file":"known-mapping-input-audit.jsonl","bytes":path.metadata()?.len(),"sha256":file_hash(&path)?}],
         "elapsed_seconds":started.elapsed().as_secs_f64()});
     annotate_seen(args, &mut report);
+    known_replay::annotate(args, &mut report);
     if args.known_seen {
         report["expected_training_query_members"] = json!(layouts);
         report["external_training_query_members"] = if training_queries.is_empty() {
@@ -272,20 +274,27 @@ pub(super) fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
     let mut queries = HashSet::new();
     let mut inputs = HashSet::new();
     let mut labels = [0; ACTIONS];
+    let mut replay = args.known_replay.then(known_replay::Audit::default);
     for id in 0..rows as u64 {
         deadline(args, started)?;
         let (episode, rule, sample) = coverage_sample(args, id)?;
         ensure!(
             rule == 0
                 && episode
-                    == if args.coverage == Coverage::Fixed {
+                    == if args.known_replay {
+                        known_replay::episode_id(id)
+                    } else if args.coverage == Coverage::Fixed {
                         (id / 16) % 8
                     } else {
                         id / 16
                     },
-            "known-mapping sampler changed the original query schedule"
+            "known-mapping sampler differs from its declared query schedule"
         );
-        let row = training_row(id, episode, &sample);
+        let mut row = training_row(id, episode, &sample);
+        if let Some(replay) = &mut replay {
+            replay.observe(id, episode)?;
+            known_replay::annotate_row(id, episode, &mut row);
+        }
         let identity = (
             row["input_sha256"].clone(),
             row["query_sha256"].clone(),
@@ -296,6 +305,24 @@ pub(super) fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
             ensure!(
                 previous == identity,
                 "repeated known-mapping query/input/targets changed"
+            );
+        } else if args.known_replay {
+            let original = task::sample(&task::episode_with_permutation(
+                args.data_seed ^ TRAIN_TAG,
+                episode,
+                0,
+                1,
+                1,
+            )?)?;
+            ensure!(
+                sample.inputs.patches == original.inputs.patches
+                    && sample.inputs.metadata == original.inputs.metadata
+                    && sample.current == original.current
+                    && sample.next == original.next
+                    && sample.policy == original.policy
+                    && sample.rewards == original.rewards
+                    && sample.value == original.value,
+                "replay changed the original known-mapping input or targets"
             );
         } else {
             let legacy_rule = task::permutation_ids(Split::Train)[0];
@@ -329,7 +356,13 @@ pub(super) fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
     }
     writer.flush()?;
     drop(writer);
-    let expected_episodes = if args.coverage == Coverage::Fixed {
+    let expected_episodes = if args.known_replay {
+        if args.updates == 3 {
+            192
+        } else {
+            4600
+        }
+    } else if args.coverage == Coverage::Fixed {
         (rows / 16).min(8)
     } else {
         rows / 16
@@ -338,19 +371,31 @@ pub(super) fn coverage_audit(args: &Args, started: Instant) -> Result<Value> {
         seen.len() == expected_episodes,
         "known-mapping query ID coverage differs"
     );
+    let replay_report = replay.map(|audit| audit.finish(args.updates)).transpose()?;
+    if args.known_replay {
+        ensure!(
+            inputs.len() == expected_episodes && queries.len() == expected_episodes,
+            "replay population has duplicate complete inputs or queries"
+        );
+    }
     let frozen = audit(args, started, &queries)?;
     let mut counts = [0usize; 24];
     counts[0] = rows;
-    Ok(
-        json!({"status":"complete_pending_analysis","schema":SCHEMA,"evidence_class":"data_audit",
+    let mut report = json!({"status":"complete_pending_analysis","schema":SCHEMA,"evidence_class":"data_audit",
         "known_mapping":population(),"coverage":args.coverage,"optimizer_updates":0,"model_forwards":0,
         "rows":rows,"episode_ids":seen.len(),"unique_query_frames":queries.len(),"unique_inputs":inputs.len(),
         "repeated_complete_input_rows":rows-inputs.len(),"rule_counts":counts,
-        "query_schedule_matches_legacy":true,"repeated_known_inputs_and_targets_identical":true,
+        "query_schedule_matches_legacy":!args.known_replay,"repeated_known_inputs_and_targets_identical":true,
         "policy_controls":controls_from_counts(labels)?,"frozen_panel":frozen,
         "training_stream_file_sha256":file_hash(&args.output_dir.join("training-stream.jsonl"))?,
-        "elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+        "elapsed_seconds":started.elapsed().as_secs_f64()});
+    known_replay::annotate(args, &mut report);
+    if let Some(mut replay) = replay_report {
+        replay["complete_input_target_identity_verified"] = json!(true);
+        report["known_replay_audit"] = replay;
+        report["full_input_target_depth_multiset_matches_contiguous"] = json!(args.updates == 1150);
+    }
+    Ok(report)
 }
 
 #[derive(Default, Serialize)]
