@@ -987,6 +987,8 @@ but target attention mass falls from almost 1 to about 0.197/0.210; retained
 winners do not establish intact soft pooling. [Completed C12 result](research/2026-09-09-looped-grounded-policy-results.md).
 The subsequent [C13 query-sharpening check](research/2026-09-09-looped-query-sharpening-results.md)
 restores concentrated attention but scores 25% with worse CE; it adds no Best So Far gain.
+The [C14 fixed affine witness](research/2026-09-09-looped-affine-action-witness-results.md)
+also fails its registered gates; its small exploratory contrasts do not change this record.
 
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
@@ -1388,6 +1390,42 @@ correlation gaps. [Exact metrics, commands, setup history, seals and limits](res
 This reused seen-cohort test shows that the fixed sharpening intervention is
 insufficient with this terminal body/decoder. It does not establish C12's original
 failure mechanism, missing support information, generalization, ARC gain or
-promotion. The privileged C10 warm start remains a limitation. The next separately
-registered check is a frozen linear action-readout witness on retained C12
-features; no new end-to-end training recipe is selected.
+promotion. The privileged C10 warm start remains a limitation. The subsequent
+frozen affine action-readout witness is complete below; no new end-to-end training
+recipe is selected.
+
+## Frozen affine action witness — completed exploratory negative, September 9, 2026 IST
+
+C14 fits three fixed F64 ridge decoders on retained C12 pooled256 features, with
+**zero neural forwards, GPU work or neural optimizer updates**. The final-feature
+true-label arm scores **273/1024 seen, 262/1024 familiar and 125/512 held-out**;
+initial features score **288/1024, 245/1024 and 126/512**. The permuted-label arm
+scores **241/1024, 250/1024 and 122/512 against true labels**; its fitting-label
+score is 269/1024. Every arm has zero all-maps-correct query groups. Controls pass,
+both true-arm witness gates fail: `registered_affine_witness_not_supported`.
+
+Two exploratory positives remain visible: initial-feature seen accuracy is
+28.125%, **+3.125 pp [0.2930,6.0547]** over native/constant on its fitting cohort;
+final-minus-initial familiar accuracy is **+1.6602 pp [0.0977,3.2227]**. Final
+familiar accuracy is still only 25.5859%, and no transfer advantage over its native
+decoder or 25% constant has a strictly positive lower interval bound. Neither
+contrast establishes promotion or isolates a benefit of core training.
+
+Independent augmented least squares verifies the three fits and exact action
+agreement; all 120 compared floating report fields match exactly. No feature-scale
+floor is active. Map-dependent pooled variation is nonzero but small relative to
+between-query variation, with raw RMS ratios around 1.05% final and 2.56% initial.
+These are scale-dependent diagnostics, not an information-absence proof.
+[Counts, controls, objectives, uncertainty, runtime and exact provenance](research/2026-09-09-looped-affine-action-witness-results.md).
+The completed seal verifies 12 files, 232,108 bytes, 84 external bindings and four
+PIDs gone; analysis plus review takes 2.8865 s, with no new model capture required.
+
+The affine function class at this fixed pooling seam is unchanged, but squared
+loss, closed-form fitting, standardization and regularization differ from C12's
+joint AdamW/CE training. One fixed ridge failure does not rule out another affine
+fit, nonlinear decoding or information elsewhere in the model. All populations
+are reused and the privileged C10 warm start remains. After C12/C13/C14, the
+working direction is to reassess demonstration and action-effect representations;
+fixed-penalty and feature-spectrum limits require choosing the smallest next
+discriminator before redesign. The next architecture and training recipe are not
+yet selected. Best So Far and ARC claims remain unchanged.
