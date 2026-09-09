@@ -979,6 +979,31 @@ the run must record this scope note and cannot support a learning-trajectory cla
 
 ## Best So Far
 
+**C19–C21 native composition component:** the [completed frozen image-to-action test](research/2026-09-09-looped-native-composition-results.md)
+answers **768/768**, including **576/576 demonstrated and 192/192 omitted-action**
+cases, on 32 new queries across all 24 cardinal mappings. The initial visual core,
+privileged role selectors and C18 binder execute together without new training.
+Uniform attention answers **192/768**, always choosing the missing ID: **0%
+demonstrated /100% omitted /25% overall by construction**, with CE **25.689461**.
+All registered gates and numerical checks pass. This is a finite component result;
+the ordinary policy head and public **0/23** score remain unchanged. Initial success
+earns no C7 credit, and four shared loops do not establish a recurrence benefit.
+
+CUDA runtime source is `e68703cf4d42119407e721edf42170beec515037`, with native
+physical batch **256** after 512 OOM. C21 source
+`6ccd87fee115ae64e9056a0f91676e3052592143` corrects only F32 metadata identity
+checking on those retained outputs. This is not a second panel or fresh replication.
+Exact historical completed-rescore command; the linked report also gives the
+owning CUDA execution command, failure history, hashes and profiler limits:
+
+```bash
+cd /home/stepan/Projects/code/Tofy-native-binding-results
+/home/stepan/venvs/tensorboard/bin/python3 /home/stepan/Research/_runs/2026-09-09T213625Z-tofy-looped-native-f32-rescore/rescore_operator.py analyze \
+  --campaign /home/stepan/Projects/code/.tofy-runs/looped-native-f32-rescore-20260909T224747-IST
+```
+
+This is a historical command; the sealed root must not be reused.
+
 **C12 does not improve this record:** integrated policy-only training with the
 privileged C10 warm start finishes at **254/1024 seen, 255/1024 familiar and
 127/512 held-out**, versus 25% frozen and cleared controls. All seven learning
@@ -1611,3 +1636,41 @@ allocation-lifetime, instrumented physical-memory and device-event gaps remain;
 automatic GPU correlation is incomplete. All 15 streams per arm, the finite
 proof, exact commands, checkpoint identities, controls and limits are in the
 [completed result document](research/2026-09-09-looped-equivariant-binding-results.md).
+
+
+## Frozen native composition — finite gate passes, September 9, 2026 IST
+
+C19–C21 connect the frozen initial visual core, privileged seven-frame role
+selectors and C18 action-equivariant binder on device. Factual inference scores
+**768/768**, including **576/576 demonstrated, 192/192 omitted**, and all 32
+complete mapping groups. Factual CE is **1.49450226e-8**, with minimum true-action
+margin **16.7352153**. Uniform attention still executes vision and selectors but
+replaces their attention before the adapter: **192/768**, entirely omitted-action
+answers, **0/576 demonstrated**, and CE **25.6894612**. Its 25% overall is forced
+by balanced labels for identical inputs; its missing-ID shortcut is not recovery
+of an omitted physical effect.
+
+All 14 role locations are correct on every factual row; minimum true-role mass
+is **0.9999988079**. Independent reconstructed-record NumPy replay agrees on all
+**1,536 eligible winners**, with maximum logit error **4.74453e-5** inside the
+fixed tolerance. The separate scalar reviewer agrees on **716 floating and 606
+discrete fields**, sharing the pinned neural replay and external runtime receipt.
+
+C19 failed its profiler declaration before scientific inference. C20 corrected
+that contract and completed both streams at **batch 256** after **512 CUDA OOM**;
+this native workload differs from C18 binder-only training at 4096/accumulation 1.
+C20's first scorer rejected equivalent JSON representations of identical F32
+metadata before computing action summaries. C21 repaired only that check and
+rescored the same sealed panel/weights, with no new GPU work or replication.
+Outer CUDA execution cost **111.419627 s**; C21 analysis/review **11.190735 s**.
+All 11 successful captures are healthy and Nsight-bound; uninstrumented operation,
+allocation, physical-memory and device-event coverage and incomplete automatic
+GPU correlation remain explicit. All recorded processes, including sealing,
+are closed; the verified C21 seal is
+`cbbcb0878bec40c4603c581c0201fa47fbc0bfbe98745707a3ac2c2428b04043`.
+
+This supports frozen composition on 32 novel queries relative to six named
+historical files, with simple cardinal controls and restricted support images.
+It does not train the initial core, remove privileged selector fitting, establish
+useful recurrence, or improve the unchanged ordinary policy head/public **0/23**
+record. [Exact results, identities, historical commands and limitations](research/2026-09-09-looped-native-composition-results.md).
