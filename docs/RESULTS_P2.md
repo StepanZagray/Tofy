@@ -89,17 +89,22 @@ Evaluatorae4597b6, zero updates;20 Rust/16 Python fixtures, exactlegacyparity an
 wired profiler checks pass. Next: cohort-preserving replay on unchanged model/data/depths.
 No ARC gain; new-core memory/probing/ARC integration remain absent.
 
-## Cohort replay screen — active preparation, September 9, 2026 IST
+## Cohort replay screen — completed negative, September 9, 2026 IST
 
-The [registered ordering screen](research/2026-09-09-looped-cohort-replay.md) follows
-the valid seen-query failure. It preserves every input/target/training-depth count,
-initialization, optimizer and 1,150-update budget, but uses 64 distinct queries per
-update and revisits each query in 16 updates. Physical 33/tail 31/accumulation 2;
-no model, loss or ARC-data change. Source implementation passes 24 CPU tests and
-independent review. Launch still requires full retained-parent data parity, exact
-CUDA smoke and profiler qualification. No replay quality result exists yet.
-The reused 64-query panel is selection-only; fresh panels and multiple seeds are
-required for promotion. New-core memory, probing and ARC integration remain absent.
+The complete 1,150-update replay run at source 8cec1006 still scores **15/64**
+factual actions, identical to C5 and below the **18/64** constant baseline.
+All 512 factual/cleared successor predictions are goal templates: exact 64/256
+per condition, terminal only; copy gets 72/256. Every continuation gate fails.
+The full input/target/depth multiset is unchanged, but batches contain 64 distinct
+queries and each query is visited in 16 updates. Physical 33/tail 31/accumulation 2.
+Grouping and spacing change together; this does not prove optimization or
+architecture impossibility. The reused panel is selection-only.
+
+[Full result, commands, confidence intervals and provenance](research/2026-09-09-looped-cohort-replay-results.md).
+All 24 CPU tests, 17 analyzer fixtures, legacy parity, stream checks and eight
+bound profiler captures pass; unwired operation/memory/device-event gaps remain.
+Next: frozen feature/readout diagnosis before another full-model training run.
+No Best So Far or ARC gain; new-core memory, probing and ARC integration remain absent.
 
 ## Frozen fields for the first experimental run
 
