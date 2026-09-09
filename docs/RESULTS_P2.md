@@ -1002,6 +1002,28 @@ fits its isolated abstract task at **256/256**, but held-out mappings score only
 **1024/1024** reused visual-cache result uses familiar mappings and privileged
 initial role attention; it adds no native-controller or ARC best metric.
 
+**C18 component selection only:** the [matched action-equivariant comparison](research/2026-09-09-looped-equivariant-binding-results.md)
+fits **256/256** cases in both arms. The treatment reaches **128/128 held-map
+cases**, including all 32 omitted cases, versus legacy **81/128** and **5/32
+omitted**. This is coverage of 16 action-renaming orbit types under an explicit
+representation/output-sharing prior; it creates no new native-controller or
+public ARC record. Both reused privileged visual caches score 1024/1024. The
+treatment is already perfect at one evaluation loop, so useful recurrence is
+not established. Both arms use physical/effective **4096, accumulation 1,
+144 updates and 588,800 presentations**, including a 3,072-row tail. Exact
+historical command at source `ec6ba27c05fa1032a82362a05dbd15fe51cc043a`:
+
+```bash
+cd /home/stepan/Projects/code/Tofy-equivariant-binding
+/home/stepan/venvs/tensorboard/bin/python3 /home/stepan/Research/_runs/2026-09-09T194505Z-tofy-looped-action-equivariance/campaign_operator.py execute \
+  --campaign /home/stepan/Projects/code/.tofy-runs/looped-action-equivariant-20260909T212250-IST \
+  --spec-sha256 86b3e47c5680633ec49739c2a679bb129e5ecef22ae7247a943225165b82c6aa
+```
+
+The sealed root must not be reused. Both treatment clamps always choose the
+omitted action: 0% demonstrated, 100% omitted and 25% overall by construction;
+query-zero CE is 19.919956. These controls are not additional learning gains.
+
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
 and joint roles** for both initial and C7-final cores across three new 256-query
@@ -1545,6 +1567,47 @@ temperature **74°C**. The outer seal verifies **1408 files /596,145,101 bytes,
 1050 bindings and518 recorded PIDs gone**. Source **9d4827d2**.
 
 [All counts, CE, controls, exact commands, hashes and limitations](research/2026-09-09-looped-binding-screen-results.md).
-The next hypothesis is a learned binder equivariant to renaming action IDs;
-the requested larger power-of-two batch remains a future constraint. No next
-recipe or training result is claimed. Native-policy and ARC Best So Far remain unchanged.
+The separately registered C18 comparison below completes that action-renaming
+hypothesis at a larger matched batch. Native-policy and ARC Best So Far remain unchanged.
+
+## Action-equivariant binding — finite selection passes, September 9, 2026 IST
+
+C18 completes a matched single-seed comparison at source **ec6ba27c**. Both
+models fit **256/256 canonical cases**. The equivariant treatment reaches
+**128/128 held-map cases: 96/96 demonstrated and 32/32 omitted**. Legacy reaches
+**81/128: 76/96 demonstrated and 5/32 omitted** and fails its held thresholds.
+The treatment passes all 16 orbit margin and numerical symmetry gates. These
+held cases are action renamings of fitted semantic types; success establishes
+structural coverage under the imposed symmetry, not independent semantic
+generalization or a general reasoning algorithm.
+
+Both arms use **4096 physical/effective batch, accumulation 1**, with **144
+updates /588,800 presentations**, including the explicit 3,072-row tail. The
+legacy 8192 trial fails with CUDA OOM; 4096 is the largest tested joint stable
+batch, not the treatment's separately measured maximum. Model-reported fitting
+lifetimes are **74.687315 s legacy /62.137947 s treatment**. Instrumented single
+runs do not establish production speed superiority or a causal batch benefit
+over C17's different update count.
+
+Legacy held accuracy improves from 31/128, but CE worsens **1.590677 → 2.573086**;
+omitted accuracy falls **7/32 → 5/32** and omitted CE rises **1.674560 → 7.750146**.
+Treatment factual held CE is **1.641353e-8**. Under either treatment clamp,
+every prediction selects the omitted ID: **0% demonstrated /100% omitted /25%
+overall by construction**. Effects-zero CE is **4.882372**, query-zero CE
+**19.919956**. Factual success does not establish calibrated behavior when
+required information is removed.
+
+Both cached visual scores are **1024/1024**, using reused C15 initial privileged
+role attention and familiar mappings. No vision core executes or learns here.
+Treatment factual accuracy is already 100% at one loop; the 1/2/4/8-loop readouts
+do not establish necessity or benefit of recurrence. There is no LLM controller, native
+policy improvement, planner, memory or ARC result.
+
+Independent reviews agree on **3,195 floating and 5,309 discrete fields per arm**,
+with maximum floating disagreement **7.11e-15**, sharing the pinned lifecycle
+receipts. The seal verifies **3,692 files /1,564,624,017 bytes, 2,610 bindings,
+1,356 recorded PIDs gone and 54 healthy CUDA captures**. Operation/activation,
+allocation-lifetime, instrumented physical-memory and device-event gaps remain;
+automatic GPU correlation is incomplete. All 15 streams per arm, the finite
+proof, exact commands, checkpoint identities, controls and limits are in the
+[completed result document](research/2026-09-09-looped-equivariant-binding-results.md).
