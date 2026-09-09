@@ -979,6 +979,13 @@ the run must record this scope note and cannot support a learning-trajectory cla
 
 ## Best So Far
 
+**Role-supervised diagnostic boundary:** [C10](research/2026-09-09-looped-role-witness-results.md)
+reaches 256/256 joint localization and hard/soft actions at both initial and final
+cores, using privileged role fitting labels and a frozen C8 policy. Inference is
+feature-only, but the reused C9 panel is selection-only. This creates no new
+native-controller/ARC best metric and gives no C7 credit for initial success.
+The exact supervised command and uncertainty are retained in the linked report.
+
 **Frozen readout diagnostic boundary:** [C8](research/2026-09-09-looped-frozen-features-results.md) reaches
 256/256 only with a true-role selection oracle, including at initialization.
 This establishes no new native-controller best metric: final native policy is
@@ -1236,3 +1243,26 @@ All12 full heads independently reconstruct, legacy raw outputs are byte-identica
 and18 bound profiler captures pass with the stated operation/memory/device-event
 gaps. The6 fits use37.29s model phase. Next: frozen linear role-selector witness
 with explicit synthetic role supervision; core memory/probing/ARC remain absent.
+
+## Frozen role-selector witness — September 9, 2026 IST
+
+C10 at source `82ac8cb6` fits two shared linear role queries from synthetic
+agent/goal labels over 32,768 frozen fitting tokens. Both initial and C7-final
+cores localize all 256 role pairs and score 256/256 hard and soft actions on the
+reused C9 panel; best constant is 77/256. Both lower constant-advantage bounds are
+64.453125 percentage points. This uses privileged role supervision during fitting
+and is selection-only evidence. It establishes no policy-only success, fresh
+confirmation, CUDA transplant, or ARC result. Initial success predates C7 training.
+
+Null joint localization is 0/256 for both cores, but initial-null agent localization
+is 39/256. Null hard actions are 58/256 and 85/256; soft actions are 56/256 for both.
+Oracle scores 256/256 for both; native policy scores 56/256 and 77/256. Every
+registered control passes. Empirical [1,1] intervals do not guarantee population
+perfection. [Full counts, exact command, finite witness, seals and limitations](research/2026-09-09-looped-role-witness-results.md).
+
+The four independently checked normal-equation residuals are <=7.21e-16. C10 uses
+one BLAS thread and 1.908 seconds of diagnostic time, with no model forwards or
+optimizer updates. NumPy/BLAS has no Candle Graph instrumentation; existing
+extraction profiles retain their known gaps. Next: fixed Rust/CUDA heads and three
+new 256-query panels in C11, without refitting. New-core memory, probing and ARC
+integration remain absent; no optimizer-cause or architecture promotion follows.
