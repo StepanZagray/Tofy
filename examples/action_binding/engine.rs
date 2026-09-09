@@ -21,7 +21,7 @@ use tofy::p2::{
     optimizer::{accumulate_parameter_gradients, clip_gradients_gpu_with_stats},
 };
 
-pub const EFFECTIVE: usize = 64;
+pub const EFFECTIVE: usize = 512;
 pub const DIGEST_SCHEMA: &str = "looped-action-binding-parameters-v1";
 
 #[derive(Clone)]
@@ -504,8 +504,25 @@ pub fn train_update(
     capture: Option<&LoopedCapture>,
 ) -> Result<UpdateMetrics> {
     ensure!(
-        rows.len() == EFFECTIVE && (1..=EFFECTIVE).contains(&physical),
-        "update requires 64 rows and batch1..64"
+        rows.len() == EFFECTIVE && physical.is_power_of_two() && physical <= EFFECTIVE,
+        "update requires {EFFECTIVE} rows and a power-of-two batch in 1..={EFFECTIVE}"
+    );
+    train_update_rows(model, rows, physical, optimizer, capture)
+}
+
+// The registered entry point fixes 512 rows. This shared implementation also
+// permits small CPU fixtures to check row weighting, including uneven chunks.
+fn train_update_rows(
+    model: &Model,
+    rows: &[Row],
+    physical: usize,
+    optimizer: &mut AdamW,
+    capture: Option<&LoopedCapture>,
+) -> Result<UpdateMetrics> {
+    let effective = rows.len();
+    ensure!(
+        effective > 0 && (1..=effective).contains(&physical),
+        "invalid update batch"
     );
     ensure!(
         rows.iter()
@@ -520,7 +537,7 @@ pub fn train_update(
         let mut mean_ce = 0.0;
         let mut correct = 0;
         for (micro, rows) in rows.chunks(physical).enumerate() {
-            let weight = rows.len() as f64 / EFFECTIVE as f64;
+            let weight = rows.len() as f64 / effective as f64;
             let loss = phase(
                 capture,
                 &model.device,
@@ -599,10 +616,10 @@ pub fn train_update(
             },
         )?;
         Ok(UpdateMetrics {
-            rows: EFFECTIVE,
+            rows: effective,
             physical_batch: physical,
-            microbatches: EFFECTIVE.div_ceil(physical),
-            tail_batch: (EFFECTIVE - 1) % physical + 1,
+            microbatches: effective.div_ceil(physical),
+            tail_batch: (effective - 1) % physical + 1,
             mean_ce,
             pre_update_correct: correct,
             pre_clip_norm: clip.pre_clip_norm,
@@ -857,19 +874,19 @@ pub mod tests {
             let logits = model
                 .binder
                 .forward(&tensors(chunk, Intervention::default(), &Device::Cpu)?, 4)?;
-            let loss = (cross_entropy(&logits, chunk)? * (chunk.len() as f64 / 64.0))?;
+            let loss = (cross_entropy(&logits, chunk)? * (chunk.len() as f64 / rows.len() as f64))?;
             accumulate_parameter_gradients(&mut gradients, loss.backward()?, &model.vars)?;
         }
         Ok(gradients.unwrap())
     }
 
     #[test]
-    fn accumulation64_vs32_matches_gradients_and_one_update_behavior() -> Result<()> {
+    fn bounded_accumulation_matches_gradients_and_one_update_behavior() -> Result<()> {
         let a = Model::new(&Device::Cpu)?;
         let b = Model::new(&Device::Cpu)?;
-        let rows = (0..64).map(row).collect::<Vec<_>>();
-        let ga = accumulated(&a, &rows, 64)?;
-        let gb = accumulated(&b, &rows, 32)?;
+        let rows = (0..8).map(row).collect::<Vec<_>>();
+        let ga = accumulated(&a, &rows, 8)?;
+        let gb = accumulated(&b, &rows, 3)?;
         for ((name, va), (_, vb)) in a.names.iter().zip(&b.names) {
             let x = ga
                 .get(va)
@@ -889,8 +906,10 @@ pub mod tests {
             }
         }
         let before = a.snapshot()?;
-        let ma = train_update(&a, &rows, 64, &mut a.optimizer()?, None)?;
-        let mb = train_update(&b, &rows, 32, &mut b.optimizer()?, None)?;
+        let ma = train_update_rows(&a, &rows, 8, &mut a.optimizer()?, None)?;
+        let mb = train_update_rows(&b, &rows, 3, &mut b.optimizer()?, None)?;
+        assert_eq!((ma.rows, ma.microbatches, ma.tail_batch), (8, 1, 8));
+        assert_eq!((mb.rows, mb.microbatches, mb.tail_batch), (8, 3, 2));
         assert!((ma.mean_ce - mb.mean_ce).abs() < 1e-5);
         assert!((ma.pre_clip_norm - mb.pre_clip_norm).abs() < 1e-4);
         // Near-zero softmax key-bias gradients can give different AdamW bit
@@ -920,6 +939,13 @@ pub mod tests {
         let changes = a.changes(&before)?;
         assert!(!changes.changed_body_names.is_empty() && !changes.changed_head_names.is_empty());
         a.restore(&before)?;
+        assert!(a.changes(&before)?.all_parameters_unchanged);
+        let mut optimizer = a.optimizer()?;
+        assert!(train_update(&a, &rows, 8, &mut optimizer, None).is_err());
+        let registered_rows = (0..EFFECTIVE).map(row).collect::<Vec<_>>();
+        for physical in [0, 3, EFFECTIVE + 1, 2 * EFFECTIVE] {
+            assert!(train_update(&a, &registered_rows, physical, &mut optimizer, None).is_err());
+        }
         assert!(a.changes(&before)?.all_parameters_unchanged);
         Ok(())
     }

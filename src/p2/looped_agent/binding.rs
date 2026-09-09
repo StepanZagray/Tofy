@@ -10,11 +10,11 @@ use candle_nn::{linear, Linear, Module, VarBuilder};
 
 pub const RECORDS: usize = 4;
 pub const INPUT_WIDTH: usize = 7;
-pub const WIDTH: usize = 64;
+pub const WIDTH: usize = 256;
 pub const HEADS: usize = 4;
 pub const LAYERS: usize = 2;
 pub const MAX_LOOPS: usize = 8;
-pub const PARAMETERS: usize = 100_292;
+pub const PARAMETERS: usize = 1_580_804;
 
 /// Two transformer blocks reused at every loop, followed by a four-action head.
 /// No positional encoding distinguishes the support records: reordering them
@@ -144,6 +144,8 @@ mod tests {
                 .collect::<BTreeMap<_, _>>()
         };
         let before = names();
+        assert_eq!(WIDTH / HEADS, 64);
+        assert_eq!(PARAMETERS, 24 * WIDTH * WIDTH + 31 * WIDTH + 4);
         assert_eq!(before.len(), 29);
         assert_eq!(before.values().sum::<usize>(), PARAMETERS);
         assert!(before.contains_key("block_0.attention.query.weight"));

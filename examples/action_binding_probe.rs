@@ -7,6 +7,7 @@ mod evidence;
 use anyhow::{ensure, Context, Result};
 use candle_core::Device;
 use clap::Parser;
+use engine::EFFECTIVE;
 use evidence::{file_hash, write_json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,8 +53,8 @@ struct Config {
 impl Config {
     fn validate_mode(&self) -> Result<()> {
         ensure!(
-            (1..=64).contains(&self.physical_batch),
-            "physical batch must be1..64"
+            self.physical_batch.is_power_of_two() && self.physical_batch <= EFFECTIVE,
+            "physical batch must be a power of two in 1..={EFFECTIVE}"
         );
         ensure!(
             self.max_seconds > 0
@@ -219,7 +220,7 @@ impl Dataset {
             updates.len() == 1150
                 && updates
                     .iter()
-                    .all(|u| u.len() == 64 && u.iter().all(|&i| i < 1536)),
+                    .all(|u| u.len() == EFFECTIVE && u.iter().all(|&i| i < 1536)),
             "invalid fixed update stream"
         );
         Ok(Self {
@@ -268,7 +269,7 @@ fn capture(
         &model.device,
         training.then_some(&model.vars),
         rows,
-        if training { 64 } else { rows },
+        if training { EFFECTIVE } else { rows },
         config.loops,
         config.source_kind(),
     )
@@ -433,7 +434,7 @@ fn train(
         restored_sha256 = json!(file_hash(&restored)?);
     }
     Ok(
-        json!({"status":"complete_pending_analysis","classification":if config.mode == Mode::Train { "single_seed_screen" } else { "implementation_smoke" },"optimizer_updates":config.updates,"input_rows":config.updates*64,"physical_batch":config.physical_batch,"effective_batch":64,"accumulation":64usize.div_ceil(config.physical_batch),"loops":4,"cleared":false,"query_cleared":false,"input_source":"abstract_effects","executed_vision_core_forwards":0,"changes":changes,"restored_changes":restoration,"restored_sha256":restored_sha256,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"final_sha256":file_hash(&final_path)?,"final_parameter_sha256":final_parameter_sha256,"elapsed_seconds":started.elapsed().as_secs_f64()}),
+        json!({"status":"complete_pending_analysis","classification":if config.mode == Mode::Train { "single_seed_screen" } else { "implementation_smoke" },"optimizer_updates":config.updates,"input_rows":config.updates*EFFECTIVE,"physical_batch":config.physical_batch,"effective_batch":EFFECTIVE,"accumulation":EFFECTIVE.div_ceil(config.physical_batch),"loops":4,"cleared":false,"query_cleared":false,"input_source":"abstract_effects","executed_vision_core_forwards":0,"changes":changes,"restored_changes":restoration,"restored_sha256":restored_sha256,"updates_elapsed_seconds":updates_elapsed,"checkpoint_seconds":checkpoint_seconds,"last_update":last,"final_sha256":file_hash(&final_path)?,"final_parameter_sha256":final_parameter_sha256,"elapsed_seconds":started.elapsed().as_secs_f64()}),
     )
 }
 
@@ -464,7 +465,7 @@ fn run(config: &Config, started: Instant) -> Result<Value> {
     let starting_parameter_sha256 = engine::parameter_digest(&model.snapshot()?);
     write_json(
         &config.output_dir.join("metadata.json"),
-        &json!({"schema":"looped-action-binding-v1","config":config,"provenance":source,"parameter_count":PARAMETERS,"parameter_digest_schema":engine::DIGEST_SCHEMA,"initial_parameter_sha256":initial_parameter_sha256,"input_source":config.source_kind(),"seed":0,"objective":"policy_cross_entropy_only","executed_vision_core_forwards":0,"effective_batch":if matches!(config.mode, Mode::Train | Mode::BatchSmoke) { 64 } else { config.physical_batch },"deferred":["online_visual_adapter","reward","value","dynamics","planner","ARC_evaluation"]}),
+        &json!({"schema":"looped-action-binding-v1","config":config,"provenance":source,"parameter_count":PARAMETERS,"parameter_digest_schema":engine::DIGEST_SCHEMA,"initial_parameter_sha256":initial_parameter_sha256,"input_source":config.source_kind(),"seed":0,"objective":"policy_cross_entropy_only","executed_vision_core_forwards":0,"effective_batch":if matches!(config.mode, Mode::Train | Mode::BatchSmoke) { EFFECTIVE } else { config.physical_batch },"deferred":["online_visual_adapter","reward","value","dynamics","planner","ARC_evaluation"]}),
     )?;
     config.deadline(started)?;
     let mut report = if matches!(config.mode, Mode::Train | Mode::BatchSmoke) {
@@ -546,7 +547,7 @@ mod tests {
             dataset_sha256: String::new(),
             mode: Mode::Train,
             output_dir: "/fixture/new".into(),
-            physical_batch: 64,
+            physical_batch: EFFECTIVE,
             updates: 1150,
             max_seconds: 600,
             checkpoint: None,
@@ -561,6 +562,15 @@ mod tests {
     fn mode_guards_keep_training_and_controls_separate() -> Result<()> {
         let mut c = config();
         c.validate_mode()?;
+        for physical in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+            c.physical_batch = physical;
+            c.validate_mode()?;
+        }
+        for physical in [0, 3, 511, 513, 1024] {
+            c.physical_batch = physical;
+            assert!(c.validate_mode().is_err());
+        }
+        c.physical_batch = EFFECTIVE;
         c.updates = 1149;
         assert!(c.validate_mode().is_err());
         c.updates = 1150;
@@ -610,16 +620,16 @@ mod tests {
                 .map(|i| engine::tests::row(i).raw)
                 .collect::<Vec<_>>()
         };
-        json!({"schema":"looped-action-binding-data-v1","fit":rows(1536),"heldout":rows(768),"cached_visual":rows(1024),"updates":vec![(0..64).rev().collect::<Vec<_>>();1150]})
+        json!({"schema":"looped-action-binding-data-v1","fit":rows(1536),"heldout":rows(768),"cached_visual":rows(1024),"updates":vec![(0..EFFECTIVE).rev().collect::<Vec<_>>();1150]})
     }
     #[test]
     fn dataset_replay_and_export_preserve_audit_boundaries() -> Result<()> {
         let data = Dataset::parse(dataset_value())?;
         for index in [0, 1149] {
             let batch = data.update(index)?;
-            assert_eq!(batch.len(), 64);
+            assert_eq!(batch.len(), EFFECTIVE);
             for (slot, row) in batch.iter().enumerate() {
-                assert_eq!(row.raw, data.fit[63 - slot].raw);
+                assert_eq!(row.raw, data.fit[EFFECTIVE - 1 - slot].raw);
             }
         }
         assert!(data.update(1150).is_err());
@@ -641,7 +651,7 @@ mod tests {
     }
     #[test]
     fn bad_schedule_or_population_fails_before_model_construction() {
-        for kind in 0..5 {
+        for kind in 0..6 {
             let mut value = dataset_value();
             match kind {
                 0 => {
@@ -652,7 +662,8 @@ mod tests {
                 }
                 2 => value["updates"][0][0] = json!(1536),
                 3 => value["fit"][0]["index"] = json!(1),
-                _ => value["fit"][0]["input_sha256"] = json!("0".repeat(64)),
+                4 => value["fit"][0]["input_sha256"] = json!("0".repeat(64)),
+                _ => value["updates"][0] = json!(vec![0; 64]),
             }
             assert!(Dataset::parse(value).is_err());
         }

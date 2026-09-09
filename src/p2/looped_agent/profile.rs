@@ -686,8 +686,8 @@ mod tests {
             2,
             &device,
             Some(&vars),
-            64,
-            64,
+            512,
+            512,
             4,
             "abstract_effects",
         )?;
@@ -735,7 +735,9 @@ mod tests {
             families,
             std::collections::BTreeSet::from(["input", "shared_core", "policy"])
         );
-        assert_eq!(trace.run.tags["parameter_count"], "100292");
+        assert_eq!(trace.run.tags["parameter_count"], "1580804");
+        assert_eq!(trace.run.tags["physical_batch"], "512");
+        assert_eq!(trace.run.tags["effective_batch"], "512");
         assert_eq!(trace.run.tags["vision_core_forwards"], "0");
         let destination = dir.0.join("eval");
         let cap = LoopedCapture::begin_binding(
