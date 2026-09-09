@@ -151,7 +151,8 @@ def qualify(spec):
     for batch in (1,4):launch(spec,f'parity-b{batch}','qualify',batch)
     def deadline_signal(_number,_frame):raise TimeoutError('registered parity CPU budget exceeded')
     previous=signal.signal(signal.SIGALRM,deadline_signal)
-    signal.setitimer(signal.ITIMER_REAL,min(120,5400-budgets(spec)['wall']))
+    parity_seconds=min(120,5400-budgets(spec)['wall']);require(parity_seconds>0,'parity wall deadline exhausted')
+    signal.setitimer(signal.ITIMER_REAL,parity_seconds)
     try:parity(spec)
     finally:signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,previous)
     tested={};low,high=0,65
