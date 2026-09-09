@@ -989,6 +989,9 @@ The subsequent [C13 query-sharpening check](research/2026-09-09-looped-query-sha
 restores concentrated attention but scores 25% with worse CE; it adds no Best So Far gain.
 The [C14 fixed affine witness](research/2026-09-09-looped-affine-action-witness-results.md)
 also fails its registered gates; its small exploratory contrasts do not change this record.
+The [C15 demonstration-grounding diagnostic](research/2026-09-09-looped-demonstration-grounding-results.md)
+passes both frozen selector-reuse gates, but current actions remain 256/1024 initial
+and 254/1024 final. This adds no policy best metric or learned-binding claim.
 
 **Fixed CUDA role-readout confirmation (known-control synthetic only):**
 [C11](research/2026-09-09-looped-cuda-readout-results.md) confirms **768/768 actions
@@ -1429,3 +1432,39 @@ working direction is to reassess demonstration and action-effect representations
 fixed-penalty and feature-spectrum limits require choosing the smallest next
 discriminator before redesign. The next architecture and training recipe are not
 yet selected. Best So Far and ARC claims remain unchanged.
+
+## Frozen demonstration grounding — completed bounded positive, September 9, 2026 IST
+
+C15 applies each unchanged initial/final spatial head to all seven existing frame
+feature slices on the reused C12 seen panel: **64 query groups ×16 mappings**.
+Both arms correctly select the agent and goal in **1024/1024 rows for every frame**,
+including all six support frames. Every before/after displacement is correct:
+**3072/3072**, with all three correct in every row. Both selector-reuse gates pass
+**21/21 components**. This supports this specific frozen selector pathway; it does
+not establish learned action binding. Current policy remains **256/1024 initial
+and 254/1024 final**, exactly unchanged from C12.
+
+Correct winners do not mean intact soft pooling: final support target mass is
+only **0.1617–0.1634 for agents and 0.1835–0.1871 for goals**, versus almost 1
+initially. Support goals are always at cell63, so their perfect location scores
+alone cannot exclude a position shortcut. All populations are reused; the initial
+head has privileged C10 role supervision and its success is not C12 learning credit.
+Whole-query bootstrap location/displacement intervals are [1,1], conditional on
+the fixed panel and checkpoints, not population guarantees.
+
+Source **61e13356**, four loops, physical **34 + tail4**, zero optimizer updates,
+all parameters unchanged. Four-row CUDA qualification and all current output
+comparisons have zero maximum error. Independent reconstruction verifies **445
+floating fields** with maximum difference about 1.11e-16 and **127 discrete fields** exactly. A prelaunch
+test-import correction was caught before model outcomes and changes no scientific
+result. [Counts, attention masses, controls, commands, runtime and provenance](research/2026-09-09-looped-demonstration-grounding-results.md).
+
+Three bound CUDA captures pass wired integrity checks. Automatic GPU correlation
+remains incomplete despite exact raw application-label matches; operation,
+activation, allocation-lifetime, physical-memory and device-event instrumentation
+gaps remain. Initial/final model-reported times are **9.1030/8.6788 s**, maximum
+temperature **59°C**, minimum sampled VRAM reserve **7161 MiB**. The completed seal
+verifies **217 files /240,074,195 bytes, 109 external bindings and 103 PIDs gone**.
+Next is a separately registered learned before/after binding experiment, with no
+automatic training or selected recipe. Best So Far policy, ARC, planner, dynamics,
+memory and useful-recurrence claims remain unchanged.
