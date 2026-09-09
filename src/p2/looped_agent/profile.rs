@@ -41,6 +41,80 @@ pub struct LoopedRange<'a> {
 }
 
 impl LoopedCapture {
+    /// Head-only work on cached tensors: never declares frozen-core gradients.
+    pub fn begin_readout(
+        destination: &Path,
+        step: u64,
+        device: &Device,
+        vars: Option<&VarMap>,
+        batch: usize,
+        kind: &str,
+    ) -> Result<Self> {
+        ensure!(matches!(kind, "spatial" | "cls"), "unknown learned readout");
+        let family = |name: &str| match name.split('.').next()? {
+            "queries" if kind == "spatial" => Some("readout_queries"),
+            "hidden" if kind == "cls" => Some("readout_hidden"),
+            "output" => Some("readout_policy"),
+            _ => None,
+        };
+        let gradients = vars
+            .map(|vars| -> Result<GradientCapturePlan> {
+                let mut named = vars
+                    .data()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("readout VarMap lock poisoned"))?
+                    .iter()
+                    .map(|(key, var)| (key.clone(), var.clone()))
+                    .collect::<Vec<_>>();
+                named.sort_by(|a, b| a.0.cmp(&b.0));
+                ensure!(
+                    !named.is_empty() && named.iter().all(|(name, _)| family(name).is_some()),
+                    "readout capture contains unexpected or empty parameter population"
+                );
+                let families = [
+                    if kind == "spatial" {
+                        "readout_queries"
+                    } else {
+                        "readout_hidden"
+                    },
+                    "readout_policy",
+                ]
+                .into_iter()
+                .map(|name| GradientFamilyContract::active(name, 1))
+                .collect();
+                GradientCapturePlan::from_named_vars(
+                    "parameters/pre_clip",
+                    named,
+                    |name| family(name).expect("validated head family").into(),
+                    families,
+                )
+            })
+            .transpose()?;
+        let run = if vars.is_some() {
+            ProfileRun::training(
+                "tofy::p2::learned_readout::optimizer_update",
+                step,
+                device_name(device),
+            )
+        } else {
+            ProfileRun::inference(
+                "tofy::p2::learned_readout::evaluation",
+                step,
+                device_name(device),
+            )
+        }
+        .correlation_id(format!(
+            "tofy.looped/readout-{}-{step:012}",
+            if vars.is_some() { "update" } else { "eval" }
+        ))
+        .tag("workload", "cached-learned-readout")
+        .tag("head_kind", kind)
+        .tag("executed_core_forwards", "0")
+        .tag("cached_extraction_loops", "4")
+        .tag("head_recurrence", "none");
+        Self::open(destination, run, gradients, batch, batch, 1)
+    }
+
     pub fn begin(
         destination: &Path,
         update: u64,
@@ -160,6 +234,10 @@ impl LoopedCapture {
             // are unwired. Cargo features do not supply their instrumentation.
             ..CaptureContract::default()
         };
+        let cached_readout = run
+            .tags
+            .get("workload")
+            .is_some_and(|x| x == "cached-learned-readout");
         let mut run = run
             .capture_contract(contract)
             .tag("physical_batch", physical_batch.to_string())
@@ -172,7 +250,14 @@ impl LoopedCapture {
                 "tail_batch",
                 ((effective_batch - 1) % physical_batch + 1).to_string(),
             )
-            .tag("loops", loops.to_string())
+            .tag(
+                "loops",
+                if cached_readout {
+                    "not_applicable".into()
+                } else {
+                    loops.to_string()
+                },
+            )
             .tag("boundary_synchronization", "caller_owned");
         if gpu {
             run = run.measured_region_device_synchronized();

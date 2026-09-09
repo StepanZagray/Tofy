@@ -465,10 +465,10 @@ pub fn foundation_v2_armed_gates_passed(evaluation: &FoundationV2GateEvaluation)
 
 /// The gate evaluation currently holding the promotion under `metric`,
 /// obtained by replaying the strict-improvement scan over the history.
-pub fn foundation_v2_best_evaluation<'a>(
+pub fn foundation_v2_best_evaluation(
     metric: PromotionMetric,
-    gate_history: &'a [FoundationV2GateEvaluation],
-) -> Option<&'a FoundationV2GateEvaluation> {
+    gate_history: &[FoundationV2GateEvaluation],
+) -> Option<&FoundationV2GateEvaluation> {
     let mut best: Option<&FoundationV2GateEvaluation> = None;
     for evaluation in gate_history {
         if foundation_v2_armed_gates_passed(evaluation)
@@ -731,8 +731,8 @@ pub fn foundation_v2_gate_history_aborts(history: &[FoundationV2GateEvaluation])
         return false;
     };
     latest.gates.iter().any(|gate| {
-        !gate.passed
-            && !(matches!(
+        !(gate.passed
+            || matches!(
                 gate.name.as_str(),
                 "foreground_reconstruction" | "shuffled_action_ratio"
             ) && gate.abort_exempt)

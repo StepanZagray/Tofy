@@ -1455,6 +1455,8 @@ pub fn sample_from_transition(
     ))
 }
 
+// Keep simulator context and the two already-rendered frames explicit.
+#[allow(clippy::too_many_arguments)]
 fn sample_from_rendered_transition(
     scenario: &Scenario,
     before: &State,
@@ -2097,6 +2099,8 @@ fn null_sample_from_state(
     })
 }
 
+// Preserve the existing augmentation inputs and independently borrowed RNG/cache.
+#[allow(clippy::too_many_arguments)]
 fn augment_v5_transition(
     mut transition: TransitionSample,
     split: V5DataSplit,

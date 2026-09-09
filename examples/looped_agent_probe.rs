@@ -75,6 +75,9 @@ struct Args {
     /// Reorder known fresh queries within their original training-depth cohorts.
     #[arg(long)]
     known_replay: bool,
+    /// C9 fresh panel; generate only after every learned readout is sealed.
+    #[arg(long)]
+    known_features_heldout: bool,
     /// Absolute JSONL populations whose query hashes the feature panel must exclude.
     #[arg(long)]
     known_features_exclude: Vec<PathBuf>,

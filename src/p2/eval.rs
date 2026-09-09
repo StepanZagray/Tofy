@@ -2507,6 +2507,8 @@ pub fn one_step_changed_exact(
 /// size, held-out operator families) instead of only the legacy
 /// origin-aligned curriculum rows. Selection-only; each population uses an
 /// eval-domain seed distinct from the reserved in-trainer gate seed.
+// Return the existing gate report with its three aligned population sidecars.
+#[allow(clippy::type_complexity)]
 fn foundation_v2_v5_holdout_gates(
     model: &WorldModel,
     cfg: &EvalConfig,
@@ -3311,7 +3313,7 @@ fn eval_identifiability(
         }
         labeled_h.push(encoder.clone());
         labeled_z.push(oracle.clone());
-        labeled_val.push(identifiability_group_hash(sample) % 5 == 0);
+        labeled_val.push(identifiability_group_hash(sample).is_multiple_of(5));
     }
     if labeled_h.is_empty() {
         return None;
@@ -3355,7 +3357,7 @@ fn eval_identifiability(
     for (sample, encoder) in samples.iter().zip(encoders.iter()) {
         // Pair metrics score only validation groups: training-pair alignment
         // must not raise the reported held-out increment cosine.
-        if split_usable && identifiability_group_hash(sample) % 5 != 0 {
+        if split_usable && !identifiability_group_hash(sample).is_multiple_of(5) {
             prev = None;
             continue;
         }
@@ -3704,6 +3706,8 @@ struct BatchEvalPartial {
     ptrm_forward_elapsed: Duration,
 }
 
+// Keep the optional current/next representation rows paired in the local result.
+#[allow(clippy::type_complexity)]
 fn eval_one_batch(
     model: &WorldModel,
     chunk: &[TransitionSample],
@@ -6962,13 +6966,13 @@ fn evaluate_impl(cfg: &EvalConfig, allow_gate_profile: bool) -> Result<EvalRepor
     };
     let (arc3_transfer, arc3_population_fingerprint) = if let Some((samples, _)) = &arc3_recordings
     {
-        let fingerprint = semantic_population_fingerprint(&samples);
+        let fingerprint = semantic_population_fingerprint(samples);
         (
             Some(eval_sample_set(
                 &train_cfg,
                 &cfg.checkpoint,
                 &model,
-                &samples,
+                samples,
                 "arc3_transfer",
                 None,
                 cfg,

@@ -9,6 +9,17 @@ const EPISODE_TAG: u64 = 0x46454154555245;
 const LAYOUTS: usize = 768;
 const FIT_LAYOUTS: usize = 512;
 const WIDTH: usize = 128;
+const FRESH_SEED: u64 = 20260916;
+const FRESH_TAG: u64 = 0x524541444f5554;
+const FRESH_LAYOUTS: usize = 256;
+
+fn panel(heldout: bool) -> (u64, u64, usize, usize) {
+    if heldout {
+        (FRESH_SEED, FRESH_TAG, FRESH_LAYOUTS, 0)
+    } else {
+        (DATA_SEED, EPISODE_TAG, LAYOUTS, FIT_LAYOUTS)
+    }
+}
 const INITIAL: &str = "4cd502f7a76fe3dd9729f6693e9d707c670972f7ebe58ad1cbdde37ea2bb2802";
 const FINAL: &str = "a983626a888279cbb31651c6abcd1ebf4f808c8927a29a8349d03ffc35bd4e5a";
 const AUDIT_FILE: &str = "known-features-input-audit.jsonl";
@@ -29,6 +40,12 @@ fn dedicated(mode: Mode) -> bool {
 
 pub(super) fn validate_args(args: &Args) -> Result<()> {
     ensure!(
+        !args.known_features_heldout
+            || matches!(args.mode, Mode::KnownFeatures | Mode::KnownFeaturesAudit),
+        "--known-features-heldout requires full known-features or known-features-audit mode"
+    );
+    let (data_seed, _, layouts, _) = panel(args.known_features_heldout);
+    ensure!(
         dedicated(args.mode) || args.known_features_exclude.is_empty(),
         "--known-features-exclude is scoped to known-features modes"
     );
@@ -40,9 +57,9 @@ pub(super) fn validate_args(args: &Args) -> Result<()> {
         "known-features requires --known-mapping, factual support, no --known-seen, --known-replay or --search"
     );
     ensure!(
-        args.seed == 0 && args.data_seed == DATA_SEED && args.eval_episodes == LAYOUTS
+        args.seed == 0 && args.data_seed == data_seed && args.eval_episodes == layouts
             && args.loops == 4 && args.batch == 1 && args.effective_batch == 1,
-        "known-features requires --seed 0 --data-seed 20260915 --eval-episodes 768 --loops 4 --batch 1 --effective-batch 1"
+        "known-features requires registered seed/layouts (20260915/768 or heldout 20260916/256), seed 0, loops 4, physical/effective batch 1"
     );
     ensure!(
         args.hidden == WIDTH && args.heads == 4 && args.layers == 2 && args.max_loops == 8,
@@ -57,8 +74,8 @@ pub(super) fn validate_args(args: &Args) -> Result<()> {
         "known-features extraction requires first-forward profiling"
     );
     ensure!(
-        args.mode == Mode::KnownFeaturesSmoke || args.known_features_exclude.len() == 4,
-        "known-features full/audit modes require four --known-features-exclude JSONLs: C5/C7 training and C5/C6 evaluated populations"
+        args.mode == Mode::KnownFeaturesSmoke || args.known_features_exclude.len() == if args.known_features_heldout { 5 } else { 4 },
+        "known-features full/audit modes require four exclusion JSONLs; heldout additionally requires all C8 queries as a fifth exclusion"
     );
     ensure!(
         args.known_features_exclude.iter().all(|p| p.is_absolute()),
@@ -79,7 +96,7 @@ fn row_count(args: &Args) -> usize {
     if args.mode == Mode::KnownFeaturesSmoke {
         1
     } else {
-        LAYOUTS
+        panel(args.known_features_heldout).2
     }
 }
 
@@ -87,17 +104,21 @@ pub(super) fn annotate(args: &Args, document: &mut Value) {
     if !dedicated(args.mode) {
         return;
     }
+    let (data_seed, tag, layouts, fit_layouts) = panel(args.known_features_heldout);
     document["known_features"] = json!({
-        "schema":SCHEMA,"data_seed":DATA_SEED,"episode_id_base":EPISODE_TAG,
-        "layouts":LAYOUTS,"fit_layouts":FIT_LAYOUTS,"eval_layouts":LAYOUTS-FIT_LAYOUTS,
+        "schema":SCHEMA,"data_seed":data_seed,"episode_id_base":tag,
+        "layouts":layouts,"fit_layouts":fit_layouts,"eval_layouts":layouts-fit_layouts,
         "loops":4,"condition":"factual","optimizer_updates":0,
         "implementation_smoke":args.mode==Mode::KnownFeaturesSmoke,
         "smoke_boundary":"first fitting row only; excluded from evidence and probe selection",
         "feature_seam":"exact post-final-RMS CLS and current-patch tensors consumed by ordinary heads"
     });
-    document["known_mapping"]["frozen_data_seed"] = json!(DATA_SEED);
-    document["known_mapping"]["frozen_episode_id_base"] = json!(EPISODE_TAG);
-    document["known_mapping"]["frozen_layouts"] = json!(LAYOUTS);
+    document["known_mapping"]["frozen_data_seed"] = json!(data_seed);
+    document["known_mapping"]["frozen_episode_id_base"] = json!(tag);
+    document["known_mapping"]["frozen_layouts"] = json!(layouts);
+    if args.known_features_heldout {
+        document["known_features_heldout"] = json!(true);
+    }
 }
 
 pub(super) fn check_checkpoint(args: &Args) -> Result<String> {
@@ -127,10 +148,16 @@ fn cells(pixels: &[u32]) -> Result<Vec<u8>> {
         .collect()
 }
 
+#[cfg(test)]
 fn panel_input(index: usize) -> Result<(Value, Sample)> {
-    ensure!(index < LAYOUTS, "feature layout out of range");
-    let episode_id = EPISODE_TAG + index as u64;
-    let episode = task::episode_with_permutation(DATA_SEED, episode_id, 0, 1, 1)?;
+    panel_input_for(false, index)
+}
+
+fn panel_input_for(heldout: bool, index: usize) -> Result<(Value, Sample)> {
+    let (data_seed, tag, layouts, fit_layouts) = panel(heldout);
+    ensure!(index < layouts, "feature layout out of range");
+    let episode_id = tag + index as u64;
+    let episode = task::episode_with_permutation(data_seed, episode_id, 0, 1, 1)?;
     let sample = task::sample(&episode)?;
     let controls = task::inferred_controls(&episode.support)?;
     let (policy, distance) = task::oracle(&episode.support, &episode.maze.render())?;
@@ -179,8 +206,8 @@ fn panel_input(index: usize) -> Result<(Value, Sample)> {
     let observed: Vec<_> = episode.support.iter().map(|step| step.action).collect();
     let row = json!({
         "schema":SCHEMA,"input_index":index,"layout_index":index,
-        "partition":if index<FIT_LAYOUTS {"fit"} else {"eval"},
-        "episode_id":episode_id,"episode_seed":DATA_SEED,"data_seed":DATA_SEED,
+        "partition":if heldout {"fresh_eval"} else if index<fit_layouts {"fit"} else {"eval"},
+        "episode_id":episode_id,"episode_seed":data_seed,"data_seed":data_seed,
         "permutation_id":0,"split":"KnownMapping","condition":"factual","support_cleared":false,
         "min_distance":1,"max_distance":1,"oracle_distance":distance,"evaluation_loops":4,
         "observed_support_action_ids":observed,"inferred_controls":controls,
@@ -235,6 +262,7 @@ fn artifact(args: &Args, name: &str) -> Result<Value> {
 
 pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
     validate_args(args)?;
+    let (data_seed, tag, _, fit_layouts) = panel(args.known_features_heldout);
     let (excluded, exclusions) = excluded_queries(args)?;
     let mut writer = BufWriter::new(File::create_new(args.output_dir.join(AUDIT_FILE))?);
     let mut queries = HashSet::new();
@@ -242,7 +270,7 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
     let mut labels = [[0usize; ACTIONS]; 2];
     for index in 0..row_count(args) {
         deadline(args, started)?;
-        let (row, _) = panel_input(index)?;
+        let (row, _) = panel_input_for(args.known_features_heldout, index)?;
         let query = row["query_sha256"].as_str().context("query digest")?;
         ensure!(
             !excluded.contains(query),
@@ -261,7 +289,7 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
             ),
             "duplicate feature input at row {index}"
         );
-        labels[usize::from(index >= FIT_LAYOUTS)]
+        labels[usize::from(index >= fit_layouts)]
             [row["correct_action"].as_u64().context("label")? as usize] += 1;
         serde_json::to_writer(&mut writer, &row)?;
         writer.write_all(b"\n")?;
@@ -270,7 +298,10 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
     drop(writer);
     if args.mode != Mode::KnownFeaturesSmoke {
         ensure!(
-            labels.iter().flatten().all(|&n| n > 0),
+            labels[usize::from(args.known_features_heldout)..]
+                .iter()
+                .flatten()
+                .all(|&n| n > 0),
             "both feature partitions must contain all four labels"
         );
     }
@@ -278,11 +309,11 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
         json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"status":"complete_pending_analysis",
         "evidence_class":if args.mode==Mode::KnownFeaturesSmoke {"implementation_smoke"} else {"data_audit"},
         "optimizer_updates":0,"model_forwards":0,"layouts":row_count(args),"input_rows":row_count(args),
-        "data_seed":DATA_SEED,"episode_id_base":EPISODE_TAG,"fit_rows":labels[0].iter().sum::<usize>(),
+        "data_seed":data_seed,"episode_id_base":tag,"fit_rows":labels[0].iter().sum::<usize>(),
         "eval_rows":labels[1].iter().sum::<usize>(),"label_counts":{"fit":labels[0],"eval":labels[1]},
         "unique_queries":queries.len(),"unique_inputs":inputs.len(),"exclusions":exclusions,
         "excluded_unique_queries":excluded.len(),"query_overlap":0,
-        "exclusion_scope":"supplied populations; supervising analyzer must bind the four registered source artifacts",
+        "exclusion_scope":if args.known_features_heldout {"supplied populations; supervising analyzer must bind five registered source artifacts including all C8 queries"} else {"supplied populations; supervising analyzer must bind the four registered source artifacts"},
         "hash_layout":{"input":"patches U32 LE then metadata F32 LE","query":"4096 patch-major U32 LE pixels",
             "targets":"4*4096 U32 LE successor pixels then policy4/rewards4/value1 F32 LE","label":"correct_action U32 LE"},
         "artifacts":[artifact(args,AUDIT_FILE)?],"elapsed_seconds":started.elapsed().as_secs_f64()}),
@@ -384,6 +415,7 @@ pub(super) fn extract(
     audit: Value,
     started: Instant,
 ) -> Result<Value> {
+    let (data_seed, tag, _, _) = panel(args.known_features_heldout);
     ensure!(parameters == 992393, "feature parameter count changed");
     let checkpoint = check_checkpoint(args)?;
     vars.save(args.output_dir.join("initial.safetensors"))?;
@@ -406,7 +438,7 @@ pub(super) fn extract(
         std::io::BufReader::new(File::open(args.output_dir.join(AUDIT_FILE))?).lines();
     for index in 0..row_count(args) {
         deadline(args, started)?;
-        let (mut row, sample) = panel_input(index)?;
+        let (mut row, sample) = panel_input_for(args.known_features_heldout, index)?;
         let audited: Value =
             serde_json::from_str(&identities.next().context("missing feature audit row")??)?;
         ensure!(
@@ -461,7 +493,7 @@ pub(super) fn extract(
         "ordinary_heads_per_forward":{"policy":1,"value":1,"reward":1,"successor":ACTIONS},
         "parameters":parameters,"physical_batch":1,"effective_batch":1,"accumulation":1,"loops":args.loops,
         "layouts":row_count(args),"input_rows":row_count(args),"fit_rows":audit["fit_rows"],"eval_rows":audit["eval_rows"],
-        "data_seed":DATA_SEED,"episode_id_base":EPISODE_TAG,"feature_width":WIDTH,
+        "data_seed":data_seed,"episode_id_base":tag,"feature_width":WIDTH,
         "checkpoint_sha256":checkpoint,"initial_checkpoint_sha256":checkpoint,"final_checkpoint_sha256":checkpoint,
         "feature_layout":"separate input-major F32 little-endian CLS[N,128], current[N,64,128], policy[N,4]; current patches row-major",
         "first_forward_profile":"evaluation-000001","audit":audit,"artifacts":artifacts,
@@ -677,6 +709,11 @@ mod tests {
             assert_eq!(report["optimizer_updates"], 0);
             assert_eq!(report["input_rows"], 768);
             assert_eq!(report["excluded_unique_queries"], 1);
+            assert_eq!(
+                report["artifacts"][0]["sha256"],
+                "09559eb4dd1b933de724da81aef3bb80547e010a00e38e39de31c9f72fab1c6d",
+                "C8 identity JSONL must remain byte-identical"
+            );
             assert_eq!(fs::read_dir(&args.output_dir)?.count(), 1);
             assert!(
                 audit(&args, Instant::now()).is_err(),
@@ -694,5 +731,31 @@ mod tests {
         })();
         fs::remove_dir_all(&root)?;
         result
+    }
+
+    #[test]
+    fn heldout_configuration_is_scoped_without_generating_the_future_panel() -> Result<()> {
+        let mut fresh = args("known-features-audit");
+        fresh.known_features_heldout = true;
+        assert!(validate_args(&fresh).is_err());
+        fresh.data_seed = FRESH_SEED;
+        fresh.eval_episodes = FRESH_LAYOUTS;
+        assert!(validate_args(&fresh).is_err());
+        fresh
+            .known_features_exclude
+            .push(PathBuf::from("/all-c8-queries.jsonl"));
+        validate_args(&fresh)?;
+        assert_eq!(row_count(&fresh), 256);
+        assert_eq!(panel(true), (20260916, 0x524541444f5554, 256, 0));
+        let mut metadata = json!({});
+        annotate(&fresh, &mut metadata);
+        assert_eq!(metadata["known_features"]["fit_layouts"], 0);
+        assert_eq!(metadata["known_features"]["eval_layouts"], 256);
+        assert_eq!(metadata["known_features_heldout"], true);
+        fresh.mode = Mode::KnownFeaturesSmoke;
+        fresh.checkpoint = Some(PathBuf::from("unused"));
+        assert!(validate_args(&fresh).is_err());
+        // Preregistration forbids calling the future generator until all six heads seal.
+        Ok(())
     }
 }
