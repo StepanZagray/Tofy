@@ -145,14 +145,48 @@ pub fn verified_manifest(root: &Path, expected: &str, object_entries: bool) -> R
 }
 
 pub fn load(root: &Path, expected: &str, core: Core, kind: Kind, fresh: bool) -> Result<Cache> {
+    load_population(root, expected, core, kind, fresh, None)
+}
+
+pub fn load_confirmation(
+    root: &Path,
+    expected: &str,
+    core: Core,
+    kind: Kind,
+    panel: u8,
+) -> Result<Cache> {
+    ensure!(panel < 3, "confirmation panel must be 0, 1 or 2");
+    load_population(root, expected, core, kind, true, Some(panel))
+}
+
+fn load_population(
+    root: &Path,
+    expected: &str,
+    core: Core,
+    kind: Kind,
+    fresh: bool,
+    panel: Option<u8>,
+) -> Result<Cache> {
     let manifest = verified_manifest(root, expected, true)?;
-    let (count, partition, seed, tag) = if fresh {
+    let (count, partition, seed, tag) = if let Some(index) = panel {
+        (
+            FRESH_ROWS,
+            "confirmation_eval",
+            20260917 + u64::from(index),
+            0x43554441434f4e46 + u64::from(index) * 0x10000,
+        )
+    } else if fresh {
         (FRESH_ROWS, "fresh_eval", 20260916u64, 0x524541444f5554u64)
     } else {
         (FIT_ROWS, "fit", 20260915, 0x46454154555245)
     };
     ensure!(
-        manifest["schema"] == "looped-learned-readout-cache-v1"
+        manifest["schema"]
+            == if panel.is_some() {
+                "looped-imported-readout-cache-v1"
+            } else {
+                "looped-learned-readout-cache-v1"
+            }
             && manifest["partition"] == partition
             && manifest["rows"] == count
             && manifest["core_checkpoint_sha256"] == core.checkpoint(),
@@ -167,6 +201,12 @@ pub fn load(root: &Path, expected: &str, core: Core, kind: Kind, fresh: bool) ->
         "cache must contain only materialized features and projected identities"
     );
     let source = &manifest["source"];
+    if let Some(index) = panel {
+        ensure!(
+            source["confirmation_panel"] == index,
+            "cache confirmation panel mismatch"
+        );
+    }
     ensure!(
         source["data_seed"] == seed
             && source["episode_id_base"] == tag
@@ -311,6 +351,79 @@ pub fn permutation(path: &Path, expected: &str) -> Result<Vec<usize>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn synthetic_confirmation_cache_enforces_panel_identity_and_legacy_separation() -> Result<()> {
+        // Synthetic identities/features only: never call the new episode generator.
+        for index in 0..3u8 {
+            let dir = super::super::tests::TestDir::new("confirmation-cache")?;
+            let root = &dir.0;
+            let tag = 0x43554441434f4e46 + u64::from(index) * 0x10000;
+            let rows = (0..FRESH_ROWS)
+                .map(|i| Row {
+                    input_index: i,
+                    episode_id: tag + i as u64,
+                    partition: "confirmation_eval".into(),
+                    input_sha256: digest(&i.to_le_bytes()),
+                    query_sha256: digest(&[i.to_le_bytes().as_slice(), b"q"].concat()),
+                    label_sha256: digest(&((i % 4) as u32).to_le_bytes()),
+                    correct_action: (i % 4) as u32,
+                })
+                .map(|row| Ok(serde_json::to_string(&row)? + "\n"))
+                .collect::<Result<String>>()?;
+            fs::write(root.join("rows.jsonl"), rows)?;
+            let mut arrays = serde_json::Map::new();
+            for (name, width) in [("cls", WIDTH), ("current", 64 * WIDTH)] {
+                fs::write(
+                    root.join(format!("{name}.f32")),
+                    vec![0u8; FRESH_ROWS * width * 4],
+                )?;
+                arrays.insert(name.into(),json!({"file":format!("known-features-{name}.f32"),"sha256":"3".repeat(64),"byte_offset":0,"byte_length":FRESH_ROWS*width*4}));
+            }
+            let mut files = serde_json::Map::new();
+            for name in ["cls.f32", "current.f32", "rows.jsonl"] {
+                files.insert(name.into(),json!({"sha256":file_hash(&root.join(name))?,"bytes":root.join(name).metadata()?.len()}));
+            }
+            let manifest = json!({"schema":"looped-imported-readout-cache-v1","partition":"confirmation_eval","rows":FRESH_ROWS,
+                "core_checkpoint_sha256":Core::Initial.checkpoint(),"files":files,"source_arrays":arrays,
+                "source":{"root":"/synthetic-source-not-opened","manifest_sha256":"4".repeat(64),"source_revision":"5".repeat(40),"binary_sha256":"6".repeat(64),
+                    "data_seed":20260917+u64::from(index),"episode_id_base":tag,"confirmation_panel":index,"feature_schema":"looped-known-features-v1"}});
+            let seal = |value: &Value| -> Result<String> {
+                fs::write(root.join("manifest.json"), serde_json::to_vec(value)?)?;
+                file_hash(&root.join("manifest.json"))
+            };
+            let hash = seal(&manifest)?;
+            assert_eq!(
+                load_confirmation(root, &hash, Core::Initial, Kind::Spatial, index)?
+                    .rows
+                    .len(),
+                256
+            );
+            assert!(
+                load_confirmation(root, &hash, Core::Initial, Kind::Spatial, (index + 1) % 3)
+                    .is_err()
+            );
+            assert!(load_confirmation(root, &hash, Core::Final, Kind::Cls, index).is_err());
+            assert!(load(root, &hash, Core::Initial, Kind::Cls, true).is_err());
+            assert!(load(root, &hash, Core::Initial, Kind::Cls, false).is_err());
+            for (pointer, value) in [
+                ("/source/confirmation_panel", json!(3)),
+                ("/source/data_seed", json!(20260916)),
+                ("/source/episode_id_base", json!(tag + 1)),
+                ("/partition", json!("fit")),
+                ("/source_arrays/current/byte_offset", json!(4)),
+                ("/rows", json!(512)),
+            ] {
+                let mut bad = manifest.clone();
+                *bad.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    load_confirmation(root, &seal(&bad)?, Core::Initial, Kind::Cls, index).is_err(),
+                    "accepted {pointer}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn synthetic_fit_cache_rejects_checkpoint_partition_offsets_nonfinite_and_tampering(

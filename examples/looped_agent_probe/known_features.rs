@@ -12,6 +12,39 @@ const WIDTH: usize = 128;
 const FRESH_SEED: u64 = 20260916;
 const FRESH_TAG: u64 = 0x524541444f5554;
 const FRESH_LAYOUTS: usize = 256;
+const CONFIRMATION_EXCLUSIONS: [&str; 6] = [
+    "b7f33c8d3968f55bd1298aeda53f91849d40275b42a3aaf53facadf995e7b938",
+    "0613fecd567a0887a94a7698e5a5b7c7d9776f6b8f6ee249f56f5da6a8ce77d5",
+    "68a010fc546f727782bf7de178ec8850d48253306aca185a1d337609c53bc697",
+    "6379faa5b6b9df51876852bbf0c7dbbda60bb4a8d72ef20a9fecb96d7c1e2f00",
+    "09559eb4dd1b933de724da81aef3bb80547e010a00e38e39de31c9f72fab1c6d",
+    "361092818769307bcd82f1f30e10808e73857be7a96844f1293f2021d0410d87",
+];
+
+fn confirmation(index: u8) -> Result<(u64, u64, usize, usize)> {
+    ensure!(index < 3, "confirmation panel must be 0, 1 or 2");
+    Ok((
+        20260917 + u64::from(index),
+        0x43554441434f4e46 + u64::from(index) * 0x10000,
+        256,
+        0,
+    ))
+}
+
+fn selected_panel(args: &Args) -> (u64, u64, usize, usize) {
+    args.known_features_confirmation_panel
+        .map(|i| confirmation(i).expect("validated panel"))
+        .unwrap_or_else(|| panel(args.known_features_heldout))
+}
+
+fn cuda_gemm_reduced_precision(args: &Args) -> Option<bool> {
+    #[cfg(feature = "cudnn")]
+    if extracts(args.mode) && args.device.starts_with("cuda") {
+        return Some(candle_core::cuda_backend::gemm_reduced_precision_f32());
+    }
+    let _ = args;
+    None
+}
 
 fn panel(heldout: bool) -> (u64, u64, usize, usize) {
     if heldout {
@@ -39,12 +72,20 @@ fn dedicated(mode: Mode) -> bool {
 }
 
 pub(super) fn validate_args(args: &Args) -> Result<()> {
+    if let Some(index) = args.known_features_confirmation_panel {
+        confirmation(index)?;
+        ensure!(
+            !args.known_features_heldout
+                && matches!(args.mode, Mode::KnownFeatures | Mode::KnownFeaturesAudit),
+            "confirmation panel requires known-features/audit and forbids legacy heldout or smoke"
+        );
+    }
     ensure!(
         !args.known_features_heldout
             || matches!(args.mode, Mode::KnownFeatures | Mode::KnownFeaturesAudit),
         "--known-features-heldout requires full known-features or known-features-audit mode"
     );
-    let (data_seed, _, layouts, _) = panel(args.known_features_heldout);
+    let (data_seed, _, layouts, _) = selected_panel(args);
     ensure!(
         dedicated(args.mode) || args.known_features_exclude.is_empty(),
         "--known-features-exclude is scoped to known-features modes"
@@ -74,7 +115,7 @@ pub(super) fn validate_args(args: &Args) -> Result<()> {
         "known-features extraction requires first-forward profiling"
     );
     ensure!(
-        args.mode == Mode::KnownFeaturesSmoke || args.known_features_exclude.len() == if args.known_features_heldout { 5 } else { 4 },
+        args.mode == Mode::KnownFeaturesSmoke || args.known_features_exclude.len() == if args.known_features_confirmation_panel.is_some() { 6 } else if args.known_features_heldout { 5 } else { 4 },
         "known-features full/audit modes require four exclusion JSONLs; heldout additionally requires all C8 queries as a fifth exclusion"
     );
     ensure!(
@@ -96,7 +137,7 @@ fn row_count(args: &Args) -> usize {
     if args.mode == Mode::KnownFeaturesSmoke {
         1
     } else {
-        panel(args.known_features_heldout).2
+        selected_panel(args).2
     }
 }
 
@@ -104,7 +145,7 @@ pub(super) fn annotate(args: &Args, document: &mut Value) {
     if !dedicated(args.mode) {
         return;
     }
-    let (data_seed, tag, layouts, fit_layouts) = panel(args.known_features_heldout);
+    let (data_seed, tag, layouts, fit_layouts) = selected_panel(args);
     document["known_features"] = json!({
         "schema":SCHEMA,"data_seed":data_seed,"episode_id_base":tag,
         "layouts":layouts,"fit_layouts":fit_layouts,"eval_layouts":layouts-fit_layouts,
@@ -118,6 +159,14 @@ pub(super) fn annotate(args: &Args, document: &mut Value) {
     document["known_mapping"]["frozen_layouts"] = json!(layouts);
     if args.known_features_heldout {
         document["known_features_heldout"] = json!(true);
+    }
+    if let Some(index) = args.known_features_confirmation_panel {
+        document["known_features"]["confirmation_panel"] = json!(index);
+        document["known_features"]["partition"] = json!("confirmation_eval");
+        document["known_features"]["cuda_gemm_reduced_precision_f32"] =
+            json!(cuda_gemm_reduced_precision(args));
+        document["known_features"]["nvidia_tf32_override"] =
+            json!(std::env::var("NVIDIA_TF32_OVERRIDE").ok());
     }
 }
 
@@ -155,6 +204,24 @@ fn panel_input(index: usize) -> Result<(Value, Sample)> {
 
 fn panel_input_for(heldout: bool, index: usize) -> Result<(Value, Sample)> {
     let (data_seed, tag, layouts, fit_layouts) = panel(heldout);
+    population_input((data_seed, tag, layouts, fit_layouts), heldout, None, index)
+}
+
+fn selected_input(args: &Args, index: usize) -> Result<(Value, Sample)> {
+    if let Some(panel) = args.known_features_confirmation_panel {
+        population_input(confirmation(panel)?, false, Some(panel), index)
+    } else {
+        panel_input_for(args.known_features_heldout, index)
+    }
+}
+
+fn population_input(
+    population: (u64, u64, usize, usize),
+    heldout: bool,
+    confirmation_panel: Option<u8>,
+    index: usize,
+) -> Result<(Value, Sample)> {
+    let (data_seed, tag, layouts, fit_layouts) = population;
     ensure!(index < layouts, "feature layout out of range");
     let episode_id = tag + index as u64;
     let episode = task::episode_with_permutation(data_seed, episode_id, 0, 1, 1)?;
@@ -204,7 +271,7 @@ fn panel_input_for(heldout: bool, index: usize) -> Result<(Value, Sample)> {
     ensure!(target_cells.len() == ACTIONS, "wrong successor population");
     let label_sha256 = format!("{:x}", Sha256::digest((label as u32).to_le_bytes()));
     let observed: Vec<_> = episode.support.iter().map(|step| step.action).collect();
-    let row = json!({
+    let mut row = json!({
         "schema":SCHEMA,"input_index":index,"layout_index":index,
         "partition":if heldout {"fresh_eval"} else if index<fit_layouts {"fit"} else {"eval"},
         "episode_id":episode_id,"episode_seed":data_seed,"data_seed":data_seed,
@@ -216,12 +283,40 @@ fn panel_input_for(heldout: bool, index: usize) -> Result<(Value, Sample)> {
         "label_sha256":label_sha256,"correct_action":label,"visible_cells":visible,"target_cells":target_cells,
         "target_policy":sample.policy,"target_rewards":sample.rewards,"target_value":sample.value
     });
+    if let Some(panel) = confirmation_panel {
+        row["confirmation_panel"] = json!(panel);
+        row["partition"] = json!("confirmation_eval");
+    }
     Ok((row, sample))
 }
 
-fn excluded_queries(args: &Args) -> Result<(HashSet<String>, Vec<Value>)> {
+struct Exclusions {
+    queries: HashSet<String>,
+    artifacts: Vec<Value>,
+    inputs: HashSet<String>,
+    episodes: HashSet<u64>,
+}
+
+fn historical_episode(row: &Value) -> Result<u64> {
+    let episode = row.get("episode_id");
+    let legacy = row.get("id");
+    if let (Some(episode), Some(legacy)) = (episode, legacy) {
+        ensure!(
+            episode == legacy,
+            "conflicting historical episode_id/id fields"
+        );
+    }
+    episode
+        .or(legacy)
+        .and_then(Value::as_u64)
+        .context("historical episode_id/id missing or invalid")
+}
+
+fn excluded_queries(args: &Args) -> Result<Exclusions> {
     let mut queries = HashSet::new();
     let mut artifacts = Vec::new();
+    let mut inputs = HashSet::new();
+    let mut episodes = HashSet::new();
     for path in &args.known_features_exclude {
         ensure!(
             path.is_file(),
@@ -243,6 +338,20 @@ fn excluded_queries(args: &Args) -> Result<(HashSet<String>, Vec<Value>)> {
                 "invalid exclusion query digest"
             );
             queries.insert(query.to_owned());
+            if args.known_features_confirmation_panel.is_some() {
+                let input = row["input_sha256"]
+                    .as_str()
+                    .context("historical input hash missing")?;
+                ensure!(
+                    input.len() == 64
+                        && input
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                    "invalid historical input hash"
+                );
+                inputs.insert(input.to_owned());
+                episodes.insert(historical_episode(&row)?);
+            }
             rows += 1;
         }
         ensure!(
@@ -252,7 +361,35 @@ fn excluded_queries(args: &Args) -> Result<(HashSet<String>, Vec<Value>)> {
         artifacts
             .push(json!({"path":path,"sha256":digest,"rows":rows,"bytes":path.metadata()?.len()}));
     }
-    Ok((queries, artifacts))
+    if args.known_features_confirmation_panel.is_some() {
+        ensure!(
+            queries.len() == 5688
+                && artifacts
+                    .iter()
+                    .map(|a| a["sha256"].as_str().expect("hash"))
+                    .collect::<HashSet<_>>()
+                    == CONFIRMATION_EXCLUSIONS.into_iter().collect(),
+            "confirmation historical population/seal mismatch"
+        );
+    }
+    Ok(Exclusions {
+        queries,
+        artifacts,
+        inputs,
+        episodes,
+    })
+}
+
+fn confirmation_report(args: &Args, mut report: Value) -> Value {
+    if let Some(panel) = args.known_features_confirmation_panel {
+        report["confirmation_panel"] = json!(panel);
+        report["partition"] = json!("confirmation_eval");
+        report["historical_input_overlap"] = json!(0);
+        report["historical_episode_overlap"] = json!(0);
+        report["exclusion_scope"] = json!("six hash-pinned historical populations; supervisor must validate cross-panel query/input/episode disjointness and freeze all three audits before extraction");
+        report["claim_boundary"] = json!("frozen C11 synthetic confirmation features; factual support changes with seed; no training, architecture or ARC promotion");
+    }
+    report
 }
 
 fn artifact(args: &Args, name: &str) -> Result<Value> {
@@ -262,20 +399,33 @@ fn artifact(args: &Args, name: &str) -> Result<Value> {
 
 pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
     validate_args(args)?;
-    let (data_seed, tag, _, fit_layouts) = panel(args.known_features_heldout);
-    let (excluded, exclusions) = excluded_queries(args)?;
+    let (data_seed, tag, _, fit_layouts) = selected_panel(args);
+    let Exclusions {
+        queries: excluded,
+        artifacts: exclusions,
+        inputs: excluded_inputs,
+        episodes: excluded_episodes,
+    } = excluded_queries(args)?;
     let mut writer = BufWriter::new(File::create_new(args.output_dir.join(AUDIT_FILE))?);
     let mut queries = HashSet::new();
     let mut inputs = HashSet::new();
     let mut labels = [[0usize; ACTIONS]; 2];
     for index in 0..row_count(args) {
         deadline(args, started)?;
-        let (row, _) = panel_input_for(args.known_features_heldout, index)?;
+        let (row, _) = selected_input(args, index)?;
         let query = row["query_sha256"].as_str().context("query digest")?;
         ensure!(
             !excluded.contains(query),
             "registered feature query overlaps excluded population at row {index}"
         );
+        if args.known_features_confirmation_panel.is_some() {
+            ensure!(
+                !excluded_inputs.contains(row["input_sha256"].as_str().context("input hash")?)
+                    && !excluded_episodes
+                        .contains(&row["episode_id"].as_u64().context("episode ID")?),
+                "confirmation input/episode overlaps historical population"
+            );
+        }
         ensure!(
             queries.insert(query.to_owned()),
             "duplicate feature query at row {index}"
@@ -298,14 +448,17 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
     drop(writer);
     if args.mode != Mode::KnownFeaturesSmoke {
         ensure!(
-            labels[usize::from(args.known_features_heldout)..]
+            labels[usize::from(
+                args.known_features_heldout || args.known_features_confirmation_panel.is_some()
+            )..]
                 .iter()
                 .flatten()
                 .all(|&n| n > 0),
             "both feature partitions must contain all four labels"
         );
     }
-    Ok(
+    Ok(confirmation_report(
+        args,
         json!({"schema":SCHEMA,"task_schema":task::SCHEMA,"status":"complete_pending_analysis",
         "evidence_class":if args.mode==Mode::KnownFeaturesSmoke {"implementation_smoke"} else {"data_audit"},
         "optimizer_updates":0,"model_forwards":0,"layouts":row_count(args),"input_rows":row_count(args),
@@ -317,7 +470,7 @@ pub(super) fn audit(args: &Args, started: Instant) -> Result<Value> {
         "hash_layout":{"input":"patches U32 LE then metadata F32 LE","query":"4096 patch-major U32 LE pixels",
             "targets":"4*4096 U32 LE successor pixels then policy4/rewards4/value1 F32 LE","label":"correct_action U32 LE"},
         "artifacts":[artifact(args,AUDIT_FILE)?],"elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+    ))
 }
 
 fn feature_forward(
@@ -415,7 +568,13 @@ pub(super) fn extract(
     audit: Value,
     started: Instant,
 ) -> Result<Value> {
-    let (data_seed, tag, _, _) = panel(args.known_features_heldout);
+    let (data_seed, tag, _, _) = selected_panel(args);
+    if args.known_features_confirmation_panel.is_some() {
+        ensure!(
+            cuda_gemm_reduced_precision(args) != Some(true),
+            "C11 requires strict F32 GEMM"
+        );
+    }
     ensure!(parameters == 992393, "feature parameter count changed");
     let checkpoint = check_checkpoint(args)?;
     vars.save(args.output_dir.join("initial.safetensors"))?;
@@ -438,7 +597,7 @@ pub(super) fn extract(
         std::io::BufReader::new(File::open(args.output_dir.join(AUDIT_FILE))?).lines();
     for index in 0..row_count(args) {
         deadline(args, started)?;
-        let (mut row, sample) = panel_input_for(args.known_features_heldout, index)?;
+        let (mut row, sample) = selected_input(args, index)?;
         let audited: Value =
             serde_json::from_str(&identities.next().context("missing feature audit row")??)?;
         ensure!(
@@ -487,7 +646,9 @@ pub(super) fn extract(
     for (_, file, _) in ARRAYS {
         artifacts.push(artifact(args, file)?);
     }
-    Ok(json!({"schema":SCHEMA,"status":"complete_pending_analysis",
+    Ok(confirmation_report(
+        args,
+        json!({"schema":SCHEMA,"status":"complete_pending_analysis",
         "evidence_class":if args.mode==Mode::KnownFeaturesSmoke {"implementation_smoke"} else {"frozen_feature_diagnostic"},
         "included_in_evidence":args.mode!=Mode::KnownFeaturesSmoke,"optimizer_updates":0,"model_forwards":row_count(args),
         "ordinary_heads_per_forward":{"policy":1,"value":1,"reward":1,"successor":ACTIONS},
@@ -498,12 +659,101 @@ pub(super) fn extract(
         "feature_layout":"separate input-major F32 little-endian CLS[N,128], current[N,64,128], policy[N,4]; current patches row-major",
         "first_forward_profile":"evaluation-000001","audit":audit,"artifacts":artifacts,
         "elapsed_seconds":started.elapsed().as_secs_f64(),
-        "claim_boundary":"frozen synthetic features for preregistered CPU probes; no model training, ARC claim or promotion"}))
+        "claim_boundary":"frozen synthetic features for preregistered CPU probes; no model training, ARC claim or promotion"}),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_training_ids_are_accepted_without_silent_conflicts() -> Result<()> {
+        assert_eq!(
+            historical_episode(&json!({"id":17,"query_sha256":"synthetic"}))?,
+            17
+        );
+        assert_eq!(historical_episode(&json!({"episode_id":18}))?, 18);
+        assert_eq!(historical_episode(&json!({"episode_id":19,"id":19}))?, 19);
+        for row in [
+            json!({}),
+            json!({"id":-1}),
+            json!({"id":0.5}),
+            json!({"id":"1"}),
+            json!({"episode_id":1,"id":2}),
+            json!({"episode_id":null,"id":1}),
+        ] {
+            assert!(historical_episode(&row).is_err());
+        }
+        let mut a = args("known-features-audit");
+        assert_eq!(cuda_gemm_reduced_precision(&a), None);
+        a.mode = Mode::KnownFeatures;
+        a.device = "cpu".into();
+        assert_eq!(cuda_gemm_reduced_precision(&a), None);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmation_flags_are_closed_and_do_not_generate_future_inputs() -> Result<()> {
+        for index in 0..3 {
+            let mut a = args("known-features-audit");
+            a.known_features_confirmation_panel = Some(index);
+            assert!(validate_args(&a).is_err());
+            a.data_seed = 20260917 + u64::from(index);
+            a.eval_episodes = 256;
+            a.known_features_exclude = (0..6)
+                .map(|i| PathBuf::from(format!("/excluded-{i}.jsonl")))
+                .collect();
+            validate_args(&a)?;
+            assert_eq!(
+                selected_panel(&a),
+                (
+                    a.data_seed,
+                    0x43554441434f4e46 + u64::from(index) * 0x10000,
+                    256,
+                    0
+                )
+            );
+            assert_eq!(row_count(&a), 256);
+            let mut metadata = json!({});
+            annotate(&a, &mut metadata);
+            assert_eq!(metadata["known_features"]["confirmation_panel"], index);
+            assert_eq!(metadata["known_features"]["partition"], "confirmation_eval");
+            a.known_features_heldout = true;
+            assert!(validate_args(&a).is_err());
+            a.known_features_heldout = false;
+            a.known_features_confirmation_panel = Some(3);
+            assert!(validate_args(&a).is_err());
+            a.known_features_confirmation_panel = Some(index);
+            for mode in [
+                Mode::Evaluate,
+                Mode::Fit,
+                Mode::KnownFeaturesSmoke,
+                Mode::CoverageAudit,
+            ] {
+                a.mode = mode;
+                assert!(validate_args(&a).is_err());
+            }
+        }
+        assert!(confirmation(3).is_err());
+        // Exercise identity/target plumbing only on an already accessed C8 row.
+        let (original, sample) = panel_input(0)?;
+        let (tagged, tagged_sample) = population_input(panel(false), false, Some(0), 0)?;
+        for key in [
+            "input_sha256",
+            "query_sha256",
+            "targets_sha256",
+            "label_sha256",
+            "visible_cells",
+            "target_cells",
+        ] {
+            assert_eq!(original[key], tagged[key]);
+        }
+        assert_eq!(sample.next, tagged_sample.next);
+        assert_eq!(tagged["partition"], "confirmation_eval");
+        assert_eq!(tagged["confirmation_panel"], 0);
+        Ok(())
+    }
 
     fn args(mode: &str) -> Args {
         let mut args = Args::parse_from([

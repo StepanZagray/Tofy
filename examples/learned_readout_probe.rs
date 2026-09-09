@@ -3,6 +3,8 @@
 mod cache;
 #[path = "learned_readout_probe/head.rs"]
 mod head;
+#[path = "learned_readout_probe/import.rs"]
+mod import;
 
 use anyhow::{ensure, Context, Result};
 use cache::{Cache, Core, Row, FIT_ROWS};
@@ -29,6 +31,7 @@ enum Mode {
     Fit,
     Smoke,
     Evaluate,
+    EvaluateImported,
 }
 #[derive(Debug, Parser)]
 struct Args {
@@ -58,16 +61,28 @@ struct Args {
     head_dir: Option<PathBuf>,
     #[arg(long)]
     head_manifest_sha256: Option<String>,
+    /// C11 canonical fixed parameters and their actual producer recipe.
+    #[arg(long)]
+    import_dir: Option<PathBuf>,
+    #[arg(long)]
+    import_manifest_sha256: Option<String>,
+    /// Qualification reads only the already accessed C8 fitting cache.
+    #[arg(long)]
+    import_qualification: bool,
+    #[arg(long)]
+    confirmation_panel: Option<u8>,
     #[arg(long, default_value_t = 100)]
     max_seconds: u64,
 }
 
 impl Args {
+    fn evaluates(&self) -> bool {
+        matches!(self.mode, Mode::Evaluate | Mode::EvaluateImported)
+    }
     fn validate(&self) -> Result<()> {
         ensure!(self.seed == 0, "C9 fixes initialization seed zero");
         ensure!(
-            self.max_seconds > 0
-                && self.max_seconds <= if self.mode == Mode::Evaluate { 60 } else { 100 },
+            self.max_seconds > 0 && self.max_seconds <= if self.evaluates() { 60 } else { 100 },
             "registered per-invocation time limit exceeded"
         );
         ensure!(
@@ -79,6 +94,28 @@ impl Args {
             "cache/output paths must be absolute"
         );
         cache::hash_text(&self.cache_manifest_sha256)?;
+        if self.mode == Mode::EvaluateImported {
+            ensure!(self.import_dir.as_ref().is_some_and(|p| p.is_absolute())
+                && self.import_manifest_sha256.is_some()
+                && (self.import_qualification != self.confirmation_panel.is_some())
+                && self.confirmation_panel.is_none_or(|i| i < 3)
+                && self.head_dir.is_none() && self.head_manifest_sha256.is_none()
+                && self.label_permutation.is_none() && self.label_permutation_sha256.is_none()
+                && !self.permuted_labels, "imported evaluation requires a sealed import and exactly qualification or one closed confirmation panel; fitting/legacy head flags are forbidden");
+            cache::hash_text(
+                self.import_manifest_sha256
+                    .as_deref()
+                    .context("import hash")?,
+            )?;
+            return Ok(());
+        }
+        ensure!(
+            self.import_dir.is_none()
+                && self.import_manifest_sha256.is_none()
+                && !self.import_qualification
+                && self.confirmation_panel.is_none(),
+            "import/panel flags require evaluate-imported mode"
+        );
         if self.mode == Mode::Evaluate {
             ensure!(
                 self.head_dir.is_some()
@@ -102,7 +139,7 @@ impl Args {
         match self.mode {
             Mode::Fit => UPDATES,
             Mode::Smoke => 2,
-            Mode::Evaluate => 0,
+            Mode::Evaluate | Mode::EvaluateImported => 0,
         }
     }
     fn deadline(&self, started: Instant) -> Result<()> {
@@ -309,7 +346,7 @@ fn final_forward(
     labels: &Tensor,
     device: &Device,
 ) -> Result<Output> {
-    if args.mode != Mode::Evaluate {
+    if !args.evaluates() {
         return head.forward(features);
     }
     let capture = LoopedCapture::begin_readout(
@@ -342,6 +379,16 @@ fn final_forward(
 }
 
 fn predictions(root: &Path, rows: &[Row], fitted_labels: &[u32], output: &Output) -> Result<Value> {
+    write_predictions(root, rows, fitted_labels, output, false)
+}
+
+fn write_predictions(
+    root: &Path,
+    rows: &[Row],
+    fitted_labels: &[u32],
+    output: &Output,
+    imported: bool,
+) -> Result<Value> {
     let logits = finite(&output.logits)?;
     ensure!(
         logits.len() == rows.len() * 4 && fitted_labels.len() == rows.len(),
@@ -350,6 +397,39 @@ fn predictions(root: &Path, rows: &[Row], fitted_labels: &[u32], output: &Output
     finite(&output.pooled)?;
     if let Some(a) = &output.attention {
         finite(a)?;
+    }
+    let pooled_width = if output.attention.is_some() { 256 } else { 10 };
+    if imported {
+        ensure!(
+            output.pooled.dims() == [rows.len(), pooled_width],
+            "wrong imported pooled shape"
+        );
+        let mut arrays = vec![("pooled.f32", &output.pooled)];
+        if let Some(attention) = &output.attention {
+            ensure!(
+                attention.dims() == [rows.len(), 2, 64],
+                "wrong imported attention shape"
+            );
+            for weights in finite(attention)?.chunks_exact(64) {
+                ensure!(
+                    weights.iter().all(|&x| (0.0..=1.0).contains(&x))
+                        && (weights.iter().map(|&x| x as f64).sum::<f64>() - 1.0).abs() <= 1e-5,
+                    "invalid imported attention normalization"
+                );
+            }
+            arrays.push(("attention.f32", attention));
+        }
+        for (name, tensor) in arrays {
+            let mut file = BufWriter::new(File::create_new(root.join(name))?);
+            for value in finite(tensor)? {
+                file.write_all(&value.to_le_bytes())?;
+            }
+            file.flush()?;
+            ensure!(
+                root.join(name).metadata()?.len() == (tensor.elem_count() * 4) as u64,
+                "wrong imported raw array byte count"
+            );
+        }
     }
     let mut raw = BufWriter::new(File::create_new(root.join("logits.f32"))?);
     let mut labels = BufWriter::new(File::create_new(root.join("labels.u32"))?);
@@ -378,13 +458,19 @@ fn predictions(root: &Path, rows: &[Row], fitted_labels: &[u32], output: &Output
         labels.write_all(&row.correct_action.to_le_bytes())?;
         labels.write_all(&fitted_labels[i].to_le_bytes())?;
         ids.write_all(&row.episode_id.to_le_bytes())?;
-        serde_json::to_writer(
-            &mut records,
-            &json!({"identity":row,"true_action":row.correct_action,"fitted_action":fitted_labels[i],"prediction":action,
+        let mut record = json!({"identity":row,"true_action":row.correct_action,"fitted_action":fitted_labels[i],"prediction":action,
             "logits":{"file":"logits.f32","dtype":"F32LE","byte_offset":i*16,"byte_length":16,"shape":[4]},
             "labels":{"file":"labels.u32","dtype":"U32LE","byte_offset":i*8,"byte_length":8,"order":["true","fitted"]},
-            "episode_id":{"file":"episode-ids.u64","dtype":"U64LE","byte_offset":i*8,"byte_length":8}}),
-        )?;
+            "episode_id":{"file":"episode-ids.u64","dtype":"U64LE","byte_offset":i*8,"byte_length":8}});
+        if imported {
+            record["pooled"] = json!({"file":"pooled.f32","dtype":"F32LE","shape":[pooled_width],"byte_offset":i*pooled_width*4,"byte_length":pooled_width*4});
+            record["attention"] = if output.attention.is_some() {
+                json!({"file":"attention.f32","dtype":"F32LE","shape":[2,64],"byte_offset":i*512,"byte_length":512})
+            } else {
+                Value::Null
+            };
+        }
+        serde_json::to_writer(&mut records, &record)?;
         records.write_all(b"\n")?;
     }
     raw.flush()?;
@@ -403,15 +489,77 @@ fn predictions(root: &Path, rows: &[Row], fitted_labels: &[u32], output: &Output
     )
 }
 
+fn annotate_import(args: &Args, source: &Value, document: &mut Value) {
+    document["schema"] = json!(import::SCHEMA);
+    document["import_source"] = source.clone();
+    document["arm"] = source["manifest"]["arm"].clone();
+    document["optimizer"] = Value::Null;
+    document["optimizer_updates"] = json!(0);
+    document["cuda_gemm_reduced_precision_f32"] =
+        json!(import::gemm_reduced_precision(&args.device));
+    document["nvidia_tf32_override"] = json!(std::env::var("NVIDIA_TF32_OVERRIDE").ok());
+    document["import_qualification"] = json!(args.import_qualification);
+    document["confirmation_panel"] = json!(args.confirmation_panel);
+    document["evidence_class"] = json!(if args.import_qualification {
+        "implementation_smoke"
+    } else {
+        "frozen_imported_readout_confirmation"
+    });
+    document["partition"] = json!(if args.import_qualification {
+        "fit"
+    } else {
+        "confirmation_eval"
+    });
+    document["objective"] = json!("frozen policy inference; labels enter scoring only");
+    document["claim_boundary"] = json!("fixed synthetic readout confirmation; C10 originally used privileged role fitting and a frozen C8 affine policy; initial-core capability is not C7 learning; no policy-only learnability or architecture/ARC promotion");
+    for key in [
+        "head_source",
+        "permuted_labels",
+        "label_permutation",
+        "label_permutation_sha256",
+    ] {
+        document.as_object_mut().expect("report object").remove(key);
+    }
+}
+
 fn run(args: &Args, started: Instant) -> Result<Value> {
     let provenance = provenance(args)?;
-    let cache = cache::load(
-        &args.cache_dir,
-        &args.cache_manifest_sha256,
-        args.core_checkpoint,
-        args.kind,
-        args.mode == Mode::Evaluate,
-    )?;
+    if args.mode == Mode::EvaluateImported {
+        ensure!(
+            import::gemm_reduced_precision(&args.device) != Some(true),
+            "C11 requires strict F32 GEMM"
+        );
+    }
+    let imported = if args.mode == Mode::EvaluateImported {
+        Some(import::Imported::load(
+            args.import_dir.as_deref().context("import root")?,
+            args.import_manifest_sha256
+                .as_deref()
+                .context("import seal")?,
+            args.core_checkpoint,
+            args.kind,
+        )?)
+    } else {
+        None
+    };
+    let import_source = imported.as_ref().map(|source| json!({"root":args.import_dir,"manifest_sha256":args.import_manifest_sha256,"manifest":source.manifest}));
+    let cache = if let Some(panel) = args.confirmation_panel {
+        cache::load_confirmation(
+            &args.cache_dir,
+            &args.cache_manifest_sha256,
+            args.core_checkpoint,
+            args.kind,
+            panel,
+        )?
+    } else {
+        cache::load(
+            &args.cache_dir,
+            &args.cache_manifest_sha256,
+            args.core_checkpoint,
+            args.kind,
+            args.mode == Mode::Evaluate,
+        )?
+    };
     let Cache {
         manifest: cache_manifest,
         rows,
@@ -421,7 +569,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         .iter()
         .map(|row| row.correct_action)
         .collect::<Vec<_>>();
-    let permutation = if args.mode == Mode::Evaluate {
+    let permutation = if args.evaluates() {
         None
     } else {
         Some(cache::permutation(
@@ -433,7 +581,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
                 .context("permutation hash")?,
         )?)
     };
-    let fitted_labels = if args.permuted_labels && args.mode != Mode::Evaluate {
+    let fitted_labels = if args.permuted_labels && !args.evaluates() {
         permutation
             .as_ref()
             .context("permutation")?
@@ -473,15 +621,18 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
             json!({"root":root,"manifest_sha256":args.head_manifest_sha256,"checkpoint_sha256":seal["files"]["final.safetensors"]}),
         );
     }
-    let metadata = json!({"schema":SCHEMA,"status":"running","exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,
+    let mut metadata = json!({"schema":SCHEMA,"status":"running","exact_args":std::env::args().collect::<Vec<_>>(),"provenance":provenance,
         "model":{"type":"learned_readout","head_kind":args.kind,"parameters":args.kind.parameters(),"cached_width":128,"head_recurrence":false},
         "head_kind":args.kind,"core_checkpoint":args.core_checkpoint,"core_checkpoint_sha256":args.core_checkpoint.checkpoint(),
         "cache":{"root":args.cache_dir,"manifest_sha256":args.cache_manifest_sha256,"manifest":cache_manifest},"head_source":head_source,
         "seed":args.seed,"permuted_labels":args.permuted_labels,"label_permutation":args.label_permutation,"label_permutation_sha256":args.label_permutation_sha256,
         "physical_batch":rows.len(),"effective_batch":rows.len(),"accumulation":1,"executed_core_forwards":0,"core_optimizer_updates":0,"cached_extraction_loops":4,
         "optimizer":{"kind":"AdamW","updates":args.updates(),"learning_rate":0.003,"weight_decay":0.0,"beta1":0.9,"beta2":0.999,"epsilon":1e-8,"clip_norm":1.0,"sorted_parameters":true},
-        "objective":"mean policy cross-entropy only","feature_preprocessing":"none; raw cached F32","profile_updates":if args.mode==Mode::Evaluate {vec![]}else{vec![2]},
+        "objective":"mean policy cross-entropy only","feature_preprocessing":"none; raw cached F32","profile_updates":if args.evaluates() {vec![]}else{vec![2]},
         "claim_boundary":"learned cached-feature readout screen; no true-role routing, core training, architecture promotion or ARC claim"});
+    if let Some(source) = &import_source {
+        annotate_import(args, source, &mut metadata);
+    }
     write_json(&args.output_dir.join("metadata.json"), &metadata)?;
     let device = tofy::p2::train::resolve_device(&args.device)?;
     let features = cache::frozen_tensor(values, args.kind, rows.len(), &device)?;
@@ -498,6 +649,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         VarBuilder::from_varmap(&vars, DType::F32, &device),
     )?;
     head::initialize(&vars, args.seed)?;
+    if let Some(imported) = &imported {
+        imported.apply(&vars, &device)?;
+    }
     if let Some(source) = &head_source {
         vars.load(
             args.head_dir
@@ -517,6 +671,9 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     );
     vars.save(args.output_dir.join("initial.safetensors"))?;
     let initial_hash = cache::file_hash(&args.output_dir.join("initial.safetensors"))?;
+    if let Some(imported) = &imported {
+        imported.verify_saved(&args.output_dir.join("initial.safetensors"))?;
+    }
     if let Some(source) = &head_source {
         ensure!(
             source["checkpoint_sha256"] == initial_hash,
@@ -525,7 +682,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     }
     let mut updates = BufWriter::new(File::create_new(args.output_dir.join("updates.jsonl"))?);
     let mut losses = BufWriter::new(File::create_new(args.output_dir.join("losses.jsonl"))?);
-    if args.mode != Mode::Evaluate {
+    if !args.evaluates() {
         ensure!(
             rows.len() == FIT_ROWS,
             "fit batch must contain all 512 cached examples"
@@ -600,12 +757,33 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
     }
     vars.save(args.output_dir.join("final.safetensors"))?;
     let final_hash = cache::file_hash(&args.output_dir.join("final.safetensors"))?;
-    if args.mode == Mode::Evaluate {
+    if args.evaluates() {
         ensure!(initial_hash == final_hash, "frozen head parameters changed");
     }
     args.deadline(started)?;
     let output = final_forward(args, &head, &features, &label_tensor, &device)?;
-    let predictions = predictions(&args.output_dir, &rows, &fitted_labels, &output)?;
+    let predictions = if imported.is_some() {
+        write_predictions(&args.output_dir, &rows, &fitted_labels, &output, true)?
+    } else {
+        predictions(&args.output_dir, &rows, &fitted_labels, &output)?
+    };
+    if let Some(imported) = &imported {
+        imported.verify(&vars)?;
+        imported.verify_saved(&args.output_dir.join("final.safetensors"))?;
+        let reloaded = import::Imported::load(
+            args.import_dir.as_deref().context("import root")?,
+            args.import_manifest_sha256
+                .as_deref()
+                .context("import seal")?,
+            args.core_checkpoint,
+            args.kind,
+        )?;
+        reloaded.verify(&vars)?;
+        ensure!(
+            cache::file_hash(&args.output_dir.join("initial.safetensors"))? == final_hash,
+            "imported saved head changed during inference"
+        );
+    }
     ensure!(
         original_features
             == cache::digest(
@@ -634,8 +812,7 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         );
     }
     args.deadline(started)?;
-    Ok(
-        json!({"schema":SCHEMA,"status":"complete_pending_analysis","evidence_class":match args.mode {Mode::Fit=>"learned_readout_screen",Mode::Smoke=>"implementation_smoke",Mode::Evaluate=>"frozen_learned_readout_evaluation"},
+    let mut report = json!({"schema":SCHEMA,"status":"complete_pending_analysis","evidence_class":match args.mode {Mode::Fit=>"learned_readout_screen",Mode::Smoke=>"implementation_smoke",Mode::Evaluate=>"frozen_learned_readout_evaluation",Mode::EvaluateImported=>"frozen_imported_readout_confirmation"},
         "head_kind":args.kind,"model_type":"learned_readout","parameters":args.kind.parameters(),"parameter_names":names.iter().map(|(name,_)|name).collect::<Vec<_>>(),
         "core_checkpoint_sha256":args.core_checkpoint.checkpoint(),"permuted_labels":args.permuted_labels,"seed":0,
         "optimizer_updates":args.updates(),"executed_core_forwards":0,"core_optimizer_updates":0,"head_forwards":args.updates()+1,
@@ -643,8 +820,13 @@ fn run(args: &Args, started: Instant) -> Result<Value> {
         "physical_batch":rows.len(),"effective_batch":rows.len(),"accumulation":1,"input_rows":rows.len(),"partition":if args.mode==Mode::Evaluate {"fresh_eval"}else{"fit"},
         "cache_manifest_sha256":args.cache_manifest_sha256,"core_source":cache_manifest["source"],"head_source":head_source,
         "initial_checkpoint_sha256":initial_hash,"final_checkpoint_sha256":final_hash,"query_separation":head.query_separation()?,
-        "predictions":predictions,"elapsed_seconds":started.elapsed().as_secs_f64(),"method_promotion":false}),
-    )
+        "predictions":predictions,"elapsed_seconds":started.elapsed().as_secs_f64(),"method_promotion":false});
+    if let Some(source) = &import_source {
+        annotate_import(args, source, &mut report);
+        report["canonical_parameter_bytes_unchanged"] = json!(true);
+        report["saved_canonical_parameter_roundtrip"] = json!(true);
+    }
+    Ok(report)
 }
 
 fn bind_profiles(root: &Path) -> Result<()> {
@@ -823,6 +1005,60 @@ mod tests {
     }
 
     #[test]
+    fn imported_cli_is_zero_update_and_separates_qualification_confirmation_and_legacy(
+    ) -> Result<()> {
+        let mut a = args();
+        a.import_dir = Some("/import".into());
+        assert!(a.validate().is_err());
+        a.mode = Mode::EvaluateImported;
+        a.max_seconds = 60;
+        a.import_manifest_sha256 = Some("a".repeat(64));
+        a.import_qualification = true;
+        assert!(a.validate().is_err());
+        a.label_permutation = None;
+        a.label_permutation_sha256 = None;
+        a.validate()?;
+        assert_eq!(a.updates(), 0);
+        assert!(a.evaluates());
+        a.confirmation_panel = Some(0);
+        assert!(a.validate().is_err());
+        a.import_qualification = false;
+        for panel in 0..3 {
+            a.confirmation_panel = Some(panel);
+            a.validate()?;
+        }
+        a.confirmation_panel = Some(3);
+        assert!(a.validate().is_err());
+        a.confirmation_panel = None;
+        assert!(a.validate().is_err());
+        a.import_qualification = true;
+        a.permuted_labels = true;
+        assert!(a.validate().is_err());
+        a.permuted_labels = false;
+        a.head_dir = Some("/legacy".into());
+        assert!(a.validate().is_err());
+        a.head_dir = None;
+        a.max_seconds = 61;
+        assert!(a.validate().is_err());
+        a.max_seconds = 60;
+        let mut metadata = json!({"optimizer":{"kind":"AdamW"},"permuted_labels":false});
+        annotate_import(
+            &a,
+            &json!({"manifest":{"arm":"c10_true","source_kind":"c10_role_ridge"}}),
+            &mut metadata,
+        );
+        assert!(metadata["optimizer"].is_null());
+        assert_eq!(metadata["optimizer_updates"], 0);
+        assert_eq!(metadata["evidence_class"], "implementation_smoke");
+        assert!(metadata.get("permuted_labels").is_none());
+        for mode in [Mode::Fit, Mode::Smoke, Mode::Evaluate] {
+            a.mode = mode;
+            assert!(a.validate().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn two_artificial_updates_capture_only_head_gradients_and_freeze_inputs() -> Result<()> {
         for kind in [Kind::Spatial, Kind::Cls] {
             let dir = TestDir::new(kind.name())?;
@@ -932,19 +1168,23 @@ mod tests {
                 finite(&restored_head.forward(&features)?.logits)?
             );
             // Frozen evaluation publishes no active gradient families.
-            let mut a = args();
-            a.mode = Mode::Evaluate;
-            a.kind = kind;
-            a.output_dir = dir.0.join("eval");
-            final_forward(&a, &restored_head, &features, &labels, &Device::Cpu)?;
-            let eval = candle_graph::parse_trace(
-                a.output_dir
-                    .with_extension("profiles")
-                    .join("evaluation-000001/trace.jsonl"),
-            )?;
-            assert!(eval.run.capture_contract.gradient_contract.is_none());
-            assert!(eval.gradients.is_empty());
-            assert!(analyze_health(&eval).capture_complete);
+            for mode in [Mode::Evaluate, Mode::EvaluateImported] {
+                let mut a = args();
+                a.mode = mode;
+                a.kind = kind;
+                a.output_dir = dir.0.join(format!("eval-{mode:?}"));
+                let before = finite(&restored_head.forward(&features)?.logits)?;
+                let measured = final_forward(&a, &restored_head, &features, &labels, &Device::Cpu)?;
+                assert_eq!(finite(&measured.logits)?, before);
+                let eval = candle_graph::parse_trace(
+                    a.output_dir
+                        .with_extension("profiles")
+                        .join("evaluation-000001/trace.jsonl"),
+                )?;
+                assert!(eval.run.capture_contract.gradient_contract.is_none());
+                assert!(eval.gradients.is_empty());
+                assert!(analyze_health(&eval).capture_complete);
+            }
         }
         Ok(())
     }

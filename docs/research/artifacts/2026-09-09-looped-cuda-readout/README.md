@@ -1,0 +1,11 @@
+# C11 fixed-readout runtime confirmation
+
+These source snapshots accompany the scoped `evaluate-imported` and confirmation-panel example interfaces. They preserve the exact registration, parameter translation, independent evaluator and bounded operator tools before any new episode access. Their runtime copies live in `/home/stepan/Research/_runs/2026-09-09T131652Z-tofy-looped-cuda-readout-confirmation`; paths are experiment provenance, not a portable product interface.
+
+C10 role-supervised queries and the frozen C8 affine action policy are translated once to named F32 tensors. The six C9 policy-trained comparators retain their original F32 bytes. The existing shared-depth transformer and `Head::forward` mathematics are unchanged. Every C11 invocation has zero optimizer updates. Fitting recipes remain attached to their actual producers; no fabricated C9 training report stands in for C10.
+
+Qualification uses already accessed fitting inputs and checks actual CUDA logits, attention and pooled features against independent numerical reconstruction. Only successful qualification permits three new population audits; all three audits precede extraction, and all six feature caches precede imported-head evaluation. Exact commands, binary hashes, input/export seals and lifecycle records belong to the unique campaign root. Do not rerun these historical operator commands against a sealed or partial root.
+
+This tests a role-supervised readout and nuisance/support robustness in a narrow synthetic task. Initial-core success cannot receive C7 training credit. No policy-only learnability, useful recurrence, architecture superiority, integrated controller, planner, world-model or ARC result is established by implementation or qualification. The registration fixes separate integrity, numerical, control and accuracy gates.
+
+CUDA builds use `cargo build --release --locked --offline --features cudnn,profiling,serde_json/float_roundtrip --example learned_readout_probe --example looped_agent_probe`. First-forward CandleGraph, host/NVTX and Nsight captures are required. Operation/activation linkage, allocation lifetimes, instrumented physical-memory checkpoints and device-event intervals remain unwired; profiled captures are not production timing evidence. NumPy reference operations are not CandleGraph-instrumented.

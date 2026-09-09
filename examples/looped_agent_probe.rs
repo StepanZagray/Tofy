@@ -78,6 +78,9 @@ struct Args {
     /// C9 fresh panel; generate only after every learned readout is sealed.
     #[arg(long)]
     known_features_heldout: bool,
+    /// Closed C11 confirmation population, available only after device qualification.
+    #[arg(long)]
+    known_features_confirmation_panel: Option<u8>,
     /// Absolute JSONL populations whose query hashes the feature panel must exclude.
     #[arg(long)]
     known_features_exclude: Vec<PathBuf>,
