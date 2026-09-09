@@ -37,8 +37,26 @@ The run also fixes a demonstrated unordered gradient-clipping reduction and veri
 exact six-update CUDA replay. Two interrupted precursor arms remain excluded; batch34
 failed the long-run512MiB memory reserve and both valid arms restarted at33.
 [Full counts, controls, amendments, hashes, commands and profiler limits](research/2026-09-09-looped-coverage-results.md).
-Next: frozen fixed-query successor counterfactuals, before a new representation or
-loss experiment. New-core episode memory, active probing and ARC integration remain absent.
+The frozen counterfactual result below now confirms the categorical shortcut;
+the probability-invariance criterion fails, so no internal disconnection is established. New-core episode memory, active probing and ARC integration remain absent.
+
+## Frozen successor counterfactuals — September 9, 2026 IST
+
+At evaluator source2dc5c10e, the fresh-coverage checkpoint emits the same
+**goal-completion template for all3,072 action/mapping outputs** on32 new queries.
+Its384 exact frames are all terminal; copy-current gets1,008. Fixed coverage gets
+zero exact frames. Neither model correctly predicts both members of any
+alternative-mapping pair with genuinely different outcomes. Fresh maximum rule
+TV is0.001499679 familiar and0.001473145 held-out, above the registered0.001
+threshold: categorical invariance is established, probability invariance is not.
+
+Legacy evaluator fields/rows reproduce exactly except durations. All raw outputs,
+independent simulator checks and profiler integrity pass. This supplies no new
+Best So Far gain, ARC score, internal-disconnection proof or architecture promotion.
+[Full result, exact commands, hashes and limits](research/2026-09-09-looped-successor-results.md).
+Next: train the unchanged looped model on a constant known mapping and fresh
+layouts to test spatial learning before a control-learning curriculum. The new
+core still lacks learned episode memory, active probing and ARC integration.
 
 ## Frozen fields for the first experimental run
 

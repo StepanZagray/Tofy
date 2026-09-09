@@ -116,3 +116,19 @@ before sealing, verify all hashes, and store the final manifest digest externall
 
 Completing this diagnostic is a research milestone. It does not end the user's
 broader instruction to continue improving Tofy autonomously.
+
+
+# Pre-readout descriptive clarification
+
+Recorded 2026-09-09T09:12:38.056781+01:00, before any model output from this diagnostic.
+
+Retain the panel, all primary endpoints, strict-template definition and TV tolerance.
+Add descriptive per-pixel Hamming error to oracle/copy/goal-completion template,
+nearest-template rankings (retain ties), and true destination-category probability
+and rank. Report same-input different-action-head TV as a diagnostic, not a guaranteed
+positive control. Break outcome counts out by distance regime as well as split and
+demonstration. In particular, distance-1 wrong-action nonterminal/blocked cases have
+the same query as the terminal case and distinguish oracle from goal template.
+No causal horizon comparison is made across the different layout populations.
+These fields use the same retained raw arrays and add no forward passes or promotion
+opportunities. Qualify aggregate strict-template rejection with pixel distances.
